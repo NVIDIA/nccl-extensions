@@ -34,7 +34,7 @@ INCFLAGS = -I. -I./include -I./device -I$(BUILDDIR)/include -I$(BUILDDIR)/includ
 # Add --expt-relaxed-constexpr for std::max, std::min, etc. in device code
 # CUDA code MUST use -fvisibility=hidden for kernel registration to work correctly.
 # The ncclEp* API is in nccl_ep.cc (compiled with CXXFLAGS), so it still gets exported.
-NVCUFLAGS := $(NVCC_GENCODE) $(INCFLAGS) --expt-relaxed-constexpr --compiler-options "-fPIC -fvisibility=hidden" -ccbin $(CXX) $(CXXSTD)
+NVCUFLAGS := $(NVCC_GENCODE) --extended-lambda $(INCFLAGS) --expt-relaxed-constexpr --compiler-options "-fPIC -fvisibility=hidden" -ccbin $(CXX) $(CXXSTD)
 CXXFLAGS += $(INCFLAGS) -fPIC -fvisibility=default
 
 # Configurable LSA team size range for compile-time instantiation.

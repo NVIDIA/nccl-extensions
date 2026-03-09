@@ -1512,6 +1512,7 @@ ncclResult_t ncclEpCreateHandle(
     const int num_topk = static_cast<int>(topk_idx->sizes[1]);
     handle->num_tokens = num_tokens;
     handle->num_topk = num_topk;
+    assert(handle->num_topk <= MAX_NUM_TOPK && "num_topk exceeds MAX_NUM_TOPK");
 
     if (ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         // LL mode does not accept local tensors
@@ -1519,12 +1520,14 @@ ncclResult_t ncclEpCreateHandle(
 
         // Allocate packed tensors
         // packed_recv_x is the input tensor in the dispatch
-        ncclEpTensorCreate(ep_group, &handle->ll.expert_recv_source_indices, 2, ncclInt32, NCCL_EP_TENSOR_TAG_NONE, nullptr, static_cast<unsigned int>(handle->group->num_local_experts), static_cast<unsigned int>(ep_group->nRanks * ep_group->config.max_tokens_per_rank));
+
+        ncclEpTensorCreate(ep_group, &handle->ll.expert_recv_source_indices, 1, ncclInt32, NCCL_EP_TENSOR_TAG_NONE, nullptr, static_cast<unsigned int>(ep_group->nRanks * (1 + (handle->num_topk + 1)  * ep_group->config.max_tokens_per_rank)));
+        // TODO: unused currently, but keep for future use
         ncclEpTensorCreate(ep_group, &handle->ll.expert_dispatch_layout, 2, ncclInt64, NCCL_EP_TENSOR_TAG_NONE, nullptr, static_cast<unsigned int>(handle->group->num_local_experts), static_cast<unsigned int>(ep_group->nRanks));
 
         assert((ep_group->config.max_tokens_per_rank * handle->group->num_local_experts) % 4 == 0 and "TMA requires the number of tokens to be multiple of 4");
 
-        handle->ll.layout = nccl_ep::LowLatencyLayout(handle->group->rdma_buffer, handle->group->config.max_tokens_per_rank, handle->group->hidden, handle->group->nRanks, handle->group->config.num_experts);
+        handle->ll.layout = nccl_ep::LowLatencyLayout(handle->group->rdma_buffer, handle->group->config.max_tokens_per_rank, handle->group->hidden, handle->group->nRanks, handle->group->config.num_experts, handle->num_topk);
 
         assert(handle->ll.layout.total_bytes <= handle->group->config.rdma_buffer_size);
     } else { // HT
@@ -2192,10 +2195,9 @@ ncclResult_t ncclEpCombine(
         assert(topk_idx->datatype == ncclInt64);
 
             // Validate src_info tensor
-        assert(src_info->ndim == 2);
+        assert(src_info->ndim == 1);
         assert(tensor_is_contiguous(src_info));
         assert(src_info->datatype == ncclInt32);
-        assert(x->sizes[0] == src_info->sizes[0]);
 
             // Validate topk_weights tensor
         assert(topk_weights->ndim == 2);

@@ -386,6 +386,13 @@ void cleanupBenchmarkTensors(ncclEpGroup_t ep_group, BenchmarkTensors& tensors, 
 
 // ============================================================================
 // Data Validation Support (similar to DeepEP test_internode.py / test_low_latency.py)
+//
+// Methodology:
+//   - Input tokens are fingerprinted with (source_rank, token_id) in BF16.
+//   - Dispatch validation recomputes expected routing deterministically and
+//     verifies each received token's identity and integrity.
+//   - Combine validation computes expected weighted sums analytically and
+//     compares against actual output using a cosine-similarity metric (calc_diff).
 // ============================================================================
 
 // Rank offset for BF16 precision: integers > 256 lose precision in BF16
@@ -404,11 +411,27 @@ static float bf16ToFloat(uint16_t bf16) {
     return f;
 }
 
-// Helper: Convert float to BF16 (CPU-side)
+// Helper: Convert float to BF16 (CPU-side, truncation — used only for initialization)
 static uint16_t floatToBf16(float f) {
     uint32_t bits;
     memcpy(&bits, &f, sizeof(bits));
     return static_cast<uint16_t>(bits >> 16);
+}
+
+// Cosine-similarity-based discrepancy metric in double precision
+// Returns 0 for perfect match, larger values for worse match
+static double calc_diff(const double* x, const double* y, size_t n) {
+    double dot_xy = 0, dot_xx = 0, dot_yy = 0;
+    for (size_t i = 0; i < n; i++) {
+        double xi = x[i] + 1.0;
+        double yi = y[i] + 1.0;
+        dot_xy += xi * yi;
+        dot_xx += xi * xi;
+        dot_yy += yi * yi;
+    }
+    double denom = dot_xx + dot_yy;
+    if (denom == 0) return 0;
+    return 1.0 - 2.0 * dot_xy / denom;
 }
 
 // Initialize input tensors with validation-friendly patterns (DeepEP style)
@@ -429,14 +452,18 @@ void initializeValidationData(
     size_t token_size = num_tokens * hidden;
     uint16_t* token_data_host = new uint16_t[token_size];
 
-    // Fill token data with rank value, embed token index in last TOKEN_ID_COLS columns
+    // Fill token data with rank value, embed token index in last TOKEN_ID_COLS columns.
+    // Token ID is split into high (t/256) and low (t%256) bytes to stay within BF16's
+    // exact integer range (0-255). First TOKEN_ID column = high byte, rest = low byte.
     for (unsigned int t = 0; t < num_tokens; t++) {
+        uint16_t token_hi = floatToBf16(static_cast<float>(t / 256));
+        uint16_t token_lo = floatToBf16(static_cast<float>(t % 256));
         for (unsigned int h = 0; h < hidden; h++) {
-            if (h >= hidden - TOKEN_ID_COLS) {
-                // Last TOKEN_ID_COLS columns: store token index
-                token_data_host[t * hidden + h] = floatToBf16(static_cast<float>(t));
+            if (h == hidden - TOKEN_ID_COLS) {
+                token_data_host[t * hidden + h] = token_hi;
+            } else if (h > hidden - TOKEN_ID_COLS) {
+                token_data_host[t * hidden + h] = token_lo;
             } else {
-                // Rest: store rank value
                 token_data_host[t * hidden + h] = rank_bf16;
             }
         }
@@ -450,11 +477,15 @@ void initializeValidationData(
                              token_size * sizeof(uint16_t), cudaMemcpyHostToDevice));
     }
 
-    // Initialize topk_weights with simple values for validation
-    // HT mode: dispatch_topk_weights, LL mode: topk_weights (for combine)
+    // Generate random positive topk_weights: abs(randn)
+    // LL: weights applied during combine → affects combined output
+    // HT: weights forwarded during dispatch → does NOT affect combined output
     float* topk_weights_host = new float[num_tokens * top_k];
+    std::mt19937 rng(42 + myRank);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
     for (unsigned int i = 0; i < num_tokens * top_k; i++) {
-        topk_weights_host[i] = 1.0f;  // Use 1.0 for simpler validation math
+        topk_weights_host[i] = std::abs(normal(rng));
+        if (topk_weights_host[i] < 1e-6f) topk_weights_host[i] = 1e-6f;
     }
 
     if (is_ht_mode) {
@@ -483,69 +514,307 @@ struct ValidationResult {
     std::string message;
 };
 
-// Validate dispatch output: check that received data came from correct source ranks
-// For HT mode: validates recv_tokens tensor
+// Forward declaration (defined later in the file)
+void generateRandomTopkIndicesLL(
+    int64_t* topk_idx_host, unsigned int num_tokens, unsigned int num_experts,
+    unsigned int top_k, int rank, int seed = 1);
+
+// Regenerate HT topk_idx for a given rank (deterministic, uses srand/rand)
+// Must match the generation logic in main()
+static void generateTopkIndicesHT(
+    int64_t* topk_idx_host,
+    unsigned int num_tokens,
+    unsigned int num_experts,
+    unsigned int top_k,
+    int rank
+) {
+    std::mt19937 gen(rank + 42);
+    std::vector<int64_t> expert_perm(num_experts);
+    std::iota(expert_perm.begin(), expert_perm.end(), 0);
+    for (unsigned int i = 0; i < num_tokens; i++) {
+        std::shuffle(expert_perm.begin(), expert_perm.end(), gen);
+        for (unsigned int j = 0; j < top_k; j++) {
+            topk_idx_host[i * top_k + j] = expert_perm[j];
+        }
+    }
+}
+
+// Extract (source_rank, token_id) from a received token row using first and last columns
+static bool extractTokenIdentity(
+    const uint16_t* row,
+    unsigned int hidden,
+    int nRanks,
+    unsigned int num_tokens,
+    int* out_source_rank,
+    int* out_token_id
+) {
+    float rank_val = bf16ToFloat(row[0]);
+    *out_source_rank = static_cast<int>(rank_val + RANK_OFFSET + 0.5f);
+
+    float token_hi = bf16ToFloat(row[hidden - TOKEN_ID_COLS]);
+    float token_lo = bf16ToFloat(row[hidden - 1]);
+    *out_token_id = static_cast<int>(token_hi + 0.5f) * 256 + static_cast<int>(token_lo + 0.5f);
+
+    return (*out_source_rank >= 0 && *out_source_rank < nRanks &&
+            *out_token_id >= 0 && *out_token_id < static_cast<int>(num_tokens));
+}
+
+// Verify a received token row has consistent data (all rank cols match, all token_id cols match)
+static bool verifyTokenIntegrity(
+    const uint16_t* row,
+    unsigned int hidden
+) {
+    uint16_t expected_rank_bf16 = row[0];
+    for (unsigned int h = 1; h < hidden - TOKEN_ID_COLS; h++) {
+        if (row[h] != expected_rank_bf16) return false;
+    }
+    // First TOKEN_ID column is the high byte (standalone), rest are low byte
+    uint16_t expected_token_lo_bf16 = row[hidden - 1];
+    for (unsigned int h = hidden - TOKEN_ID_COLS + 1; h < hidden - 1; h++) {
+        if (row[h] != expected_token_lo_bf16) return false;
+    }
+    return true;
+}
+
+// Validate dispatch output: verify that expected tokens arrived at the correct experts.
+// Recomputes every rank's topk_idx deterministically to build the expected set,
+// then checks the dispatch output for missing, unexpected, or corrupted tokens.
 ValidationResult validateDispatchOutput(
     BenchmarkTensors& tensors,
     unsigned int num_tokens,
     unsigned int hidden,
     unsigned int top_k,
+    unsigned int num_experts,
     unsigned int num_local_experts,
     int myRank,
     int nRanks,
     bool is_ht_mode
 ) {
     ValidationResult result = {true, 0, 0.0, ""};
+    int errors = 0;
+    const int max_errors_to_print = 10;
+    int errors_printed = 0;
 
-    if (is_ht_mode) {
-        // HT mode: recv_tokens is 2D [num_recv_tokens, hidden]
-        // We need to check that all elements in each row match a valid rank value
-        size_t recv_size = num_tokens * hidden;  // Max allocation size
+    // Temp buffer to recompute each rank's topk_idx
+    int64_t* src_topk = new int64_t[num_tokens * top_k];
+
+    if (!is_ht_mode) {
+        // ==================== LL Mode ====================
+        // Output: 3D [num_local_experts, max_tokens_per_expert, hidden]
+
+        const unsigned int* out0_sizes; unsigned int out0_ndim;
+        NCCLCHECK(ncclEpTensorGetSizes(tensors.outputs[0], &out0_sizes, &out0_ndim));
+        unsigned int max_tpe = out0_sizes[1];
+        size_t total_size = static_cast<size_t>(num_local_experts) * max_tpe * hidden;
+        uint16_t* recv_data = new uint16_t[total_size];
+        void* output0_data_ll;
+        NCCLCHECK(ncclEpTensorGetData(tensors.outputs[0], &output0_data_ll));
+        CUDACHECK(cudaMemcpy(recv_data, output0_data_ll,
+                             total_size * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+        int* tokens_per_expert = new int[num_local_experts];
+        void* local0_data;
+        NCCLCHECK(ncclEpTensorGetData(tensors.local_tensors[0], &local0_data));
+        CUDACHECK(cudaMemcpy(tokens_per_expert, local0_data,
+                             num_local_experts * sizeof(int), cudaMemcpyDeviceToHost));
+
+        // Build expected set: expected[local_expert] = set of (source_rank, token_id)
+        std::vector<std::set<std::pair<int,int>>> expected(num_local_experts);
+
+        for (int r = 0; r < nRanks; r++) {
+            generateRandomTopkIndicesLL(src_topk, num_tokens, num_experts, top_k, r);
+            for (unsigned int t = 0; t < num_tokens; t++) {
+                for (unsigned int k = 0; k < top_k; k++) {
+                    int64_t expert_id = src_topk[t * top_k + k];
+                    if (expert_id < 0) continue;
+                    int expert_rank = static_cast<int>(expert_id) / static_cast<int>(num_local_experts);
+                    int local_expert = static_cast<int>(expert_id) % static_cast<int>(num_local_experts);
+                    if (expert_rank == myRank) {
+                        expected[local_expert].insert({r, static_cast<int>(t)});
+                    }
+                }
+            }
+        }
+
+        // Scan output and match against expected
+        for (unsigned int e = 0; e < num_local_experts; e++) {
+            int count = tokens_per_expert[e];
+            if (count < 0 || count > static_cast<int>(max_tpe)) {
+                if (errors_printed < max_errors_to_print) {
+                    printf("[Rank %d] LL dispatch: expert %u has invalid count %d (max %u)\n",
+                           myRank, e, count, max_tpe);
+                    errors_printed++;
+                }
+                errors++;
+                continue;
+            }
+
+            std::set<std::pair<int,int>> found;
+
+            for (int j = 0; j < count; j++) {
+                const uint16_t* row = recv_data + (e * max_tpe + j) * hidden;
+                int source_rank = -1, token_id = -1;
+
+                if (!extractTokenIdentity(row, hidden, nRanks, num_tokens, &source_rank, &token_id)) {
+                    if (errors_printed < max_errors_to_print) {
+                        printf("[Rank %d] LL dispatch: expert %u slot %d: invalid identity (rank=%d, token=%d)\n",
+                               myRank, e, j, source_rank, token_id);
+                        errors_printed++;
+                    }
+                    errors++;
+                    continue;
+                }
+
+                if (!verifyTokenIntegrity(row, hidden)) {
+                    if (errors_printed < max_errors_to_print) {
+                        printf("[Rank %d] LL dispatch: expert %u slot %d: data corruption (rank=%d, token=%d)\n",
+                               myRank, e, j, source_rank, token_id);
+                        errors_printed++;
+                    }
+                    errors++;
+                }
+
+                auto key = std::make_pair(source_rank, token_id);
+                if (expected[e].find(key) == expected[e].end()) {
+                    if (errors_printed < max_errors_to_print) {
+                        printf("[Rank %d] LL dispatch: expert %u slot %d: unexpected token (rank=%d, token=%d)\n",
+                               myRank, e, j, source_rank, token_id);
+                        errors_printed++;
+                    }
+                    errors++;
+                }
+                found.insert(key);
+            }
+
+            // Check for missing tokens
+            for (const auto& key : expected[e]) {
+                if (found.find(key) == found.end()) {
+                    if (errors_printed < max_errors_to_print) {
+                        printf("[Rank %d] LL dispatch: expert %u: missing token (rank=%d, token=%d)\n",
+                               myRank, e, key.first, key.second);
+                        errors_printed++;
+                    }
+                    errors++;
+                }
+            }
+        }
+
+        delete[] tokens_per_expert;
+        delete[] recv_data;
+
+    } else {
+        // ==================== HT Mode ====================
+        // FIXME: ncclEpHandleGetNumRecvTokens returns buffer max, not actual count — scan recv_topk_idx as workaround.
+        // Output buffer is [nRanks * max_tokens_per_rank, hidden], tokens packed contiguously at 0..N-1.
+        // We use recv_topk_idx (outputs[2]) to identify valid rows (expert index >= 0).
+
+        const unsigned int* out0_sizes_ht; unsigned int out0_ndim_ht;
+        NCCLCHECK(ncclEpTensorGetSizes(tensors.outputs[0], &out0_sizes_ht, &out0_ndim_ht));
+        unsigned int buf_rows = out0_sizes_ht[0];
+        size_t recv_size = static_cast<size_t>(buf_rows) * hidden;
         uint16_t* recv_data = new uint16_t[recv_size];
         void* output0_data;
         NCCLCHECK(ncclEpTensorGetData(tensors.outputs[0], &output0_data));
         CUDACHECK(cudaMemcpy(recv_data, output0_data,
                              recv_size * sizeof(uint16_t), cudaMemcpyDeviceToHost));
 
-        // Check each received token row
-        int errors = 0;
-        for (unsigned int t = 0; t < num_tokens && t < 10; t++) {  // Check first 10 tokens
-            // Get the rank value from first column (excluding last TOKEN_ID_COLS)
-            float first_val = bf16ToFloat(recv_data[t * hidden]);
-            float expected_rank_val = first_val;  // The source rank value
+        // Read recv_topk_idx to identify valid rows
+        int64_t* recv_topk_idx = new int64_t[static_cast<size_t>(buf_rows) * top_k];
+        void* output2_data;
+        NCCLCHECK(ncclEpTensorGetData(tensors.outputs[2], &output2_data));
+        CUDACHECK(cudaMemcpy(recv_topk_idx, output2_data,
+                             static_cast<size_t>(buf_rows) * top_k * sizeof(int64_t),
+                             cudaMemcpyDeviceToHost));
 
-            // Check all columns (except last TOKEN_ID_COLS) have same value
-            bool row_has_error = false;
-            for (unsigned int h = 1; h < hidden - TOKEN_ID_COLS; h++) {
-                float val = bf16ToFloat(recv_data[t * hidden + h]);
-                if (fabs(val - expected_rank_val) > 0.1) {
-                    row_has_error = true;
+        // Build expected set from deterministic routing
+        std::set<std::pair<int,int>> expected;
+        for (int r = 0; r < nRanks; r++) {
+            generateTopkIndicesHT(src_topk, num_tokens, num_experts, top_k, r);
+            for (unsigned int t = 0; t < num_tokens; t++) {
+                for (unsigned int k = 0; k < top_k; k++) {
+                    int64_t expert_id = src_topk[t * top_k + k];
+                    int expert_rank = static_cast<int>(expert_id) / static_cast<int>(num_local_experts);
+                    if (expert_rank == myRank) {
+                        expected.insert({r, static_cast<int>(t)});
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Scan ALL rows, but only validate rows where recv_topk_idx has valid entries
+        std::set<std::pair<int,int>> found;
+
+        for (unsigned int j = 0; j < buf_rows; j++) {
+            // Check if this row has any valid expert index
+            bool has_valid_expert = false;
+            for (unsigned int k = 0; k < top_k; k++) {
+                if (recv_topk_idx[j * top_k + k] >= 0) {
+                    has_valid_expert = true;
                     break;
                 }
             }
-            if (row_has_error) errors++;
+            if (!has_valid_expert) continue;
 
-            // Verify the rank value is in valid range
-            int source_rank = static_cast<int>(expected_rank_val + RANK_OFFSET + 0.5);
-            if (source_rank < 0 || source_rank >= nRanks) {
+            const uint16_t* row = recv_data + j * hidden;
+            int source_rank = -1, token_id = -1;
+
+            if (!extractTokenIdentity(row, hidden, nRanks, num_tokens, &source_rank, &token_id)) {
+                if (errors_printed < max_errors_to_print) {
+                    printf("[Rank %d] HT dispatch: slot %u: invalid identity (rank=%d, token=%d)\n",
+                           myRank, j, source_rank, token_id);
+                    errors_printed++;
+                }
+                errors++;
+                continue;
+            }
+
+            if (!verifyTokenIntegrity(row, hidden)) {
+                if (errors_printed < max_errors_to_print) {
+                    printf("[Rank %d] HT dispatch: slot %u: data corruption (rank=%d, token=%d)\n",
+                           myRank, j, source_rank, token_id);
+                    errors_printed++;
+                }
+                errors++;
+            }
+
+            auto key = std::make_pair(source_rank, token_id);
+            if (expected.find(key) == expected.end()) {
+                if (errors_printed < max_errors_to_print) {
+                    printf("[Rank %d] HT dispatch: slot %u: unexpected token (rank=%d, token=%d)\n",
+                           myRank, j, source_rank, token_id);
+                    errors_printed++;
+                }
+                errors++;
+            }
+            found.insert(key);
+        }
+
+        // Check for missing tokens
+        for (const auto& key : expected) {
+            if (found.find(key) == found.end()) {
+                if (errors_printed < max_errors_to_print) {
+                    printf("[Rank %d] HT dispatch: missing token (rank=%d, token=%d)\n",
+                           myRank, key.first, key.second);
+                    errors_printed++;
+                }
                 errors++;
             }
         }
 
-        result.errors = errors;
-        result.passed = (errors == 0);
-        if (!result.passed) {
-            char buf[256];
-            snprintf(buf, sizeof(buf), "HT dispatch validation: %d errors in first 10 tokens", errors);
-            result.message = buf;
-        }
-
+        delete[] recv_topk_idx;
         delete[] recv_data;
-    } else {
-        // LL mode: recv_tokens is 3D [num_local_experts, max_tokens_per_expert, hidden]
-        // Similar validation logic but per-expert
-        result.message = "LL dispatch validation not yet implemented";
-        result.passed = true;  // Skip for now
+    }
+
+    delete[] src_topk;
+
+    result.errors = errors;
+    result.passed = (errors == 0);
+    if (!result.passed) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s dispatch validation: %d errors",
+                 is_ht_mode ? "HT" : "LL", errors);
+        result.message = buf;
     }
 
     return result;
@@ -590,8 +859,9 @@ int countValidExperts(const int64_t* topk_idx_host, unsigned int token_idx, unsi
 }
 
 // Validate combine output for Low Latency mode
-// Formula: combined = original * num_valid_experts (when weights=1.0)
-// So: check = combined / num_valid_experts should equal original
+// DeepEP formula: check = combined / is_token_in_rank.sum()
+// LL combine applies weighted sum: combined[t] = x[t] * sum(valid weights)
+// Compared using calc_diff in double precision with threshold 1e-5
 ValidationResult validateCombineOutputLL(
     BenchmarkTensors& tensors,
     unsigned int num_tokens,
@@ -602,12 +872,11 @@ ValidationResult validateCombineOutputLL(
     int nRanks,
     int64_t* topk_idx_host
 ) {
-    (void)num_experts;  // Unused
-    (void)nRanks;       // Unused
+    (void)num_experts;
+    (void)nRanks;
 
     ValidationResult result = {true, 0, 0.0, ""};
 
-    // Get combined output from GPU
     size_t output_size = num_tokens * hidden;
     uint16_t* combined_data = new uint16_t[output_size];
     {
@@ -617,63 +886,77 @@ ValidationResult validateCombineOutputLL(
                              output_size * sizeof(uint16_t), cudaMemcpyDeviceToHost));
     }
 
-    // Original value for this rank's tokens
+    float* topk_weights_host = new float[num_tokens * top_k];
+    void* tw_data_ll;
+    NCCLCHECK(ncclEpTensorGetData(tensors.topk_weights, &tw_data_ll));
+    CUDACHECK(cudaMemcpy(topk_weights_host, tw_data_ll,
+                         num_tokens * top_k * sizeof(float), cudaMemcpyDeviceToHost));
+
     float original_rank_val = static_cast<float>(myRank - RANK_OFFSET);
 
-    int errors = 0;
-    double max_diff = 0.0;
-    int tokens_checked = 0;
-
+    size_t num_elements = 0;
     for (unsigned int t = 0; t < num_tokens; t++) {
-        int num_experts_valid = countValidExperts(topk_idx_host, t, top_k);
-        if (num_experts_valid == 0) continue;  // Skip tokens with no valid routing
-        tokens_checked++;
+        if (countValidExperts(topk_idx_host, t, top_k) > 0)
+            num_elements += hidden;
+    }
 
-        // Get combined value (first element of token)
-        float combined_val = bf16ToFloat(combined_data[t * hidden]);
+    double* ref = new double[num_elements];
+    double* actual = new double[num_elements];
+    size_t idx = 0;
 
-        // Check for NaN/Inf
-        if (std::isnan(combined_val) || std::isinf(combined_val)) {
-            errors++;
-            continue;
+    bool has_nan = false;
+    for (unsigned int t = 0; t < num_tokens; t++) {
+        int nv = countValidExperts(topk_idx_host, t, top_k);
+        if (nv == 0) continue;
+
+        double weight_sum = 0;
+        for (unsigned int k = 0; k < top_k; k++) {
+            if (topk_idx_host[t * top_k + k] >= 0)
+                weight_sum += static_cast<double>(topk_weights_host[t * top_k + k]);
         }
 
-        // combined = original * num_valid_experts (with weights=1.0)
-        // So: check = combined / num_valid_experts
-        float check_val = combined_val / static_cast<float>(num_experts_valid);
+        double rank_val = static_cast<double>(original_rank_val);
+        double token_hi_val = static_cast<double>(bf16ToFloat(floatToBf16(static_cast<float>(t / 256))));
+        double token_lo_val = static_cast<double>(bf16ToFloat(floatToBf16(static_cast<float>(t % 256))));
 
-        // Compare to original value
-        float diff = fabs(check_val - original_rank_val);
-        if (diff > max_diff) max_diff = diff;
-
-        // Allow tolerance for BF16 precision (relative + absolute)
-        float tolerance = fabs(original_rank_val) * 0.01f + 1.0f;
-        if (diff > tolerance) {
-            errors++;
-            if (errors <= 3) {
-                printf("[Rank %d] Token %u: combined=%.2f, valid_experts=%d, check=%.2f, expected=%.2f, diff=%.2f\n",
-                       myRank, t, combined_val, num_experts_valid, check_val, original_rank_val, diff);
-            }
+        for (unsigned int h = 0; h < hidden; h++) {
+            double orig;
+            if (h == hidden - TOKEN_ID_COLS)
+                orig = token_hi_val;
+            else if (h > hidden - TOKEN_ID_COLS)
+                orig = token_lo_val;
+            else
+                orig = rank_val;
+            ref[idx] = orig * weight_sum;
+            float actual_f = bf16ToFloat(combined_data[t * hidden + h]);
+            actual[idx] = static_cast<double>(actual_f);
+            if (std::isnan(actual_f)) has_nan = true;
+            idx++;
         }
     }
 
-    result.errors = errors;
-    result.max_diff = max_diff;
-    result.passed = (errors == 0);
+    double diff = calc_diff(ref, actual, num_elements);
+    result.max_diff = diff;
+    result.passed = (diff < 1e-5) && !has_nan;
 
     if (!result.passed) {
         char buf[256];
-        snprintf(buf, sizeof(buf), "LL combine: %d/%d tokens failed, max_diff=%.4f",
-                 errors, tokens_checked, max_diff);
+        snprintf(buf, sizeof(buf), "LL combine: calc_diff=%.6e (threshold=1e-5)%s",
+                 diff, has_nan ? ", NaN detected" : "");
         result.message = buf;
     }
 
+    delete[] ref;
+    delete[] actual;
+    delete[] topk_weights_host;
     delete[] combined_data;
     return result;
 }
 
 // Validate combine output for High Throughput mode
 // DeepEP formula: check = combined / is_token_in_rank.sum()
+// HT combine is unweighted sum: combined[t] = x[t] * num_unique_ranks
+// Compared using calc_diff in double precision with threshold 5e-6
 ValidationResult validateCombineOutputHT(
     BenchmarkTensors& tensors,
     unsigned int num_tokens,
@@ -686,7 +969,6 @@ ValidationResult validateCombineOutputHT(
 ) {
     ValidationResult result = {true, 0, 0.0, ""};
 
-    // Get combined output from GPU
     size_t output_size = num_tokens * hidden;
     uint16_t* combined_data = new uint16_t[output_size];
     {
@@ -696,62 +978,60 @@ ValidationResult validateCombineOutputHT(
                              output_size * sizeof(uint16_t), cudaMemcpyDeviceToHost));
     }
 
-    // Count unique ranks per token (is_token_in_rank.sum())
     int* unique_ranks = countUniqueRanksPerToken(topk_idx_host, num_tokens,
                                                   num_experts, top_k, nRanks);
 
-    // Original value for this rank's tokens
     float original_rank_val = static_cast<float>(myRank - RANK_OFFSET);
 
-    int errors = 0;
-    double max_diff = 0.0;
-    int tokens_checked = 0;
-
+    size_t num_elements = 0;
     for (unsigned int t = 0; t < num_tokens; t++) {
-        int num_ranks = unique_ranks[t];
-        if (num_ranks == 0) continue;
-        tokens_checked++;
+        if (unique_ranks[t] > 0) num_elements += hidden;
+    }
 
-        // Get combined value (first element of token)
-        float combined_val = bf16ToFloat(combined_data[t * hidden]);
+    double* ref = new double[num_elements];
+    double* actual = new double[num_elements];
+    size_t idx = 0;
 
-        // Check for NaN/Inf
-        if (std::isnan(combined_val) || std::isinf(combined_val)) {
-            errors++;
-            continue;
-        }
+    bool has_nan = false;
+    for (unsigned int t = 0; t < num_tokens; t++) {
+        int nr = unique_ranks[t];
+        if (nr == 0) continue;
 
-        // DeepEP formula: check = combined / is_token_in_rank.sum()
-        float check_val = combined_val / static_cast<float>(num_ranks);
+        double rank_val = static_cast<double>(original_rank_val);
+        double token_hi_val = static_cast<double>(bf16ToFloat(floatToBf16(static_cast<float>(t / 256))));
+        double token_lo_val = static_cast<double>(bf16ToFloat(floatToBf16(static_cast<float>(t % 256))));
+        double scale = static_cast<double>(nr);
 
-        // Compare to original value
-        float diff = fabs(check_val - original_rank_val);
-        if (diff > max_diff) max_diff = diff;
-
-        // Allow tolerance for BF16 precision
-        float tolerance = fabs(original_rank_val) * 0.01f + 1.0f;
-        if (diff > tolerance) {
-            errors++;
-            if (errors <= 3) {
-                printf("[Rank %d] Token %u: combined=%.2f, unique_ranks=%d, check=%.2f, expected=%.2f, diff=%.2f\n",
-                       myRank, t, combined_val, num_ranks, check_val, original_rank_val, diff);
-            }
+        for (unsigned int h = 0; h < hidden; h++) {
+            double orig;
+            if (h == hidden - TOKEN_ID_COLS)
+                orig = token_hi_val;
+            else if (h > hidden - TOKEN_ID_COLS)
+                orig = token_lo_val;
+            else
+                orig = rank_val;
+            ref[idx] = orig * scale;
+            float actual_f = bf16ToFloat(combined_data[t * hidden + h]);
+            actual[idx] = static_cast<double>(actual_f);
+            if (std::isnan(actual_f)) has_nan = true;
+            idx++;
         }
     }
 
-    result.errors = errors;
-    result.max_diff = max_diff;
-    result.passed = (errors == 0);
+    double diff = calc_diff(ref, actual, num_elements);
+    result.max_diff = diff;
+    result.passed = (diff < 5e-6) && !has_nan;
 
     if (!result.passed) {
         char buf[256];
-        snprintf(buf, sizeof(buf), "HT combine: %d/%d tokens failed, max_diff=%.4f",
-                 errors, tokens_checked, max_diff);
+        snprintf(buf, sizeof(buf), "HT combine: calc_diff=%.6e (threshold=5e-6)%s",
+                 diff, has_nan ? ", NaN detected" : "");
         result.message = buf;
     }
 
+    delete[] ref;
+    delete[] actual;
     delete[] unique_ranks;
-
     delete[] combined_data;
     return result;
 }
@@ -1340,15 +1620,15 @@ void runNvtxProfiling(
     }
 }
 
-// Generate random topk indices for LL mode
-// Uses realistic distribution and randomly masks 10 positions with -1
+// Generate topk indices for LL mode (consistent with DeepEP test_low_latency.py)
+// abs(randn)+1 scores → topk selection → random -1 masking (simulates dropped tokens)
 void generateRandomTopkIndicesLL(
     int64_t* topk_idx_host,
     unsigned int num_tokens,
     unsigned int num_experts,
     unsigned int top_k,
     int rank,
-    int seed = 1
+    int seed
 ) {
     // Seed with (seed + rank) for reproducibility across ranks
     std::mt19937 gen(seed + rank);
@@ -1627,8 +1907,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Generate topk indices
-    // HT mode: random without -1 masking (HT doesn't support -1 in input)
-    // LL mode: random with -1 masking (simulates dropped tokens)
+    // HT: randperm (uniform), consistent with Hybrid-EP (test_hybrid_ep.py)
+    // LL: abs(randn)+1 scores + topk + -1 masking, consistent with DeepEP (test_low_latency.py)
     int64_t *topk_idx_host = new int64_t[num_tokens * top_k];
 
     if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
@@ -1921,9 +2201,8 @@ int main(int argc, char* argv[]) {
         CUDACHECK(cudaStreamSynchronize(stream));
         MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
 
-        // Validate dispatch output
         ValidationResult dispatch_valid = validateDispatchOutput(
-            tensors, num_tokens, hidden, top_k, num_local_experts, myRank, nRanks,
+            tensors, num_tokens, hidden, top_k, num_experts, num_local_experts, myRank, nRanks,
             algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT);
 
         // Copy dispatch output to combine input (simulating expert processing)
@@ -1974,7 +2253,7 @@ int main(int argc, char* argv[]) {
             if (!combine_valid.passed) {
                 printf(" (%s)", combine_valid.message.c_str());
             }
-            printf(" (max_diff=%.4f)\n", combine_valid.max_diff);
+            printf(" (calc_diff=%.6e)\n", combine_valid.max_diff);
             fflush(stdout);
         }
 

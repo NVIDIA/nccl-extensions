@@ -130,7 +130,7 @@ setup_prenyx:
     CI_BUILDS_DIR: "${PRE_NYX_CI_BUILDS_DIR}"
 
 ##
-## Stage: test (srun on GPU partition; runs contrib/nccl_ep/scripts/run_nccl_ep_ci_tests.sh)
+## Stage: test (srun on GPU partition; runs contrib/nccl_ep/ci/run_nccl_ep_ci_tests.sh)
 ##
 
 test_ipp6:
@@ -151,7 +151,7 @@ test_ipp6:
   script:
     - set -ex
     - export SALLOC="salloc -N ${NNODES} --exclusive -p ${SLURM_PARTITION} --account=${SLURM_ACCOUNT} -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN}:nccl-ep-test::${CI_COMMIT_BRANCH}:${CI_COMMIT_SHORT_SHA}" -t ${SLURM_TIME}"
-    - $SALLOC ./contrib/nccl_ep/scripts/run_nccl_ep_ci_tests.sh
+    - $SALLOC ./contrib/nccl_ep/ci/run_nccl_ep_ci_tests.sh
 
 test_eos:
   stage: test
@@ -180,7 +180,7 @@ test_eos:
     - export OMPI_MCA_btl=tcp,self
     # Same salloc as perftest-single-eos; tests use srun --mpi=pmix inside allocation
     - export SALLOC="salloc -N ${NNODES} --ntasks-per-node ${NP} --exclusive --account=${SLURM_ACCOUNT} -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN}:nccl-ep-test-eos::${CI_COMMIT_BRANCH}:${CI_COMMIT_SHORT_SHA}" -t ${SLURM_TIME}"
-    - $SALLOC ./contrib/nccl_ep/scripts/run_nccl_ep_ci_tests.sh
+    - $SALLOC ./contrib/nccl_ep/ci/run_nccl_ep_ci_tests.sh
 
 
 test_prenyx:
@@ -209,4 +209,4 @@ test_prenyx:
     - export LD_LIBRARY_PATH="${NCCL_HOME}/lib:${CUDA_HOME}/lib64:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
     - export SLURM_ACCOUNT="${SLURM_ACCOUNT}"
     - export SALLOC="salloc -N ${NNODES} --ntasks-per-node ${NP} --exclusive -p ${SLURM_PARTITION} --account=${SLURM_ACCOUNT} -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN}:nccl-ep-test-prenyx::${CI_COMMIT_BRANCH}:${CI_COMMIT_SHORT_SHA}" -t ${SLURM_TIME}"
-    - $SALLOC ./contrib/nccl_ep/scripts/run_nccl_ep_ci_tests.sh
+    - $SALLOC ./contrib/nccl_ep/ci/run_nccl_ep_ci_tests.sh

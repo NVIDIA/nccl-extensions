@@ -70,7 +70,7 @@ build_ipp6:
       srun \
         -p cpuonly \
         -J nccl-ep:build \
-        -t 00:45:00 \
+        -t 01:00:00 \
         -n 1 \
         --exclusive \
         --container-image="$container_image" \

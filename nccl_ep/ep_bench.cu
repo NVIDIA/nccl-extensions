@@ -14,13 +14,16 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <map>
 #include <numeric>
 #include <random>
 #include <set>
+#include <string>
 #include <vector>
 #include <mpi.h>
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
+#include <cupti.h>
 #include <nvtx3/nvToolsExt.h>
 #include <nccl.h>
 #include <nccl_device.h>
@@ -53,6 +56,89 @@
     exit(EXIT_FAILURE);                             \
   }                                                 \
 } while(0)
+
+// ============================================================================
+// KernelTimer: CUPTI Activity API-based per-kernel GPU timing
+// ============================================================================
+// Records per-kernel GPU execution times by matching kernel name substrings.
+// Entirely benchmark-side — zero impact on the production nccl_ep library.
+// Same mechanism used by PyTorch kineto (torch.profiler).
+
+#define CUPTI_CALL(call) do {                                                  \
+    CUptiResult _s = (call);                                                   \
+    if (_s != CUPTI_SUCCESS) {                                                 \
+        const char* _e; cuptiGetResultString(_s, &_e);                        \
+        fprintf(stderr, "CUPTI error %s:%d: %s\n", __FILE__, __LINE__, _e);   \
+    }                                                                          \
+} while (0)
+
+static const size_t CUPTI_BUF_SIZE = 8 * 1024 * 1024;  // 8 MB per buffer
+
+struct KernelStat { uint64_t total_ns = 0; int count = 0; };
+// Global accumulator populated by CUPTI buffer-completed callback
+static std::map<std::string, KernelStat> g_kernel_stats;
+
+static void CUPTIAPI cuptiBufferRequested(uint8_t** buf, size_t* sz, size_t* maxRecords) {
+    // aligned_alloc requires size to be a multiple of alignment
+    *buf = static_cast<uint8_t*>(aligned_alloc(8, CUPTI_BUF_SIZE));
+    *sz = CUPTI_BUF_SIZE;
+    *maxRecords = 0;
+}
+
+static void CUPTIAPI cuptiBufferCompleted(CUcontext /*ctx*/, uint32_t /*streamId*/,
+                                           uint8_t* buf, size_t /*sz*/, size_t validSz) {
+    CUpti_Activity* record = nullptr;
+    while (cuptiActivityGetNextRecord(buf, validSz, &record) == CUPTI_SUCCESS) {
+        if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) {
+            auto* k = reinterpret_cast<CUpti_ActivityKernel5*>(record);
+            if (k->name) {
+                g_kernel_stats[k->name].total_ns += k->end - k->start;
+                g_kernel_stats[k->name].count++;
+            }
+        }
+    }
+    free(buf);
+}
+
+class KernelTimer {
+public:
+    // Enable CUPTI kernel activity recording and clear accumulated stats.
+    void start() {
+        g_kernel_stats.clear();
+        CUPTI_CALL(cuptiActivityRegisterCallbacks(cuptiBufferRequested, cuptiBufferCompleted));
+        CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
+    }
+
+    // Flush all pending CUPTI buffers and disable recording.
+    void stop() {
+        CUPTI_CALL(cuptiActivityFlushAll(0));
+        CUPTI_CALL(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
+    }
+
+    // Average GPU execution time (microseconds) across all kernels whose
+    // mangled name contains substr.  Returns 0 if no matching kernel found.
+    double get_avg_us(const char* substr) const {
+        uint64_t total_ns = 0; int count = 0;
+        for (const auto& kv : g_kernel_stats) {
+            if (kv.first.find(substr) != std::string::npos) {
+                total_ns += kv.second.total_ns;
+                count    += kv.second.count;
+            }
+        }
+        return count ? static_cast<double>(total_ns) / count / 1000.0 : 0.0;
+    }
+
+    // Print all captured kernel names and their stats to stdout (debug helper).
+    void dump(int rank) const {
+        if (rank != 0) return;
+        printf("[KernelTimer] Captured %zu distinct kernel(s):\n", g_kernel_stats.size());
+        for (const auto& kv : g_kernel_stats) {
+            double avg_us = static_cast<double>(kv.second.total_ns) / kv.second.count / 1000.0;
+            printf("  count=%3d  avg=%.2f us  %s\n", kv.second.count, avg_us, kv.first.c_str());
+        }
+        fflush(stdout);
+    }
+};
 
 static uint64_t getHostHash(const char* string) {
   uint64_t result = 5381;
@@ -855,21 +941,21 @@ LowLatencyBytes calculateLowLatencyBytes(
 // Six bandwidth metrics for High Throughput mode, all dividing by measured time t:
 //
 //  Send-side (this rank dispatching tokens to experts):
-//   total_send  = total_send_bytes / t   — all destinations (NVL+RDMA) ≡ HybridEP "IB BW"
+//   total_send  = total_send_bytes / t   — all destinations (NVL+RDMA)
 //   nvl_send    = nvl_send_bytes / t     — local node only (NVLink)
 //   rdma_send   = rdma_send_bytes / t    — remote nodes only (RDMA outbound)
 //
 //  Recv-side (this rank's experts receiving tokens):
-//   total_recv  = total_recv_bytes / t   — all sources (NVL+RDMA)      ≡ HybridEP "NVL BW"
+//   total_recv  = total_recv_bytes / t   — all sources (NVL+RDMA)
 //   nvl_recv    = nvl_recv_bytes / t     — from local ranks (NVLink)
 //   rdma_recv   = rdma_recv_bytes / t    — from remote ranks (RDMA inbound)
 //
 //  Derived: nvl_send = total_send - rdma_send
 //           nvl_recv = total_recv - rdma_recv
 struct HighThroughputBytes {
-    size_t total_send_bytes;     // NVL + RDMA outbound  ≡ HybridEP "IB BW"
+    size_t total_send_bytes;     // NVL + RDMA outbound
     size_t rdma_send_bytes;      // RDMA outbound only
-    size_t total_recv_bytes;     // NVL + RDMA inbound   ≡ HybridEP "NVL BW"
+    size_t total_recv_bytes;     // NVL + RDMA inbound
     size_t rdma_recv_bytes;      // RDMA inbound only (from remote ranks)
     unsigned int total_send_tokens;
     unsigned int rdma_send_tokens;
@@ -908,6 +994,9 @@ HighThroughputBytes calculateHighThroughputBytes(
     unsigned int num_experts_per_rank = num_experts / static_cast<unsigned int>(nRanks);
 
     // Send side: count unique (token, node) pairs from this rank's topk_idx
+    // A token routed to multiple experts on the same node is counted only once, even though
+    // NCCL EP sends it to each target rank individually via NVLink P2P (not once per node).
+    // TODO: switch to per-rank counting for both nvl_send and nvl_recv.
     for (unsigned int t = 0; t < num_tokens; t++) {
         std::set<int> nodes_for_token;
         for (unsigned int k = 0; k < top_k; k++) {
@@ -925,6 +1014,7 @@ HighThroughputBytes calculateHighThroughputBytes(
     // Recv side: replay every source rank's randperm routing to count tokens
     // received by myRank. This is deterministic because each rank uses the
     // same seed (src_rank + 42) and same shuffle algorithm.
+    // Each (src_rank, token) pair is counted once regardless of how many experts on myRank it targets.
     std::vector<int64_t> src_perm(num_experts);
     for (int src_rank = 0; src_rank < nRanks; src_rank++) {
         int src_node = src_rank / num_ranks_per_node;
@@ -1075,38 +1165,30 @@ void printLowLatencyResults(
     }
 }
 
-// Print benchmark results for High Throughput mode.
-// Six bandwidth perspectives per operation (send/recv × total/nvl/rdma).
-// During Combine the data flow reverses: experts send what they received,
-// ranks receive what they sent.
+// Print results for High Throughput mode.
+// local_kernel_dk_us / local_kernel_ck_us: per-rank CUPTI kernel times for the per-rank lines.
+// All "global_*" parameters are raw MPI_SUM across all ranks (rank 0 only; 0 on other ranks).
+// The function averages them by nRanks before use.
 void printHighThroughputResults(
     int myRank,
     int nRanks,
     const BenchResult& dispatch_result,
     const BenchResult& combine_result,
     const BenchResult& combined_result,
-    const HighThroughputBytes& ht_bytes
+    const HighThroughputBytes& ht_bytes,
+    double local_kernel_dk_us,
+    double local_kernel_ck_us,
+    double global_kernel_dk_us,
+    double global_kernel_ck_us,
+    size_t global_total_send, size_t global_rdma_send,
+    size_t global_total_recv, size_t global_rdma_recv
 ) {
-    // Dispatch BW: rank → experts
-    double d_total_recv = (ht_bytes.total_recv_bytes / 1e9) / (dispatch_result.avg_ms / 1000.0);
-    double d_rdma_recv  = (ht_bytes.rdma_recv_bytes  / 1e9) / (dispatch_result.avg_ms / 1000.0);
-    double d_total_send = (ht_bytes.total_send_bytes / 1e9) / (dispatch_result.avg_ms / 1000.0);
-    double d_rdma_send  = (ht_bytes.rdma_send_bytes  / 1e9) / (dispatch_result.avg_ms / 1000.0);
+    printf("[Rank %d] Dispatch:         total=%.2f us  kernel=%.2f us\n",
+           myRank, dispatch_result.avg_ms * 1000, local_kernel_dk_us);
+    printf("[Rank %d] Combine:          total=%.2f us  kernel=%.2f us\n",
+           myRank, combine_result.avg_ms * 1000, local_kernel_ck_us);
+    printf("[Rank %d] Dispatch+Combine: total=%.2f us\n", myRank, combined_result.avg_ms * 1000);
 
-    // Combine BW: experts → rank (send/recv swap)
-    double c_total_send = (ht_bytes.total_recv_bytes / 1e9) / (combine_result.avg_ms / 1000.0);
-    double c_rdma_send  = (ht_bytes.rdma_recv_bytes  / 1e9) / (combine_result.avg_ms / 1000.0);
-    double c_total_recv = (ht_bytes.total_send_bytes / 1e9) / (combine_result.avg_ms / 1000.0);
-    double c_rdma_recv  = (ht_bytes.rdma_send_bytes  / 1e9) / (combine_result.avg_ms / 1000.0);
-
-    printf("[Rank %d] Dispatch:         avg=%.2f us, total_recv=%.2f GB/s, total_send=%.2f GB/s\n",
-           myRank, dispatch_result.avg_ms * 1000, d_total_recv, d_total_send);
-    printf("[Rank %d] Combine:          avg=%.2f us, total_send=%.2f GB/s, total_recv=%.2f GB/s\n",
-           myRank, combine_result.avg_ms * 1000, c_total_send, c_total_recv);
-    printf("[Rank %d] Dispatch+Combine: avg=%.2f us\n",
-           myRank, combined_result.avg_ms * 1000);
-
-    // Aggregate latency across ranks
     double local_dispatch_avg = dispatch_result.avg_ms;
     double local_dispatch_min = dispatch_result.min_ms;
     double local_dispatch_max = dispatch_result.max_ms;
@@ -1131,13 +1213,6 @@ void printHighThroughputResults(
     MPI_Reduce(&local_total_min, &global_total_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_total_max, &global_total_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    // Aggregate byte counts across ranks for summary
-    size_t global_total_send, global_rdma_send, global_total_recv, global_rdma_recv;
-    MPI_Reduce(&ht_bytes.total_send_bytes, &global_total_send, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&ht_bytes.rdma_send_bytes,  &global_rdma_send,  1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&ht_bytes.total_recv_bytes, &global_total_recv, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&ht_bytes.rdma_recv_bytes,  &global_rdma_recv,  1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-
     if (myRank == 0) {
         global_dispatch_avg /= nRanks;
         global_combine_avg  /= nRanks;
@@ -1150,65 +1225,78 @@ void printHighThroughputResults(
         double avg_nvl_send   = avg_total_send - avg_rdma_send;
         double avg_nvl_recv   = avg_total_recv - avg_rdma_recv;
 
-        double d_avg_s = global_dispatch_avg / 1000.0;
-        double c_avg_s = global_combine_avg  / 1000.0;
-
-        double d_total_recv_bw = (avg_total_recv / 1e9) / d_avg_s;
-        double d_nvl_recv_bw   = (avg_nvl_recv   / 1e9) / d_avg_s;
-        double d_rdma_recv_bw  = (avg_rdma_recv  / 1e9) / d_avg_s;
-        double d_total_send_bw = (avg_total_send / 1e9) / d_avg_s;
-        double d_nvl_send_bw   = (avg_nvl_send   / 1e9) / d_avg_s;
-        double d_rdma_send_bw  = (avg_rdma_send  / 1e9) / d_avg_s;
-
-        double c_total_send_bw = (avg_total_recv / 1e9) / c_avg_s;
-        double c_nvl_send_bw   = (avg_nvl_recv   / 1e9) / c_avg_s;
-        double c_rdma_send_bw  = (avg_rdma_recv  / 1e9) / c_avg_s;
-        double c_total_recv_bw = (avg_total_send / 1e9) / c_avg_s;
-        double c_nvl_recv_bw   = (avg_nvl_send   / 1e9) / c_avg_s;
-        double c_rdma_recv_bw  = (avg_rdma_send  / 1e9) / c_avg_s;
+        double avg_kernel_dk_us = global_kernel_dk_us / nRanks;
+        double avg_kernel_ck_us = global_kernel_ck_us / nRanks;
+        double dk_s       = avg_kernel_dk_us / 1e6;
+        double ck_s       = avg_kernel_ck_us / 1e6;
+        double dk_total_s = global_dispatch_avg * 1e-3;  // avg total dispatch time in seconds
+        double ck_total_s = global_combine_avg  * 1e-3;
 
         printf("\n=== Summary (High Throughput %s, across %d ranks) ===\n",
                ht_bytes.is_fp8 ? "FP8" : "BF16", nRanks);
-        printf("Dispatch:    avg=%.2f us, min=%.2f us, max=%.2f us\n",
+        printf("NOTE: total time = kernel time + memcpyD2D + misc\n");
+
+        // --- BW based on total time ---
+        printf("--- BW based on total time ---\n");
+        printf("Dispatch:    total=%.2f us (min=%.2f, max=%.2f)\n",
                global_dispatch_avg * 1000, global_dispatch_min * 1000, global_dispatch_max * 1000);
-        printf("Combine:     avg=%.2f us, min=%.2f us, max=%.2f us\n",
+        if (dk_total_s > 0) {
+            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                   (avg_total_recv / 1e9) / dk_total_s, (avg_nvl_recv / 1e9) / dk_total_s, (avg_rdma_recv / 1e9) / dk_total_s);
+            printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                   (avg_total_send / 1e9) / dk_total_s, (avg_nvl_send / 1e9) / dk_total_s, (avg_rdma_send / 1e9) / dk_total_s);
+        }
+        printf("Combine:     total=%.2f us (min=%.2f, max=%.2f)\n",
                global_combine_avg * 1000, global_combine_min * 1000, global_combine_max * 1000);
+        if (ck_total_s > 0) {
+            printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                   (avg_total_recv / 1e9) / ck_total_s, (avg_nvl_recv / 1e9) / ck_total_s, (avg_rdma_recv / 1e9) / ck_total_s);
+            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                   (avg_total_send / 1e9) / ck_total_s, (avg_nvl_send / 1e9) / ck_total_s, (avg_rdma_send / 1e9) / ck_total_s);
+        }
         printf("Total (D+C): avg=%.2f us, min=%.2f us, max=%.2f us\n",
                global_total_avg * 1000, global_total_min * 1000, global_total_max * 1000);
 
-        printf("\n--- Dispatch BW (rank -> experts) ---\n");
-        printf("  total_recv=%.2f  nvl_recv=%.2f  rdma_recv=%.2f GB/s  [= HybridEP NVL BW]\n",
-               d_total_recv_bw, d_nvl_recv_bw, d_rdma_recv_bw);
-        printf("  total_send=%.2f  nvl_send=%.2f  rdma_send=%.2f GB/s  [= HybridEP IB BW]\n",
-               d_total_send_bw, d_nvl_send_bw, d_rdma_send_bw);
+        // --- BW based on kernel time ---
+        printf("\n--- BW based on kernel time ---\n");
+        printf("Dispatch:    kernel=%.2f us\n", avg_kernel_dk_us);
+        if (dk_s > 0) {
+            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                   (avg_total_recv / 1e9) / dk_s, (avg_nvl_recv / 1e9) / dk_s, (avg_rdma_recv / 1e9) / dk_s);
+            printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                   (avg_total_send / 1e9) / dk_s, (avg_nvl_send / 1e9) / dk_s, (avg_rdma_send / 1e9) / dk_s);
+        }
+        printf("Combine:     kernel=%.2f us\n", avg_kernel_ck_us);
+        if (ck_s > 0) {
+            printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                   (avg_total_recv / 1e9) / ck_s, (avg_nvl_recv / 1e9) / ck_s, (avg_rdma_recv / 1e9) / ck_s);
+            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                   (avg_total_send / 1e9) / ck_s, (avg_nvl_send / 1e9) / ck_s, (avg_rdma_send / 1e9) / ck_s);
+        }
+        printf("Total (D+C): kernel=%.2f us\n", avg_kernel_dk_us + avg_kernel_ck_us);
 
-        printf("\n--- Combine BW (experts -> rank) ---\n");
-        printf("  total_send=%.2f  nvl_send=%.2f  rdma_send=%.2f GB/s\n",
-               c_total_send_bw, c_nvl_send_bw, c_rdma_send_bw);
-        printf("  total_recv=%.2f  nvl_recv=%.2f  rdma_recv=%.2f GB/s\n",
-               c_total_recv_bw, c_nvl_recv_bw, c_rdma_recv_bw);
-
-        printf("\nByte counts (per rank avg): total_send=%.2f MB (%u tokens), rdma_send=%.2f MB (%u tokens), "
-               "rdma_recv=%.2f MB (%u tokens), total_recv=%.2f MB (%u tokens)\n",
-               avg_total_send / 1e6, ht_bytes.total_send_tokens,
-               avg_rdma_send  / 1e6, ht_bytes.rdma_send_tokens,
-               avg_rdma_recv  / 1e6, ht_bytes.rdma_recv_tokens,
-               avg_total_recv / 1e6, ht_bytes.total_recv_tokens);
+        if (dk_s > 0 || ck_s > 0) {
+            printf("\nByte counts (per rank avg): total_send=%.2f MB (%u tokens), rdma_send=%.2f MB (%u tokens), "
+                   "rdma_recv=%.2f MB (%u tokens), total_recv=%.2f MB (%u tokens)\n",
+                   avg_total_send / 1e6, ht_bytes.total_send_tokens,
+                   avg_rdma_send  / 1e6, ht_bytes.rdma_send_tokens,
+                   avg_rdma_recv  / 1e6, ht_bytes.rdma_recv_tokens,
+                   avg_total_recv / 1e6, ht_bytes.total_recv_tokens);
+        }
     }
 }
 
-// Run NVTX profiling with labeled ranges for nsys analysis
-// Always runs dispatch+combine paired for correctness
+// Run NVTX profiling with labeled ranges for nsys analysis.
+// Profiles one HandleCreate (to see AG + metadata processing) followed by
+// num_iters paired Dispatch+Combine iterations.
 void runNvtxProfiling(
     int myRank,
     int num_iters,
     std::function<void()> dispatch_fn,
     std::function<void()> combine_fn,
-    std::function<void()> dispatch_combine_fn,
+    std::function<void()> handle_create_fn,
     cudaStream_t stream
 ) {
-    (void)dispatch_combine_fn;  // Not used anymore, kept for API compatibility
-
     if (myRank == 0) {
         printf("\n=== NVTX Profiling Mode ===\n");
         printf("Run with: nsys profile --stats=true mpirun ...\n\n");
@@ -1219,6 +1307,14 @@ void runNvtxProfiling(
 
     // Start CUDA profiler (for nsys --capture-range=cudaProfilerApi)
     cudaProfilerStart();
+
+    // Profile HandleCreate to expose AG and metadata processing phases
+    nvtxRangePush("HandleCreate");
+    handle_create_fn();
+    CUDACHECK(cudaStreamSynchronize(stream));
+    nvtxRangePop();
+
+    MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
 
     // Profile paired dispatch+combine iterations with individual labels
     // Note: cudaStreamSynchronize between dispatch and combine is required for HT mode
@@ -1235,7 +1331,7 @@ void runNvtxProfiling(
         nvtxRangePop();
         MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     }
-    nvtxRangePop();  // Dispatch+Combine Benchmark
+    nvtxRangePop();  // Paired Dispatch+Combine Benchmark
 
     cudaProfilerStop();
 
@@ -1536,7 +1632,7 @@ int main(int argc, char* argv[]) {
     int64_t *topk_idx_host = new int64_t[num_tokens * top_k];
 
     if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
-        // Randperm routing matching HybridEP's test_hybrid_ep.py:
+        // Randperm routing with uniform distribution
         //   selected_experts = torch.randperm(num_of_experts)[:topk]
         // Uniform distribution across all experts for a fair BW comparison.
         std::mt19937 gen(myRank + 42);
@@ -1549,7 +1645,7 @@ int main(int argc, char* argv[]) {
             }
         }
         if (myRank == 0) {
-            printf("Using randperm topk_idx for HT mode (uniform distribution, matches HybridEP)\n\n");
+            printf("Using randperm topk_idx for HT mode (uniform distribution)\n\n");
         }
     } else {
         generateRandomTopkIndicesLL(topk_idx_host, num_tokens, num_experts, top_k, myRank);
@@ -1707,10 +1803,17 @@ int main(int argc, char* argv[]) {
     int actual_warmup = num_warmup;
     int actual_iters = num_iters;
 
+    // CUPTI wraps the benchmark loop — records kernel GPU timestamps in hardware
+    // alongside the cudaEvent timing, with zero interference.
+    KernelTimer ktimer;
+    ktimer.start();
+
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     PairedBenchResult paired_result = runPairedBenchmark(
         dispatch_fn, combine_fn, actual_warmup, actual_iters,
         dispatch_data_bytes, combine_data_bytes, stream);
+
+    ktimer.stop();
 
     // Extract individual results for printing
     BenchResult dispatch_result = paired_result.dispatch;
@@ -1719,16 +1822,61 @@ int main(int argc, char* argv[]) {
 
     // ==================== NVTX Profiling Mode ====================
     if (profile_mode) {
-        // Pass nullptr for dispatch_combine_fn (not used anymore)
-        // Use actual_iters (1 for HT mode, num_iters for LL mode)
-        runNvtxProfiling(myRank, actual_iters, dispatch_fn, combine_fn, nullptr, stream);
+        auto handle_create_fn = [&]() {
+            NCCLCHECK(ncclEpHandleDestroy(ep_handle));
+            NCCLCHECK(ncclEpCreateHandle(&ep_handle, ep_group, topk_idx,
+                                          handle_local_tensors, handle_num_local_tensors,
+                                          nullptr, stream, use_fp8));
+        };
+        runNvtxProfiling(myRank, actual_iters, dispatch_fn, combine_fn, handle_create_fn, stream);
+    }
+
+    // ==================== CUPTI Kernel-Only Timing (reduce before print) ====================
+    // Debug: show all captured kernels on rank 0 (uncomment to inspect names)
+    // ktimer.dump(myRank);
+
+    double dispatch_kernel_us = ktimer.get_avg_us("dispatch_kernel");
+    double combine_kernel_us  = ktimer.get_avg_us("combine_kernel");
+    double global_dk_us = 0.0, global_ck_us = 0.0;
+    MPI_Reduce(&dispatch_kernel_us, &global_dk_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&combine_kernel_us,  &global_ck_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    // Aggregate byte counts across ranks (HT only)
+    size_t global_total_send = 0, global_rdma_send = 0;
+    size_t global_total_recv = 0, global_rdma_recv = 0;
+    if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+        MPI_Reduce(&ht_bytes.total_send_bytes, &global_total_send, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&ht_bytes.rdma_send_bytes,  &global_rdma_send,  1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&ht_bytes.total_recv_bytes, &global_total_recv, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&ht_bytes.rdma_recv_bytes,  &global_rdma_recv,  1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
     }
 
     // Print results and summary based on algorithm mode
     if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         printLowLatencyResults(myRank, nRanks, dispatch_result, combine_result, combined_result, ll_bytes);
+        if (myRank == 0) {
+            double avg_dk_us = global_dk_us / nRanks;
+            double avg_ck_us = global_ck_us / nRanks;
+            printf("\n=== Kernel-Only Timing (CUPTI, avg across %d ranks) ===\n", nRanks);
+            printf("dispatch_kernel: avg=%.2f us\n", avg_dk_us);
+            printf("combine_kernel:  avg=%.2f us\n", avg_ck_us);
+            if (avg_dk_us == 0.0 || avg_ck_us == 0.0) {
+                printf("  NOTE: 0 us means no matching kernel was captured.\n");
+                printf("  Uncomment ktimer.dump() above to inspect captured kernel names.\n");
+            }
+            fflush(stdout);
+        }
     } else {
-        printHighThroughputResults(myRank, nRanks, dispatch_result, combine_result, combined_result, ht_bytes);
+        printHighThroughputResults(myRank, nRanks, dispatch_result, combine_result, combined_result, ht_bytes,
+                                   dispatch_kernel_us, combine_kernel_us,
+                                   global_dk_us, global_ck_us,
+                                   global_total_send, global_rdma_send,
+                                   global_total_recv, global_rdma_recv);
+        if (myRank == 0 && (global_dk_us == 0.0 || global_ck_us == 0.0)) {
+            printf("  NOTE: 0 us means no matching kernel was captured.\n");
+            printf("  Uncomment ktimer.dump() above to inspect captured kernel names.\n");
+            fflush(stdout);
+        }
     }
 
     // Aggregate group/handle creation times across ranks

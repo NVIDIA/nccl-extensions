@@ -23,7 +23,7 @@
 #define FINISHED_SUM_TAG 1024
 #define NUM_WAIT_NANOSECONDS 500
 #define MAX_SUPPORTED_TOKENS_PER_RANK 8192  // Must match kernel template in hybridep_adapter.cu
-#define HT_OF_NUM_TOKENS_PER_CHUNK 128
+#define HT_OF_NUM_TOKENS_PER_CHUNK 64
 
 #ifndef ENABLE_FAST_DEBUG
 #define NUM_CPU_TIMEOUT_SECS 100

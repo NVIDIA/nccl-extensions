@@ -133,25 +133,25 @@ setup_prenyx:
 ## Stage: test (srun on GPU partition; runs contrib/nccl_ep/ci/run_nccl_ep_ci_tests.sh)
 ##
 
-test_ipp6:
-  stage: test
-  needs:
-    - job: build_ipp6
-      artifacts: false
-  tags:
-    - ipp6-nccl
-  variables:
-    NNODES: 1
-    NP: 8
-    NGPUS: 8
-    SLURM_PARTITION: h100x8-cicd
-    SLURM_ACCOUNT: coreai_libraries_nccl
-    SLURM_TIME: 30
-    NCCL_EP_BENCH_HT: "0"
-  script:
-    - set -ex
-    - export SALLOC="salloc -N ${NNODES} --exclusive -p ${SLURM_PARTITION} --account=${SLURM_ACCOUNT} -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN}:nccl-ep-test::${CI_COMMIT_BRANCH}:${CI_COMMIT_SHORT_SHA}" -t ${SLURM_TIME}"
-    - $SALLOC ./contrib/nccl_ep/ci/run_nccl_ep_ci_tests.sh
+# test_ipp6:
+#   stage: test
+#   needs:
+#     - job: build_ipp6
+#       artifacts: false
+#   tags:
+#     - ipp6-nccl
+#   variables:
+#     NNODES: 1
+#     NP: 8
+#     NGPUS: 8
+#     SLURM_PARTITION: h100x8-cicd
+#     SLURM_ACCOUNT: coreai_libraries_nccl
+#     SLURM_TIME: 30
+#     NCCL_EP_BENCH_HT: "0"
+#   script:
+#     - set -ex
+#     - export SALLOC="salloc -N ${NNODES} --exclusive -p ${SLURM_PARTITION} --account=${SLURM_ACCOUNT} -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN}:nccl-ep-test::${CI_COMMIT_BRANCH}:${CI_COMMIT_SHORT_SHA}" -t ${SLURM_TIME}"
+#     - $SALLOC ./contrib/nccl_ep/ci/run_nccl_ep_ci_tests.sh
 
 test_eos:
   stage: test

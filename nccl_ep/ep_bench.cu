@@ -519,8 +519,8 @@ void generateRandomTopkIndicesLL(
     int64_t* topk_idx_host, unsigned int num_tokens, unsigned int num_experts,
     unsigned int top_k, int rank, int seed = 1);
 
-// Regenerate HT topk_idx for a given rank (deterministic, uses srand/rand)
-// Must match the generation logic in main()
+// Generate HT topk_idx for a given rank (deterministic)
+// Randperm routing (uniform), consistent with Hybrid-EP (test_hybrid_ep.py)
 static void generateTopkIndicesHT(
     int64_t* topk_idx_host,
     unsigned int num_tokens,
@@ -1912,18 +1912,7 @@ int main(int argc, char* argv[]) {
     int64_t *topk_idx_host = new int64_t[num_tokens * top_k];
 
     if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
-        // Randperm routing with uniform distribution
-        //   selected_experts = torch.randperm(num_of_experts)[:topk]
-        // Uniform distribution across all experts for a fair BW comparison.
-        std::mt19937 gen(myRank + 42);
-        std::vector<int64_t> expert_perm(num_experts);
-        std::iota(expert_perm.begin(), expert_perm.end(), 0);
-        for (unsigned int i = 0; i < num_tokens; i++) {
-            std::shuffle(expert_perm.begin(), expert_perm.end(), gen);
-            for (unsigned int j = 0; j < top_k; j++) {
-                topk_idx_host[i * top_k + j] = expert_perm[j];
-            }
-        }
+        generateTopkIndicesHT(topk_idx_host, num_tokens, num_experts, top_k, myRank);
         if (myRank == 0) {
             printf("Using randperm topk_idx for HT mode (uniform distribution)\n\n");
         }

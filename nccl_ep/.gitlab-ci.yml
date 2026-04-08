@@ -176,7 +176,7 @@ test_eos:
     - export CUDA_HOME="${EOS_CUDA_HOME}"
     - export MPI_HOME="${EOS_MPI_HOME}"
     - export PATH="${MPI_HOME}/bin:${PATH}"
-    - export LD_LIBRARY_PATH="${NCCL_HOME}/lib:${CUDA_HOME}/lib64:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
+    - export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
     - export SLURM_ACCOUNT="${SLURM_ACCOUNT}"
     # OpenMPI TCP BTL on EOS (see docker/clusters/eos-config.sh); used by srun --mpi=pmix tasks
     - export OMPI_MCA_btl_tcp_if_include=eth3
@@ -209,7 +209,7 @@ test_prenyx:
     - export CUDA_HOME="${PRE_NYX_CUDA_HOME}"
     - export MPI_HOME="${PRE_NYX_MPI_HOME}"
     - export PATH="${MPI_HOME}/bin:${PATH}"
-    - export LD_LIBRARY_PATH="${NCCL_HOME}/lib:${CUDA_HOME}/lib64:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
+    - export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
     - export SLURM_ACCOUNT="${SLURM_ACCOUNT}"
     - export SALLOC="salloc -N ${NNODES} --ntasks-per-node ${NP} --exclusive -p ${SLURM_PARTITION} --account=${SLURM_ACCOUNT} -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN}:nccl-ep-test-prenyx::${CI_COMMIT_BRANCH}:${CI_COMMIT_SHORT_SHA}" -t ${SLURM_TIME}"
     - $SALLOC ./contrib/nccl_ep/ci/run_nccl_ep_ci_tests.sh

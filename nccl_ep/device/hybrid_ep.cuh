@@ -970,69 +970,50 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
       int remote_node_id = remote_idx < node_rank ? remote_idx : remote_idx + 1;
       int rank_in_remote = remote_idx < node_rank ? node_rank - 1 : node_rank;
 
-      uint8_t* gin_base = reinterpret_cast<uint8_t*>(gin_base_ptr);
-      int run_count = 0;
-      int dense_dst_offset = 0;
-      size_t staging_base = smem_mr_info_ptr->rdma_send_staging_offset +
-                            remote_idx * smem_mr_info_ptr->max_tokens_per_dest *
-                            smem_mr_info_ptr->bytes_per_entry +
-                            static_cast<size_t>(chunk_idx * NUM_OF_TOKENS_PER_CHUNK) *
-                            smem_mr_info_ptr->bytes_per_entry;
-      size_t packed_dst_base = smem_mr_info_ptr->rdma_inter_node_group_packed_offset +
+      int dense_dst_offset = smem_mr_info_ptr->rdma_inter_node_group_packed_offset +
                                rank_in_remote * smem_mr_info_ptr->max_tokens_per_dest *
                                smem_mr_info_ptr->bytes_per_entry +
                                static_cast<size_t>(chunk_idx * NUM_OF_TOKENS_PER_CHUNK) *
                                smem_mr_info_ptr->bytes_per_entry;
 
-      for (int token_idx_in_chunk = 0; token_idx_in_chunk < token_range; ++token_idx_in_chunk) {
+                               
+      for (int token_idx_in_chunk = ncclCoopWarp().thread_rank(); token_idx_in_chunk < token_range; token_idx_in_chunk += ncclCoopWarp().size()) {
         int token_idx = token_idx_in_chunk + chunk_base_token_idx;
         bool need_write = attn_to_rdma_map[chunk_base_token_idx * (NUM_LSA_TEAMS - 1) + remote_idx + token_idx_in_chunk * (NUM_LSA_TEAMS - 1)];
-        bool is_last_token = (token_idx_in_chunk == token_range - 1);
-
+        size_t base_offset = dense_dst_offset;
+        for (int i = 0; i < token_idx_in_chunk; i++) {
+          bool prev_need_write = attn_to_rdma_map[chunk_base_token_idx * (NUM_LSA_TEAMS - 1) + remote_idx + i * (NUM_LSA_TEAMS - 1)];
+          if (prev_need_write) {
+            base_offset += smem_mr_info_ptr->bytes_per_entry;
+          }
+        }
         if (need_write) {
-          uint8_t* staging_entry = gin_base + staging_base +
-                                   (dense_dst_offset + run_count) * smem_mr_info_ptr->bytes_per_entry;
-
-          const uint8_t* token_src = gin_base +
-                                     smem_mr_info_ptr->attn_input_token_offset +
-                                    token_idx * token_bytes;
-          warp_copy_int4(staging_entry, token_src, token_bytes, lane_id);
+          net.put(world, remote_node_id,
+                  nccl_window, base_offset,
+                  nccl_window, smem_mr_info_ptr->attn_input_token_offset + token_idx * token_bytes,
+                  token_bytes,
+                  ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests); // TODO(Katie): check thread scope args
 
           if constexpr(FORWARD_DISPATCH) {
-            const uint8_t* prob_src = gin_base +
-                                      smem_mr_info_ptr->attn_input_prob_offset +
-                                      (token_idx * NUM_LSA_TEAMS + remote_node_id) * prob_bytes;
-            warp_copy_int4(staging_entry + token_bytes, prob_src, prob_bytes, lane_id);
+            size_t offset = base_offset + token_bytes;
+            net.put(world, remote_node_id,
+                    nccl_window, offset,
+                    nccl_window, smem_mr_info_ptr->attn_input_prob_offset + (token_idx * NUM_LSA_TEAMS + remote_node_id) * prob_bytes,
+                    prob_bytes,
+                    ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
           }
 
           if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
-            const uint8_t* sf_src = gin_base +
-                                    smem_mr_info_ptr->attn_input_scaling_factor_offset +
-                                    token_idx * sf_bytes;
-            size_t sf_offset_in_entry = token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
-            warp_copy_int4(staging_entry + sf_offset_in_entry, sf_src, sf_bytes, lane_id);
+            size_t offset = base_offset + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
+            net.put(world, remote_node_id,
+                    nccl_window, offset,
+                    nccl_window, smem_mr_info_ptr->attn_input_scaling_factor_offset + (token_idx * sf_bytes),
+                    sf_bytes,
+                    ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{},  cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
           }
-
-          run_count++;
-        }
-
-        constexpr int max_batch = HYBRIDEP_DISPATCH_RDMA_BATCH_SIZE;
-        bool should_flush = run_count > 0 &&
-                           (is_last_token || run_count >= max_batch);
-
-        if (should_flush) {
-          size_t packed_dst_offset = packed_dst_base +
-                                     dense_dst_offset * smem_mr_info_ptr->bytes_per_entry;
-
-          net.put(world, remote_node_id,
-                  nccl_window, packed_dst_offset,
-                  nccl_window, staging_base + dense_dst_offset * smem_mr_info_ptr->bytes_per_entry,
-                  run_count * smem_mr_info_ptr->bytes_per_entry,
-                  ncclGin_None{}, ncclGin_None{}, ncclCoopWarp());
-          dense_dst_offset += run_count;
-          run_count = 0;
         }
       }
+      ncclCoopWarp().sync();
 
       // Signal this chunk's completion on the SAME put comm.
       // Same-QP ordering guarantees all preceding puts are visible at the
@@ -1048,7 +1029,8 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
                    ncclCoopThread(),
                    ncclGin_None{},
                    cuda::thread_scope_thread,
-                   cuda::thread_scope_thread);
+                   cuda::thread_scope_thread,
+                   ncclGinOptFlagsDefault);
       }
     }
   }

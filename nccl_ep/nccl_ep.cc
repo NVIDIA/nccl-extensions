@@ -802,7 +802,13 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
     NCCLCHECK(ncclCommSplit(ep_group->comm, color, key, &ep_group->gin_config.split_comm, nullptr));
 
     int qps_per_rank = ep_group->config.num_qp_per_rank;
-    if (qps_per_rank == 0) qps_per_rank = 24;
+    int min_required_ctx = HYBRIDEP_DISPATCH_NUM_OF_BLOCKS * HYBRIDEP_DISPATCH_N2N_WARPS;
+    if (qps_per_rank == 0) qps_per_rank = min_required_ctx;
+    if (qps_per_rank < min_required_ctx) {
+        fprintf(stderr, "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d for dedicated N2N warp contexts\n",
+                qps_per_rank, min_required_ctx);
+        return ncclInvalidUsage;
+    }
     ep_group->gin_config.qps_per_rank = qps_per_rank;
     ep_group->gin_config.num_comms = 1;
     ep_group->gin_config.num_ctx_per_comm = qps_per_rank;
@@ -1002,7 +1008,7 @@ ncclResult_t ncclEpCreateGroup(
     }
 
     if (ep_group->config.num_qp_per_rank == NCCL_EP_AUTO) {
-        ep_group->config.num_qp_per_rank = 24;
+        ep_group->config.num_qp_per_rank = HYBRIDEP_DISPATCH_NUM_OF_BLOCKS * HYBRIDEP_DISPATCH_N2N_WARPS;
     }
 
     // Physical node properties

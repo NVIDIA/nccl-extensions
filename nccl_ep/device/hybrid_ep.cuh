@@ -959,12 +959,13 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
 
     for (int idx = 0; idx < NUM_LSA_TEAMS - 1; ++idx) {
       int remote_idx = (idx + node_rank) % (NUM_LSA_TEAMS - 1);
-      int total_channels = num_gin_comms * num_ctx_per_comm;
-      int global_channel = (remote_idx + chunk_idx + local_rank) % total_channels;
+      int global_channel = blockIdx.x * N2N_WARPS + n2n_warp_id;
+      
       int comm_idx, ctx_idx;
       get_comm_ctx(global_channel, num_ctx_per_comm, comm_idx, ctx_idx);
       all_used_comms_mask |= (1u << comm_idx);
-      ncclGin net(dcomms[comm_idx], ctx_idx);
+      
+      ncclGin net(dcomms[comm_idx], ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
       ncclTeam world = ncclTeamWorld(dcomms[comm_idx]);
       int remote_node_id = remote_idx < node_rank ? remote_idx : remote_idx + 1;
       int rank_in_remote = remote_idx < node_rank ? node_rank - 1 : node_rank;
@@ -1055,7 +1056,7 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
   // Single flush covering all puts + signals across all chunks.
   for (int c = 0; c < num_gin_comms; ++c) {
     if (all_used_comms_mask & (1u << c)) {
-      ncclGin net_flush(dcomms[c], 0);
+      ncclGin net_flush(dcomms[c], 0, NCCL_GIN_RESOURCE_SHARING_CTA);
       net_flush.flush(ncclCoopWarp(), cuda::std::memory_order_acquire);
     }
   }
@@ -1137,12 +1138,13 @@ __forceinline__ __device__ void G2S_warp_group_device_function(const int local_r
                                      node_rank * (num_of_ranks_per_node * MAX_CHUNKS_PER_RANK) +
                                      local_rank * MAX_CHUNKS_PER_RANK +
                                      i;
-          int sender_remote_idx = node_rank < node_id ? node_rank : node_rank - 1;
-          int total_channels = num_gin_comms * num_ctx_per_comm;
-          int signal_channel = (sender_remote_idx + i + local_rank) % total_channels;
+          constexpr int N2N_WARPS = (NUM_LSA_TEAMS == 1) ? 1 : HYBRIDEP_DISPATCH_N2N_WARPS;
+          int sender_block_warp = i % (NUM_OF_BLOCKS * N2N_WARPS);
+          int signal_channel = sender_block_warp;
+
           int comm_idx, ctx_idx;
           get_comm_ctx(signal_channel, num_ctx_per_comm, comm_idx, ctx_idx);
-          ncclGin net(dcomms[comm_idx], ctx_idx);
+          ncclGin net(dcomms[comm_idx], ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
           net.waitSignal(ncclCoopThread(), tail_signal_id, expected_flag_value);
         }
         const rdma_to_attn_map_load_t* rdma_to_attn_map_load_base_addr = reinterpret_cast<const rdma_to_attn_map_load_t*>(rdma_to_attn_map +
@@ -4470,7 +4472,7 @@ public:
   {
     constexpr bool multinode_layout = (NUM_LSA_TEAMS != 1);
     constexpr int NUM_PIPELINES = HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
-    constexpr int INTER_NODE_GROUP_WARPS = multinode_layout ? 2 : 0;
+    constexpr int INTER_NODE_GROUP_WARPS = multinode_layout ? HYBRIDEP_DISPATCH_N2N_WARPS : 0;
     constexpr int INTER_NODE_GROUP_START = 0;
     constexpr int INTRA_NODE_G2S_GROUP_WARPS = NUM_PIPELINES;
     constexpr int INTRA_NODE_G2S_GROUP_START = multinode_layout ? 2 : 0;

@@ -22,6 +22,7 @@
 #define HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G 4
 #define HYBRIDEP_DISPATCH_NUM_OF_BLOCKS HYBRIDEP_MAX_NUM_SMS_PER_RANK
 #define HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK 2
+#define HYBRIDEP_DISPATCH_N2N_WARPS 2
 // Maximum consecutive tokens batched into a single RDMA put in dispatch N2N.
 // Larger batches reduce NIC doorbell overhead but may delay first-byte latency.
 #define HYBRIDEP_DISPATCH_RDMA_BATCH_SIZE 4

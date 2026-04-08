@@ -1013,25 +1013,22 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
           }
         }
       }
-      ncclCoopWarp().sync();
 
       // Signal this chunk's completion on the SAME put comm.
       // Same-QP ordering guarantees all preceding puts are visible at the
       // remote before this signal arrives.
-      if (lane_id == 0) {
-        unsigned tail_signal_id = smem_mr_info_ptr->signals_tail_base +
-                                   node_rank * (NUM_LSA_TEAMS * num_of_ranks_per_node * MAX_CHUNKS_PER_RANK) +
-                                   remote_node_id * (num_of_ranks_per_node * MAX_CHUNKS_PER_RANK) +
-                                   local_rank * MAX_CHUNKS_PER_RANK +
-                                   chunk_idx;
-        net.signal(world, remote_node_id,
-                   ncclGin_SignalAdd{tail_signal_id, 1},
-                   ncclCoopThread(),
-                   ncclGin_None{},
-                   cuda::thread_scope_thread,
-                   cuda::thread_scope_thread,
-                   ncclGinOptFlagsDefault);
-      }
+      unsigned tail_signal_id = smem_mr_info_ptr->signals_tail_base +
+                                  node_rank * (NUM_LSA_TEAMS * num_of_ranks_per_node * MAX_CHUNKS_PER_RANK) +
+                                  remote_node_id * (num_of_ranks_per_node * MAX_CHUNKS_PER_RANK) +
+                                  local_rank * MAX_CHUNKS_PER_RANK +
+                                  chunk_idx;
+      net.signal(world, remote_node_id,
+                  ncclGin_SignalAdd{tail_signal_id, 1},
+                  ncclCoopWarp(),
+                  ncclGin_None{},
+                  cuda::thread_scope_thread,
+                  cuda::thread_scope_thread,
+                  ncclGinOptFlagsDefault);
     }
   }
 

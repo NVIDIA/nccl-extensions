@@ -844,6 +844,7 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
         reqs.ginSignalCount = ep_group->gin_config.num_total_signals;
         reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
         reqs.ginContextCount = ep_group->gin_config.num_ctx_per_comm;
+        reqs.ginQueueDepth = 3 * HT_OF_NUM_TOKENS_PER_CHUNK + 1;
         NCCLCHECK(ncclDevCommCreate(ep_group->gin_config.split_comm, &reqs, &ep_group->gin_config.dcomms[0]));
     }
 

@@ -1982,7 +1982,7 @@ int main(int argc, char* argv[]) {
             fflush(stdout);
         }
     } else {
-        num_recv_tokens = config.max_tokens_per_rank * nRanks;
+        num_recv_tokens = config.max_tokens_per_rank * num_local_experts;
     }
     assert(num_recv_tokens);
 

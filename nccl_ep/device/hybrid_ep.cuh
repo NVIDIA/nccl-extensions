@@ -945,8 +945,15 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
   size_t token_bytes = HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE);
   size_t prob_bytes = (experts_per_rank * num_of_ranks_per_node) * sizeof(float);
   size_t sf_bytes = (HIDDEN_DIM / 128) * sizeof(float);
-  uint32_t all_used_comms_mask = 0;
   constexpr int MAX_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
+
+  // GIN device side setup
+  int comm_idx, ctx_idx;
+  int global_channel = blockIdx.x * N2N_WARPS + n2n_warp_id;
+  get_comm_ctx(global_channel, num_ctx_per_comm, comm_idx, ctx_idx);
+
+  ncclGin net(dcomms[comm_idx], ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
+  ncclTeam world = ncclTeamWorld(dcomms[comm_idx]);
 
   for (int chunk_idx = blockIdx.x * N2N_WARPS + n2n_warp_id;
        chunk_idx < NUM_OF_CHUNKS_PER_RANK;
@@ -959,14 +966,6 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
 
     for (int idx = 0; idx < NUM_LSA_TEAMS - 1; ++idx) {
       int remote_idx = (idx + node_rank) % (NUM_LSA_TEAMS - 1);
-      int global_channel = blockIdx.x * N2N_WARPS + n2n_warp_id;
-      
-      int comm_idx, ctx_idx;
-      get_comm_ctx(global_channel, num_ctx_per_comm, comm_idx, ctx_idx);
-      all_used_comms_mask |= (1u << comm_idx);
-      
-      ncclGin net(dcomms[comm_idx], ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
-      ncclTeam world = ncclTeamWorld(dcomms[comm_idx]);
       int remote_node_id = remote_idx < node_rank ? remote_idx : remote_idx + 1;
       int rank_in_remote = remote_idx < node_rank ? node_rank - 1 : node_rank;
 
@@ -977,16 +976,19 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
                                smem_mr_info_ptr->bytes_per_entry;
 
                                
-      for (int token_idx_in_chunk = ncclCoopWarp().thread_rank(); token_idx_in_chunk < token_range; token_idx_in_chunk += ncclCoopWarp().size()) {
+      for (int token_idx_in_chunk = ncclCoopWarp().thread_rank(); token_idx_in_chunk < token_range;
+           token_idx_in_chunk += ncclCoopWarp().size()) {
         int token_idx = token_idx_in_chunk + chunk_base_token_idx;
-        bool need_write = attn_to_rdma_map[chunk_base_token_idx * (NUM_LSA_TEAMS - 1) + remote_idx + token_idx_in_chunk * (NUM_LSA_TEAMS - 1)];
+        bool need_write = attn_to_rdma_map[token_idx * (NUM_LSA_TEAMS - 1) + remote_idx];
         size_t base_offset = dense_dst_offset;
+
         for (int i = 0; i < token_idx_in_chunk; i++) {
-          bool prev_need_write = attn_to_rdma_map[chunk_base_token_idx * (NUM_LSA_TEAMS - 1) + remote_idx + i * (NUM_LSA_TEAMS - 1)];
+          bool prev_need_write = attn_to_rdma_map[((i + chunk_base_token_idx) * (NUM_LSA_TEAMS - 1)) + remote_idx];
           if (prev_need_write) {
             base_offset += smem_mr_info_ptr->bytes_per_entry;
           }
         }
+
         if (need_write) {
           net.put(world, remote_node_id,
                   nccl_window, base_offset,
@@ -1031,15 +1033,8 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
                   ncclGinOptFlagsDefault);
     }
   }
-
-  // Single flush covering all puts + signals across all chunks.
-  for (int c = 0; c < num_gin_comms; ++c) {
-    if (all_used_comms_mask & (1u << c)) {
-      ncclGin net_flush(dcomms[c], 0, NCCL_GIN_RESOURCE_SHARING_CTA);
-      net_flush.flush(ncclCoopWarp(), cuda::std::memory_order_acquire);
-    }
-  }
-  __syncwarp(0xffffffff);
+  // GIN flush with coopWarp includes syncwarp at the end
+  net.flush(ncclCoopWarp(), cuda::memory_order_acquire);
 }
 
 

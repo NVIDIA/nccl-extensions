@@ -172,6 +172,13 @@ class NCCLLibrary:
             ctypes.c_bool  # use_fp8
         ]),
         Function("ncclEpHandleDestroy", ncclResult_t, [ncclEpHandle_t]),
+        Function("ncclEpUpdateHandle", ncclResult_t, [
+            ncclEpHandle_t,
+            ncclNDTensor_t,  # topk_idx
+            ctypes.POINTER(ncclNDTensor_t),  # local_tensors array
+            ctypes.c_uint,  # num_local_tensors
+            cudaStream_t
+        ]),
         Function("ncclEpDispatch", ncclResult_t, [
             ncclEpHandle_t,
             ctypes.POINTER(ncclNDTensor_t), ctypes.c_uint,
@@ -223,7 +230,7 @@ class NCCLLibrary:
 
     ep_function_names = [
         "ncclEpCreateGroup", "ncclEpGroupDestroy",
-        "ncclEpCreateHandle", "ncclEpHandleDestroy",
+        "ncclEpCreateHandle", "ncclEpHandleDestroy", "ncclEpUpdateHandle",
         "ncclEpDispatch", "ncclEpCombine", "ncclEpHandleGetNumRecvTokens",
         "ncclEpComplete",
         "ncclEpTensorCreate", "ncclEpTensorDestroy",
@@ -489,6 +496,22 @@ class NCCLLibrary:
         if not self.ep_available:
             raise RuntimeError("NCCL EP not available")
         self.NCCL_CHECK(self._funcs["ncclEpHandleDestroy"](handle))
+
+    def ncclEpUpdateHandle(self, handle, topk_tensor, stream, local_tensors=None):
+        """Rebind topk_idx on an existing handle without reallocating buffers."""
+        if not self.ep_available:
+            raise RuntimeError("NCCL EP not available")
+
+        local_tensors_ptr = None
+        num_local_tensors = 0
+        if local_tensors is not None and len(local_tensors) > 0:
+            tensor_arr = (ncclNDTensor_t * len(local_tensors))(*local_tensors)
+            local_tensors_ptr = ctypes.cast(tensor_arr, ctypes.POINTER(ncclNDTensor_t))
+            num_local_tensors = len(local_tensors)
+
+        self.NCCL_CHECK(self._funcs["ncclEpUpdateHandle"](
+            handle, topk_tensor, local_tensors_ptr, num_local_tensors, stream
+        ))
 
     def ncclEpDispatch(self, handle, input_tensors, num_in, output_tensors, num_out, local_tensors, num_local, send_only, config, stream):
         config_ptr = ctypes.byref(config) if config else None

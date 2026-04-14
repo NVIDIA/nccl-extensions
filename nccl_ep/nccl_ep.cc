@@ -1532,16 +1532,6 @@ ncclResult_t ncclEpCreateHandle(
         assert(handle->ll.layout.total_bytes <= handle->group->config.rdma_buffer_size);
     } else { // HT
         assert(ep_group->config.max_tokens_per_rank > 0 && "HT requires max_tokens_per_rank > 0");
-        assert(handle->num_tokens <= static_cast<int>(ep_group->config.max_tokens_per_rank) && "Token count exceeds HT buffer capacity");
-
-        // Optional: per-expert token counts output
-        ncclNDTensor_t recv_expert_counter = nullptr;
-        if (num_local_tensors > 0) {
-            recv_expert_counter = find_tensor_by_tag(local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST);
-            if (recv_expert_counter == nullptr) {
-                recv_expert_counter = find_tensor_by_tag(local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE);
-            }
-        }
 
         const int nRanks = ep_group->nRanks;
         const int num_experts = ep_group->config.num_experts;
@@ -1638,121 +1628,167 @@ ncclResult_t ncclEpCreateHandle(
             sizeof(int32_t),
             cudaHostAllocDefault));
         *handle->hybridep.num_tokens_for_experts_host = -1;
+    }
 
-        // Initialize only the regions touched by this handle's num_tokens.
-        // Keep allocation capacities unchanged to preserve buffer layout/contracts.
-        const int num_experts_packed = (num_experts + 7) / 8;
-        const int padded_num_tokens = ((handle->num_tokens + 15) / 16) * 16;  // rdma_to_attn_map uint4 loads
-        const size_t routing_send_bytes = static_cast<size_t>(handle->num_tokens) * num_experts_packed;
-        const size_t rdma_to_attn_bytes = static_cast<size_t>(nNodes) * padded_num_tokens * sizeof(bool);
-        const size_t attn_to_rdma_bytes = (nNodes > 1) ?
-            static_cast<size_t>(handle->num_tokens) * (nNodes - 1) * sizeof(bool) : 0;
-        const size_t local_expert_routing_bytes =
-            static_cast<size_t>(ep_group->max_recv_tokens) * experts_per_rank * sizeof(bool);
-        const size_t sparse_to_dense_bytes =
-            static_cast<size_t>(nNodes) * handle->num_tokens * n_ranks_per_node * sizeof(int32_t);
+    return ncclEpUpdateHandle(handle, topk_idx, local_tensors, num_local_tensors, stream);
+}
+// TODO:
+// Perhaps ncclEpCreateHandle should become ncclEpInitHandle of which the only job is to allocate resource?
+// This would also remove the need for ncclEpCreateHandle to accept topk_idx.
+// ncclEpUpdateHandle should then be the one to accept topk_idx.
 
-        // convert_topk_to_routing_map uses bitwise-OR into this buffer, so local send rows must be pre-zeroed.
-        uint8_t* local_routing_send_ptr =
-            handle->hybridep.global_routing_map + (max_tokens * num_experts_packed) * ep_group->rank;
-        if (routing_send_bytes > 0) {
-            CUDA_CHECK(cudaMemsetAsync(local_routing_send_ptr, 0, routing_send_bytes, stream));
+
+ncclResult_t ncclEpUpdateHandle(
+    ncclEpHandle_t handle,
+    ncclNDTensor_t topk_idx,
+    const ncclNDTensor_t* local_tensors,
+    unsigned int num_local_tensors,
+    cudaStream_t stream
+) {
+    assert(handle != nullptr);
+    assert(topk_idx != nullptr);
+    assert(topk_idx->ndim == 2);
+    assert(topk_idx->datatype == ncclInt64);
+    assert(topk_idx->tag == NCCL_EP_TENSOR_TAG_TOPK_IDX);
+    assert(tensor_is_contiguous(topk_idx));
+
+    ncclEpGroup_t ep_group = handle->group;
+    assert(ep_group != nullptr);
+
+    handle->topk_idx = topk_idx;
+    handle->num_tokens = static_cast<int>(topk_idx->sizes[0]);
+    handle->num_topk = static_cast<int>(topk_idx->sizes[1]);
+
+    if (ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
+        return ncclSuccess;
+    }
+
+    assert(handle->num_tokens <= static_cast<int>(ep_group->config.max_tokens_per_rank) && "Token count exceeds HT buffer capacity");
+
+    // Optional: per-expert token counts output
+    ncclNDTensor_t recv_expert_counter = nullptr;
+    if (num_local_tensors > 0) {
+        recv_expert_counter = find_tensor_by_tag(local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST);
+        if (recv_expert_counter == nullptr) {
+            recv_expert_counter = find_tensor_by_tag(local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE);
         }
-        if (rdma_to_attn_bytes > 0) {
-            CUDA_CHECK(cudaMemsetAsync(handle->hybridep.rdma_to_attn_map, 0, rdma_to_attn_bytes, stream));
-        }
-        if (attn_to_rdma_bytes > 0) {
-            CUDA_CHECK(cudaMemsetAsync(handle->hybridep.attn_to_rdma_map, 0, attn_to_rdma_bytes, stream));
-        }
-        // Keep full clear for local_expert_routing_map to preserve current dispatch output behavior
-        // when callers allocate outputs at max receive capacity.
+    }
+
+    const int num_experts = ep_group->config.num_experts;
+    const int max_tokens = ep_group->config.max_tokens_per_rank;
+    const int n_ranks_per_node = ep_group->lsa_rank_count;
+    const int nNodes = ep_group->nNodes;
+    const int experts_per_rank = ep_group->num_local_experts;
+    const int num_experts_packed = (num_experts + 7) / 8;
+    const int padded_num_tokens = ((handle->num_tokens + 15) / 16) * 16;  // rdma_to_attn_map uint4 loads
+
+    const size_t routing_send_bytes = static_cast<size_t>(handle->num_tokens) * num_experts_packed;
+    const size_t rdma_to_attn_bytes = static_cast<size_t>(nNodes) * padded_num_tokens * sizeof(bool);
+    const size_t attn_to_rdma_bytes = (nNodes > 1) ?
+        static_cast<size_t>(handle->num_tokens) * (nNodes - 1) * sizeof(bool) : 0;
+    const size_t local_expert_routing_bytes =
+        static_cast<size_t>(ep_group->max_recv_tokens) * experts_per_rank * sizeof(bool);
+    const size_t sparse_to_dense_bytes =
+        static_cast<size_t>(nNodes) * handle->num_tokens * n_ranks_per_node * sizeof(int32_t);
+
+    // convert_topk_to_routing_map uses bitwise-OR into this buffer, so local send rows must be pre-zeroed.
+    uint8_t* local_routing_send_ptr =
+        handle->hybridep.global_routing_map + (max_tokens * num_experts_packed) * ep_group->rank;
+    if (routing_send_bytes > 0) {
+        CUDA_CHECK(cudaMemsetAsync(local_routing_send_ptr, 0, routing_send_bytes, stream));
+    }
+    if (rdma_to_attn_bytes > 0) {
+        CUDA_CHECK(cudaMemsetAsync(handle->hybridep.rdma_to_attn_map, 0, rdma_to_attn_bytes, stream));
+    }
+    if (attn_to_rdma_bytes > 0) {
+        CUDA_CHECK(cudaMemsetAsync(handle->hybridep.attn_to_rdma_map, 0, attn_to_rdma_bytes, stream));
+    }
+    // Keep full clear for local_expert_routing_map to preserve current dispatch output behavior
+    // when callers allocate outputs at max receive capacity.
+    CUDA_CHECK(cudaMemsetAsync(
+        handle->hybridep.local_expert_routing_map, 0, local_expert_routing_bytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        handle->hybridep.num_tokens_for_experts, 0, sizeof(*handle->hybridep.num_tokens_for_experts), stream));
+    if (sparse_to_dense_bytes > 0) {
         CUDA_CHECK(cudaMemsetAsync(
-            handle->hybridep.local_expert_routing_map, 0, local_expert_routing_bytes, stream));
-        CUDA_CHECK(cudaMemsetAsync(
-            handle->hybridep.num_tokens_for_experts, 0, sizeof(*handle->hybridep.num_tokens_for_experts), stream));
-        if (sparse_to_dense_bytes > 0) {
-            CUDA_CHECK(cudaMemsetAsync(
-                handle->hybridep.sparse_to_dense_map, 0xFF, sparse_to_dense_bytes, stream));
+            handle->hybridep.sparse_to_dense_map, 0xFF, sparse_to_dense_bytes, stream));
+    }
+
+    // ===== Step 1: Convert sparse topk_idx to bitmap routing map =====
+    nccl_ep::hybridep::convert_topk_to_routing_map(
+        static_cast<const int64_t*>(topk_idx->data),
+        local_routing_send_ptr,
+        handle->num_tokens,
+        handle->num_topk,
+        num_experts_packed,
+        stream);
+
+    // ===== Step 2: Allgather bitmap routing maps =====
+    NCCL_CHECK_RESULT(ncclAllGather(
+        local_routing_send_ptr,
+        handle->hybridep.global_routing_map,
+        static_cast<size_t>(handle->num_tokens) * num_experts_packed,
+        ncclUint8,
+        ep_group->comm,
+        stream));
+
+    // ===== Step 3: Run metadata_preprocessing =====
+    int32_t* per_expert_counts_device = nullptr;
+    bool copy_per_expert_counts_to_host = false;
+    if (recv_expert_counter != nullptr) {
+        assert(recv_expert_counter->ndim == 1 && "recv_expert_counter must be 1D");
+        assert(recv_expert_counter->datatype == ncclInt32 && "recv_expert_counter must be ncclInt32");
+        assert(recv_expert_counter->sizes[0] >= static_cast<unsigned int>(ep_group->num_local_experts) &&
+            "recv_expert_counter size must be >= num_local_experts");
+        assert(recv_expert_counter->data != nullptr && "recv_expert_counter data must not be null");
+
+        if (recv_expert_counter->tag == NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST) {
+            // Fused preprocessing uses atomics; avoid atomics directly into mapped host memory.
+            per_expert_counts_device = handle->hybridep.per_expert_counts_tmp;
+            copy_per_expert_counts_to_host = true;
+        } else {
+            per_expert_counts_device = static_cast<int32_t*>(recv_expert_counter->data);
         }
+    }
 
-        // ===== Step 1: Convert sparse topk_idx to bitmap routing map =====
-        nccl_ep::hybridep::convert_topk_to_routing_map(
-            static_cast<const int64_t*>(topk_idx->data),
-            local_routing_send_ptr,
-            handle->num_tokens,
-            handle->num_topk,
-            num_experts_packed,
-            stream);
+    nccl_ep::hybridep::call_metadata_preprocessing(
+        handle->hybridep.global_routing_map,
+        handle->hybridep.sparse_to_dense_map,
+        handle->hybridep.rdma_to_attn_map,
+        handle->hybridep.attn_to_rdma_map,
+        handle->hybridep.token_rank_mask,
+        handle->hybridep.num_tokens_for_experts,
+        handle->hybridep.local_expert_routing_map,
+        per_expert_counts_device,
+        handle->hybridep.preprocessing_scan_tmp,
+        ep_group->node_id,
+        ep_group->rank_in_node,
+        handle->num_tokens,
+        ep_group->hidden,
+        nNodes,
+        n_ranks_per_node,
+        experts_per_rank,
+        stream);
 
-        // ===== Step 2: Allgather bitmap routing maps =====
-        NCCL_CHECK_RESULT(ncclAllGather(
-            local_routing_send_ptr,
-            handle->hybridep.global_routing_map,
-            static_cast<size_t>(handle->num_tokens) * num_experts_packed,
-            ncclUint8,
-            ep_group->comm,
-            stream));
-
-        // ===== Step 3: Run metadata_preprocessing =====
-        int32_t* per_expert_counts_device = nullptr;
-        bool copy_per_expert_counts_to_host = false;
-        if (recv_expert_counter != nullptr) {
-            if (recv_expert_counter != nullptr) {
-                assert(recv_expert_counter->ndim == 1 && "recv_expert_counter must be 1D");
-                assert(recv_expert_counter->datatype == ncclInt32 && "recv_expert_counter must be ncclInt32");
-                assert(recv_expert_counter->sizes[0] >= static_cast<unsigned int>(ep_group->num_local_experts) &&
-                    "recv_expert_counter size must be >= num_local_experts");
-                assert(recv_expert_counter->data != nullptr && "recv_expert_counter data must not be null");
-            }
-
-            if (recv_expert_counter->tag == NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST) {
-                // Fused preprocessing uses atomics; avoid atomics directly into mapped host memory.
-                per_expert_counts_device = handle->hybridep.per_expert_counts_tmp;
-                copy_per_expert_counts_to_host = true;
-            } else {
-                per_expert_counts_device = static_cast<int32_t*>(recv_expert_counter->data);
-            }
-        }
-
-        nccl_ep::hybridep::call_metadata_preprocessing(
-            handle->hybridep.global_routing_map,
-            handle->hybridep.sparse_to_dense_map,
-            handle->hybridep.rdma_to_attn_map,
-            handle->hybridep.attn_to_rdma_map,
-            handle->hybridep.token_rank_mask,
-            handle->hybridep.num_tokens_for_experts,
-            handle->hybridep.local_expert_routing_map,
-            per_expert_counts_device,
-            handle->hybridep.preprocessing_scan_tmp,
-            ep_group->node_id,
-            ep_group->rank_in_node,
-            handle->num_tokens,
-            ep_group->hidden,
-            nNodes,
-            n_ranks_per_node,
-            experts_per_rank,
-            stream);
-
-        if (copy_per_expert_counts_to_host) {
-            CUDA_CHECK(cudaMemcpyAsync(
-                recv_expert_counter->data,
-                per_expert_counts_device,
-                static_cast<size_t>(experts_per_rank) * sizeof(int32_t),
-                cudaMemcpyDeviceToHost,
-                stream));
-        }
-
-        // Mirror the actual recv-token count to host once; getters can read this cached value.
+    if (copy_per_expert_counts_to_host) {
         CUDA_CHECK(cudaMemcpyAsync(
-            handle->hybridep.num_tokens_for_experts_host,
-            handle->hybridep.num_tokens_for_experts,
-            sizeof(*handle->hybridep.num_tokens_for_experts_host),
+            recv_expert_counter->data,
+            per_expert_counts_device,
+            static_cast<size_t>(experts_per_rank) * sizeof(int32_t),
             cudaMemcpyDeviceToHost,
             stream));
     }
 
+    // Mirror the actual recv-token count to host once; getters can read this cached value.
+    CUDA_CHECK(cudaMemcpyAsync(
+        handle->hybridep.num_tokens_for_experts_host,
+        handle->hybridep.num_tokens_for_experts,
+        sizeof(*handle->hybridep.num_tokens_for_experts_host),
+        cudaMemcpyDeviceToHost,
+        stream));
+
     return ncclSuccess;
-    }
+}
 
 ncclResult_t ncclEpHandleDestroy(
     ncclEpHandle_t handle

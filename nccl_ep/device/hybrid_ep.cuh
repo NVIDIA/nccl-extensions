@@ -871,6 +871,12 @@ struct combine_kernel_param_t{
   unsigned combine_signal_offset;  // Signal offset for combine operations
   // qp info and mr info
   struct combine_memory_region_info_t mr_info;
+#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+  struct warp_timing_entry_t { long long work_start_clock; long long work_end_clock; };
+  struct block_timing_entry_t { long long head_sync_start_clock; long long head_sync_end_clock; };
+  warp_timing_entry_t* warp_timing;
+  block_timing_entry_t* block_timing;
+#endif
 };
 
 // Each CUDA block has sixteen named barriers numbered 0..15.
@@ -3802,6 +3808,14 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LS
   assert((param.hidden_dim * sizeof(uint16_t)) % 16 == 0);
   static_assert(MAX_NUM_OF_TOKENS_PER_RANK % NUM_OF_TOKENS_PER_CHUNK == 0, "MAX_NUM_OF_TOKENS_PER_RANK must be multiple of NUM_OF_TOKENS_PER_CHUNK.");
   constexpr int MAX_NUM_OF_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
+#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+  constexpr int _WT_WARPS =
+      (INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() +
+       INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() +
+       INTER_NODE_RDMA_GROUP::size()) / 32;
+  long long _wt_head_start = 0;
+  long long _wt_head_end = 0;
+#endif
 
   // Shared memory used over 48KB, should use dynamic shared memory.
   extern __shared__ uint8_t smem_bytes[];
@@ -3827,6 +3841,9 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LS
   // ===== FUSED DEVICE SYNC (combine head) =====
   // Wait for all ranks' dispatch S2G writes to complete before reading them.
   // Block 0 signals this rank's arrival at the inter-rank barrier.
+#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+  if (threadIdx.x == 0) _wt_head_start = clock64();
+#endif
   if (threadIdx.x == 0 && blockIdx.x == 0) {
       asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;"
                    :
@@ -3845,6 +3862,13 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LS
                        : "memory");
       } while (flag_data != param.expected_intra_node_flag_value);
   }
+#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+  if (threadIdx.x == 0) {
+    _wt_head_end = clock64();
+    param.block_timing[blockIdx.x].head_sync_start_clock = _wt_head_start;
+    param.block_timing[blockIdx.x].head_sync_end_clock = _wt_head_end;
+  }
+#endif
   // The __syncthreads() below (for mbarrier init) also ensures all threads
   // see the poll completion before proceeding with combine work.
 
@@ -3877,6 +3901,12 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LS
 
   // Make sure all the warps wait for mbarriers to be initialized before producing/consuming data.
   __syncthreads();
+
+#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+  // Measure warp-group work only (starts after combine-head sync and setup barriers).
+  long long _wt_start = 0;
+  if (threadIdx.x % 32 == 0) _wt_start = clock64();
+#endif
 
   // Now warps can become specialized.
   // The input warp group data type must match the warp groups layout.
@@ -3922,6 +3952,14 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LS
   }else{
     // Too many threads, should not goes here.
   }
+#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+  if (threadIdx.x % 32 == 0) {
+    int _warp_id = threadIdx.x / 32;
+    int _idx = blockIdx.x * _WT_WARPS + _warp_id;
+    param.warp_timing[_idx].work_start_clock = _wt_start;
+    param.warp_timing[_idx].work_end_clock = clock64();
+  }
+#endif
 }
 
 static __device__ __forceinline__ bool bitmap_range_has_set_bit(
@@ -4512,35 +4550,41 @@ public:
     dispatch_kernel_ptr<<<NUM_OF_BLOCKS, BLOCK_DIM, SMEM_SIZE, stream>>>(param);
     CUDA_CHECK(cudaGetLastError());
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    warp_timing_entry_t h_wt[WT_TOTAL];
-    CUDA_CHECK(cudaMemcpy(h_wt, d_wt, WT_TOTAL * sizeof(warp_timing_entry_t), cudaMemcpyDeviceToHost));
-    int _wt_clock_khz;
-    CUDA_CHECK(cudaDeviceGetAttribute(&_wt_clock_khz, cudaDevAttrClockRate, 0));
-    auto _wt_us = [&](long long cycles) { return (double)cycles * 1000.0 / _wt_clock_khz; };
-    auto _wt_print_group = [&](const char* name, int warp_start, int warp_count) {
-        if (warp_count == 0) return;
-        long long mn = LLONG_MAX, mx = 0, sum = 0;
-        int n = 0;
-        for (int b = 0; b < NUM_OF_BLOCKS; b++) {
-            for (int w = warp_start; w < warp_start + warp_count; w++) {
-                long long d = h_wt[b * WT_WARPS_PER_BLOCK + w].end_clock
-                            - h_wt[b * WT_WARPS_PER_BLOCK + w].start_clock;
-                if (d < mn) mn = d;
-                if (d > mx) mx = d;
-                sum += d;
-                n++;
-            }
-        }
-        printf("  %-9s (%d warp%s x %d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n",
-               name, warp_count, warp_count > 1 ? "s" : " ", NUM_OF_BLOCKS,
-               _wt_us(mn), _wt_us(mx), _wt_us(sum / n));
-    };
-    printf("[DISPATCH WARP TIMING] (%d blocks, %d warps/block, %d pipelines, clock=%d kHz)\n",
-           NUM_OF_BLOCKS, WT_WARPS_PER_BLOCK, NUM_PIPELINES, _wt_clock_khz);
-    _wt_print_group("N2N",   0, INTER_NODE_GROUP_WARPS);
-    _wt_print_group("G2S",   INTER_NODE_GROUP_WARPS, INTRA_NODE_G2S_GROUP_WARPS);
-    _wt_print_group("S2G",   INTER_NODE_GROUP_WARPS + INTRA_NODE_G2S_GROUP_WARPS, INTRA_NODE_S2G_GROUP_WARPS);
+    char *pmix_rank_str = getenv("PMIX_RANK");
+    int pmix_rank = pmix_rank_str ? atoi(pmix_rank_str) : -1;
+    static int iter_count = 0;
+    iter_count++;
+    if (pmix_rank == 0 && iter_count == 40) {
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      warp_timing_entry_t h_wt[WT_TOTAL];
+      CUDA_CHECK(cudaMemcpy(h_wt, d_wt, WT_TOTAL * sizeof(warp_timing_entry_t), cudaMemcpyDeviceToHost));
+      int _wt_clock_khz;
+      CUDA_CHECK(cudaDeviceGetAttribute(&_wt_clock_khz, cudaDevAttrClockRate, 0));
+      auto _wt_us = [&](long long cycles) { return (double)cycles * 1000.0 / _wt_clock_khz; };
+      auto _wt_print_group = [&](const char* name, int warp_start, int warp_count) {
+          if (warp_count == 0) return;
+          long long mn = LLONG_MAX, mx = 0, sum = 0;
+          int n = 0;
+          for (int b = 0; b < NUM_OF_BLOCKS; b++) {
+              for (int w = warp_start; w < warp_start + warp_count; w++) {
+                  long long d = h_wt[b * WT_WARPS_PER_BLOCK + w].end_clock
+                              - h_wt[b * WT_WARPS_PER_BLOCK + w].start_clock;
+                  if (d < mn) mn = d;
+                  if (d > mx) mx = d;
+                  sum += d;
+                  n++;
+              }
+          }
+          printf("  %-9s (%d warp%s x %d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n",
+                name, warp_count, warp_count > 1 ? "s" : " ", NUM_OF_BLOCKS,
+                _wt_us(mn), _wt_us(mx), _wt_us(sum / n));
+      };
+      printf("[DISPATCH WARP TIMING] (%d blocks, %d warps/block, %d pipelines, clock=%d kHz)\n",
+            NUM_OF_BLOCKS, WT_WARPS_PER_BLOCK, NUM_PIPELINES, _wt_clock_khz);
+      _wt_print_group("N2N",   0, INTER_NODE_GROUP_WARPS);
+      _wt_print_group("G2S",   INTER_NODE_GROUP_WARPS, INTRA_NODE_G2S_GROUP_WARPS);
+      _wt_print_group("S2G",   INTER_NODE_GROUP_WARPS + INTRA_NODE_G2S_GROUP_WARPS, INTRA_NODE_S2G_GROUP_WARPS);
+    }
     CUDA_CHECK(cudaFree(d_wt));
 #endif
   }
@@ -4612,10 +4656,98 @@ public:
 
     // Launch combine kernel (device_sync is fused into combine kernel head).
     constexpr int BLOCK_DIM = INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size();
+#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+    using warp_timing_entry_t = typename combine_kernel_param_t<LSA_TEAM_SIZE>::warp_timing_entry_t;
+    using block_timing_entry_t = typename combine_kernel_param_t<LSA_TEAM_SIZE>::block_timing_entry_t;
+    constexpr int WT_WARPS_PER_BLOCK = BLOCK_DIM / 32;
+    constexpr int WT_TOTAL = NUM_OF_BLOCKS * WT_WARPS_PER_BLOCK;
+    warp_timing_entry_t* d_wt;
+    block_timing_entry_t* d_bt;
+    CUDA_CHECK(cudaMalloc(&d_wt, WT_TOTAL * sizeof(warp_timing_entry_t)));
+    CUDA_CHECK(cudaMalloc(&d_bt, NUM_OF_BLOCKS * sizeof(block_timing_entry_t)));
+    CUDA_CHECK(cudaMemsetAsync(d_wt, 0, WT_TOTAL * sizeof(warp_timing_entry_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(d_bt, 0, NUM_OF_BLOCKS * sizeof(block_timing_entry_t), stream));
+    param.warp_timing = d_wt;
+    param.block_timing = d_bt;
+#endif
     combine_kernel_ptr<<<NUM_OF_BLOCKS, BLOCK_DIM, SMEM_SIZE, stream>>>(param);
 
     // Check if there is any CUDA error.
     CUDA_CHECK(cudaGetLastError());
+#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+    char *pmix_rank_str = getenv("PMIX_RANK");
+    int pmix_rank = pmix_rank_str ? atoi(pmix_rank_str) : -1;
+    static int iter_count = 0;
+    iter_count++;
+    if (pmix_rank == 0 && iter_count == 40) {
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      warp_timing_entry_t h_wt[WT_TOTAL];
+      block_timing_entry_t h_bt[NUM_OF_BLOCKS];
+      CUDA_CHECK(cudaMemcpy(h_wt, d_wt, WT_TOTAL * sizeof(warp_timing_entry_t), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(h_bt, d_bt, NUM_OF_BLOCKS * sizeof(block_timing_entry_t), cudaMemcpyDeviceToHost));
+      int _wt_clock_khz;
+      CUDA_CHECK(cudaDeviceGetAttribute(&_wt_clock_khz, cudaDevAttrClockRate, 0));
+      auto _wt_us = [&](long long cycles) { return (double)cycles * 1000.0 / _wt_clock_khz; };
+      auto _wt_print_head_sync = [&]() {
+        long long mn = LLONG_MAX, mx = 0, sum = 0;
+        for (int b = 0; b < NUM_OF_BLOCKS; b++) {
+          long long d = h_bt[b].head_sync_end_clock - h_bt[b].head_sync_start_clock;
+          if (d < mn) mn = d;
+          if (d > mx) mx = d;
+          sum += d;
+        }
+        printf("[COMBINE HEAD SYNC TIMING] (%d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n",
+              NUM_OF_BLOCKS, _wt_us(mn), _wt_us(mx), _wt_us(sum / NUM_OF_BLOCKS));
+      };
+      auto _wt_print_work_group = [&](const char* name, int warp_start, int warp_count) {
+        if (warp_count == 0) return;
+        long long mn = LLONG_MAX, mx = 0, sum = 0;
+        int n = 0;
+        for (int b = 0; b < NUM_OF_BLOCKS; b++) {
+          for (int w = warp_start; w < warp_start + warp_count; w++) {
+            long long d = h_wt[b * WT_WARPS_PER_BLOCK + w].work_end_clock -
+                          h_wt[b * WT_WARPS_PER_BLOCK + w].work_start_clock;
+            if (d < mn) mn = d;
+            if (d > mx) mx = d;
+            sum += d;
+            n++;
+          }
+        }
+        printf("  %-9s (%d warp%s x %d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n",
+              name, warp_count, warp_count > 1 ? "s" : " ", NUM_OF_BLOCKS,
+              _wt_us(mn), _wt_us(mx), _wt_us(sum / n));
+      };
+      auto _wt_print_block_span = [&]() {
+        long long mn = LLONG_MAX, mx = 0, sum = 0;
+        for (int b = 0; b < NUM_OF_BLOCKS; b++) {
+          long long blk_start = LLONG_MAX;
+          long long blk_end = 0;
+          for (int w = 0; w < WT_WARPS_PER_BLOCK; w++) {
+            const auto& e = h_wt[b * WT_WARPS_PER_BLOCK + w];
+            if (e.work_start_clock < blk_start) blk_start = e.work_start_clock;
+            if (e.work_end_clock > blk_end) blk_end = e.work_end_clock;
+          }
+          long long d = blk_end - blk_start;
+          if (d < mn) mn = d;
+          if (d > mx) mx = d;
+          sum += d;
+        }
+        printf("[COMBINE BLOCK SPAN TIMING] (%d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n",
+              NUM_OF_BLOCKS, _wt_us(mn), _wt_us(mx), _wt_us(sum / NUM_OF_BLOCKS));
+      };
+      _wt_print_head_sync();
+      printf("[COMBINE WORK WARP TIMING] (%d blocks, %d warps/block, %d pipelines, clock=%d kHz)\n",
+            NUM_OF_BLOCKS, WT_WARPS_PER_BLOCK, NUM_OF_DATA_PIPELINE_PER_BLOCK, _wt_clock_khz);
+      _wt_print_work_group("INTRA_RED", INTRA_NODE_RED_GROUP_START, INTRA_NODE_RED_GROUP_WARPS);
+      _wt_print_work_group("INTER_RED", INTER_NODE_RED_GROUP_START, INTER_NODE_RED_GROUP_WARPS);
+      _wt_print_work_group("INTRA_G2S", INTRA_NODE_G2S_GROUP_START, INTRA_NODE_G2S_GROUP_WARPS);
+      _wt_print_work_group("INTER_G2S", INTER_NODE_G2S_GROUP_START, INTER_NODE_G2S_GROUP_WARPS);
+      _wt_print_work_group("INTER_N2N", INTER_NODE_RDMA_GROUP_START, INTER_NODE_RDMA_GROUP_WARPS);
+      _wt_print_block_span();
+    }
+    CUDA_CHECK(cudaFree(d_wt));
+    CUDA_CHECK(cudaFree(d_bt));
+#endif
   }
 
 };

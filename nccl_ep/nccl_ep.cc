@@ -1594,39 +1594,22 @@ ncclResult_t ncclEpUpdateHandle(
     const int nNodes = ep_group->nNodes;
     const int experts_per_rank = ep_group->num_local_experts;
     const int num_experts_packed = (num_experts + 7) / 8;
-    const int padded_num_tokens = ((handle->num_tokens + 15) / 16) * 16;  // rdma_to_attn_map uint4 loads
 
-    const size_t routing_send_bytes = static_cast<size_t>(handle->num_tokens) * num_experts_packed;
-    const size_t rdma_to_attn_bytes = static_cast<size_t>(nNodes) * padded_num_tokens * sizeof(bool);
-    const size_t attn_to_rdma_bytes = (nNodes > 1) ?
-        static_cast<size_t>(handle->num_tokens) * (nNodes - 1) * sizeof(bool) : 0;
-    const size_t local_expert_routing_bytes =
-        static_cast<size_t>(ep_group->max_recv_tokens) * experts_per_rank * sizeof(bool);
-    const size_t sparse_to_dense_bytes =
-        static_cast<size_t>(nNodes) * handle->num_tokens * n_ranks_per_node * sizeof(int32_t);
+    // Zero the entire preprocessing zero region (routing, r2a, a2r, ler, ntfe) in one call.
+    // Buffers are allocated at max_tokens capacity, so this clears beyond the active num_tokens
+    // region — safe because allgather/preprocessing will overwrite the relevant portions.
+    CUDA_CHECK(cudaMemsetAsync(
+        handle->hybridep.preprocessing_block, 0,
+        handle->hybridep.preprocessing_zero_region_size, stream));
+    // sparse_to_dense_map uses 0xFF sentinel (not zero)
+    if (handle->hybridep.preprocessing_s2d_size > 0) {
+        CUDA_CHECK(cudaMemsetAsync(
+            handle->hybridep.sparse_to_dense_map, 0xFF,
+            handle->hybridep.preprocessing_s2d_size, stream));
+    }
 
-    // convert_topk_to_routing_map uses bitwise-OR into this buffer, so local send rows must be pre-zeroed.
     uint8_t* local_routing_send_ptr =
         handle->hybridep.global_routing_map + (max_tokens * num_experts_packed) * ep_group->rank;
-    if (routing_send_bytes > 0) {
-        CUDA_CHECK(cudaMemsetAsync(local_routing_send_ptr, 0, routing_send_bytes, stream));
-    }
-    if (rdma_to_attn_bytes > 0) {
-        CUDA_CHECK(cudaMemsetAsync(handle->hybridep.rdma_to_attn_map, 0, rdma_to_attn_bytes, stream));
-    }
-    if (attn_to_rdma_bytes > 0) {
-        CUDA_CHECK(cudaMemsetAsync(handle->hybridep.attn_to_rdma_map, 0, attn_to_rdma_bytes, stream));
-    }
-    // Keep full clear for local_expert_routing_map to preserve current dispatch output behavior
-    // when callers allocate outputs at max receive capacity.
-    CUDA_CHECK(cudaMemsetAsync(
-        handle->hybridep.local_expert_routing_map, 0, local_expert_routing_bytes, stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        handle->hybridep.num_tokens_for_experts, 0, sizeof(*handle->hybridep.num_tokens_for_experts), stream));
-    if (sparse_to_dense_bytes > 0) {
-        CUDA_CHECK(cudaMemsetAsync(
-            handle->hybridep.sparse_to_dense_map, 0xFF, sparse_to_dense_bytes, stream));
-    }
 
     // ===== Step 1: Convert sparse topk_idx to bitmap routing map =====
     nccl_ep::hybridep::convert_topk_to_routing_map(

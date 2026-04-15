@@ -975,7 +975,7 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
                                static_cast<size_t>(chunk_idx * NUM_OF_TOKENS_PER_CHUNK) *
                                smem_mr_info_ptr->bytes_per_entry;
 
-                               
+
       for (int token_idx_in_chunk = ncclCoopWarp().thread_rank(); token_idx_in_chunk < token_range;
            token_idx_in_chunk += ncclCoopWarp().size()) {
         int token_idx = token_idx_in_chunk + chunk_base_token_idx;

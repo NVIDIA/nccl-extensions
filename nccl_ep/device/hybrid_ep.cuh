@@ -975,29 +975,34 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
                                static_cast<size_t>(chunk_idx * NUM_OF_TOKENS_PER_CHUNK) *
                                smem_mr_info_ptr->bytes_per_entry;
 
+      // Create a bitmask of tokens that need to be written. One word per 32 tokens.
+      int32_t need_write_bitmask[NUM_OF_TOKENS_PER_CHUNK / 32];
+      for (int i = 0; i < NUM_OF_TOKENS_PER_CHUNK / 32; i++) {
+        int token_idx_in_chunk = i * 32 + ncclCoopWarp().thread_rank();
+        bool need_write = token_idx_in_chunk < token_range && attn_to_rdma_map[((token_idx_in_chunk + chunk_base_token_idx) * (NUM_LSA_TEAMS - 1)) + remote_idx];
+        need_write_bitmask[i] = __ballot_sync(~0u, need_write);
+      }
 
-      for (int token_idx_in_chunk = ncclCoopWarp().thread_rank(); token_idx_in_chunk < token_range;
-           token_idx_in_chunk += ncclCoopWarp().size()) {
-        int token_idx = token_idx_in_chunk + chunk_base_token_idx;
-        bool need_write = attn_to_rdma_map[token_idx * (NUM_LSA_TEAMS - 1) + remote_idx];
-        size_t base_offset = dense_dst_offset;
+      for (int token_idx_in_chunk = ncclCoopWarp().thread_rank(); token_idx_in_chunk < token_range; token_idx_in_chunk += ncclCoopWarp().size()) {
+        size_t dst_offset = dense_dst_offset;
 
-        for (int i = 0; i < token_idx_in_chunk; i++) {
-          bool prev_need_write = attn_to_rdma_map[((i + chunk_base_token_idx) * (NUM_LSA_TEAMS - 1)) + remote_idx];
-          if (prev_need_write) {
-            base_offset += smem_mr_info_ptr->bytes_per_entry;
-          }
+        // Adjust offset according to the need_write values of previous tokens in the word.
+        if (token_idx_in_chunk % 32 > 0) {
+          uint32_t prev_token_need_write_bitmask = need_write_bitmask[token_idx_in_chunk / 32] & ((1u << (token_idx_in_chunk % 32)) - 1);
+          dst_offset += __popc(prev_token_need_write_bitmask) * smem_mr_info_ptr->bytes_per_entry;
         }
 
+        bool need_write = attn_to_rdma_map[((chunk_base_token_idx + token_idx_in_chunk) * (NUM_LSA_TEAMS - 1)) + remote_idx];
         if (need_write) {
+          int token_idx = chunk_base_token_idx + token_idx_in_chunk;
           net.put(world, remote_node_id,
-                  nccl_window, base_offset,
+                  nccl_window, dst_offset,
                   nccl_window, smem_mr_info_ptr->attn_input_token_offset + token_idx * token_bytes,
                   token_bytes,
-                  ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests); // TODO(Katie): check thread scope args
+                  ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
 
           if constexpr(FORWARD_DISPATCH) {
-            size_t offset = base_offset + token_bytes;
+            size_t offset = dst_offset + token_bytes;
             net.put(world, remote_node_id,
                     nccl_window, offset,
                     nccl_window, smem_mr_info_ptr->attn_input_prob_offset + (token_idx * NUM_LSA_TEAMS + remote_node_id) * prob_bytes,
@@ -1006,7 +1011,7 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
           }
 
           if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
-            size_t offset = base_offset + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
+            size_t offset = dst_offset + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
             net.put(world, remote_node_id,
                     nccl_window, offset,
                     nccl_window, smem_mr_info_ptr->attn_input_scaling_factor_offset + (token_idx * sf_bytes),
@@ -1014,6 +1019,8 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
                     ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{},  cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
           }
         }
+        // Adjsut dense_dst_offset based on the need_write values of this entire word.
+        dense_dst_offset += __popc(need_write_bitmask[token_idx_in_chunk / 32]) * smem_mr_info_ptr->bytes_per_entry;
       }
 
       // Signal this chunk's completion on the SAME put comm.

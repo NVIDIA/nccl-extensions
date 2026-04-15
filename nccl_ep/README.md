@@ -121,14 +121,14 @@ This section provides a high-level overview of the input, output, and local tens
 
 #### LL mode (same data type)
 
-| Operation | Tensor | Tag     | Dims         |
-|:---------:|:------:|:-------:|:------------:|
-| Dispatch  | Input  | TOKENS  | [B x H]      |
-|           | Output | TOKENS  | [L x R*B x H]  |
-|           | Local  | CNTR_D  | [L]          |
-| Combine   | Input  | TOKENS  | [L x R*B x H]  |
-|           | Output | TOKENS  | [B x H]      |
-|           | Local  | WEIGHTS | [B x K]      |
+| Operation | Tensor | Tag     | Dims             |
+|:---------:|:------:|:-------:|:----------------:|
+| Dispatch  | Input  | TOKENS  | [B x H]          |
+|           | Output | TOKENS  | [L x R x B x H]  |
+|           | Local  | CNTR_D  | [L]              |
+| Combine   | Input  | TOKENS  | [L x R x B x H]  |
+|           | Output | TOKENS  | [B x H]          |
+|           | Local  | WEIGHTS | [B x K]          |
 
 
 #### HT mode (same data type)
@@ -177,15 +177,15 @@ in LL mode, the Dispatch operation will perform precision reduction and
 return lower-precision tokens via `TOKENS` tensor.
 In addition, the `SCALES` output tensor must be provided to return the scaling information.
 
-| Operation | Tensor | Tag        | Dims         |
-|:---------:|:------:|:----------:|:------------:|
-| Dispatch  | Input  | TOKENS     | [B x H]      |
-|           | Output | TOKENS     | [L x R*B x H]  |
-|           | Output | **SCALES** | [L x R*B x S]  |
-|           | Local  | CNTR_D     | [L]          |
-| Combine   | Input  | TOKENS     | [L x R*B x H]  |
-|           | Output | TOKENS     | [B x H]      |
-|           | Local  | WEIGHTS    | [B x K]      |
+| Operation | Tensor | Tag        | Dims             |
+|:---------:|:------:|:----------:|:----------------:|
+| Dispatch  | Input  | TOKENS     | [B x H]          |
+|           | Output | TOKENS     | [L x R x B x H]  |
+|           | Output | **SCALES** | [L x R x B x S]  |
+|           | Local  | CNTR_D     | [L]              |
+| Combine   | Input  | TOKENS     | [L x R x B x H]  |
+|           | Output | TOKENS     | [B x H]          |
+|           | Local  | WEIGHTS    | [B x K]          |
 
 #### HT mode (FP16 -> FP8 conversion - NOT SUPPORTED)
 

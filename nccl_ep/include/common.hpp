@@ -151,6 +151,7 @@ void dispatch(const void* inData,
               void* outDataBuf,
               void* outScalesBuf,
               int* outSrcInfo,
+              int* outRecvRankCounter,          // rank-major: RECV_RANK_COUNTER_DEVICE [nRanks]; nullptr for expert-major
               int64_t* outLayout,
               int* outCnt,
               float* outRecvTopkWeights,     // rank-major: received topk weights; nullptr for expert-major

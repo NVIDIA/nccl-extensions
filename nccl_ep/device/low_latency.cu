@@ -47,6 +47,17 @@ __device__ __forceinline__ int getExpertRankIdx(int expertIdx, int numLocalExper
     return (expertIdx >= 0) ? expertIdx / numLocalExperts : -1;
 }
 
+// Warp-cooperative: all 32 lanes must call together.
+// Each lane inspects its own topk index and matches it with others via __match_any_sync.
+// If this lane is not the first occurrence of its source rank, topkIdxByLane is dropped to -1.
+__device__ __forceinline__
+int warpMarkFirstOccurrence(int topkIdxByLane, int numLocalExperts, int laneId) {
+    int rank = getExpertRankIdx(topkIdxByLane, numLocalExperts);
+    uint32_t mask = __match_any_sync(0xffffffff, rank);
+    bool isFirst = (laneId == (__ffs(mask) - 1));
+    return topkIdxByLane * (int)isFirst - (int)(!isFirst);
+}
+
 __device__ __forceinline__ void syncSmGroup(int groupIdx, int nThreads) {
     asm volatile("bar.sync %0, %1;" :: "r"(groupIdx), "r"(nThreads));
 }
@@ -442,13 +453,17 @@ template <bool kUseFP8, bool kUseUE8M0, int kHidden, ncclEpLayout_t kLayout>
 __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
                                                     const void* inData,
                                                     const int64_t* inTopkIdx,
+                                                    const float* inTopkWeights,
                                                     int* rankMask,
                                                     // OUTPUT
                                                     void* outDataBuf,
                                                     void* outScalesBuf,
                                                     int* outSrcInfo,
+                                                    int* outRecvRankCounter,
                                                     int64_t* outLayout,
                                                     int* outCnt,
+                                                    float* outRecvTopkWeights,
+                                                    int32_t* outRecvTopkIdx,
                                                     // INTERMEDIATE
                                                     void* sendBuf,
                                                     void* recvBuf,
@@ -477,7 +492,6 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
                                                     ncclDevComm* devComms,
                                                     const ncclWindow_t* windows,
                                                     unsigned signalsBase) {
-    static_assert(kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR, "rank-major dispatch not yet implemented");
     const auto smId = static_cast<int>(blockIdx.x);
     const auto threadId = static_cast<int>(threadIdx.x);
     const auto warpId = threadId / 32, laneId = get_lane_id();
@@ -557,6 +571,9 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
                     sendBufHdr->token_id = tokenIdx;
                 }
                 sendBufHdr->rtr[warpId].expert_id = static_cast<uint16_t>(dstExpertIdx);
+                if constexpr (kLayout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+                    sendBufHdr->rtr[warpId].topk_weight = __ldg(inTopkWeights + tokenIdx * numTopk + warpId);
+                }
             }
 
             // Cast and write data to send buffer
@@ -667,9 +684,11 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
             recvCntPtr, recvCntOffset, recvCntBuf, rankMask, signalsBase,
             windows, devComms);
 
-        // Clean `packed_recv_count`
-        if (dstRank == 0)
-            outCnt[dstExpertLocalIdx] = 0;
+        // Clean `packed_recv_count` (expert-major only: outCnt is the per-expert slot allocator)
+        if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+            if (dstRank == 0)
+                outCnt[dstExpertLocalIdx] = 0;
+        }
     }
     __syncwarp();
 
@@ -732,60 +751,118 @@ LOW_LATENCY_DISPATCH_RECV:
         if (laneId == 0 and rankLaneIdx == 0) {
             // The first lane of the rank also stores the total number of tokens received from this rank
             outSrcInfo[srcRank] = numRecvTokens;
+            if (outRecvRankCounter) outRecvRankCounter[srcRank] = numRecvTokens;
         }
 
-        for (int i = rankLaneIdx * numWarpsPerGroup + subWarpId; i < numRecvTokens * numTopk; i += numWarpsPerGroup * numLocalExperts) {
-            int tokenIdx = i / numTopk;
-            int topkIdx = i % numTopk;
+        if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+            for (int i = rankLaneIdx * numWarpsPerGroup + subWarpId; i < numRecvTokens * numTopk; i += numWarpsPerGroup * numLocalExperts) {
+                int tokenIdx = i / numTopk;
+                int topkIdx = i % numTopk;
 
-            const auto recvBufUint8 = reinterpret_cast<uint8_t*>(recvBuf) + srcRank * maxTokensPerRank * numBytesPerMsg;
-            const auto recvTokenMsg = (const uint8_t*)(recvBufUint8 + tokenIdx * numBytesPerMsg);
-            const auto recvBufHdr = reinterpret_cast<const DispatchHdr<kLayout>*>(recvTokenMsg);
-            const auto slotsPerToken = numTopk + 1; // token_id + topk_idx's
-            const auto recvSrcInfo = recvSrcInfoBase + (srcRank * maxTokensPerRank + tokenIdx) * slotsPerToken;
-            const auto recvSrcTopkInfo = recvSrcInfo + 1;
+                const auto recvBufUint8 = reinterpret_cast<uint8_t*>(recvBuf) + srcRank * maxTokensPerRank * numBytesPerMsg;
+                const auto recvTokenMsg = (const uint8_t*)(recvBufUint8 + tokenIdx * numBytesPerMsg);
+                const auto recvBufHdr = reinterpret_cast<const DispatchHdr<kLayout>*>(recvTokenMsg);
+                const auto slotsPerToken = numTopk + 1; // token_id + topk_idx's
+                const auto recvSrcInfo = recvSrcInfoBase + (srcRank * maxTokensPerRank + tokenIdx) * slotsPerToken;
+                const auto recvSrcTopkInfo = recvSrcInfo + 1;
 
-            // Initialize the token_id in the source tracking table
-            if(laneId == 0 && topkIdx == 0) {
-                recvSrcInfo[0] = recvBufHdr->token_id;
-            }
-
-            // Locate local experts
-            int localExpertIdx = recvBufHdr->rtr[topkIdx].expert_id - globalExpertStartIdx;
-            if (localExpertIdx < 0 || localExpertIdx >= numLocalExperts) {
-                // skip this topK, mark as invalid
-                if (laneId == 0) {
-                    recvSrcTopkInfo[topkIdx] = -1;
+                // Initialize the token_id in the source tracking table
+                if(laneId == 0 && topkIdx == 0) {
+                    recvSrcInfo[0] = recvBufHdr->token_id;
                 }
-                continue;
+
+                // Locate local experts
+                int localExpertIdx = recvBufHdr->rtr[topkIdx].expert_id - globalExpertStartIdx;
+                if (localExpertIdx < 0 || localExpertIdx >= numLocalExperts) {
+                    // skip this topK, mark as invalid
+                    if (laneId == 0) {
+                        recvSrcTopkInfo[topkIdx] = -1;
+                    }
+                    continue;
+                }
+
+                // Locate the output base for the local expert
+                int outDataOffset = localExpertIdx * numRanks * maxTokensPerRank;
+                const auto outDataInt4 = static_cast<int4*>((outDataBuf) + outDataOffset * hiddenBytes);
+                const auto outScales = static_cast<scale_t*>(outScalesBuf) + outDataOffset * numAlignedScales;
+
+                // Locate the next available slot
+                int recvTokenBeginIdx = 0;
+                if (laneId == 0) {
+                    recvTokenBeginIdx = atomicAdd(outCnt + localExpertIdx, 1);
+                    // Save the slot used for this topK
+                    recvSrcTopkInfo[topkIdx] = outDataOffset + recvTokenBeginIdx;
+                }
+                recvTokenBeginIdx = __shfl_sync(0xFFFFFFFF, recvTokenBeginIdx, 0);
+
+
+                // MEMOPT: Possibly we need to fix it
+                copyRecvTokenData<kUseFP8, kUseUE8M0>(
+                                recvBufUint8, tokenIdx,         // Location in the receive buffer
+                                recvTokenBeginIdx,       // Location in the output data
+                                outDataInt4,             // Output data
+                                outScales,               // Output scales
+                                hiddenInt4, hiddenBytes, numScales, numBytesPerMsg,
+                                dispatch_hdr_sz,
+                                maxTokensPerRank,
+                                numRanks,
+                                laneId);
             }
+        } else if constexpr (kLayout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+            // Rank-major: one output slot per received token (flat 2D index).
+            // outRecvTopkIdx/Weights are written so the user can route and reduce.
+            for (int i = rankLaneIdx * numWarpsPerGroup + subWarpId; i < numRecvTokens; i += numWarpsPerGroup * numLocalExperts) {
+                const auto recvBufUint8 = reinterpret_cast<uint8_t*>(recvBuf) + srcRank * maxTokensPerRank * numBytesPerMsg;
+                const auto recvTokenMsg = (const uint8_t*)(recvBufUint8 + i * numBytesPerMsg);
+                const auto recvBufHdr = reinterpret_cast<const DispatchHdr<kLayout>*>(recvTokenMsg);
+                const auto slotsPerToken = numTopk + 1; // token_id + topk_idx's
+                const auto recvSrcInfo = recvSrcInfoBase + (srcRank * maxTokensPerRank + i) * slotsPerToken;
+                const auto recvSrcTopkInfo = recvSrcInfo + 1;
 
-            // Locate the output base for the local expert
-            int outDataOffset = localExpertIdx * numRanks * maxTokensPerRank;
-            const auto outDataInt4 = static_cast<int4*>((outDataBuf) + outDataOffset * hiddenBytes);
-            const auto outScales = static_cast<scale_t*>(outScalesBuf) + outDataOffset * numAlignedScales;
+                auto* outDataInt4 = static_cast<int4*>(outDataBuf);
+                auto* outScales   = static_cast<scale_t*>(outScalesBuf);
+                const int slot = srcRank * maxTokensPerRank + i;
 
-            // Locate the next available slot
-            int recvTokenBeginIdx = 0;
-            if (laneId == 0) {
-                recvTokenBeginIdx = atomicAdd(outCnt + localExpertIdx, 1);
-                // Save the slot used for this topK
-                recvSrcTopkInfo[topkIdx] = outDataOffset + recvTokenBeginIdx;
+                // Lane 0: write token_id and flat slot index.
+                // srcInfo: j=0 is the flat 2D slot index into inData (for processAndSendToken);
+                // j=1 is the first topk position on this rank (j_eff), used by combine send to
+                //   compute the receive slot: (tokenIdx * numTopk + j_eff) * numBytesPerSlot.
+                // j>1 = -1 (no additional sends needed).
+                if (laneId == 0) {
+                    recvSrcInfo[0] = recvBufHdr->token_id;
+                    recvSrcTopkInfo[0] = slot;
+                }
+
+                // Each lane writes its own topk entry in parallel.
+                EP_DEVICE_ASSERT(outRecvTopkIdx != nullptr && outRecvTopkWeights != nullptr);
+                if (laneId < numTopk) {
+                    int localExpertIdx = (int)recvBufHdr->rtr[laneId].expert_id - globalExpertStartIdx;
+                    bool valid = (localExpertIdx >= 0 && localExpertIdx < numLocalExperts);
+                    outRecvTopkIdx[slot * numTopk + laneId] = valid ? (int32_t)localExpertIdx : (int32_t)-1;
+                    outRecvTopkWeights[slot * numTopk + laneId] = recvBufHdr->rtr[laneId].topk_weight;
+                }
+
+                // Compute j_eff via __ballot_sync: first topk position mapping to currRank.
+                if (numTopk > 1) {
+                    bool matchesCurrRank = (laneId < numTopk) &&
+                        (getExpertRankIdx((int)recvBufHdr->rtr[laneId].expert_id, numLocalExperts) == currRank);
+                    uint32_t currRankMask = __ballot_sync(0xffffffff, matchesCurrRank);
+                    int j_eff = currRankMask ? (__ffs(currRankMask) - 1) : -1;
+                    if (laneId == 0) {
+                        recvSrcTopkInfo[1] = j_eff;
+                    }
+                }
+                copyRecvTokenData<kUseFP8, kUseUE8M0>(
+                                recvBufUint8, i,         // Location in the receive buffer
+                                slot,                    // Location in the output data
+                                outDataInt4,             // Output data
+                                outScales,               // Output scales
+                                hiddenInt4, hiddenBytes, numScales, numBytesPerMsg,
+                                dispatch_hdr_sz,
+                                maxTokensPerRank,
+                                numRanks,
+                                laneId);
             }
-            recvTokenBeginIdx = __shfl_sync(0xFFFFFFFF, recvTokenBeginIdx, 0);
-
-
-            // MEMOPT: Possibly we need to fix it
-            copyRecvTokenData<kUseFP8, kUseUE8M0>(
-                            recvBufUint8, tokenIdx,         // Location in the receive buffer
-                            recvTokenBeginIdx,       // Location in the output data
-                            outDataInt4,             // Output data
-                            outScales,               // Output scales
-                            hiddenInt4, hiddenBytes, numScales, numBytesPerMsg,
-                            dispatch_hdr_sz,
-                            maxTokensPerRank,
-                            numRanks,
-                            laneId);
         }
     }
 }
@@ -796,6 +873,7 @@ void dispatch(const void* inData,
               void* outDataBuf,
               void* outScalesBuf,
               int* outSrcInfo,
+              int* outRecvRankCounter,
               int64_t* outLayout,
               int* outCnt,
               float* outRecvTopkWeights,
@@ -851,23 +929,25 @@ void dispatch(const void* inData,
         EP_HOST_ASSERT(roundScale and "UE8M0 SF requires `round_scale=True`");
 
     SETUP_LAUNCH_CONFIG(numSms, numWarps * 32, stream);
-    switch (layout) {
-        case NCCL_EP_LAYOUT_EXPERT_MAJOR: {
-#define DISPATCH_LAUNCH_CASE(hidden) { \
-auto dispatchFunc = dispatch<false, false, hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR>; \
+#define DISPATCH_LAUNCH_CASE_IMPL(hidden, kLayout) { \
+auto dispatchFunc = dispatch<false, false, hidden, kLayout>; \
 if (useFp8 and not useUe8m0) \
-    dispatchFunc = dispatch<true, false, hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR>; \
+    dispatchFunc = dispatch<true, false, hidden, kLayout>; \
 if (useFp8 and useUe8m0) \
-    dispatchFunc = dispatch<true, true, hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR>; \
+    dispatchFunc = dispatch<true, true, hidden, kLayout>; \
 LAUNCH_KERNEL(&cfg, dispatchFunc, \
               inData, \
               inTopkIdx, \
+              inTopkWeights, \
               /*rankMask=*/nullptr, \
               outDataBuf, \
               outScalesBuf, \
               outSrcInfo, \
+              outRecvRankCounter, \
               outLayout, \
               outCnt, \
+              outRecvTopkWeights, \
+              outRecvTopkIdx, \
               sendBuf, \
               recvBuf, \
               recvCntBuf, \
@@ -894,13 +974,16 @@ LAUNCH_KERNEL(&cfg, dispatchFunc, \
               devComms, \
               windows, \
               signalsBase); } break
-            SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
-#undef DISPATCH_LAUNCH_CASE
-            break;
-        }
-        default:
-            EP_HOST_ASSERT(false && "rank-major dispatch not yet implemented");
+#define DISPATCH_LAUNCH_CASE_RM(hidden) DISPATCH_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_RANK_MAJOR)
+#define DISPATCH_LAUNCH_CASE_EM(hidden) DISPATCH_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR)
+    if (layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+        SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE_RM);
+    } else {
+        SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE_EM);
     }
+#undef DISPATCH_LAUNCH_CASE_IMPL
+#undef DISPATCH_LAUNCH_CASE_RM
+#undef DISPATCH_LAUNCH_CASE_EM
 }
 
 template <int kNumSendUnrolls>
@@ -1092,7 +1175,7 @@ __forceinline__ __device__ void sendFinishFlag(
     unsigned signalsBase,
     const ncclWindow_t* windows,
     ncclDevComm* devComms) {
-    auto dstP2pPtr = ncclGetP2pPtr(recvFlagPtr, recvFlagOffset, 
+    auto dstP2pPtr = ncclGetP2pPtr(recvFlagPtr, recvFlagOffset,
                                    currRank, dstRank, windows, devComms);
 
     if (not isRankMasked(rankMask, dstRank)) {
@@ -1352,7 +1435,6 @@ __global__ __launch_bounds__(1024, 1) void combine(// INPUT
                                                    ncclDevComm* devComms,
                                                    const ncclWindow_t* windows,
                                                    unsigned signalsBase) {
-    static_assert(kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR, "rank-major combine not yet implemented");
     const auto smId = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto numSms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
     const auto threadId = static_cast<int>(threadIdx.x);
@@ -1440,42 +1522,80 @@ __global__ __launch_bounds__(1024, 1) void combine(// INPUT
         if (not isRankMasked<true>(rankMask, dstRank)) {
 
             // Use all lanes to send tokens
-            for (int i = subWarpId * numLocalExperts + rankLaneIdx; i < numRecvTokens * numTopk; i += numWarpsPerGroup * numLocalExperts) {
-                int tokenIdx = i / numTopk;
-                int topkIdx = i % numTopk;
-                auto localSrcTokenInfo = localSrcInfo + tokenIdx * slotsPerToken;
-                auto localSrcTopkInfo = localSrcTokenInfo + 1;
+            if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+                for (int i = subWarpId * numLocalExperts + rankLaneIdx; i < numRecvTokens * numTopk; i += numWarpsPerGroup * numLocalExperts) {
+                    int tokenIdx = i / numTopk;
+                    int topkIdx = i % numTopk;
+                    auto localSrcTokenInfo = localSrcInfo + tokenIdx * slotsPerToken;
+                    auto localSrcTopkInfo = localSrcTokenInfo + 1;
 
-                // Load the global expert index for this topk (skipping token index via "+1")
-                int offset = __shfl_sync(0xffffffff, __ldg(localSrcTopkInfo + topkIdx), 0);
-                if (offset == -1) {
-                    continue;
+                    // Load the global expert index for this topk (skipping token index via "+1")
+                    int offset = __shfl_sync(0xffffffff, __ldg(localSrcTopkInfo + topkIdx), 0);
+                    if (offset == -1) {
+                        continue;
+                    }
+                    int remoteTokenIdx = __shfl_sync(0xffffffff, __ldg(localSrcTokenInfo), 0);
+
+                    const auto srcDataInt4Ptr = static_cast<const int4*>(inData) + offset * hiddenBf16Int4;
+
+                    // Currently, a staging RDMA buffer is used for copying
+                    // TODO: Fix this code path to use less memory
+                    int sndTokenOffset = offset * numBytesPerSlot;
+                    const auto sendBufUint8 = static_cast<uint8_t*>(sendBuf) + sndTokenOffset;
+                    const auto sendBufInt4 = reinterpret_cast<int4*>(sendBufUint8);
+
+                    // Receive location calculation
+                    int rcvTokenOffset = (remoteTokenIdx * numTopk + topkIdx) * numBytesPerSlot;
+                    const auto recvPtr = reinterpret_cast<uint64_t>(recvBuf) + rcvTokenOffset;
+                    const auto expectedDstOffset = recvOff + rcvTokenOffset;
+                    const auto dstP2pPtr =
+                        ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComms);
+
+                    processAndSendToken<kUseLogFMT, kHidden, kNumSendUnrolls, kNumStages, kNumPrefetch>(
+                        tokenIdx, srcDataInt4Ptr, sendBufInt4, recvPtr,
+                        recvOff + rcvTokenOffset, sendOff + sndTokenOffset, dstRank, rankLaneIdx,
+                        currRank, numRanks, maxTokensPerRank, numBytesPerSlot,
+                        hidden, hiddenBf16Int4, hiddenBf16Int4Pad, kNumMetaBytes,
+                        kNumTMABufferBytes, zeroCopy,
+                        dstP2pPtr, tmaBuffers, fullBarriers, metaBuffers, tmaPhase,
+                        tmaLoadAndArrive, getNumTmaBytes, laneId, devComms, windows);
                 }
-                int remoteTokenIdx = __shfl_sync(0xffffffff, __ldg(localSrcTokenInfo), 0);
+            } else if constexpr (kLayout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+                // Rank-major: one send per received slot.
+                // srcInfo[0] = flat 2D slot into inData; srcInfo[1] = j_eff (topk return index).
+                // The receive slot is (tokenIdx * numTopk + j_eff) * numBytesPerSlot, placing
+                // each expert rank's contribution into a distinct position in the recv buffer.
+                for (int i = subWarpId * numLocalExperts + rankLaneIdx; i < numRecvTokens; i += numWarpsPerGroup * numLocalExperts) {
+                    auto localSrcTokenInfo = localSrcInfo + i * slotsPerToken;
+                    auto localSrcTopkInfo = localSrcTokenInfo + 1;
+                    int tokenIdx = __shfl_sync(0xffffffff, __ldg(localSrcTokenInfo), 0);
 
-                const auto srcDataInt4Ptr = static_cast<const int4*>(inData) + offset * hiddenBf16Int4;
+                    int slot  = __shfl_sync(0xffffffff, __ldg(localSrcTopkInfo + 0), 0);
+                    int j_eff = (numTopk > 1)
+                                ? __shfl_sync(0xffffffff, __ldg(localSrcTopkInfo + 1), 0)
+                                : 0;
+                    if (j_eff < 0) continue; // no local expert found (shouldn't happen)
 
-                // Currently, a staging RDMA buffer is used for copying
-                // TODO: Fix this code path to use less memory
-                int sndTokenOffset = offset * numBytesPerSlot;
-                const auto sendBufUint8 = static_cast<uint8_t*>(sendBuf) + sndTokenOffset;
-                const auto sendBufInt4 = reinterpret_cast<int4*>(sendBufUint8);
+                    int sndTokenOffset = slot * numBytesPerSlot;
+                    int rcvTokenOffset = (tokenIdx * numTopk + j_eff) * numBytesPerSlot;
 
-                // Receive location calculation
-                int rcvTokenOffset = (remoteTokenIdx * numTopk + topkIdx) * numBytesPerSlot;
-                const auto recvPtr = reinterpret_cast<uint64_t>(recvBuf) + rcvTokenOffset;
-                const auto expectedDstOffset = recvOff + rcvTokenOffset;
-                const auto dstP2pPtr =
-                    ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComms);
+                    const auto srcDataInt4Ptr = static_cast<const int4*>(inData) + (int64_t)slot * hiddenBf16Int4;
+                    const auto sendBufUint8   = static_cast<uint8_t*>(sendBuf) + sndTokenOffset;
+                    const auto sendBufPtr     = reinterpret_cast<int4*>(sendBufUint8);
+                    const auto recvPtr        = reinterpret_cast<uint64_t>(recvBuf) + rcvTokenOffset;
+                    const auto expectedDstOffset = recvOff + rcvTokenOffset;
+                    const auto dstP2pPtr =
+                        ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComms);
 
-                processAndSendToken<kUseLogFMT, kHidden, kNumSendUnrolls, kNumStages, kNumPrefetch>(
-                    tokenIdx, srcDataInt4Ptr, sendBufInt4, recvPtr,
-                    recvOff + rcvTokenOffset, sendOff + sndTokenOffset, dstRank, rankLaneIdx,
-                    currRank, numRanks, maxTokensPerRank, numBytesPerSlot,
-                    hidden, hiddenBf16Int4, hiddenBf16Int4Pad, kNumMetaBytes,
-                    kNumTMABufferBytes, zeroCopy,
-                    dstP2pPtr, tmaBuffers, fullBarriers, metaBuffers, tmaPhase,
-                    tmaLoadAndArrive, getNumTmaBytes, laneId, devComms, windows);
+                    processAndSendToken<kUseLogFMT, kHidden, kNumSendUnrolls, kNumStages, kNumPrefetch>(
+                        tokenIdx, srcDataInt4Ptr, sendBufPtr, recvPtr,
+                        recvOff + rcvTokenOffset, sendOff + sndTokenOffset, dstRank, rankLaneIdx,
+                        currRank, numRanks, maxTokensPerRank, numBytesPerSlot,
+                        hidden, hiddenBf16Int4, hiddenBf16Int4Pad, kNumMetaBytes,
+                        kNumTMABufferBytes, zeroCopy,
+                        dstP2pPtr, tmaBuffers, fullBarriers, metaBuffers, tmaPhase,
+                        tmaLoadAndArrive, getNumTmaBytes, laneId, devComms, windows);
+                }
             }
         }
 
@@ -1570,12 +1690,17 @@ LOW_LATENCY_COMBINE_RECV:
         asm volatile("bar.sync %0, %1;" :: "r"(groupIdx + 1), "r"((numDecodeWarps + 1) * 32));
 
         int stageIdx = 0, topkIdxByLane = 0;
-        EP_STATIC_ASSERT(kNumMaxTopk <= 32, "Invalid number of topks");
+        EP_STATIC_ASSERT(kNumMaxTopk <= 32, "numTopk must not exceed warp size: warpMarkFirstOccurrence relies on active lanes (0..numTopk-1) having lower IDs than inactive lanes (numTopk..31)");
+
         if (decodeWarpIdx == numDecodeWarps) {
             // TMA load warp
             for (int tokenIdx = smId + numSms * groupIdx; tokenIdx < numCombinedTokens; tokenIdx += numSms * numGroups) {
                 if (laneId < numTopk)
                     topkIdxByLane = static_cast<int>(__ldg(inTopkIdx + tokenIdx * numTopk + laneId));
+
+                if constexpr (kLayout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+                    topkIdxByLane = warpMarkFirstOccurrence(topkIdxByLane, numLocalExperts, laneId);
+                }
 
                 for (int i = 0; i < numTopk; ++ i) {
                     int topkIdxReg = __shfl_sync(0xffffffff, topkIdxByLane, i);
@@ -1617,9 +1742,15 @@ LOW_LATENCY_COMBINE_RECV:
             for (int tokenIdx = smId + numSms * groupIdx; tokenIdx < numCombinedTokens; tokenIdx += numSms * numGroups) {
                 if (laneId < numTopk) {
                     topkIdxByLane = static_cast<int>(__ldg(inTopkIdx + tokenIdx * numTopk + laneId));
-                    topkWeightsByLane = __ldg(topkWeights + tokenIdx * numTopk + laneId);
+                    // Rank-major: weights applied by caller before combine; kernel uses weight=1
+                    if constexpr (kLayout != NCCL_EP_LAYOUT_RANK_MAJOR)
+                        topkWeightsByLane = __ldg(topkWeights + tokenIdx * numTopk + laneId);
                 }
                 __syncwarp();
+
+                if constexpr (kLayout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+                    topkIdxByLane = warpMarkFirstOccurrence(topkIdxByLane, numLocalExperts, laneId);
+                }
 
                 float combinedData[kNumElemsPerInt4 * kNumRecvUnrolls] = {0.0f};
                 for (int i = 0; i < numTopk; ++ i) {
@@ -1628,7 +1759,13 @@ LOW_LATENCY_COMBINE_RECV:
                         continue;
                     if (isRankMasked(rankMask, topkIdxReg / numLocalExperts))
                         continue;
-                    const auto& topkWeight = __shfl_sync(0xffffffff, topkWeightsByLane, i);
+                    float topkWeight;
+                    if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+                        topkWeight = __shfl_sync(0xffffffff, topkWeightsByLane, i);
+                    } else if constexpr (kLayout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+                        // Per-rank weight sum is applied by the caller before ncclEpCombine.
+                        topkWeight = 1.0f;
+                    }
 
                     mbarrier_wait<true>(fullBarriers[stageIdx], tmaPhase, stageIdx);
                     if constexpr (kUseLogFMT) {
@@ -1749,12 +1886,10 @@ void combine(const void* inData,
     const int smem_size = max(smemSendSize, smemRecvSize);
 
     SETUP_LAUNCH_CONFIG(numSms, numWarps * 32, stream);
-    switch (layout) {
-        case NCCL_EP_LAYOUT_EXPERT_MAJOR: {
-#define COMBINE_LAUNCH_CASE(hidden) { \
+#define COMBINE_LAUNCH_CASE_IMPL(hidden, kLayout) { \
 if (useLogfmt) { \
-    SET_SHARED_MEMORY_FOR_TMA((combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls, NCCL_EP_LAYOUT_EXPERT_MAJOR>)); \
-    LAUNCH_KERNEL(&cfg, (combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls, NCCL_EP_LAYOUT_EXPERT_MAJOR>), \
+    SET_SHARED_MEMORY_FOR_TMA((combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout>)); \
+    LAUNCH_KERNEL(&cfg, (combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout>), \
                   inData, \
                   srcInfo, \
                   layoutRange, \
@@ -1788,8 +1923,8 @@ if (useLogfmt) { \
                   windows, \
                   signalsBase); \
 } else { \
-    SET_SHARED_MEMORY_FOR_TMA((combine<false, hidden, kCombineMaxTopk, kCombineMaxUnrolls, NCCL_EP_LAYOUT_EXPERT_MAJOR>)); \
-    LAUNCH_KERNEL(&cfg, (combine<false, hidden, kCombineMaxTopk, kCombineMaxUnrolls, NCCL_EP_LAYOUT_EXPERT_MAJOR>), \
+    SET_SHARED_MEMORY_FOR_TMA((combine<false, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout>)); \
+    LAUNCH_KERNEL(&cfg, (combine<false, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout>), \
                   inData, \
                   srcInfo, \
                   layoutRange, \
@@ -1823,13 +1958,16 @@ if (useLogfmt) { \
                   windows, \
                   signalsBase); \
 } } break
-            SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
-#undef COMBINE_LAUNCH_CASE
-            break;
-        }
-        default:
-            EP_HOST_ASSERT(false && "rank-major combine not yet implemented");
+#define COMBINE_LAUNCH_CASE_RM(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_RANK_MAJOR)
+#define COMBINE_LAUNCH_CASE_EM(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR)
+    if (layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+        SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_RM);
+    } else {
+        SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_EM);
     }
+#undef COMBINE_LAUNCH_CASE_IMPL
+#undef COMBINE_LAUNCH_CASE_RM
+#undef COMBINE_LAUNCH_CASE_EM
 }
 
 } // namespace internode_ll

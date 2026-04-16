@@ -110,4 +110,7 @@ typedef enum {
     // LL rank-major dispatch outputs: topk indices/weights received from source ranks
     NCCL_EP_TENSOR_TAG_RECV_TOPK_IDX     = 8,
     NCCL_EP_TENSOR_TAG_RECV_TOPK_WEIGHTS = 9,
+    // LL rank-major dispatch local tensor: per-source-rank received token counts [nRanks], int32.
+    // Analogous to RECV_EXPERT_COUNTER_DEVICE for HT/LL expert-major, but shaped by source rank.
+    NCCL_EP_TENSOR_TAG_RECV_RANK_COUNTER_DEVICE = 10,
 } ncclEpTensorTag_t;

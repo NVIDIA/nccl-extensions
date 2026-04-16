@@ -866,8 +866,9 @@ ncclResult_t ncclEpCreateGroup(
                      effective_layout != NCCL_EP_LAYOUT_FLAT) &&
                    "ncclEpCreateGroup: HT mode only supports flat layout (NCCL_EP_LAYOUT_FLAT)");
     EP_HOST_ASSERT(!(in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY &&
-                     effective_layout != NCCL_EP_LAYOUT_EXPERT_MAJOR) &&
-                   "ncclEpCreateGroup: LL mode only supports expert-major layout");
+                     effective_layout != NCCL_EP_LAYOUT_EXPERT_MAJOR &&
+                     effective_layout != NCCL_EP_LAYOUT_RANK_MAJOR) &&
+                   "ncclEpCreateGroup: LL mode supports only expert-major and rank-major layouts");
 
     bool low_latency_mode = (in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY);
     bool hybridep_mode = (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT);
@@ -1769,6 +1770,7 @@ ncclResult_t ncclEpDispatch(
         ncclNDTensor_t topk_weights_in   = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS);
         ncclNDTensor_t recv_topk_weights = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_RECV_TOPK_WEIGHTS);
         ncclNDTensor_t recv_topk_idx     = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_RECV_TOPK_IDX);
+        ncclNDTensor_t recv_rank_counter = find_tensor_by_tag(local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_RECV_RANK_COUNTER_DEVICE);
 
         const unsigned num_recv_tokens = static_cast<unsigned>(group->nRanks) * group->config.max_tokens_per_rank;
         switch (group->config.layout) {
@@ -1779,6 +1781,10 @@ ncclResult_t ncclEpDispatch(
                 assert(topk_weights_in   != nullptr);
                 assert(recv_topk_weights != nullptr);
                 assert(recv_topk_idx     != nullptr);
+                assert(recv_rank_counter != nullptr);
+                assert(recv_rank_counter->ndim == 1);
+                assert(recv_rank_counter->datatype == ncclInt32);
+                assert(recv_rank_counter->sizes[0] == static_cast<unsigned>(group->nRanks));
                 break;
             default:
                 assert(recv_x->ndim == 3);
@@ -1788,6 +1794,7 @@ ncclResult_t ncclEpDispatch(
                 assert(topk_weights_in   == nullptr);
                 assert(recv_topk_weights == nullptr);
                 assert(recv_topk_idx     == nullptr);
+                assert(recv_rank_counter == nullptr);
                 break;
         }
 
@@ -1802,15 +1809,20 @@ ncclResult_t ncclEpDispatch(
             assert(scales->sizes[2] == group->hidden / scale_block_size);
         }
 
+        // RECV_EXPERT_COUNTER_DEVICE is required for expert-major (per-expert atomic slot allocator)
+        // and must be absent for rank-major (outCnt is unused in the rank-major kernel path).
         ncclNDTensor_t recv_count = find_tensor_by_tag(
             local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE
         );
-
-        assert(recv_count != nullptr);
-        assert(recv_count->ndim == 1);
-        assert(tensor_is_contiguous(recv_count));
-        assert(recv_count->datatype == ncclInt32);
-        assert(recv_count->sizes[0] == group->num_local_experts);
+        if (group->config.layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+            assert(recv_count == nullptr);
+        } else {
+            assert(recv_count != nullptr);
+            assert(recv_count->ndim == 1);
+            assert(tensor_is_contiguous(recv_count));
+            assert(recv_count->datatype == ncclInt32);
+            assert(recv_count->sizes[0] == group->num_local_experts);
+        }
 
         const auto& buffer = handle->ll.layout.buffers[handle->ll.buffer_idx];
         auto& next_buffer = handle->ll.layout.buffers[handle->ll.buffer_idx ^= 1];
@@ -1822,8 +1834,9 @@ ncclResult_t ncclEpDispatch(
             auto* recv_x_data = recv_x->data;
             auto* scales_data = scales ? scales->data : nullptr;
             auto* expert_recv_source_indices_data = static_cast<int*>(handle->ll.expert_recv_source_indices->data);
+            auto* recv_rank_counter_data = recv_rank_counter ? static_cast<int*>(recv_rank_counter->data) : nullptr;
             auto* expert_dispatch_layout_data = static_cast<int64_t*>(handle->ll.expert_dispatch_layout->data);
-            auto* recv_count_data = static_cast<int*>(recv_count->data);
+            auto* recv_count_data = recv_count ? static_cast<int*>(recv_count->data) : nullptr;
             auto* x_data = x->data;
             auto* topk_idx_data = static_cast<int64_t*>(handle->topk_idx->data);
             auto* topk_weights_in_data = topk_weights_in ? static_cast<const float*>(topk_weights_in->data) : nullptr;
@@ -1841,6 +1854,7 @@ ncclResult_t ncclEpDispatch(
                 recv_x_data,
                 scales_data,
                 expert_recv_source_indices_data,
+                recv_rank_counter_data,
                 expert_dispatch_layout_data,
                 recv_count_data,
                 recv_topk_weights_data,
@@ -2150,12 +2164,11 @@ ncclResult_t ncclEpCombine(
         ncclNDTensor_t src_info = handle->ll.expert_recv_source_indices;
         ncclNDTensor_t layout_range = handle->ll.expert_dispatch_layout;
 
-        // topk_weights: expert-major → local tensor; rank-major → input tensor (required in both cases)
+        // topk_weights: expert-major requires it as a local tensor; rank-major does not
+        // (weights are applied by the caller in preReduceRankMajor before ncclEpCombine).
         ncclNDTensor_t topk_weights;
         if (handle->group->config.layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
-            topk_weights = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS);
-            EP_HOST_ASSERT(topk_weights != nullptr &&
-                           "rank-major combine requires TOPK_WEIGHTS in inputs");
+            topk_weights = nullptr;
         } else {
             topk_weights = find_tensor_by_tag(local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS);
             EP_HOST_ASSERT(topk_weights != nullptr &&
@@ -2199,17 +2212,19 @@ ncclResult_t ncclEpCombine(
         assert(tensor_is_contiguous(src_info));
         assert(src_info->datatype == ncclInt32);
 
-            // Validate topk_weights tensor
-        assert(topk_weights->ndim == 2);
-        assert(tensor_is_contiguous(topk_weights));
-        assert(topk_weights->sizes[0] == topk_idx->sizes[0]);
-        assert(topk_weights->sizes[1] == topk_idx->sizes[1]);
-        assert(topk_weights->datatype == ncclFloat32);
-        assert(topk_weights->sizes[0] <= num_max_dispatch_tokens_per_rank);
+        // Validate topk_weights tensor (expert-major only; rank-major applies weights before combine)
+        if (topk_weights != nullptr) {
+            assert(topk_weights->ndim == 2);
+            assert(tensor_is_contiguous(topk_weights));
+            assert(topk_weights->sizes[0] == topk_idx->sizes[0]);
+            assert(topk_weights->sizes[1] == topk_idx->sizes[1]);
+            assert(topk_weights->datatype == ncclFloat32);
+            assert(topk_weights->sizes[0] <= num_max_dispatch_tokens_per_rank);
+        }
 
         // Extract dimensions (hidden already set in the layout switch above)
-        const int num_topk = static_cast<int>(topk_weights->sizes[1]);
-        const int num_combined_tokens = static_cast<int>(topk_weights->sizes[0]);
+        const int num_topk = static_cast<int>(topk_idx->sizes[1]);
+        const int num_combined_tokens = static_cast<int>(topk_idx->sizes[0]);
 
         // Manage double-buffering
         const auto& buffer = handle->ll.layout.buffers[handle->ll.buffer_idx];
@@ -2238,7 +2253,7 @@ ncclResult_t ncclEpCombine(
             auto* out_data = out->data;
             auto* x_data = x->data;
             auto* topk_idx_data = static_cast<int64_t*>(topk_idx->data);
-            auto* topk_weights_data = static_cast<float*>(topk_weights->data);
+            auto* topk_weights_data = topk_weights ? static_cast<float*>(topk_weights->data) : nullptr;
             auto* src_info_data = static_cast<int*>(src_info->data);
             auto* layout_range_data = static_cast<int64_t*>(layout_range->data);
 

@@ -195,6 +195,7 @@ struct BenchmarkTensors {
     ncclNDTensor_t local_tensors[1];
     int num_dispatch_inputs;
     int num_dispatch_outputs;
+    int num_dispatch_local_tensors;
 
     // Combine tensors
     ncclNDTensor_t combine_inputs[2];
@@ -214,12 +215,11 @@ struct BenchmarkTensors {
     bool is_ll_mode;
 };
 
-// LL benchmark — layout-independent dispatch inputs and dispatch local tensor.
+// LL benchmark — layout-independent dispatch inputs.
 //
 // Initializes:
-//   tensors.inputs[0]        tokens [num_tokens, hidden]
-//   tensors.topk_weights     [num_tokens, top_k] (for combine; rank-major also aliases to inputs[1])
-//   tensors.local_tensors[0] RECV_EXPERT_COUNTER_DEVICE [num_local_experts]
+//   tensors.inputs[0]    tokens [num_tokens, hidden]
+//   tensors.topk_weights [num_tokens, top_k] (for combine; rank-major also aliases to inputs[1])
 static void setupLowLatencyTensorsSharedInputs(
     ncclEpGroup_t ep_group,
     BenchmarkTensors& tensors,
@@ -235,10 +235,6 @@ static void setupLowLatencyTensorsSharedInputs(
     NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.topk_weights, 2, ncclFloat32,
                                    NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
                                    nullptr, num_tokens, top_k));
-
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.local_tensors[0], 1, ncclInt32,
-                                   NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
-                                   nullptr, num_local_experts));
 }
 
 // LL benchmark — NCCL_EP_LAYOUT_EXPERT_MAJOR dispatch outputs + combine input shape.
@@ -246,6 +242,7 @@ static void setupLowLatencyTensorsSharedInputs(
 // Initializes:
 //   tensors.num_dispatch_inputs  (= 1)
 //   tensors.num_dispatch_outputs (= 1)
+//   tensors.local_tensors[0]     RECV_EXPERT_COUNTER_DEVICE [num_local_experts]
 //   tensors.outputs[0]           recv_x [num_local_experts, nRanks*max_tokens_per_rank, hidden] (3D)
 //   tensors.expert_outputs       same shape; combine path token input
 static void setupLowLatencyTensorsExpertMajLayout(
@@ -256,10 +253,15 @@ static void setupLowLatencyTensorsExpertMajLayout(
     unsigned int max_tokens_per_rank,
     int nRanks
 ) {
-    tensors.num_dispatch_inputs       = 1;
-    tensors.num_dispatch_outputs      = 1;
-    tensors.num_combine_inputs        = 1;
-    tensors.num_combine_local_tensors = 1;
+    tensors.num_dispatch_inputs        = 1;
+    tensors.num_dispatch_outputs       = 1;
+    tensors.num_dispatch_local_tensors = 1;
+    tensors.num_combine_inputs         = 1;
+    tensors.num_combine_local_tensors  = 1;
+
+    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.local_tensors[0], 1, ncclInt32,
+                                   NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
+                                   nullptr, num_local_experts));
 
     NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.outputs[0], 3, ncclBfloat16,
                                    NCCL_EP_TENSOR_TAG_TOKENS,
@@ -282,27 +284,35 @@ static void setupLowLatencyTensorsExpertMajLayout(
 //                                      topk_idx is not a numbered input — dispatch extracts
 //                                      it from the ep handle by NCCL_EP_TENSOR_TAG_TOPK_IDX)
 //   tensors.num_dispatch_outputs      (= 3)
+//   tensors.local_tensors[0]          RECV_RANK_COUNTER_DEVICE [nRanks] (ncclInt32); per-source-rank token counts
 //   tensors.outputs[0]                recv_x [nRanks*max_tokens_per_rank, hidden]; written by dispatch kernel
 //   tensors.outputs[1]                recv_topk_weights [nRanks*max_tokens_per_rank, top_k]
 //   tensors.outputs[2]                recv_topk_idx     [nRanks*max_tokens_per_rank, top_k] (ncclInt32)
-//   tensors.expert_outputs            combine input, same shape as outputs[0]; caller writes pre-reduced expert
-//                                     activations here (outputs[0] weighted by per-slot topk weight sum)
+//   tensors.expert_outputs            combine input, same shape as outputs[0]; caller writes expert FFN
+//                                     outputs pre-multiplied by per-rank weight sums (see preReduceRankMajor)
 //   tensors.num_combine_inputs        (= 1)
+//   tensors.combine_inputs[0]         expert_outputs (pre-multiplied by per-rank weight sums)
 //   tensors.num_combine_local_tensors (= 0)
 static void setupLowLatencyTensorsRankMajLayout(
     ncclEpGroup_t ep_group,
     BenchmarkTensors& tensors,
     unsigned int hidden,
     unsigned int top_k,
+    unsigned int num_local_experts,
     unsigned int max_tokens_per_rank,
     int nRanks
 ) {
-    tensors.num_dispatch_inputs       = 2;
-    tensors.num_dispatch_outputs      = 3;
-    tensors.num_combine_inputs        = 1;
-    tensors.num_combine_local_tensors = 0;
+    tensors.num_dispatch_inputs        = 2;
+    tensors.num_dispatch_outputs       = 3;
+    tensors.num_dispatch_local_tensors = 1;
+    tensors.num_combine_inputs         = 1;
+    tensors.num_combine_local_tensors  = 0;
 
     tensors.inputs[1] = tensors.topk_weights;  // alias: same tensor used as dispatch input
+
+    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.local_tensors[0], 1, ncclInt32,
+                                   NCCL_EP_TENSOR_TAG_RECV_RANK_COUNTER_DEVICE,
+                                   nullptr, (unsigned)nRanks));
 
     NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.outputs[0], 2, ncclBfloat16,
                                    NCCL_EP_TENSOR_TAG_TOKENS,
@@ -349,7 +359,7 @@ void setupLowLatencyTensors(
             break;
         case NCCL_EP_LAYOUT_RANK_MAJOR:
             setupLowLatencyTensorsRankMajLayout(ep_group, tensors, hidden, top_k,
-                                                 max_tokens_per_rank, nRanks);
+                                                 num_local_experts, max_tokens_per_rank, nRanks);
             break;
         default:
             fprintf(stderr, "setupLowLatencyTensors: unsupported layout %d\n", (int)layout);
@@ -381,6 +391,7 @@ void setupHighThroughputTensors(
     tensors.is_ll_mode = false;
     tensors.num_dispatch_inputs = 3;
     tensors.num_dispatch_outputs = 3;
+    tensors.num_dispatch_local_tensors = 1;
     // HT combine uses only 1 input (expert_outputs) and 1 output (combined_output)
     tensors.num_combine_inputs = 1;
     tensors.num_combine_outputs = 1;
@@ -488,7 +499,8 @@ void cleanupBenchmarkTensors(ncclEpGroup_t ep_group, BenchmarkTensors& tensors, 
         ncclEpTensorDestroy(ep_group, tensors.outputs[i]);
     }
 
-    ncclEpTensorDestroy(ep_group, tensors.local_tensors[0]);
+    for (int i = 0; i < tensors.num_dispatch_local_tensors; i++)
+        ncclEpTensorDestroy(ep_group, tensors.local_tensors[i]);
     ncclEpTensorDestroy(ep_group, tensors.expert_outputs);
     ncclEpTensorDestroy(ep_group, tensors.combined_output);
     ncclEpTensorDestroy(ep_group, tensors.topk_weights);
@@ -908,21 +920,240 @@ static ValidationResult validateDispatchOutputLLExpertMaj(
 }
 
 // ==================== LL rank-major dispatch validation ====================
-// Output: 2D [nRanks*max_tokens_per_rank, hidden], packed by source rank.
-// recv_topk_idx (outputs[2], int32) and recv_topk_weights (outputs[1]) identify
-// valid slots and carry routing metadata.
-// Placeholder: to be implemented in Phase 2 alongside the rank-major kernel.
+// Output: 2D [nRanks*max_tokens_per_rank, hidden], one slot per received token packed by source rank.
+// outputs[1] = recv_topk_weights [nRanks*max_tpr, top_k]: all top-k weights from the source token.
+// outputs[2] = recv_topk_idx     [nRanks*max_tpr, top_k]: local expert index on myRank, or -1.
+// Slots within each rank's block are contiguous from index 0; first invalid slot ends the block.
 static ValidationResult validateDispatchOutputLLRankMaj(
-    BenchmarkTensors& /*tensors*/,
-    unsigned int /*num_tokens*/,
-    unsigned int /*hidden*/,
-    unsigned int /*top_k*/,
-    unsigned int /*num_experts*/,
-    unsigned int /*num_local_experts*/,
-    int /*myRank*/,
-    int /*nRanks*/
+    BenchmarkTensors& tensors,
+    unsigned int num_tokens,
+    unsigned int hidden,
+    unsigned int top_k,
+    unsigned int num_experts,
+    unsigned int num_local_experts,
+    int myRank,
+    int nRanks
 ) {
-    return {false, 0, 0.0, "LL-RM dispatch validation not yet implemented"};
+    ValidationResult result = {true, 0, 0.0, ""};
+    int errors = 0;
+    const int max_errors_to_print = 10;
+    int errors_printed = 0;
+
+    // Get output tensor sizes: outputs[0] is [nRanks * max_tpr, hidden]
+    const unsigned int* out0_sizes; unsigned int out0_ndim;
+    NCCLCHECK(ncclEpTensorGetSizes(tensors.outputs[0], &out0_sizes, &out0_ndim));
+    const unsigned int max_tpr = out0_sizes[0] / (unsigned)nRanks;
+    const size_t total_slots   = (size_t)nRanks * max_tpr;
+
+    // Copy recv_x, recv_topk_weights, recv_topk_idx, recv_rank_counter to host
+    uint16_t* recv_data = new uint16_t[total_slots * hidden];
+    float*    recv_wgt  = new float   [total_slots * top_k];
+    int32_t*  recv_idx  = new int32_t [total_slots * top_k];
+    int32_t*  recv_cnt  = new int32_t [(size_t)nRanks];
+
+    void *out0_data, *out1_data, *out2_data, *local0_data;
+    NCCLCHECK(ncclEpTensorGetData(tensors.outputs[0], &out0_data));
+    NCCLCHECK(ncclEpTensorGetData(tensors.outputs[1], &out1_data));
+    NCCLCHECK(ncclEpTensorGetData(tensors.outputs[2], &out2_data));
+    NCCLCHECK(ncclEpTensorGetData(tensors.local_tensors[0], &local0_data));
+    CUDACHECK(cudaMemcpy(recv_data, out0_data,    total_slots * hidden * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_wgt,  out1_data,    total_slots * top_k  * sizeof(float),   cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_idx,  out2_data,    total_slots * top_k  * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_cnt,  local0_data,  (size_t)nRanks       * sizeof(int32_t), cudaMemcpyDeviceToHost));
+
+    int64_t* src_topk = new int64_t[num_tokens * top_k];
+    float*   src_wgt  = new float  [num_tokens * top_k];
+
+    for (int r = 0; r < nRanks; r++) {
+        // Regenerate expected topk indices and weights for rank r (must match initializeValidationData)
+        generateRandomTopkIndicesLL(src_topk, num_tokens, num_experts, top_k, r);
+        {
+            std::mt19937 rng(42 + r);
+            std::normal_distribution<float> normal_dist(0.0f, 1.0f);
+            for (unsigned int i = 0; i < num_tokens * top_k; i++) {
+                src_wgt[i] = std::abs(normal_dist(rng));
+                if (src_wgt[i] < 1e-6f) src_wgt[i] = 1e-6f;
+            }
+        }
+
+        // Build ordered list of tokens from rank r that map at least one expert to myRank
+        std::vector<int> expected_tokens;
+        for (unsigned int t = 0; t < num_tokens; t++) {
+            for (unsigned int k = 0; k < top_k; k++) {
+                int64_t eid = src_topk[t * top_k + k];
+                if (eid >= 0 && (int)(eid / num_local_experts) == myRank) {
+                    expected_tokens.push_back((int)t);
+                    break;
+                }
+            }
+        }
+
+        // Scan exactly recv_cnt[r] slots — the authoritative count written by the dispatch kernel.
+        const int expected_slot_count = recv_cnt[r];
+        int slot_count = 0;
+        std::set<int> found_tokens;
+
+        for (int s = 0; s < expected_slot_count; s++) {
+            unsigned int slot = (unsigned)r * max_tpr + (unsigned)s;
+            const uint16_t* row = recv_data + slot * hidden;
+            const int32_t*  idx = recv_idx  + slot * top_k;
+            const float*    wgt = recv_wgt  + slot * top_k;
+
+            int source_rank = -1, token_id = -1;
+            if (!extractTokenIdentity(row, hidden, nRanks, num_tokens, &source_rank, &token_id)) {
+                if (errors_printed++ < max_errors_to_print)
+                    printf("[Rank %d] LL-RM dispatch: rank %d slot %d: invalid token identity\n",
+                           myRank, r, s);
+                errors++; continue;
+            }
+            slot_count++;
+
+            if (source_rank != r) {
+                if (errors_printed++ < max_errors_to_print)
+                    printf("[Rank %d] LL-RM dispatch: rank %d slot %u: wrong source rank %d\n",
+                           myRank, r, s, source_rank);
+                errors++; continue;
+            }
+            if (!verifyTokenIntegrity(row, hidden)) {
+                if (errors_printed++ < max_errors_to_print)
+                    printf("[Rank %d] LL-RM dispatch: rank %d slot %u (token %d): data corruption\n",
+                           myRank, r, s, token_id);
+                errors++;
+            }
+
+            // Verify recv_topk_idx: local expert index for experts on myRank, -1 otherwise
+            for (unsigned int k = 0; k < top_k; k++) {
+                int64_t eid = src_topk[token_id * top_k + k];
+                int32_t expected_idx;
+                if (eid < 0) {
+                    expected_idx = -1;
+                } else {
+                    int expert_rank = (int)(eid / num_local_experts);
+                    expected_idx = (expert_rank == myRank) ? (int32_t)(eid % num_local_experts) : (int32_t)-1;
+                }
+                if (idx[k] != expected_idx) {
+                    if (errors_printed++ < max_errors_to_print)
+                        printf("[Rank %d] LL-RM dispatch: rank %d slot %u token %d: topk[%u] idx=%d expected=%d\n",
+                               myRank, r, s, token_id, k, idx[k], expected_idx);
+                    errors++;
+                }
+            }
+
+            // Verify recv_topk_weights: should exactly match source weights (float, no precision loss)
+            for (unsigned int k = 0; k < top_k; k++) {
+                float expected_w = src_wgt[token_id * top_k + k];
+                if (std::abs(wgt[k] - expected_w) > 1e-5f * expected_w) {
+                    if (errors_printed++ < max_errors_to_print)
+                        printf("[Rank %d] LL-RM dispatch: rank %d slot %u token %d: weight[%u]=%.6f expected=%.6f\n",
+                               myRank, r, s, token_id, k, wgt[k], expected_w);
+                    errors++;
+                }
+            }
+
+            found_tokens.insert(token_id);
+        }
+
+        // Verify token count: recv_cnt[r] must match expected
+        if (expected_slot_count != (int)expected_tokens.size()) {
+            if (errors_printed++ < max_errors_to_print)
+                printf("[Rank %d] LL-RM dispatch: rank %d: recv_cnt=%d, expected %d\n",
+                       myRank, r, expected_slot_count, (int)expected_tokens.size());
+            errors++;
+        } else if (slot_count != expected_slot_count) {
+            if (errors_printed++ < max_errors_to_print)
+                printf("[Rank %d] LL-RM dispatch: rank %d: decoded %d valid slots of %d\n",
+                       myRank, r, slot_count, expected_slot_count);
+            errors++;
+        }
+
+        // Verify coverage: all expected tokens were received
+        for (int t : expected_tokens) {
+            if (found_tokens.find(t) == found_tokens.end()) {
+                if (errors_printed++ < max_errors_to_print)
+                    printf("[Rank %d] LL-RM dispatch: rank %d: missing token %d\n",
+                           myRank, r, t);
+                errors++;
+            }
+        }
+    }
+
+    delete[] src_wgt;
+    delete[] src_topk;
+    delete[] recv_cnt;
+    delete[] recv_idx;
+    delete[] recv_wgt;
+    delete[] recv_data;
+
+    result.errors = errors;
+    result.passed = (errors == 0);
+    if (!result.passed) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "LL-RM dispatch: %d errors", errors);
+        result.message = buf;
+    }
+    return result;
+}
+
+// ==================== LL rank-major pre-reduction ====================
+// Multiplies each received expert output slot by the per-rank weight sum before combine.
+// The rank-major combine kernel uses weight=1; the caller is responsible for applying
+// the weights so that combined[t] = sum_R(weight_sum_R * expert_output_R).
+//
+// For each valid slot s from source rank r:
+//   weight_sum = sum of recv_topk_weights[slot, k] for all k where recv_topk_idx[slot, k] >= 0
+//   expert_outputs[slot] *= weight_sum
+//
+// Uses RECV_RANK_COUNTER_DEVICE (local_tensors[0]) as the authoritative per-rank slot count.
+static void preReduceRankMajor(
+    BenchmarkTensors& tensors,
+    unsigned int top_k,
+    int nRanks
+) {
+    const unsigned int* out0_sizes; unsigned int out0_ndim;
+    NCCLCHECK(ncclEpTensorGetSizes(tensors.outputs[0], &out0_sizes, &out0_ndim));
+    const unsigned int max_tpr  = out0_sizes[0] / (unsigned)nRanks;
+    const unsigned int hidden   = out0_sizes[1];
+    const unsigned int total_slots = out0_sizes[0];
+
+    void *out1_data, *out2_data, *local0_data;
+    NCCLCHECK(ncclEpTensorGetData(tensors.outputs[1], &out1_data));
+    NCCLCHECK(ncclEpTensorGetData(tensors.outputs[2], &out2_data));
+    NCCLCHECK(ncclEpTensorGetData(tensors.local_tensors[0], &local0_data));
+
+    float*   recv_wgt = new float  [total_slots * top_k];
+    int32_t* recv_idx = new int32_t[total_slots * top_k];
+    int32_t* recv_cnt = new int32_t[nRanks];
+    CUDACHECK(cudaMemcpy(recv_wgt, out1_data, total_slots * top_k * sizeof(float),   cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_idx, out2_data, total_slots * top_k * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_cnt, local0_data, (size_t)nRanks      * sizeof(int32_t), cudaMemcpyDeviceToHost));
+
+    void* eo_data;
+    NCCLCHECK(ncclEpTensorGetData(tensors.expert_outputs, &eo_data));
+    uint16_t* eo_host = new uint16_t[total_slots * hidden];
+    CUDACHECK(cudaMemcpy(eo_host, eo_data, total_slots * hidden * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+    for (int r = 0; r < nRanks; r++) {
+        for (int s = 0; s < recv_cnt[r]; s++) {
+            unsigned int slot = (unsigned)r * max_tpr + (unsigned)s;
+            // Sum weights for all top-k entries that routed to this rank (non-negative local idx)
+            float weight_sum = 0.0f;
+            for (unsigned int k = 0; k < top_k; k++) {
+                if (recv_idx[slot * top_k + k] >= 0)
+                    weight_sum += recv_wgt[slot * top_k + k];
+            }
+            for (unsigned int h = 0; h < hidden; h++) {
+                float val = bf16ToFloat(eo_host[slot * hidden + h]);
+                eo_host[slot * hidden + h] = floatToBf16(val * weight_sum);
+            }
+        }
+    }
+
+    CUDACHECK(cudaMemcpy(eo_data, eo_host, total_slots * hidden * sizeof(uint16_t), cudaMemcpyHostToDevice));
+
+    delete[] eo_host;
+    delete[] recv_cnt;
+    delete[] recv_idx;
+    delete[] recv_wgt;
 }
 
 // Dispatcher: routes to the appropriate per-mode validation function.
@@ -1805,7 +2036,7 @@ void printUsage(const char* programName, int myRank) {
         printf("                          ht or high-throughput:  High throughput mode\n");
         printf("  --layout <layout>       Buffer layout\n");
         printf("                          em or expert-major:  Expert-major layout (LL only, default for LL)\n");
-        printf("                          rm or rank-major:    Rank-major layout (LL only, not yet implemented)\n");
+        printf("                          rm or rank-major:    Rank-major layout (LL only)\n");
         printf("                          fl or flat:          Flat layout (HT only, default for HT)\n");
         printf("  --tokens <num>          Number of tokens (default: LL=128, HT=4096)\n");
         printf("  --hidden <num>          Hidden dimension (default: 7168)\n");
@@ -1900,6 +2131,7 @@ int main(int argc, char* argv[]) {
                     MPI_Finalize();
                     return 1;
                 }
+                layout_set = true;
                 break;
             case 't':
                 num_tokens = static_cast<unsigned int>(atoi(optarg));
@@ -2000,7 +2232,8 @@ int main(int argc, char* argv[]) {
             MPI_Finalize();
             return 1;
         }
-        if (algorithm == NCCL_EP_ALGO_LOW_LATENCY && layout != NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+        if (algorithm == NCCL_EP_ALGO_LOW_LATENCY &&
+            (layout != NCCL_EP_LAYOUT_EXPERT_MAJOR && layout != NCCL_EP_LAYOUT_RANK_MAJOR)) {
             if (myRank == 0)
                 printf("Error: LL mode only supports expert-major layout.\n");
             MPI_Finalize();
@@ -2267,8 +2500,10 @@ int main(int argc, char* argv[]) {
     }
     if (myRank == 0) { printf("[DEBUG] Starting benchmark...\n"); fflush(stdout); }
 
-    // HT mode: 0 local tensors, LL mode: 1 local tensor (tokens_per_experts)
-    int num_dispatch_local_tensors = (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) ? 0 : 1;
+    // HT mode: 0 local tensors passed to dispatch (handle uses them internally);
+    // LL expert-major: 1; LL rank-major: 2 (expert counter + rank counter).
+    int num_dispatch_local_tensors = (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT)
+                                     ? 0 : tensors.num_dispatch_local_tensors;
 
     auto dispatch_fn = [&]() {
         NCCLCHECK(ncclEpDispatch(ep_handle, tensors.inputs, tensors.num_dispatch_inputs,
@@ -2417,9 +2652,8 @@ int main(int argc, char* argv[]) {
             tensors, num_tokens, hidden, top_k, num_experts, num_local_experts, myRank, nRanks,
             algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT, config.layout);
 
-        // Copy dispatch output to combine input (simulating expert processing)
-        // In real usage, expert FFN processing would happen here
-        // For validation, we just pass through the received tokens
+        // Simulate expert FFN processing: copy dispatch output into expert_outputs,
+        // then apply per-rank weight sums for rank-major (kernel uses weight=1).
         {
             void* eo_data;
             void* output0_data;
@@ -2439,11 +2673,12 @@ int main(int argc, char* argv[]) {
                 size_t data_size = out0_sizes[0] * out0_sizes[1] * out0_sizes[2] * sizeof(uint16_t);
                 CUDACHECK(cudaMemcpy(eo_data, output0_data, data_size, cudaMemcpyDeviceToDevice));
             } else {
-                // LL rank-major: 2D [nRanks*max_tokens_per_rank, hidden]
+                // LL rank-major: copy then apply per-rank weight sums before combine
                 const unsigned int* out0_sizes; unsigned int out0_ndim;
                 NCCLCHECK(ncclEpTensorGetSizes(tensors.outputs[0], &out0_sizes, &out0_ndim));
                 size_t data_size = out0_sizes[0] * out0_sizes[1] * sizeof(uint16_t);
                 CUDACHECK(cudaMemcpy(eo_data, output0_data, data_size, cudaMemcpyDeviceToDevice));
+                preReduceRankMajor(tensors, top_k, nRanks);
             }
         }
 

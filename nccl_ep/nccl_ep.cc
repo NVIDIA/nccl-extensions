@@ -1271,10 +1271,6 @@ struct ncclEpHandle {
              // lifetime: valid after metadata_preprocessing
             int32_t* num_tokens_for_experts;
 
-            // Host-pinned mirror of num_tokens_for_experts (single scalar).
-            // Filled once during handle creation on the same stream as preprocessing.
-            int32_t* num_tokens_for_experts_host;
-
              // =================================================================================
              // CONVERSION BUFFERS - Pre-allocated to avoid dispatch/combine-time malloc
              // =================================================================================
@@ -1536,12 +1532,6 @@ ncclResult_t ncclEpCreateHandle(
             handle->hybridep.scaling_factor_staging_buffer = nullptr;
         }
 
-        // Cache actual received token count on host once per handle.
-        CUDA_CHECK(cudaHostAlloc(
-            reinterpret_cast<void**>(&handle->hybridep.num_tokens_for_experts_host),
-            sizeof(int32_t),
-            cudaHostAllocDefault));
-        *handle->hybridep.num_tokens_for_experts_host = -1;
     }
 
     return ncclEpUpdateHandle(handle, topk_idx, local_tensors, num_local_tensors, stream);
@@ -1658,15 +1648,6 @@ ncclResult_t ncclEpUpdateHandle(
         experts_per_rank,
         stream);
 
-    // Mirror the actual recv-token count to host; getters can read this cached value.
-    // NOTE: This D2H copy prevents CUDA graph capture.
-    CUDA_CHECK(cudaMemcpyAsync(
-        handle->hybridep.num_tokens_for_experts_host,
-        handle->hybridep.num_tokens_for_experts,
-        sizeof(*handle->hybridep.num_tokens_for_experts_host),
-        cudaMemcpyDeviceToHost,
-        stream));
-
     return ncclSuccess;
 }
 
@@ -1680,10 +1661,6 @@ ncclResult_t ncclEpHandleDestroy(
         tensor_free(handle->group, handle->ll.expert_recv_source_indices);
         tensor_free(handle->group, handle->ll.expert_dispatch_layout);
     } else if (handle->group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
-        if (handle->hybridep.num_tokens_for_experts_host) {
-            CUDA_CHECK(cudaFreeHost(handle->hybridep.num_tokens_for_experts_host));
-            handle->hybridep.num_tokens_for_experts_host = nullptr;
-        }
         if (handle->hybridep.preprocessing_block) {
             handle->group->free_fn(handle->hybridep.preprocessing_block);
             handle->hybridep.preprocessing_block = nullptr;
@@ -2406,21 +2383,12 @@ ncclResult_t ncclEpHandleGetNumRecvTokens(
     unsigned int* num_recv_tokens
 ) {
     if (handle->group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
-        int32_t actual_recv_tokens =
-            (handle->hybridep.num_tokens_for_experts_host != nullptr) ?
-            *handle->hybridep.num_tokens_for_experts_host : -1;
-
-        // Fallback for callers that query before stream synchronization.
-        if (actual_recv_tokens < 0) {
-            CUDA_CHECK(cudaMemcpy(
-                &actual_recv_tokens,
-                handle->hybridep.num_tokens_for_experts,
-                sizeof(actual_recv_tokens),
-                cudaMemcpyDeviceToHost));
-            if (handle->hybridep.num_tokens_for_experts_host != nullptr) {
-                *handle->hybridep.num_tokens_for_experts_host = actual_recv_tokens;
-            }
-        }
+        int32_t actual_recv_tokens;
+        CUDA_CHECK(cudaMemcpy(
+            &actual_recv_tokens,
+            handle->hybridep.num_tokens_for_experts,
+            sizeof(actual_recv_tokens),
+            cudaMemcpyDeviceToHost));
 
         assert(actual_recv_tokens >= 0);
         assert(actual_recv_tokens <= handle->group->max_recv_tokens);

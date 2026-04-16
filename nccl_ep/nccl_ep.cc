@@ -1579,13 +1579,12 @@ ncclResult_t ncclEpUpdateHandle(
 
     assert(handle->num_tokens <= static_cast<int>(ep_group->config.max_tokens_per_rank) && "Token count exceeds HT buffer capacity");
 
-    // Optional: per-expert token counts output
+    // Optional: per-expert token counts output (device only; host tag not supported here)
     ncclNDTensor_t recv_expert_counter = nullptr;
     if (num_local_tensors > 0) {
-        recv_expert_counter = find_tensor_by_tag(local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST);
-        if (recv_expert_counter == nullptr) {
-            recv_expert_counter = find_tensor_by_tag(local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE);
-        }
+        recv_expert_counter = find_tensor_by_tag(local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE);
+        assert(find_tensor_by_tag(local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST) == nullptr &&
+            "NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST is not supported in ncclEpUpdateHandle; use DEVICE tag instead");
     }
 
     const int num_experts = ep_group->config.num_experts;
@@ -1631,21 +1630,13 @@ ncclResult_t ncclEpUpdateHandle(
 
     // ===== Step 3: Run metadata_preprocessing =====
     int32_t* per_expert_counts_device = nullptr;
-    bool copy_per_expert_counts_to_host = false;
     if (recv_expert_counter != nullptr) {
         assert(recv_expert_counter->ndim == 1 && "recv_expert_counter must be 1D");
         assert(recv_expert_counter->datatype == ncclInt32 && "recv_expert_counter must be ncclInt32");
         assert(recv_expert_counter->sizes[0] >= static_cast<unsigned int>(ep_group->num_local_experts) &&
             "recv_expert_counter size must be >= num_local_experts");
         assert(recv_expert_counter->data != nullptr && "recv_expert_counter data must not be null");
-
-        if (recv_expert_counter->tag == NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST) {
-            // Fused preprocessing uses atomics; avoid atomics directly into mapped host memory.
-            per_expert_counts_device = handle->hybridep.per_expert_counts_tmp;
-            copy_per_expert_counts_to_host = true;
-        } else {
-            per_expert_counts_device = static_cast<int32_t*>(recv_expert_counter->data);
-        }
+        per_expert_counts_device = static_cast<int32_t*>(recv_expert_counter->data);
     }
 
     nccl_ep::hybridep::call_metadata_preprocessing(
@@ -1667,16 +1658,8 @@ ncclResult_t ncclEpUpdateHandle(
         experts_per_rank,
         stream);
 
-    if (copy_per_expert_counts_to_host) {
-        CUDA_CHECK(cudaMemcpyAsync(
-            recv_expert_counter->data,
-            per_expert_counts_device,
-            static_cast<size_t>(experts_per_rank) * sizeof(int32_t),
-            cudaMemcpyDeviceToHost,
-            stream));
-    }
-
-    // Mirror the actual recv-token count to host once; getters can read this cached value.
+    // Mirror the actual recv-token count to host; getters can read this cached value.
+    // NOTE: This D2H copy prevents CUDA graph capture.
     CUDA_CHECK(cudaMemcpyAsync(
         handle->hybridep.num_tokens_for_experts_host,
         handle->hybridep.num_tokens_for_experts,

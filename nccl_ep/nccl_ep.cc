@@ -10,7 +10,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
-#include <memory>
 #include <new>
 #include <optional>
 #include <set>
@@ -271,12 +270,16 @@ struct ncclEpGroup {
         // Merged IPC buffer (single cudaMalloc for all IPC-shared buffers)
         void* ipc_mega_buffer = nullptr;
         size_t ipc_mega_buffer_size = 0;
+        ncclWindow_t intranode_mega_window = {};
         size_t ipc_dispatch_token_offset = 0;
         size_t ipc_dispatch_prob_offset = 0;
         size_t ipc_combine_token_offset = 0;
         size_t ipc_combine_prob_offset = 0;
 
-        void** peer_ipc_base_ptrs = nullptr;   // Opened IPC base pointers per peer (for cleanup)
+        // Merged completion flags
+        uint32_t* completion_flags_base = nullptr;
+        ncclWindow_t completion_flags_window = {};
+
         void* host_ptr_block = nullptr;        // Single cudaHostAlloc for all pointer arrays
 
         // Config
@@ -315,69 +318,17 @@ struct ncclEpGroup {
         ht_buffers{} {}
 };
 
-// Batch allgather of multiple IPC handles in a single NCCL collective.
-// Reduces N separate cudaMalloc/ncclAllGather/cudaFree cycles to just 1.
-// local_handles: array of num_handles local IPC handle pointers (each CUDA_IPC_HANDLE_SIZE bytes)
-// all_handles:   array of num_handles output buffers (each CUDA_IPC_HANDLE_SIZE * nRanks bytes)
-static void batchAllGatherIpcHandles(
-    const void* const* local_handles,
-    void** all_handles,
-    int num_handles,
-    int rank,
-    int nRanks,
-    ncclComm_t comm,
-    cudaStream_t stream
-) {
-    const size_t per_rank_size = static_cast<size_t>(num_handles) * CUDA_IPC_HANDLE_SIZE;
-    const size_t total_size = per_rank_size * nRanks;
-    void* d_buffer;
-    CUDA_CHECK(cudaMalloc(&d_buffer, total_size));
-
-    // Pack all local handles into a contiguous host buffer, then copy to device
-    std::unique_ptr<uint8_t[]> pack_buf(new uint8_t[per_rank_size]);
-    for (int i = 0; i < num_handles; i++) {
-        memcpy(pack_buf.get() + i * CUDA_IPC_HANDLE_SIZE,
-               local_handles[i], CUDA_IPC_HANDLE_SIZE);
-    }
-    CUDA_CHECK(cudaMemcpy(
-        static_cast<uint8_t*>(d_buffer) + rank * per_rank_size,
-        pack_buf.get(), per_rank_size, cudaMemcpyHostToDevice));
-
-    // Single NCCL AllGather for all handles
-    NCCL_CHECK_RESULT(ncclAllGather(
-        static_cast<uint8_t*>(d_buffer) + rank * per_rank_size,
-        d_buffer, per_rank_size, ncclUint8, comm, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // Copy all results back to host, then unpack per-handle
-    std::unique_ptr<uint8_t[]> host_buf(new uint8_t[total_size]);
-    CUDA_CHECK(cudaMemcpy(host_buf.get(), d_buffer, total_size, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_buffer));
-
-    // Deinterleave: for each handle i, extract rank r's copy from the packed layout
-    for (int i = 0; i < num_handles; i++) {
-        uint8_t* out = static_cast<uint8_t*>(all_handles[i]);
-        for (int r = 0; r < nRanks; r++) {
-            memcpy(out + r * CUDA_IPC_HANDLE_SIZE,
-                   host_buf.get() + r * per_rank_size + i * CUDA_IPC_HANDLE_SIZE,
-                   CUDA_IPC_HANDLE_SIZE);
-        }
-    }
-}
-
 // HT Intranode Initialization (adapted for public NCCL APIs)
 static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
                                     const ncclEpGroupConfig_t* in_config,
                                     cudaStream_t stream)
 {
     ncclComm_t comm = ep_group->comm;
-    int nRanks = ep_group->nRanks;
-    int rank = ep_group->rank;
     // Node semantics: IPC, buffer sizing, and indexing use per-node device ordinals.
     // Note: for MNNVL this only covers same-node peers; cross-node MNNVL HT is not supported.
-    int gpus_per_node  = ep_group->gpus_per_node;
-    int rank_in_node   = ep_group->rank_in_node;
-    int node_id        = ep_group->node_id;
+    int gpus_per_node = ep_group->gpus_per_node;
+    int rank_in_node = ep_group->rank_in_node;
+    int node_id = ep_group->node_id;
     int hidden = ep_group->hidden;
     int num_local_experts = ep_group->num_local_experts;
     int max_recv_tokens = ep_group->max_recv_tokens;
@@ -405,7 +356,7 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // =========================================================================
-    // Phase 1: Allocate all buffers upfront (before batch IPC exchange)
+    // Phase 1: Allocate all buffers upfront
     // =========================================================================
 
     // Consolidated IPC mega-buffer: single cudaMalloc for all 4 IPC-shared buffers.
@@ -424,7 +375,7 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
 
     size_t mega_sz = dispatch_token_aligned + dispatch_prob_aligned
                    + combine_token_aligned + combine_prob_aligned;
-    CUDA_CHECK(cudaMalloc(&ep_group->ht_buffers.ipc_mega_buffer, mega_sz));
+    NCCL_CHECK_RESULT(ncclMemAlloc(&ep_group->ht_buffers.ipc_mega_buffer, mega_sz));
     ep_group->ht_buffers.ipc_mega_buffer_size = mega_sz;
 
     uint8_t* mega_base = static_cast<uint8_t*>(ep_group->ht_buffers.ipc_mega_buffer);
@@ -458,14 +409,11 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
     hptr += sizeof(uint16_t*) * gpus_per_node;
     ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs = reinterpret_cast<float**>(hptr);
 
-    // Merged completion flags: rank_in_node 0 is the primary within the node.
-    if (rank_in_node == 0) {
-        uint32_t* completion_flags_base;
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&completion_flags_base), 2 * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMemsetAsync(completion_flags_base, 0, 2 * sizeof(uint32_t), stream));
-        ep_group->ht_buffers.intra_node_write_completion_flags = completion_flags_base;
-        ep_group->ht_buffers.combine_intra_node_write_completion_flags = completion_flags_base + 1;
-    }
+    // Merged completion flags: allocate on all ranks as we will window register is collective
+    NCCL_CHECK_RESULT(ncclMemAlloc(reinterpret_cast<void**>(&ep_group->ht_buffers.completion_flags_base), 2 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemsetAsync(ep_group->ht_buffers.completion_flags_base, 0, 2 * sizeof(uint32_t), stream));
+    ep_group->ht_buffers.intra_node_write_completion_flags = ep_group->ht_buffers.completion_flags_base;
+    ep_group->ht_buffers.combine_intra_node_write_completion_flags = ep_group->ht_buffers.completion_flags_base + 1;
 
     // Dispatch grid barrier counter (local to each rank, NOT IPC-shared)
     {
@@ -476,44 +424,30 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
     }
 
     // =========================================================================
-    // Phase 2: Get IPC handles and batch-allgather in a single NCCL collective
-    // Consolidated: [0] = mega buffer (token+prob+combine), [1] = completion flags
+    // Phase 2: Register windows for shared intranode regions
+    // Consolidated registration: mega buffer (token+prob+combine) & completion flags
     // =========================================================================
-    constexpr int NUM_IPC_HANDLES = 2;
-    cudaIpcMemHandle_t local_handles[NUM_IPC_HANDLES];
-    memset(local_handles, 0, sizeof(local_handles));
-
-    CUDA_CHECK(cudaIpcGetMemHandle(&local_handles[0], ep_group->ht_buffers.ipc_mega_buffer));
-    if (rank_in_node == 0) {
-        CUDA_CHECK(cudaIpcGetMemHandle(&local_handles[1], ep_group->ht_buffers.intra_node_write_completion_flags));
-    }
-
-    std::unique_ptr<uint8_t[]> all_handles_buf[NUM_IPC_HANDLES];
-    for (int i = 0; i < NUM_IPC_HANDLES; i++) {
-        all_handles_buf[i].reset(new uint8_t[CUDA_IPC_HANDLE_SIZE * nRanks]);
-    }
-
-    const void* local_handle_ptrs[NUM_IPC_HANDLES];
-    void* all_handle_ptrs[NUM_IPC_HANDLES];
-    for (int i = 0; i < NUM_IPC_HANDLES; i++) {
-        local_handle_ptrs[i] = &local_handles[i];
-        all_handle_ptrs[i] = all_handles_buf[i].get();
-    }
-
-    batchAllGatherIpcHandles(local_handle_ptrs, all_handle_ptrs, NUM_IPC_HANDLES,
-                             rank, nRanks, comm, stream);
+    // Register the mega buffer
+    NCCL_CHECK_RESULT(ncclCommWindowRegister(
+        comm,
+        ep_group->ht_buffers.ipc_mega_buffer,
+        mega_sz,
+        &ep_group->ht_buffers.intranode_mega_window,
+        NCCL_WIN_COLL_SYMMETRIC));
+    
+    // Register the completion flags
+    NCCL_CHECK_RESULT(ncclCommWindowRegister(
+        comm,
+        ep_group->ht_buffers.completion_flags_base,
+        2 * sizeof(uint32_t),
+        &ep_group->ht_buffers.completion_flags_window,
+        NCCL_WIN_COLL_SYMMETRIC));
 
     // =========================================================================
-    // Phase 3: Open IPC handles for same-node peers (node semantics).
+    // Phase 3: Resolve same-node peer pointers from NCCL windows.
     // Indexed by rank_in_node; node_id identifies which physical node this rank belongs to.
     // =========================================================================
 
-    // Track opened IPC base pointers for cleanup (one per node peer)
-    CUDA_CHECK(cudaHostAlloc(&ep_group->ht_buffers.peer_ipc_base_ptrs,
-        sizeof(void*) * gpus_per_node, cudaHostAllocMapped));
-    memset(ep_group->ht_buffers.peer_ipc_base_ptrs, 0, sizeof(void*) * gpus_per_node);
-
-    // Open 1 mega-buffer IPC handle per node peer, derive 4 pointers via offsets
     for (int i = 0; i < gpus_per_node; i++) {
         if (i == rank_in_node) {
             ep_group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[i] =
@@ -526,13 +460,9 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
                 ep_group->ht_buffers.expert_input_prob;
         } else {
             int peer_global = node_id * gpus_per_node + i;
-            cudaIpcMemHandle_t peer_handle;
-            memcpy(&peer_handle, all_handles_buf[0].get() + peer_global * CUDA_IPC_HANDLE_SIZE,
-                   CUDA_IPC_HANDLE_SIZE);
-            void* peer_base;
-            CUDA_CHECK(cudaIpcOpenMemHandle(&peer_base, peer_handle, cudaIpcMemLazyEnablePeerAccess));
-            ep_group->ht_buffers.peer_ipc_base_ptrs[i] = peer_base;
-
+            void* peer_base = nullptr;
+            NCCL_CHECK_RESULT(ncclGetPeerDevicePointer(
+                ep_group->ht_buffers.intranode_mega_window, 0, peer_global, &peer_base));
             uint8_t* pb = static_cast<uint8_t*>(peer_base);
             ep_group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[i] =
                 pb + ep_group->ht_buffers.ipc_dispatch_token_offset;
@@ -545,13 +475,12 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
         }
     }
 
-    // Merged completion flags: non-rank_in_node-0 ranks IPC-map from node-local rank 0.
+    // Merged completion flags: non-rank_in_node-0 ranks resolve rank0 pointer from window.
     if (rank_in_node != 0) {
         int node_rank0_global = node_id * gpus_per_node;
-        cudaIpcMemHandle_t rank0_handle;
-        memcpy(&rank0_handle, all_handles_buf[1].get() + node_rank0_global * CUDA_IPC_HANDLE_SIZE, CUDA_IPC_HANDLE_SIZE);
-        void* ptr;
-        CUDA_CHECK(cudaIpcOpenMemHandle(&ptr, rank0_handle, cudaIpcMemLazyEnablePeerAccess));
+        void* ptr = nullptr;
+        NCCL_CHECK_RESULT(ncclGetPeerDevicePointer(
+            ep_group->ht_buffers.completion_flags_window, 0, node_rank0_global, &ptr));
         ep_group->ht_buffers.intra_node_write_completion_flags = static_cast<uint32_t*>(ptr);
         ep_group->ht_buffers.combine_intra_node_write_completion_flags = static_cast<uint32_t*>(ptr) + 1;
     }
@@ -566,29 +495,20 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
 static ncclResult_t destroy_hybridep_intranode(ncclEpGroup_t ep_group) {
     if (!ep_group->ht_buffers.initialized) return ncclSuccess;
 
-    // Node semantics: IPC cleanup mirrors Phase 3 — indexed by per-node position.
-    int rank_in_node  = ep_group->rank_in_node;
-    int gpus_per_node = ep_group->gpus_per_node;
-
-    // Close IPC handles: 1 mega-buffer handle per node peer + 1 completion flag handle
-    for (int i = 0; i < gpus_per_node; i++) {
-        if (i != rank_in_node && ep_group->ht_buffers.peer_ipc_base_ptrs &&
-            ep_group->ht_buffers.peer_ipc_base_ptrs[i]) {
-            cudaIpcCloseMemHandle(ep_group->ht_buffers.peer_ipc_base_ptrs[i]);
-        }
+    if (ep_group->ht_buffers.intranode_mega_window != ncclWindow_t{}) {
+        NCCL_CHECK_RESULT(ncclCommWindowDeregister(ep_group->comm, ep_group->ht_buffers.intranode_mega_window));
+        ep_group->ht_buffers.intranode_mega_window = {};
+    }
+    if (ep_group->ht_buffers.completion_flags_window != ncclWindow_t{}) {
+        NCCL_CHECK_RESULT(ncclCommWindowDeregister(ep_group->comm, ep_group->ht_buffers.completion_flags_window));
+        ep_group->ht_buffers.completion_flags_window = {};
     }
 
-    // Close completion flag IPC handle (non-rank_in_node-0)
-    if (rank_in_node != 0) {
-        if (ep_group->ht_buffers.intra_node_write_completion_flags) {
-            cudaIpcCloseMemHandle(ep_group->ht_buffers.intra_node_write_completion_flags);
-        }
-    }
-
-    // Free consolidated IPC mega-buffer (replaces 4 individual cudaFree calls)
+    // Free consolidated intranode mega-buffer (replaces 4 individual cudaFree calls)
     if (ep_group->ht_buffers.ipc_mega_buffer) {
-        cudaFree(ep_group->ht_buffers.ipc_mega_buffer);
+        NCCL_CHECK_RESULT(ncclMemFree(ep_group->ht_buffers.ipc_mega_buffer));
         ep_group->ht_buffers.ipc_mega_buffer = nullptr;
+        ep_group->ht_buffers.ipc_mega_buffer_size = 0;
         ep_group->ht_buffers.expert_output_token = nullptr;
         ep_group->ht_buffers.expert_output_prob = nullptr;
         ep_group->ht_buffers.expert_input_token = nullptr;
@@ -602,24 +522,18 @@ static ncclResult_t destroy_hybridep_intranode(ncclEpGroup_t ep_group) {
         ep_group->free_fn(ep_group->ht_buffers.dispatch_grid_barrier_counter);
     }
 
-    // Free merged completion flags (rank_in_node 0 only; base pointer covers both dispatch and combine)
-    if (rank_in_node == 0) {
-        if (ep_group->ht_buffers.intra_node_write_completion_flags) {
-            cudaFree(ep_group->ht_buffers.intra_node_write_completion_flags);
-        }
+    // Free merged completion flags local allocation
+    if (ep_group->ht_buffers.completion_flags_base) {
+        NCCL_CHECK_RESULT(ncclMemFree(ep_group->ht_buffers.completion_flags_base));
+        ep_group->ht_buffers.completion_flags_base = nullptr;
     }
+    ep_group->ht_buffers.intra_node_write_completion_flags = nullptr;
+    ep_group->ht_buffers.combine_intra_node_write_completion_flags = nullptr;
 
-    // Free consolidated host pointer block and peer IPC tracking array
-    if (ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs) {
-        cudaFreeHost(ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs);
-    }
+    // Free consolidated host pointer block
     if (ep_group->ht_buffers.host_ptr_block) {
         cudaFreeHost(ep_group->ht_buffers.host_ptr_block);
         ep_group->ht_buffers.host_ptr_block = nullptr;
-    }
-    if (ep_group->ht_buffers.peer_ipc_base_ptrs) {
-        cudaFreeHost(ep_group->ht_buffers.peer_ipc_base_ptrs);
-        ep_group->ht_buffers.peer_ipc_base_ptrs = nullptr;
     }
 
     ep_group->ht_buffers.initialized = false;
@@ -1039,7 +953,7 @@ ncclResult_t ncclEpCreateGroup(
         return ncclInvalidUsage;
     }
 
-    // Initialize HT intranode buffers (IPC handles, completion flags, etc.)
+    // Initialize HT intranode buffers (windows, completion flags, etc.)
     if (hybridep_mode) {
         NCCL_CHECK_RESULT(init_hybridep_intranode(ep_group, in_config, stream));
         NCCL_CHECK_RESULT(init_hybridep_internode(ep_group, in_config, stream));

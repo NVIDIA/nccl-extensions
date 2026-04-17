@@ -2014,6 +2014,8 @@ ncclResult_t ncclEpDispatch(
             forward_dispatch,
             stream
         );
+        unsigned int actual_recv_tokens = 0;
+        NCCL_CHECK_RESULT(ncclEpHandleGetNumRecvTokens(handle, &actual_recv_tokens));
 
         /* ===== Copy IPC staging → caller outputs ===== */
         // HT kernel writes to IPC-mapped buffers (dispatch_expert_output_*_buffer_ptrs)
@@ -2021,7 +2023,8 @@ ncclResult_t ncclEpDispatch(
         ncclNDTensor_t recv_x = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOKENS);
         if (recv_x != nullptr) {
             assert(recv_x->ndim == 2 && tensor_is_contiguous(recv_x));
-            size_t copy_size = static_cast<size_t>(recv_x->sizes[0]) * recv_x->sizes[1] * ncclTypeSize(recv_x->datatype);
+            assert(recv_x->sizes[0] >= actual_recv_tokens);
+            size_t copy_size = static_cast<size_t>(actual_recv_tokens) * recv_x->sizes[1] * ncclTypeSize(recv_x->datatype);
 
             CUDA_CHECK(cudaMemcpyAsync(recv_x->data,
                 group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->rank_in_node],
@@ -2066,7 +2069,8 @@ ncclResult_t ncclEpDispatch(
             ncclNDTensor_t recv_scales = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_SCALES);
             if (recv_scales != nullptr) {
                 assert(recv_scales->ndim == 2 && tensor_is_contiguous(recv_scales));
-                size_t copy_size = static_cast<size_t>(recv_scales->sizes[0]) * recv_scales->sizes[1] * ncclTypeSize(recv_scales->datatype);
+                assert(recv_scales->sizes[0] >= actual_recv_tokens);
+                size_t copy_size = static_cast<size_t>(actual_recv_tokens) * recv_scales->sizes[1] * ncclTypeSize(recv_scales->datatype);
 
                 CUDA_CHECK(cudaMemcpyAsync(recv_scales->data,
                     group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[group->rank_in_node],

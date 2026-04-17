@@ -322,13 +322,11 @@ def main():  # noqa: C901 — intentionally kept as a single function to mirror 
     # -- recv_expert_counter for handle (only when disable_max_tokens) ------
     handle_local_tensors = []
     handle_recv_expert_counter = None
-    recv_counter_host_ptr = None
     if disable_max_tokens:
-        recv_counter_host_ptr = cuda_host_alloc(num_local_experts * 4)
         handle_recv_expert_counter = tensor_create(
             nccl, ep_group, 1, ncclDataTypeEnum.ncclInt32,
-            ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST,
-            recv_counter_host_ptr, num_local_experts,
+            ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
+            None, num_local_experts,
         )
         handle_local_tensors.append(handle_recv_expert_counter)
 

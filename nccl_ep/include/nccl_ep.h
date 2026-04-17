@@ -156,7 +156,7 @@ typedef struct ncclEpHandleConfig* ncclEpHandleConfig_t;  // Reserved for future
 //   topk_idx            - [IN]  Tensor holding top-K expert indices (routing information)
 //   local_tensors       - [IN/OUT, optional] Array of pointers to local tensors.
 //                         HT: accepts optional RECV_EXPERT_COUNTER tensor (1D, ncclInt32, size=num_local_experts)
-//                         with tag NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST (pinned+mapped) or _DEVICE.
+//                         with tag NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE.
 //                         Required when max_tokens_per_rank is NCCL_EP_AUTO.
 //                         LL mode: does not accept local tensors (num_local_tensors must be 0).
 //   num_local_tensors   - [IN]  Number of local tensors.

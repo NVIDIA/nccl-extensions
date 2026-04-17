@@ -2154,10 +2154,8 @@ int main(int argc, char* argv[]) {
     // Create recv_expert_counter tensor for dynamic token allocation (HT + dynamic mode)
     ncclNDTensor_t recv_expert_counter_tensor = nullptr;
     if (dynamic_tokens) {
-        void* recv_expert_counter_data;
-        CUDACHECK(cudaHostAlloc(&recv_expert_counter_data, num_local_experts * sizeof(int), cudaHostAllocMapped));
         NCCLCHECK(ncclEpTensorCreate(ep_group, &recv_expert_counter_tensor, 1, ncclInt32,
-                                     NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST, recv_expert_counter_data, num_local_experts));
+                                     NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE, nullptr, num_local_experts));
     }
 
     // Create handle
@@ -2504,9 +2502,6 @@ int main(int argc, char* argv[]) {
 
     // Cleanup recv_expert_counter if allocated (must be before group destroy)
     if (dynamic_tokens && recv_expert_counter_tensor != nullptr) {
-        void* rec_data;
-        ncclEpTensorGetData(recv_expert_counter_tensor, &rec_data);
-        if (rec_data) cudaFreeHost(rec_data);
         ncclEpTensorDestroy(ep_group, recv_expert_counter_tensor);
     }
 

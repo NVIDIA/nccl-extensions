@@ -100,7 +100,6 @@ class ncclEpTensorTag_t:
     NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS = 3
     NCCL_EP_TENSOR_TAG_SCALES = 4
     NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE = 5
-    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST = 6
     NCCL_EP_TENSOR_TAG_TOKENS_PER_EXPERTS = 7
 
 
@@ -463,7 +462,7 @@ class NCCLLibrary:
             stream: CUDA stream
             local_tensors: Optional list of ncclNDTensor_t for local operations.
                           HT mode: accepts optional RECV_EXPERT_COUNTER tensor (1D, ncclInt32, size=num_local_experts)
-                          with tag RECV_EXPERT_COUNTER_HOST (pinned+mapped) or _DEVICE.
+                          with tag RECV_EXPERT_COUNTER_DEVICE.
                           Required when max_tokens_per_rank=NCCL_EP_AUTO (0).
                           LL mode: does not accept local tensors (must be None or empty list).
             use_fp8: Enable FP8 for dispatch (default: False)

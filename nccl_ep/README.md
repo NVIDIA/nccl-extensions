@@ -116,7 +116,6 @@ This section provides a high-level overview of the input, output, and local tens
 * INDEX = NCCL_EP_TENSOR_TAG_TOPK_IDX
 * SCALES = NCCL_EP_TENSOR_TAG_SCALES
 * CNTR_D = NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE
-* CNTR_H = NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST
 
 
 #### LL mode (same data type)
@@ -556,7 +555,7 @@ ncclResult_t ncclEpTensorGetSizes(ncclNDTensor_t tensor, const unsigned int** si
 //   topk_idx            - [IN]  Tensor holding top-K expert indices (routing information)
 //   local_tensors       - [IN/OUT, optional] Array of pointers to local tensors.
 //                         HT: accepts optional RECV_EXPERT_COUNTER tensor (1D, ncclInt32, size=num_local_experts)
-//                         with tag NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST (pinned+mapped) or _DEVICE.
+//                         with tag NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE.
 //                         Required when max_tokens_per_rank is NCCL_EP_AUTO.
 //                         LL mode: does not accept local tensors (num_local_tensors must be 0).
 //   num_local_tensors   - [IN]  Number of local tensors.
@@ -860,11 +859,9 @@ ncclNDTensor_t recv_expert_counter = nullptr;
 ncclNDTensor_t local_tensors[1] = {nullptr};
 unsigned int num_local_tensors = 0;
 if (config.max_tokens_per_rank == NCCL_EP_AUTO) {
-    void* recv_counter_data;
-    cudaHostAlloc(&recv_counter_data, num_local_experts * sizeof(int), cudaHostAllocMapped);
     ncclEpTensorCreate(ep_group, &recv_expert_counter, 1, ncclInt32,
-                        NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST,
-                        recv_counter_data, num_local_experts);
+                        NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
+                        nullptr, num_local_experts);
     local_tensors[0] = recv_expert_counter;
     num_local_tensors = 1;
 }

@@ -333,14 +333,12 @@ int main(int argc, char* argv[])
   NCCLCHECK(ncclEpTensorGetData(topk_idx, &topk_idx_data));
   CUDACHECK(cudaMemcpy(topk_idx_data, topk_idx_host, num_tokens * top_k * sizeof(int64_t), cudaMemcpyHostToDevice));
 
-  // Create recv_expert_counter host tensor for ncclEpCreateHandle (only when disable_max_tokens is true)
+  // Create recv_expert_counter device tensor for ncclEpCreateHandle (only when disable_max_tokens is true)
   ncclNDTensor_t handle_local_tensors[1] = {nullptr};
   unsigned int handle_num_local_tensors = 0;
   ncclNDTensor_t handle_recv_expert_counter = nullptr;
   if (disable_max_tokens) {
-    void* recv_counter_data;
-    CUDACHECK(cudaHostAlloc(&recv_counter_data, num_local_experts * sizeof(int), cudaHostAllocMapped));
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &handle_recv_expert_counter, 1, ncclInt32, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST, recv_counter_data, num_local_experts));
+    NCCLCHECK(ncclEpTensorCreate(ep_group, &handle_recv_expert_counter, 1, ncclInt32, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE, nullptr, num_local_experts));
     handle_local_tensors[0] = handle_recv_expert_counter;
     handle_num_local_tensors = 1;
   }
@@ -931,11 +929,7 @@ int main(int argc, char* argv[])
 
   delete[] topk_idx_host;
   ncclEpTensorDestroy(ep_group, topk_idx);
-  // Free recv_expert_counter host tensor (uses cudaFreeHost, not cudaFree) only if it was allocated
-  if (disable_max_tokens && handle_local_tensors[0] != nullptr) {
-    void* recv_counter_data;
-    ncclEpTensorGetData(handle_recv_expert_counter, &recv_counter_data);
-    cudaFreeHost(recv_counter_data);
+  if (disable_max_tokens && handle_recv_expert_counter != nullptr) {
     ncclEpTensorDestroy(ep_group, handle_recv_expert_counter);
   }
   ncclEpTensorDestroy(ep_group, inputs[0]);

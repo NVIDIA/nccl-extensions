@@ -1331,7 +1331,6 @@ struct ncclEpHandle {
             size_t preprocessing_zero_region_size;
             size_t preprocessing_s2d_size;
             void* preprocessing_scan_tmp;
-            int32_t* per_expert_counts_tmp;
         } hybridep;
     };
 
@@ -1409,7 +1408,7 @@ static size_t ll_handle_mem_size(ncclEpGroup_t ep_group, int num_topk) {
 // Single source of truth shared by ht_handle_mem_size() and ht_init_handle().
 struct HtBlockLayout {
     size_t sz_routing, sz_r2a, sz_a2r, sz_ler, sz_ntfe;
-    size_t sz_s2d, sz_rank_mask, sz_scan_tmp, sz_prob, sz_ec_tmp;
+    size_t sz_s2d, sz_rank_mask, sz_scan_tmp, sz_prob;
     size_t zero_region, no_memset_region, total;
 
     static HtBlockLayout compute(ncclEpGroup_t ep_group) {
@@ -1434,9 +1433,8 @@ struct HtBlockLayout {
         L.sz_scan_tmp  = align256(nccl_ep::hybridep::get_preprocessing_scan_tmp_size(n_ranks_per_node));
         L.sz_prob      = !is_internode_available(ep_group) ?
                              align256(static_cast<size_t>(max_tokens) * num_experts * sizeof(float)) : 0;
-        L.sz_ec_tmp    = align256(static_cast<size_t>(experts_per_rank) * sizeof(int32_t));
         L.zero_region      = L.sz_routing + L.sz_r2a + L.sz_a2r + L.sz_ler + L.sz_ntfe;
-        L.no_memset_region = L.sz_rank_mask + L.sz_scan_tmp + L.sz_prob + L.sz_ec_tmp;
+        L.no_memset_region = L.sz_rank_mask + L.sz_scan_tmp + L.sz_prob;
         L.total = L.zero_region + L.sz_s2d + L.no_memset_region;
         return L;
     }
@@ -1538,7 +1536,6 @@ static ncclResult_t ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group
     } else {
         handle->hybridep.dense_prob_buffer     = nullptr;
     }
-    handle->hybridep.per_expert_counts_tmp     = reinterpret_cast<int32_t*>(ptr + offset); offset += L.sz_ec_tmp;
 
     if (is_internode_available(ep_group)) {
         handle->hybridep.dense_prob_buffer             = ep_group->ht_buffers.dense_prob_buffer;
@@ -1612,12 +1609,9 @@ ncclResult_t ncclEpUpdateHandle(
 
     assert(handle->num_tokens <= static_cast<int>(ep_group->config.max_tokens_per_rank) && "Token count exceeds HT buffer capacity");
 
-    // Optional: per-expert token counts output (device only; host tag not supported here)
     ncclNDTensor_t recv_expert_counter = nullptr;
     if (num_local_tensors > 0) {
         recv_expert_counter = find_tensor_by_tag(local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE);
-        assert(find_tensor_by_tag(local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST) == nullptr &&
-            "NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST is not supported in ncclEpUpdateHandle; use DEVICE tag instead");
     }
 
     const int num_experts = ep_group->config.num_experts;

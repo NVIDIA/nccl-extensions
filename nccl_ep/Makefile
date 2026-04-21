@@ -129,6 +129,18 @@ $(INCDIR)/%.hpp: include/%.hpp
 # Include generated dependency files (the - prefix silences errors if files don't exist yet)
 -include $(ALL_OBJ:.o=.d)
 
+# Detect CUPTI headers at compile time (optional; enables kernel-level GPU timing)
+CUPTI_AVAILABLE := $(shell echo '\#include <cupti.h>' | $(CXX) -x c++ -E - >/dev/null 2>&1 && echo 1)
+ifeq ($(CUPTI_AVAILABLE),1)
+  CUPTI_CFLAGS  := -DHAVE_CUPTI
+  CUPTI_LDFLAGS := -lcupti
+else
+  $(info NOTE: CUPTI headers not found — ep_bench will build without kernel-level timing.)
+  $(info       Ensure CUDA Toolkit with CUPTI headers is installed, or set CPATH accordingly.)
+  CUPTI_CFLAGS  :=
+  CUPTI_LDFLAGS :=
+endif
+
 # Build ep_test and ep_bench (require MPI)
 ifeq ($(MPI), 1)
 MPI_CFLAGS := -DMPI_SUPPORT -I$(MPI_HOME)/include
@@ -137,9 +149,9 @@ MPI_LDFLAGS := -L$(MPI_HOME)/lib -lmpi
 EP_TEST_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) --compiler-options "-fPIC" -ccbin $(CXX) $(CXXSTD)
 EP_TEST_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda
 
-# ep_bench: performance benchmark (NVTX for profiling, CUPTI for kernel timing)
-EP_BENCH_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) --compiler-options "-fPIC" -ccbin $(CXX) $(CXXSTD)
-EP_BENCH_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda -lcupti
+# ep_bench: performance benchmark (NVTX for profiling, optional CUPTI for kernel timing)
+EP_BENCH_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) $(CUPTI_CFLAGS) --compiler-options "-fPIC" -ccbin $(CXX) $(CXXSTD)
+EP_BENCH_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(CUPTI_LDFLAGS)
 ep_test: lib $(DST_DIR)/ep_test
 ep_bench: lib $(DST_DIR)/ep_bench
 
@@ -169,8 +181,8 @@ MPI_LDFLAGS := -lmpi_ibm
 
 EP_TEST_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) --compiler-options "-fPIC" -ccbin $(CXX) $(CXXSTD)
 EP_TEST_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda
-EP_BENCH_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) --compiler-options "-fPIC" -ccbin $(CXX) $(CXXSTD)
-EP_BENCH_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda -lcupti
+EP_BENCH_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) $(CUPTI_CFLAGS) --compiler-options "-fPIC" -ccbin $(CXX) $(CXXSTD)
+EP_BENCH_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(CUPTI_LDFLAGS)
 ep_test: lib $(DST_DIR)/ep_test
 ep_bench: lib $(DST_DIR)/ep_bench
 

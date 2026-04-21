@@ -23,7 +23,9 @@
 #include <mpi.h>
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
+#ifdef HAVE_CUPTI
 #include <cupti.h>
+#endif
 #include <nvtx3/nvToolsExt.h>
 #include <nccl.h>
 #include <nccl_device.h>
@@ -58,11 +60,16 @@
 } while(0)
 
 // ============================================================================
-// KernelTimer: CUPTI Activity API-based per-kernel GPU timing
+// KernelTimer: per-kernel GPU timing (requires CUPTI)
 // ============================================================================
-// Records per-kernel GPU execution times by matching kernel name substrings.
-// Entirely benchmark-side — zero impact on the production nccl_ep library.
-// Same mechanism used by PyTorch kineto (torch.profiler).
+// When HAVE_CUPTI is defined, uses the CUPTI Activity API to record per-kernel
+// GPU execution times by matching kernel name substrings.  Entirely
+// benchmark-side — zero impact on the production nccl_ep library.
+//
+// Without CUPTI, a no-op stub is provided so ep_bench still compiles and runs;
+// kernel-level timing simply reports 0.
+
+#ifdef HAVE_CUPTI
 
 #define CUPTI_CALL(call) do {                                                  \
     CUptiResult _s = (call);                                                   \
@@ -139,6 +146,18 @@ public:
         fflush(stdout);
     }
 };
+
+#else // !HAVE_CUPTI
+
+class KernelTimer {
+public:
+    void start() {}
+    void stop() {}
+    double get_avg_us(const char*) const { return 0.0; }
+    void dump(int) const {}
+};
+
+#endif // HAVE_CUPTI
 
 static uint64_t getHostHash(const char* string) {
   uint64_t result = 5381;
@@ -1846,6 +1865,11 @@ int main(int argc, char* argv[]) {
         printf("  NVLink:          %s\n", disable_nvlink ? "disabled (force RDMA intranode, LL only)" : "enabled");
         printf("  Validate mode:   %s\n", validate_data ? "enabled" : "disabled");
         printf("  Dynamic tokens:  %s\n", dynamic_tokens ? "enabled (NCCL_EP_AUTO)" : "disabled");
+#ifdef HAVE_CUPTI
+        printf("  CUPTI:           enabled (kernel-level GPU timing available)\n");
+#else
+        printf("  CUPTI:           not available (kernel timing will report 0; ensure CUDA Toolkit with CUPTI headers is installed)\n");
+#endif
         printf("\n");
     }
 

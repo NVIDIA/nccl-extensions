@@ -959,7 +959,7 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
   get_comm_ctx(global_channel, num_ctx_per_comm, comm_idx, ctx_idx);
 
   ncclGin net(dcomms[comm_idx], ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
-  ncclTeam world = ncclTeamWorld(dcomms[comm_idx]);
+  ncclTeam rail = ncclTeamRail(dcomms[comm_idx]);
 
   for (int chunk_idx = blockIdx.x * N2N_WARPS + n2n_warp_id;
        chunk_idx < NUM_OF_CHUNKS_PER_RANK;
@@ -1001,7 +1001,7 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
         bool need_write = attn_to_rdma_map[((chunk_base_token_idx + token_idx_in_chunk) * (NUM_LSA_TEAMS - 1)) + remote_idx];
         if (need_write) {
           int token_idx = chunk_base_token_idx + token_idx_in_chunk;
-          net.put(world, remote_node_id,
+          net.put(rail, remote_node_id,
                   nccl_window, dst_offset,
                   nccl_window, smem_mr_info_ptr->attn_input_token_offset + token_idx * token_bytes,
                   token_bytes,
@@ -1009,7 +1009,7 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
 
           if constexpr(FORWARD_DISPATCH) {
             size_t offset = dst_offset + token_bytes;
-            net.put(world, remote_node_id,
+            net.put(rail, remote_node_id,
                     nccl_window, offset,
                     nccl_window, smem_mr_info_ptr->attn_input_prob_offset + (token_idx * NUM_LSA_TEAMS + remote_node_id) * prob_bytes,
                     prob_bytes,
@@ -1018,7 +1018,7 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
 
           if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
             size_t offset = dst_offset + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
-            net.put(world, remote_node_id,
+            net.put(rail, remote_node_id,
                     nccl_window, offset,
                     nccl_window, smem_mr_info_ptr->attn_input_scaling_factor_offset + (token_idx * sf_bytes),
                     sf_bytes,
@@ -1037,7 +1037,7 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
                                   remote_node_id * (num_of_ranks_per_node * MAX_CHUNKS_PER_RANK) +
                                   local_rank * MAX_CHUNKS_PER_RANK +
                                   chunk_idx;
-      net.signal(world, remote_node_id,
+      net.signal(rail, remote_node_id,
                   ncclGin_SignalAdd{tail_signal_id, 1},
                   ncclCoopWarp(),
                   ncclGin_None{},
@@ -2254,8 +2254,7 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const 
   for (int i = blockIdx.x; i < TOTAL_NUM_OF_CHUNKS; i += NUM_OF_BLOCKS) {
     // Which node this chunk will be sent to.
     int node_id = (i % (NUM_LSA_TEAMS - 1) + (node_rank + 1)) % NUM_LSA_TEAMS;
-    // With split comm (nNodes ranks), node index IS the rank in the communicator
-    int remote_global_rank = node_id;
+    // With rail-scoped GIN comms, node index maps to rail-team rank.
     int rank_in_remote = node_id < node_rank ? node_rank - 1 : node_rank;
     // What is the chunk id of this chunk for the node it will be sent to.
     int chunk_id = i / (NUM_LSA_TEAMS - 1);
@@ -2268,7 +2267,7 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const 
     int comm_idx, ctx_idx;
     get_comm_ctx(global_channel, num_ctx_per_comm, comm_idx, ctx_idx);
     ncclGin net(dcomms[comm_idx], ctx_idx);
-    ncclTeam world = ncclTeamWorld(dcomms[comm_idx]);
+    ncclTeam rail = ncclTeamRail(dcomms[comm_idx]);
     int rdma_remote_node_id = node_id > node_rank ? node_id - 1 : node_id;
     int chunk_base_token_idx = node_id * rdma_to_attn_map_size_per_node + chunk_id * NUM_OF_TOKENS_PER_CHUNK;
     int token_range = NUM_OF_TOKENS_PER_CHUNK;
@@ -2306,7 +2305,7 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const 
             size_t token_dst_offset = smem_mr_info_ptr->combine_rdma_inter_node_group_token_offset +
                 (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) *
                 HIDDEN_DIM * sizeof(uint16_t);
-            net.put(world, remote_global_rank,
+            net.put(rail, node_id,
                     nccl_window, token_dst_offset,
                     nccl_window, token_src_offset,
                     batch_count * HIDDEN_DIM * sizeof(uint16_t),
@@ -2319,7 +2318,7 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const 
               size_t prob_dst_offset = smem_mr_info_ptr->combine_rdma_inter_node_group_prob_offset +
                   (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) *
                   (experts_per_rank * num_of_ranks_per_node) * sizeof(float);
-              net.put(world, remote_global_rank,
+              net.put(rail, node_id,
                       nccl_window, prob_dst_offset,
                       nccl_window, prob_src_offset,
                       batch_count * (experts_per_rank * num_of_ranks_per_node) * sizeof(float),
@@ -2345,7 +2344,7 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const 
         unsigned signal_id = signals_base + combine_signal_offset +
             local_rank * (NUM_LSA_TEAMS * MAX_CHUNKS_PER_RANK) +
             node_rank * MAX_CHUNKS_PER_RANK + chunk_id;
-        net.signal(world, remote_global_rank,
+        net.signal(rail, node_id,
                    ncclGin_SignalAdd{signal_id, 1},
                    ncclCoopThread(), ncclGin_None{},
                    cuda::thread_scope_thread, cuda::thread_scope_thread);
@@ -2385,7 +2384,7 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const 
             size_t token_dst_offset = smem_mr_info_ptr->combine_rdma_inter_node_group_token_offset +
                 (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) *
                 HIDDEN_DIM * sizeof(uint16_t);
-            net.put(world, remote_global_rank,
+            net.put(rail, node_id,
                     nccl_window, token_dst_offset,
                     nccl_window, token_src_offset,
                     batch_count * HIDDEN_DIM * sizeof(uint16_t),
@@ -2398,7 +2397,7 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const 
               size_t prob_dst_offset = smem_mr_info_ptr->combine_rdma_inter_node_group_prob_offset +
                   (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) *
                   (experts_per_rank * num_of_ranks_per_node) * sizeof(float);
-              net.put(world, remote_global_rank,
+              net.put(rail, node_id,
                       nccl_window, prob_dst_offset,
                       nccl_window, prob_src_offset,
                       batch_count * (experts_per_rank * num_of_ranks_per_node) * sizeof(float),
@@ -2416,7 +2415,7 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const 
         unsigned signal_id = signals_base + combine_signal_offset +
             local_rank * (NUM_LSA_TEAMS * MAX_CHUNKS_PER_RANK) +
             node_rank * MAX_CHUNKS_PER_RANK + chunk_id;
-        net.signal(world, remote_global_rank,
+        net.signal(rail, node_id,
                    ncclGin_SignalAdd{signal_id, 1},
                    ncclCoopThread(), ncclGin_None{},
                    cuda::thread_scope_thread, cuda::thread_scope_thread);

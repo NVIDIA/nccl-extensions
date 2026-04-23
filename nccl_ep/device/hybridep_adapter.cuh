@@ -22,7 +22,7 @@ namespace hybridep {
 // ============================================================================
 // Runtime constants (from ep_group, not hardcoded):
 //   lsa_team_size  - ncclTeamLsa(comm).nRanks  (up to 72 for MNNVL/NVL72)
-//   rdma_ranks     - nRanks / lsa_team_size
+//   rdma_team_size - ncclTeamRail(comm).nRanks
 //   num_local_experts, hidden
 //
 // Use HYBRIDEP_SWITCH_* macros to instantiate templates with runtime values.

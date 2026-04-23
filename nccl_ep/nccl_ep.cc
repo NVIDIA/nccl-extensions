@@ -1614,7 +1614,7 @@ ncclResult_t ncclEpUpdateHandle(
     const int num_experts = ep_group->config.num_experts;
     const int max_tokens = ep_group->config.max_tokens_per_rank;
     const int n_ranks_per_node = ep_group->lsa_team_size;
-    const int nNodes = ep_group->nNodes;
+    const int nNodes = ep_group->rdma_team_size;
     const int experts_per_rank = ep_group->num_local_experts;
     const int num_experts_packed = (num_experts + 7) / 8;
 
@@ -1673,8 +1673,8 @@ ncclResult_t ncclEpUpdateHandle(
         handle->hybridep.local_expert_routing_map,
         per_expert_counts_device,
         handle->hybridep.preprocessing_scan_tmp,
-        ep_group->node_id,
-        ep_group->rank_in_node,
+        ep_group->rdma_rank,
+        ep_group->lsa_rank,
         handle->num_tokens,
         ep_group->hidden,
         nNodes,

@@ -435,7 +435,7 @@ __forceinline__ __device__ void copyRecvTokenData(
     }
 }
 
-template <bool kUseFP8, bool kUseUE8M0, int kHidden>
+template <bool kUseFP8, bool kUseUE8M0, int kHidden, ncclEpLayout_t kLayout>
 __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
                                                     const void* inData,
                                                     const int64_t* inTopkIdx,
@@ -474,6 +474,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
                                                     ncclDevComm* devComms,
                                                     const ncclWindow_t* windows,
                                                     unsigned signalsBase) {
+    static_assert(kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR, "rank-major dispatch not yet implemented");
     const auto smId = static_cast<int>(blockIdx.x);
     const auto threadId = static_cast<int>(threadIdx.x);
     const auto warpId = threadId / 32, laneId = get_lane_id();
@@ -501,7 +502,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
     // Message package: header, hidden data, FP8 scales
     // NOTES: header contains token_id + expert_id per topk
     using vec_t = std::conditional_t<kUseFP8, int2, int4>;
-    const size_t dispatch_hdr_sz = get_dispatch_hdr_sz(numTopk);
+    const size_t dispatch_hdr_sz = get_dispatch_hdr_sz<kLayout>(numTopk);
     const size_t numBytesPerMsg = dispatch_hdr_sz + (kUseFP8 ?
                                                      (kHidden + numScales * sizeof(float)) :
                                                      (kHidden * sizeof(nv_bfloat16)));
@@ -518,7 +519,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
         goto LOW_LATENCY_DISPATCH_RECV;
 
 
-    
+
     // There are 2 kinds of warps in this part:
     // 1. The first-kind warps for FP8 cast and sending top-k tokens
     // 2. The last warp for reading `topk_idx` and count for per-expert information
@@ -542,9 +543,9 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
             // Each expert is handled by a different warp in the SM.
             auto dstExpertIdx = warpId < numTopk ? static_cast<int>(__ldg(inTopkIdx + tokenIdx * numTopk + warpId)) : -1;
             auto dstRank = getExpertRankIdx(dstExpertIdx, numLocalExperts);
-            
+
             // Write token_id and routing information
-            auto* sendBufHdr = reinterpret_cast<DispatchHdr*>(sendBufBase);
+            auto* sendBufHdr = reinterpret_cast<DispatchHdr<kLayout>*>(sendBufBase);
             // Only lane0's of warps responsible for sending the token are
             // writing the header.
             if (warpId < numTopk and laneId == 0) {
@@ -620,7 +621,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
         constexpr int kNumMaxRanks = 32;
         int rankCount[kNumMaxRanks] = {0};
         uint64_t rankMap[kNumMaxRanks] = {0};
-    
+
         const auto expertBeginIdx = smId * numWarpGroups;
         const auto expertEndIdx = min(expertBeginIdx + numWarpGroups, numExperts);
 
@@ -642,7 +643,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
                 atomic_add_release_global(rankDone + i, FINISHED_SUM_TAG - sharedNumTokensSentPerRank[i - rankBeginIdx]);
             }
         }
-    } 
+    }
 
     __syncthreads();
 
@@ -733,7 +734,7 @@ LOW_LATENCY_DISPATCH_RECV:
         for (int i = rankLaneIdx * numWarpsPerGroup + subWarpId; i < numRecvTokens; i += numWarpsPerGroup * numLocalExperts) {
             const auto recvBufUint8 = reinterpret_cast<uint8_t*>(recvBuf) + srcRank * maxTokensPerRank * numBytesPerMsg;
             const auto recvTokenMsg = (const uint8_t*)(recvBufUint8 + i * numBytesPerMsg);
-            const auto recvBufHdr = reinterpret_cast<const DispatchHdr*>(recvTokenMsg);
+            const auto recvBufHdr = reinterpret_cast<const DispatchHdr<kLayout>*>(recvTokenMsg);
             const auto slotsPerToken = numTopk + 1; // token_id + topk_idx's
             const auto recvSrcInfo = recvSrcInfoBase + (srcRank * maxTokensPerRank + i) * slotsPerToken;
             const auto recvSrcTopkInfo = recvSrcInfo + 1;
@@ -750,12 +751,12 @@ LOW_LATENCY_DISPATCH_RECV:
                     recvSrcTopkInfo[j] = -1;
                     continue;
                 }
-        
+
                 // Locate the output base for the local expert
                 int outDataOffset = localExpertIdx * numRanks * maxTokensPerRank;
                 const auto outDataInt4 = static_cast<int4*>((outDataBuf) + outDataOffset * hiddenBytes);
                 const auto outScales = static_cast<scale_t*>(outScalesBuf) + outDataOffset * numAlignedScales;
-        
+
                 // Locate the next available slot
                 int recvTokenBeginIdx = 0;
                 if (laneId == 0) {
@@ -764,7 +765,7 @@ LOW_LATENCY_DISPATCH_RECV:
                     recvSrcTopkInfo[j] = outDataOffset + recvTokenBeginIdx;
                 }
                 recvTokenBeginIdx = __shfl_sync(0xFFFFFFFF, recvTokenBeginIdx, 0);
-      
+
 
                 // MEMOPT: Possibly we need to fix it
                 copyRecvTokenData<kUseFP8, kUseUE8M0>(
@@ -784,11 +785,14 @@ LOW_LATENCY_DISPATCH_RECV:
 
 void dispatch(const void* inData,
               const int64_t* inTopkIdx,
+              const float* inTopkWeights,
               void* outDataBuf,
               void* outScalesBuf,
               int* outSrcInfo,
               int64_t* outLayout,
               int* outCnt,
+              float* outRecvTopkWeights,
+              int32_t* outRecvTopkIdx,
               void* sendBuf,
               void* recvBuf,
               int* recvCntBuf,
@@ -809,6 +813,7 @@ void dispatch(const void* inData,
               bool useFp8,
               bool roundScale,
               bool useUe8m0,
+              ncclEpLayout_t layout,
               int phases,
               int numComms,
               ncclDevComm* devComms,
@@ -838,12 +843,15 @@ void dispatch(const void* inData,
     if (useUe8m0)
         EP_HOST_ASSERT(roundScale and "UE8M0 SF requires `round_scale=True`");
 
+    SETUP_LAUNCH_CONFIG(numSms, numWarps * 32, stream);
+    switch (layout) {
+        case NCCL_EP_LAYOUT_EXPERT_MAJOR: {
 #define DISPATCH_LAUNCH_CASE(hidden) { \
-auto dispatchFunc = dispatch<false, false, hidden>; \
+auto dispatchFunc = dispatch<false, false, hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR>; \
 if (useFp8 and not useUe8m0) \
-    dispatchFunc = dispatch<true, false, hidden>; \
+    dispatchFunc = dispatch<true, false, hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR>; \
 if (useFp8 and useUe8m0) \
-    dispatchFunc = dispatch<true, true, hidden>; \
+    dispatchFunc = dispatch<true, true, hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR>; \
 LAUNCH_KERNEL(&cfg, dispatchFunc, \
               inData, \
               inTopkIdx, \
@@ -879,11 +887,13 @@ LAUNCH_KERNEL(&cfg, dispatchFunc, \
               devComms, \
               windows, \
               signalsBase); } break
-
-    SETUP_LAUNCH_CONFIG(numSms, numWarps * 32, stream);
-    SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
-
+            SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
+            break;
+        }
+        default:
+            EP_HOST_ASSERT(false && "rank-major dispatch not yet implemented");
+    }
 }
 
 template <int kNumSendUnrolls>
@@ -1291,14 +1301,14 @@ __forceinline__ __device__ void processAndSendToken(
         if (laneId == 0) {
             sendTokenViaRdma(
                 dstRank, rankLaneIdx, currRank, numRanks,
-                maxTokensPerRank, tokenIdx, 
+                maxTokensPerRank, tokenIdx,
                 sendOff, recvOff,
                 numBytesPerSlot, hidden, devComms, windows);
         }
     }
 }
 
-template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls>
+template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, ncclEpLayout_t kLayout>
 __global__ __launch_bounds__(1024, 1) void combine(// INPUT
                                                    const void* inData,
                                                    const int* srcInfo,
@@ -1335,6 +1345,7 @@ __global__ __launch_bounds__(1024, 1) void combine(// INPUT
                                                    ncclDevComm* devComms,
                                                    const ncclWindow_t* windows,
                                                    unsigned signalsBase) {
+    static_assert(kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR, "rank-major combine not yet implemented");
     const auto smId = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto numSms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
     const auto threadId = static_cast<int>(threadIdx.x);
@@ -1463,7 +1474,7 @@ __global__ __launch_bounds__(1024, 1) void combine(// INPUT
 
         // Put the finishing flag
         EP_DEVICE_ASSERT(numWarpsPerGroup > 1 and numWarpGroups < 16);
-        
+
         // TODO use the new sync primitive
         asm volatile("bar.sync %0, %1;" :: "r"(warpGroupId + 1), "r"(numWarpsPerGroup * 32));
         if (subWarpId == 1 and laneId == 0) {
@@ -1688,6 +1699,7 @@ void combine(const void* inData,
              int currRank,
              int numRanks,
              bool useLogfmt,
+             ncclEpLayout_t layout,
              int phases,
              bool zeroCopy,
              int numComms,
@@ -1729,10 +1741,13 @@ void combine(const void* inData,
     // Total requirement
     const int smem_size = max(smemSendSize, smemRecvSize);
 
+    SETUP_LAUNCH_CONFIG(numSms, numWarps * 32, stream);
+    switch (layout) {
+        case NCCL_EP_LAYOUT_EXPERT_MAJOR: {
 #define COMBINE_LAUNCH_CASE(hidden) { \
 if (useLogfmt) { \
-    SET_SHARED_MEMORY_FOR_TMA((combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls>)); \
-    LAUNCH_KERNEL(&cfg, combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls>, \
+    SET_SHARED_MEMORY_FOR_TMA((combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls, NCCL_EP_LAYOUT_EXPERT_MAJOR>)); \
+    LAUNCH_KERNEL(&cfg, (combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls, NCCL_EP_LAYOUT_EXPERT_MAJOR>), \
                   inData, \
                   srcInfo, \
                   layoutRange, \
@@ -1766,8 +1781,8 @@ if (useLogfmt) { \
                   windows, \
                   signalsBase); \
 } else { \
-    SET_SHARED_MEMORY_FOR_TMA((combine<false, hidden, kCombineMaxTopk, kCombineMaxUnrolls>)); \
-    LAUNCH_KERNEL(&cfg, combine<false, hidden, kCombineMaxTopk, kCombineMaxUnrolls>, \
+    SET_SHARED_MEMORY_FOR_TMA((combine<false, hidden, kCombineMaxTopk, kCombineMaxUnrolls, NCCL_EP_LAYOUT_EXPERT_MAJOR>)); \
+    LAUNCH_KERNEL(&cfg, (combine<false, hidden, kCombineMaxTopk, kCombineMaxUnrolls, NCCL_EP_LAYOUT_EXPERT_MAJOR>), \
                   inData, \
                   srcInfo, \
                   layoutRange, \
@@ -1801,10 +1816,13 @@ if (useLogfmt) { \
                   windows, \
                   signalsBase); \
 } } break
-
-    SETUP_LAUNCH_CONFIG(numSms, numWarps * 32, stream);
-    SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
+            SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
+            break;
+        }
+        default:
+            EP_HOST_ASSERT(false && "rank-major combine not yet implemented");
+    }
 }
 
 } // namespace internode_ll

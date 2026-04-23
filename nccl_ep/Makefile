@@ -75,7 +75,7 @@ SOLIBNAME := libnccl_ep.so
 SOLIBTARGET := $(LIBDIR)/$(SOLIBNAME)
 
 # Header installation
-HEADERS := include/nccl_ep.h include/common.hpp
+HEADERS := include/nccl_ep.h include/ep_enums.h include/common.hpp
 HEADER_TARGETS := $(HEADERS:include/%=$(INCDIR)/%)
 
 # Build targets

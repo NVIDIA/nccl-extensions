@@ -75,6 +75,7 @@
 #include "nccl.h"
 #include "nccl_device.h"
 #include "device/macros.cuh"
+#include "ep_enums.h"
 
 namespace nccl_ep {
 
@@ -88,22 +89,56 @@ __host__ __device__ constexpr dtype_t align(dtype_t a, dtype_t b) {
     return ((a + b - 1) / b) * b;
 }
 
-// Dispatch message header structures (optimized path)
-struct DispatchRouter {
+// Per-hop routing entry in the dispatch message header.
+// Rank-major carries the topk weight on the wire so the receiver can write
+// outRecvTopkWeights without an extra round-trip. Expert-major omits it,
+// keeping the per-entry overhead at 2 bytes regardless of num_topk.
+template <ncclEpLayout_t kLayout>
+struct DispatchRouter;
+
+template <>
+struct DispatchRouter<NCCL_EP_LAYOUT_RANK_MAJOR> {
+    float    topk_weight;  // written to outRecvTopkWeights on the receive side
     uint16_t expert_id;
+    // sizeof = 8: float(4) + uint16_t(2) + 2 bytes implicit pad
 };
 
-struct DispatchHdr {
+template <>
+struct DispatchRouter<NCCL_EP_LAYOUT_EXPERT_MAJOR> {
+    uint16_t expert_id;
+    // sizeof = 2
+};
+
+static_assert(sizeof(DispatchRouter<NCCL_EP_LAYOUT_RANK_MAJOR>)   == 8, "unexpected rank-major router size");
+static_assert(sizeof(DispatchRouter<NCCL_EP_LAYOUT_EXPERT_MAJOR>) == 2, "unexpected expert-major router size");
+
+// Dispatch message header: token identity + per-topk routing entries.
+// alignas(16): header objects are 16-byte aligned in the RDMA buffer.
+template <ncclEpLayout_t kLayout>
+struct alignas(16) DispatchHdr {
     int token_id;
-    DispatchRouter rtr[];  // Flexible array member (Note: this is not a C++ standard, but a CUDA extension)
+    DispatchRouter<kLayout> rtr[];  // Flexible array member (Note: this is not a C++ standard, but a CUDA extension)
 };
 
-// Calculate dispatch header size aligned to int4 boundary (16 bytes) for compatibility
+static_assert(offsetof(DispatchHdr<NCCL_EP_LAYOUT_RANK_MAJOR>,   rtr) == 4, "unexpected rank-major rtr offset");
+static_assert(offsetof(DispatchHdr<NCCL_EP_LAYOUT_EXPERT_MAJOR>, rtr) == 4, "unexpected expert-major rtr offset");
+
+// Dispatch header wire size: token_id prefix through last rtr entry, rounded up
+// to int4 (16-byte) boundary for vectorized RDMA access.
+template <ncclEpLayout_t kLayout>
 __host__ __device__ __forceinline__
 size_t get_dispatch_hdr_sz(int num_topk) {
-    const size_t base_sz = sizeof(DispatchHdr) + num_topk * sizeof(DispatchRouter);
-    // Align to int4 (16 bytes) to maintain compatibility with existing vectorized operations
+    const size_t base_sz = offsetof(DispatchHdr<kLayout>, rtr) +
+                           static_cast<size_t>(num_topk) * sizeof(DispatchRouter<kLayout>);
     return align<size_t>(base_sz, sizeof(int4));
+}
+
+// Runtime overload: selects the correct template specialisation based on layout.
+__host__ __forceinline__
+size_t get_dispatch_hdr_sz(int num_topk, ncclEpLayout_t layout) {
+    return layout == NCCL_EP_LAYOUT_RANK_MAJOR
+        ? get_dispatch_hdr_sz<NCCL_EP_LAYOUT_RANK_MAJOR>(num_topk)
+        : get_dispatch_hdr_sz<NCCL_EP_LAYOUT_EXPERT_MAJOR>(num_topk);
 }
 
 void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
@@ -112,11 +147,14 @@ void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
 
 void dispatch(const void* inData,
               const int64_t* inTopkIdx,
+              const float* inTopkWeights,    // rank-major: written into dispatch message header
               void* outDataBuf,
               void* outScalesBuf,
               int* outSrcInfo,
               int64_t* outLayout,
               int* outCnt,
+              float* outRecvTopkWeights,     // rank-major: received topk weights; nullptr for expert-major
+              int32_t* outRecvTopkIdx,       // rank-major: received topk indices;  nullptr for expert-major
               void* sendBuf,
               void* recvBuf,
               int* recvCntBuf,
@@ -137,6 +175,7 @@ void dispatch(const void* inData,
               bool use_fp8,
               bool roundScale,
               bool use_ue8m0,
+              ncclEpLayout_t layout,
               int phases,
               int numComms,
               ncclDevComm* devComms,
@@ -169,6 +208,7 @@ void combine(const void* inData,
              int currRank,
              int numRanks,
              bool useLogFmt,
+             ncclEpLayout_t layout,
              int phases,
              bool zeroCopy,
              int numComms,
@@ -220,7 +260,7 @@ struct LowLatencyLayout {
         return reinterpret_cast<out_ptr_t>(reinterpret_cast<count_ptr_t>(ptr) + count);
     }
 
-    LowLatencyLayout(void* rdma_buffer, int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts, int num_topk) {
+    LowLatencyLayout(void* rdma_buffer, int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts, int num_topk, ncclEpLayout_t layout) {
         const int num_scales = hidden / 128;
 
         // Dispatch and combine layout:
@@ -233,7 +273,7 @@ struct LowLatencyLayout {
         // NOTES: `num_scales * sizeof(nv_bfloat162)` means the per-128-channel min/max
         EP_HOST_ASSERT(num_scales * sizeof(float) <= hidden);
 
-        size_t disp_hdr_sz = internode_ll::get_dispatch_hdr_sz(num_topk);
+        size_t disp_hdr_sz = internode_ll::get_dispatch_hdr_sz(num_topk, layout);
         size_t num_bytes_per_dispatch_msg = disp_hdr_sz + std::max(hidden * sizeof(nv_bfloat16),
                                                                           hidden + num_scales * sizeof(float));
         size_t num_bytes_per_combine_msg = num_scales * sizeof(nv_bfloat162) + hidden * sizeof(nv_bfloat16);
@@ -245,9 +285,11 @@ struct LowLatencyLayout {
         EP_HOST_ASSERT(send_buffer_bytes % sizeof(int4) == 0);
         total_bytes += send_buffer_bytes * 2;
 
-        // Symmetric receive buffers
-        size_t dispatch_recv_data_buffer_bytes = num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
-        size_t combine_recv_buffer_bytes = num_max_dispatch_tokens_per_rank * num_bytes_per_combine_msg * num_topk;
+        // Symmetric receive buffers: the RDMA wire is always rank-major regardless of user-facing layout.
+        size_t dispatch_recv_data_buffer_bytes =
+            static_cast<size_t>(num_ranks) * static_cast<size_t>(num_max_dispatch_tokens_per_rank) * num_bytes_per_dispatch_msg;
+        size_t combine_recv_buffer_bytes =
+            static_cast<size_t>(num_max_dispatch_tokens_per_rank) * num_bytes_per_combine_msg * static_cast<size_t>(num_topk);
         size_t recv_buffer_bytes = std::max(dispatch_recv_data_buffer_bytes, combine_recv_buffer_bytes);
         EP_HOST_ASSERT(recv_buffer_bytes % sizeof(int4) == 0);
         total_bytes += recv_buffer_bytes * 2;
@@ -277,8 +319,8 @@ struct LowLatencyLayout {
     }
 };
 
-inline unsigned long int get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
-    auto num_bytes = LowLatencyLayout(nullptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, MAX_NUM_TOPK).total_bytes;
+inline unsigned long int get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts, ncclEpLayout_t layout) {
+    auto num_bytes = LowLatencyLayout(nullptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, MAX_NUM_TOPK, layout).total_bytes;
     return ((num_bytes + NUM_BUFFER_ALIGNMENT_BYTES) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES;
 }
 

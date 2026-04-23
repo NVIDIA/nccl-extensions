@@ -858,6 +858,16 @@ ncclResult_t ncclEpCreateGroup(
     assert((in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY ||
             in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) &&
            "ncclEpCreateGroup: invalid algorithm, supported: low_latency, high_throughput");
+    const ncclEpLayout_t effective_layout =
+        (in_config->layout != NCCL_EP_LAYOUT_AUTO) ? in_config->layout :
+        (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) ? NCCL_EP_LAYOUT_RANK_MAJOR :
+                                                                  NCCL_EP_LAYOUT_EXPERT_MAJOR;
+    EP_HOST_ASSERT(!(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
+                     effective_layout != NCCL_EP_LAYOUT_RANK_MAJOR) &&
+                   "ncclEpCreateGroup: HT mode requires rank-major layout");
+    EP_HOST_ASSERT(!(in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY &&
+                     effective_layout != NCCL_EP_LAYOUT_EXPERT_MAJOR) &&
+                   "ncclEpCreateGroup: LL mode only supports expert-major layout");
 
     bool low_latency_mode = (in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY);
     bool hybridep_mode = (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT);
@@ -888,6 +898,9 @@ ncclResult_t ncclEpCreateGroup(
     // Store configuration
     ep_group->comm = comm;
     ep_group->config = *in_config;
+    ep_group->config.layout = effective_layout;
+    EP_HOST_ASSERT(ep_group->config.layout != NCCL_EP_LAYOUT_AUTO &&
+                   "ncclEpCreateGroup: layout was not resolved from AUTO");
     // C-style cast required: cudaMalloc/cudaFree are overloaded and reinterpret_cast
     // cannot disambiguate overloaded functions.
     ep_group->alloc_fn = alloc_fn ? alloc_fn : (ncclEpAllocFn_t)cudaMalloc;
@@ -919,7 +932,7 @@ ncclResult_t ncclEpCreateGroup(
     }
 
     if (ep_group->config.rdma_buffer_size == NCCL_EP_AUTO && ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        ep_group->config.rdma_buffer_size = nccl_ep::get_low_latency_rdma_size_hint(ep_group->config.max_tokens_per_rank, ep_group->hidden, ep_group->nRanks, ep_group->config.num_experts);
+        ep_group->config.rdma_buffer_size = nccl_ep::get_low_latency_rdma_size_hint(ep_group->config.max_tokens_per_rank, ep_group->hidden, ep_group->nRanks, ep_group->config.num_experts, ep_group->config.layout);
     }
 
     if (ep_group->config.num_qp_per_rank == NCCL_EP_AUTO) {
@@ -1437,7 +1450,7 @@ ncclResult_t ncclEpCreateHandle(
 
         assert((ep_group->config.max_tokens_per_rank * handle->group->num_local_experts) % 4 == 0 and "TMA requires the number of tokens to be multiple of 4");
 
-        handle->ll.layout = nccl_ep::LowLatencyLayout(handle->group->rdma_buffer, handle->group->config.max_tokens_per_rank, handle->group->hidden, handle->group->nRanks, handle->group->config.num_experts, handle->num_topk);
+        handle->ll.layout = nccl_ep::LowLatencyLayout(handle->group->rdma_buffer, handle->group->config.max_tokens_per_rank, handle->group->hidden, handle->group->nRanks, handle->group->config.num_experts, handle->num_topk, handle->group->config.layout);
 
         assert(handle->ll.layout.total_bytes <= handle->group->config.rdma_buffer_size);
     } else { // HT
@@ -1708,11 +1721,34 @@ ncclResult_t ncclEpDispatch(
             outputs, num_outputs, NCCL_EP_TENSOR_TAG_SCALES
         );
         assert(recv_x != nullptr);
-        assert(recv_x->ndim == 3);
         assert(tensor_is_contiguous(recv_x));
-        assert(recv_x->sizes[0] == group->num_local_experts);
-        assert(recv_x->sizes[1] == group->nRanks * group->config.max_tokens_per_rank);
-        assert(recv_x->sizes[2] == group->hidden);
+
+        // Find rank-major-specific tensors unconditionally so we can assert
+        // their presence (rank-major) or absence (expert-major) in the switch below.
+        ncclNDTensor_t topk_weights_in   = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS);
+        ncclNDTensor_t recv_topk_weights = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_RECV_TOPK_WEIGHTS);
+        ncclNDTensor_t recv_topk_idx     = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_RECV_TOPK_IDX);
+
+        const unsigned num_recv_tokens = static_cast<unsigned>(group->nRanks) * group->config.max_tokens_per_rank;
+        switch (group->config.layout) {
+            case NCCL_EP_LAYOUT_RANK_MAJOR:
+                assert(recv_x->ndim == 2);
+                assert(recv_x->sizes[0] == num_recv_tokens);
+                assert(recv_x->sizes[1] == group->hidden);
+                assert(topk_weights_in   != nullptr);
+                assert(recv_topk_weights != nullptr);
+                assert(recv_topk_idx     != nullptr);
+                break;
+            default:
+                assert(recv_x->ndim == 3);
+                assert(recv_x->sizes[0] == group->num_local_experts);
+                assert(recv_x->sizes[1] == num_recv_tokens);
+                assert(recv_x->sizes[2] == group->hidden);
+                assert(topk_weights_in   == nullptr);
+                assert(recv_topk_weights == nullptr);
+                assert(recv_topk_idx     == nullptr);
+                break;
+        }
 
         if (scales != nullptr) {
             constexpr int scale_block_size = 128;
@@ -1749,6 +1785,9 @@ ncclResult_t ncclEpDispatch(
             auto* recv_count_data = static_cast<int*>(recv_count->data);
             auto* x_data = x->data;
             auto* topk_idx_data = static_cast<int64_t*>(handle->topk_idx->data);
+            auto* topk_weights_in_data = topk_weights_in ? static_cast<const float*>(topk_weights_in->data) : nullptr;
+            auto* recv_topk_weights_data = recv_topk_weights ? static_cast<float*>(recv_topk_weights->data) : nullptr;
+            auto* recv_topk_idx_data = recv_topk_idx ? static_cast<int32_t*>(recv_topk_idx->data) : nullptr;
 
             const bool use_fp8 = (scales != nullptr);
             const bool round_scale = config->round_scales;
@@ -1757,11 +1796,14 @@ ncclResult_t ncclEpDispatch(
             nccl_ep::internode_ll::dispatch(
                 x_data,
                 topk_idx_data,
+                topk_weights_in_data,
                 recv_x_data,
                 scales_data,
                 expert_recv_source_indices_data,
                 expert_dispatch_layout_data,
                 recv_count_data,
+                recv_topk_weights_data,
+                recv_topk_idx_data,
                 buffer.dispatch_rdma_send_buffer,
                 buffer.dispatch_rdma_recv_data_buffer,
                 buffer.dispatch_rdma_recv_count_buffer,
@@ -1782,6 +1824,7 @@ ncclResult_t ncclEpDispatch(
                 use_fp8,
                 round_scale,
                 use_ue8m0,
+                group->config.layout,
                 phases,
                 group->num_nccl_comms,
                 group->nccl_dev_comms,
@@ -2066,25 +2109,44 @@ ncclResult_t ncclEpCombine(
         ncclNDTensor_t src_info = handle->ll.expert_recv_source_indices;
         ncclNDTensor_t layout_range = handle->ll.expert_dispatch_layout;
 
-        // Find and validate local tensors
-        ncclNDTensor_t topk_weights = find_tensor_by_tag(
-            local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS
-        );
-            assert(topk_weights != nullptr);
+        // topk_weights: expert-major → local tensor; rank-major → input tensor (required in both cases)
+        ncclNDTensor_t topk_weights;
+        if (handle->group->config.layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+            topk_weights = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS);
+            EP_HOST_ASSERT(topk_weights != nullptr &&
+                           "rank-major combine requires TOPK_WEIGHTS in inputs");
+        } else {
+            topk_weights = find_tensor_by_tag(local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS);
+            EP_HOST_ASSERT(topk_weights != nullptr &&
+                           "expert-major combine requires TOPK_WEIGHTS in local_tensors");
+        }
 
         // Extract configuration values
         const int num_experts = handle->group->config.num_experts;
         const int num_ranks = handle->group->nRanks;
         const int num_max_dispatch_tokens_per_rank = handle->group->config.max_tokens_per_rank;
 
-        // Validate input tensor x
-        assert(x->ndim == 3);
+        // Validate input tensor x; extract hidden dimension (index differs by layout).
         assert(tensor_is_contiguous(x));
         assert(x->datatype == ncclBfloat16);
-            assert(x->sizes[0] == num_experts / num_ranks);
-            assert(x->sizes[1] == num_ranks * num_max_dispatch_tokens_per_rank);
-        assert(x->sizes[2] % sizeof(int4) == 0);
-        assert(x->sizes[2] % 128 == 0);
+        int hidden;
+        switch (handle->group->config.layout) {
+            case NCCL_EP_LAYOUT_RANK_MAJOR:
+                assert(x->ndim == 2);
+                assert(x->sizes[0] == static_cast<unsigned>(num_ranks) * num_max_dispatch_tokens_per_rank);
+                assert(x->sizes[1] % sizeof(int4) == 0);
+                assert(x->sizes[1] % 128 == 0);
+                hidden = static_cast<int>(x->sizes[1]);
+                break;
+            default:
+                assert(x->ndim == 3);
+                assert(x->sizes[0] == num_experts / num_ranks);
+                assert(x->sizes[1] == static_cast<unsigned>(num_ranks) * num_max_dispatch_tokens_per_rank);
+                assert(x->sizes[2] % sizeof(int4) == 0);
+                assert(x->sizes[2] % 128 == 0);
+                hidden = static_cast<int>(x->sizes[2]);
+                break;
+        }
 
             // Validate topk_idx tensor
         assert(topk_idx->ndim == 2);
@@ -2104,8 +2166,7 @@ ncclResult_t ncclEpCombine(
         assert(topk_weights->datatype == ncclFloat32);
         assert(topk_weights->sizes[0] <= num_max_dispatch_tokens_per_rank);
 
-        // Extract dimensions
-        const int hidden = static_cast<int>(x->sizes[2]);
+        // Extract dimensions (hidden already set in the layout switch above)
         const int num_topk = static_cast<int>(topk_weights->sizes[1]);
         const int num_combined_tokens = static_cast<int>(topk_weights->sizes[0]);
 
@@ -2167,6 +2228,7 @@ ncclResult_t ncclEpCombine(
                 handle->group->rank,
                 handle->group->nRanks,
                 use_fp8,
+                handle->group->config.layout,
                 phases,
                 zero_copy,
                 handle->group->num_nccl_comms,

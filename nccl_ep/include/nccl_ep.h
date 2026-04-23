@@ -8,6 +8,7 @@
 
 #include <cuda.h>
 #include <nccl.h>
+#include "ep_enums.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,45 +18,19 @@ typedef enum {
     NCCL_EP_TENSOR_FLAG_NONE = 0,
 } ncclEpTensorFlags_t; // Reserved for future use
 
-// Tensor tags required to identify the type of tensors in `ncclEpDispatch` and `ncclEpCombine`
-typedef enum {
-    NCCL_EP_TENSOR_TAG_NONE = 0,
-    // Tensor containing tokens
-    NCCL_EP_TENSOR_TAG_TOKENS = 1,
-    // Tensor containing top-k expert indices
-    NCCL_EP_TENSOR_TAG_TOPK_IDX = 2,
-    // Tensor containing top-k weights
-    NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS = 3,
-    // Tensor containing scales
-    NCCL_EP_TENSOR_TAG_SCALES = 4,
-    // Tensor containing tokens received per expert (device memory)
-    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE = 5,
-    // Tensor containing tokens received per expert (pinned host memory)
-    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST = 6,
-    // Tensor containing per-expert token counts
-    NCCL_EP_TENSOR_TAG_TOKENS_PER_EXPERTS = 7,
-} ncclEpTensorTag_t;
-
-
 // Opaque N-dimensional tensor handle used to describe various user inputs
 // (i.e., tokens, top-k indices, weights, scales, etc.)
 typedef struct ncclNDTensor* ncclNDTensor_t;
-
-// Communication algorithm (mode)
-typedef enum {
-    // Low-Latency (LL) mode
-    NCCL_EP_ALGO_LOW_LATENCY = 0,
-    // High-Throughput (HT) mode
-    NCCL_EP_ALGO_HIGH_THROUGHPUT = 1
-} ncclEpAlgorithm_t;
-
-// Auto configuration constant for dynamic/automatic sizing
-#define NCCL_EP_AUTO 0
 
 // EP group configuration structure
 typedef struct {
     unsigned int version;                // Structure version (set to 1.0.0)
     ncclEpAlgorithm_t algorithm;         // low_latency or high_throughput
+    // Receive buffer layout for the dispatch and combine path.
+    // Determines the shape of recv_x on dispatch output and the expected input shape for combine.
+    // Default (NCCL_EP_LAYOUT_AUTO / zero-init): auto-selected based on algorithm
+    //   (EXPERT_MAJOR for LL, RANK_MAJOR for HT).
+    ncclEpLayout_t layout;
     unsigned int num_experts;            // Number of experts (required)
     // Maximum number of tokens any single rank will dispatch. Must be the same across all ranks.
     // Each rank should be prepared to receive up to max_tokens_per_rank * num_ranks tokens.
@@ -275,6 +250,13 @@ typedef struct {
 //                                    The dimensions of the scaling factors tensor are:
 //                                    [local_experts x num_recv_tokens x (hidden / 128)] (3D, ncclFloat32)
 //                                    where num_recv_tokens = num_ranks * max_tokens_per_rank.
+//                            For LL rank-major: outputs are [num_recv_tokens x data_size] (2D),
+//                                    where num_recv_tokens = num_ranks * max_tokens_per_rank.
+//                                    Additionally requires two routing output tensors:
+//                                    RECV_TOPK_IDX:     [OUT] 2D [num_recv_tokens x num_topk], ncclInt32.
+//                                        Top-k expert indices received from source ranks.
+//                                    RECV_TOPK_WEIGHTS: [OUT] 2D [num_recv_tokens x num_topk], ncclFloat32.
+//                                        Top-k weights received from source ranks.
 //   num_outputs   - [IN]     Number of output tensors (equal to num_inputs plus number of scaling tensors)
 //   local_tensors - [IN,OUT] Array of pointers to preallocated tensors, with information that is local to the rank.
 //                            LL mode: accepts 1 optional local tensor:
@@ -326,6 +308,8 @@ typedef struct ncclEpCombineConfig ncclEpCombineConfig_t;
 //                                       where num_recv_tokens = num_ranks * max_tokens_per_rank.
 //                               For LL: inputs are [local_experts x num_recv_tokens x data_size] (3D, expert-major),
 //                                       where num_recv_tokens = num_ranks * max_tokens_per_rank.
+//                               For LL rank-major: inputs are [num_recv_tokens x data_size] (2D),
+//                                       pre-reduced across local experts by the caller before this call.
 //   num_inputs       - [IN]     Number of input tensors
 //   outputs          - [IN,OUT] Array of pointers to preallocated output nd tensors, same number & order as inputs.
 //                               All must be 2D [num_tokens x data_size]; tokens and metadata are restored to original order.
@@ -333,6 +317,8 @@ typedef struct ncclEpCombineConfig ncclEpCombineConfig_t;
 //   local_tensors    - [IN,OUT] Array of pointers to preallocated tensors, with information that is local to the rank.
 //                               LL mode: accepts 1 optional local tensor:
 //                                       TOP_K_WEIGHTS - IN [num_tokens x top_k] - top-k weights for each token.
+//                               Expert-major: applied as per-expert weights on the combine receive side.
+//                               Rank-major: not used; weight reduction and application are the caller's responsibility.
 //   num_local_tensors - [IN]    Number of local tensors.
 //   send_only        - [IN]     If true, the combine will only initiate data transfers and immediately
 //                               release GPU resources (without waiting for the data to be received).

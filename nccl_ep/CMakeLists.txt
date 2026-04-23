@@ -95,11 +95,13 @@ endforeach()
 
 # Copy headers to build/include (runs at configure)
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/include")
-configure_file(include/nccl_ep.h "${CMAKE_BINARY_DIR}/include/nccl_ep.h" COPYONLY)
+configure_file(include/nccl_ep.h    "${CMAKE_BINARY_DIR}/include/nccl_ep.h"    COPYONLY)
+configure_file(include/ep_enums.h   "${CMAKE_BINARY_DIR}/include/ep_enums.h"   COPYONLY)
 
 # Install to custom prefix
 install(FILES
     include/nccl_ep.h
+    include/ep_enums.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 

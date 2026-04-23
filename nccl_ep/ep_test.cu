@@ -96,6 +96,7 @@ void printUsage(const char* programName, int myRank) {
         printf("  -r                           Enable random mode (random topk_idx, skip correctness checks)\n");
         printf("  -t <num>                     Set number of tokens (default: 50)\n");
         printf("  -d <num>                     Set hidden dimension size (default: 7168)\n");
+        printf("  -e <num>                     Set total number of experts (default: top_k * nRanks)\n");
         printf("  -h                           Show this help message\n");
     }
 }
@@ -111,6 +112,7 @@ int main(int argc, char* argv[])
   bool random_mode = false;        // random mode flag (random topk_idx, skip checks)
   unsigned int num_tokens = 50; // number of tokens (default)
   unsigned int hidden = 7168;      // hidden dimension size (default)
+  unsigned int num_experts = 0;    // 0 = auto (top_k * nRanks)
 
   // initializing MPI
   MPICHECK(MPI_Init(&argc, &argv));
@@ -125,7 +127,7 @@ int main(int argc, char* argv[])
 
   // Parse command line arguments using getopt
   int opt;
-  while ((opt = getopt(argc, argv, "a:ms:crt:d:h")) != -1) {
+  while ((opt = getopt(argc, argv, "a:ms:crt:d:e:h")) != -1) {
     switch (opt) {
       case 'a':
         if (strcmp(optarg, "ll") == 0) {
@@ -194,6 +196,9 @@ int main(int argc, char* argv[])
           exit(EXIT_FAILURE);
         }
         break;
+      case 'e':
+        num_experts = static_cast<unsigned int>(atoi(optarg));
+        break;
       case 'h':
         printUsage(argv[0], myRank);
         MPI_Finalize();
@@ -231,19 +236,25 @@ int main(int argc, char* argv[])
   uint64_t hostHashs[nRanks];
 
   const unsigned int ELEMENTS_TESTED_PER_TOKEN = 10;
-  unsigned int top_k = std::min(8, nRanks); // DeepSeek v3 has 8, how many experts each token goes to
-  unsigned int num_experts = std::min(256u, top_k * nRanks); // DeepSeek v3
+  unsigned int top_k = std::min(8, nRanks);
+  if (num_experts == 0)
+    num_experts = top_k * static_cast<unsigned int>(nRanks);
   unsigned int num_local_experts = num_experts / nRanks;
   unsigned int local_experts_start = num_local_experts * myRank;
   unsigned int local_experts_end = local_experts_start + num_local_experts; // exclusive
 
+  if (num_experts == 0 || (num_experts & (num_experts - 1)) != 0) {
+    if (myRank == 0) printf("Error: num_experts (%u) must be a power of 2\n", num_experts);
+    MPI_Finalize();
+    exit(EXIT_FAILURE);
+  }
   if (num_experts % nRanks != 0) {
     if (myRank == 0) printf("Error: num_experts (%u) must be divisible by nRanks (%d)\n", num_experts, nRanks);
     MPI_Finalize();
     exit(EXIT_FAILURE);
   }
-  if (top_k > num_local_experts) {
-    if (myRank == 0) printf("Error: top_k (%u) must be less than or equal to num_local_experts (%u)\n", top_k, num_local_experts);
+  if (num_experts < top_k * static_cast<unsigned int>(nRanks)) {
+    if (myRank == 0) printf("Error: num_experts (%u) must be >= top_k * nRanks (%u)\n", num_experts, top_k * static_cast<unsigned int>(nRanks));
     MPI_Finalize();
     exit(EXIT_FAILURE);
   }
@@ -310,10 +321,11 @@ int main(int argc, char* argv[])
       printf("Random mode enabled: first expert random, rest deterministic (no repetitions)\n");
     }
   } else {
-    // Deterministic mode: send each token to top_k number of semi-random experts, equal distribution
+    // Deterministic mode: send each token to top_k experts, cycling through all
+    // num_local_experts on the target rank for equal distribution
     for (int i = 0; i < num_tokens; i++) {
       for (int j = 0; j < top_k; j++) {
-        topk_idx_host[i * top_k + j] = (local_experts_end + j) % num_experts;
+        topk_idx_host[i * top_k + j] = (local_experts_end + (i * top_k + j) % num_local_experts) % num_experts;
       }
     }
   }
@@ -461,7 +473,7 @@ int main(int argc, char* argv[])
                          cudaMemcpyDeviceToHost));
 
     for (unsigned int e = 0; e < num_local_experts; e++) {
-      int expected_count = num_tokens; // Each expert receives num_tokens tokens (one from each rank)
+      int expected_count = static_cast<int>(num_tokens) * top_k / num_local_experts;
       if (recv_count_host[e] != expected_count) {
         printf("Recv_count check failed! Rank %d, expert %d: expected %d, got %d\n",
                myRank, e, expected_count, recv_count_host[e]);
@@ -492,7 +504,7 @@ int main(int argc, char* argv[])
     // Check recv_count (only if available)
     if (recv_count_host != nullptr) {
       for (unsigned int e = 0; e < num_local_experts; e++) {
-        int expected_count = num_tokens; // Each expert receives num_tokens tokens (one from each rank)
+        int expected_count = static_cast<int>(num_tokens) * top_k / num_local_experts;
         if (recv_count_host[e] != expected_count) {
           printf("Recv_count check failed! Rank %d, expert %d: expected %d, got %d\n",
                   myRank, e, expected_count, recv_count_host[e]);

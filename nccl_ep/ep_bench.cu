@@ -1958,6 +1958,14 @@ int main(int argc, char* argv[]) {
     }
 
     // Validate parameters
+    if (num_experts < top_k * static_cast<unsigned int>(nRanks)) {
+        if (myRank == 0) {
+            printf("Error: num_experts (%u) must be >= top_k * nRanks (%u)\n",
+                   num_experts, top_k * static_cast<unsigned int>(nRanks));
+        }
+        MPI_Finalize();
+        return 1;
+    }
     if (num_experts % nRanks != 0) {
         if (myRank == 0) {
             printf("Error: num_experts (%u) must be divisible by nRanks (%d)\n", num_experts, nRanks);

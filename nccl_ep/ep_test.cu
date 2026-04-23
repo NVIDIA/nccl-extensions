@@ -273,7 +273,7 @@ int main(int argc, char* argv[])
   NCCLCHECK(ncclCommInitRank(&comm, nRanks, id, myRank));
 
   ncclEpGroup_t ep_group;
-  ncclEpGroupConfig_t config;
+  ncclEpGroupConfig_t config = {};
   config.version = 1;                                    // Structure version
   config.algorithm = algorithm;                          // Algorithm type (set by command line)
   config.num_experts = num_experts;

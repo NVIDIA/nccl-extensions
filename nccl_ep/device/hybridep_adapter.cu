@@ -308,7 +308,7 @@ void call_metadata_preprocessing(
     int32_t* sparse_to_dense_map,
     bool* rdma_to_attn_map,
     bool* attn_to_rdma_map,
-    uint8_t* token_rank_mask,
+    uint64_t* token_rank_mask,
     int32_t* num_tokens_for_experts,
     bool* local_expert_routing_map,
     int32_t* per_expert_token_counts,

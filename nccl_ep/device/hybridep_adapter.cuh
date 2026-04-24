@@ -257,7 +257,7 @@ void call_metadata_preprocessing(
     int32_t* sparse_to_dense_map,       // Output: token→rank→position mapping
     bool* rdma_to_attn_map,             // Output: which tokens come from RDMA
     bool* attn_to_rdma_map,             // Output: which tokens go to RDMA
-    uint8_t* token_rank_mask,           // Scratch: cached per-token rank mask [tokens * ranks_per_node * nodes]
+    uint64_t* token_rank_mask,          // Scratch: cached per-token rank mask [tokens * ranks_per_node * nodes]
     int32_t* num_tokens_for_experts,    // Output: total tokens for local experts
     bool* local_expert_routing_map,     // Output: per-expert routing for local tokens
     int32_t* per_expert_token_counts,   // Optional output: per-expert counts (nullptr to skip)

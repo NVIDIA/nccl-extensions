@@ -434,7 +434,7 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
         mega_sz,
         &ep_group->ht_buffers.intranode_mega_window,
         NCCL_WIN_COLL_SYMMETRIC));
-    
+
     // Register the completion flags
     NCCL_CHECK_RESULT(ncclCommWindowRegister(
         comm,
@@ -1327,6 +1327,7 @@ struct ncclEpHandle {
 
             // Per-handle preprocessing block (single allocation for all preprocessing buffers)
             void* preprocessing_block;
+            bool  owns_handle_mem; // false = caller-owned (user path); destroy skips free
             size_t preprocessing_zero_region_size;
             size_t preprocessing_s2d_size;
             void* preprocessing_scan_tmp;
@@ -1391,168 +1392,191 @@ static void tensor_free(ncclEpGroup_t group, ncclNDTensor_t t) {
     delete t;
 }
 
-ncclResult_t ncclEpCreateHandle(
-    ncclEpHandle_t* out_handle,
-    ncclEpGroup_t ep_group,
-    ncclNDTensor_t topk_idx,
-    const ncclNDTensor_t* local_tensors,
-    unsigned int num_local_tensors,
-    const ncclEpHandleConfig_t* config,
-    cudaStream_t stream,
-    bool use_fp8
+// Returns the total buffer size (in bytes) for a LL handle_mem block.
+// Used by ncclEpHandleMemSize (public) and ncclEpInitHandle (internal).
+static size_t ll_handle_mem_size(ncclEpGroup_t ep_group, int num_topk) {
+    auto align256 = [](size_t s) -> size_t { return (s + 255) & ~size_t(255); };
+    const size_t local_experts = static_cast<size_t>(ep_group->num_local_experts);
+    const size_t nRanks        = static_cast<size_t>(ep_group->nRanks);
+    const size_t max_tokens    = static_cast<size_t>(ep_group->config.max_tokens_per_rank);
+    // Layout: nRanks per-rank counts + nRanks * max_tokens * (num_topk+1) token entries
+    size_t sz_recv_src  = align256(nRanks * (1 + static_cast<size_t>(num_topk + 1) * max_tokens) * sizeof(int32_t));
+    size_t sz_dispatch  = align256(local_experts * nRanks * sizeof(int64_t));
+    return sz_recv_src + sz_dispatch;
+}
+
+// All individual buffer sizes for a HT handle_mem block plus derived totals.
+// Single source of truth shared by ht_handle_mem_size() and ht_init_handle().
+struct HtBlockLayout {
+    size_t sz_routing, sz_r2a, sz_a2r, sz_ler, sz_ntfe;
+    size_t sz_s2d, sz_rank_mask, sz_scan_tmp, sz_prob, sz_ec_tmp;
+    size_t zero_region, no_memset_region, total;
+
+    static HtBlockLayout compute(ncclEpGroup_t ep_group) {
+        auto align256 = [](size_t s) -> size_t { return (s + 255) & ~size_t(255); };
+        const int nRanks           = ep_group->nRanks;
+        const int num_experts      = ep_group->config.num_experts;
+        const int max_tokens       = ep_group->config.max_tokens_per_rank;
+        const int n_ranks_per_node = ep_group->lsa_rank_count;
+        const int nNodes           = ep_group->nNodes;
+        const int experts_per_rank = ep_group->num_local_experts;
+        const int padded_max_tokens  = ((max_tokens + 15) / 16) * 16;
+        const int num_experts_packed = (num_experts + 7) / 8;
+
+        HtBlockLayout L = {};
+        L.sz_routing   = align256(static_cast<size_t>(nRanks * max_tokens) * num_experts_packed);
+        L.sz_r2a       = align256(static_cast<size_t>(nNodes) * padded_max_tokens * sizeof(bool));
+        L.sz_a2r       = (nNodes > 1) ? align256(static_cast<size_t>(max_tokens) * (nNodes - 1) * sizeof(bool)) : 0;
+        L.sz_ler       = align256(static_cast<size_t>(ep_group->max_recv_tokens) * experts_per_rank * sizeof(bool));
+        L.sz_ntfe      = align256(sizeof(int32_t));
+        L.sz_s2d       = align256(static_cast<size_t>(nNodes) * max_tokens * n_ranks_per_node * sizeof(int32_t));
+        L.sz_rank_mask = align256(static_cast<size_t>(nNodes) * max_tokens * n_ranks_per_node * sizeof(uint8_t));
+        L.sz_scan_tmp  = align256(nccl_ep::hybridep::get_preprocessing_scan_tmp_size(n_ranks_per_node));
+        L.sz_prob      = !is_internode_available(ep_group) ?
+                             align256(static_cast<size_t>(max_tokens) * num_experts * sizeof(float)) : 0;
+        L.sz_ec_tmp    = align256(static_cast<size_t>(experts_per_rank) * sizeof(int32_t));
+        L.zero_region      = L.sz_routing + L.sz_r2a + L.sz_a2r + L.sz_ler + L.sz_ntfe;
+        L.no_memset_region = L.sz_rank_mask + L.sz_scan_tmp + L.sz_prob + L.sz_ec_tmp;
+        L.total = L.zero_region + L.sz_s2d + L.no_memset_region;
+        return L;
+    }
+};
+
+static size_t ht_handle_mem_size(ncclEpGroup_t ep_group) {
+    return HtBlockLayout::compute(ep_group).total;
+}
+
+ncclResult_t ncclEpHandleMemSize(
+    ncclEpGroup_t               ep_group,
+    const ncclEpHandleConfig_t* /*config*/,
+    size_t*                     size_out,
+    int                         num_topk
 ) {
-    assert(topk_idx != nullptr);
-    assert(ep_group != nullptr);
-    assert(out_handle != nullptr);
-    assert(config == nullptr);
+    assert(ep_group != nullptr && size_out != nullptr);
+    if (ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+        *size_out = ht_handle_mem_size(ep_group);
+    } else if (ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
+        assert(num_topk > 0 && "LL mode requires num_topk > 0 for ncclEpHandleMemSize");
+        *size_out = ll_handle_mem_size(ep_group, num_topk);
+    } else {
+        return ncclInvalidUsage;
+    }
+    return ncclSuccess;
+}
 
-    // Validate communicator
-    int nRanks = 0;
+static ncclResult_t ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, ncclNDTensor_t handle_mem, int num_topk) {
+    assert(num_topk > 0 && "LL mode requires num_topk > 0 (pass top_k to ncclEpInitHandle)");
+    // TODO: internal alloc path allocates two tensors separately via ncclEpTensorCreate;
+    // consolidate into a single alloc_fn call (like ht_init_handle) for symmetry.
+    void* recv_src_ptr = nullptr;
+    void* dispatch_ptr = nullptr;
+    if (handle_mem != nullptr) {
+        auto align256 = [](size_t s) -> size_t { return (s + 255) & ~size_t(255); };
+        assert(handle_mem->ndim == 1 && handle_mem->datatype == ncclUint8);
+        assert(static_cast<size_t>(handle_mem->sizes[0]) >= ll_handle_mem_size(ep_group, num_topk) &&
+               "handle_mem too small; use ncclEpHandleMemSize to query required size");
+        char* ptr = static_cast<char*>(handle_mem->data);
+        size_t offset = 0;
+        recv_src_ptr = ptr + offset;
+        offset += align256(static_cast<size_t>(ep_group->nRanks) *
+                           (1 + static_cast<size_t>(num_topk + 1) * ep_group->config.max_tokens_per_rank) * sizeof(int32_t));
+        dispatch_ptr = ptr + offset;
+    }
+    ncclEpTensorCreate(ep_group, &handle->ll.expert_recv_source_indices, 1, ncclInt32,
+        NCCL_EP_TENSOR_TAG_NONE, recv_src_ptr,
+        static_cast<unsigned int>(ep_group->nRanks * (1 + (num_topk + 1) * ep_group->config.max_tokens_per_rank)));
+    ncclEpTensorCreate(ep_group, &handle->ll.expert_dispatch_layout, 2, ncclInt64,
+        NCCL_EP_TENSOR_TAG_NONE, dispatch_ptr,
+        static_cast<unsigned int>(ep_group->num_local_experts),
+        static_cast<unsigned int>(ep_group->nRanks));
+    assert((ep_group->config.max_tokens_per_rank * ep_group->num_local_experts) % 4 == 0
+           && "TMA requires the number of tokens to be multiple of 4");
+    handle->num_topk = num_topk;
+    handle->ll.layout = nccl_ep::LowLatencyLayout(
+        ep_group->rdma_buffer, ep_group->config.max_tokens_per_rank,
+        ep_group->hidden, ep_group->nRanks, ep_group->config.num_experts, num_topk, handle->group->config.layout);
+    assert(handle->ll.layout.total_bytes <= ep_group->config.rdma_buffer_size);
+    return ncclSuccess;
+}
+
+static ncclResult_t ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, ncclNDTensor_t handle_mem, int num_topk) {
+    assert(ep_group->config.max_tokens_per_rank > 0 && "HT requires max_tokens_per_rank > 0");
+    if (num_topk >= 0){
+      assert(num_topk != 0 && "HT mode requires num_topk > 0");
+      handle->num_topk = num_topk;
+    }
+    const auto L = HtBlockLayout::compute(ep_group);
+
+    if (handle_mem != nullptr) {
+        assert(handle_mem->ndim == 1 && handle_mem->datatype == ncclUint8);
+        assert(static_cast<size_t>(handle_mem->sizes[0]) >= L.total &&
+               "handle_mem too small; use ncclEpHandleMemSize to query required size");
+        handle->hybridep.preprocessing_block = handle_mem->data;
+        handle->hybridep.owns_handle_mem = false;
+    } else {
+        CUDA_CHECK(ep_group->alloc_fn(&handle->hybridep.preprocessing_block, L.total));
+        handle->hybridep.owns_handle_mem = true;
+    }
+    handle->hybridep.preprocessing_zero_region_size = L.zero_region;
+    handle->hybridep.preprocessing_s2d_size = L.sz_s2d;
+
+    char* ptr = static_cast<char*>(handle->hybridep.preprocessing_block);
+    size_t offset = 0;
+
+    handle->hybridep.global_routing_map        = reinterpret_cast<uint8_t*>(ptr + offset); offset += L.sz_routing;
+    handle->hybridep.rdma_to_attn_map          = reinterpret_cast<bool*>(ptr + offset);    offset += L.sz_r2a;
+    handle->hybridep.attn_to_rdma_map          = (ep_group->nNodes > 1) ?
+                                                     reinterpret_cast<bool*>(ptr + offset) : nullptr;
+                                                                                             offset += L.sz_a2r;
+    handle->hybridep.local_expert_routing_map  = reinterpret_cast<bool*>(ptr + offset);    offset += L.sz_ler;
+    handle->hybridep.num_tokens_for_experts    = reinterpret_cast<int32_t*>(ptr + offset); offset += L.sz_ntfe;
+    handle->hybridep.sparse_to_dense_map       = reinterpret_cast<int32_t*>(ptr + offset); offset += L.sz_s2d;
+    handle->hybridep.token_rank_mask           = reinterpret_cast<uint8_t*>(ptr + offset); offset += L.sz_rank_mask;
+    handle->hybridep.preprocessing_scan_tmp   = reinterpret_cast<void*>(ptr + offset);    offset += L.sz_scan_tmp;
+    if (!is_internode_available(ep_group)) {
+        handle->hybridep.dense_prob_buffer     = reinterpret_cast<float*>(ptr + offset);   offset += L.sz_prob;
+    } else {
+        handle->hybridep.dense_prob_buffer     = nullptr;
+    }
+    handle->hybridep.per_expert_counts_tmp     = reinterpret_cast<int32_t*>(ptr + offset); offset += L.sz_ec_tmp;
+
+    if (is_internode_available(ep_group)) {
+        handle->hybridep.dense_prob_buffer             = ep_group->ht_buffers.dense_prob_buffer;
+        handle->hybridep.token_staging_buffer          = ep_group->ht_buffers.token_staging_buffer;
+        handle->hybridep.scaling_factor_staging_buffer = ep_group->ht_buffers.scaling_factor_staging_buffer;
+    } else {
+        handle->hybridep.token_staging_buffer          = nullptr;
+        handle->hybridep.scaling_factor_staging_buffer = nullptr;
+    }
+    return ncclSuccess;
+}
+
+// No collective; allocates routing buffers only.
+// handle_mem == nullptr → alloc_fn owns the block; freed on destroy.
+// handle_mem != nullptr → wraps caller buffer; destroy frees only the struct.
+ncclResult_t ncclEpInitHandle(
+    ncclEpHandle_t*             out_handle,
+    ncclEpGroup_t               ep_group,
+    const ncclEpHandleConfig_t* config,
+    int                         num_topk,
+    bool                        use_fp8,
+    ncclNDTensor_t              handle_mem
+) {
+    assert(ep_group != nullptr && out_handle != nullptr);
     assert(ep_group->comm != nullptr);
-    assert(ncclCommCount(ep_group->comm, &nRanks) == ncclSuccess);
-    assert(nRanks > 0);
-
-    // Validate tensor properties
-    assert(topk_idx->ndim == 2);
-    assert(topk_idx->datatype == ncclInt64);
-    assert(topk_idx->tag == NCCL_EP_TENSOR_TAG_TOPK_IDX);
-    assert(tensor_is_contiguous(topk_idx));
-
-    // Validate expert configuration
+    assert(config == nullptr);
     assert(ep_group->config.num_experts > 0);
     assert(ep_group->config.num_experts % ep_group->nRanks == 0);
 
-    // Create and initialize handle
     *out_handle = new ncclEpHandle();
     ncclEpHandle_t handle = *out_handle;
-
     handle->group = ep_group;
     handle->use_fp8 = use_fp8;
-    handle->topk_idx = topk_idx;
 
-    // Extract tensor dimensions
-    const int num_tokens = static_cast<int>(topk_idx->sizes[0]);
-    const int num_topk = static_cast<int>(topk_idx->sizes[1]);
-    handle->num_tokens = num_tokens;
-    handle->num_topk = num_topk;
-    assert(handle->num_topk <= MAX_NUM_TOPK && "num_topk exceeds MAX_NUM_TOPK");
-
-    if (ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        // LL mode does not accept local tensors
-        assert(num_local_tensors == 0 && "LL mode does not accept local tensors in ncclEpCreateHandle");
-
-        // Allocate packed tensors
-        // packed_recv_x is the input tensor in the dispatch
-
-        ncclEpTensorCreate(ep_group, &handle->ll.expert_recv_source_indices, 1, ncclInt32, NCCL_EP_TENSOR_TAG_NONE, nullptr, static_cast<unsigned int>(ep_group->nRanks * (1 + (handle->num_topk + 1)  * ep_group->config.max_tokens_per_rank)));
-        // TODO: unused currently, but keep for future use
-        ncclEpTensorCreate(ep_group, &handle->ll.expert_dispatch_layout, 2, ncclInt64, NCCL_EP_TENSOR_TAG_NONE, nullptr, static_cast<unsigned int>(handle->group->num_local_experts), static_cast<unsigned int>(ep_group->nRanks));
-
-        assert((ep_group->config.max_tokens_per_rank * handle->group->num_local_experts) % 4 == 0 and "TMA requires the number of tokens to be multiple of 4");
-
-        handle->ll.layout = nccl_ep::LowLatencyLayout(handle->group->rdma_buffer, handle->group->config.max_tokens_per_rank, handle->group->hidden, handle->group->nRanks, handle->group->config.num_experts, handle->num_topk, handle->group->config.layout);
-
-        assert(handle->ll.layout.total_bytes <= handle->group->config.rdma_buffer_size);
-    } else { // HT
-        assert(ep_group->config.max_tokens_per_rank > 0 && "HT requires max_tokens_per_rank > 0");
-
-        const int nRanks = ep_group->nRanks;
-        const int num_experts = ep_group->config.num_experts;
-        const int max_tokens = ep_group->config.max_tokens_per_rank;
-        const int n_ranks_per_node = ep_group->lsa_rank_count;
-        const int nNodes = ep_group->nNodes;
-        const int experts_per_rank = ep_group->num_local_experts;
-
-        // Allocate preprocessing buffers per-handle (single block allocation)
-        {
-            auto align256 = [](size_t s) -> size_t { return (s + 255) & ~size_t(255); };
-
-            const int total_send_tokens = nRanks * max_tokens;
-            const int padded_max_tokens = ((max_tokens + 15) / 16) * 16;
-            const int num_experts_packed = (num_experts + 7) / 8;
-
-            size_t sz_routing   = align256(static_cast<size_t>(total_send_tokens) * num_experts_packed);
-            size_t sz_r2a       = align256(static_cast<size_t>(nNodes) * padded_max_tokens * sizeof(bool));
-            size_t sz_a2r       = (nNodes > 1) ? align256(static_cast<size_t>(max_tokens) * (nNodes - 1) * sizeof(bool)) : 0;
-            size_t sz_ler       = align256(static_cast<size_t>(ep_group->max_recv_tokens) * experts_per_rank * sizeof(bool));
-            size_t sz_ntfe      = align256(sizeof(int32_t));
-            size_t zero_region  = sz_routing + sz_r2a + sz_a2r + sz_ler + sz_ntfe;
-
-            size_t sz_s2d       = align256(static_cast<size_t>(nNodes) * max_tokens * n_ranks_per_node * sizeof(int32_t));
-            size_t sz_rank_mask = align256(static_cast<size_t>(nNodes) * max_tokens * n_ranks_per_node * sizeof(uint8_t));
-
-            size_t sz_scan_tmp  = align256(nccl_ep::hybridep::get_preprocessing_scan_tmp_size(n_ranks_per_node));
-            size_t sz_prob      = !is_internode_available(ep_group) ? align256(static_cast<size_t>(max_tokens) * num_experts * sizeof(float)) : 0;
-            size_t sz_per_expert_counts_tmp = align256(static_cast<size_t>(experts_per_rank) * sizeof(int32_t));
-            size_t no_memset_region = sz_rank_mask + sz_scan_tmp + sz_prob + sz_per_expert_counts_tmp;
-
-            size_t total_size = zero_region + sz_s2d + no_memset_region;
-
-            CUDA_CHECK(ep_group->alloc_fn(&handle->hybridep.preprocessing_block, total_size));
-            handle->hybridep.preprocessing_zero_region_size = zero_region;
-            handle->hybridep.preprocessing_s2d_size = sz_s2d;
-
-            char* ptr = static_cast<char*>(handle->hybridep.preprocessing_block);
-            size_t offset = 0;
-
-            handle->hybridep.global_routing_map = reinterpret_cast<uint8_t*>(ptr + offset);
-            offset += sz_routing;
-
-            handle->hybridep.rdma_to_attn_map = reinterpret_cast<bool*>(ptr + offset);
-            offset += sz_r2a;
-
-            handle->hybridep.attn_to_rdma_map = (nNodes > 1) ? reinterpret_cast<bool*>(ptr + offset) : nullptr;
-            offset += sz_a2r;
-
-            handle->hybridep.local_expert_routing_map = reinterpret_cast<bool*>(ptr + offset);
-            offset += sz_ler;
-
-            handle->hybridep.num_tokens_for_experts = reinterpret_cast<int32_t*>(ptr + offset);
-            offset += sz_ntfe;
-
-            handle->hybridep.sparse_to_dense_map = reinterpret_cast<int32_t*>(ptr + offset);
-            offset += sz_s2d;
-
-            handle->hybridep.token_rank_mask = reinterpret_cast<uint8_t*>(ptr + offset);
-            offset += sz_rank_mask;
-
-            handle->hybridep.preprocessing_scan_tmp = reinterpret_cast<void*>(ptr + offset);
-            offset += sz_scan_tmp;
-
-            if (!is_internode_available(ep_group)) {
-                // Single physical node: allocate handle-local buffer
-                handle->hybridep.dense_prob_buffer = reinterpret_cast<float*>(ptr + offset);
-                offset += sz_prob;
-            } else {
-                handle->hybridep.dense_prob_buffer = nullptr;
-            }
-
-            handle->hybridep.per_expert_counts_tmp = reinterpret_cast<int32_t*>(ptr + offset);
-            offset += sz_per_expert_counts_tmp;
-        }
-
-        // For multi-node: dense_prob_buffer is the group-level GIN-registered buffer
-        if (is_internode_available(ep_group)) {
-            handle->hybridep.dense_prob_buffer = ep_group->ht_buffers.dense_prob_buffer;
-        }
-
-        // Staging buffers (group-level, GIN-registered)
-        if (is_internode_available(ep_group)) {
-            handle->hybridep.token_staging_buffer = ep_group->ht_buffers.token_staging_buffer;
-            handle->hybridep.scaling_factor_staging_buffer = ep_group->ht_buffers.scaling_factor_staging_buffer;
-        } else {
-            handle->hybridep.token_staging_buffer = nullptr;
-            handle->hybridep.scaling_factor_staging_buffer = nullptr;
-        }
-
-    }
-
-    return ncclEpUpdateHandle(handle, topk_idx, local_tensors, num_local_tensors, stream);
+    if (ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY)
+        return ll_init_handle(handle, ep_group, handle_mem, num_topk);
+    return ht_init_handle(handle, ep_group, handle_mem, num_topk);
 }
-// TODO:
-// Perhaps ncclEpCreateHandle should become ncclEpInitHandle of which the only job is to allocate resource?
-// This would also remove the need for ncclEpCreateHandle to accept topk_idx.
-// ncclEpUpdateHandle should then be the one to accept topk_idx.
 
 
 ncclResult_t ncclEpUpdateHandle(
@@ -1560,8 +1584,8 @@ ncclResult_t ncclEpUpdateHandle(
     ncclNDTensor_t topk_idx,
     const ncclNDTensor_t* local_tensors,
     unsigned int num_local_tensors,
-    cudaStream_t stream
-) {
+    cudaStream_t stream)
+{
     assert(handle != nullptr);
     assert(topk_idx != nullptr);
     assert(topk_idx->ndim == 2);
@@ -1574,11 +1598,17 @@ ncclResult_t ncclEpUpdateHandle(
 
     handle->topk_idx = topk_idx;
     handle->num_tokens = static_cast<int>(topk_idx->sizes[0]);
-    handle->num_topk = static_cast<int>(topk_idx->sizes[1]);
 
     if (ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
+        assert(static_cast<int>(topk_idx->sizes[1]) == handle->num_topk &&
+               "LL: num_topk mismatch between ncclEpInitHandle and ncclEpUpdateHandle");
+        assert(num_local_tensors == 0 && "LL mode does not accept local tensors in ncclEpUpdateHandle");
         return ncclSuccess;
     }
+
+    int num_topk = static_cast<int>(topk_idx->sizes[1]);
+    if (handle->num_topk > 0) assert(handle->num_topk == num_topk && "Given topk_idx has unmatched num_topk that ncclEpHandle was created with!");
+    else handle->num_topk = num_topk;
 
     assert(handle->num_tokens <= static_cast<int>(ep_group->config.max_tokens_per_rank) && "Token count exceeds HT buffer capacity");
 
@@ -1664,6 +1694,21 @@ ncclResult_t ncclEpUpdateHandle(
     return ncclSuccess;
 }
 
+ncclResult_t ncclEpCreateHandle(
+    ncclEpHandle_t* out_handle,
+    ncclEpGroup_t ep_group,
+    ncclNDTensor_t topk_idx,
+    const ncclNDTensor_t* local_tensors,
+    unsigned int num_local_tensors,
+    const ncclEpHandleConfig_t* config,
+    cudaStream_t stream,
+    bool use_fp8
+) {
+    NCCL_CHECK_RESULT(ncclEpInitHandle(out_handle, ep_group, config,
+                                       static_cast<int>(topk_idx->sizes[1]), use_fp8));
+    return ncclEpUpdateHandle(*out_handle, topk_idx, local_tensors, num_local_tensors, stream);
+}
+
 ncclResult_t ncclEpHandleDestroy(
     ncclEpHandle_t handle
 ) {
@@ -1674,9 +1719,11 @@ ncclResult_t ncclEpHandleDestroy(
         tensor_free(handle->group, handle->ll.expert_recv_source_indices);
         tensor_free(handle->group, handle->ll.expert_dispatch_layout);
     } else if (handle->group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
-        if (handle->hybridep.preprocessing_block) {
-            handle->group->free_fn(handle->hybridep.preprocessing_block);
-            handle->hybridep.preprocessing_block = nullptr;
+        if (handle->hybridep.owns_handle_mem) {
+            if (handle->hybridep.preprocessing_block) {
+                handle->group->free_fn(handle->hybridep.preprocessing_block);
+                handle->hybridep.preprocessing_block = nullptr;
+            }
         }
     }
 

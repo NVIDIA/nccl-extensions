@@ -1813,6 +1813,7 @@ void printUsage(const char* programName, int myRank) {
         printf("  --warmup <num>          Warmup iterations (default: 10)\n");
         printf("  --iters <num>           Benchmark iterations (default: 50)\n");
         printf("  --use-fp8               Use FP8 for dispatch (default: BF16)\n");
+        printf("  --user-handle-mem       Use caller-owned buffer via ncclEpInitHandle+ncclEpUpdateHandle\n");
         printf("  --profile               Enable NVTX profiling mode (use with nsys)\n");
         printf("  --disable-nvlink        Disable NVLink, force RDMA for intranode communication (LL only)\n");
         printf("  --validate              Validate dispatch/combine data correctness\n");
@@ -1837,6 +1838,7 @@ int main(int argc, char* argv[]) {
     bool profile_mode = false;  // Enable NVTX profiling with nsys
     bool disable_nvlink = false;  // Force RDMA instead of NVLink
     bool use_fp8 = false;  // Use FP8 for dispatch (default: BF16)
+    bool user_handle_mem = false;  // Use caller-owned buffer via ncclEpInitHandle+ncclEpUpdateHandle
     bool validate_data = false;  // Validate dispatch/combine correctness
     bool dynamic_tokens = false;  // Enable dynamic token allocation (HT only, for random topk)
 
@@ -1858,6 +1860,7 @@ int main(int argc, char* argv[]) {
         {"profile",        no_argument,       0, 'p'},
         {"disable-nvlink", no_argument,       0, 'n'},
         {"use-fp8",        no_argument,       0, 'f'},
+        {"user-handle-mem",no_argument,       0, 'U'},
         {"validate",       no_argument,       0, 'V'},
         {"dynamic-tokens", no_argument,       0, 'M'},
         {"help",           no_argument,       0, 'h'},
@@ -1866,7 +1869,7 @@ int main(int argc, char* argv[]) {
 
     int opt;
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "a:L:t:d:k:e:w:i:pnfVMh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "a:L:t:d:k:e:w:i:pnfUVMh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'a':
                 if (strcmp(optarg, "ll") == 0 || strcmp(optarg, "low-latency") == 0) {
@@ -1921,6 +1924,9 @@ int main(int argc, char* argv[]) {
                 break;
             case 'f':
                 use_fp8 = true;
+                break;
+            case 'U':
+                user_handle_mem = true;
                 break;
             case 'V':
                 validate_data = true;
@@ -2142,18 +2148,36 @@ int main(int argc, char* argv[]) {
     }
 
     // Create handle
-    printf("Rank %d: Testing ncclEpCreateHandle\n", myRank);
-    ncclEpHandle_t ep_handle;
-    // ncclEpCreateHandle expects an array of local tensors and a count
     ncclNDTensor_t handle_local_tensors[1] = { recv_expert_counter_tensor };
     unsigned int handle_num_local_tensors = recv_expert_counter_tensor ? 1 : 0;
+
+    // Optional caller-owned buffer (--user-handle-mem)
+    void* handle_user_buf = nullptr;
+    ncclNDTensor_t handle_mem_tensor = nullptr;
+    if (user_handle_mem) {
+        size_t handle_mem_size;
+        NCCLCHECK(ncclEpHandleMemSize(ep_group, nullptr, &handle_mem_size, static_cast<int>(top_k)));
+        CUDACHECK(cudaMalloc(&handle_user_buf, handle_mem_size));
+        NCCLCHECK(ncclEpTensorCreate(ep_group, &handle_mem_tensor, 1, ncclUint8,
+                                     NCCL_EP_TENSOR_TAG_NONE, handle_user_buf,
+                                     static_cast<unsigned int>(handle_mem_size)));
+        if (myRank == 0)
+            printf("Rank 0: ncclEpHandleMemSize = %zu bytes\n", handle_mem_size);
+    }
+
+    ncclEpHandle_t ep_handle;
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     double handle_create_start = MPI_Wtime();
-    NCCLCHECK(ncclEpCreateHandle(&ep_handle, ep_group, topk_idx, handle_local_tensors, handle_num_local_tensors, nullptr, stream, use_fp8));
+    if (user_handle_mem) {
+        NCCLCHECK(ncclEpInitHandle(&ep_handle, ep_group, nullptr, static_cast<int>(top_k), use_fp8, handle_mem_tensor));
+        NCCLCHECK(ncclEpUpdateHandle(ep_handle, topk_idx, handle_local_tensors, handle_num_local_tensors, stream));
+    } else {
+        NCCLCHECK(ncclEpCreateHandle(&ep_handle, ep_group, topk_idx, handle_local_tensors, handle_num_local_tensors, nullptr, stream, use_fp8));
+    }
     CUDACHECK(cudaStreamSynchronize(stream));
     double handle_create_end = MPI_Wtime();
     double handle_create_ms = (handle_create_end - handle_create_start) * 1000.0;
-    printf("Rank %d: ncclEpCreateHandle took %.2f ms\n", myRank, handle_create_ms);
+    printf("Rank %d: handle creation took %.2f ms\n", myRank, handle_create_ms);
 
     // max_tokens_per_rank is the per-rank dispatch count.
     // num_recv_tokens is the max tokens this rank can receive (nRanks * max_tokens_per_rank).
@@ -2276,9 +2300,14 @@ int main(int argc, char* argv[]) {
     if (profile_mode) {
         auto handle_create_fn = [&]() {
             NCCLCHECK(ncclEpHandleDestroy(ep_handle));
-            NCCLCHECK(ncclEpCreateHandle(&ep_handle, ep_group, topk_idx,
-                                          handle_local_tensors, handle_num_local_tensors,
-                                          nullptr, stream, use_fp8));
+            if (user_handle_mem) {
+                NCCLCHECK(ncclEpInitHandle(&ep_handle, ep_group, nullptr, static_cast<int>(top_k), use_fp8, handle_mem_tensor));
+                NCCLCHECK(ncclEpUpdateHandle(ep_handle, topk_idx, handle_local_tensors, handle_num_local_tensors, stream));
+            } else {
+                NCCLCHECK(ncclEpCreateHandle(&ep_handle, ep_group, topk_idx,
+                                              handle_local_tensors, handle_num_local_tensors,
+                                              nullptr, stream, use_fp8));
+            }
         };
         runNvtxProfiling(myRank, actual_iters, dispatch_fn, combine_fn, handle_create_fn, stream);
     }
@@ -2352,7 +2381,7 @@ int main(int argc, char* argv[]) {
             printf("\n=== Setup Timing (across %d ranks) ===\n", nRanks);
             printf("ncclEpCreateGroup:   avg=%.2f ms, min=%.2f ms, max=%.2f ms\n",
                    global_group_avg, global_group_min, global_group_max);
-            printf("ncclEpCreateHandle:  avg=%.2f ms, min=%.2f ms, max=%.2f ms\n",
+            printf("Handle creation:     avg=%.2f ms, min=%.2f ms, max=%.2f ms\n",
                    global_handle_avg, global_handle_min, global_handle_max);
         }
     }
@@ -2454,6 +2483,11 @@ int main(int argc, char* argv[]) {
     delete[] topk_idx_host;  // Now safe to delete after validation
 
     NCCLCHECK(ncclEpHandleDestroy(ep_handle));
+
+    if (handle_mem_tensor != nullptr)
+        ncclEpTensorDestroy(ep_group, handle_mem_tensor);
+    if (handle_user_buf != nullptr)
+        CUDACHECK(cudaFree(handle_user_buf));
 
     // Cleanup recv_expert_counter if allocated (must be before group destroy)
     if (dynamic_tokens && recv_expert_counter_tensor != nullptr) {

@@ -193,18 +193,62 @@ ncclResult_t ncclEpHandleDestroy(
     ncclEpHandle_t handle
 );
 
-// Rebind topk_idx on an existing handle without reallocating buffers.
-//
-// Use this instead of destroying and recreating the handle when only the
-// routing (topk_idx) changes between iterations.  All buffers allocated
-// by ncclEpCreateHandle are reused.
+// Query the device bytes required for a handle's routing buffers.
 //
 // Arguments:
-//   handle              - [IN]  Existing EP handle (from ncclEpCreateHandle)
-//   topk_idx            - [IN]  New top-k index tensor (2D, ncclInt64, contiguous)
-//   local_tensors       - [IN/OUT, optional] Same semantics as ncclEpCreateHandle
-//   num_local_tensors   - [IN]  Number of local tensors
-//   stream              - [IN]  CUDA stream
+//   ep_group  - [IN]  A valid EP group
+//   config    - [IN]  Reserved, must be NULL
+//   size_out  - [OUT] Required bytes for handle_mem
+//   num_topk  - [IN]  Required for LL (> 0); optional for HT
+//
+// Returns: ncclResult_t error code
+
+ncclResult_t ncclEpHandleMemSize(
+    ncclEpGroup_t               ep_group,
+    const ncclEpHandleConfig_t* config,
+    size_t*                     size_out,
+    int                         num_topk = -1
+);
+
+// Allocate handle buffers without performing any collective.
+// Call ncclEpUpdateHandle before the first ncclEpDispatch/ncclEpCombine.
+//
+// handle_mem == NULL:  NCCL EP allocates via alloc_fn; handle owns the memory.
+// handle_mem != NULL:  wraps caller-owned 1D ncclUint8 tensor (>= ncclEpHandleMemSize);
+//                      handle owns no memory; ncclEpHandleDestroy frees only the struct.
+//
+// Arguments:
+//   handle     - [OUT] Newly created handle
+//   ep_group   - [IN]  A valid EP group
+//   config     - [IN]  Reserved, must be NULL
+//   num_topk   - [IN]  Required for LL (> 0); optional for HT (default: -1)
+//   use_fp8    - [IN]  Enable FP8 dispatch (default: false)
+//   handle_mem - [IN]  NULL = internal alloc; non-NULL = caller-owned device buffer
+//
+// Returns: ncclResult_t error code
+
+ncclResult_t ncclEpInitHandle(
+    ncclEpHandle_t*             handle,
+    ncclEpGroup_t               ep_group,
+    const ncclEpHandleConfig_t* config,
+    int                         num_topk   = -1,
+    bool                        use_fp8    = false,
+    ncclNDTensor_t              handle_mem = nullptr
+);
+
+// Per-step collective: prepare the handle for the given top-k routing decisions.
+// Must be called after ncclEpInitHandle and before ncclEpDispatch.
+//
+// Arguments:
+//   handle             - [IN]  Handle from ncclEpInitHandle
+//   topk_idx           - [IN]  [num_tokens, top_k] int64
+//   local_tensors      - [IN/OUT, optional] Array of pointers to local tensors.
+//                         HT: accepts optional RECV_EXPERT_COUNTER tensor (1D, ncclInt32, size=num_local_experts)
+//                         with tag NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE.
+//                         Required when max_tokens_per_rank is NCCL_EP_AUTO.
+//                         LL mode: does not accept local tensors (num_local_tensors must be 0).
+//   num_local_tensors  - [IN]  Number of local tensors
+//   stream             - [IN]  CUDA stream
 //
 // Returns: ncclResult_t error code
 

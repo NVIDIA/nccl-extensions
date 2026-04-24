@@ -247,6 +247,8 @@ countTokensPerRank_mask(
               rankCount[k]++;
             }
           }
+          // Clear the rankMap for the next batch
+          rankMap[j] = 0;
         }
         batchIdx = 0;
       }
@@ -258,6 +260,7 @@ countTokensPerRank_mask(
         if (rankMap[j] & (1 << k)) {
           rankCount[k]++;
         }
+        // no need to clear the rankMap for the last batch
       }
     }
 

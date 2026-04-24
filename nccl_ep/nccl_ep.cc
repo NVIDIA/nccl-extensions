@@ -1260,9 +1260,9 @@ struct ncclEpHandle {
             bool* attn_to_rdma_map;
 
             // Per-token per-rank bitmask cache produced during preprocessing.
-            // dtype: uint8_t
+            // dtype: RankMask<LSA_TEAM_SIZE> (uint8/16/32/64 depending on lsa_team_size)
             // layout: [num_nodes * max_tokens_per_rank * ranks_per_node]
-            uint64_t* token_rank_mask;
+            void* token_rank_mask;
 
              // Local expert routing map: per-expert routing for tokens in this rank's buffer.
              // Used by subsequent expert MLP layers to route tokens to correct experts.
@@ -1426,7 +1426,7 @@ struct HtBlockLayout {
         L.sz_ler       = align256(static_cast<size_t>(ep_group->max_recv_tokens) * experts_per_rank * sizeof(bool));
         L.sz_ntfe      = align256(sizeof(int32_t));
         L.sz_s2d       = align256(static_cast<size_t>(rdma_team_size) * max_tokens * lsa_team_size * sizeof(int32_t));
-        L.sz_rank_mask = align256(static_cast<size_t>(rdma_team_size) * max_tokens * lsa_team_size * sizeof(uint64_t));
+        L.sz_rank_mask = align256(static_cast<size_t>(rdma_team_size) * max_tokens * lsa_team_size * nccl_ep::hybridep::get_rank_mask_elem_size(lsa_team_size));
         L.sz_scan_tmp  = align256(nccl_ep::hybridep::get_preprocessing_scan_tmp_size(lsa_team_size));
         L.sz_prob      = !is_internode_available(ep_group) ?
                              align256(static_cast<size_t>(max_tokens) * num_experts * sizeof(float)) : 0;
@@ -1526,7 +1526,7 @@ static ncclResult_t ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group
     handle->hybridep.local_expert_routing_map  = reinterpret_cast<bool*>(ptr + offset);    offset += L.sz_ler;
     handle->hybridep.num_tokens_for_experts    = reinterpret_cast<int32_t*>(ptr + offset); offset += L.sz_ntfe;
     handle->hybridep.sparse_to_dense_map       = reinterpret_cast<int32_t*>(ptr + offset); offset += L.sz_s2d;
-    handle->hybridep.token_rank_mask           = reinterpret_cast<uint64_t*>(ptr + offset); offset += L.sz_rank_mask;
+    handle->hybridep.token_rank_mask           = ptr + offset;                              offset += L.sz_rank_mask;
     handle->hybridep.preprocessing_scan_tmp   = reinterpret_cast<void*>(ptr + offset);    offset += L.sz_scan_tmp;
     if (!is_internode_available(ep_group)) {
         handle->hybridep.dense_prob_buffer     = reinterpret_cast<float*>(ptr + offset);   offset += L.sz_prob;

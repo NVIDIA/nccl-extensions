@@ -308,7 +308,7 @@ void call_metadata_preprocessing(
     int32_t* sparse_to_dense_map,
     bool* rdma_to_attn_map,
     bool* attn_to_rdma_map,
-    uint64_t* token_rank_mask,
+    void* token_rank_mask,
     int32_t* num_tokens_for_experts,
     bool* local_expert_routing_map,
     int32_t* per_expert_token_counts,
@@ -343,7 +343,7 @@ void call_metadata_preprocessing(
                 sparse_to_dense_map,
                 rdma_to_attn_map,
                 attn_to_rdma_map,
-                token_rank_mask,
+                reinterpret_cast<::hybrid_ep::RankMask<LSA_TEAM_SIZE>*>(token_rank_mask),
                 num_tokens_for_experts,
                 local_expert_routing_map,
                 per_expert_token_counts,
@@ -360,6 +360,14 @@ void call_metadata_preprocessing(
 
 size_t get_preprocessing_scan_tmp_size(int num_ranks_per_node) {
     return HYBRIDEP_NUM_BLOCKS_PREPROCESSING * num_ranks_per_node * sizeof(::hybrid_ep::tmp_state_t);
+}
+
+size_t get_rank_mask_elem_size(int lsa_team_size) {
+    size_t result = 0;
+    HYBRIDEP_SWITCH_LSA_TEAM_SIZE(lsa_team_size, {
+        result = sizeof(::hybrid_ep::RankMask<LSA_TEAM_SIZE>);
+    });
+    return result;
 }
 
 // ============================================================================

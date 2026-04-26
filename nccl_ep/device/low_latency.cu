@@ -734,54 +734,58 @@ LOW_LATENCY_DISPATCH_RECV:
             outSrcInfo[srcRank] = numRecvTokens;
         }
 
-        for (int i = rankLaneIdx * numWarpsPerGroup + subWarpId; i < numRecvTokens; i += numWarpsPerGroup * numLocalExperts) {
+        for (int i = rankLaneIdx * numWarpsPerGroup + subWarpId; i < numRecvTokens * numTopk; i += numWarpsPerGroup * numLocalExperts) {
+            int tokenIdx = i / numTopk;
+            int topkIdx = i % numTopk;
+
             const auto recvBufUint8 = reinterpret_cast<uint8_t*>(recvBuf) + srcRank * maxTokensPerRank * numBytesPerMsg;
-            const auto recvTokenMsg = (const uint8_t*)(recvBufUint8 + i * numBytesPerMsg);
+            const auto recvTokenMsg = (const uint8_t*)(recvBufUint8 + tokenIdx * numBytesPerMsg);
             const auto recvBufHdr = reinterpret_cast<const DispatchHdr<kLayout>*>(recvTokenMsg);
             const auto slotsPerToken = numTopk + 1; // token_id + topk_idx's
-            const auto recvSrcInfo = recvSrcInfoBase + (srcRank * maxTokensPerRank + i) * slotsPerToken;
+            const auto recvSrcInfo = recvSrcInfoBase + (srcRank * maxTokensPerRank + tokenIdx) * slotsPerToken;
             const auto recvSrcTopkInfo = recvSrcInfo + 1;
 
-            if(laneId == 0) {
+            // Initialize the token_id in the source tracking table
+            if(laneId == 0 && topkIdx == 0) {
                 recvSrcInfo[0] = recvBufHdr->token_id;
             }
 
-            for (int j = 0; j < numTopk; j ++) {
-                // Locate local experts`
-                int localExpertIdx = recvBufHdr->rtr[j].expert_id - globalExpertStartIdx;
-                if (localExpertIdx < 0 || localExpertIdx >= numLocalExperts) {
-                    // skip this topK, mark as invalid
-                    recvSrcTopkInfo[j] = -1;
-                    continue;
-                }
-
-                // Locate the output base for the local expert
-                int outDataOffset = localExpertIdx * numRanks * maxTokensPerRank;
-                const auto outDataInt4 = static_cast<int4*>((outDataBuf) + outDataOffset * hiddenBytes);
-                const auto outScales = static_cast<scale_t*>(outScalesBuf) + outDataOffset * numAlignedScales;
-
-                // Locate the next available slot
-                int recvTokenBeginIdx = 0;
+            // Locate local experts
+            int localExpertIdx = recvBufHdr->rtr[topkIdx].expert_id - globalExpertStartIdx;
+            if (localExpertIdx < 0 || localExpertIdx >= numLocalExperts) {
+                // skip this topK, mark as invalid
                 if (laneId == 0) {
-                    recvTokenBeginIdx = atomicAdd(outCnt + localExpertIdx, 1);
-                    // Save the slot used for this topK
-                    recvSrcTopkInfo[j] = outDataOffset + recvTokenBeginIdx;
+                    recvSrcTopkInfo[topkIdx] = -1;
                 }
-                recvTokenBeginIdx = __shfl_sync(0xFFFFFFFF, recvTokenBeginIdx, 0);
-
-
-                // MEMOPT: Possibly we need to fix it
-                copyRecvTokenData<kUseFP8, kUseUE8M0>(
-                                recvBufUint8, i,         // Location in the receive buffer
-                                recvTokenBeginIdx,       // Location in the output data
-                                outDataInt4,             // Output data
-                                outScales,               // Output scales
-                                hiddenInt4, hiddenBytes, numScales, numBytesPerMsg,
-                                dispatch_hdr_sz,
-                                maxTokensPerRank,
-                                numRanks,
-                                laneId);
+                continue;
             }
+
+            // Locate the output base for the local expert
+            int outDataOffset = localExpertIdx * numRanks * maxTokensPerRank;
+            const auto outDataInt4 = static_cast<int4*>((outDataBuf) + outDataOffset * hiddenBytes);
+            const auto outScales = static_cast<scale_t*>(outScalesBuf) + outDataOffset * numAlignedScales;
+
+            // Locate the next available slot
+            int recvTokenBeginIdx = 0;
+            if (laneId == 0) {
+                recvTokenBeginIdx = atomicAdd(outCnt + localExpertIdx, 1);
+                // Save the slot used for this topK
+                recvSrcTopkInfo[topkIdx] = outDataOffset + recvTokenBeginIdx;
+            }
+            recvTokenBeginIdx = __shfl_sync(0xFFFFFFFF, recvTokenBeginIdx, 0);
+
+
+            // MEMOPT: Possibly we need to fix it
+            copyRecvTokenData<kUseFP8, kUseUE8M0>(
+                            recvBufUint8, tokenIdx,         // Location in the receive buffer
+                            recvTokenBeginIdx,       // Location in the output data
+                            outDataInt4,             // Output data
+                            outScales,               // Output scales
+                            hiddenInt4, hiddenBytes, numScales, numBytesPerMsg,
+                            dispatch_hdr_sz,
+                            maxTokensPerRank,
+                            numRanks,
+                            laneId);
         }
     }
 }

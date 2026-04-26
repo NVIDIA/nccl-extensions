@@ -1440,42 +1440,42 @@ __global__ __launch_bounds__(1024, 1) void combine(// INPUT
         if (not isRankMasked<true>(rankMask, dstRank)) {
 
             // Use all lanes to send tokens
-            for (int i = subWarpId * numLocalExperts + rankLaneIdx; i < numRecvTokens; i += numWarpsPerGroup * numLocalExperts) {
-                auto localSrcTokenInfo = localSrcInfo + i * slotsPerToken;
+            for (int i = subWarpId * numLocalExperts + rankLaneIdx; i < numRecvTokens * numTopk; i += numWarpsPerGroup * numLocalExperts) {
+                int tokenIdx = i / numTopk;
+                int topkIdx = i % numTopk;
+                auto localSrcTokenInfo = localSrcInfo + tokenIdx * slotsPerToken;
                 auto localSrcTopkInfo = localSrcTokenInfo + 1;
-                int tokenIdx = __shfl_sync(0xffffffff, __ldg(localSrcTokenInfo), 0);
 
-                for (int j = 0; j < numTopk; j ++) {
-                    // Load the global expert index for this topk (skipping token index via "+1")
-                    int offset = __shfl_sync(0xffffffff, __ldg(localSrcTopkInfo + j), 0);
-                    if (offset == -1) {
-                        continue;
-                    }
-
-                    const auto srcDataInt4Ptr = static_cast<const int4*>(inData) + offset * hiddenBf16Int4;
-
-                    // Currently, a staging RDMA buffer is used for copying
-                    // TODO: Fix this code path to use less memory
-                    int sndTokenOffset = offset * numBytesPerSlot;
-                    const auto sendBufUint8 = static_cast<uint8_t*>(sendBuf) + sndTokenOffset;
-                    const auto sendBufInt4 = reinterpret_cast<int4*>(sendBufUint8);
-
-                    // Receive location calculation
-                    int rcvTokenOffset = (tokenIdx * numTopk + j) * numBytesPerSlot;
-                    const auto recvPtr = reinterpret_cast<uint64_t>(recvBuf) + rcvTokenOffset;
-                    const auto expectedDstOffset = recvOff + rcvTokenOffset;
-                    const auto dstP2pPtr =
-                        ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComms);
-
-                    processAndSendToken<kUseLogFMT, kHidden, kNumSendUnrolls, kNumStages, kNumPrefetch>(
-                        tokenIdx, srcDataInt4Ptr, sendBufInt4, recvPtr,
-                        recvOff + rcvTokenOffset, sendOff + sndTokenOffset, dstRank, rankLaneIdx,
-                        currRank, numRanks, maxTokensPerRank, numBytesPerSlot,
-                        hidden, hiddenBf16Int4, hiddenBf16Int4Pad, kNumMetaBytes,
-                        kNumTMABufferBytes, zeroCopy,
-                        dstP2pPtr, tmaBuffers, fullBarriers, metaBuffers, tmaPhase,
-                        tmaLoadAndArrive, getNumTmaBytes, laneId, devComms, windows);
+                // Load the global expert index for this topk (skipping token index via "+1")
+                int offset = __shfl_sync(0xffffffff, __ldg(localSrcTopkInfo + topkIdx), 0);
+                if (offset == -1) {
+                    continue;
                 }
+                int remoteTokenIdx = __shfl_sync(0xffffffff, __ldg(localSrcTokenInfo), 0);
+
+                const auto srcDataInt4Ptr = static_cast<const int4*>(inData) + offset * hiddenBf16Int4;
+
+                // Currently, a staging RDMA buffer is used for copying
+                // TODO: Fix this code path to use less memory
+                int sndTokenOffset = offset * numBytesPerSlot;
+                const auto sendBufUint8 = static_cast<uint8_t*>(sendBuf) + sndTokenOffset;
+                const auto sendBufInt4 = reinterpret_cast<int4*>(sendBufUint8);
+
+                // Receive location calculation
+                int rcvTokenOffset = (remoteTokenIdx * numTopk + topkIdx) * numBytesPerSlot;
+                const auto recvPtr = reinterpret_cast<uint64_t>(recvBuf) + rcvTokenOffset;
+                const auto expectedDstOffset = recvOff + rcvTokenOffset;
+                const auto dstP2pPtr =
+                    ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComms);
+
+                processAndSendToken<kUseLogFMT, kHidden, kNumSendUnrolls, kNumStages, kNumPrefetch>(
+                    tokenIdx, srcDataInt4Ptr, sendBufInt4, recvPtr,
+                    recvOff + rcvTokenOffset, sendOff + sndTokenOffset, dstRank, rankLaneIdx,
+                    currRank, numRanks, maxTokensPerRank, numBytesPerSlot,
+                    hidden, hiddenBf16Int4, hiddenBf16Int4Pad, kNumMetaBytes,
+                    kNumTMABufferBytes, zeroCopy,
+                    dstP2pPtr, tmaBuffers, fullBarriers, metaBuffers, tmaPhase,
+                    tmaLoadAndArrive, getNumTmaBytes, laneId, devComms, windows);
             }
         }
 

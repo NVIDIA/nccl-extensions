@@ -16,7 +16,7 @@ if [[ ! -x "$EP_BENCH" ]]; then
   exit 1
 fi
 
-NP="${NCCL_EP_TEST_NP:-8}"
+: "${NP:?NP must be set}"
 # Set SLURM_PARTITION in CI for IPP6; leave unset on EOS (default partition / allocation).
 PARTITION="${SLURM_PARTITION:-}"
 TIME="${NCCL_EP_TEST_SLURM_TIME:-00:30:00}"

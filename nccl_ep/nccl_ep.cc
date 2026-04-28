@@ -707,7 +707,7 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
     ncclTeam rail_team = ncclTeamRail(ep_group->comm);
     if (rail_team.nRanks != rdma_team_size) {
         fprintf(stderr,
-                "[HT GIN] Error: rail team size (%d) must equal number of nodes (%d)\n",
+                "[HT GIN] Error: rail team size (%d) must equal number of LSA domains (%d)\n",
                 rail_team.nRanks, rdma_team_size);
         return ncclInvalidUsage;
     }

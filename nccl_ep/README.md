@@ -133,6 +133,10 @@ This section provides a high-level overview of the input, output, and local tens
 
 #### HT mode (same data type)
 
+HT mode uses the **flat layout** (`NCCL_EP_LAYOUT_FLAT`): dispatch output is a contiguous 2D sequence of
+N(r) received tokens with no rank-major or expert-major structure.
+This is the only layout supported by HT mode and is selected automatically when `NCCL_EP_LAYOUT_AUTO` is used.
+
 **Handle creation**
 
 | Operation | Local tags    | Local dims |
@@ -374,7 +378,12 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
 ## Algorithm-related configurations
 
 **High Throughput (HT)**:
-- Output tokens must have 2D format: `[num_recv_tokens x hidden]` where `num_recv_tokens = num_ranks * max_tokens_per_rank`
+- Uses flat layout (`NCCL_EP_LAYOUT_FLAT`), the only layout supported by HT mode.
+- Dispatch output tokens are a contiguous flat sequence: `[N(r) x hidden]` where `N(r)` is the total number of tokens targeting this rank.
+  - For static allocation: `N(r) = num_ranks * max_tokens_per_rank`
+  - For dynamic allocation (`max_tokens_per_rank = NCCL_EP_AUTO`): `N(r)` is the actual received count, queryable via `ncclEpHandleGetNumRecvTokens`
+- `recv_topk_idx` and `recv_topk_weights` carry per-slot routing metadata alongside the received tokens.
+- The caller uses `recv_topk_idx` to route each slot to the correct local expert(s), applies the weighted reduction using `recv_topk_weights`, and passes the pre-reduced `[N(r) x hidden]` tensor to `ncclEpCombine`.
 - Supports dynamic `max_tokens_per_rank` (set to `NCCL_EP_AUTO`)
 
 **Low Latency (LL)**:

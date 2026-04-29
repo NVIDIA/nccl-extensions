@@ -860,11 +860,11 @@ ncclResult_t ncclEpCreateGroup(
            "ncclEpCreateGroup: invalid algorithm, supported: low_latency, high_throughput");
     const ncclEpLayout_t effective_layout =
         (in_config->layout != NCCL_EP_LAYOUT_AUTO) ? in_config->layout :
-        (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) ? NCCL_EP_LAYOUT_RANK_MAJOR :
+        (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) ? NCCL_EP_LAYOUT_FLAT :
                                                                   NCCL_EP_LAYOUT_EXPERT_MAJOR;
     EP_HOST_ASSERT(!(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
-                     effective_layout != NCCL_EP_LAYOUT_RANK_MAJOR) &&
-                   "ncclEpCreateGroup: HT mode requires rank-major layout");
+                     effective_layout != NCCL_EP_LAYOUT_FLAT) &&
+                   "ncclEpCreateGroup: HT mode only supports flat layout (NCCL_EP_LAYOUT_FLAT)");
     EP_HOST_ASSERT(!(in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY &&
                      effective_layout != NCCL_EP_LAYOUT_EXPERT_MAJOR) &&
                    "ncclEpCreateGroup: LL mode only supports expert-major layout");

@@ -1803,9 +1803,10 @@ void printUsage(const char* programName, int myRank) {
         printf("  --algorithm <mode>      Algorithm mode (default: ll)\n");
         printf("                          ll or low-latency:  Low latency mode\n");
         printf("                          ht or high-throughput:  High throughput mode\n");
-        printf("  --layout <layout>       Buffer layout (default: expert-major; LL only)\n");
-        printf("                          em or expert-major:  Expert-major layout\n");
-        printf("                          rm or rank-major:    Rank-major layout (not yet implemented)\n");
+        printf("  --layout <layout>       Buffer layout\n");
+        printf("                          em or expert-major:  Expert-major layout (LL only, default for LL)\n");
+        printf("                          rm or rank-major:    Rank-major layout (LL only, not yet implemented)\n");
+        printf("                          fl or flat:          Flat layout (HT only, default for HT)\n");
         printf("  --tokens <num>          Number of tokens (default: LL=128, HT=4096)\n");
         printf("  --hidden <num>          Hidden dimension (default: 7168)\n");
         printf("  --top-k <num>           Top-k experts per token (default: 8)\n");
@@ -1890,9 +1891,11 @@ int main(int argc, char* argv[]) {
                     layout = NCCL_EP_LAYOUT_EXPERT_MAJOR;
                 } else if (strcmp(optarg, "rm") == 0 || strcmp(optarg, "rank-major") == 0) {
                     layout = NCCL_EP_LAYOUT_RANK_MAJOR;
+                } else if (strcmp(optarg, "fl") == 0 || strcmp(optarg, "flat") == 0) {
+                    layout = NCCL_EP_LAYOUT_FLAT;
                 } else {
                     if (myRank == 0) {
-                        printf("Error: Invalid layout '%s'. Use 'em', 'expert-major', 'rm', or 'rank-major'\n", optarg);
+                        printf("Error: Invalid layout '%s'. Use 'em'/'expert-major', 'rm'/'rank-major', or 'fl'/'flat'\n", optarg);
                     }
                     MPI_Finalize();
                     return 1;
@@ -1953,7 +1956,7 @@ int main(int argc, char* argv[]) {
     // Set algorithm-specific default layout if user didn't specify
     if (!layout_set) {
         layout = (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT)
-                 ? NCCL_EP_LAYOUT_RANK_MAJOR
+                 ? NCCL_EP_LAYOUT_FLAT
                  : NCCL_EP_LAYOUT_EXPERT_MAJOR;
     }
 
@@ -1989,11 +1992,11 @@ int main(int argc, char* argv[]) {
     }
 
     // Validate user-specified layout against algorithm.
-    // HT auto-selects rank-major; LL auto-selects expert-major.
+    // HT only supports flat; LL auto-selects expert-major (rank-major is reserved for future use).
     if (layout_set) {
-        if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && layout != NCCL_EP_LAYOUT_RANK_MAJOR) {
+        if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && layout != NCCL_EP_LAYOUT_FLAT) {
             if (myRank == 0)
-                printf("Error: HT mode only supports rank-major layout.\n");
+                printf("Error: HT mode only supports flat layout (--layout fl/flat).\n");
             MPI_Finalize();
             return 1;
         }
@@ -2024,7 +2027,9 @@ int main(int argc, char* argv[]) {
         printf("=== NCCL EP Performance Benchmark ===\n");
         printf("Configuration:\n");
         printf("  Algorithm:       %s\n", algo_name);
-        printf("  Layout:          %s\n", layout == NCCL_EP_LAYOUT_RANK_MAJOR ? "rank-major" : "expert-major");
+        printf("  Layout:          %s\n",
+               layout == NCCL_EP_LAYOUT_FLAT ? "flat" :
+               layout == NCCL_EP_LAYOUT_RANK_MAJOR ? "rank-major" : "expert-major");
         printf("  Ranks:           %d\n", nRanks);
         printf("  Tokens:          %u\n", num_tokens);
         printf("  Hidden:          %u\n", hidden);

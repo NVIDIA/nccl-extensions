@@ -28,7 +28,7 @@ typedef enum {
 typedef enum {
     /**
      * Auto-select layout based on algorithm (zero-init default).
-     * ncclEpCreateGroup resolves this to EXPERT_MAJOR for LL and RANK_MAJOR for HT.
+     * ncclEpCreateGroup resolves this to EXPERT_MAJOR for LL and FLAT for HT.
      */
     NCCL_EP_LAYOUT_AUTO = NCCL_EP_AUTO,
 
@@ -67,6 +67,29 @@ typedef enum {
      * individual per-expert contributions.
      */
     NCCL_EP_LAYOUT_RANK_MAJOR,
+
+    /**
+     * Flat layout (HT mode only).
+     *
+     * HT dispatch output:
+     *   recv_x shape:            [N(r) x hidden]
+     *   recv_topk_weights shape: [N(r) x num_topk]
+     *   recv_topk_idx shape:     [N(r) x num_topk]
+     *
+     * where N(r) is the total number of tokens targeting this rank across all
+     * source ranks (num_ranks * max_tokens_per_rank in the static case, or the
+     * actual received count when max_tokens_per_rank is NCCL_EP_AUTO).
+     *
+     * Tokens arrive as a single contiguous sequence with no rank-major or
+     * expert-major structure.  The caller uses recv_topk_idx to route each
+     * slot to the appropriate local expert(s) and recv_topk_weights to apply
+     * the weighted reduction before passing pre-reduced outputs to
+     * ncclEpCombine.
+     *
+     * This is the only layout supported by HT mode and the default when
+     * NCCL_EP_LAYOUT_AUTO is used with NCCL_EP_ALGO_HIGH_THROUGHPUT.
+     */
+    NCCL_EP_LAYOUT_FLAT,
 } ncclEpLayout_t;
 
 // Tensor tags required to identify the type of tensors in `ncclEpDispatch` and `ncclEpCombine`

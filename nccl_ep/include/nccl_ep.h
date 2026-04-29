@@ -29,7 +29,8 @@ typedef struct {
     // Receive buffer layout for the dispatch and combine path.
     // Determines the shape of recv_x on dispatch output and the expected input shape for combine.
     // Default (NCCL_EP_LAYOUT_AUTO / zero-init): auto-selected based on algorithm
-    //   (EXPERT_MAJOR for LL, RANK_MAJOR for HT).
+    //   (EXPERT_MAJOR for LL, FLAT for HT).
+    // HT mode only supports NCCL_EP_LAYOUT_FLAT.
     ncclEpLayout_t layout;
     unsigned int num_experts;            // Number of experts (required)
     // Maximum number of tokens any single rank will dispatch. Must be the same across all ranks.
@@ -287,8 +288,10 @@ typedef struct {
 //                            then the additional output tensor with tag (NCCL_EP_TENSOR_TAG_SCALES) for scaling
 //                            factors must be supplied.
 //                            Scaling will be applied during the collective and the output tensor will be scaled.
-//                            For HT: the dimensions of output tensors are [num_recv_tokens x data_size] (2D),
-//                                    where num_recv_tokens = num_ranks * max_tokens_per_rank.
+//                            For HT (NCCL_EP_LAYOUT_FLAT): output tensors are [N(r) x data_size] (2D),
+//                                    where N(r) = num_ranks * max_tokens_per_rank for static allocation,
+//                                    or the actual received count when max_tokens_per_rank is NCCL_EP_AUTO.
+//                                    Tokens arrive as a contiguous flat sequence; no rank or expert structure.
 //                            For LL: the dimensions of output tensors are
 //                                    [local_experts x num_recv_tokens x data_size] (3D, expert-major).
 //                                    The dimensions of the scaling factors tensor are:
@@ -348,8 +351,8 @@ typedef struct ncclEpCombineConfig ncclEpCombineConfig_t;
 // Arguments:
 //   handle           - [IN,OUT] EP handle that was used for `ncclEpDispatch()` operation
 //   inputs           - [IN]     Array of pointers to input tensors, each containing expert outputs.
-//                               For HT: inputs are [num_recv_tokens x data_size] (2D),
-//                                       where num_recv_tokens = num_ranks * max_tokens_per_rank.
+//                               For HT (NCCL_EP_LAYOUT_FLAT): inputs are [N(r) x data_size] (2D),
+//                                       where N(r) is the flat received token count (same as dispatch output dim 0).
 //                               For LL: inputs are [local_experts x num_recv_tokens x data_size] (3D, expert-major),
 //                                       where num_recv_tokens = num_ranks * max_tokens_per_rank.
 //                               For LL rank-major: inputs are [num_recv_tokens x data_size] (2D),

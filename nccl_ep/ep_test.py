@@ -20,16 +20,13 @@ Options (identical to ep_test.cu):
 
 import argparse
 import ctypes
-import os
 import random
 import struct
 import sys
 
 from mpi4py import MPI
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "python"))
-
-from nccl_ep.nccl_wrapper import (
+from nccl.ep.nccl_wrapper import (
     NCCLLibrary,
     ncclDataTypeEnum,
     ncclEpAlgorithm_t,

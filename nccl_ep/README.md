@@ -4,6 +4,15 @@ NCCL EP is a high-performance NCCL API extension for efficient Mixture-of-Expert
 It provides optimized dispatch and combine primitives for Expert Parallelism (EP) across distributed GPU systems
 implemented on top of NCCL Device API: Load-Store Accessible (LSA) and GPU-Initiated Networking (GIN) operations.
 
+# Maintainers
+
+| GitHub | Areas |
+|--------|------|
+| @artpol84 | APIs, new features, layouts |
+| @kwen2501 | APIs, integration |
+| @sb17v | Kernels, build systems |
+| @nv-lschneider | Kernels, mnnvl |
+| @kgioioso | GIN, NCCL |
 
 # Table of Contents
 

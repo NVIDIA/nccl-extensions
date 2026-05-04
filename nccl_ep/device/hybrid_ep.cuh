@@ -16,7 +16,6 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda/ptx>
-#include <nccl.h>
 #include "nccl_device.h"
 #include "cuda_compat_shims.cuh" // Compatibility shims for CUDA 12.x
 #include "include/common.hpp"
@@ -3792,8 +3791,9 @@ template<// This type represent intra-node reduction warp group.
 // 1. intra-node reduction warp group(4 warps, only valid for multinode scenario). 2. inter-node reduction warp group(4 warps, 1 pipeline for multinode scenario, 2 pipeline otherwise).
 // 3. intra-node G2S warp group(1 warp, only valid for multinode scenario). 4. inter-node G2S warp group(1 warp for multinode scenario, 2 warps otherwise). 5. inter-node N2N rdma warp group(1 warp, only valid for multinode scenario).
 // Total 6(single-node) or 11(multi-node) warps per CUDA block/SM.
-__launch_bounds__(INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size(), 1)
-__global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LSA_TEAM_SIZE> param)
+__device__ __forceinline__ void combine_kernel_impl(
+  const combine_kernel_param_t<LSA_TEAM_SIZE>& param,
+  uint8_t* smem_bytes)
 {
   // Compile-time check (only enforce for multi-node layout).
   if constexpr (NUM_LSA_TEAMS != 1) {
@@ -3817,7 +3817,6 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LS
 #endif
 
   // Shared memory used over 48KB, should use dynamic shared memory.
-  extern __shared__ uint8_t smem_bytes[];
     using cur_smem_t  = combine_smem_layout_t;
 
     // Initialize the layout struct (each thread has its own copy in registers)
@@ -4407,6 +4406,58 @@ __global__ void scan(const uint8_t* input_routing_map,
       *attn_to_rdma_map_base_addr = token_needed_by_this_node;
     }
   }
+}
+
+template<// This type represent intra-node reduction warp group.
+         typename INTRA_NODE_RED_GROUP,
+         // This type represent inter-node reduction warp group.
+         typename INTER_NODE_RED_GROUP,
+         // This type represent intra-node G2S warp group.
+         typename INTRA_NODE_G2S_GROUP,
+         // This type represent inter-node G2S warp group.
+         typename INTER_NODE_G2S_GROUP,
+         // This type represent inter-node rdma warp group.
+         typename INTER_NODE_RDMA_GROUP,
+         // Number of independent data pipeline per CUDA block.
+         int NUM_OF_DATA_PIPELINE_PER_BLOCK,
+         // Number of token entry in the shared memory for G2S operations.
+         int NUM_OF_STAGES_G2S,
+         // Number of token entry in the shared memory for S2G operations.
+         int NUM_OF_STAGES_S2G,
+         // Number of token per group in the inter-node reduction/G2S warp group.
+         int NUM_OF_TOKENS_PER_GROUP,
+         // Size of each chunk.
+         int NUM_OF_TOKENS_PER_CHUNK,
+         // Model configuration.
+         int MAX_NUM_OF_TOKENS_PER_RANK,
+         int NUM_LSA_TEAMS,
+         // Number of CUDA block running dispatch kernel.
+         int NUM_OF_BLOCKS,
+         // Number of fully in-flight S2G in intra-node reduction warp group.
+         int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
+         // Whether the combine kernel is used in backward process. If so, need to transfer the prob for each token as well.
+         bool BACKWARD_COMBINE,
+         int LSA_TEAM_SIZE>
+__launch_bounds__(INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size(), 1)
+__global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LSA_TEAM_SIZE> param)
+{
+  extern __shared__ uint8_t smem_bytes[];
+  combine_kernel_impl<INTRA_NODE_RED_GROUP,
+                      INTER_NODE_RED_GROUP,
+                      INTRA_NODE_G2S_GROUP,
+                      INTER_NODE_G2S_GROUP,
+                      INTER_NODE_RDMA_GROUP,
+                      NUM_OF_DATA_PIPELINE_PER_BLOCK,
+                      NUM_OF_STAGES_G2S,
+                      NUM_OF_STAGES_S2G,
+                      NUM_OF_TOKENS_PER_GROUP,
+                      NUM_OF_TOKENS_PER_CHUNK,
+                      MAX_NUM_OF_TOKENS_PER_RANK,
+                      NUM_LSA_TEAMS,
+                      NUM_OF_BLOCKS,
+                      NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
+                      BACKWARD_COMBINE,
+                      LSA_TEAM_SIZE>(param, smem_bytes);
 }
 
 template<

@@ -15,6 +15,14 @@
 #include "hybrid_ep.cuh"
 #include "include/common.hpp"
 
+#ifndef NCCL_EP_ENABLE_NVCC_JIT
+#define NCCL_EP_ENABLE_NVCC_JIT 0
+#endif
+
+#if NCCL_EP_ENABLE_NVCC_JIT
+#include "jit/combine_jit.cuh"
+#endif
+
 namespace nccl_ep {
 namespace hybridep {
 
@@ -565,6 +573,35 @@ build_combine_param(const CombineParams& params) {
     return kp;
 }
 
+
+template <
+    int NUM_OF_STAGES_G2S,
+    int NUM_OF_STAGES_S2G,
+    int NUM_OF_TOKENS_PER_CHUNK,
+    int NUM_OF_TOKENS_PER_GROUP,
+    int NUM_OF_BLOCKS,
+    int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
+    bool BACKWARD_COMBINE,
+    int NUM_LSA_TEAMS,
+    int LSA_TEAM_SIZE>
+void launch_static_combine(
+    ::hybrid_ep::combine_kernel_param_t<LSA_TEAM_SIZE> kp,
+    cudaStream_t stream) {
+    using HybridEPType = ::hybrid_ep::hybrid_ep<
+        MAX_SUPPORTED_TOKENS_PER_RANK,
+        NUM_LSA_TEAMS,
+        LSA_TEAM_SIZE>;
+
+    HybridEPType::template combine<
+        NUM_OF_STAGES_G2S,
+        NUM_OF_STAGES_S2G,
+        NUM_OF_TOKENS_PER_CHUNK,
+        NUM_OF_TOKENS_PER_GROUP,
+        NUM_OF_BLOCKS,
+        NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
+        BACKWARD_COMBINE>(kp, stream);
+}
+
 // Template combine launcher for forward/backward
 template<bool BACKWARD_COMBINE>
 void combine_impl(
@@ -583,11 +620,6 @@ void combine_impl(
                 assert((experts_per_node * sizeof(float)) % 16 == 0 &&
                        "experts_per_node must be multiple of 4 for TMA alignment");
 
-                using HybridEPType = ::hybrid_ep::hybrid_ep<
-                    MAX_SUPPORTED_TOKENS_PER_RANK,
-                    NUM_LSA_TEAMS,
-                    LSA_TEAM_SIZE>;
-
                 auto kp = build_combine_param<LSA_TEAM_SIZE>(params);
 
                 // Select config based on NUM_LSA_TEAMS (single-node: 12 stages/2 pipelines, multi-node: 5 stages/1 pipeline)
@@ -598,14 +630,45 @@ void combine_impl(
                     ? HYBRIDEP_COMBINE_SINGLENODE_NUM_OF_STAGES_S2G
                     : HYBRIDEP_COMBINE_MULTINODE_NUM_OF_STAGES_S2G;
 
-                HybridEPType::template combine<
+#if NCCL_EP_ENABLE_NVCC_JIT
+                ::hybrid_ep::model_config_t model;
+                model.hidden_dim = kp.hidden_dim;
+                model.max_num_of_tokens_per_rank = MAX_SUPPORTED_TOKENS_PER_RANK;
+                model.num_of_experts_per_rank = kp.experts_per_rank;
+                model.num_of_ranks_per_node = kp.num_of_ranks_per_node;
+                model.num_of_nodes = NUM_LSA_TEAMS;
+                const int smem_size = ::hybrid_ep::calculate_combine_smem_layout_size<
+                    num_stages_g2s,
+                    num_stages_s2g,
+                    HT_OF_NUM_TOKENS_PER_CHUNK,
+                    MAX_SUPPORTED_TOKENS_PER_RANK,
+                    NUM_LSA_TEAMS,
+                    BACKWARD_COMBINE>(model);
+
+                if (jit::try_launch_combine<
+                        num_stages_g2s,
+                        num_stages_s2g,
+                        HT_OF_NUM_TOKENS_PER_CHUNK,
+                        HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP,
+                        HYBRIDEP_COMBINE_NUM_OF_BLOCKS,
+                        HYBRIDEP_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
+                        BACKWARD_COMBINE,
+                        NUM_LSA_TEAMS,
+                        LSA_TEAM_SIZE>(kp, smem_size, stream)) {
+                    return;
+                }
+#endif
+
+                launch_static_combine<
                     num_stages_g2s,
                     num_stages_s2g,
                     HT_OF_NUM_TOKENS_PER_CHUNK,
                     HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP,
                     HYBRIDEP_COMBINE_NUM_OF_BLOCKS,
                     HYBRIDEP_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
-                    BACKWARD_COMBINE>(kp, stream);
+                    BACKWARD_COMBINE,
+                    NUM_LSA_TEAMS,
+                    LSA_TEAM_SIZE>(kp, stream);
             });
         });
 }

@@ -23,6 +23,13 @@ LIBDIR := $(BUILDDIR)/lib
 INCDIR := $(BUILDDIR)/include
 DST_DIR := $(BUILDDIR)/test/nccl_ep
 
+# Optional experimental NVCC JIT path for HybridEP combine.
+# Build with NCCL_EP_ENABLE_NVCC_JIT=1, enable at runtime with NCCL_EP_COMBINE_JIT=1.
+ifndef NCCL_EP_ENABLE_NVCC_JIT
+  NCCL_EP_ENABLE_NVCC_JIT := 0
+endif
+NCCL_EP_JIT_LDFLAGS :=
+
 # Include paths - add current directory so common.hpp can find device/ep headers
 # Include NCCL source headers for GIN support
 INCFLAGS = -I. -I./include -I./device -I$(BUILDDIR)/include -I$(BUILDDIR)/include/nccl_device -I../../src/include
@@ -36,6 +43,16 @@ INCFLAGS = -I. -I./include -I./device -I$(BUILDDIR)/include -I$(BUILDDIR)/includ
 # The ncclEp* API is in nccl_ep.cc (compiled with CXXFLAGS), so it still gets exported.
 NVCUFLAGS := $(NVCC_GENCODE) --extended-lambda $(INCFLAGS) --expt-relaxed-constexpr --compiler-options "-fPIC -fvisibility=hidden" -ccbin $(CXX) $(CXXSTD)
 CXXFLAGS += $(INCFLAGS) -fPIC -fvisibility=default
+ifeq ($(NCCL_EP_ENABLE_NVCC_JIT),1)
+  NCCL_EP_JIT_DEFS := -DNCCL_EP_JIT_SOURCE_DIR=\"$(abspath .)\" \
+                      -DNCCL_EP_JIT_BUILD_INCLUDE_DIR=\"$(abspath $(INCDIR))\" \
+                      -DNCCL_EP_JIT_CUDA_INCLUDE_DIR=\"$(abspath $(CUDA_INC))\"
+  NVCUFLAGS += -DNCCL_EP_ENABLE_NVCC_JIT=1
+  CXXFLAGS += -DNCCL_EP_ENABLE_NVCC_JIT=1 $(NCCL_EP_JIT_DEFS) -I$(CUDA_INC) -I$(CUDA_INC)/cccl
+  NCCL_EP_JIT_LDFLAGS := -lcuda
+else
+  NVCUFLAGS += -DNCCL_EP_ENABLE_NVCC_JIT=0
+endif
 
 # Configurable LSA team size range for compile-time instantiation.
 # Restricting the range reduces build time during development.  Example:
@@ -58,6 +75,12 @@ DEPFLAGS = -MMD -MP
 HOST_SRC := nccl_ep.cc
 DEVICE_SRC := device/low_latency.cu \
               device/hybridep_adapter.cu
+ifeq ($(NCCL_EP_ENABLE_NVCC_JIT),1)
+  HOST_SRC += device/jit/jit_utils.cc \
+              device/jit/jit_cache.cc \
+              device/jit/nvcc_compiler.cc \
+              device/jit/jit_runtime.cc
+endif
 # Object files
 HOST_OBJ := $(HOST_SRC:%.cc=$(OBJDIR)/%.o)
 DEVICE_OBJ := $(DEVICE_SRC:%.cu=$(OBJDIR)/%.o)
@@ -113,7 +136,7 @@ $(LIBTARGET): $(ALL_OBJ) $(DEVGLUE_OBJ)
 $(SOLIBTARGET): $(ALL_OBJ) $(DEVGLUE_OBJ)
 	@echo "Creating shared library $@"
 	@mkdir -p $(dir $@)
-	$(NVCC) -shared $(NVCC_GENCODE) -o $@ $^ -L$(LIBDIR) -lnccl -Xlinker -rpath -Xlinker $(LIBDIR) $(LDFLAGS)
+	$(NVCC) -shared $(NVCC_GENCODE) -o $@ $^ -L$(LIBDIR) -lnccl $(NCCL_EP_JIT_LDFLAGS) -Xlinker -rpath -Xlinker $(LIBDIR) $(LDFLAGS)
 
 # Install headers
 $(INCDIR)/%.h: include/%.h
@@ -147,11 +170,11 @@ MPI_CFLAGS := -DMPI_SUPPORT -I$(MPI_HOME)/include
 MPI_LDFLAGS := -L$(MPI_HOME)/lib -lmpi
 
 EP_TEST_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) --compiler-options "-fPIC" -ccbin $(CXX) $(CXXSTD)
-EP_TEST_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda
+EP_TEST_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(NCCL_EP_JIT_LDFLAGS)
 
 # ep_bench: performance benchmark (NVTX for profiling, optional CUPTI for kernel timing)
 EP_BENCH_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) $(CUPTI_CFLAGS) --compiler-options "-fPIC" -ccbin $(CXX) $(CXXSTD)
-EP_BENCH_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(CUPTI_LDFLAGS)
+EP_BENCH_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(NCCL_EP_JIT_LDFLAGS) $(CUPTI_LDFLAGS)
 ep_test: lib $(DST_DIR)/ep_test
 ep_bench: lib $(DST_DIR)/ep_bench
 
@@ -180,9 +203,9 @@ MPI_CFLAGS := -DMPI_SUPPORT
 MPI_LDFLAGS := -lmpi_ibm
 
 EP_TEST_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) --compiler-options "-fPIC" -ccbin $(CXX) $(CXXSTD)
-EP_TEST_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda
+EP_TEST_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(NCCL_EP_JIT_LDFLAGS)
 EP_BENCH_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) $(CUPTI_CFLAGS) --compiler-options "-fPIC" -ccbin $(CXX) $(CXXSTD)
-EP_BENCH_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(CUPTI_LDFLAGS)
+EP_BENCH_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(NCCL_EP_JIT_LDFLAGS) $(CUPTI_LDFLAGS)
 ep_test: lib $(DST_DIR)/ep_test
 ep_bench: lib $(DST_DIR)/ep_bench
 

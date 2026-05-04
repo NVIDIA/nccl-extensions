@@ -109,6 +109,10 @@ static void CUPTIAPI cuptiBufferCompleted(CUcontext /*ctx*/, uint32_t /*streamId
 
 class KernelTimer {
 public:
+
+    KernelTimer() {
+        CUPTI_CALL(cuptiActivityFlushAll(0));
+    }
     // Enable CUPTI kernel activity recording and clear accumulated stats.
     void start() {
         g_kernel_stats.clear();
@@ -145,6 +149,8 @@ public:
         }
         fflush(stdout);
     }
+
+    inline bool is_valid() { return true;}
 };
 
 #else // !HAVE_CUPTI
@@ -155,6 +161,7 @@ public:
     void stop() {}
     double get_avg_us(const char*) const { return 0.0; }
     void dump(int) const {}
+    inline bool is_valid() { return false;}
 };
 
 #endif // HAVE_CUPTI
@@ -1445,6 +1452,7 @@ PairedBenchResult runPairedBenchmark(
     int num_iters,
     size_t dispatch_bytes,
     size_t combine_bytes,
+    KernelTimer& ktimer,
     cudaStream_t stream
 ) {
     // Warmup with paired dispatch+combine
@@ -1471,6 +1479,9 @@ PairedBenchResult runPairedBenchmark(
         CUDACHECK(cudaEventCreate(&combine_end[i]));
     }
 
+    // Start CUPTI kernel timer
+    ktimer.start();    
+
     // Run paired benchmark with individual timing
     // Events are recorded immediately after kernel launch (before sync) to measure GPU time only
     // Sync happens after event recording to not affect timing
@@ -1486,6 +1497,9 @@ PairedBenchResult runPairedBenchmark(
         CUDACHECK(cudaStreamSynchronize(stream));             // Sync outside timing
         MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     }
+
+    // Stop CUPTI kernel timer
+    ktimer.stop();
 
     // Collect times
     std::vector<float> dispatch_times(num_iters);
@@ -1700,23 +1714,26 @@ void printLowLatencyResults(
     const BenchResult& dispatch_result,
     const BenchResult& combine_result,
     const BenchResult& combined_result,
+    KernelTimer& ktimer,
     const LowLatencyBytes& ll_bytes
 ) {
-    // Print per-rank results
-    printf("[Rank %d] Dispatch:         avg=%.2f us, min=%.2f us, max=%.2f us, throughput=%.2f GB/s\n",
-           myRank,
-           dispatch_result.avg_ms * 1000, dispatch_result.min_ms * 1000, dispatch_result.max_ms * 1000,
-           dispatch_result.throughput_gbps);
 
-    printf("[Rank %d] Combine:          avg=%.2f us, min=%.2f us, max=%.2f us, throughput=%.2f GB/s\n",
-           myRank,
-           combine_result.avg_ms * 1000, combine_result.min_ms * 1000, combine_result.max_ms * 1000,
-           combine_result.throughput_gbps);
+    // Uncomment for detailed per-rank results
+    // // Print per-rank results
+    // printf("[Rank %d] Dispatch:         avg=%.2f us, min=%.2f us, max=%.2f us, throughput=%.2f GB/s\n",
+    //        myRank,
+    //        dispatch_result.avg_ms * 1000, dispatch_result.min_ms * 1000, dispatch_result.max_ms * 1000,
+    //        dispatch_result.throughput_gbps);
 
-    printf("[Rank %d] Dispatch+Combine: avg=%.2f us, min=%.2f us, max=%.2f us, throughput=%.2f GB/s\n",
-           myRank,
-           combined_result.avg_ms * 1000, combined_result.min_ms * 1000, combined_result.max_ms * 1000,
-           combined_result.throughput_gbps);
+    // printf("[Rank %d] Combine:          avg=%.2f us, min=%.2f us, max=%.2f us, throughput=%.2f GB/s\n",
+    //        myRank,
+    //        combine_result.avg_ms * 1000, combine_result.min_ms * 1000, combine_result.max_ms * 1000,
+    //        combine_result.throughput_gbps);
+
+    // printf("[Rank %d] Dispatch+Combine: avg=%.2f us, min=%.2f us, max=%.2f us, throughput=%.2f GB/s\n",
+    //        myRank,
+    //        combined_result.avg_ms * 1000, combined_result.min_ms * 1000, combined_result.max_ms * 1000,
+    //        combined_result.throughput_gbps);
 
     // Aggregate latency results across ranks
     double local_dispatch_avg = dispatch_result.avg_ms;
@@ -1763,6 +1780,26 @@ void printLowLatencyResults(
     MPI_Reduce(&local_total_tp, &global_total_tp_min, 1, MPI_DOUBLE_INT, MPI_MINLOC, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_total_tp, &global_total_tp_max, 1, MPI_DOUBLE_INT, MPI_MAXLOC, 0, MPI_COMM_WORLD);
 
+
+
+    double dispatch_kernel_avg = 0.0, combine_kernel_avg = 0.0;
+    double dispatch_kernel_min = 0.0, combine_kernel_min = 0.0;
+    double dispatch_kernel_max = 0.0, combine_kernel_max = 0.0;
+    if (ktimer.is_valid()) {
+        double local_disp_kern = ktimer.get_avg_us("dispatch");
+        double local_comb_kern = ktimer.get_avg_us("combine");
+        double global_disp_kern = 0.0, global_comb_kern = 0.0;
+        MPI_Reduce(&local_disp_kern, &global_disp_kern, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_comb_kern, &global_comb_kern, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        dispatch_kernel_avg = global_disp_kern / nRanks;
+        combine_kernel_avg = global_comb_kern / nRanks;
+        MPI_Reduce(&local_disp_kern, &dispatch_kernel_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_comb_kern, &combine_kernel_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_disp_kern, &dispatch_kernel_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_comb_kern, &combine_kernel_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    }
+
+
     // Print summary on rank 0
     if (myRank == 0) {
         global_dispatch_avg /= nRanks;
@@ -1775,6 +1812,9 @@ void printLowLatencyResults(
         double avg_total_tp = (total_data_bytes / 1e9) / (global_total_avg / 1000.0);
 
         printf("\n=== Summary (Low Latency, across %d ranks) ===\n", nRanks);
+
+        printf("\n--- Host-observed performance ---\n");
+
         printf("Dispatch (%s):  avg=%.2f us, min=%.2f us, max=%.2f us\n",
                ll_bytes.is_fp8 ? "FP8" : "BF16",
                global_dispatch_avg * 1000,
@@ -1800,11 +1840,35 @@ void printLowLatencyResults(
                avg_total_tp,
                global_total_tp_min.value, global_total_tp_min.rank,
                global_total_tp_max.value, global_total_tp_max.rank);
+
+        printf("\n--- Kernel-only performance ---\n");
+        if (ktimer.is_valid()) {
+            printf("Dispatch:    avg=%.2f us, min=%.2f us, max=%.2f us\n",
+                dispatch_kernel_avg,
+                dispatch_kernel_min,
+                dispatch_kernel_max);
+            printf("                  throughput: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
+                    (ll_bytes.dispatch_bytes / 1e9) / (dispatch_kernel_avg / 1e6),
+                    (ll_bytes.dispatch_bytes / 1e9) / (dispatch_kernel_min / 1e6),
+                    (ll_bytes.dispatch_bytes / 1e9) / (dispatch_kernel_max / 1e6));
+            printf("Combine:     avg=%.2f us, min=%.2f us, max=%.2f us\n",
+                combine_kernel_avg,
+                combine_kernel_min,
+                combine_kernel_max);
+            printf("                  throughput: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
+                    (ll_bytes.combine_bytes / 1e9) / (combine_kernel_avg / 1e6),
+                    (ll_bytes.combine_bytes / 1e9) / (combine_kernel_min / 1e6),
+                    (ll_bytes.combine_bytes / 1e9) / (combine_kernel_max / 1e6));
+        } else {
+            printf("  NOTE: CUPTI support was not compiled.\n");
+        }
+
         printf("\nByte counts: dispatch=%.2f MB (%s), combine=%.2f MB (BF16), selections=%u\n",
                ll_bytes.dispatch_bytes / 1e6,
                ll_bytes.is_fp8 ? "FP8" : "BF16",
                ll_bytes.combine_bytes / 1e6,
                ll_bytes.num_valid_selections);
+        fflush(stdout);
     }
 }
 
@@ -1818,20 +1882,11 @@ void printHighThroughputResults(
     const BenchResult& dispatch_result,
     const BenchResult& combine_result,
     const BenchResult& combined_result,
+    KernelTimer& ktimer,
     const HighThroughputBytes& ht_bytes,
-    double local_kernel_dk_us,
-    double local_kernel_ck_us,
-    double global_kernel_dk_us,
-    double global_kernel_ck_us,
     size_t global_total_send, size_t global_rdma_send,
     size_t global_total_recv, size_t global_rdma_recv
 ) {
-    printf("[Rank %d] Dispatch:         total=%.2f us  kernel=%.2f us\n",
-           myRank, dispatch_result.avg_ms * 1000, local_kernel_dk_us);
-    printf("[Rank %d] Combine:          total=%.2f us  kernel=%.2f us\n",
-           myRank, combine_result.avg_ms * 1000, local_kernel_ck_us);
-    printf("[Rank %d] Dispatch+Combine: total=%.2f us\n", myRank, combined_result.avg_ms * 1000);
-
     double local_dispatch_avg = dispatch_result.avg_ms;
     double local_dispatch_min = dispatch_result.min_ms;
     double local_dispatch_max = dispatch_result.max_ms;
@@ -1856,6 +1911,26 @@ void printHighThroughputResults(
     MPI_Reduce(&local_total_min, &global_total_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_total_max, &global_total_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
+
+    // Obtain kernel times from CUPTI if available
+    double global_kernel_dk_us = 0.0, global_kernel_ck_us = 0.0;
+    double local_dispatch_kernel_us = 0.0;
+    double local_combine_kernel_us  = 0.0;
+    if (ktimer.is_valid()) {
+        local_dispatch_kernel_us = ktimer.get_avg_us("dispatch_kernel");
+        local_combine_kernel_us  = ktimer.get_avg_us("combine_kernel");
+        MPI_Reduce(&local_dispatch_kernel_us, &global_kernel_dk_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_combine_kernel_us,  &global_kernel_ck_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    }
+
+    // Uncomment for debugging
+    // printf("[Rank %d] Dispatch:         total=%.2f us  kernel=%.2f us\n",
+    //     myRank, dispatch_result.avg_ms * 1000, local_dispatch_kernel_us);
+    // printf("[Rank %d] Combine:          total=%.2f us  kernel=%.2f us\n",
+    //     myRank, combine_result.avg_ms * 1000, local_combine_kernel_us);
+    // printf("[Rank %d] Dispatch+Combine: total=%.2f us\n", myRank, combined_result.avg_ms * 1000);
+
+
     if (myRank == 0) {
         global_dispatch_avg /= nRanks;
         global_combine_avg  /= nRanks;
@@ -1868,10 +1943,6 @@ void printHighThroughputResults(
         double avg_nvl_send   = avg_total_send - avg_rdma_send;
         double avg_nvl_recv   = avg_total_recv - avg_rdma_recv;
 
-        double avg_kernel_dk_us = global_kernel_dk_us / nRanks;
-        double avg_kernel_ck_us = global_kernel_ck_us / nRanks;
-        double dk_s       = avg_kernel_dk_us / 1e6;
-        double ck_s       = avg_kernel_ck_us / 1e6;
         double dk_total_s = global_dispatch_avg * 1e-3;  // avg total dispatch time in seconds
         double ck_total_s = global_combine_avg  * 1e-3;
 
@@ -1902,30 +1973,34 @@ void printHighThroughputResults(
 
         // --- BW based on kernel time ---
         printf("\n--- BW based on kernel time ---\n");
-        printf("Dispatch:    kernel=%.2f us\n", avg_kernel_dk_us);
-        if (dk_s > 0) {
+        if (ktimer.is_valid()) {
+            double avg_kernel_dk_us = global_kernel_dk_us / nRanks;
+            double avg_kernel_ck_us = global_kernel_ck_us / nRanks;
+            double dk_s       = avg_kernel_dk_us / 1e6;
+            double ck_s       = avg_kernel_ck_us / 1e6;
+            printf("Dispatch:    kernel=%.2f us\n", avg_kernel_dk_us);
             printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
-                   (avg_total_recv / 1e9) / dk_s, (avg_nvl_recv / 1e9) / dk_s, (avg_rdma_recv / 1e9) / dk_s);
+                (avg_total_recv / 1e9) / dk_s, (avg_nvl_recv / 1e9) / dk_s, (avg_rdma_recv / 1e9) / dk_s);
             printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
-                   (avg_total_send / 1e9) / dk_s, (avg_nvl_send / 1e9) / dk_s, (avg_rdma_send / 1e9) / dk_s);
-        }
-        printf("Combine:     kernel=%.2f us\n", avg_kernel_ck_us);
-        if (ck_s > 0) {
-            printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
-                   (avg_total_recv / 1e9) / ck_s, (avg_nvl_recv / 1e9) / ck_s, (avg_rdma_recv / 1e9) / ck_s);
-            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
-                   (avg_total_send / 1e9) / ck_s, (avg_nvl_send / 1e9) / ck_s, (avg_rdma_send / 1e9) / ck_s);
-        }
-        printf("Total (D+C): kernel=%.2f us\n", avg_kernel_dk_us + avg_kernel_ck_us);
+                (avg_total_send / 1e9) / dk_s, (avg_nvl_send / 1e9) / dk_s, (avg_rdma_send / 1e9) / dk_s);
 
-        if (dk_s > 0 || ck_s > 0) {
-            printf("\nByte counts (per rank avg): total_send=%.2f MB (%u tokens), rdma_send=%.2f MB (%u tokens), "
-                   "rdma_recv=%.2f MB (%u tokens), total_recv=%.2f MB (%u tokens)\n",
-                   avg_total_send / 1e6, ht_bytes.total_send_tokens,
-                   avg_rdma_send  / 1e6, ht_bytes.rdma_send_tokens,
-                   avg_rdma_recv  / 1e6, ht_bytes.rdma_recv_tokens,
-                   avg_total_recv / 1e6, ht_bytes.total_recv_tokens);
+            printf("Combine:     kernel=%.2f us\n", avg_kernel_ck_us);
+            printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                (avg_total_recv / 1e9) / ck_s, (avg_nvl_recv / 1e9) / ck_s, (avg_rdma_recv / 1e9) / ck_s);
+            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                (avg_total_send / 1e9) / ck_s, (avg_nvl_send / 1e9) / ck_s, (avg_rdma_send / 1e9) / ck_s);
+            printf("Total (D+C): kernel=%.2f us\n", avg_kernel_dk_us + avg_kernel_ck_us);
+        } else {
+            printf("  NOTE: CUPTI support was not compiled.\n");
         }
+
+        printf("\nByte counts (per rank avg): total_send=%.2f MB (%u tokens), rdma_send=%.2f MB (%u tokens), "
+                "rdma_recv=%.2f MB (%u tokens), total_recv=%.2f MB (%u tokens)\n",
+                avg_total_send / 1e6, ht_bytes.total_send_tokens,
+                avg_rdma_send  / 1e6, ht_bytes.rdma_send_tokens,
+                avg_rdma_recv  / 1e6, ht_bytes.rdma_recv_tokens,
+                avg_total_recv / 1e6, ht_bytes.total_recv_tokens);
+
     }
 }
 
@@ -2528,14 +2603,14 @@ int main(int argc, char* argv[]) {
     // CUPTI wraps the benchmark loop — records kernel GPU timestamps in hardware
     // alongside the cudaEvent timing, with zero interference.
     KernelTimer ktimer;
-    ktimer.start();
 
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     PairedBenchResult paired_result = runPairedBenchmark(
         dispatch_fn, combine_fn, actual_warmup, actual_iters,
-        dispatch_data_bytes, combine_data_bytes, stream);
+        dispatch_data_bytes, combine_data_bytes, 
+        ktimer,
+        stream);
 
-    ktimer.stop();
 
     // Extract individual results for printing
     BenchResult dispatch_result = paired_result.dispatch;
@@ -2562,12 +2637,6 @@ int main(int argc, char* argv[]) {
     // Debug: show all captured kernels on rank 0 (uncomment to inspect names)
     // ktimer.dump(myRank);
 
-    double dispatch_kernel_us = ktimer.get_avg_us("dispatch_kernel");
-    double combine_kernel_us  = ktimer.get_avg_us("combine_kernel");
-    double global_dk_us = 0.0, global_ck_us = 0.0;
-    MPI_Reduce(&dispatch_kernel_us, &global_dk_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&combine_kernel_us,  &global_ck_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-
     // Aggregate byte counts across ranks (HT only)
     size_t global_total_send = 0, global_rdma_send = 0;
     size_t global_total_recv = 0, global_rdma_recv = 0;
@@ -2580,30 +2649,16 @@ int main(int argc, char* argv[]) {
 
     // Print results and summary based on algorithm mode
     if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        printLowLatencyResults(myRank, nRanks, dispatch_result, combine_result, combined_result, ll_bytes);
-        if (myRank == 0) {
-            double avg_dk_us = global_dk_us / nRanks;
-            double avg_ck_us = global_ck_us / nRanks;
-            printf("\n=== Kernel-Only Timing (CUPTI, avg across %d ranks) ===\n", nRanks);
-            printf("dispatch_kernel: avg=%.2f us\n", avg_dk_us);
-            printf("combine_kernel:  avg=%.2f us\n", avg_ck_us);
-            if (avg_dk_us == 0.0 || avg_ck_us == 0.0) {
-                printf("  NOTE: 0 us means no matching kernel was captured.\n");
-                printf("  Uncomment ktimer.dump() above to inspect captured kernel names.\n");
-            }
-            fflush(stdout);
-        }
+        printLowLatencyResults(myRank, nRanks, 
+                              dispatch_result, combine_result, combined_result,
+                              ktimer,
+                              ll_bytes);
     } else {
-        printHighThroughputResults(myRank, nRanks, dispatch_result, combine_result, combined_result, ht_bytes,
-                                   dispatch_kernel_us, combine_kernel_us,
-                                   global_dk_us, global_ck_us,
+        printHighThroughputResults(myRank, nRanks, dispatch_result, combine_result, combined_result,
+                                   ktimer,
+                                   ht_bytes,
                                    global_total_send, global_rdma_send,
                                    global_total_recv, global_rdma_recv);
-        if (myRank == 0 && (global_dk_us == 0.0 || global_ck_us == 0.0)) {
-            printf("  NOTE: 0 us means no matching kernel was captured.\n");
-            printf("  Uncomment ktimer.dump() above to inspect captured kernel names.\n");
-            fflush(stdout);
-        }
     }
 
     // Aggregate group/handle creation times across ranks

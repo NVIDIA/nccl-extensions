@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -30,6 +31,7 @@ struct JitKernelVariant {
     std::string_view source;
     std::string_view entry_name;
     const void* identity = nullptr;
+    std::uint64_t runtime_key = 0;
     int num_blocks = 0;
     int block_dim = 0;
     int dynamic_smem_bytes = 0;

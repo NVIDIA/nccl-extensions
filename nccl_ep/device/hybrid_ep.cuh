@@ -23,13 +23,6 @@
 namespace hybrid_ep{
 
 
-// Register head size for combine (BF16 tokens). Tail (if any) accumulates in shared memory.
-constexpr int COMBINE_REG_HEAD_HIDDEN_DIM = 4096;
-static_assert((COMBINE_REG_HEAD_HIDDEN_DIM % 2) == 0,
-              "COMBINE_REG_HEAD_HIDDEN_DIM must be even for BF16x2.");
-static_assert(COMBINE_REG_HEAD_HIDDEN_DIM <= MAX_HIDDEN_DIM,
-              "COMBINE_REG_HEAD_HIDDEN_DIM must not exceed MAX_HIDDEN_DIM.");
-
 template<int NUM_OF_BOOL_TO_REDUCE>
 using Reduce_t =
   typename std::conditional<NUM_OF_BOOL_TO_REDUCE % 8 == 0, uint64_t,
@@ -171,10 +164,8 @@ struct model_config_t {
 struct combine_smem_layout_t {
   uint16_t* intra_node_token_G2S_buffer;
   uint16_t* intra_node_token_S2G_buffer;
-  float2* intra_node_token_tail_S2G_buffer;
   uint16_t* inter_node_token_G2S_buffer;
   uint16_t* inter_node_token_S2G_buffer;
-  float2* inter_node_token_tail_S2G_buffer;
   float* intra_node_prob_G2S_buffer;
   float* intra_node_prob_S2G_buffer;
   float* inter_node_prob_G2S_buffer;
@@ -187,11 +178,9 @@ struct combine_smem_layout_t {
 
   int token_G2S_stage_stride;  // elements (not bytes)
   int token_S2G_stage_stride;  // elements (not bytes)
-  int token_tail_S2G_stage_stride;  // float2 elements (not bytes)
   int prob_G2S_stage_stride;        // elements (not bytes)
   int prob_S2G_stage_stride;        // intra-node elements (not bytes)
   int prob_S2G_inter_stage_stride;  // inter-node elements (not bytes)
-  int hidden_dim;              // model hidden dimension
   combine_memory_region_info_t* combine_memory_region_info;
 
   // Streaming overlap: reduction warp -> RDMA warp within a chunk
@@ -204,17 +193,11 @@ struct combine_smem_layout_t {
   __device__ __forceinline__ uint16_t* get_intra_node_token_S2G(int stage) const {
     return intra_node_token_S2G_buffer + stage * token_S2G_stage_stride;
   }
-  __device__ __forceinline__ float2* get_intra_node_token_tail_S2G(int stage) const {
-    return intra_node_token_tail_S2G_buffer + stage * token_tail_S2G_stage_stride;
-  }
   __device__ __forceinline__ uint16_t* get_inter_node_token_G2S(int stage) const {
     return inter_node_token_G2S_buffer + stage * token_G2S_stage_stride;
   }
   __device__ __forceinline__ uint16_t* get_inter_node_token_S2G(int stage) const {
     return inter_node_token_S2G_buffer + stage * token_S2G_stage_stride;
-  }
-  __device__ __forceinline__ float2* get_inter_node_token_tail_S2G(int stage) const {
-    return inter_node_token_tail_S2G_buffer + stage * token_tail_S2G_stage_stride;
   }
   __device__ __forceinline__ float* get_intra_node_prob_G2S(int stage) const {
     return intra_node_prob_G2S_buffer + stage * prob_G2S_stage_stride;
@@ -486,9 +469,6 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     }
   };
 
-  // Store hidden_dim in layout
-  layout.hidden_dim = model.hidden_dim;
-
   // In the single-node case (num_of_nodes == 1), the combine kernel does not use the
   // intra-node staging buffers. Skipping these buffers can cut SMEM roughly in half.
   const bool multinode = (model.num_of_nodes > 1);
@@ -496,11 +476,6 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
   // Calculate stage strides (in elements, not bytes)
   layout.token_G2S_stage_stride = model.hidden_dim;
   layout.token_S2G_stage_stride = model.hidden_dim;
-  const int tail_hidden_dim =
-      model.hidden_dim > COMBINE_REG_HEAD_HIDDEN_DIM
-          ? (model.hidden_dim - COMBINE_REG_HEAD_HIDDEN_DIM)
-          : 0;
-  layout.token_tail_S2G_stage_stride = tail_hidden_dim / 2;
   layout.prob_G2S_stage_stride = model.num_of_experts_per_rank * model.num_of_ranks_per_node;
   layout.prob_S2G_stage_stride = model.num_of_experts_per_rank * model.num_of_ranks_per_node;
   layout.prob_S2G_inter_stage_stride = layout.prob_S2G_stage_stride * model.num_of_nodes;
@@ -516,20 +491,9 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
   layout.intra_node_token_S2G_buffer = reinterpret_cast<uint16_t*>(
       reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += num_of_stages_s2g * model.hidden_dim * sizeof(uint16_t);
-
-    // intra_node_token_tail_S2G_buffer (FP32 tail accum, 16B aligned)
-    if (tail_hidden_dim > 0) {
-      align_offset(16);
-      layout.intra_node_token_tail_S2G_buffer = reinterpret_cast<float2*>(
-          reinterpret_cast<uint8_t*>(smem_base) + offset);
-      offset += num_of_stages_s2g * layout.token_tail_S2G_stage_stride * sizeof(float2);
-    } else {
-      layout.intra_node_token_tail_S2G_buffer = nullptr;
-    }
   } else {
     layout.intra_node_token_G2S_buffer = nullptr;
     layout.intra_node_token_S2G_buffer = nullptr;
-    layout.intra_node_token_tail_S2G_buffer = nullptr;
   }
 
   // inter_node_token_G2S_buffer (128B aligned)
@@ -543,16 +507,6 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
   layout.inter_node_token_S2G_buffer = reinterpret_cast<uint16_t*>(
       reinterpret_cast<uint8_t*>(smem_base) + offset);
   offset += num_of_stages_s2g * model.hidden_dim * sizeof(uint16_t);
-
-  // inter_node_token_tail_S2G_buffer (FP32 tail accum, 16B aligned)
-  if (tail_hidden_dim > 0) {
-    align_offset(16);
-    layout.inter_node_token_tail_S2G_buffer = reinterpret_cast<float2*>(
-        reinterpret_cast<uint8_t*>(smem_base) + offset);
-    offset += num_of_stages_s2g * layout.token_tail_S2G_stage_stride * sizeof(float2);
-  } else {
-    layout.inter_node_token_tail_S2G_buffer = nullptr;
-  }
 
   // Prob buffers (only if backward_combine, 16B aligned)
   if (backward_combine) {
@@ -692,19 +646,6 @@ static size_t calculate_combine_smem_layout_size(
     total_size += NUM_OF_STAGES_S2G * hidden_dim * sizeof(uint16_t);
   }
 
-  // token_tail_S2G buffers (FP32 tail accum):
-  const int tail_hidden_dim =
-      hidden_dim > COMBINE_REG_HEAD_HIDDEN_DIM
-          ? (hidden_dim - COMBINE_REG_HEAD_HIDDEN_DIM)
-          : 0;
-  const int token_tail_S2G_stage_stride = tail_hidden_dim / 2;  // float2 elements
-  if (tail_hidden_dim > 0) {
-    if constexpr (multinode) {
-      total_size = (total_size + 15) & ~15;
-      total_size += NUM_OF_STAGES_S2G * token_tail_S2G_stage_stride * sizeof(float2);
-    }
-  }
-
   // inter_node_token_G2S_buffer
   total_size = (total_size + 127) & ~127;
   total_size += NUM_OF_STAGES_G2S * hidden_dim * sizeof(uint16_t);
@@ -712,12 +653,6 @@ static size_t calculate_combine_smem_layout_size(
   // inter_node_token_S2G_buffer
   total_size = (total_size + 127) & ~127;
   total_size += NUM_OF_STAGES_S2G * hidden_dim * sizeof(uint16_t);
-
-  // inter_node_token_tail_S2G_buffer (FP32 tail accum)
-  if (tail_hidden_dim > 0) {
-    total_size = (total_size + 15) & ~15;
-    total_size += NUM_OF_STAGES_S2G * token_tail_S2G_stage_stride * sizeof(float2);
-  }
 
   // Prob buffers (16B aligned, only if backward_combine)
   if constexpr (BACKWARD_COMBINE) {
@@ -1495,7 +1430,8 @@ template<typename SMEM_TYPE,
          int NUM_OF_TOKENS_PER_CHUNK,
          int NUM_LSA_TEAMS,
          int NUM_OF_BLOCKS,
-         bool BACKWARD_COMBINE>
+         bool BACKWARD_COMBINE,
+         int HIDDEN_DIM>
 __forceinline__ __device__ void intra_node_G2S_warp_group_device_function(const int node_rank,
                                                                  const int num_of_tokens_per_rank,
                                                                  const int num_of_ranks_per_node,
@@ -1504,7 +1440,6 @@ __forceinline__ __device__ void intra_node_G2S_warp_group_device_function(const 
                                                                  uint16_t* const* remote_expert_input_token,
                                                                  float* const* remote_expert_input_prob,
                                                                  SMEM_TYPE* smem_buffer_ptr,
-                                                                 const int HIDDEN_DIM,
                                                                  const int experts_per_rank)
 {
   static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
@@ -1666,6 +1601,7 @@ template<typename INTRA_NODE_RED_GROUP,
          int NUM_OF_BLOCKS,
          int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
          bool BACKWARD_COMBINE,
+         int HIDDEN_DIM,
          int LSA_TEAM_SIZE>
 __forceinline__ __device__ void intra_node_red_warp_group_device_function(const int node_rank,
                                                                  const int num_of_tokens_per_rank,
@@ -1674,7 +1610,6 @@ __forceinline__ __device__ void intra_node_red_warp_group_device_function(const 
                                                                  uint16_t* rdma_intra_node_red_token,
                                                                  float* rdma_intra_node_red_prob,
                                                                  SMEM_TYPE* smem_buffer_ptr,
-                                                                 const int HIDDEN_DIM,
                                                                  const int experts_per_rank)
 {
   // Vectorized loads from rdma_to_attn_map. Each destination token contributes one bool.
@@ -1687,18 +1622,10 @@ __forceinline__ __device__ void intra_node_red_warp_group_device_function(const 
 
   // Token values are processed as BF16x2 and accumulated in FP32. HIDDEN_DIM must be even.
 
-  const int NUM_OF_BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
-  // Keep a fixed-size prefix of each token in registers; spill the remaining suffix to SMEM.
-  constexpr int REG_HEAD_BF16X2_ELEMENTS_PER_TOKEN = COMBINE_REG_HEAD_HIDDEN_DIM / 2;
-  const int head_bf16x2 =
-      NUM_OF_BF16X2_ELEMENTS_PER_TOKEN > REG_HEAD_BF16X2_ELEMENTS_PER_TOKEN
-          ? REG_HEAD_BF16X2_ELEMENTS_PER_TOKEN
-          : NUM_OF_BF16X2_ELEMENTS_PER_TOKEN;
-  const int tail_bf16x2 = NUM_OF_BF16X2_ELEMENTS_PER_TOKEN - head_bf16x2;
-  const int tail_float4 = tail_bf16x2 >> 1;
+  constexpr int NUM_OF_BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
   constexpr int MAX_NUM_OF_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
-  constexpr int MAX_NUM_OF_HEAD_ACC_ELEMENTS_PER_THREAD_INTRA =
-      ((REG_HEAD_BF16X2_ELEMENTS_PER_TOKEN - 1) / INTRA_NODE_RED_GROUP::size()) + 1;
+  constexpr int NUM_OF_ACC_ELEMENTS_PER_THREAD_INTRA =
+      ((NUM_OF_BF16X2_ELEMENTS_PER_TOKEN - 1) / INTRA_NODE_RED_GROUP::size()) + 1;
   // Backward-combine probability vectors stay in float (no BF16 packing).
   const int NUM_OF_PROB_VEC_ELEMENT_PER_THREAD =
       ((experts_per_rank * num_of_ranks_per_node - 1) / INTRA_NODE_RED_GROUP::size()) + 1;
@@ -1782,8 +1709,8 @@ __forceinline__ __device__ void intra_node_red_warp_group_device_function(const 
         bool token_needed_by_this_node = *(reinterpret_cast<bool*>(&rdma_to_attn_map_data) + k);
         // If so, one or more contributing source tokens are already being staged through G2S.
         if (token_needed_by_this_node) {
-          // FP32 accumulator for the register-resident token head.
-          float2 acc_token_fp32[MAX_NUM_OF_HEAD_ACC_ELEMENTS_PER_THREAD_INTRA];
+          // FP32 accumulator for the register-resident token.
+          float2 acc_token_fp32[NUM_OF_ACC_ELEMENTS_PER_THREAD_INTRA];
           // Optional FP32 accumulator for probability data in backward combine.
           // This storage is instantiated only in backward specializations.
           using acc_prob_storage_type =
@@ -1796,7 +1723,7 @@ __forceinline__ __device__ void intra_node_red_warp_group_device_function(const 
           // Producer marks the final contributor for this destination token with this flag.
           bool last_src_token = false;
           #pragma unroll
-          for (int n = 0; n < MAX_NUM_OF_HEAD_ACC_ELEMENTS_PER_THREAD_INTRA; n++) {
+          for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD_INTRA; n++) {
             acc_token_fp32[n].x = 0.0f;
             acc_token_fp32[n].y = 0.0f;
           }
@@ -1806,14 +1733,6 @@ __forceinline__ __device__ void intra_node_red_warp_group_device_function(const 
               acc_prob_ptr[n] = 0.0f;
             }
           }
-          float4* acc_token_tail_smem4 = nullptr;
-          bool tail_initialized = false;
-          if (tail_bf16x2 > 0) {
-            // Tail accumulation uses the per-stage S2G scratch buffer in shared memory.
-            acc_token_tail_smem4 = reinterpret_cast<float4*>(
-                smem_buffer_ptr->get_intra_node_token_tail_S2G(dst_token_stage));
-          }
-
           // Consume source tokens for this destination token until the producer marks the last one.
           do {
             // Current source token / optional prob slice in the G2S FIFO stage.
@@ -1831,11 +1750,11 @@ __forceinline__ __device__ void intra_node_red_warp_group_device_function(const 
             }
             arrive_and_wait(INTRA_NODE_RED_GROUP::size(), 1);
 
-            // Accumulate the register-resident token head.
+            // Accumulate the register-resident token.
             #pragma unroll
-            for (int n = 0; n < MAX_NUM_OF_HEAD_ACC_ELEMENTS_PER_THREAD_INTRA; n++) {
+            for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD_INTRA; n++) {
               int element_id = (n * INTRA_NODE_RED_GROUP::size()) + INTRA_NODE_RED_GROUP::thread_rank();
-              if (element_id < head_bf16x2) {
+              if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
                 __nv_bfloat162 src_data = load_token_base_ptr[element_id];
                 float2 src_data_fp32 = __bfloat1622float2(src_data);
                 acc_token_fp32[n].x += src_data_fp32.x;
@@ -1843,117 +1762,6 @@ __forceinline__ __device__ void intra_node_red_warp_group_device_function(const 
               }
             }
             // Accumulate the token tail in shared memory to cap register usage for large hidden dims.
-            if (tail_bf16x2 > 0) {
-              if (!tail_initialized) {
-                // First contributor initializes the SMEM tail accumulator.
-                int p = INTRA_NODE_RED_GROUP::thread_rank();
-                for (; p + 7 * INTRA_NODE_RED_GROUP::size() < tail_float4;
-                     p += 8 * INTRA_NODE_RED_GROUP::size()) {
-                  const int p0 = p, p1 = p + INTRA_NODE_RED_GROUP::size();
-                  const int p2 = p + 2 * INTRA_NODE_RED_GROUP::size(), p3 = p + 3 * INTRA_NODE_RED_GROUP::size();
-                  const int p4 = p + 4 * INTRA_NODE_RED_GROUP::size(), p5 = p + 5 * INTRA_NODE_RED_GROUP::size();
-                  const int p6 = p + 6 * INTRA_NODE_RED_GROUP::size(), p7 = p + 7 * INTRA_NODE_RED_GROUP::size();
-                  const int e0 = head_bf16x2 + (p0 << 1), e1 = head_bf16x2 + (p1 << 1);
-                  const int e2 = head_bf16x2 + (p2 << 1), e3 = head_bf16x2 + (p3 << 1);
-                  const int e4 = head_bf16x2 + (p4 << 1), e5 = head_bf16x2 + (p5 << 1);
-                  const int e6 = head_bf16x2 + (p6 << 1), e7 = head_bf16x2 + (p7 << 1);
-                  __nv_bfloat162 s0a = load_token_base_ptr[e0], s0b = load_token_base_ptr[e0 + 1];
-                  __nv_bfloat162 s1a = load_token_base_ptr[e1], s1b = load_token_base_ptr[e1 + 1];
-                  __nv_bfloat162 s2a = load_token_base_ptr[e2], s2b = load_token_base_ptr[e2 + 1];
-                  __nv_bfloat162 s3a = load_token_base_ptr[e3], s3b = load_token_base_ptr[e3 + 1];
-                  __nv_bfloat162 s4a = load_token_base_ptr[e4], s4b = load_token_base_ptr[e4 + 1];
-                  __nv_bfloat162 s5a = load_token_base_ptr[e5], s5b = load_token_base_ptr[e5 + 1];
-                  __nv_bfloat162 s6a = load_token_base_ptr[e6], s6b = load_token_base_ptr[e6 + 1];
-                  __nv_bfloat162 s7a = load_token_base_ptr[e7], s7b = load_token_base_ptr[e7 + 1];
-                  float2 f0a = __bfloat1622float2(s0a), f0b = __bfloat1622float2(s0b);
-                  float2 f1a = __bfloat1622float2(s1a), f1b = __bfloat1622float2(s1b);
-                  float2 f2a = __bfloat1622float2(s2a), f2b = __bfloat1622float2(s2b);
-                  float2 f3a = __bfloat1622float2(s3a), f3b = __bfloat1622float2(s3b);
-                  float2 f4a = __bfloat1622float2(s4a), f4b = __bfloat1622float2(s4b);
-                  float2 f5a = __bfloat1622float2(s5a), f5b = __bfloat1622float2(s5b);
-                  float2 f6a = __bfloat1622float2(s6a), f6b = __bfloat1622float2(s6b);
-                  float2 f7a = __bfloat1622float2(s7a), f7b = __bfloat1622float2(s7b);
-                  acc_token_tail_smem4[p0] = make_float4(f0a.x, f0a.y, f0b.x, f0b.y);
-                  acc_token_tail_smem4[p1] = make_float4(f1a.x, f1a.y, f1b.x, f1b.y);
-                  acc_token_tail_smem4[p2] = make_float4(f2a.x, f2a.y, f2b.x, f2b.y);
-                  acc_token_tail_smem4[p3] = make_float4(f3a.x, f3a.y, f3b.x, f3b.y);
-                  acc_token_tail_smem4[p4] = make_float4(f4a.x, f4a.y, f4b.x, f4b.y);
-                  acc_token_tail_smem4[p5] = make_float4(f5a.x, f5a.y, f5b.x, f5b.y);
-                  acc_token_tail_smem4[p6] = make_float4(f6a.x, f6a.y, f6b.x, f6b.y);
-                  acc_token_tail_smem4[p7] = make_float4(f7a.x, f7a.y, f7b.x, f7b.y);
-                }
-                for (; p < tail_float4; p += INTRA_NODE_RED_GROUP::size()) {
-                  const int e = head_bf16x2 + (p << 1);
-                  __nv_bfloat162 sa = load_token_base_ptr[e], sb = load_token_base_ptr[e + 1];
-                  float2 fa = __bfloat1622float2(sa), fb = __bfloat1622float2(sb);
-                  acc_token_tail_smem4[p] = make_float4(fa.x, fa.y, fb.x, fb.y);
-                }
-                tail_initialized = true;
-              } else {
-                // Later contributors add into the existing SMEM tail accumulator.
-                int p = INTRA_NODE_RED_GROUP::thread_rank();
-                for (; p + 7 * INTRA_NODE_RED_GROUP::size() < tail_float4;
-                     p += 8 * INTRA_NODE_RED_GROUP::size()) {
-                  const int p0 = p, p1 = p + INTRA_NODE_RED_GROUP::size();
-                  const int p2 = p + 2 * INTRA_NODE_RED_GROUP::size(), p3 = p + 3 * INTRA_NODE_RED_GROUP::size();
-                  const int p4 = p + 4 * INTRA_NODE_RED_GROUP::size(), p5 = p + 5 * INTRA_NODE_RED_GROUP::size();
-                  const int p6 = p + 6 * INTRA_NODE_RED_GROUP::size(), p7 = p + 7 * INTRA_NODE_RED_GROUP::size();
-                  const int e0 = head_bf16x2 + (p0 << 1), e1 = head_bf16x2 + (p1 << 1);
-                  const int e2 = head_bf16x2 + (p2 << 1), e3 = head_bf16x2 + (p3 << 1);
-                  const int e4 = head_bf16x2 + (p4 << 1), e5 = head_bf16x2 + (p5 << 1);
-                  const int e6 = head_bf16x2 + (p6 << 1), e7 = head_bf16x2 + (p7 << 1);
-                  __nv_bfloat162 s0a = load_token_base_ptr[e0], s0b = load_token_base_ptr[e0 + 1];
-                  __nv_bfloat162 s1a = load_token_base_ptr[e1], s1b = load_token_base_ptr[e1 + 1];
-                  __nv_bfloat162 s2a = load_token_base_ptr[e2], s2b = load_token_base_ptr[e2 + 1];
-                  __nv_bfloat162 s3a = load_token_base_ptr[e3], s3b = load_token_base_ptr[e3 + 1];
-                  __nv_bfloat162 s4a = load_token_base_ptr[e4], s4b = load_token_base_ptr[e4 + 1];
-                  __nv_bfloat162 s5a = load_token_base_ptr[e5], s5b = load_token_base_ptr[e5 + 1];
-                  __nv_bfloat162 s6a = load_token_base_ptr[e6], s6b = load_token_base_ptr[e6 + 1];
-                  __nv_bfloat162 s7a = load_token_base_ptr[e7], s7b = load_token_base_ptr[e7 + 1];
-                  float2 f0a = __bfloat1622float2(s0a), f0b = __bfloat1622float2(s0b);
-                  float2 f1a = __bfloat1622float2(s1a), f1b = __bfloat1622float2(s1b);
-                  float2 f2a = __bfloat1622float2(s2a), f2b = __bfloat1622float2(s2b);
-                  float2 f3a = __bfloat1622float2(s3a), f3b = __bfloat1622float2(s3b);
-                  float2 f4a = __bfloat1622float2(s4a), f4b = __bfloat1622float2(s4b);
-                  float2 f5a = __bfloat1622float2(s5a), f5b = __bfloat1622float2(s5b);
-                  float2 f6a = __bfloat1622float2(s6a), f6b = __bfloat1622float2(s6b);
-                  float2 f7a = __bfloat1622float2(s7a), f7b = __bfloat1622float2(s7b);
-                  float4 acc0 = acc_token_tail_smem4[p0];
-                  float4 acc1 = acc_token_tail_smem4[p1];
-                  float4 acc2 = acc_token_tail_smem4[p2];
-                  float4 acc3 = acc_token_tail_smem4[p3];
-                  float4 acc4 = acc_token_tail_smem4[p4];
-                  float4 acc5 = acc_token_tail_smem4[p5];
-                  float4 acc6 = acc_token_tail_smem4[p6];
-                  float4 acc7 = acc_token_tail_smem4[p7];
-                  acc0.x += f0a.x; acc0.y += f0a.y; acc0.z += f0b.x; acc0.w += f0b.y;
-                  acc1.x += f1a.x; acc1.y += f1a.y; acc1.z += f1b.x; acc1.w += f1b.y;
-                  acc2.x += f2a.x; acc2.y += f2a.y; acc2.z += f2b.x; acc2.w += f2b.y;
-                  acc3.x += f3a.x; acc3.y += f3a.y; acc3.z += f3b.x; acc3.w += f3b.y;
-                  acc4.x += f4a.x; acc4.y += f4a.y; acc4.z += f4b.x; acc4.w += f4b.y;
-                  acc5.x += f5a.x; acc5.y += f5a.y; acc5.z += f5b.x; acc5.w += f5b.y;
-                  acc6.x += f6a.x; acc6.y += f6a.y; acc6.z += f6b.x; acc6.w += f6b.y;
-                  acc7.x += f7a.x; acc7.y += f7a.y; acc7.z += f7b.x; acc7.w += f7b.y;
-                  acc_token_tail_smem4[p0] = acc0;
-                  acc_token_tail_smem4[p1] = acc1;
-                  acc_token_tail_smem4[p2] = acc2;
-                  acc_token_tail_smem4[p3] = acc3;
-                  acc_token_tail_smem4[p4] = acc4;
-                  acc_token_tail_smem4[p5] = acc5;
-                  acc_token_tail_smem4[p6] = acc6;
-                  acc_token_tail_smem4[p7] = acc7;
-                }
-                for (; p < tail_float4; p += INTRA_NODE_RED_GROUP::size()) {
-                  const int e = head_bf16x2 + (p << 1);
-                  __nv_bfloat162 sa = load_token_base_ptr[e], sb = load_token_base_ptr[e + 1];
-                  float2 fa = __bfloat1622float2(sa), fb = __bfloat1622float2(sb);
-                  float4 acc = acc_token_tail_smem4[p];
-                  acc.x += fa.x; acc.y += fa.y; acc.z += fb.x; acc.w += fb.y;
-                  acc_token_tail_smem4[p] = acc;
-                }
-              }
-            }
-
             if constexpr(BACKWARD_COMBINE) {
               #pragma unroll
               for (int n = 0; n < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; n++) {
@@ -2001,89 +1809,15 @@ __forceinline__ __device__ void intra_node_red_warp_group_device_function(const 
           // All reduction threads wait here before storing new data into this stage.
           arrive_and_wait(INTRA_NODE_RED_GROUP::size(), 1);
 
-          // Store the register-resident token head.
+          // Store the register-resident token.
           #pragma unroll
-          for (int n = 0; n < MAX_NUM_OF_HEAD_ACC_ELEMENTS_PER_THREAD_INTRA; n++) {
+          for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD_INTRA; n++) {
             int element_id = (n * INTRA_NODE_RED_GROUP::size()) + INTRA_NODE_RED_GROUP::thread_rank();
-            if (element_id < head_bf16x2) {
+            if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
               store_token_base_ptr[element_id] = __float22bfloat162_rn(acc_token_fp32[n]);
             }
           }
           // Store the token tail from the SMEM accumulator, or zeros if no tail element was touched.
-          if (tail_bf16x2 > 0) {
-            const __nv_bfloat162 zero_bf16x2 = __float22bfloat162_rn(make_float2(0.0f, 0.0f));
-            if (!tail_initialized) {
-              int p = INTRA_NODE_RED_GROUP::thread_rank();
-              for (; p + 7 * INTRA_NODE_RED_GROUP::size() < tail_float4;
-                   p += 8 * INTRA_NODE_RED_GROUP::size()) {
-                const int p0 = p, p1 = p + INTRA_NODE_RED_GROUP::size();
-                const int p2 = p + 2 * INTRA_NODE_RED_GROUP::size(), p3 = p + 3 * INTRA_NODE_RED_GROUP::size();
-                const int p4 = p + 4 * INTRA_NODE_RED_GROUP::size(), p5 = p + 5 * INTRA_NODE_RED_GROUP::size();
-                const int p6 = p + 6 * INTRA_NODE_RED_GROUP::size(), p7 = p + 7 * INTRA_NODE_RED_GROUP::size();
-                const int e0 = head_bf16x2 + (p0 << 1), e1 = head_bf16x2 + (p1 << 1);
-                const int e2 = head_bf16x2 + (p2 << 1), e3 = head_bf16x2 + (p3 << 1);
-                const int e4 = head_bf16x2 + (p4 << 1), e5 = head_bf16x2 + (p5 << 1);
-                const int e6 = head_bf16x2 + (p6 << 1), e7 = head_bf16x2 + (p7 << 1);
-                store_token_base_ptr[e0] = zero_bf16x2; store_token_base_ptr[e0 + 1] = zero_bf16x2;
-                store_token_base_ptr[e1] = zero_bf16x2; store_token_base_ptr[e1 + 1] = zero_bf16x2;
-                store_token_base_ptr[e2] = zero_bf16x2; store_token_base_ptr[e2 + 1] = zero_bf16x2;
-                store_token_base_ptr[e3] = zero_bf16x2; store_token_base_ptr[e3 + 1] = zero_bf16x2;
-                store_token_base_ptr[e4] = zero_bf16x2; store_token_base_ptr[e4 + 1] = zero_bf16x2;
-                store_token_base_ptr[e5] = zero_bf16x2; store_token_base_ptr[e5 + 1] = zero_bf16x2;
-                store_token_base_ptr[e6] = zero_bf16x2; store_token_base_ptr[e6 + 1] = zero_bf16x2;
-                store_token_base_ptr[e7] = zero_bf16x2; store_token_base_ptr[e7 + 1] = zero_bf16x2;
-              }
-              for (; p < tail_float4; p += INTRA_NODE_RED_GROUP::size()) {
-                const int e = head_bf16x2 + (p << 1);
-                store_token_base_ptr[e] = zero_bf16x2;
-                store_token_base_ptr[e + 1] = zero_bf16x2;
-              }
-            } else {
-              int p = INTRA_NODE_RED_GROUP::thread_rank();
-              for (; p + 7 * INTRA_NODE_RED_GROUP::size() < tail_float4;
-                   p += 8 * INTRA_NODE_RED_GROUP::size()) {
-                const int p0 = p, p1 = p + INTRA_NODE_RED_GROUP::size();
-                const int p2 = p + 2 * INTRA_NODE_RED_GROUP::size(), p3 = p + 3 * INTRA_NODE_RED_GROUP::size();
-                const int p4 = p + 4 * INTRA_NODE_RED_GROUP::size(), p5 = p + 5 * INTRA_NODE_RED_GROUP::size();
-                const int p6 = p + 6 * INTRA_NODE_RED_GROUP::size(), p7 = p + 7 * INTRA_NODE_RED_GROUP::size();
-                const int e0 = head_bf16x2 + (p0 << 1), e1 = head_bf16x2 + (p1 << 1);
-                const int e2 = head_bf16x2 + (p2 << 1), e3 = head_bf16x2 + (p3 << 1);
-                const int e4 = head_bf16x2 + (p4 << 1), e5 = head_bf16x2 + (p5 << 1);
-                const int e6 = head_bf16x2 + (p6 << 1), e7 = head_bf16x2 + (p7 << 1);
-                float4 acc0 = acc_token_tail_smem4[p0];
-                float4 acc1 = acc_token_tail_smem4[p1];
-                float4 acc2 = acc_token_tail_smem4[p2];
-                float4 acc3 = acc_token_tail_smem4[p3];
-                float4 acc4 = acc_token_tail_smem4[p4];
-                float4 acc5 = acc_token_tail_smem4[p5];
-                float4 acc6 = acc_token_tail_smem4[p6];
-                float4 acc7 = acc_token_tail_smem4[p7];
-                store_token_base_ptr[e0] = __float22bfloat162_rn(make_float2(acc0.x, acc0.y));
-                store_token_base_ptr[e0 + 1] = __float22bfloat162_rn(make_float2(acc0.z, acc0.w));
-                store_token_base_ptr[e1] = __float22bfloat162_rn(make_float2(acc1.x, acc1.y));
-                store_token_base_ptr[e1 + 1] = __float22bfloat162_rn(make_float2(acc1.z, acc1.w));
-                store_token_base_ptr[e2] = __float22bfloat162_rn(make_float2(acc2.x, acc2.y));
-                store_token_base_ptr[e2 + 1] = __float22bfloat162_rn(make_float2(acc2.z, acc2.w));
-                store_token_base_ptr[e3] = __float22bfloat162_rn(make_float2(acc3.x, acc3.y));
-                store_token_base_ptr[e3 + 1] = __float22bfloat162_rn(make_float2(acc3.z, acc3.w));
-                store_token_base_ptr[e4] = __float22bfloat162_rn(make_float2(acc4.x, acc4.y));
-                store_token_base_ptr[e4 + 1] = __float22bfloat162_rn(make_float2(acc4.z, acc4.w));
-                store_token_base_ptr[e5] = __float22bfloat162_rn(make_float2(acc5.x, acc5.y));
-                store_token_base_ptr[e5 + 1] = __float22bfloat162_rn(make_float2(acc5.z, acc5.w));
-                store_token_base_ptr[e6] = __float22bfloat162_rn(make_float2(acc6.x, acc6.y));
-                store_token_base_ptr[e6 + 1] = __float22bfloat162_rn(make_float2(acc6.z, acc6.w));
-                store_token_base_ptr[e7] = __float22bfloat162_rn(make_float2(acc7.x, acc7.y));
-                store_token_base_ptr[e7 + 1] = __float22bfloat162_rn(make_float2(acc7.z, acc7.w));
-              }
-              for (; p < tail_float4; p += INTRA_NODE_RED_GROUP::size()) {
-                const int e = head_bf16x2 + (p << 1);
-                float4 acc = acc_token_tail_smem4[p];
-                store_token_base_ptr[e] = __float22bfloat162_rn(make_float2(acc.x, acc.y));
-                store_token_base_ptr[e + 1] = __float22bfloat162_rn(make_float2(acc.z, acc.w));
-              }
-            }
-          }
-
           // Store the prob(optional).
           if constexpr(BACKWARD_COMBINE) {
             #pragma unroll
@@ -2198,7 +1932,8 @@ template<typename INTER_NODE_RDMA_GROUP,
          int MAX_NUM_OF_TOKENS_PER_RANK,
          int NUM_LSA_TEAMS,
          int NUM_OF_BLOCKS,
-         bool BACKWARD_COMBINE>
+         bool BACKWARD_COMBINE,
+         int HIDDEN_DIM>
 __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const int local_rank,
                                                                  const int node_rank,
                                                                  const int num_of_tokens_per_rank,
@@ -2213,7 +1948,6 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const 
                                                                  unsigned combine_signal_offset,
                                                                  const struct combine_memory_region_info_t *mr_info,
                                                                  SMEM_TYPE* smem_buffer_ptr,
-                                                                 const int HIDDEN_DIM,
                                                                  const int experts_per_rank)
 {
   // Load rdma_to_attn_map using LDG.128. Each token will need 1 bool from this map.
@@ -2434,7 +2168,8 @@ template<typename SMEM_TYPE,
          int NUM_LSA_TEAMS,
          int NUM_OF_BLOCKS,
          int NUM_OF_TOKENS_PER_GROUP,
-         bool BACKWARD_COMBINE>
+         bool BACKWARD_COMBINE,
+         int HIDDEN_DIM>
 __forceinline__ __device__ void inter_node_G2S_warp_group_device_function(const int local_rank,
                                                                  const int node_rank,
                                                                  const int num_of_tokens_per_rank,
@@ -2454,7 +2189,6 @@ __forceinline__ __device__ void inter_node_G2S_warp_group_device_function(const 
                                                                  int num_ctx_per_comm,
                                                                  uint64_t* rdma_inter_node_group_flags,
                                                                  SMEM_TYPE* smem_buffer_ptr,
-                                                                 const int HIDDEN_DIM,
                                                                  const int experts_per_rank)
 {
   // The warps from inter-node G2S warp group will be divided into multiple independent pipeline.
@@ -2900,6 +2634,7 @@ template<typename SMEM_TYPE,
          int NUM_OF_BLOCKS,
          int NUM_OF_TOKENS_PER_GROUP,
          bool BACKWARD_COMBINE,
+         int HIDDEN_DIM,
          int LSA_TEAM_SIZE>
 __forceinline__ __device__ void inter_node_red_warp_group_device_function(const int node_rank,
                                                                  const int num_of_tokens_per_rank,
@@ -2909,7 +2644,6 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(const 
                                                                  uint16_t* attn_output_token,
                                                                  float* attn_output_prob,
                                                                  SMEM_TYPE* smem_buffer_ptr,
-                                                                 const int HIDDEN_DIM,
                                                                  const int experts_per_rank)
 {
 
@@ -2933,20 +2667,9 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(const 
   static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
 
   // Processing token using BF16x2 intruction, HIDDEN_DIM must be multiple of 2.
-  constexpr int REG_HEAD_BF16X2_ELEMENTS_PER_TOKEN = COMBINE_REG_HEAD_HIDDEN_DIM / 2;
-  const int NUM_OF_BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
-
-  // Split the token into a register-resident "head" and a shared-memory "tail".
-  // The head fits in registers per thread (bf16x2 lanes), giving a fixed per-thread
-  // workload and avoiding large register arrays when HIDDEN_DIM is large. The tail
-  // (if any) is handled separately (float4 = 2 bf16x2) from shared memory.
-  constexpr int NUM_OF_HEAD_ACC_ELEMENTS_PER_THREAD =
-      ((REG_HEAD_BF16X2_ELEMENTS_PER_TOKEN - 1) / NUM_OF_THREADS_PER_PIPELINE) + 1;
-  const int head_bf16x2 = NUM_OF_BF16X2_ELEMENTS_PER_TOKEN > REG_HEAD_BF16X2_ELEMENTS_PER_TOKEN
-          ? REG_HEAD_BF16X2_ELEMENTS_PER_TOKEN
-          : NUM_OF_BF16X2_ELEMENTS_PER_TOKEN;
-  const int tail_bf16x2 = NUM_OF_BF16X2_ELEMENTS_PER_TOKEN - head_bf16x2;
-  const int tail_float4 = tail_bf16x2 >> 1;
+  constexpr int NUM_OF_BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
+  constexpr int NUM_OF_ACC_ELEMENTS_PER_THREAD =
+      ((NUM_OF_BF16X2_ELEMENTS_PER_TOKEN - 1) / NUM_OF_THREADS_PER_PIPELINE) + 1;
 
   // Processing prob using fp32.
   const int NUM_OF_PROB_VEC_ELEMENT_PER_THREAD =
@@ -3024,7 +2747,7 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(const 
         // Each dst token need to accumulate src tokens from local node's ranks(this part is the same as intra-node reduction), and src tokens from rdma inter-node buffers.
         // Accumulate local tokens first, then rdma tokens.
         // Accumulator for this dst token. Token must be accumulated in FP32.
-        float2 acc_token_fp32[NUM_OF_HEAD_ACC_ELEMENTS_PER_THREAD];
+        float2 acc_token_fp32[NUM_OF_ACC_ELEMENTS_PER_THREAD];
         // Optional Accumulator for this dst token prob.
         // Different node's prob need to be gathered together to output.
         // 0 used for local node's prob, [1, NUM_LSA_TEAMS - 1] used for remote node's prob.
@@ -3040,7 +2763,7 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(const 
         }
         // Init accumulator.
         #pragma unroll
-        for (int n = 0; n < NUM_OF_HEAD_ACC_ELEMENTS_PER_THREAD; n++) {
+        for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD; n++) {
           acc_token_fp32[n].x = 0.0f;
           acc_token_fp32[n].y = 0.0f;
         }
@@ -3052,13 +2775,6 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(const 
             }
           }
         }
-        float4* acc_token_tail_smem4 = nullptr;
-        bool tail_initialized = false;
-        if (tail_bf16x2 > 0) {
-          acc_token_tail_smem4 = reinterpret_cast<float4*>(
-              smem_buffer_ptr->get_inter_node_token_tail_S2G(dst_token_stage));
-        }
-
         // Check whether this dst token is needed by this(local) node. If not needed, just skip local accumulation.
         bool token_needed_by_this_node = rdma_to_attn_map_load_base_addr[current_token_id];
         // If this dst token is needed by this node, load the local src token from shared memory and accumulate them.
@@ -3085,126 +2801,15 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(const 
 
             // Accumulate token and prob(optional).
             #pragma unroll
-            for (int n = 0; n < NUM_OF_HEAD_ACC_ELEMENTS_PER_THREAD; n++) {
+            for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD; n++) {
               int element_id = (n * NUM_OF_THREADS_PER_PIPELINE) + thread_rank_within_pipeline;
-              if (element_id < head_bf16x2) {
+              if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
                 __nv_bfloat162 src_data = load_token_base_ptr[element_id];
                 float2 src_data_fp32 = __bfloat1622float2(src_data);
               acc_token_fp32[n].x += src_data_fp32.x;
               acc_token_fp32[n].y += src_data_fp32.y;
               }
             }
-            if (tail_bf16x2 > 0) {
-              if (!tail_initialized) {
-                // First iteration: load source directly into smem (no accumulation)
-                int p = thread_rank_within_pipeline;
-                for (; p + 7 * NUM_OF_THREADS_PER_PIPELINE < tail_float4;
-                    p += 8 * NUM_OF_THREADS_PER_PIPELINE) {
-                  const int p0 = p, p1 = p + NUM_OF_THREADS_PER_PIPELINE;
-                  const int p2 = p + 2 * NUM_OF_THREADS_PER_PIPELINE, p3 = p + 3 * NUM_OF_THREADS_PER_PIPELINE;
-                  const int p4 = p + 4 * NUM_OF_THREADS_PER_PIPELINE, p5 = p + 5 * NUM_OF_THREADS_PER_PIPELINE;
-                  const int p6 = p + 6 * NUM_OF_THREADS_PER_PIPELINE, p7 = p + 7 * NUM_OF_THREADS_PER_PIPELINE;
-                  const int e0 = head_bf16x2 + (p0 << 1), e1 = head_bf16x2 + (p1 << 1);
-                  const int e2 = head_bf16x2 + (p2 << 1), e3 = head_bf16x2 + (p3 << 1);
-                  const int e4 = head_bf16x2 + (p4 << 1), e5 = head_bf16x2 + (p5 << 1);
-                  const int e6 = head_bf16x2 + (p6 << 1), e7 = head_bf16x2 + (p7 << 1);
-                  __nv_bfloat162 s0a = load_token_base_ptr[e0], s0b = load_token_base_ptr[e0 + 1];
-                  __nv_bfloat162 s1a = load_token_base_ptr[e1], s1b = load_token_base_ptr[e1 + 1];
-                  __nv_bfloat162 s2a = load_token_base_ptr[e2], s2b = load_token_base_ptr[e2 + 1];
-                  __nv_bfloat162 s3a = load_token_base_ptr[e3], s3b = load_token_base_ptr[e3 + 1];
-                  __nv_bfloat162 s4a = load_token_base_ptr[e4], s4b = load_token_base_ptr[e4 + 1];
-                  __nv_bfloat162 s5a = load_token_base_ptr[e5], s5b = load_token_base_ptr[e5 + 1];
-                  __nv_bfloat162 s6a = load_token_base_ptr[e6], s6b = load_token_base_ptr[e6 + 1];
-                  __nv_bfloat162 s7a = load_token_base_ptr[e7], s7b = load_token_base_ptr[e7 + 1];
-                  float2 f0a = __bfloat1622float2(s0a), f0b = __bfloat1622float2(s0b);
-                  float2 f1a = __bfloat1622float2(s1a), f1b = __bfloat1622float2(s1b);
-                  float2 f2a = __bfloat1622float2(s2a), f2b = __bfloat1622float2(s2b);
-                  float2 f3a = __bfloat1622float2(s3a), f3b = __bfloat1622float2(s3b);
-                  float2 f4a = __bfloat1622float2(s4a), f4b = __bfloat1622float2(s4b);
-                  float2 f5a = __bfloat1622float2(s5a), f5b = __bfloat1622float2(s5b);
-                  float2 f6a = __bfloat1622float2(s6a), f6b = __bfloat1622float2(s6b);
-                  float2 f7a = __bfloat1622float2(s7a), f7b = __bfloat1622float2(s7b);
-                  acc_token_tail_smem4[p0] = make_float4(f0a.x, f0a.y, f0b.x, f0b.y);
-                  acc_token_tail_smem4[p1] = make_float4(f1a.x, f1a.y, f1b.x, f1b.y);
-                  acc_token_tail_smem4[p2] = make_float4(f2a.x, f2a.y, f2b.x, f2b.y);
-                  acc_token_tail_smem4[p3] = make_float4(f3a.x, f3a.y, f3b.x, f3b.y);
-                  acc_token_tail_smem4[p4] = make_float4(f4a.x, f4a.y, f4b.x, f4b.y);
-                  acc_token_tail_smem4[p5] = make_float4(f5a.x, f5a.y, f5b.x, f5b.y);
-                  acc_token_tail_smem4[p6] = make_float4(f6a.x, f6a.y, f6b.x, f6b.y);
-                  acc_token_tail_smem4[p7] = make_float4(f7a.x, f7a.y, f7b.x, f7b.y);
-                }
-                for (; p < tail_float4; p += NUM_OF_THREADS_PER_PIPELINE) {
-                  const int e = head_bf16x2 + (p << 1);
-                  __nv_bfloat162 sa = load_token_base_ptr[e], sb = load_token_base_ptr[e + 1];
-                  float2 fa = __bfloat1622float2(sa), fb = __bfloat1622float2(sb);
-                  acc_token_tail_smem4[p] = make_float4(fa.x, fa.y, fb.x, fb.y);
-                }
-                tail_initialized = true;
-              } else {
-                // Subsequent iterations: load, add to smem accumulator, store back
-                int p = thread_rank_within_pipeline;
-                for (; p + 7 * NUM_OF_THREADS_PER_PIPELINE < tail_float4;
-                    p += 8 * NUM_OF_THREADS_PER_PIPELINE) {
-                  const int p0 = p, p1 = p + NUM_OF_THREADS_PER_PIPELINE;
-                  const int p2 = p + 2 * NUM_OF_THREADS_PER_PIPELINE, p3 = p + 3 * NUM_OF_THREADS_PER_PIPELINE;
-                  const int p4 = p + 4 * NUM_OF_THREADS_PER_PIPELINE, p5 = p + 5 * NUM_OF_THREADS_PER_PIPELINE;
-                  const int p6 = p + 6 * NUM_OF_THREADS_PER_PIPELINE, p7 = p + 7 * NUM_OF_THREADS_PER_PIPELINE;
-                  const int e0 = head_bf16x2 + (p0 << 1), e1 = head_bf16x2 + (p1 << 1);
-                  const int e2 = head_bf16x2 + (p2 << 1), e3 = head_bf16x2 + (p3 << 1);
-                  const int e4 = head_bf16x2 + (p4 << 1), e5 = head_bf16x2 + (p5 << 1);
-                  const int e6 = head_bf16x2 + (p6 << 1), e7 = head_bf16x2 + (p7 << 1);
-                  __nv_bfloat162 s0a = load_token_base_ptr[e0], s0b = load_token_base_ptr[e0 + 1];
-                  __nv_bfloat162 s1a = load_token_base_ptr[e1], s1b = load_token_base_ptr[e1 + 1];
-                  __nv_bfloat162 s2a = load_token_base_ptr[e2], s2b = load_token_base_ptr[e2 + 1];
-                  __nv_bfloat162 s3a = load_token_base_ptr[e3], s3b = load_token_base_ptr[e3 + 1];
-                  __nv_bfloat162 s4a = load_token_base_ptr[e4], s4b = load_token_base_ptr[e4 + 1];
-                  __nv_bfloat162 s5a = load_token_base_ptr[e5], s5b = load_token_base_ptr[e5 + 1];
-                  __nv_bfloat162 s6a = load_token_base_ptr[e6], s6b = load_token_base_ptr[e6 + 1];
-                  __nv_bfloat162 s7a = load_token_base_ptr[e7], s7b = load_token_base_ptr[e7 + 1];
-                  float2 f0a = __bfloat1622float2(s0a), f0b = __bfloat1622float2(s0b);
-                  float2 f1a = __bfloat1622float2(s1a), f1b = __bfloat1622float2(s1b);
-                  float2 f2a = __bfloat1622float2(s2a), f2b = __bfloat1622float2(s2b);
-                  float2 f3a = __bfloat1622float2(s3a), f3b = __bfloat1622float2(s3b);
-                  float2 f4a = __bfloat1622float2(s4a), f4b = __bfloat1622float2(s4b);
-                  float2 f5a = __bfloat1622float2(s5a), f5b = __bfloat1622float2(s5b);
-                  float2 f6a = __bfloat1622float2(s6a), f6b = __bfloat1622float2(s6b);
-                  float2 f7a = __bfloat1622float2(s7a), f7b = __bfloat1622float2(s7b);
-                  float4 acc0 = acc_token_tail_smem4[p0];
-                  float4 acc1 = acc_token_tail_smem4[p1];
-                  float4 acc2 = acc_token_tail_smem4[p2];
-                  float4 acc3 = acc_token_tail_smem4[p3];
-                  float4 acc4 = acc_token_tail_smem4[p4];
-                  float4 acc5 = acc_token_tail_smem4[p5];
-                  float4 acc6 = acc_token_tail_smem4[p6];
-                  float4 acc7 = acc_token_tail_smem4[p7];
-                  acc0.x += f0a.x; acc0.y += f0a.y; acc0.z += f0b.x; acc0.w += f0b.y;
-                  acc1.x += f1a.x; acc1.y += f1a.y; acc1.z += f1b.x; acc1.w += f1b.y;
-                  acc2.x += f2a.x; acc2.y += f2a.y; acc2.z += f2b.x; acc2.w += f2b.y;
-                  acc3.x += f3a.x; acc3.y += f3a.y; acc3.z += f3b.x; acc3.w += f3b.y;
-                  acc4.x += f4a.x; acc4.y += f4a.y; acc4.z += f4b.x; acc4.w += f4b.y;
-                  acc5.x += f5a.x; acc5.y += f5a.y; acc5.z += f5b.x; acc5.w += f5b.y;
-                  acc6.x += f6a.x; acc6.y += f6a.y; acc6.z += f6b.x; acc6.w += f6b.y;
-                  acc7.x += f7a.x; acc7.y += f7a.y; acc7.z += f7b.x; acc7.w += f7b.y;
-                  acc_token_tail_smem4[p0] = acc0;
-                  acc_token_tail_smem4[p1] = acc1;
-                  acc_token_tail_smem4[p2] = acc2;
-                  acc_token_tail_smem4[p3] = acc3;
-                  acc_token_tail_smem4[p4] = acc4;
-                  acc_token_tail_smem4[p5] = acc5;
-                  acc_token_tail_smem4[p6] = acc6;
-                  acc_token_tail_smem4[p7] = acc7;
-                }
-                for (; p < tail_float4; p += NUM_OF_THREADS_PER_PIPELINE) {
-                  const int e = head_bf16x2 + (p << 1);
-                  __nv_bfloat162 sa = load_token_base_ptr[e], sb = load_token_base_ptr[e + 1];
-                  float2 fa = __bfloat1622float2(sa), fb = __bfloat1622float2(sb);
-                  float4 acc = acc_token_tail_smem4[p];
-                  acc.x += fa.x; acc.y += fa.y; acc.z += fb.x; acc.w += fb.y;
-                  acc_token_tail_smem4[p] = acc;
-                }
-              }
-            }
-
             if constexpr(BACKWARD_COMBINE) {
               #pragma unroll
               for (int n = 0; n < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; n++) {
@@ -3266,126 +2871,15 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(const 
 
             // Accumulate token and prob(optional).
             #pragma unroll
-            for (int m = 0; m < NUM_OF_HEAD_ACC_ELEMENTS_PER_THREAD; m++){
+            for (int m = 0; m < NUM_OF_ACC_ELEMENTS_PER_THREAD; m++){
               int element_id = (m * NUM_OF_THREADS_PER_PIPELINE) + thread_rank_within_pipeline;
-              if (element_id < head_bf16x2){
+              if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN){
                 __nv_bfloat162 src_data = load_token_base_ptr[element_id];
                 float2 src_data_fp32 = __bfloat1622float2(src_data);
               acc_token_fp32[m].x += src_data_fp32.x;
               acc_token_fp32[m].y += src_data_fp32.y;
               }
             }
-            if (tail_bf16x2 > 0) {
-              if (!tail_initialized) {
-                // First iteration: load source directly into smem (no accumulation)
-                int p = thread_rank_within_pipeline;
-                for (; p + 7 * NUM_OF_THREADS_PER_PIPELINE < tail_float4;
-                    p += 8 * NUM_OF_THREADS_PER_PIPELINE) {
-                  const int p0 = p, p1 = p + NUM_OF_THREADS_PER_PIPELINE;
-                  const int p2 = p + 2 * NUM_OF_THREADS_PER_PIPELINE, p3 = p + 3 * NUM_OF_THREADS_PER_PIPELINE;
-                  const int p4 = p + 4 * NUM_OF_THREADS_PER_PIPELINE, p5 = p + 5 * NUM_OF_THREADS_PER_PIPELINE;
-                  const int p6 = p + 6 * NUM_OF_THREADS_PER_PIPELINE, p7 = p + 7 * NUM_OF_THREADS_PER_PIPELINE;
-                  const int e0 = head_bf16x2 + (p0 << 1), e1 = head_bf16x2 + (p1 << 1);
-                  const int e2 = head_bf16x2 + (p2 << 1), e3 = head_bf16x2 + (p3 << 1);
-                  const int e4 = head_bf16x2 + (p4 << 1), e5 = head_bf16x2 + (p5 << 1);
-                  const int e6 = head_bf16x2 + (p6 << 1), e7 = head_bf16x2 + (p7 << 1);
-                  __nv_bfloat162 s0a = load_token_base_ptr[e0], s0b = load_token_base_ptr[e0 + 1];
-                  __nv_bfloat162 s1a = load_token_base_ptr[e1], s1b = load_token_base_ptr[e1 + 1];
-                  __nv_bfloat162 s2a = load_token_base_ptr[e2], s2b = load_token_base_ptr[e2 + 1];
-                  __nv_bfloat162 s3a = load_token_base_ptr[e3], s3b = load_token_base_ptr[e3 + 1];
-                  __nv_bfloat162 s4a = load_token_base_ptr[e4], s4b = load_token_base_ptr[e4 + 1];
-                  __nv_bfloat162 s5a = load_token_base_ptr[e5], s5b = load_token_base_ptr[e5 + 1];
-                  __nv_bfloat162 s6a = load_token_base_ptr[e6], s6b = load_token_base_ptr[e6 + 1];
-                  __nv_bfloat162 s7a = load_token_base_ptr[e7], s7b = load_token_base_ptr[e7 + 1];
-                  float2 f0a = __bfloat1622float2(s0a), f0b = __bfloat1622float2(s0b);
-                  float2 f1a = __bfloat1622float2(s1a), f1b = __bfloat1622float2(s1b);
-                  float2 f2a = __bfloat1622float2(s2a), f2b = __bfloat1622float2(s2b);
-                  float2 f3a = __bfloat1622float2(s3a), f3b = __bfloat1622float2(s3b);
-                  float2 f4a = __bfloat1622float2(s4a), f4b = __bfloat1622float2(s4b);
-                  float2 f5a = __bfloat1622float2(s5a), f5b = __bfloat1622float2(s5b);
-                  float2 f6a = __bfloat1622float2(s6a), f6b = __bfloat1622float2(s6b);
-                  float2 f7a = __bfloat1622float2(s7a), f7b = __bfloat1622float2(s7b);
-                  acc_token_tail_smem4[p0] = make_float4(f0a.x, f0a.y, f0b.x, f0b.y);
-                  acc_token_tail_smem4[p1] = make_float4(f1a.x, f1a.y, f1b.x, f1b.y);
-                  acc_token_tail_smem4[p2] = make_float4(f2a.x, f2a.y, f2b.x, f2b.y);
-                  acc_token_tail_smem4[p3] = make_float4(f3a.x, f3a.y, f3b.x, f3b.y);
-                  acc_token_tail_smem4[p4] = make_float4(f4a.x, f4a.y, f4b.x, f4b.y);
-                  acc_token_tail_smem4[p5] = make_float4(f5a.x, f5a.y, f5b.x, f5b.y);
-                  acc_token_tail_smem4[p6] = make_float4(f6a.x, f6a.y, f6b.x, f6b.y);
-                  acc_token_tail_smem4[p7] = make_float4(f7a.x, f7a.y, f7b.x, f7b.y);
-                }
-                for (; p < tail_float4; p += NUM_OF_THREADS_PER_PIPELINE){
-                  const int e = head_bf16x2 + (p << 1);
-                  __nv_bfloat162 sa = load_token_base_ptr[e], sb = load_token_base_ptr[e + 1];
-                  float2 fa = __bfloat1622float2(sa), fb = __bfloat1622float2(sb);
-                  acc_token_tail_smem4[p] = make_float4(fa.x, fa.y, fb.x, fb.y);
-                }
-                tail_initialized = true;
-              } else {
-                // Subsequent iterations: load, add to smem accumulator, store back
-                int p = thread_rank_within_pipeline;
-                for (; p + 7 * NUM_OF_THREADS_PER_PIPELINE < tail_float4;
-                    p += 8 * NUM_OF_THREADS_PER_PIPELINE){
-                  const int p0 = p, p1 = p + NUM_OF_THREADS_PER_PIPELINE;
-                  const int p2 = p + 2 * NUM_OF_THREADS_PER_PIPELINE, p3 = p + 3 * NUM_OF_THREADS_PER_PIPELINE;
-                  const int p4 = p + 4 * NUM_OF_THREADS_PER_PIPELINE, p5 = p + 5 * NUM_OF_THREADS_PER_PIPELINE;
-                  const int p6 = p + 6 * NUM_OF_THREADS_PER_PIPELINE, p7 = p + 7 * NUM_OF_THREADS_PER_PIPELINE;
-                  const int e0 = head_bf16x2 + (p0 << 1), e1 = head_bf16x2 + (p1 << 1);
-                  const int e2 = head_bf16x2 + (p2 << 1), e3 = head_bf16x2 + (p3 << 1);
-                  const int e4 = head_bf16x2 + (p4 << 1), e5 = head_bf16x2 + (p5 << 1);
-                  const int e6 = head_bf16x2 + (p6 << 1), e7 = head_bf16x2 + (p7 << 1);
-                  __nv_bfloat162 s0a = load_token_base_ptr[e0], s0b = load_token_base_ptr[e0 + 1];
-                  __nv_bfloat162 s1a = load_token_base_ptr[e1], s1b = load_token_base_ptr[e1 + 1];
-                  __nv_bfloat162 s2a = load_token_base_ptr[e2], s2b = load_token_base_ptr[e2 + 1];
-                  __nv_bfloat162 s3a = load_token_base_ptr[e3], s3b = load_token_base_ptr[e3 + 1];
-                  __nv_bfloat162 s4a = load_token_base_ptr[e4], s4b = load_token_base_ptr[e4 + 1];
-                  __nv_bfloat162 s5a = load_token_base_ptr[e5], s5b = load_token_base_ptr[e5 + 1];
-                  __nv_bfloat162 s6a = load_token_base_ptr[e6], s6b = load_token_base_ptr[e6 + 1];
-                  __nv_bfloat162 s7a = load_token_base_ptr[e7], s7b = load_token_base_ptr[e7 + 1];
-                  float2 f0a = __bfloat1622float2(s0a), f0b = __bfloat1622float2(s0b);
-                  float2 f1a = __bfloat1622float2(s1a), f1b = __bfloat1622float2(s1b);
-                  float2 f2a = __bfloat1622float2(s2a), f2b = __bfloat1622float2(s2b);
-                  float2 f3a = __bfloat1622float2(s3a), f3b = __bfloat1622float2(s3b);
-                  float2 f4a = __bfloat1622float2(s4a), f4b = __bfloat1622float2(s4b);
-                  float2 f5a = __bfloat1622float2(s5a), f5b = __bfloat1622float2(s5b);
-                  float2 f6a = __bfloat1622float2(s6a), f6b = __bfloat1622float2(s6b);
-                  float2 f7a = __bfloat1622float2(s7a), f7b = __bfloat1622float2(s7b);
-                  float4 acc0 = acc_token_tail_smem4[p0];
-                  float4 acc1 = acc_token_tail_smem4[p1];
-                  float4 acc2 = acc_token_tail_smem4[p2];
-                  float4 acc3 = acc_token_tail_smem4[p3];
-                  float4 acc4 = acc_token_tail_smem4[p4];
-                  float4 acc5 = acc_token_tail_smem4[p5];
-                  float4 acc6 = acc_token_tail_smem4[p6];
-                  float4 acc7 = acc_token_tail_smem4[p7];
-                  acc0.x += f0a.x; acc0.y += f0a.y; acc0.z += f0b.x; acc0.w += f0b.y;
-                  acc1.x += f1a.x; acc1.y += f1a.y; acc1.z += f1b.x; acc1.w += f1b.y;
-                  acc2.x += f2a.x; acc2.y += f2a.y; acc2.z += f2b.x; acc2.w += f2b.y;
-                  acc3.x += f3a.x; acc3.y += f3a.y; acc3.z += f3b.x; acc3.w += f3b.y;
-                  acc4.x += f4a.x; acc4.y += f4a.y; acc4.z += f4b.x; acc4.w += f4b.y;
-                  acc5.x += f5a.x; acc5.y += f5a.y; acc5.z += f5b.x; acc5.w += f5b.y;
-                  acc6.x += f6a.x; acc6.y += f6a.y; acc6.z += f6b.x; acc6.w += f6b.y;
-                  acc7.x += f7a.x; acc7.y += f7a.y; acc7.z += f7b.x; acc7.w += f7b.y;
-                  acc_token_tail_smem4[p0] = acc0;
-                  acc_token_tail_smem4[p1] = acc1;
-                  acc_token_tail_smem4[p2] = acc2;
-                  acc_token_tail_smem4[p3] = acc3;
-                  acc_token_tail_smem4[p4] = acc4;
-                  acc_token_tail_smem4[p5] = acc5;
-                  acc_token_tail_smem4[p6] = acc6;
-                  acc_token_tail_smem4[p7] = acc7;
-                }
-                for (; p < tail_float4; p += NUM_OF_THREADS_PER_PIPELINE){
-                  const int e = head_bf16x2 + (p << 1);
-                  __nv_bfloat162 sa = load_token_base_ptr[e], sb = load_token_base_ptr[e + 1];
-                  float2 fa = __bfloat1622float2(sa), fb = __bfloat1622float2(sb);
-                  float4 acc = acc_token_tail_smem4[p];
-                  acc.x += fa.x; acc.y += fa.y; acc.z += fb.x; acc.w += fb.y;
-                  acc_token_tail_smem4[p] = acc;
-                }
-              }
-            }
-
             if constexpr(BACKWARD_COMBINE) {
               #pragma unroll
               for (int m = 0; m < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; m++) {
@@ -3435,89 +2929,13 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(const 
 
         // Store the token.
         #pragma unroll
-        for (int n = 0; n < NUM_OF_HEAD_ACC_ELEMENTS_PER_THREAD; n++) {
+        for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD; n++) {
           int element_id = (n * NUM_OF_THREADS_PER_PIPELINE) + thread_rank_within_pipeline;
-          if (element_id < head_bf16x2) {
+          if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
             // Convert accumulated token back to BF16 and store the result back to shared memory token entry.
             store_token_base_ptr[element_id] = __float22bfloat162_rn(acc_token_fp32[n]);
           }
         }
-        if (tail_bf16x2 > 0) {
-          const __nv_bfloat162 zero_bf16x2 = __float22bfloat162_rn(make_float2(0.0f, 0.0f));
-          if (!tail_initialized) {
-            // No sources contributed to this token's tail, write zeros
-            int p = thread_rank_within_pipeline;
-            for (; p + 7 * NUM_OF_THREADS_PER_PIPELINE < tail_float4;
-                p += 8 * NUM_OF_THREADS_PER_PIPELINE) {
-              const int p0 = p, p1 = p + NUM_OF_THREADS_PER_PIPELINE;
-              const int p2 = p + 2 * NUM_OF_THREADS_PER_PIPELINE, p3 = p + 3 * NUM_OF_THREADS_PER_PIPELINE;
-              const int p4 = p + 4 * NUM_OF_THREADS_PER_PIPELINE, p5 = p + 5 * NUM_OF_THREADS_PER_PIPELINE;
-              const int p6 = p + 6 * NUM_OF_THREADS_PER_PIPELINE, p7 = p + 7 * NUM_OF_THREADS_PER_PIPELINE;
-              const int e0 = head_bf16x2 + (p0 << 1), e1 = head_bf16x2 + (p1 << 1);
-              const int e2 = head_bf16x2 + (p2 << 1), e3 = head_bf16x2 + (p3 << 1);
-              const int e4 = head_bf16x2 + (p4 << 1), e5 = head_bf16x2 + (p5 << 1);
-              const int e6 = head_bf16x2 + (p6 << 1), e7 = head_bf16x2 + (p7 << 1);
-              store_token_base_ptr[e0] = zero_bf16x2; store_token_base_ptr[e0 + 1] = zero_bf16x2;
-              store_token_base_ptr[e1] = zero_bf16x2; store_token_base_ptr[e1 + 1] = zero_bf16x2;
-              store_token_base_ptr[e2] = zero_bf16x2; store_token_base_ptr[e2 + 1] = zero_bf16x2;
-              store_token_base_ptr[e3] = zero_bf16x2; store_token_base_ptr[e3 + 1] = zero_bf16x2;
-              store_token_base_ptr[e4] = zero_bf16x2; store_token_base_ptr[e4 + 1] = zero_bf16x2;
-              store_token_base_ptr[e5] = zero_bf16x2; store_token_base_ptr[e5 + 1] = zero_bf16x2;
-              store_token_base_ptr[e6] = zero_bf16x2; store_token_base_ptr[e6 + 1] = zero_bf16x2;
-              store_token_base_ptr[e7] = zero_bf16x2; store_token_base_ptr[e7 + 1] = zero_bf16x2;
-            }
-            for (; p < tail_float4; p += NUM_OF_THREADS_PER_PIPELINE) {
-              const int e = head_bf16x2 + (p << 1);
-              store_token_base_ptr[e] = zero_bf16x2;
-              store_token_base_ptr[e + 1] = zero_bf16x2;
-            }
-          } else {
-            // Store accumulated tail from smem to global
-            int p = thread_rank_within_pipeline;
-            for (; p + 7 * NUM_OF_THREADS_PER_PIPELINE < tail_float4;
-                p += 8 * NUM_OF_THREADS_PER_PIPELINE) {
-              const int p0 = p, p1 = p + NUM_OF_THREADS_PER_PIPELINE;
-              const int p2 = p + 2 * NUM_OF_THREADS_PER_PIPELINE, p3 = p + 3 * NUM_OF_THREADS_PER_PIPELINE;
-              const int p4 = p + 4 * NUM_OF_THREADS_PER_PIPELINE, p5 = p + 5 * NUM_OF_THREADS_PER_PIPELINE;
-              const int p6 = p + 6 * NUM_OF_THREADS_PER_PIPELINE, p7 = p + 7 * NUM_OF_THREADS_PER_PIPELINE;
-              const int e0 = head_bf16x2 + (p0 << 1), e1 = head_bf16x2 + (p1 << 1);
-              const int e2 = head_bf16x2 + (p2 << 1), e3 = head_bf16x2 + (p3 << 1);
-              const int e4 = head_bf16x2 + (p4 << 1), e5 = head_bf16x2 + (p5 << 1);
-              const int e6 = head_bf16x2 + (p6 << 1), e7 = head_bf16x2 + (p7 << 1);
-              float4 acc0 = acc_token_tail_smem4[p0];
-              float4 acc1 = acc_token_tail_smem4[p1];
-              float4 acc2 = acc_token_tail_smem4[p2];
-              float4 acc3 = acc_token_tail_smem4[p3];
-              float4 acc4 = acc_token_tail_smem4[p4];
-              float4 acc5 = acc_token_tail_smem4[p5];
-              float4 acc6 = acc_token_tail_smem4[p6];
-              float4 acc7 = acc_token_tail_smem4[p7];
-              store_token_base_ptr[e0] = __float22bfloat162_rn(make_float2(acc0.x, acc0.y));
-              store_token_base_ptr[e0 + 1] = __float22bfloat162_rn(make_float2(acc0.z, acc0.w));
-              store_token_base_ptr[e1] = __float22bfloat162_rn(make_float2(acc1.x, acc1.y));
-              store_token_base_ptr[e1 + 1] = __float22bfloat162_rn(make_float2(acc1.z, acc1.w));
-              store_token_base_ptr[e2] = __float22bfloat162_rn(make_float2(acc2.x, acc2.y));
-              store_token_base_ptr[e2 + 1] = __float22bfloat162_rn(make_float2(acc2.z, acc2.w));
-              store_token_base_ptr[e3] = __float22bfloat162_rn(make_float2(acc3.x, acc3.y));
-              store_token_base_ptr[e3 + 1] = __float22bfloat162_rn(make_float2(acc3.z, acc3.w));
-              store_token_base_ptr[e4] = __float22bfloat162_rn(make_float2(acc4.x, acc4.y));
-              store_token_base_ptr[e4 + 1] = __float22bfloat162_rn(make_float2(acc4.z, acc4.w));
-              store_token_base_ptr[e5] = __float22bfloat162_rn(make_float2(acc5.x, acc5.y));
-              store_token_base_ptr[e5 + 1] = __float22bfloat162_rn(make_float2(acc5.z, acc5.w));
-              store_token_base_ptr[e6] = __float22bfloat162_rn(make_float2(acc6.x, acc6.y));
-              store_token_base_ptr[e6 + 1] = __float22bfloat162_rn(make_float2(acc6.z, acc6.w));
-              store_token_base_ptr[e7] = __float22bfloat162_rn(make_float2(acc7.x, acc7.y));
-              store_token_base_ptr[e7 + 1] = __float22bfloat162_rn(make_float2(acc7.z, acc7.w));
-            }
-            for(; p < tail_float4; p += NUM_OF_THREADS_PER_PIPELINE){
-              const int e = head_bf16x2 + (p << 1);
-              float4 acc = acc_token_tail_smem4[p];
-              store_token_base_ptr[e] = __float22bfloat162_rn(make_float2(acc.x, acc.y));
-              store_token_base_ptr[e + 1] = __float22bfloat162_rn(make_float2(acc.z, acc.w));
-            }
-          }
-        }
-
         // Store the prob(optional).
         if constexpr(BACKWARD_COMBINE) {
           #pragma unroll
@@ -3786,6 +3204,7 @@ template<// This type represent intra-node reduction warp group.
          int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
          // Whether the combine kernel is used in backward process. If so, need to transfer the prob for each token as well.
          bool BACKWARD_COMBINE,
+         int HIDDEN_DIM,
          int LSA_TEAM_SIZE>
 // Each CUDA block of combine kernel has 5 warp groups and has the following layout:
 // 1. intra-node reduction warp group(4 warps, only valid for multinode scenario). 2. inter-node reduction warp group(4 warps, 1 pipeline for multinode scenario, 2 pipeline otherwise).
@@ -3804,7 +3223,8 @@ __device__ __forceinline__ void combine_kernel_impl(
   // Currently, we use TMA to copy prob data, which need at least 16B size and alignment(which requires expert per node to be multiple of 4).
   // We need to add padding or not using TMA for prob, if we want to support other scenario.
   //assert((param.experts_per_rank * param.num_of_ranks_per_node * sizeof(float)) % 16 == 0);
-  assert((param.hidden_dim * sizeof(uint16_t)) % 16 == 0);
+  static_assert((HIDDEN_DIM % 2) == 0, "HIDDEN_DIM must be even for BF16x2.");
+  static_assert((HIDDEN_DIM * sizeof(uint16_t)) % 16 == 0, "HIDDEN_DIM must satisfy TMA alignment.");
   static_assert(MAX_NUM_OF_TOKENS_PER_RANK % NUM_OF_TOKENS_PER_CHUNK == 0, "MAX_NUM_OF_TOKENS_PER_RANK must be multiple of NUM_OF_TOKENS_PER_CHUNK.");
   constexpr int MAX_NUM_OF_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
@@ -3822,7 +3242,7 @@ __device__ __forceinline__ void combine_kernel_impl(
     // Initialize the layout struct (each thread has its own copy in registers)
     cur_smem_t smem_layout;
     model_config_t c_model;
-    c_model.hidden_dim = param.hidden_dim;
+    c_model.hidden_dim = HIDDEN_DIM;
     c_model.max_num_of_tokens_per_rank = MAX_NUM_OF_TOKENS_PER_RANK;
     c_model.num_of_experts_per_rank = param.experts_per_rank;
     c_model.num_of_ranks_per_node = param.num_of_ranks_per_node;
@@ -3915,37 +3335,37 @@ __device__ __forceinline__ void combine_kernel_impl(
     // Intra-node reduction warp group.
       intra_node_red_warp_group_device_function
       <INTRA_NODE_RED_GROUP, cur_smem_t, NUM_OF_STAGES_G2S, NUM_OF_STAGES_S2G, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK,
-      NUM_LSA_TEAMS, NUM_OF_BLOCKS, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, BACKWARD_COMBINE, LSA_TEAM_SIZE>
-      (param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.rdma_to_attn_map, param.rdma_intra_node_red_token, param.rdma_intra_node_red_prob, smem_buffer_ptr, param.hidden_dim, param.experts_per_rank);
+      NUM_LSA_TEAMS, NUM_OF_BLOCKS, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SIZE>
+      (param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.rdma_to_attn_map, param.rdma_intra_node_red_token, param.rdma_intra_node_red_prob, smem_buffer_ptr, param.experts_per_rank);
     }
   }else if (threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size()) {
     // Inter-node reduction warp group.
     inter_node_red_warp_group_device_function
     <cur_smem_t, INTER_NODE_RED_GROUP, NUM_OF_DATA_PIPELINE_PER_BLOCK, NUM_OF_STAGES_G2S, NUM_OF_STAGES_S2G, NUM_OF_TOKENS_PER_CHUNK,
-    NUM_LSA_TEAMS, NUM_OF_BLOCKS, NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE, LSA_TEAM_SIZE>
-    (param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.rdma_to_attn_map, param.attn_to_rdma_map, param.attn_output_token, param.attn_output_prob, smem_buffer_ptr, param.hidden_dim, param.experts_per_rank);
+    NUM_LSA_TEAMS, NUM_OF_BLOCKS, NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SIZE>
+    (param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.rdma_to_attn_map, param.attn_to_rdma_map, param.attn_output_token, param.attn_output_prob, smem_buffer_ptr, param.experts_per_rank);
   }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size()){
     // Intra-node G2S warp group.
     if constexpr(NUM_LSA_TEAMS != 1) {
       intra_node_G2S_warp_group_device_function
-      <cur_smem_t, NUM_OF_STAGES_G2S, NUM_OF_TOKENS_PER_CHUNK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, BACKWARD_COMBINE>
-      (param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.rdma_to_attn_map, param.sparse_to_dense_map, param.expert_input_token, param.expert_input_prob, smem_buffer_ptr, param.hidden_dim, param.experts_per_rank);
+      <cur_smem_t, NUM_OF_STAGES_G2S, NUM_OF_TOKENS_PER_CHUNK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, BACKWARD_COMBINE, HIDDEN_DIM>
+      (param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.rdma_to_attn_map, param.sparse_to_dense_map, param.expert_input_token, param.expert_input_prob, smem_buffer_ptr, param.experts_per_rank);
     }
   }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size()){
     // Inter-node G2S warp group.
     inter_node_G2S_warp_group_device_function
     <cur_smem_t, INTER_NODE_G2S_GROUP, NUM_OF_STAGES_G2S, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS,
-    NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE>
+    NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE, HIDDEN_DIM>
     (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.expected_rdma_flag_value, param.rdma_to_attn_map, param.attn_to_rdma_map, param.sparse_to_dense_map, param.expert_input_token, param.expert_input_prob,
-    param.rdma_inter_node_group_token, param.rdma_inter_node_group_prob, param.dcomms, param.signals_base, param.combine_signal_offset, param.num_gin_comms, param.num_ctx_per_comm, param.rdma_inter_node_group_flags, smem_buffer_ptr, param.hidden_dim, param.experts_per_rank);
+    param.rdma_inter_node_group_token, param.rdma_inter_node_group_prob, param.dcomms, param.signals_base, param.combine_signal_offset, param.num_gin_comms, param.num_ctx_per_comm, param.rdma_inter_node_group_flags, smem_buffer_ptr, param.experts_per_rank);
   }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size()){
     // Inter-node rdma warp group.
     if constexpr(NUM_LSA_TEAMS != 1){
       inter_node_N2N_warp_group_device_function
-      <INTER_NODE_RDMA_GROUP, cur_smem_t, NUM_OF_STAGES_S2G, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, BACKWARD_COMBINE>
+      <INTER_NODE_RDMA_GROUP, cur_smem_t, NUM_OF_STAGES_S2G, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, BACKWARD_COMBINE, HIDDEN_DIM>
       (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.rdma_to_attn_map,
        param.dcomms, param.nccl_window, param.num_gin_comms, param.num_ctx_per_comm, param.gin_base_ptr, param.signals_base, param.combine_signal_offset,
-       &param.mr_info, smem_buffer_ptr, param.hidden_dim, param.experts_per_rank);
+       &param.mr_info, smem_buffer_ptr, param.experts_per_rank);
     }
   }else{
     // Too many threads, should not goes here.

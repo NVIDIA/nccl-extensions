@@ -8,7 +8,6 @@
 
 #include "device/hybrid_ep.cuh"
 #include "device/jit/jit_runtime.hpp"
-#include "device/jit/jit_utils.hpp"
 
 #include <climits>
 #include <cstdio>
@@ -93,7 +92,7 @@ template <
     bool BACKWARD_COMBINE,
     int NUM_LSA_TEAMS,
     int LSA_TEAM_SIZE>
-bool try_launch_combine(
+void launch_combine(
     ::hybrid_ep::combine_kernel_param_t<LSA_TEAM_SIZE>& param,
     int dynamic_smem_bytes,
     cudaStream_t stream) {
@@ -115,8 +114,6 @@ bool try_launch_combine(
         INTRA_NODE_G2S_GROUP_WARPS +
         INTER_NODE_G2S_GROUP_WARPS +
         INTER_NODE_RDMA_GROUP_WARPS);
-
-    if (!::nccl_ep::jit::env_flag_enabled("NCCL_EP_COMBINE_JIT")) return false;
 
     static const int variant_identity = 0; // address is a stable-inprocess id for each template instantiation.
     static const std::string variant_name = [] {
@@ -274,7 +271,6 @@ bool try_launch_combine(
     CUDA_CHECK(cudaFree(d_wt));
     CUDA_CHECK(cudaFree(d_bt));
 #endif
-    return true;
 }
 
 } // namespace jit

@@ -178,6 +178,8 @@ setup_eos:
 
 setup_prenyx:
   extends: .setup_base
+  rules:
+    - when: never
   tags:
     - prenyx
   variables:
@@ -253,6 +255,8 @@ test_eos:
 
 test_prenyx:
   stage: test
+  rules:
+    - when: never
   tags:
     - prenyx
   needs:

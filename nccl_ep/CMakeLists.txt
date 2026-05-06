@@ -8,10 +8,23 @@ if(DEFINED CMAKE_CUDA_ARCHITECTURES)
   endforeach()
 endif()
 
+option(NCCL_EP_ENABLE_NVCC_JIT
+    "Build optional NVCC JIT path for HybridEP combine. Runtime still requires NCCL_EP_COMBINE_JIT=1."
+    OFF)
+
 # Source files
 set(NCCL_EP_HOST_SRC
     nccl_ep.cc
 )
+
+if(NCCL_EP_ENABLE_NVCC_JIT)
+    list(APPEND NCCL_EP_HOST_SRC
+        device/jit/jit_utils.cc
+        device/jit/jit_cache.cc
+        device/jit/nvcc_compiler.cc
+        device/jit/jit_runtime.cc
+    )
+endif()
 
 set(NCCL_EP_DEVICE_SRC
     device/low_latency.cu
@@ -83,6 +96,20 @@ foreach(t IN LISTS NCCL_EP_TARGETS)
     target_compile_definitions(${t} PRIVATE
         _NCCL_EP_LSA_TEAM_SIZE_MIN=${_NCCL_EP_LSA_TEAM_SIZE_MIN}
         _NCCL_EP_LSA_TEAM_SIZE_MAX=${_NCCL_EP_LSA_TEAM_SIZE_MAX})
+    if(NCCL_EP_ENABLE_NVCC_JIT)
+        target_compile_definitions(${t} PRIVATE
+            NCCL_EP_ENABLE_NVCC_JIT=1
+            NCCL_EP_JIT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+            NCCL_EP_JIT_BUILD_INCLUDE_DIR="${CMAKE_BINARY_DIR}/include"
+            NCCL_EP_JIT_CUDA_INCLUDE_DIR="${CUDAToolkit_INCLUDE_DIRS}")
+        if(TARGET CUDA::cuda_driver)
+            target_link_libraries(${t} PUBLIC CUDA::cuda_driver)
+        else()
+            target_link_libraries(${t} PUBLIC cuda)
+        endif()
+    else()
+        target_compile_definitions(${t} PRIVATE NCCL_EP_ENABLE_NVCC_JIT=0)
+    endif()
     target_include_directories(${t} PUBLIC ${NCCL_EP_INCLUDE_DIRS})
     target_link_libraries(${t} PUBLIC nccl ${CUDAToolkit_LIBRARIES})
 endforeach()

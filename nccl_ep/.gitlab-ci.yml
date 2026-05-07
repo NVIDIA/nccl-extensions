@@ -85,6 +85,8 @@ build_ipp6:
         --container-mounts="$container_mounts" \
         env NCCL_HOME=/nccl_install/build \
         MPI_HOME="$MPI_HOME" \
+        NCCL_EP_JIT_CACHE_DIR=/nccl/jit_cache \
+        NCCL_EP_JIT_SOURCE_DIR=/nccl/contrib/nccl_ep \
         make -C /nccl/contrib/nccl_ep \
           MPI=1 \
           MPI_HOME="$MPI_HOME" \
@@ -132,6 +134,8 @@ build_pretyche:
         --container-mounts="$container_mounts" \
         env NCCL_HOME=/nccl_install/build \
         MPI_HOME="$MPI_HOME" \
+        NCCL_EP_JIT_CACHE_DIR=/nccl/jit_cache \
+        NCCL_EP_JIT_SOURCE_DIR=/nccl/contrib/nccl_ep \
         make -C /nccl/contrib/nccl_ep \
           MPI=1 \
           MPI_HOME="$MPI_HOME" \

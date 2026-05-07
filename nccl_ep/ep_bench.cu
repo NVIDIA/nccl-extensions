@@ -218,13 +218,13 @@ static ncclResult_t epMakeTensor(ncclNDTensor_t* tensor, unsigned int ndim,
     return ncclEpTensorCreate(tensor, ndim, dt, tag, data, s0, s1, s2, s3, s4);
 }
 
-// Inverse of epMakeTensor: cudaFree the backing buffer, then destroy the descriptor.
+// Inverse of epMakeTensor: destroy the descriptor first, then cudaFree the backing buffer.
 static void epFreeTensor(ncclNDTensor_t tensor) {
     if (tensor == nullptr) return;
     void* data = nullptr;
     ncclEpTensorGetData(tensor, &data);
-    if (data) cudaFree(data);
     ncclEpTensorDestroy(tensor);
+    if (data) cudaFree(data);
 }
 
 // Structure to hold all tensors needed for benchmarking

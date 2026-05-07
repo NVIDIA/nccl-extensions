@@ -845,13 +845,14 @@ static ncclResult_t make_tensor(ncclNDTensor_t* t, unsigned int ndim,
     return ncclEpTensorCreate(t, ndim, dt, tag, data, s0, s1, s2, s3, s4);
 }
 
-// Inverse: cudaFree the backing buffer, then destroy the descriptor.
+// Inverse: destroy the descriptor first, then free the backing buffer
+// (mirror of make_tensor's cudaMalloc + Create order).
 static void free_tensor(ncclNDTensor_t t) {
     if (!t) return;
     void* data = nullptr;
     ncclEpTensorGetData(t, &data);
-    if (data) cudaFree(data);
     ncclEpTensorDestroy(t);
+    if (data) cudaFree(data);
 }
 
 // Initialize NCCL communicator

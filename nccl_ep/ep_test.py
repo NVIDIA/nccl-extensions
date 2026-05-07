@@ -130,6 +130,7 @@ def cuda_device_reset():
 # ---------------------------------------------------------------------------
 
 # Element size in bytes for the dtypes used by this test.
+# TODO: replace with a helper from nccl4py once one is available.
 _DTYPE_BYTES = {
     ncclDataTypeEnum.ncclInt8: 1,
     ncclDataTypeEnum.ncclUint8: 1,
@@ -164,13 +165,13 @@ def tensor_create(nccl, ndim, datatype, tag, *sizes):
 
 
 def tensor_destroy(nccl, tensor):
-    """Inverse of tensor_create: cudaFree the backing buffer, then destroy the descriptor."""
+    """Inverse of tensor_create: destroy the descriptor first, then cudaFree the backing buffer."""
     if tensor is None:
         return
     data = tensor_get_data(nccl, tensor)
+    nccl.NCCL_CHECK(nccl._funcs["ncclEpTensorDestroy"](tensor))
     if data and data.value:
         cuda_free(data)
-    nccl.NCCL_CHECK(nccl._funcs["ncclEpTensorDestroy"](tensor))
 
 
 def tensor_get_data(nccl, tensor):

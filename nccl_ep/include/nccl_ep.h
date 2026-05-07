@@ -97,7 +97,9 @@ ncclResult_t ncclEpGroupDestroy(
 //   setting the strides to 1 for all dimensions).
 //
 //   The buffer is NOT owned by the tensor; the caller is responsible for the lifetime of `data`
-//   and must keep it valid until ncclEpTensorDestroy returns.
+//   and must keep it valid until ncclEpTensorDestroy returns. Releasing `data` while the tensor
+//   handle is still live leaves the handle dangling — any subsequent use is undefined behavior.
+//   Recommended teardown order: ncclEpTensorDestroy(t) first, then free the buffer.
 //
 // Arguments:
 //   tensor       - [OUT] Pointer to newly created tensor

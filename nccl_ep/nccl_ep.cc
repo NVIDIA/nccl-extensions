@@ -34,7 +34,6 @@ struct ncclNDTensor {
     void* data;
     unsigned int tag;
     ncclEpTensorFlags_t flags;
-    bool owns_data;
 };
 
 // Forward declarations for HT functions
@@ -42,7 +41,7 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group, const ncclEp
 static ncclResult_t destroy_hybridep_intranode(ncclEpGroup_t ep_group);
 static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* config, cudaStream_t stream);
 static ncclResult_t destroy_hybridep_internode(ncclEpGroup_t ep_group);
-static void tensor_free(ncclEpGroup_t group, ncclNDTensor_t t);
+static void tensor_free(ncclNDTensor_t t);
 
 // Define NCCL_CHECK_RESULT macro for NCCL error checking
 #ifndef NCCL_CHECK_RESULT
@@ -1102,7 +1101,6 @@ ncclResult_t ncclEpGroupDestroy(
 }
 
 ncclResult_t ncclEpTensorCreate(
-    ncclEpGroup_t ep_group,
     ncclNDTensor_t* tensor,
     unsigned int ndim,
     ncclDataType_t datatype,
@@ -1114,8 +1112,8 @@ ncclResult_t ncclEpTensorCreate(
     unsigned int size3,
     unsigned int size4
 ) {
-    assert(ep_group != nullptr);
     assert(tensor != nullptr);
+    assert(data != nullptr);
     assert(ndim > 0 && ndim <= 5);
 
     unsigned int dim_sizes[] = {size0, size1, size2, size3, size4};
@@ -1126,41 +1124,27 @@ ncclResult_t ncclEpTensorCreate(
     t->datatype = datatype;
     t->tag = tag;
     t->flags = NCCL_EP_TENSOR_FLAG_NONE;
+    t->data = data;
 
     t->sizes = new unsigned int[ndim];
     t->strides = new unsigned int[ndim];
 
-    unsigned int total_size = 1;
     for (unsigned int i = 0; i < ndim; i++) {
         t->sizes[i] = dim_sizes[i];
         t->strides[i] = 1;
-        total_size *= dim_sizes[i];
     }
 
-    if (data != nullptr) {
-        t->data = data;
-        t->owns_data = false;
-    } else {
-        CUDA_CHECK(ep_group->alloc_fn(&t->data, total_size * ncclTypeSize(datatype)));
-        t->owns_data = true;
-    }
     *tensor = t;
     return ncclSuccess;
 }
 
 ncclResult_t ncclEpTensorDestroy(
-    ncclEpGroup_t ep_group,
     ncclNDTensor_t tensor
 ) {
     if (tensor == nullptr) return ncclSuccess;
-
-    if (tensor->owns_data && tensor->data && ep_group) {
-        CUDA_CHECK(ep_group->free_fn(tensor->data));
-    }
     delete[] tensor->sizes;
     delete[] tensor->strides;
     delete tensor;
-
     return ncclSuccess;
 }
 
@@ -1200,9 +1184,13 @@ struct ncclEpHandle {
 
     union {
         struct {
-            // packed tensors for LL
+            // packed tensors for LL (descriptors only; data pointers reference handle_mem)
             ncclNDTensor_t expert_recv_source_indices;
             ncclNDTensor_t expert_dispatch_layout;
+
+            // Backing storage for the two tensors above. Layout matches ll_handle_mem_size().
+            void* handle_mem;
+            bool owns_handle_mem;
 
             int buffer_idx = 0;
 
@@ -1377,10 +1365,8 @@ static bool is_internode_available(ncclEpGroup_t ep_group) {
 }
 
 
-static void tensor_free(ncclEpGroup_t group, ncclNDTensor_t t) {
+static void tensor_free(ncclNDTensor_t t) {
     if (t == nullptr) return;
-    if (t->owns_data && t->data)
-        group->free_fn(t->data);
     if (t->strides)
         delete[] t->strides;
     if (t->sizes)
@@ -1461,27 +1447,29 @@ ncclResult_t ncclEpHandleMemSize(
 
 static ncclResult_t ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, ncclNDTensor_t handle_mem, int num_topk) {
     assert(num_topk > 0 && "LL mode requires num_topk > 0 (pass top_k to ncclEpInitHandle)");
-    // TODO: internal alloc path allocates two tensors separately via ncclEpTensorCreate;
-    // consolidate into a single alloc_fn call (like ht_init_handle) for symmetry.
-    void* recv_src_ptr = nullptr;
-    void* dispatch_ptr = nullptr;
+
     if (handle_mem != nullptr) {
-        auto align256 = [](size_t s) -> size_t { return (s + 255) & ~size_t(255); };
         assert(handle_mem->ndim == 1 && handle_mem->datatype == ncclUint8);
         assert(static_cast<size_t>(handle_mem->sizes[0]) >= ll_handle_mem_size(ep_group, num_topk) &&
                "handle_mem too small; use ncclEpHandleMemSize to query required size");
-        char* ptr = static_cast<char*>(handle_mem->data);
-        size_t offset = 0;
-        recv_src_ptr = ptr + offset;
-        offset += align256(static_cast<size_t>(ep_group->nRanks) *
-                           (1 + static_cast<size_t>(num_topk + 1) * ep_group->config.max_tokens_per_rank) * sizeof(int32_t));
-        dispatch_ptr = ptr + offset;
+        handle->ll.handle_mem = handle_mem->data;
+        handle->ll.owns_handle_mem = false;
+    } else {
+        CUDA_CHECK(ep_group->alloc_fn(&handle->ll.handle_mem, ll_handle_mem_size(ep_group, num_topk)));
+        handle->ll.owns_handle_mem = true;
     }
-    ncclEpTensorCreate(ep_group, &handle->ll.expert_recv_source_indices, 1, ncclInt32,
-        NCCL_EP_TENSOR_TAG_NONE, recv_src_ptr,
-        static_cast<unsigned int>(ep_group->nRanks * (1 + (num_topk + 1) * ep_group->config.max_tokens_per_rank)));
-    ncclEpTensorCreate(ep_group, &handle->ll.expert_dispatch_layout, 2, ncclInt64,
-        NCCL_EP_TENSOR_TAG_NONE, dispatch_ptr,
+    char* base = static_cast<char*>(handle->ll.handle_mem);
+
+    const size_t recv_src_count = static_cast<size_t>(ep_group->nRanks) *
+        (1 + static_cast<size_t>(num_topk + 1) * ep_group->config.max_tokens_per_rank);
+    ncclEpTensorCreate(&handle->ll.expert_recv_source_indices, 1, ncclInt32,
+        NCCL_EP_TENSOR_TAG_NONE, base,
+        static_cast<unsigned int>(recv_src_count));
+
+    auto align256 = [](size_t s) -> size_t { return (s + 255) & ~size_t(255); };
+    const size_t recv_src_bytes = align256(recv_src_count * sizeof(int32_t));
+    ncclEpTensorCreate(&handle->ll.expert_dispatch_layout, 2, ncclInt64,
+        NCCL_EP_TENSOR_TAG_NONE, base + recv_src_bytes,
         static_cast<unsigned int>(ep_group->num_local_experts),
         static_cast<unsigned int>(ep_group->nRanks));
     assert((ep_group->config.max_tokens_per_rank * ep_group->num_local_experts) % 4 == 0
@@ -1707,8 +1695,12 @@ ncclResult_t ncclEpHandleDestroy(
         return ncclSuccess;
 
     if (handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        tensor_free(handle->group, handle->ll.expert_recv_source_indices);
-        tensor_free(handle->group, handle->ll.expert_dispatch_layout);
+        tensor_free(handle->ll.expert_recv_source_indices);
+        tensor_free(handle->ll.expert_dispatch_layout);
+        if (handle->ll.owns_handle_mem && handle->ll.handle_mem) {
+            handle->group->free_fn(handle->ll.handle_mem);
+            handle->ll.handle_mem = nullptr;
+        }
     } else if (handle->group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
         if (handle->hybridep.owns_handle_mem) {
             if (handle->hybridep.preprocessing_block) {

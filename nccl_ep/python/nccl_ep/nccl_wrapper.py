@@ -200,12 +200,11 @@ class NCCLLibrary:
             ncclEpHandle_t, ctypes.c_void_p, cudaStream_t
         ]),
         Function("ncclEpTensorCreate", ncclResult_t, [
-            ncclEpGroup_t,
             ctypes.POINTER(ncclNDTensor_t),  # OUT tensor handle
             ctypes.c_uint,  # ndim
             ctypes.c_int,   # datatype
             ctypes.c_int,   # tag
-            ctypes.c_void_p,  # data (nullptr = library allocates)
+            ctypes.c_void_p,  # data (caller-owned device pointer; must be non-null)
             ctypes.c_uint,  # size0
             ctypes.c_uint,  # size1
             ctypes.c_uint,  # size2
@@ -213,7 +212,6 @@ class NCCLLibrary:
             ctypes.c_uint,  # size4
         ]),
         Function("ncclEpTensorDestroy", ncclResult_t, [
-            ncclEpGroup_t,
             ncclNDTensor_t,  # tensor handle
         ]),
         Function("ncclEpTensorGetData", ncclResult_t, [

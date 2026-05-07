@@ -185,13 +185,46 @@ static void getHostName(char* hostname, int maxlen) {
 }
 
 // CUDA allocator callbacks for ncclEpCreateGroup
-// These are used by ncclEpTensorCreate/Destroy to allocate/free tensor memory
 static cudaError_t cudaAllocCallback(void** ptr, size_t size) {
     return cudaMalloc(ptr, size);
 }
 
 static cudaError_t cudaFreeCallback(void* ptr) {
     return cudaFree(ptr);
+}
+
+// Element size for the dtypes used in this benchmark. ncclTypeSize is internal to the EP library.
+static size_t epDtypeBytes(ncclDataType_t dt) {
+    switch (dt) {
+        case ncclInt8:    case ncclUint8:                              return 1;
+        case ncclFloat16: case ncclBfloat16:                           return 2;
+        case ncclFloat32: case ncclInt32: case ncclUint32:             return 4;
+        case ncclInt64:   case ncclUint64: case ncclFloat64:           return 8;
+        default: return 0;
+    }
+}
+
+// cudaMalloc + ncclEpTensorCreate. The tensor wraps a buffer the benchmark owns.
+static ncclResult_t epMakeTensor(ncclNDTensor_t* tensor, unsigned int ndim,
+                                 ncclDataType_t dt, ncclEpTensorTag_t tag,
+                                 unsigned int s0, unsigned int s1 = 1, unsigned int s2 = 1,
+                                 unsigned int s3 = 1, unsigned int s4 = 1) {
+    unsigned int dims[5] = {s0, s1, s2, s3, s4};
+    size_t total = 1;
+    for (unsigned int i = 0; i < ndim; i++) total *= dims[i];
+    void* data = nullptr;
+    cudaError_t e = cudaMalloc(&data, total * epDtypeBytes(dt));
+    if (e != cudaSuccess) return ncclSystemError;
+    return ncclEpTensorCreate(tensor, ndim, dt, tag, data, s0, s1, s2, s3, s4);
+}
+
+// Inverse of epMakeTensor: cudaFree the backing buffer, then destroy the descriptor.
+static void epFreeTensor(ncclNDTensor_t tensor) {
+    if (tensor == nullptr) return;
+    void* data = nullptr;
+    ncclEpTensorGetData(tensor, &data);
+    if (data) cudaFree(data);
+    ncclEpTensorDestroy(tensor);
 }
 
 // Structure to hold all tensors needed for benchmarking
@@ -228,20 +261,19 @@ struct BenchmarkTensors {
 //   tensors.inputs[0]    tokens [num_tokens, hidden]
 //   tensors.topk_weights [num_tokens, top_k] (for combine; rank-major also aliases to inputs[1])
 static void setupLowLatencyTensorsSharedInputs(
-    ncclEpGroup_t ep_group,
     BenchmarkTensors& tensors,
     unsigned int num_tokens,
     unsigned int hidden,
     unsigned int top_k,
     unsigned int num_local_experts
 ) {
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.inputs[0], 2, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_TOKENS,
-                                   nullptr, num_tokens, hidden));
+    NCCLCHECK(epMakeTensor(&tensors.inputs[0], 2, ncclBfloat16,
+                             NCCL_EP_TENSOR_TAG_TOKENS,
+                             num_tokens, hidden));
 
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.topk_weights, 2, ncclFloat32,
-                                   NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
-                                   nullptr, num_tokens, top_k));
+    NCCLCHECK(epMakeTensor(&tensors.topk_weights, 2, ncclFloat32,
+                             NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
+                             num_tokens, top_k));
 }
 
 // LL benchmark — NCCL_EP_LAYOUT_EXPERT_MAJOR dispatch outputs + combine input shape.
@@ -253,7 +285,6 @@ static void setupLowLatencyTensorsSharedInputs(
 //   tensors.outputs[0]           recv_x [num_local_experts, nRanks*max_tokens_per_rank, hidden] (3D)
 //   tensors.expert_outputs       same shape; combine path token input
 static void setupLowLatencyTensorsExpertMajLayout(
-    ncclEpGroup_t ep_group,
     BenchmarkTensors& tensors,
     unsigned int hidden,
     unsigned int num_local_experts,
@@ -266,19 +297,19 @@ static void setupLowLatencyTensorsExpertMajLayout(
     tensors.num_combine_inputs         = 1;
     tensors.num_combine_local_tensors  = 1;
 
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.local_tensors[0], 1, ncclInt32,
-                                   NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
-                                   nullptr, num_local_experts));
+    NCCLCHECK(epMakeTensor(&tensors.local_tensors[0], 1, ncclInt32,
+                             NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
+                             num_local_experts));
 
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.outputs[0], 3, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_TOKENS,
-                                   nullptr, num_local_experts,
-                                   (unsigned)nRanks * max_tokens_per_rank, hidden));
+    NCCLCHECK(epMakeTensor(&tensors.outputs[0], 3, ncclBfloat16,
+                             NCCL_EP_TENSOR_TAG_TOKENS,
+                             num_local_experts,
+                             (unsigned)nRanks * max_tokens_per_rank, hidden));
 
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.expert_outputs, 3, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_TOKENS,
-                                   nullptr, num_local_experts,
-                                   (unsigned)nRanks * max_tokens_per_rank, hidden));
+    NCCLCHECK(epMakeTensor(&tensors.expert_outputs, 3, ncclBfloat16,
+                             NCCL_EP_TENSOR_TAG_TOKENS,
+                             num_local_experts,
+                             (unsigned)nRanks * max_tokens_per_rank, hidden));
 }
 
 // LL benchmark — NCCL_EP_LAYOUT_RANK_MAJOR dispatch outputs + combine input shape.
@@ -301,7 +332,6 @@ static void setupLowLatencyTensorsExpertMajLayout(
 //   tensors.combine_inputs[0]         expert_outputs (pre-multiplied by per-rank weight sums)
 //   tensors.num_combine_local_tensors (= 0)
 static void setupLowLatencyTensorsRankMajLayout(
-    ncclEpGroup_t ep_group,
     BenchmarkTensors& tensors,
     unsigned int hidden,
     unsigned int top_k,
@@ -317,32 +347,31 @@ static void setupLowLatencyTensorsRankMajLayout(
 
     tensors.inputs[1] = tensors.topk_weights;  // alias: same tensor used as dispatch input
 
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.local_tensors[0], 1, ncclInt32,
-                                   NCCL_EP_TENSOR_TAG_RECV_RANK_COUNTER_DEVICE,
-                                   nullptr, (unsigned)nRanks));
+    NCCLCHECK(epMakeTensor(&tensors.local_tensors[0], 1, ncclInt32,
+                             NCCL_EP_TENSOR_TAG_RECV_RANK_COUNTER_DEVICE,
+                             (unsigned)nRanks));
 
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.outputs[0], 2, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_TOKENS,
-                                   nullptr, (unsigned)nRanks * max_tokens_per_rank, hidden));
+    NCCLCHECK(epMakeTensor(&tensors.outputs[0], 2, ncclBfloat16,
+                             NCCL_EP_TENSOR_TAG_TOKENS,
+                             (unsigned)nRanks * max_tokens_per_rank, hidden));
 
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.outputs[1], 2, ncclFloat32,
-                                   NCCL_EP_TENSOR_TAG_RECV_TOPK_WEIGHTS,
-                                   nullptr, (unsigned)nRanks * max_tokens_per_rank, top_k));
+    NCCLCHECK(epMakeTensor(&tensors.outputs[1], 2, ncclFloat32,
+                             NCCL_EP_TENSOR_TAG_RECV_TOPK_WEIGHTS,
+                             (unsigned)nRanks * max_tokens_per_rank, top_k));
 
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.outputs[2], 2, ncclInt32,
-                                   NCCL_EP_TENSOR_TAG_RECV_TOPK_IDX,
-                                   nullptr, (unsigned)nRanks * max_tokens_per_rank, top_k));
+    NCCLCHECK(epMakeTensor(&tensors.outputs[2], 2, ncclInt32,
+                             NCCL_EP_TENSOR_TAG_RECV_TOPK_IDX,
+                             (unsigned)nRanks * max_tokens_per_rank, top_k));
 
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.expert_outputs, 2, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_TOKENS,
-                                   nullptr, (unsigned)nRanks * max_tokens_per_rank, hidden));
+    NCCLCHECK(epMakeTensor(&tensors.expert_outputs, 2, ncclBfloat16,
+                             NCCL_EP_TENSOR_TAG_TOKENS,
+                             (unsigned)nRanks * max_tokens_per_rank, hidden));
 }
 
 // LL benchmark — full tensor graph for ncclEpDispatch / ncclEpCombine.
 //
 // topk_idx is unused on the LL path (signature matches setupHighThroughputTensors).
 void setupLowLatencyTensors(
-    ncclEpGroup_t ep_group,
     BenchmarkTensors& tensors,
     ncclNDTensor_t& topk_idx,
     unsigned int num_tokens,
@@ -357,15 +386,15 @@ void setupLowLatencyTensors(
     tensors.is_ll_mode = true;
     tensors.num_combine_outputs = 1;
 
-    setupLowLatencyTensorsSharedInputs(ep_group, tensors, num_tokens, hidden, top_k, num_local_experts);
+    setupLowLatencyTensorsSharedInputs(tensors, num_tokens, hidden, top_k, num_local_experts);
 
     switch (layout) {
         case NCCL_EP_LAYOUT_EXPERT_MAJOR:
-            setupLowLatencyTensorsExpertMajLayout(ep_group, tensors, hidden, num_local_experts,
+            setupLowLatencyTensorsExpertMajLayout(tensors, hidden, num_local_experts,
                                                     max_tokens_per_rank, nRanks);
             break;
         case NCCL_EP_LAYOUT_RANK_MAJOR:
-            setupLowLatencyTensorsRankMajLayout(ep_group, tensors, hidden, top_k,
+            setupLowLatencyTensorsRankMajLayout(tensors, hidden, top_k,
                                                  num_local_experts, max_tokens_per_rank, nRanks);
             break;
         default:
@@ -373,9 +402,9 @@ void setupLowLatencyTensors(
             exit(EXIT_FAILURE);
     }
 
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.combined_output, 2, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_TOKENS,
-                                   nullptr, num_tokens, hidden));
+    NCCLCHECK(epMakeTensor(&tensors.combined_output, 2, ncclBfloat16,
+                             NCCL_EP_TENSOR_TAG_TOKENS,
+                             num_tokens, hidden));
 
     tensors.combine_inputs[0] = tensors.expert_outputs;
     tensors.combine_outputs[0] = tensors.combined_output;
@@ -384,9 +413,8 @@ void setupLowLatencyTensors(
     }
 }
 
-// Setup tensors for HIGH_THROUGHPUT mode using ncclEpTensorCreate
+// Setup tensors for HIGH_THROUGHPUT mode using epMakeTensor
 void setupHighThroughputTensors(
-    ncclEpGroup_t ep_group,
     BenchmarkTensors& tensors,
     ncclNDTensor_t& topk_idx,
     unsigned int num_tokens,
@@ -405,9 +433,9 @@ void setupHighThroughputTensors(
     tensors.num_combine_local_tensors = 0;
 
     // Dispatch input: tokens - initialize with test pattern
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.inputs[0], 2, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_TOKENS,
-                                   nullptr, num_tokens, hidden));
+    NCCLCHECK(epMakeTensor(&tensors.inputs[0], 2, ncclBfloat16,
+                             NCCL_EP_TENSOR_TAG_TOKENS,
+                             num_tokens, hidden));
     {
         void* input0_data;
         NCCLCHECK(ncclEpTensorGetData(tensors.inputs[0], &input0_data));
@@ -415,9 +443,9 @@ void setupHighThroughputTensors(
     }
 
     // Dispatch input: topk_weights - initialize with equal weights
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.dispatch_topk_weights, 2, ncclFloat32,
-                                   NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
-                                   nullptr, num_tokens, top_k));
+    NCCLCHECK(epMakeTensor(&tensors.dispatch_topk_weights, 2, ncclFloat32,
+                             NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
+                             num_tokens, top_k));
     {
         float *topk_weights_host = new float[num_tokens * top_k];
         for (unsigned int i = 0; i < num_tokens * top_k; i++) {
@@ -434,29 +462,29 @@ void setupHighThroughputTensors(
     tensors.inputs[2] = topk_idx;
 
     // Dispatch output: 2D [num_recv_tokens, hidden]
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.outputs[0], 2, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_TOKENS,
-                                   nullptr, num_recv_tokens, hidden));
+    NCCLCHECK(epMakeTensor(&tensors.outputs[0], 2, ncclBfloat16,
+                             NCCL_EP_TENSOR_TAG_TOKENS,
+                             num_recv_tokens, hidden));
 
     // Dispatch output: recv_topk_weights
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.outputs[1], 2, ncclFloat32,
-                                   NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
-                                   nullptr, num_recv_tokens, top_k));
+    NCCLCHECK(epMakeTensor(&tensors.outputs[1], 2, ncclFloat32,
+                             NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
+                             num_recv_tokens, top_k));
 
     // Dispatch output: recv_topk_idx
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.outputs[2], 2, ncclInt64,
-                                   NCCL_EP_TENSOR_TAG_TOPK_IDX,
-                                   nullptr, num_recv_tokens, top_k));
+    NCCLCHECK(epMakeTensor(&tensors.outputs[2], 2, ncclInt64,
+                             NCCL_EP_TENSOR_TAG_TOPK_IDX,
+                             num_recv_tokens, top_k));
 
     // Local tensors: recv expert counter (device memory) - required for dispatch
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.local_tensors[0], 1, ncclInt32,
-                                   NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
-                                   nullptr, num_local_experts));
+    NCCLCHECK(epMakeTensor(&tensors.local_tensors[0], 1, ncclInt32,
+                             NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
+                             num_local_experts));
 
     // Combine input: 2D expert outputs - same size as dispatch output (received token count)
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.expert_outputs, 2, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_TOKENS,
-                                   nullptr, num_recv_tokens, hidden));
+    NCCLCHECK(epMakeTensor(&tensors.expert_outputs, 2, ncclBfloat16,
+                             NCCL_EP_TENSOR_TAG_TOKENS,
+                             num_recv_tokens, hidden));
     {
         void* eo_data;
         NCCLCHECK(ncclEpTensorGetData(tensors.expert_outputs, &eo_data));
@@ -464,19 +492,19 @@ void setupHighThroughputTensors(
     }
 
     // Combine output - sized to num_tokens (original token count per rank)
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.combined_output, 2, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_TOKENS,
-                                   nullptr, num_tokens, hidden));
+    NCCLCHECK(epMakeTensor(&tensors.combined_output, 2, ncclBfloat16,
+                             NCCL_EP_TENSOR_TAG_TOKENS,
+                             num_tokens, hidden));
 
     // topk_weights as regular input for combine
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.topk_weights, 2, ncclFloat32,
-                                   NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
-                                   nullptr, num_tokens, top_k));
+    NCCLCHECK(epMakeTensor(&tensors.topk_weights, 2, ncclFloat32,
+                             NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
+                             num_tokens, top_k));
 
     // Combine output: topk_weights
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.combine_output_topk_weights, 2, ncclFloat32,
-                                   NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
-                                   nullptr, num_tokens, top_k));
+    NCCLCHECK(epMakeTensor(&tensors.combine_output_topk_weights, 2, ncclFloat32,
+                             NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
+                             num_tokens, top_k));
 
     // Setup combine arrays
     tensors.combine_inputs[0] = tensors.expert_outputs;
@@ -485,35 +513,27 @@ void setupHighThroughputTensors(
     tensors.combine_outputs[1] = tensors.combine_output_topk_weights;
 }
 
-// Cleanup benchmark tensors using ncclEpTensorDestroy
-void cleanupBenchmarkTensors(ncclEpGroup_t ep_group, BenchmarkTensors& tensors, ncclNDTensor_t topk_idx) {
-    // topk_idx is created with ncclEpTensorCreate (user-provided data_ptr)
-    {
-        void* topk_data;
-        ncclEpTensorGetData(topk_idx, &topk_data);
-        if (topk_data) cudaFree(topk_data);
-        ncclEpTensorDestroy(ep_group, topk_idx);
-    }
-
-    // All other tensors are created with ncclEpTensorCreate
-    ncclEpTensorDestroy(ep_group, tensors.inputs[0]);
+// Cleanup benchmark tensors created via epMakeTensor.
+void cleanupBenchmarkTensors(BenchmarkTensors& tensors, ncclNDTensor_t topk_idx) {
+    epFreeTensor(topk_idx);
+    epFreeTensor(tensors.inputs[0]);
 
     if (!tensors.is_ll_mode) {
-        ncclEpTensorDestroy(ep_group, tensors.dispatch_topk_weights);
+        epFreeTensor(tensors.dispatch_topk_weights);
     }
 
     for (int i = 0; i < tensors.num_dispatch_outputs; i++) {
-        ncclEpTensorDestroy(ep_group, tensors.outputs[i]);
+        epFreeTensor(tensors.outputs[i]);
     }
 
     for (int i = 0; i < tensors.num_dispatch_local_tensors; i++)
-        ncclEpTensorDestroy(ep_group, tensors.local_tensors[i]);
-    ncclEpTensorDestroy(ep_group, tensors.expert_outputs);
-    ncclEpTensorDestroy(ep_group, tensors.combined_output);
-    ncclEpTensorDestroy(ep_group, tensors.topk_weights);
+        epFreeTensor(tensors.local_tensors[i]);
+    epFreeTensor(tensors.expert_outputs);
+    epFreeTensor(tensors.combined_output);
+    epFreeTensor(tensors.topk_weights);
 
     if (!tensors.is_ll_mode) {
-        ncclEpTensorDestroy(ep_group, tensors.combine_output_topk_weights);
+        epFreeTensor(tensors.combine_output_topk_weights);
     }
 }
 
@@ -2402,11 +2422,7 @@ int main(int argc, char* argv[]) {
 
     // Initialize topk_idx tensor
     ncclNDTensor_t topk_idx;
-    {
-        void* topk_idx_data;
-        CUDACHECK(cudaMalloc(&topk_idx_data, num_tokens * top_k * sizeof(int64_t)));
-        NCCLCHECK(ncclEpTensorCreate(ep_group, &topk_idx, 2, ncclInt64, NCCL_EP_TENSOR_TAG_TOPK_IDX, topk_idx_data, num_tokens, top_k));
-    }
+    NCCLCHECK(epMakeTensor(&topk_idx, 2, ncclInt64, NCCL_EP_TENSOR_TAG_TOPK_IDX, num_tokens, top_k));
 
     // Generate topk indices
     // HT: randperm (uniform), consistent with Hybrid-EP (test_hybrid_ep.py)
@@ -2454,8 +2470,8 @@ int main(int argc, char* argv[]) {
     // Create recv_expert_counter tensor for dynamic token allocation (HT + dynamic mode)
     ncclNDTensor_t recv_expert_counter_tensor = nullptr;
     if (dynamic_tokens) {
-        NCCLCHECK(ncclEpTensorCreate(ep_group, &recv_expert_counter_tensor, 1, ncclInt32,
-                                     NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE, nullptr, num_local_experts));
+        NCCLCHECK(epMakeTensor(&recv_expert_counter_tensor, 1, ncclInt32,
+                                 NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE, num_local_experts));
     }
 
     // Create handle
@@ -2463,15 +2479,13 @@ int main(int argc, char* argv[]) {
     unsigned int handle_num_local_tensors = recv_expert_counter_tensor ? 1 : 0;
 
     // Optional caller-owned buffer (--user-handle-mem)
-    void* handle_user_buf = nullptr;
     ncclNDTensor_t handle_mem_tensor = nullptr;
     if (user_handle_mem) {
         size_t handle_mem_size;
         NCCLCHECK(ncclEpHandleMemSize(ep_group, nullptr, &handle_mem_size, static_cast<int>(top_k)));
-        CUDACHECK(cudaMalloc(&handle_user_buf, handle_mem_size));
-        NCCLCHECK(ncclEpTensorCreate(ep_group, &handle_mem_tensor, 1, ncclUint8,
-                                     NCCL_EP_TENSOR_TAG_NONE, handle_user_buf,
-                                     static_cast<unsigned int>(handle_mem_size)));
+        NCCLCHECK(epMakeTensor(&handle_mem_tensor, 1, ncclUint8,
+                                 NCCL_EP_TENSOR_TAG_NONE,
+                                 static_cast<unsigned int>(handle_mem_size)));
         if (myRank == 0)
             printf("Rank 0: ncclEpHandleMemSize = %zu bytes\n", handle_mem_size);
     }
@@ -2517,10 +2531,10 @@ int main(int argc, char* argv[]) {
 
     if (myRank == 0) { printf("[DEBUG] Setting up tensors...\n"); fflush(stdout); }
     if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        setupLowLatencyTensors(ep_group, tensors, topk_idx, num_tokens, hidden, top_k,
+        setupLowLatencyTensors(tensors, topk_idx, num_tokens, hidden, top_k,
                                num_local_experts, config.max_tokens_per_rank, nRanks, config.layout);
     } else {
-        setupHighThroughputTensors(ep_group, tensors, topk_idx, num_tokens, hidden, top_k,
+        setupHighThroughputTensors(tensors, topk_idx, num_tokens, hidden, top_k,
                                    num_local_experts, num_recv_tokens);
     }
     if (myRank == 0) { printf("[DEBUG] Tensors set up\n"); fflush(stdout); }
@@ -2772,19 +2786,17 @@ int main(int argc, char* argv[]) {
     }
 
     // Cleanup (order matters: tensors -> handle -> group -> comm)
-    cleanupBenchmarkTensors(ep_group, tensors, topk_idx);
+    cleanupBenchmarkTensors(tensors, topk_idx);
     delete[] topk_idx_host;  // Now safe to delete after validation
 
     NCCLCHECK(ncclEpHandleDestroy(ep_handle));
 
     if (handle_mem_tensor != nullptr)
-        ncclEpTensorDestroy(ep_group, handle_mem_tensor);
-    if (handle_user_buf != nullptr)
-        CUDACHECK(cudaFree(handle_user_buf));
+        epFreeTensor(handle_mem_tensor);
 
     // Cleanup recv_expert_counter if allocated (must be before group destroy)
     if (dynamic_tokens && recv_expert_counter_tensor != nullptr) {
-        ncclEpTensorDestroy(ep_group, recv_expert_counter_tensor);
+        epFreeTensor(recv_expert_counter_tensor);
     }
 
     NCCLCHECK(ncclEpGroupDestroy(ep_group, stream));

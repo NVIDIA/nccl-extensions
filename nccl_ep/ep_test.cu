@@ -24,6 +24,40 @@ static cudaError_t torchFree(void* ptr) {
     return cudaFree(ptr);
 }
 
+// Element size for the dtypes used in this test. ncclTypeSize is internal to the EP library.
+static size_t epDtypeBytes(ncclDataType_t dt) {
+    switch (dt) {
+        case ncclInt8:    case ncclUint8:                              return 1;
+        case ncclFloat16: case ncclBfloat16:                           return 2;
+        case ncclFloat32: case ncclInt32: case ncclUint32:             return 4;
+        case ncclInt64:   case ncclUint64: case ncclFloat64:           return 8;
+        default: return 0;
+    }
+}
+
+// cudaMalloc + ncclEpTensorCreate. The tensor wraps a buffer the test owns.
+static ncclResult_t epMakeTensor(ncclNDTensor_t* tensor, unsigned int ndim,
+                                 ncclDataType_t dt, ncclEpTensorTag_t tag,
+                                 unsigned int s0, unsigned int s1 = 1, unsigned int s2 = 1,
+                                 unsigned int s3 = 1, unsigned int s4 = 1) {
+    unsigned int dims[5] = {s0, s1, s2, s3, s4};
+    size_t total = 1;
+    for (unsigned int i = 0; i < ndim; i++) total *= dims[i];
+    void* data = nullptr;
+    cudaError_t e = cudaMalloc(&data, total * epDtypeBytes(dt));
+    if (e != cudaSuccess) return ncclSystemError;
+    return ncclEpTensorCreate(tensor, ndim, dt, tag, data, s0, s1, s2, s3, s4);
+}
+
+// Inverse of epMakeTensor: cudaFree the backing buffer, then destroy the descriptor.
+static void epFreeTensor(ncclNDTensor_t tensor) {
+    if (tensor == nullptr) return;
+    void* data = nullptr;
+    ncclEpTensorGetData(tensor, &data);
+    if (data) cudaFree(data);
+    ncclEpTensorDestroy(tensor);
+}
+
 #define MPICHECK(cmd) do {                          \
   int e = cmd;                                      \
   if( e != MPI_SUCCESS ) {                          \
@@ -301,7 +335,7 @@ int main(int argc, char* argv[])
   NCCLCHECK(ncclEpCreateGroup(&ep_group, comm, &config, s, torchMalloc, torchFree));
 
   ncclNDTensor_t topk_idx;
-  NCCLCHECK(ncclEpTensorCreate(ep_group, &topk_idx, 2, ncclInt64, NCCL_EP_TENSOR_TAG_TOPK_IDX, nullptr, static_cast<unsigned int>(num_tokens), static_cast<unsigned int>(top_k)));
+  NCCLCHECK(epMakeTensor(&topk_idx, 2, ncclInt64, NCCL_EP_TENSOR_TAG_TOPK_IDX, static_cast<unsigned int>(num_tokens), static_cast<unsigned int>(top_k)));
   int64_t *topk_idx_host = new int64_t[num_tokens * top_k];
 
   if (random_mode) {
@@ -338,7 +372,7 @@ int main(int argc, char* argv[])
   unsigned int handle_num_local_tensors = 0;
   ncclNDTensor_t handle_recv_expert_counter = nullptr;
   if (disable_max_tokens) {
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &handle_recv_expert_counter, 1, ncclInt32, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE, nullptr, num_local_experts));
+    NCCLCHECK(epMakeTensor(&handle_recv_expert_counter, 1, ncclInt32, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE, num_local_experts));
     handle_local_tensors[0] = handle_recv_expert_counter;
     handle_num_local_tensors = 1;
   }
@@ -370,33 +404,33 @@ int main(int argc, char* argv[])
   ncclNDTensor_t outputs[3];
   ncclNDTensor_t local_tensors[1];
 
-  NCCLCHECK(ncclEpTensorCreate(ep_group, &inputs[0], 2, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS, nullptr, static_cast<unsigned int>(num_tokens), static_cast<unsigned int>(hidden)));
+  NCCLCHECK(epMakeTensor(&inputs[0], 2, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS, static_cast<unsigned int>(num_tokens), static_cast<unsigned int>(hidden)));
   ncclNDTensor_t topk_weights;
   if (algorithm != NCCL_EP_ALGO_LOW_LATENCY) {
     // HT: topk_weights and topk_idx are dispatch inputs
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &topk_weights, 2, ncclFloat32, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS, nullptr, static_cast<unsigned int>(num_tokens), static_cast<unsigned int>(top_k)));
+    NCCLCHECK(epMakeTensor(&topk_weights, 2, ncclFloat32, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS, static_cast<unsigned int>(num_tokens), static_cast<unsigned int>(top_k)));
     inputs[1] = topk_weights;
     inputs[2] = topk_idx;
   } else {
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &topk_weights, 2, ncclFloat32, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS, nullptr, static_cast<unsigned int>(num_tokens), static_cast<unsigned int>(top_k)));
+    NCCLCHECK(epMakeTensor(&topk_weights, 2, ncclFloat32, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS, static_cast<unsigned int>(num_tokens), static_cast<unsigned int>(top_k)));
   }
   // outputs[0] shape depends on algorithm
   if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
     // LL mode: outputs[0] is [num_local_experts, max_recv_tokens * nRanks, hidden]
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &outputs[0], 3, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS, nullptr, static_cast<unsigned int>(num_local_experts), config.max_tokens_per_rank * nRanks, static_cast<unsigned int>(hidden)));
+    NCCLCHECK(epMakeTensor(&outputs[0], 3, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS, static_cast<unsigned int>(num_local_experts), config.max_tokens_per_rank * nRanks, static_cast<unsigned int>(hidden)));
   } else {
     // HT mode: outputs[0] is [num_tokens, hidden]
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &outputs[0], 2, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS, nullptr, static_cast<unsigned int>(num_recv_tokens), static_cast<unsigned int>(hidden)));
+    NCCLCHECK(epMakeTensor(&outputs[0], 2, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS, static_cast<unsigned int>(num_recv_tokens), static_cast<unsigned int>(hidden)));
   }
 
   if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &local_tensors[0], 1, ncclInt32, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE, nullptr, static_cast<unsigned int>(num_local_experts)));
+    NCCLCHECK(epMakeTensor(&local_tensors[0], 1, ncclInt32, NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE, static_cast<unsigned int>(num_local_experts)));
   }
 
   // In HT mode, outputs[1] (recv_topk_weights) and outputs[2] (recv_topk_idx) are 2D tensors [num_recv_tokens, top_k]
   if (algorithm != NCCL_EP_ALGO_LOW_LATENCY) {
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &outputs[1], 2, ncclFloat32, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS, nullptr, static_cast<unsigned int>(num_recv_tokens), static_cast<unsigned int>(top_k)));
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &outputs[2], 2, ncclInt64, NCCL_EP_TENSOR_TAG_TOPK_IDX, nullptr, static_cast<unsigned int>(num_recv_tokens), static_cast<unsigned int>(top_k)));
+    NCCLCHECK(epMakeTensor(&outputs[1], 2, ncclFloat32, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS, static_cast<unsigned int>(num_recv_tokens), static_cast<unsigned int>(top_k)));
+    NCCLCHECK(epMakeTensor(&outputs[2], 2, ncclInt64, NCCL_EP_TENSOR_TAG_TOPK_IDX, static_cast<unsigned int>(num_recv_tokens), static_cast<unsigned int>(top_k)));
   }
 
   // Fill the first ELEMENTS_TESTED_PER_TOKEN elements of each token with a special value based on the current rank
@@ -624,7 +658,7 @@ int main(int argc, char* argv[])
 
   if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
       // LL mode: expert_outputs is 3D [num_local_experts, config.max_tokens_per_rank * nRanks, hidden]
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &expert_outputs, 3, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS, nullptr, static_cast<unsigned int>(num_local_experts), static_cast<unsigned int>(config.max_tokens_per_rank * nRanks), static_cast<unsigned int>(hidden)));
+    NCCLCHECK(epMakeTensor(&expert_outputs, 3, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS, static_cast<unsigned int>(num_local_experts), static_cast<unsigned int>(config.max_tokens_per_rank * nRanks), static_cast<unsigned int>(hidden)));
 
     // Fill expert outputs with multiple test values per token
     // The ith element will be (i+1)*2 for all experts
@@ -651,7 +685,7 @@ int main(int argc, char* argv[])
     delete[] expert_outputs_host;
   } else {
     // HT mode: expert_outputs is 2D [num_recv_tokens, hidden]
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &expert_outputs, 2, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS, nullptr, num_recv_tokens, static_cast<unsigned int>(hidden)));
+    NCCLCHECK(epMakeTensor(&expert_outputs, 2, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS, num_recv_tokens, static_cast<unsigned int>(hidden)));
 
     // Fill expert outputs with test values
     // The ith element will be (i+1)*2
@@ -669,7 +703,7 @@ int main(int argc, char* argv[])
 
   // Create combined output tensor
   ncclNDTensor_t combined_output;
-  NCCLCHECK(ncclEpTensorCreate(ep_group, &combined_output, 2, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS, nullptr, static_cast<unsigned int>(num_tokens), static_cast<unsigned int>(hidden)));
+  NCCLCHECK(epMakeTensor(&combined_output, 2, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS, static_cast<unsigned int>(num_tokens), static_cast<unsigned int>(hidden)));
 
   // Setup combine inputs and outputs
   ncclNDTensor_t combine_inputs[1];
@@ -774,15 +808,15 @@ int main(int argc, char* argv[])
 
     // Allocate new output tensors for second phase dispatch
     ncclNDTensor_t cached_outputs[1];
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &cached_outputs[0], 2, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS, nullptr,
+    NCCLCHECK(epMakeTensor(&cached_outputs[0], 2, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS,
                        static_cast<unsigned int>(num_recv_tokens), static_cast<unsigned int>(hidden)));
 
     // Allocate new output tensors for second phase combine
     ncclNDTensor_t cached_combined_output;
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &cached_combined_output, 2, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS, nullptr,
+    NCCLCHECK(epMakeTensor(&cached_combined_output, 2, ncclBfloat16, NCCL_EP_TENSOR_TAG_TOKENS,
                        static_cast<unsigned int>(num_tokens), static_cast<unsigned int>(hidden)));
     ncclNDTensor_t cached_combined_topk_weights;
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &cached_combined_topk_weights, 2, ncclFloat32, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS, nullptr,
+    NCCLCHECK(epMakeTensor(&cached_combined_topk_weights, 2, ncclFloat32, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
                        static_cast<unsigned int>(num_tokens), static_cast<unsigned int>(top_k)));
     ncclNDTensor_t cached_combine_outputs[2];
     cached_combine_outputs[0] = cached_combined_output;
@@ -793,7 +827,7 @@ int main(int argc, char* argv[])
 
     // Create a new tensor with the correct COMBINE_INPUT tag and copy data from dispatch output.
     ncclNDTensor_t cached_combine_topk_weights_input;
-    NCCLCHECK(ncclEpTensorCreate(ep_group, &cached_combine_topk_weights_input, 2, ncclFloat32, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS, nullptr,
+    NCCLCHECK(epMakeTensor(&cached_combine_topk_weights_input, 2, ncclFloat32, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
                        static_cast<unsigned int>(num_recv_tokens), static_cast<unsigned int>(top_k)));
     void* cached_ctwi_data;
     NCCLCHECK(ncclEpTensorGetData(cached_combine_topk_weights_input, &cached_ctwi_data));
@@ -904,10 +938,10 @@ int main(int argc, char* argv[])
       delete[] first_dispatch_output2;
       delete[] first_combine_output;
     }
-    ncclEpTensorDestroy(ep_group, cached_outputs[0]);
-    ncclEpTensorDestroy(ep_group, cached_combined_output);
-    ncclEpTensorDestroy(ep_group, cached_combined_topk_weights);
-    ncclEpTensorDestroy(ep_group, cached_combine_topk_weights_input);
+    epFreeTensor(cached_outputs[0]);
+    epFreeTensor(cached_combined_output);
+    epFreeTensor(cached_combined_topk_weights);
+    epFreeTensor(cached_combine_topk_weights_input);
 
     printf("Rank %d: Cached mode - second dispatch and combine calls completed successfully\n", myRank);
   }
@@ -916,9 +950,9 @@ int main(int argc, char* argv[])
   if (first_dispatch_output0_host) delete[] first_dispatch_output0_host;
 
   // Clean up combine tensors
-  ncclEpTensorDestroy(ep_group, expert_outputs);
-  ncclEpTensorDestroy(ep_group, topk_weights);
-  ncclEpTensorDestroy(ep_group, combined_output);
+  epFreeTensor(expert_outputs);
+  epFreeTensor(topk_weights);
+  epFreeTensor(combined_output);
 
   NCCLCHECK(ncclEpHandleDestroy(ep_handle));
 
@@ -928,18 +962,18 @@ int main(int argc, char* argv[])
   ncclCommDestroy(comm);
 
   delete[] topk_idx_host;
-  ncclEpTensorDestroy(ep_group, topk_idx);
+  epFreeTensor(topk_idx);
   if (disable_max_tokens && handle_recv_expert_counter != nullptr) {
-    ncclEpTensorDestroy(ep_group, handle_recv_expert_counter);
+    epFreeTensor(handle_recv_expert_counter);
   }
-  ncclEpTensorDestroy(ep_group, inputs[0]);
-  ncclEpTensorDestroy(ep_group, outputs[0]);
+  epFreeTensor(inputs[0]);
+  epFreeTensor(outputs[0]);
   if (algorithm != NCCL_EP_ALGO_LOW_LATENCY) {
-    ncclEpTensorDestroy(ep_group, outputs[1]);
-    ncclEpTensorDestroy(ep_group, outputs[2]);
+    epFreeTensor(outputs[1]);
+    epFreeTensor(outputs[2]);
   }
   if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-    ncclEpTensorDestroy(ep_group, local_tensors[0]);
+    epFreeTensor(local_tensors[0]);
   }
 
   // finalizing MPI

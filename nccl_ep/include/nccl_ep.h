@@ -61,7 +61,6 @@ typedef cudaError_t (*ncclEpFreeFn_t)(void* ptr);
 //   ep_group   - [OUT] Pointer to newly created EP group
 //   comm       - [IN]  Existing NCCL communicator
 //   config     - [IN]  Pointer to EP configuration structure
-//   stream     - [IN]  CUDA stream
 //   alloc_fn   - [IN]  Optional custom allocator function (NULL for default cudaMalloc)
 //   free_fn    - [IN]  Optional custom free function (NULL for default cudaFree)
 //
@@ -72,7 +71,6 @@ ncclResult_t ncclEpCreateGroup(
     ncclEpGroup_t* ep_group,
     ncclComm_t comm,
     const ncclEpGroupConfig_t* config,
-    cudaStream_t stream,
     ncclEpAllocFn_t alloc_fn = nullptr,
     ncclEpFreeFn_t free_fn = nullptr
 );
@@ -81,14 +79,12 @@ ncclResult_t ncclEpCreateGroup(
 //
 // Arguments:
 //   ep_group     - [IN]  EP group to destroy
-//   stream       - [IN]  CUDA stream on which the group is being destroyed
 //
 // Returns:
 //   ncclResult_t error code
 
 ncclResult_t ncclEpGroupDestroy(
-    ncclEpGroup_t ep_group,
-    cudaStream_t stream
+    ncclEpGroup_t ep_group
 );
 
 

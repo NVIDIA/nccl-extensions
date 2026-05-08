@@ -332,7 +332,7 @@ int main(int argc, char* argv[])
   const char* algorithm_name = (algorithm == NCCL_EP_ALGO_LOW_LATENCY) ? "LOW_LATENCY" : "HIGH_THROUGHPUT";
   printf("Rank %d: Testing ncclEpCreateGroup with algorithm: %s%s\n", myRank, algorithm_name,
          disable_max_tokens ? " (no max_tokens_per_rank)" : "");
-  NCCLCHECK(ncclEpCreateGroup(&ep_group, comm, &config, s, torchMalloc, torchFree));
+  NCCLCHECK(ncclEpCreateGroup(&ep_group, comm, &config, torchMalloc, torchFree));
 
   ncclNDTensor_t topk_idx;
   NCCLCHECK(epMakeTensor(&topk_idx, 2, ncclInt64, NCCL_EP_TENSOR_TAG_TOPK_IDX, static_cast<unsigned int>(num_tokens), static_cast<unsigned int>(top_k)));
@@ -956,7 +956,7 @@ int main(int argc, char* argv[])
 
   NCCLCHECK(ncclEpHandleDestroy(ep_handle));
 
-  NCCLCHECK(ncclEpGroupDestroy(ep_group, s));
+  NCCLCHECK(ncclEpGroupDestroy(ep_group));
 
   // finalizing NCCL
   ncclCommDestroy(comm);

@@ -833,10 +833,11 @@ ncclResult_t ncclEpCreateGroup(
     ncclEpGroup_t* out_ep_group,
     ncclComm_t comm,
     const ncclEpGroupConfig_t* in_config,
-    cudaStream_t stream,
     ncclEpAllocFn_t alloc_fn,
     ncclEpFreeFn_t free_fn
 ) {
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
     // Parameter validation
     assert(out_ep_group != nullptr);
     assert(in_config != nullptr);
@@ -1033,13 +1034,13 @@ ncclResult_t ncclEpCreateGroup(
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
-
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaStreamDestroy(stream));
     return ncclSuccess;
 }
 
 ncclResult_t ncclEpGroupDestroy(
-    ncclEpGroup_t ep_group,
-    cudaStream_t stream
+    ncclEpGroup_t ep_group
 ) {
     if (ep_group == nullptr) {
         return ncclSuccess;
@@ -1065,7 +1066,11 @@ ncclResult_t ncclEpGroupDestroy(
     // Clean up RDMA resources (single-comm path: 1 window, 1 devcomm on ep_group->comm)
     if (ep_group->config.rdma_buffer_size > 0 && NCCL_EP_ALGO_LOW_LATENCY == ep_group->config.algorithm) {
         CUDA_CHECK(cudaDeviceSynchronize());
+        cudaStream_t stream;
+        CUDA_CHECK(cudaStreamCreate(&stream));
         NCCL_CHECK_RESULT(ncclBarrier(ep_group->comm, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaStreamDestroy(stream));
 
         // Deregister single NCCL window (copy back from device, deregister on ep_group->comm)
         ncclWindow_t win_host;

@@ -2414,8 +2414,7 @@ int main(int argc, char* argv[]) {
            (algorithm == NCCL_EP_ALGO_LOW_LATENCY) ? "LOW_LATENCY" : "HIGH_THROUGHPUT");
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     double group_create_start = MPI_Wtime();
-    NCCLCHECK(ncclEpCreateGroup(&ep_group, comm, &config, stream, cudaAllocCallback, cudaFreeCallback));
-    CUDACHECK(cudaStreamSynchronize(stream));
+    NCCLCHECK(ncclEpCreateGroup(&ep_group, comm, &config, cudaAllocCallback, cudaFreeCallback));
     double group_create_end = MPI_Wtime();
     double group_create_ms = (group_create_end - group_create_start) * 1000.0;
     printf("Rank %d: ncclEpCreateGroup took %.2f ms\n", myRank, group_create_ms);
@@ -2799,7 +2798,7 @@ int main(int argc, char* argv[]) {
         epFreeTensor(recv_expert_counter_tensor);
     }
 
-    NCCLCHECK(ncclEpGroupDestroy(ep_group, stream));
+    NCCLCHECK(ncclEpGroupDestroy(ep_group));
     ncclCommDestroy(comm);
 
     CUDACHECK(cudaStreamDestroy(stream));

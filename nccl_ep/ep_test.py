@@ -319,7 +319,7 @@ def main():  # noqa: C901 — intentionally kept as a single function to mirror 
     extra = " (no max_tokens_per_rank)" if disable_max_tokens else ""
     print(f"Rank {my_rank}: Testing ncclEpCreateGroup with algorithm: {algorithm_name}{extra}")
 
-    ep_group = nccl.ncclEpCreateGroup(comm, config, stream, _alloc_fn, _free_fn)
+    ep_group = nccl.ncclEpCreateGroup(comm, config, _alloc_fn, _free_fn)
 
     # -- topk_idx tensor [num_tokens, top_k] int64 --------------------------
     topk_idx = tensor_create(
@@ -875,7 +875,7 @@ def main():  # noqa: C901 — intentionally kept as a single function to mirror 
         tensor_destroy(nccl, local_tensor_recv_count)
 
     nccl.ncclEpHandleDestroy(ep_handle)
-    nccl.ncclEpGroupDestroy(ep_group, stream)
+    nccl.ncclEpGroupDestroy(ep_group)
 
     # ncclCommDestroy (not exposed in wrapper — call underlying library)
     _nccl_base = NCCLLibrary._nccl_base_lib or nccl.lib

@@ -49,8 +49,8 @@ NCCL EP relies on NCCL Device API, using GIN `put`/`signal` operations for RDMA 
 
 ```c
 // Group management
-ncclEpCreateGroup(&ep_group, comm, &config, stream, alloc_fn, free_fn);
-ncclEpGroupDestroy(ep_group, stream);
+ncclEpCreateGroup(&ep_group, comm, &config, alloc_fn, free_fn);
+ncclEpGroupDestroy(ep_group);
 
 // Handle management
 ncclEpCreateHandle(&handle, ep_group, topk_idx, local_tensors, num_local, config, stream);
@@ -429,7 +429,7 @@ cudaError_t my_free(void* ptr) {
 }
 
 // Pass to ncclEpCreateGroup
-ncclEpCreateGroup(&ep_group, comm, &config, stream, my_alloc, my_free);
+ncclEpCreateGroup(&ep_group, comm, &config, my_alloc, my_free);
 ```
 
 If `NULL` is passed for both allocator functions, the default `cudaMalloc`/`cudaFree` are used.
@@ -449,7 +449,6 @@ If `NULL` is passed for both allocator functions, the default `cudaMalloc`/`cuda
 //   ep_group   - [OUT] Pointer to newly created EP group
 //   comm       - [IN]  Existing NCCL communicator
 //   config     - [IN]  Pointer to EP configuration structure
-//   stream     - [IN]  CUDA stream
 //   alloc_fn   - [IN]  Optional custom allocator function (NULL for default cudaMalloc)
 //   free_fn    - [IN]  Optional custom free function (NULL for default cudaFree)
 //
@@ -460,7 +459,6 @@ ncclResult_t ncclEpCreateGroup(
     ncclEpGroup_t* ep_group,
     ncclComm_t comm,
     const ncclEpGroupConfig_t* config,
-    cudaStream_t stream,
     ncclEpAllocFn_t alloc_fn,
     ncclEpFreeFn_t free_fn
 );
@@ -473,14 +471,12 @@ ncclResult_t ncclEpCreateGroup(
 //
 // Arguments:
 //   ep_group     - [IN]  EP group to destroy
-//   stream       - [IN]  CUDA stream on which the group is being destroyed
 //
 // Returns:
 //   ncclResult_t error code
 
 ncclResult_t ncclEpGroupDestroy(
-    ncclEpGroup_t ep_group,
-    cudaStream_t stream
+    ncclEpGroup_t ep_group
 );
 ```
 
@@ -877,7 +873,7 @@ config.num_qp_per_rank = NCCL_EP_AUTO;      // Auto-size
 config.num_channels = NCCL_EP_AUTO;         // Auto-size
 
 ncclEpGroup_t ep_group;
-ncclEpCreateGroup(&ep_group, comm, &config, stream, my_alloc, my_free);
+ncclEpCreateGroup(&ep_group, comm, &config, my_alloc, my_free);
 
 ncclNDTensor_t topk_idx;
 make_tensor(&topk_idx, 2, ncclInt64,
@@ -998,7 +994,7 @@ ncclEpCombine(handle, backward_combine_inputs, 2, backward_combine_outputs, 2,
 
 // Cleanup
 ncclEpHandleDestroy(handle);
-ncclEpGroupDestroy(ep_group, stream);
+ncclEpGroupDestroy(ep_group);
 ncclCommDestroy(comm);
 cudaStreamDestroy(stream);
 ```
@@ -1033,7 +1029,7 @@ config.num_qp_per_rank = NCCL_EP_AUTO;      // Auto-size (or specify for LL)
 config.num_channels = NCCL_EP_AUTO;         // Auto-size
 
 ncclEpGroup_t ep_group;
-ncclEpCreateGroup(&ep_group, comm, &config, stream, my_alloc, my_free);
+ncclEpCreateGroup(&ep_group, comm, &config, my_alloc, my_free);
 
 // Create routing tensor (topk_idx)
 ncclNDTensor_t topk_idx;
@@ -1121,7 +1117,7 @@ cudaStreamSynchronize(stream);
 
 // Cleanup
 ncclEpHandleDestroy(handle);
-ncclEpGroupDestroy(ep_group, stream);
+ncclEpGroupDestroy(ep_group);
 ncclCommDestroy(comm);
 cudaStreamDestroy(stream);
 ```

@@ -899,7 +899,7 @@ static ValidationResult validateDispatchOutputLLExpertMaj(
         }
         std::set<std::pair<int,int>> found;
         for (int j = 0; j < count; j++) {
-            const uint16_t* row = recv_data + (e * max_tpe + j) * hidden;
+            const uint16_t* row = recv_data + (e * max_tpe + j) * static_cast<size_t>(hidden);
             int source_rank = -1, token_id = -1;
             if (!extractTokenIdentity(row, hidden, nRanks, num_tokens, &source_rank, &token_id)) {
                 if (errors_printed++ < max_errors_to_print)
@@ -2724,19 +2724,19 @@ int main(int argc, char* argv[]) {
                 // HT: 2D [num_recv_tokens, hidden]
                 const unsigned int* eo_sizes; unsigned int eo_ndim;
                 NCCLCHECK(ncclEpTensorGetSizes(tensors.expert_outputs, &eo_sizes, &eo_ndim));
-                size_t data_size = eo_sizes[0] * eo_sizes[1] * sizeof(uint16_t);
+                size_t data_size = static_cast<size_t>(eo_sizes[0]) * eo_sizes[1] * sizeof(uint16_t);
                 CUDACHECK(cudaMemcpy(eo_data, output0_data, data_size, cudaMemcpyDeviceToDevice));
             } else if (config.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
                 // LL expert-major: 3D [num_local_experts, max_tokens_per_expert, hidden]
                 const unsigned int* out0_sizes; unsigned int out0_ndim;
                 NCCLCHECK(ncclEpTensorGetSizes(tensors.outputs[0], &out0_sizes, &out0_ndim));
-                size_t data_size = out0_sizes[0] * out0_sizes[1] * out0_sizes[2] * sizeof(uint16_t);
+                size_t data_size = static_cast<size_t>(out0_sizes[0]) * out0_sizes[1] * out0_sizes[2] * sizeof(uint16_t);
                 CUDACHECK(cudaMemcpy(eo_data, output0_data, data_size, cudaMemcpyDeviceToDevice));
             } else {
                 // LL rank-major: copy then apply per-rank weight sums before combine
                 const unsigned int* out0_sizes; unsigned int out0_ndim;
                 NCCLCHECK(ncclEpTensorGetSizes(tensors.outputs[0], &out0_sizes, &out0_ndim));
-                size_t data_size = out0_sizes[0] * out0_sizes[1] * sizeof(uint16_t);
+                size_t data_size = static_cast<size_t>(out0_sizes[0]) * out0_sizes[1] * sizeof(uint16_t);
                 CUDACHECK(cudaMemcpy(eo_data, output0_data, data_size, cudaMemcpyDeviceToDevice));
                 preReduceRankMajor(tensors, top_k, nRanks);
             }

@@ -61,7 +61,6 @@ typedef cudaError_t (*ncclEpFreeFn_t)(void* ptr);
 //   ep_group   - [OUT] Pointer to newly created EP group
 //   comm       - [IN]  Existing NCCL communicator
 //   config     - [IN]  Pointer to EP configuration structure
-//   stream     - [IN]  CUDA stream
 //   alloc_fn   - [IN]  Optional custom allocator function (NULL for default cudaMalloc)
 //   free_fn    - [IN]  Optional custom free function (NULL for default cudaFree)
 //
@@ -72,7 +71,6 @@ ncclResult_t ncclEpCreateGroup(
     ncclEpGroup_t* ep_group,
     ncclComm_t comm,
     const ncclEpGroupConfig_t* config,
-    cudaStream_t stream,
     ncclEpAllocFn_t alloc_fn = nullptr,
     ncclEpFreeFn_t free_fn = nullptr
 );
@@ -81,38 +79,35 @@ ncclResult_t ncclEpCreateGroup(
 //
 // Arguments:
 //   ep_group     - [IN]  EP group to destroy
-//   stream       - [IN]  CUDA stream on which the group is being destroyed
 //
 // Returns:
 //   ncclResult_t error code
 
 ncclResult_t ncclEpGroupDestroy(
-    ncclEpGroup_t ep_group,
-    cudaStream_t stream
+    ncclEpGroup_t ep_group
 );
 
 
-// Create a tensor with the given dimensions and data type.
+// Wrap a caller-provided device buffer in a tensor descriptor.
 //   The implementation guarantees that the tensor is contiguous in memory (including accordingly
 //   setting the strides to 1 for all dimensions).
 //
-//   When data is nullptr, memory is allocated using the EP group's allocator and the tensor
-//   owns the memory (freed on destroy). When data is non-null, the tensor wraps the user-provided
-//   pointer without taking ownership (data is NOT freed on destroy).
+//   The buffer is NOT owned by the tensor; the caller is responsible for the lifetime of `data`
+//   and must keep it valid until ncclEpTensorDestroy returns. Releasing `data` while the tensor
+//   handle is still live leaves the handle dangling — any subsequent use is undefined behavior.
+//   Recommended teardown order: ncclEpTensorDestroy(t) first, then free the buffer.
 //
 // Arguments:
-//   ep_group     - [IN]  EP group to create the tensor for
 //   tensor       - [OUT] Pointer to newly created tensor
-//   ndim         - [IN]  Number of dimensions
+//   ndim         - [IN]  Number of dimensions (1..5)
 //   datatype     - [IN]  Data type
 //   tag          - [IN]  Tensor identification tag
-//   data         - [IN]  nullptr = library allocates, non-null = user-managed pointer
+//   data         - [IN]  Non-null device pointer to the tensor's storage
 //   size0..size4 - [IN]  Dimension sizes
 //
 // Returns: ncclResult_t error code
 
 ncclResult_t ncclEpTensorCreate(
-    ncclEpGroup_t ep_group,
     ncclNDTensor_t* tensor,
     unsigned int ndim,
     ncclDataType_t datatype,
@@ -126,19 +121,15 @@ ncclResult_t ncclEpTensorCreate(
 );
 
 
-// Destroy a tensor and free its handle.
-//   If the tensor owns its data (created with data=nullptr), the data is freed
-//   using the group's allocator. If the tensor wraps user-provided data, only the
-//   handle is freed; the data pointer is NOT freed.
+// Destroy a tensor descriptor.
+//   Only the descriptor is freed; the underlying data buffer is the caller's responsibility.
 //
 // Arguments:
-//   ep_group     - [IN]  EP group the tensor belongs to
 //   tensor       - [IN]  Tensor handle to destroy
 //
 // Returns: ncclResult_t error code
 
 ncclResult_t ncclEpTensorDestroy(
-    ncclEpGroup_t ep_group,
     ncclNDTensor_t tensor
 );
 

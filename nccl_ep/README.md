@@ -49,8 +49,8 @@ NCCL EP relies on NCCL Device API, using GIN `put`/`signal` operations for RDMA 
 
 ```c
 // Group management
-ncclEpCreateGroup(&ep_group, comm, &config, stream, alloc_fn, free_fn);
-ncclEpGroupDestroy(ep_group, stream);
+ncclEpCreateGroup(&ep_group, comm, &config, alloc_fn, free_fn);
+ncclEpGroupDestroy(ep_group);
 
 // Handle management
 ncclEpCreateHandle(&handle, ep_group, topk_idx, local_tensors, num_local, config, stream);
@@ -353,7 +353,8 @@ mpirun -np 16 \
 
 An opaque handle that encapsulates tensor metadata and data layout information.
 Tensors are created with `ncclEpTensorCreate` and accessed through getter functions.
-Pass `data=nullptr` for library-managed memory, or a non-null pointer for user-managed memory.
+The library does not own the buffer: the caller passes a non-null device pointer and is
+responsible for freeing it after `ncclEpTensorDestroy`.
 
 ```c
 typedef struct ncclNDTensor* ncclNDTensor_t;
@@ -429,7 +430,7 @@ cudaError_t my_free(void* ptr) {
 }
 
 // Pass to ncclEpCreateGroup
-ncclEpCreateGroup(&ep_group, comm, &config, stream, my_alloc, my_free);
+ncclEpCreateGroup(&ep_group, comm, &config, my_alloc, my_free);
 ```
 
 If `NULL` is passed for both allocator functions, the default `cudaMalloc`/`cudaFree` are used.
@@ -449,7 +450,6 @@ If `NULL` is passed for both allocator functions, the default `cudaMalloc`/`cuda
 //   ep_group   - [OUT] Pointer to newly created EP group
 //   comm       - [IN]  Existing NCCL communicator
 //   config     - [IN]  Pointer to EP configuration structure
-//   stream     - [IN]  CUDA stream
 //   alloc_fn   - [IN]  Optional custom allocator function (NULL for default cudaMalloc)
 //   free_fn    - [IN]  Optional custom free function (NULL for default cudaFree)
 //
@@ -460,7 +460,6 @@ ncclResult_t ncclEpCreateGroup(
     ncclEpGroup_t* ep_group,
     ncclComm_t comm,
     const ncclEpGroupConfig_t* config,
-    cudaStream_t stream,
     ncclEpAllocFn_t alloc_fn,
     ncclEpFreeFn_t free_fn
 );
@@ -473,14 +472,12 @@ ncclResult_t ncclEpCreateGroup(
 //
 // Arguments:
 //   ep_group     - [IN]  EP group to destroy
-//   stream       - [IN]  CUDA stream on which the group is being destroyed
 //
 // Returns:
 //   ncclResult_t error code
 
 ncclResult_t ncclEpGroupDestroy(
-    ncclEpGroup_t ep_group,
-    cudaStream_t stream
+    ncclEpGroup_t ep_group
 );
 ```
 
@@ -489,25 +486,22 @@ ncclResult_t ncclEpGroupDestroy(
 #### `ncclEpTensorCreate()`
 
 ```c
-// Create a tensor with the given dimensions and data type.
+// Wrap a caller-provided device buffer in a tensor descriptor.
 //   Contiguous in memory (strides set to 1 for all dimensions).
-//
-//   data = nullptr : memory is allocated using the EP group's allocator (freed on destroy).
-//   data != nullptr: wraps the user-provided pointer (NOT freed on destroy).
+//   The buffer is NOT owned by the tensor; the caller is responsible for the lifetime
+//   of `data` and must keep it valid until ncclEpTensorDestroy returns.
 //
 // Arguments:
-//   ep_group     - [IN]  EP group to create the tensor for
 //   tensor       - [OUT] Pointer to the newly created tensor
-//   ndim         - [IN]  Number of dimensions
+//   ndim         - [IN]  Number of dimensions (1..5)
 //   datatype     - [IN]  Data type
 //   tag          - [IN]  Tensor identification tag
-//   data         - [IN]  nullptr = library allocates, non-null = user-managed pointer
+//   data         - [IN]  Non-null device pointer to the tensor's storage
 //   size0..size4 - [IN]  Dimension sizes
 //
 // Returns: ncclResult_t error code
 
 ncclResult_t ncclEpTensorCreate(
-    ncclEpGroup_t ep_group,
     ncclNDTensor_t* tensor,
     unsigned int ndim,
     ncclDataType_t datatype,
@@ -524,18 +518,15 @@ ncclResult_t ncclEpTensorCreate(
 #### `ncclEpTensorDestroy()`
 
 ```c
-// Destroy a tensor and free its handle.
-//   If the tensor owns its data (created with data=nullptr), the data is freed
-//   using the group's allocator. Otherwise only the handle is freed.
+// Destroy a tensor descriptor.
+//   Only the descriptor is freed; the underlying data buffer is the caller's responsibility.
 //
 // Arguments:
-//   ep_group     - [IN]  EP group the tensor belongs to
 //   tensor       - [IN]  Tensor handle to destroy
 //
 // Returns: ncclResult_t error code
 
 ncclResult_t ncclEpTensorDestroy(
-    ncclEpGroup_t ep_group,
     ncclNDTensor_t tensor
 );
 ```
@@ -834,6 +825,33 @@ ncclEpComplete(handle, &continue_config, stream);
 #include "nccl_ep.h"
 #include "cuda_runtime.h"
 
+// The library does not own tensor memory. The caller allocates a device
+// buffer and passes it to ncclEpTensorCreate; the snippets below use these
+// helpers to keep the call sites compact (see ep_test.cu for the full version).
+static size_t dtype_bytes(ncclDataType_t dt) { /* 1, 2, 4, 8 by type */ }
+
+static ncclResult_t make_tensor(ncclNDTensor_t* t, unsigned int ndim,
+                                ncclDataType_t dt, ncclEpTensorTag_t tag,
+                                unsigned int s0, unsigned int s1 = 1, unsigned int s2 = 1,
+                                unsigned int s3 = 1, unsigned int s4 = 1) {
+    unsigned int dims[5] = {s0, s1, s2, s3, s4};
+    size_t total = dtype_bytes(dt);
+    for (unsigned int i = 0; i < ndim; i++) total *= dims[i];
+    void* data = nullptr;
+    cudaMalloc(&data, total);
+    return ncclEpTensorCreate(t, ndim, dt, tag, data, s0, s1, s2, s3, s4);
+}
+
+// Inverse: destroy the descriptor first, then free the backing buffer
+// (mirror of make_tensor's cudaMalloc + Create order).
+static void free_tensor(ncclNDTensor_t t) {
+    if (!t) return;
+    void* data = nullptr;
+    ncclEpTensorGetData(t, &data);
+    ncclEpTensorDestroy(t);
+    if (data) cudaFree(data);
+}
+
 // Initialize NCCL communicator
 ncclComm_t comm;
 ncclCommInitRank(&comm, nRanks, id, myRank);
@@ -856,12 +874,12 @@ config.num_qp_per_rank = NCCL_EP_AUTO;      // Auto-size
 config.num_channels = NCCL_EP_AUTO;         // Auto-size
 
 ncclEpGroup_t ep_group;
-ncclEpCreateGroup(&ep_group, comm, &config, stream, my_alloc, my_free);
+ncclEpCreateGroup(&ep_group, comm, &config, my_alloc, my_free);
 
 ncclNDTensor_t topk_idx;
-ncclEpTensorCreate(ep_group, &topk_idx, 2, ncclInt64,
-                    NCCL_EP_TENSOR_TAG_TOPK_IDX,
-                    nullptr, num_tokens, top_k);
+make_tensor(&topk_idx, 2, ncclInt64,
+            NCCL_EP_TENSOR_TAG_TOPK_IDX,
+            num_tokens, top_k);
 
 // Create recv_expert_counter local tensor for ncclEpCreateHandle (optional, for HT mode)
 // This tensor will receive the number of tokens per expert after metadata exchange
@@ -869,9 +887,9 @@ ncclNDTensor_t recv_expert_counter = nullptr;
 ncclNDTensor_t local_tensors[1] = {nullptr};
 unsigned int num_local_tensors = 0;
 if (config.max_tokens_per_rank == NCCL_EP_AUTO) {
-    ncclEpTensorCreate(ep_group, &recv_expert_counter, 1, ncclInt32,
-                        NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
-                        nullptr, num_local_experts);
+    make_tensor(&recv_expert_counter, 1, ncclInt32,
+                NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
+                num_local_experts);
     local_tensors[0] = recv_expert_counter;
     num_local_tensors = 1;
 }
@@ -893,41 +911,41 @@ if (config.max_tokens_per_rank == NCCL_EP_AUTO) {
 
 // Create input tensors (HT mode uses 3 inputs)
 ncclNDTensor_t input_tokens;
-ncclEpTensorCreate(ep_group, &input_tokens, 2, ncclBfloat16,
-                    NCCL_EP_TENSOR_TAG_TOKENS,
-                    nullptr, num_tokens, hidden);
+make_tensor(&input_tokens, 2, ncclBfloat16,
+            NCCL_EP_TENSOR_TAG_TOKENS,
+            num_tokens, hidden);
 
 ncclNDTensor_t topk_weights;
-ncclEpTensorCreate(ep_group, &topk_weights, 2, ncclFloat32,
-                    NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
-                    nullptr, num_tokens, top_k);
+make_tensor(&topk_weights, 2, ncclFloat32,
+            NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
+            num_tokens, top_k);
 
 ncclNDTensor_t forward_inputs[3] = {input_tokens, topk_weights, topk_idx};
 
 // Create output tensors (HT mode: 3 outputs, all 2D)
 ncclNDTensor_t output_tokens;
-ncclEpTensorCreate(ep_group, &output_tokens, 2, ncclBfloat16,
-                    NCCL_EP_TENSOR_TAG_TOKENS,
-                    nullptr, num_recv_tokens, hidden);
+make_tensor(&output_tokens, 2, ncclBfloat16,
+            NCCL_EP_TENSOR_TAG_TOKENS,
+            num_recv_tokens, hidden);
 
 ncclNDTensor_t recv_topk_weights;
-ncclEpTensorCreate(ep_group, &recv_topk_weights, 2, ncclFloat32,
-                    NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
-                    nullptr, num_recv_tokens, top_k);
+make_tensor(&recv_topk_weights, 2, ncclFloat32,
+            NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
+            num_recv_tokens, top_k);
 
 ncclNDTensor_t recv_topk_idx;
-ncclEpTensorCreate(ep_group, &recv_topk_idx, 2, ncclInt64,
-                    NCCL_EP_TENSOR_TAG_TOPK_IDX,
-                    nullptr, num_recv_tokens, top_k);
+make_tensor(&recv_topk_idx, 2, ncclInt64,
+            NCCL_EP_TENSOR_TAG_TOPK_IDX,
+            num_recv_tokens, top_k);
 
 ncclNDTensor_t forward_outputs[3] = {output_tokens, recv_topk_weights, recv_topk_idx};
 
 // Local tensors for dispatch
 unsigned int num_local_experts = config.num_experts / nRanks;
 ncclNDTensor_t tokens_per_expert;
-ncclEpTensorCreate(ep_group, &tokens_per_expert, 1, ncclInt32,
-                    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
-                    nullptr, num_local_experts);
+make_tensor(&tokens_per_expert, 1, ncclInt32,
+            NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
+            num_local_experts);
 
 ncclNDTensor_t dispatch_local_tensors[1] = {tokens_per_expert};
 
@@ -941,14 +959,14 @@ ncclEpDispatch(handle, forward_inputs, 3, forward_outputs, 3,
 
 // Create expert output tensor
 ncclNDTensor_t expert_outputs;
-ncclEpTensorCreate(ep_group, &expert_outputs, 2, ncclBfloat16,
-                    NCCL_EP_TENSOR_TAG_TOKENS,
-                    nullptr, num_recv_tokens, hidden);
+make_tensor(&expert_outputs, 2, ncclBfloat16,
+            NCCL_EP_TENSOR_TAG_TOKENS,
+            num_recv_tokens, hidden);
 
 ncclNDTensor_t combined_output;
-ncclEpTensorCreate(ep_group, &combined_output, 2, ncclBfloat16,
-                    NCCL_EP_TENSOR_TAG_TOKENS,
-                    nullptr, num_tokens, hidden);
+make_tensor(&combined_output, 2, ncclBfloat16,
+            NCCL_EP_TENSOR_TAG_TOKENS,
+            num_tokens, hidden);
 
 ncclNDTensor_t combine_inputs[1] = {expert_outputs};
 ncclNDTensor_t combine_outputs[1] = {combined_output};
@@ -977,7 +995,7 @@ ncclEpCombine(handle, backward_combine_inputs, 2, backward_combine_outputs, 2,
 
 // Cleanup
 ncclEpHandleDestroy(handle);
-ncclEpGroupDestroy(ep_group, stream);
+ncclEpGroupDestroy(ep_group);
 ncclCommDestroy(comm);
 cudaStreamDestroy(stream);
 ```
@@ -1012,13 +1030,13 @@ config.num_qp_per_rank = NCCL_EP_AUTO;      // Auto-size (or specify for LL)
 config.num_channels = NCCL_EP_AUTO;         // Auto-size
 
 ncclEpGroup_t ep_group;
-ncclEpCreateGroup(&ep_group, comm, &config, stream, my_alloc, my_free);
+ncclEpCreateGroup(&ep_group, comm, &config, my_alloc, my_free);
 
 // Create routing tensor (topk_idx)
 ncclNDTensor_t topk_idx;
-ncclEpTensorCreate(ep_group, &topk_idx, 2, ncclInt64,
-                    NCCL_EP_TENSOR_TAG_TOPK_IDX,
-                    nullptr, num_tokens, top_k);
+make_tensor(&topk_idx, 2, ncclInt64,
+            NCCL_EP_TENSOR_TAG_TOPK_IDX,
+            num_tokens, top_k);
 
 // Create EP handle
 ncclEpHandle_t handle;
@@ -1028,25 +1046,25 @@ ncclEpCreateHandle(&handle, ep_group, topk_idx, NULL, 0, NULL, stream);
 
 // Create input tensor (LL mode uses 1 input)
 ncclNDTensor_t input_tokens;
-ncclEpTensorCreate(ep_group, &input_tokens, 2, ncclBfloat16,
-                    NCCL_EP_TENSOR_TAG_TOKENS,
-                    nullptr, num_tokens, hidden);
+make_tensor(&input_tokens, 2, ncclBfloat16,
+            NCCL_EP_TENSOR_TAG_TOKENS,
+            num_tokens, hidden);
 
 ncclNDTensor_t dispatch_inputs[1] = {input_tokens};
 
 // Create output tensor (LL mode: 3D format [num_local_experts, nRanks * max_tokens, hidden])
 ncclNDTensor_t output_tokens;
-ncclEpTensorCreate(ep_group, &output_tokens, 3, ncclBfloat16,
-                    NCCL_EP_TENSOR_TAG_TOKENS,
-                    nullptr, num_local_experts, nRanks * config.max_tokens_per_rank, hidden);
+make_tensor(&output_tokens, 3, ncclBfloat16,
+            NCCL_EP_TENSOR_TAG_TOKENS,
+            num_local_experts, nRanks * config.max_tokens_per_rank, hidden);
 
 ncclNDTensor_t dispatch_outputs[1] = {output_tokens};
 
 // Create local tensors for LL mode
 ncclNDTensor_t tokens_per_expert;
-ncclEpTensorCreate(ep_group, &tokens_per_expert, 1, ncclInt32,
-                    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
-                    nullptr, num_local_experts);
+make_tensor(&tokens_per_expert, 1, ncclInt32,
+            NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
+            num_local_experts);
 
 ncclNDTensor_t local_tensors[1] = {tokens_per_expert};
 
@@ -1071,23 +1089,23 @@ cudaStreamSynchronize(stream);
 
 // Create expert output tensor (also 3D in LL mode)
 ncclNDTensor_t expert_outputs;
-ncclEpTensorCreate(ep_group, &expert_outputs, 3, ncclBfloat16,
-                    NCCL_EP_TENSOR_TAG_TOKENS,
-                    nullptr, num_local_experts, nRanks * config.max_tokens_per_rank, hidden);
+make_tensor(&expert_outputs, 3, ncclBfloat16,
+            NCCL_EP_TENSOR_TAG_TOKENS,
+            num_local_experts, nRanks * config.max_tokens_per_rank, hidden);
 
 // Create topk_weights for combine
 ncclNDTensor_t topk_weights;
-ncclEpTensorCreate(ep_group, &topk_weights, 2, ncclFloat32,
-                    NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
-                    nullptr, num_tokens, top_k);
+make_tensor(&topk_weights, 2, ncclFloat32,
+            NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
+            num_tokens, top_k);
 
 ncclNDTensor_t combine_local_tensors[1] = {topk_weights};
 
 // Combine expert outputs back to original token order
 ncclNDTensor_t combined_output;
-ncclEpTensorCreate(ep_group, &combined_output, 2, ncclBfloat16,
-                    NCCL_EP_TENSOR_TAG_TOKENS,
-                    nullptr, num_tokens, hidden);
+make_tensor(&combined_output, 2, ncclBfloat16,
+            NCCL_EP_TENSOR_TAG_TOKENS,
+            num_tokens, hidden);
 
 ncclNDTensor_t combine_inputs[1] = {expert_outputs};
 ncclNDTensor_t combine_outputs[1] = {combined_output};
@@ -1100,7 +1118,7 @@ cudaStreamSynchronize(stream);
 
 // Cleanup
 ncclEpHandleDestroy(handle);
-ncclEpGroupDestroy(ep_group, stream);
+ncclEpGroupDestroy(ep_group);
 ncclCommDestroy(comm);
 cudaStreamDestroy(stream);
 ```

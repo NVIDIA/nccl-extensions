@@ -125,11 +125,17 @@ def cuda_device_reset():
 # Tensor helpers (ncclEpTensor* not exposed as high-level wrapper methods)
 # ---------------------------------------------------------------------------
 
-def tensor_create(nccl, ep_group, ndim, datatype, tag, data, *sizes):
+
+def tensor_create(nccl, ndim, datatype, tag, *sizes):
+    """cudaMalloc + ncclEpTensorCreate. Returns the tensor; data buffer is freed by tensor_destroy."""
     tensor = ncclNDTensor_t()
     padded = list(sizes) + [1] * (5 - len(sizes))
+    nbytes = datatype.itemsize
+    for i in range(ndim):
+        nbytes *= padded[i]
+    data = cuda_malloc(nbytes)
     nccl.NCCL_CHECK(nccl._funcs["ncclEpTensorCreate"](
-        ep_group, ctypes.byref(tensor),
+        ctypes.byref(tensor),
         ctypes.c_uint(ndim), ctypes.c_int(int(datatype)), ctypes.c_int(tag),
         data,
         ctypes.c_uint(padded[0]), ctypes.c_uint(padded[1]),
@@ -139,8 +145,14 @@ def tensor_create(nccl, ep_group, ndim, datatype, tag, data, *sizes):
     return tensor
 
 
-def tensor_destroy(nccl, ep_group, tensor):
-    nccl.NCCL_CHECK(nccl._funcs["ncclEpTensorDestroy"](ep_group, tensor))
+def tensor_destroy(nccl, tensor):
+    """Inverse of tensor_create: destroy the descriptor first, then cudaFree the backing buffer."""
+    if tensor is None:
+        return
+    data = tensor_get_data(nccl, tensor)
+    nccl.NCCL_CHECK(nccl._funcs["ncclEpTensorDestroy"](tensor))
+    if data and data.value:
+        cuda_free(data)
 
 
 def tensor_get_data(nccl, tensor):
@@ -281,13 +293,13 @@ def main():  # noqa: C901 — intentionally kept as a single function to mirror 
     extra = " (no max_tokens_per_rank)" if disable_max_tokens else ""
     print(f"Rank {my_rank}: Testing ncclEpCreateGroup with algorithm: {algorithm_name}{extra}")
 
-    ep_group = nccl.ncclEpCreateGroup(comm, config, stream, _alloc_fn, _free_fn)
+    ep_group = nccl.ncclEpCreateGroup(comm, config, _alloc_fn, _free_fn)
 
     # -- topk_idx tensor [num_tokens, top_k] int64 --------------------------
     topk_idx = tensor_create(
-        nccl, ep_group, 2, nccl_core.INT64,
+        nccl, 2, nccl_core.INT64,
         ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOPK_IDX,
-        None, num_tokens, top_k,
+        num_tokens, top_k,
     )
 
     topk_idx_host = (ctypes.c_int64 * (num_tokens * top_k))()
@@ -313,9 +325,9 @@ def main():  # noqa: C901 — intentionally kept as a single function to mirror 
     handle_recv_expert_counter = None
     if disable_max_tokens:
         handle_recv_expert_counter = tensor_create(
-            nccl, ep_group, 1, nccl_core.INT32,
+            nccl, 1, nccl_core.INT32,
             ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
-            None, num_local_experts,
+            num_local_experts,
         )
         handle_local_tensors.append(handle_recv_expert_counter)
 
@@ -344,50 +356,50 @@ def main():  # noqa: C901 — intentionally kept as a single function to mirror 
 
     # -- input/output tensors for dispatch ----------------------------------
     input_tokens = tensor_create(
-        nccl, ep_group, 2, nccl_core.BFLOAT16,
+        nccl, 2, nccl_core.BFLOAT16,
         ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOKENS,
-        None, num_tokens, hidden,
+        num_tokens, hidden,
     )
 
     topk_weights = tensor_create(
-        nccl, ep_group, 2, nccl_core.FLOAT32,
+        nccl, 2, nccl_core.FLOAT32,
         ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
-        None, num_tokens, top_k,
+        num_tokens, top_k,
     )
 
     if is_ll:
         output_tokens = tensor_create(
-            nccl, ep_group, 3, nccl_core.BFLOAT16,
+            nccl, 3, nccl_core.BFLOAT16,
             ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOKENS,
-            None, num_local_experts, config.max_tokens_per_rank * n_ranks, hidden,
+            num_local_experts, config.max_tokens_per_rank * n_ranks, hidden,
         )
     else:
         output_tokens = tensor_create(
-            nccl, ep_group, 2, nccl_core.BFLOAT16,
+            nccl, 2, nccl_core.BFLOAT16,
             ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOKENS,
-            None, num_recv_tokens, hidden,
+            num_recv_tokens, hidden,
         )
 
     local_tensor_recv_count = None
     if is_ll:
         local_tensor_recv_count = tensor_create(
-            nccl, ep_group, 1, nccl_core.INT32,
+            nccl, 1, nccl_core.INT32,
             ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE,
-            None, num_local_experts,
+            num_local_experts,
         )
 
     output_topk_weights = None
     output_topk_idx = None
     if not is_ll:
         output_topk_weights = tensor_create(
-            nccl, ep_group, 2, nccl_core.FLOAT32,
+            nccl, 2, nccl_core.FLOAT32,
             ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
-            None, num_recv_tokens, top_k,
+            num_recv_tokens, top_k,
         )
         output_topk_idx = tensor_create(
-            nccl, ep_group, 2, nccl_core.INT64,
+            nccl, 2, nccl_core.INT64,
             ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOPK_IDX,
-            None, num_recv_tokens, top_k,
+            num_recv_tokens, top_k,
         )
 
     # -- fill input tokens: first ELEMENTS_TESTED_PER_TOKEN elems = 0x1000 + rank
@@ -574,9 +586,9 @@ def main():  # noqa: C901 — intentionally kept as a single function to mirror 
 
     if is_ll:
         expert_outputs = tensor_create(
-            nccl, ep_group, 3, nccl_core.BFLOAT16,
+            nccl, 3, nccl_core.BFLOAT16,
             ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOKENS,
-            None, num_local_experts, config.max_tokens_per_rank * n_ranks, hidden,
+            num_local_experts, config.max_tokens_per_rank * n_ranks, hidden,
         )
         eo_host = (ctypes.c_uint16 * (config.max_tokens_per_rank * hidden))()
         for t in range(config.max_tokens_per_rank):
@@ -589,9 +601,9 @@ def main():  # noqa: C901 — intentionally kept as a single function to mirror 
             cuda_memcpy(dst, eo_host, config.max_tokens_per_rank * hidden * 2, CUDA_MEMCPY_H2D)
     else:
         expert_outputs = tensor_create(
-            nccl, ep_group, 2, nccl_core.BFLOAT16,
+            nccl, 2, nccl_core.BFLOAT16,
             ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOKENS,
-            None, num_recv_tokens, hidden,
+            num_recv_tokens, hidden,
         )
         eo_host = (ctypes.c_uint16 * (num_recv_tokens * hidden))()
         for t in range(num_recv_tokens):
@@ -601,9 +613,9 @@ def main():  # noqa: C901 — intentionally kept as a single function to mirror 
         cuda_memcpy(eo_data, eo_host, num_recv_tokens * hidden * 2, CUDA_MEMCPY_H2D)
 
     combined_output = tensor_create(
-        nccl, ep_group, 2, nccl_core.BFLOAT16,
+        nccl, 2, nccl_core.BFLOAT16,
         ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOKENS,
-        None, num_tokens, hidden,
+        num_tokens, hidden,
     )
 
     combine_in = (ncclNDTensor_t * 1)()
@@ -694,19 +706,19 @@ def main():  # noqa: C901 — intentionally kept as a single function to mirror 
 
         # new output tensors for second dispatch
         cached_out_tokens = tensor_create(
-            nccl, ep_group, 2, nccl_core.BFLOAT16,
+            nccl, 2, nccl_core.BFLOAT16,
             ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOKENS,
-            None, num_recv_tokens, hidden,
+            num_recv_tokens, hidden,
         )
         cached_combined_output = tensor_create(
-            nccl, ep_group, 2, nccl_core.BFLOAT16,
+            nccl, 2, nccl_core.BFLOAT16,
             ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOKENS,
-            None, num_tokens, hidden,
+            num_tokens, hidden,
         )
         cached_combined_tw = tensor_create(
             nccl, ep_group, 2, nccl_core.FLOAT32,
             ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
-            None, num_tokens, top_k,
+            num_tokens, top_k,
         )
 
         cached_comb_outs = (ncclNDTensor_t * 2)()
@@ -715,9 +727,9 @@ def main():  # noqa: C901 — intentionally kept as a single function to mirror 
 
         # topk_weights input for combine (copy from dispatch output)
         cached_ctw_in = tensor_create(
-            nccl, ep_group, 2, nccl_core.FLOAT32,
+            nccl, 2, nccl_core.FLOAT32,
             ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
-            None, num_recv_tokens, top_k,
+            num_recv_tokens, top_k,
         )
         ctw_dst = tensor_get_data(nccl, cached_ctw_in)
         ctw_src = tensor_get_data(nccl, output_topk_weights)
@@ -812,36 +824,32 @@ def main():  # noqa: C901 — intentionally kept as a single function to mirror 
             sys.exit(1)
 
         # cleanup cached tensors
-        tensor_destroy(nccl, ep_group, cached_out_tokens)
-        tensor_destroy(nccl, ep_group, cached_combined_output)
-        tensor_destroy(nccl, ep_group, cached_combined_tw)
-        tensor_destroy(nccl, ep_group, cached_ctw_in)
+        tensor_destroy(nccl, cached_out_tokens)
+        tensor_destroy(nccl, cached_combined_output)
+        tensor_destroy(nccl, cached_combined_tw)
+        tensor_destroy(nccl, cached_ctw_in)
 
         print(f"Rank {my_rank}: Cached mode - second dispatch and combine calls completed successfully")
 
     # ===================================================================
-    # Cleanup — all tensor destroys must happen before ncclEpGroupDestroy
-    # because GroupDestroy free()s the ep_group struct whose free_fn is
-    # needed by TensorDestroy to release owned device memory.
+    # Cleanup
     # ===================================================================
-    tensor_destroy(nccl, ep_group, expert_outputs)
-    tensor_destroy(nccl, ep_group, topk_weights)
-    tensor_destroy(nccl, ep_group, combined_output)
-    tensor_destroy(nccl, ep_group, topk_idx)
+    tensor_destroy(nccl, expert_outputs)
+    tensor_destroy(nccl, topk_weights)
+    tensor_destroy(nccl, combined_output)
+    tensor_destroy(nccl, topk_idx)
     if disable_max_tokens and handle_recv_expert_counter is not None:
-        rc_data = tensor_get_data(nccl, handle_recv_expert_counter)
-        cuda_free_host(rc_data)
-        tensor_destroy(nccl, ep_group, handle_recv_expert_counter)
-    tensor_destroy(nccl, ep_group, input_tokens)
-    tensor_destroy(nccl, ep_group, output_tokens)
+        tensor_destroy(nccl, handle_recv_expert_counter)
+    tensor_destroy(nccl, input_tokens)
+    tensor_destroy(nccl, output_tokens)
     if not is_ll:
-        tensor_destroy(nccl, ep_group, output_topk_weights)
-        tensor_destroy(nccl, ep_group, output_topk_idx)
+        tensor_destroy(nccl, output_topk_weights)
+        tensor_destroy(nccl, output_topk_idx)
     if is_ll:
-        tensor_destroy(nccl, ep_group, local_tensor_recv_count)
+        tensor_destroy(nccl, local_tensor_recv_count)
 
     nccl.ncclEpHandleDestroy(ep_handle)
-    nccl.ncclEpGroupDestroy(ep_group, stream)
+    nccl.ncclEpGroupDestroy(ep_group)
 
     comm.destroy()
 

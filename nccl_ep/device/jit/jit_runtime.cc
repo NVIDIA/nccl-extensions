@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <mutex>
@@ -48,6 +49,7 @@ struct LoadedKernelModule {
 
 struct FastCacheKey {
     const void* identity = nullptr;
+    std::uint64_t runtime_key = 0;
     CUcontext context = nullptr;
     int device = -1;
 };
@@ -55,6 +57,8 @@ struct FastCacheKey {
 struct FastCacheKeyHash {
     size_t operator()(const FastCacheKey& key) const {
         size_t seed = std::hash<const void*>{}(key.identity);
+        seed ^= std::hash<std::uint64_t>{}(key.runtime_key) +
+                0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
         seed ^= std::hash<const void*>{}(static_cast<const void*>(key.context)) +
                 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
         seed ^= std::hash<int>{}(key.device) + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
@@ -64,7 +68,10 @@ struct FastCacheKeyHash {
 
 struct FastCacheKeyEqual {
     bool operator()(const FastCacheKey& lhs, const FastCacheKey& rhs) const {
-        return lhs.identity == rhs.identity && lhs.context == rhs.context && lhs.device == rhs.device;
+        return lhs.identity == rhs.identity &&
+               lhs.runtime_key == rhs.runtime_key &&
+               lhs.context == rhs.context &&
+               lhs.device == rhs.device;
     }
 };
 
@@ -269,6 +276,7 @@ std::string source_fingerprint(
         std::string(variant.entry_name),
         std::string(variant.source),
         "sm=" + std::to_string(sm),
+        "runtime_key=" + std::to_string(variant.runtime_key),
         env_hash,
     };
     return fnv1a_digest(parts);
@@ -803,7 +811,7 @@ JitKernelStatus launch_jit_kernel(
         return JitKernelStatus::kUnsupportedDevice;
     }
 
-    const FastCacheKey fast_key{variant.identity, context, device};
+    const FastCacheKey fast_key{variant.identity, variant.runtime_key, context, device};
     const JitKernelStatus fast_status = try_fast_launch(fast_key, variant, kernel_param, stream, error);
     if (fast_status == JitKernelStatus::kLaunched ||
         fast_status == JitKernelStatus::kLaunchFailed) {

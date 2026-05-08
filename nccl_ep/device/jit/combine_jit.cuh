@@ -8,10 +8,10 @@
 
 #include "device/hybrid_ep.cuh"
 #include "device/jit/jit_runtime.hpp"
-#include "device/jit/jit_utils.hpp"
 
 #include <climits>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <sstream>
 #include <string>
@@ -47,7 +47,7 @@ template <
     int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
     bool BACKWARD_COMBINE,
     int LSA_TEAM_SIZE>
-std::string combine_jit_source() {
+std::string combine_jit_source(int hidden_dim) {
     std::ostringstream src;
     src
         << "#include \"device/hybrid_ep.cuh\"\n"
@@ -78,6 +78,7 @@ std::string combine_jit_source() {
         << "      " << NUM_OF_BLOCKS << ",\n"
         << "      " << NUM_OF_ADDITIONAL_IN_FLIGHT_S2G << ",\n"
         << "      " << bool_literal(BACKWARD_COMBINE) << ",\n"
+        << "      " << hidden_dim << ",\n"
         << "      " << LSA_TEAM_SIZE << ">(param, smem_bytes);\n"
         << "}\n";
     return src.str();
@@ -93,7 +94,7 @@ template <
     bool BACKWARD_COMBINE,
     int NUM_LSA_TEAMS,
     int LSA_TEAM_SIZE>
-bool try_launch_combine(
+void launch_combine(
     ::hybrid_ep::combine_kernel_param_t<LSA_TEAM_SIZE>& param,
     int dynamic_smem_bytes,
     cudaStream_t stream) {
@@ -116,15 +117,15 @@ bool try_launch_combine(
         INTER_NODE_G2S_GROUP_WARPS +
         INTER_NODE_RDMA_GROUP_WARPS);
 
-    if (!::nccl_ep::jit::env_flag_enabled("NCCL_EP_COMBINE_JIT")) return false;
-
-    static const int variant_identity = 0; // address is a stable-inprocess id for each template instantiation.
-    static const std::string variant_name = [] {
+    const int hidden_dim = param.hidden_dim;
+    static const int variant_identity = 0;
+    const std::string variant_name = [&] {
         std::ostringstream name;
         name
             << "combine"
             << "_nodes" << NUM_LSA_TEAMS
             << "_lsa" << LSA_TEAM_SIZE
+            << "_hdim" << hidden_dim
             << "_g2s" << NUM_OF_STAGES_G2S
             << "_s2g" << NUM_OF_STAGES_S2G
             << "_chunk" << NUM_OF_TOKENS_PER_CHUNK
@@ -134,7 +135,7 @@ bool try_launch_combine(
             << (BACKWARD_COMBINE ? "_bwd" : "_fwd");
         return name.str();
     }();
-    static const std::string source = combine_jit_source<
+    const std::string source = combine_jit_source<
         INTRA_NODE_RED_GROUP_WARPS,
         INTRA_NODE_RED_GROUP_START,
         INTER_NODE_RED_GROUP_WARPS,
@@ -154,7 +155,7 @@ bool try_launch_combine(
         NUM_OF_BLOCKS,
         NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
         BACKWARD_COMBINE,
-        LSA_TEAM_SIZE>();
+        LSA_TEAM_SIZE>(hidden_dim);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_combine";
@@ -162,6 +163,7 @@ bool try_launch_combine(
     variant.source = source;
     variant.entry_name = kCombineJitEntryName;
     variant.identity = &variant_identity;
+    variant.runtime_key = static_cast<std::uint64_t>(hidden_dim);
     variant.num_blocks = NUM_OF_BLOCKS;
     variant.block_dim = BLOCK_DIM;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
@@ -274,7 +276,6 @@ bool try_launch_combine(
     CUDA_CHECK(cudaFree(d_wt));
     CUDA_CHECK(cudaFree(d_bt));
 #endif
-    return true;
 }
 
 } // namespace jit

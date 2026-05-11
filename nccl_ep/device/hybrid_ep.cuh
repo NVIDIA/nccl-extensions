@@ -11,6 +11,7 @@
 
 #pragma once
 #include "common.hpp"
+#include "device_primitives.cuh"
 #include "hybridep_configs.cuh"
 #include <assert.h>
 #include <cooperative_groups.h>
@@ -1421,6 +1422,8 @@ __forceinline__ __device__ void S2G_warp_group_device_function(const int local_r
     // Required because fused device_sync signals inter-rank completion
     // inside this kernel (no stream-ordering guarantee from a separate kernel).
     cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+    // Drain TMA stores into the generic memory path so the dispatch-tail barrier sees them.
+    nccl_ep::fence_proxy_async();
   }
 }
 
@@ -3144,29 +3147,23 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
   __syncthreads();
 
   if (threadIdx.x == 0) {
-      // Grid barrier: all blocks in this kernel must arrive before inter-rank signaling.
-      // TMA S2G writes are already committed by cp_async_bulk_wait_group in S2G warp group.
-      unsigned int arrived = atomicAdd(param.dispatch_grid_barrier_counter, 1);
+      // Grid barrier: each block release-adds to publish its TMA stores (already proxy-drained
+      // in S2G warp, propagated here by __syncthreads). Last block acquires peers' releases.
+      uint32_t arrived = static_cast<uint32_t>(nccl_ep::atomic_add_acqrel_global(
+                          reinterpret_cast<const int*>(param.dispatch_grid_barrier_counter), 1));
 
-      // Last block to arrive: all blocks' TMA writes are now system-visible.
-      // Signal the inter-rank completion flag.
+      // Last block: signal inter-rank completion. Acquire-load the counter to pair with peers'
+      // release-adds (the prior atom.add.release alone is not acquire on the load side).
       if (arrived == NUM_OF_BLOCKS - 1) {
-          asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;"
-                       :
-                       : "l"(__cvta_generic_to_global(
-                             param.intra_node_write_completion_flags)), "n"(1)
-                       : "memory");
+          nccl_ep::red_add_release_sys_global(param.intra_node_write_completion_flags, 1u);
       }
 
-      // All blocks poll the inter-rank flag until all ranks have signaled.
+      // Poll inter-rank flag (relaxed in loop; single fence.acq_rel.sys after orders subsequent reads).
       uint32_t flag_data;
       do {
-          asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
-                       : "=r"(flag_data)
-                       : "l"(__cvta_generic_to_global(
-                             param.intra_node_write_completion_flags))
-                       : "memory");
+          flag_data = nccl_ep::ld_relaxed_sys_global(param.intra_node_write_completion_flags);
       } while (flag_data != param.expected_intra_node_flag_value);
+      nccl_ep::memory_fence();
 
       // Last block resets grid counter for next invocation.
       if (arrived == NUM_OF_BLOCKS - 1) {
@@ -3262,23 +3259,17 @@ __device__ __forceinline__ void combine_kernel_impl(
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
   if (threadIdx.x == 0) _wt_head_start = clock64();
 #endif
+  // red.release.sys orders prior generic stores before the flag.
   if (threadIdx.x == 0 && blockIdx.x == 0) {
-      asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;"
-                   :
-                   : "l"(__cvta_generic_to_global(
-                         param.intra_node_write_completion_flags)), "n"(1)
-                   : "memory");
+      nccl_ep::red_add_release_sys_global(param.intra_node_write_completion_flags, 1u);
   }
-  // All blocks' thread 0 poll until all ranks have signaled.
+  // Poll inter-rank flag (relaxed in loop; single fence.acq_rel.sys after orders subsequent reads).
   if (threadIdx.x == 0) {
       uint32_t flag_data;
       do {
-          asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
-                       : "=r"(flag_data)
-                       : "l"(__cvta_generic_to_global(
-                             param.intra_node_write_completion_flags))
-                       : "memory");
+          flag_data = nccl_ep::ld_relaxed_sys_global(param.intra_node_write_completion_flags);
       } while (flag_data != param.expected_intra_node_flag_value);
+      nccl_ep::memory_fence();
   }
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
   if (threadIdx.x == 0) {
@@ -3613,10 +3604,7 @@ __global__ void scan(const uint8_t* input_routing_map,
     tmp_state_t* tmp_dst = &tmp[blockIdx.x * num_of_ranks_per_node + i];
     tmp_state_t tmp_data{PRIV_SUM, rank_acc};
     uint64_t data = *reinterpret_cast<uint64_t*>(&tmp_data);
-    asm volatile("st.relaxed.gpu.global.b64 [%0], %1;"
-                  :
-                  : "l"(__cvta_generic_to_global(tmp_dst)), "l"(data)
-                  : "memory");
+    nccl_ep::st_relaxed_gpu_global(reinterpret_cast<uint64_t*>(tmp_dst), data);
   }
 
   // Each thread within a CUDA block load previous blocks' block level sum for a single rank at a time.
@@ -3628,11 +3616,7 @@ __global__ void scan(const uint8_t* input_routing_map,
       do{
           // Load previous blocks' per-rank sum from global memory.
           // Strong(atomic) load is needed to view strong(atomic) store from other blocks.
-          uint64_t data = 0;
-          asm volatile("ld.relaxed.gpu.global.b64 %0, [%1];"
-                        : "=l"(data)
-                        : "l"(__cvta_generic_to_global(tmp_src))
-                        : "memory");
+          uint64_t data = nccl_ep::ld_relaxed_gpu_global(reinterpret_cast<const uint64_t*>(tmp_src));
           tmp_data = *reinterpret_cast<tmp_state_t*>(&data);
       }while(tmp_data.state != PRIV_SUM);
       previous_block_sum_for_current_rank += tmp_data.value;

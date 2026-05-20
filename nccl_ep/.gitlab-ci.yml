@@ -95,7 +95,7 @@ build_ipp6:
       rm -rf "$ART"
       mkdir -p "$ART/lib" "$ART/include" "$ART/test/nccl_ep"
       cp -a "${NCCL_HOME}/lib"/libnccl_ep.* "$ART/lib/"
-      cp -a "${NCCL_HOME}/include/nccl_ep.h" "${NCCL_HOME}/include/ep_enums.h" "${NCCL_HOME}/include/common.hpp" "$ART/include/"
+      cp -a "${NCCL_HOME}/include/nccl_ep.h" "${NCCL_HOME}/include/ep_enums.h" "$ART/include/"
       cp -a "${NCCL_HOME}/include/nccl_ep" "$ART/include/"
       cp -a "${NCCL_HOME}/test/nccl_ep/ep_test" "${NCCL_HOME}/test/nccl_ep/ep_bench" "$ART/test/nccl_ep/"
   artifacts:
@@ -143,7 +143,7 @@ build_pretyche:
       rm -rf "$ART"
       mkdir -p "$ART/lib" "$ART/include" "$ART/test/nccl_ep"
       cp -a "${NCCL_HOME}/lib"/libnccl_ep.* "$ART/lib/"
-      cp -a "${NCCL_HOME}/include/nccl_ep.h" "${NCCL_HOME}/include/ep_enums.h" "${NCCL_HOME}/include/common.hpp" "$ART/include/"
+      cp -a "${NCCL_HOME}/include/nccl_ep.h" "${NCCL_HOME}/include/ep_enums.h" "$ART/include/"
       cp -a "${NCCL_HOME}/include/nccl_ep" "$ART/include/"
       cp -a "${NCCL_HOME}/test/nccl_ep/ep_test" "${NCCL_HOME}/test/nccl_ep/ep_bench" "$ART/test/nccl_ep/"
   artifacts:
@@ -168,7 +168,7 @@ build_pretyche:
       DST="${NCCL_EP_MERGE_TARGET}"
       mkdir -p "${DST}/lib" "${DST}/include" "${DST}/test/nccl_ep"
       cp -a "${ART}/lib"/libnccl_ep.* "${DST}/lib/"
-      cp -a "${ART}/include/nccl_ep.h" "${ART}/include/ep_enums.h" "${ART}/include/common.hpp" "${DST}/include/"
+      cp -a "${ART}/include/nccl_ep.h" "${ART}/include/ep_enums.h" "${DST}/include/"
       cp -a "${ART}/include/nccl_ep" "${DST}/include/"
       cp -a "${ART}/test/nccl_ep/ep_test" "${ART}/test/nccl_ep/ep_bench" "${DST}/test/nccl_ep/"
 

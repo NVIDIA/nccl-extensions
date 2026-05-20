@@ -5,9 +5,6 @@
 
 : "${NCCL_HOME:?NCCL_HOME must be set}"
 
-export NCCL_EP_JIT_BUILD_INCLUDE_DIR="${NCCL_EP_JIT_BUILD_INCLUDE_DIR:-${NCCL_HOME}/include}"
-export NCCL_EP_JIT_CACHE_DIR="${NCCL_EP_JIT_CACHE_DIR:-${NCCL_HOME}/jit_cache}"
-
 EP_TEST="${NCCL_HOME}/test/nccl_ep/ep_test"
 EP_BENCH="${NCCL_HOME}/test/nccl_ep/ep_bench"
 if [[ ! -x "$EP_TEST" ]]; then

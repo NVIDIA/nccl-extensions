@@ -13,33 +13,33 @@ stages:
   - setup
   - test
 
+include:
+  - local: '.gitlab/cluster-paths.yml'
+
 variables:
   FF_USE_FASTZIP: "true"
   FF_ENABLE_JOB_CLEANUP: "true"
   FF_TIMESTAMPS: true
   GIT_STRATEGY: clone
-  # IPP6 cluster (must match parent pipeline's install path; same as unit tests / nccl4py)
+  # Per-cluster install dirs (child scope: keyed by parent's PARENT_PIPELINE_ID).
+  EOS_INSTALL_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/install/${PARENT_PIPELINE_ID}"
+  PRE_NYX_INSTALL_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/install/${PARENT_PIPELINE_ID}"
+  PRE_TYCHE_INSTALL_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/install/${PARENT_PIPELINE_ID}"
   IPP6_INSTALL_DIR: "/storage/gitlab-runner/nccl/install/${PARENT_PIPELINE_ID}"
+  # IPP6 cluster
   IPP6_SLURM_PARTITION: a100-cicd
   IPP6_CUDA_HOME: "/storage/toolkits/cuda-12.9"
   # Reuse parent's NCCL build (same path as unit-tests-ipp6-*, apitest-ipp6-*, etc.)
   NCCL_HOME: "${IPP6_INSTALL_DIR}/build"
   # MPI path inside IPP6 build container for ep_test / ep_bench
   MPI_HOME: "/usr/local/openmpi"
-  # EOS: same layout as main .gitlab-template.yml (PARENT_PIPELINE_ID matches parent setup-eos)
-  EOS_INSTALL_DIR: "/lustre/fsw/coreai_libraries_nccl/${GITLAB_USER_LOGIN}/gitlab-runner/install/${PARENT_PIPELINE_ID}"
+  # EOS
   EOS_CUDA_HOME: "/lustre/fsw/coreai_libraries_nccl/toolkits/cuda-12.8.0"
   EOS_MPI_HOME: "/usr/mpi/gcc/openmpi-4.1.5rc2"
-  # Pre-Nyx install (parent pipeline id; same layout as .gitlab-template.yml PRE_NYX_INSTALL_DIR)
-  PRE_NYX_INSTALL_DIR: "/lustre/fsw/coreai_libraries_nccl/${GITLAB_USER_LOGIN}/gitlab-runner/install/${PARENT_PIPELINE_ID}"
-  PRE_NYX_CI_BUILDS_DIR: "/lustre/fsw/coreai_libraries_nccl/${GITLAB_USER_LOGIN}/gitlab-runner"
-  # Host CUDA/MPI for EP tests on Pre-Nyx (see docker/clusters/pre-nyx-config.sh)
+  # Pre-Nyx host CUDA/MPI for EP tests (see docker/clusters/pre-nyx-config.sh)
   PRE_NYX_CUDA_HOME: "/lustre/fsw/coreai_libraries_nccl/toolkits/cuda-12.8.0"
   PRE_NYX_MPI_HOME: "/lustre/fsw/coreai_libraries_nccl/toolkits/openmpi-5.0.6"
-  # Pre-Tyche install (parent pipeline id; same layout as .gitlab-template.yml PRE_TYCHE_INSTALL_DIR)
-  PRE_TYCHE_INSTALL_DIR: "/lustre/fsw/coreai_libraries_nccl/${GITLAB_USER_LOGIN}/gitlab-runner/install/${PARENT_PIPELINE_ID}"
-  PRE_TYCHE_CI_BUILDS_DIR: "/lustre/fsw/coreai_libraries_nccl/${GITLAB_USER_LOGIN}/gitlab-runner"
-  # Host CUDA/MPI for EP tests on Pre-Tyche (see docker/clusters/pre-tyche-config.sh)
+  # Pre-Tyche host CUDA/MPI for EP tests (see docker/clusters/pre-tyche-config.sh)
   PRE_TYCHE_CUDA_HOME: "/lustre/fsw/coreai_libraries_nccl/toolkits/cuda-13.0"
   PRE_TYCHE_MPI_HOME: "/lustre/fsw/coreai_libraries_nccl/toolkits/openmpi-5.0.6"
 
@@ -49,7 +49,7 @@ workflow:
     - when: never
 
 default:
-  retry: 2
+  retry: 1
 
 
 ##

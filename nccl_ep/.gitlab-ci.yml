@@ -20,7 +20,9 @@ variables:
   FF_USE_FASTZIP: "true"
   FF_ENABLE_JOB_CLEANUP: "true"
   FF_TIMESTAMPS: true
-  GIT_STRATEGY: clone
+  GIT_DEPTH: "1"
+  # Per-job subpath under CI_BUILDS_DIR — keeps each job's checkout isolated.
+  CI_JOB_SUBPATH: "${CI_PIPELINE_ID}/${CI_JOB_ID}"
   # Per-cluster install dirs (child scope: keyed by parent's PARENT_PIPELINE_ID).
   EOS_INSTALL_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/install/${PARENT_PIPELINE_ID}"
   PRE_NYX_INSTALL_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/install/${PARENT_PIPELINE_ID}"
@@ -61,7 +63,6 @@ build_ipp6:
   tags:
     - ipp6-nccl
   variables:
-    GIT_CLONE_PATH: "${CI_BUILDS_DIR}/${CI_JOB_ID}/${CI_PROJECT_PATH}"
     NCCL_HOME: "${IPP6_INSTALL_DIR}/build"
     MPI_HOME: "/usr/local/openmpi"
     NVIDIA_VISIBLE_DEVICES: "void"
@@ -108,7 +109,7 @@ build_pretyche:
   tags:
     - ptyche
   variables:
-    CI_BUILDS_DIR: "${PRE_TYCHE_CI_BUILDS_DIR}"
+    CI_BUILDS_DIR: "${PRE_TYCHE_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
     NCCL_HOME: "${PRE_TYCHE_INSTALL_DIR}/build"
     MPI_HOME: "/usr/local/openmpi"
     NVIDIA_VISIBLE_DEVICES: "void"
@@ -178,6 +179,7 @@ setup_eos:
     - nccl-eos
   variables:
     NCCL_EP_MERGE_TARGET: "${EOS_INSTALL_DIR}/build"
+    CI_BUILDS_DIR: "${EOS_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
 
 setup_prenyx:
   extends: .setup_base
@@ -187,7 +189,7 @@ setup_prenyx:
     - prenyx
   variables:
     NCCL_EP_MERGE_TARGET: "${PRE_NYX_INSTALL_DIR}/build"
-    CI_BUILDS_DIR: "${PRE_NYX_CI_BUILDS_DIR}"
+    CI_BUILDS_DIR: "${PRE_NYX_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
 
 setup_pretyche:
   extends: .setup_base
@@ -197,7 +199,7 @@ setup_pretyche:
     - ptyche
   variables:
     NCCL_EP_MERGE_TARGET: "${PRE_TYCHE_INSTALL_DIR}/build"
-    CI_BUILDS_DIR: "${PRE_TYCHE_CI_BUILDS_DIR}"
+    CI_BUILDS_DIR: "${PRE_TYCHE_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
 
 ##
 ## Stage: test (srun on GPU partition; runs contrib/nccl_ep/ci/run_nccl_ep_ci_tests.sh)
@@ -234,6 +236,7 @@ test_eos:
     - setup_eos
   variables:
     NCCL_HOME: "${EOS_INSTALL_DIR}/build"
+    CI_BUILDS_DIR: "${EOS_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
     NNODES: 1
     NP: 8
     NGPUS: 8
@@ -272,7 +275,7 @@ test_prenyx:
     SLURM_PARTITION: batch
     SLURM_ACCOUNT: coreai_libraries_nccl
     SLURM_TIME: 60
-    CI_BUILDS_DIR: "${PRE_NYX_CI_BUILDS_DIR}"
+    CI_BUILDS_DIR: "${PRE_NYX_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
     NCCL_EP_BENCH_HT: "1"
   script:
     - set -ex
@@ -300,7 +303,7 @@ test_pretyche:
     SLURM_PARTITION: batch
     SLURM_ACCOUNT: coreai_libraries_nccl
     SLURM_TIME: 60
-    CI_BUILDS_DIR: "${PRE_TYCHE_CI_BUILDS_DIR}"
+    CI_BUILDS_DIR: "${PRE_TYCHE_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
     NCCL_EP_BENCH_HT: "1"
   script:
     - set -ex

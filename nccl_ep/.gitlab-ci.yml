@@ -67,6 +67,7 @@ build_ipp6:
     MPI_HOME: "/usr/local/openmpi"
     NVIDIA_VISIBLE_DEVICES: "void"
     SLURM_PARTITION: ""
+    GIT_CLONE_PATH: "${CI_BUILDS_DIR}/${CI_JOB_ID}/${CI_PROJECT_PATH}" # Use a unique path for each job to avoid conflicts
   script:
     - |
       set -euxo pipefail

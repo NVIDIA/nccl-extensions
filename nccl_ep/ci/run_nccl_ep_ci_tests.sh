@@ -65,15 +65,38 @@ run_ep_bench_variants() {
   run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" --algorithm "$algorithm" --tokens "$tokens" --hidden 7168 --top-k 8 --experts 256 --validate --non-uniform-tokens
 }
 
-# ep_test: low-latency / high-throughput
-run_nccl_ep_srun "$EP_TEST" "$TIME" -a ll -t 128 -d 7168
-run_nccl_ep_srun "$EP_TEST" "$TIME" -a ht -t 4096 -d 7168
+# ep_test: low-latency (expert-major, LL-hardcoded) / high-throughput × {flat, expert-major}
+# ep_test is kept at one canonical batch size per algorithm (smoke coverage); batch-size
+# sweep lives in ep_bench below.
+run_nccl_ep_srun "$EP_TEST" "$TIME" -a ll              -t 128  -d 7168
+run_nccl_ep_srun "$EP_TEST" "$TIME" -a ht -L fl        -t 4096 -d 7168
+run_nccl_ep_srun "$EP_TEST" "$TIME" -a ht -L em        -t 4096 -d 7168
 
-# ep_bench: same shapes (override bench wall time with NCCL_EP_BENCH_SLURM_TIME if needed)
-run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" --algorithm low-latency --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate
+# ep_bench: layout × batch-size cross-product (override bench wall time with NCCL_EP_BENCH_SLURM_TIME if needed)
+# LL supports {expert-major, rank-major}; HT supports {flat, expert-major}.
+# Batch sizes (tokens per rank): 128, 256, 1K, 4K, 8K.
+EP_BENCH_TOKEN_SIZES=(128 256 1024 4096)
+
+run_ep_bench_layout_size_sweep() {
+  local algorithm="$1"; shift
+  local layouts=("$@")
+  local layout tokens
+  for layout in "${layouts[@]}"; do
+    for tokens in "${EP_BENCH_TOKEN_SIZES[@]}"; do
+      run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+        --algorithm "$algorithm" --layout "$layout" \
+        --tokens "$tokens" --hidden 7168 --top-k 8 --experts 256 --validate
+    done
+  done
+}
+
+run_ep_bench_layout_size_sweep low-latency em rm
+# Token-distribution variants stay at the canonical LL batch size (cover the variant axis,
+# not the size axis — already swept above).
 run_ep_bench_variants low-latency 128
+
 # High-throughput ep_bench (set NCCL_EP_BENCH_HT=1 to run; off by default — cluster-dependent)
 if [[ "${NCCL_EP_BENCH_HT:-0}" == "1" ]]; then
-  run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" --algorithm high-throughput --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate
+  run_ep_bench_layout_size_sweep high-throughput fl em
   run_ep_bench_variants high-throughput 4096
 fi

@@ -4,10 +4,10 @@
 # NCCL_EP_BENCH_HT=1 enables ep_bench --algorithm high-throughput (optional; not all clusters pass it).
 
 : "${NCCL_HOME:?NCCL_HOME must be set}"
-NCCL_EP_BUILDDIR="${NCCL_EP_BUILDDIR:-${NCCL_HOME}}"
+NCCL_EP_HOME="${NCCL_EP_HOME:-${NCCL_HOME}}"
 
-EP_TEST="${NCCL_EP_BUILDDIR}/test/nccl_ep/ep_test"
-EP_BENCH="${NCCL_EP_BUILDDIR}/test/nccl_ep/ep_bench"
+EP_TEST="${NCCL_EP_HOME}/test/nccl_ep/ep_test"
+EP_BENCH="${NCCL_EP_HOME}/test/nccl_ep/ep_bench"
 if [[ ! -x "$EP_TEST" ]]; then
   echo "ERROR: ep_test not found or not executable: $EP_TEST" >&2
   exit 1
@@ -23,7 +23,7 @@ PARTITION="${SLURM_PARTITION:-}"
 TIME="${NCCL_EP_TEST_SLURM_TIME:-00:30:00}"
 BENCH_TIME="${NCCL_EP_BENCH_SLURM_TIME:-$TIME}"
 
-export LD_LIBRARY_PATH="${NCCL_EP_BUILDDIR}/lib:${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${NCCL_EP_HOME}/lib:${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
 if [[ -n "${CUDA_HOME:-}" ]]; then
   export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${CUDA_HOME}/lib:${LD_LIBRARY_PATH}"
 fi

@@ -97,7 +97,7 @@ build_ipp6:
       rm -rf "$ART"
       mkdir -p "$ART/lib" "$ART/include" "$ART/test/nccl_ep"
       cp -a "${NCCL_HOME}/lib"/libnccl_ep.* "$ART/lib/"
-      cp -a "${NCCL_HOME}/include/nccl_ep.h" "${NCCL_HOME}/include/ep_enums.h" "$ART/include/"
+      cp -a "${NCCL_HOME}/include/nccl_ep.h" "$ART/include/"
       cp -a "${NCCL_HOME}/include/nccl_ep" "$ART/include/"
       cp -a "${NCCL_HOME}/test/nccl_ep/ep_test" "${NCCL_HOME}/test/nccl_ep/ep_bench" "$ART/test/nccl_ep/"
   artifacts:
@@ -145,7 +145,7 @@ build_pretyche:
       rm -rf "$ART"
       mkdir -p "$ART/lib" "$ART/include" "$ART/test/nccl_ep"
       cp -a "${NCCL_HOME}/lib"/libnccl_ep.* "$ART/lib/"
-      cp -a "${NCCL_HOME}/include/nccl_ep.h" "${NCCL_HOME}/include/ep_enums.h" "$ART/include/"
+      cp -a "${NCCL_HOME}/include/nccl_ep.h" "$ART/include/"
       cp -a "${NCCL_HOME}/include/nccl_ep" "$ART/include/"
       cp -a "${NCCL_HOME}/test/nccl_ep/ep_test" "${NCCL_HOME}/test/nccl_ep/ep_bench" "$ART/test/nccl_ep/"
   artifacts:
@@ -170,7 +170,7 @@ build_pretyche:
       DST="${NCCL_EP_MERGE_TARGET}"
       mkdir -p "${DST}/lib" "${DST}/include" "${DST}/test/nccl_ep"
       cp -a "${ART}/lib"/libnccl_ep.* "${DST}/lib/"
-      cp -a "${ART}/include/nccl_ep.h" "${ART}/include/ep_enums.h" "${DST}/include/"
+      cp -a "${ART}/include/nccl_ep.h" "${DST}/include/"
       cp -a "${ART}/include/nccl_ep" "${DST}/include/"
       cp -a "${ART}/test/nccl_ep/ep_test" "${ART}/test/nccl_ep/ep_bench" "${DST}/test/nccl_ep/"
 
@@ -237,6 +237,7 @@ test_eos:
     - setup_eos
   variables:
     NCCL_HOME: "${EOS_INSTALL_DIR}/build"
+    NCCL_EP_HOME: "${EOS_INSTALL_DIR}/build"
     CI_BUILDS_DIR: "${EOS_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
     NNODES: 1
     NP: 8
@@ -247,6 +248,7 @@ test_eos:
   script:
     - set -ex
     - export NCCL_HOME="${NCCL_HOME}"
+    - export NCCL_EP_HOME="${NCCL_EP_HOME}"
     - export CUDA_HOME="${EOS_CUDA_HOME}"
     - export MPI_HOME="${EOS_MPI_HOME}"
     - export PATH="${MPI_HOME}/bin:${PATH}"
@@ -270,6 +272,7 @@ test_prenyx:
     - setup_prenyx
   variables:
     NCCL_HOME: "${PRE_NYX_INSTALL_DIR}/build"
+    NCCL_EP_HOME: "${PRE_NYX_INSTALL_DIR}/build"
     NNODES: 1
     NP: 8
     NGPUS: 8
@@ -282,6 +285,7 @@ test_prenyx:
     - set -ex
     - source docker/clusters/pre-nyx-config.sh && configure_test_env
     - export NCCL_HOME="${NCCL_HOME}"
+    - export NCCL_EP_HOME="${NCCL_EP_HOME}"
     - export CUDA_HOME="${PRE_NYX_CUDA_HOME}"
     - export MPI_HOME="${PRE_NYX_MPI_HOME}"
     - export PATH="${MPI_HOME}/bin:${PATH}"
@@ -298,6 +302,7 @@ test_pretyche:
     - setup_pretyche
   variables:
     NCCL_HOME: "${PRE_TYCHE_INSTALL_DIR}/build"
+    NCCL_EP_HOME: "${PRE_TYCHE_INSTALL_DIR}/build"
     NNODES: 1
     NP: 4
     NGPUS: 4
@@ -310,6 +315,7 @@ test_pretyche:
     - set -ex
     - source docker/clusters/pre-tyche-config.sh && configure_test_env
     - export NCCL_HOME="${NCCL_HOME}"
+    - export NCCL_EP_HOME="${NCCL_EP_HOME}"
     - export CUDA_HOME="${PRE_TYCHE_CUDA_HOME}"
     - export MPI_HOME="${PRE_TYCHE_MPI_HOME}"
     - export PATH="${MPI_HOME}/bin:${PATH}"

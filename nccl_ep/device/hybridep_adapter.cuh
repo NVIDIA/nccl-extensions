@@ -86,18 +86,23 @@ void sparse_to_dense_prob_combine(
 // HT outputs: dense_prob[recv_token][experts_per_node]
 // HT expects: recv_topk_weights[recv_token][topk], recv_topk_idx[recv_token][topk]
 // Uses local_expert_routing_map to know which experts each token is routed to.
-// NOTE: recv_topk_idx contains LOCAL expert indices (0-based within this rank)
-//       to match NCCL API expectations.
+// recv_topk_idx numbering is selected by recv_topk_idx_kind:
+//   LOCAL  -- per-rank local expert id (0-based within this rank); default.
+//   GLOBAL -- wire-format global expert id (= global_expert_offset + local_id),
+//             matching the LL rank-major GLOBAL contract.
+// recv_topk_idx_kind must be resolved (no AUTO) by the caller.
 void dense_to_sparse_prob(
     const float* dense_prob,              // [num_recv_tokens, experts_per_node] - from IPC buffer
     const bool* local_expert_routing_map, // [num_recv_tokens, experts_per_rank] - from preprocessing
     float* recv_topk_weights,             // EM: [N]; FLAT/RM: [N, topk]
-    int64_t* recv_topk_idx,               // [num_recv_tokens, topk] - output LOCAL expert indices (0-based); nullptr under EM
+    int64_t* recv_topk_idx,               // [num_recv_tokens, topk] - LOCAL or GLOBAL expert id (see kind); nullptr under EM
     int num_recv_tokens,
     int topk,
     int experts_per_rank,
     int experts_per_node,                 // = experts_per_rank * ranks_per_node
     int local_rank,                       // rank within node
+    int global_expert_offset,             // = group_rank * experts_per_rank; added to local id under GLOBAL
+    ncclEpExpertIdKind_t recv_topk_idx_kind,
     bool expert_major,                    // true = 1D recv_topk_weights, false = 2D
     cudaStream_t stream);
 

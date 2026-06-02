@@ -79,9 +79,9 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
 } while (0)
 #define EP_OPTIONAL_STRUCT(ptr) do { \
     assert(((ptr) == nullptr || (ptr)->size == sizeof(*(ptr))) && \
-           "ABI struct size mismatch — caller and libnccl_ep.so must be from the same release"); \
+           "ABI struct size mismatch -- caller and libnccl_ep.so must be from the same release"); \
     assert(((ptr) == nullptr || (ptr)->magic == NCCL_EP_MAGIC) && \
-           "struct magic mismatch — pointer is uninitialised or not an NCCL EP struct " \
+           "struct magic mismatch -- pointer is uninitialised or not an NCCL EP struct " \
            "(initialise with the corresponding NCCL_EP_*_INIT macro)"); \
 } while (0)
 
@@ -89,6 +89,42 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
 // Buffer is sized at group create assuming this value; callers must use scale_block_size >= this.
 // TODO: remove when ncclEpGroupConfig_t gains max_scale_bytes_per_token (future API update).
 static constexpr int kFP8ExternScaleBlockSize = 128;
+
+// Targeted forward-binary-compat for ncclEpLayoutInfo_t (only). The struct
+// grows by appending; older callers built against a pre-flag header report a
+// smaller `size`. Accept any size in [min-known, current-sizeof] and let
+// per-field readers default to the corresponding AUTO sentinel when a field
+// falls beyond the caller's reported size. Bumps to this struct must
+// document the corresponding legacy size below.
+static constexpr size_t kNcclEpLayoutInfoMinSize =
+    offsetof(ncclEpLayoutInfo_t, recv_topk_idx_kind); // last legacy field end
+#define EP_OPTIONAL_LAYOUT_INFO(ptr) do { \
+    assert(((ptr) == nullptr || \
+            ((ptr)->size >= kNcclEpLayoutInfoMinSize && \
+             (ptr)->size <= sizeof(*(ptr)))) && \
+           "ncclEpLayoutInfo_t size out of supported range -- caller / libnccl_ep.so version skew exceeds tolerance"); \
+    assert(((ptr) == nullptr || (ptr)->magic == NCCL_EP_MAGIC) && \
+           "ncclEpLayoutInfo_t magic mismatch -- pointer is uninitialised or not an " \
+           "NCCL EP struct (initialise with NCCL_EP_LAYOUT_INFO_INIT)"); \
+} while (0)
+
+// Safe field reader for ncclEpLayoutInfo_t::recv_topk_idx_kind. Returns AUTO
+// when the caller's struct (size) does not cover the field, preserving the
+// pre-flag default.
+static inline ncclEpExpertIdKind_t layoutInfoRecvTopkIdxKind(const ncclEpLayoutInfo_t* lip) {
+    if (lip == nullptr) return NCCL_EP_EXPERT_ID_AUTO;
+    constexpr size_t field_end =
+        offsetof(ncclEpLayoutInfo_t, recv_topk_idx_kind) + sizeof(ncclEpExpertIdKind_t);
+    if (lip->size < field_end) return NCCL_EP_EXPERT_ID_AUTO;
+    return lip->recv_topk_idx_kind;
+}
+
+// Resolve AUTO -- the public sentinel meaning "library default" -- to the
+// concrete numbering the kernels need. AUTO maps to LOCAL today; pinning a
+// non-AUTO value passes straight through.
+static inline ncclEpExpertIdKind_t resolveRecvTopkIdxKind(ncclEpExpertIdKind_t k) {
+    return (k == NCCL_EP_EXPERT_ID_AUTO) ? NCCL_EP_EXPERT_ID_LOCAL : k;
+}
 
 // Helper function to convert ncclDataType_t to cudaDataType_t
 static cudaDataType_t ncclDataTypeToCudaDataType(ncclDataType_t nccl_type) {
@@ -2397,7 +2433,7 @@ ncclResult_t ncclEpUpdateHandle(
 {
     assert(handle != nullptr);
     topk_idx = tensor_required(topk_idx);
-    EP_OPTIONAL_STRUCT(layout_info);
+    EP_OPTIONAL_LAYOUT_INFO(layout_info);
     assert(topk_idx->ndim == 2);
 
     ncclEpGroup_t ep_group = handle->group;
@@ -2664,7 +2700,7 @@ ncclResult_t ncclEpDispatch(
 ) {
     EP_REQUIRE_STRUCT(inputs);
     EP_REQUIRE_STRUCT(outputs);
-    EP_OPTIONAL_STRUCT(layout_info);
+    EP_OPTIONAL_LAYOUT_INFO(layout_info);
     EP_OPTIONAL_STRUCT(config);
     const unsigned int send_only = config ? config->send_only : 0;
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
@@ -2857,6 +2893,11 @@ ncclResult_t ncclEpDispatch(
             const bool use_fp8 = (scales != nullptr) || extern_fp8;
             const bool round_scale = config ? config->round_scales : false;
             const bool use_ue8m0 = false;
+            // recv_topk_idx numbering selector. Read in a version-safe way
+            // (older callers' smaller layout_info reports AUTO), then resolve
+            // AUTO -> LOCAL so the kernel sees only concrete kinds.
+            const ncclEpExpertIdKind_t recv_topk_idx_kind =
+                resolveRecvTopkIdxKind(layoutInfoRecvTopkIdxKind(layout_info));
 
             // LL accepts int32 or int64 topk_idx; cached dtype picks the
             // kernel specialisation. The generic lambda body is shared and
@@ -2901,6 +2942,7 @@ ncclResult_t ncclEpDispatch(
                     round_scale,
                     use_ue8m0,
                     handle->layout,
+                    recv_topk_idx_kind,
                     phases,
                     group->num_nccl_comms,
                     group->nccl_dev_comms,
@@ -3343,6 +3385,12 @@ ncclResult_t ncclEpDispatch(
 
             int num_recv_tokens = static_cast<int>(max_recv_tokens);
             int experts_per_node = group->num_local_experts * group->lsa_team_size;
+            // recv_topk_idx numbering selector (matches LL rank-major path):
+            // version-safe read of layout_info, resolve AUTO -> LOCAL, pass the
+            // concrete kind plus the per-group GLOBAL offset to the kernel.
+            const ncclEpExpertIdKind_t recv_topk_idx_kind =
+                resolveRecvTopkIdxKind(layoutInfoRecvTopkIdxKind(layout_info));
+            const int global_expert_offset = group->rank * group->num_local_experts;
 
             // em-permute path: dense_to_sparse_prob runs in FLAT shape.
             // Weights are written to FLAT scratch (recv_topk_weights_flat) and
@@ -3367,6 +3415,8 @@ ncclResult_t ncclEpDispatch(
                 group->num_local_experts,
                 experts_per_node,
                 group->lsa_rank,
+                global_expert_offset,
+                recv_topk_idx_kind,
                 dsp_em,
                 stream);
         }

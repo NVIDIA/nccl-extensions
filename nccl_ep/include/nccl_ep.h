@@ -279,8 +279,9 @@ ncclResult_t ncclEpGroupDestroy(
 );
 
 // Layout info passed to ncclEpCreateHandle / ncclEpUpdateHandle and ncclEpDispatch.
-// All fields are optional (NULL = not provided). Each field is a pointer to a
-// caller-owned descriptor (stack/static/struct-embedded or from ncclEpTensorAlloc).
+// Tensor-descriptor fields are optional (NULL = not provided). Each tensor
+// field is a pointer to a caller-owned descriptor (stack/static/struct-embedded
+// or from ncclEpTensorAlloc).
 typedef struct {
     unsigned int    size;                // = sizeof(this struct); first field, never moves
     unsigned int    magic;               // = NCCL_EP_MAGIC; second field, never moves
@@ -296,6 +297,14 @@ typedef struct {
                                          //   HT (Handle time): scalar total recv token count. 
                                          //     * Flat layout: unpadded.
                                          //     * Expert-major layout: padded slot total.
+    ncclEpExpertIdKind_t recv_topk_idx_kind; // Numbering of values written to recv_topk_idx.
+                                         //   AUTO (zero-init default): library default; today LOCAL.
+                                         //   LOCAL:  per-rank local expert id, or -1 if not routed.
+                                         //   GLOBAL: wire-format global expert id, or -1 if not routed.
+                                         // Applies to layouts that populate recv_topk_idx (LL rank-major, HT flat);
+                                         // ignored by layouts that do not (LL/HT expert-major). AUTO preserves
+                                         // pre-flag callers' behavior on the wire and may shift in a future
+                                         // release without an ABI break; pin LOCAL or GLOBAL for a stable contract.
 } ncclEpLayoutInfo_t;
 
 #define NCCL_EP_LAYOUT_INFO_INIT ((ncclEpLayoutInfo_t){ \
@@ -329,14 +338,11 @@ typedef struct {
     ncclEpTensor_t* tokens;       // required; received tokens
     ncclEpTensor_t* topk_weights; // optional; LL rank-major or HT: received top-k weights
                                   //   LL rank-major: ncclFloat32 [num_ranks, max_dispatch_tokens_per_rank, top_k]
-    ncclEpTensor_t* scales;       // Reserved for future use
+    ncclEpTensor_t* scales;       // optional; FP8 only; received per-token scaling factors
     ncclEpTensor_t* topk_idx;     // optional; LL rank-major or HT FLAT: received top-k expert indices
-                                  //   Current dispatch-output semantics:
-                                  //     HT FLAT: int64 [N(r), top_k], local expert indices on
-                                  //       this rank, unused entries are -1.
-                                  //     LL rank-major: int32 [num_ranks, max_dispatch_tokens_per_rank, top_k],
-                                  //       preserving source top-k order; local expert index on this
-                                  //       rank, or -1 when that top-k entry is not hosted locally.
+                                  // Per-slot values are either the local or global expert id, selected via
+                                  // ncclEpLayoutInfo_t::recv_topk_idx_kind (AUTO/LOCAL/GLOBAL; AUTO resolves
+                                  // to LOCAL today). -1 marks slots not routed to this rank.
 } ncclEpDispatchOutputs_t;
 
 #define NCCL_EP_DISPATCH_OUTPUTS_INIT ((ncclEpDispatchOutputs_t){ \

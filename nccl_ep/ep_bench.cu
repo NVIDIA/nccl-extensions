@@ -1085,7 +1085,9 @@ static ValidationResult validateDispatchOutputLLExpertMaj(
 // ==================== LL rank-major dispatch validation ====================
 // Output: 3D [nRanks, max_dispatch_tokens_per_rank, hidden], one slot per received token packed by source rank.
 // outputs[1] = recv_topk_weights [nRanks, max_tpr, top_k]: all top-k weights from the source token.
-// outputs[2] = recv_topk_idx     [nRanks, max_tpr, top_k]: local expert index on myRank, or -1.
+// outputs[2] = recv_topk_idx     [nRanks, max_tpr, top_k]: LOCAL (default) or GLOBAL expert id if
+//                                                        routed to myRank, or -1. Numbering is selected
+//                                                        by dispatch_layout_info.recv_topk_idx_kind.
 // Slots within each rank's block are contiguous from index 0; first invalid slot ends the block.
 static ValidationResult validateDispatchOutputLLRankMaj(
     const BenchmarkAllocState&     alloc,
@@ -1187,7 +1189,10 @@ static ValidationResult validateDispatchOutputLLRankMaj(
                 errors++;
             }
 
-            // Verify recv_topk_idx: local expert index for experts on myRank, -1 otherwise
+            // Verify recv_topk_idx: LOCAL or GLOBAL expert id for experts on myRank, -1 otherwise.
+            // Mirrors the kernel's resolution: AUTO collapses to LOCAL.
+            ncclEpExpertIdKind_t kind = dispatch_layout_info.recv_topk_idx_kind;
+            if (kind == NCCL_EP_EXPERT_ID_AUTO) kind = NCCL_EP_EXPERT_ID_LOCAL;
             for (unsigned int k = 0; k < top_k; k++) {
                 int64_t eid = src_topk[token_id * top_k + k];
                 int32_t expected_idx;
@@ -1195,12 +1200,18 @@ static ValidationResult validateDispatchOutputLLRankMaj(
                     expected_idx = -1;
                 } else {
                     int expert_rank = (int)(eid / num_local_experts);
-                    expected_idx = (expert_rank == myRank) ? (int32_t)(eid % num_local_experts) : (int32_t)-1;
+                    if (expert_rank != myRank) {
+                        expected_idx = (int32_t)-1;
+                    } else if (kind == NCCL_EP_EXPERT_ID_GLOBAL) {
+                        expected_idx = (int32_t)eid;
+                    } else {
+                        expected_idx = (int32_t)(eid % num_local_experts);
+                    }
                 }
                 if (idx[k] != expected_idx) {
                     if (errors_printed++ < max_errors_to_print)
-                        printf("[Rank %d] LL-RM dispatch: rank %d slot %u token %d: topk[%u] idx=%d expected=%d\n",
-                               myRank, r, s, token_id, k, idx[k], expected_idx);
+                        printf("[Rank %d] LL-RM dispatch: rank %d slot %u token %d: topk[%u] idx=%d expected=%d (kind=%d)\n",
+                               myRank, r, s, token_id, k, idx[k], expected_idx, (int)kind);
                     errors++;
                 }
             }
@@ -1476,10 +1487,12 @@ static ValidationResult validateDispatchOutputHTExtern(
 
 // ==================== HT rank-major dispatch validation ====================
 // Output: 2D [nRanks*max_tokens_per_rank, hidden]; row valid iff any recv_topk_idx[k] >= 0.
-// FIXME: ncclEpHandleGetNumRecvTokens returns buffer max, not actual count — scan recv_topk_idx as workaround.
+// FIXME: ncclEpHandleGetNumRecvTokens returns buffer max, not actual count -- scan recv_topk_idx as workaround.
+// recv_topk_idx numbering: LOCAL (default) or GLOBAL per dispatch_layout_info.recv_topk_idx_kind.
 static ValidationResult validateDispatchOutputHTRankMaj(
     const BenchmarkAllocState&     alloc,
     const ncclEpDispatchOutputs_t& dispatch_outputs,
+    const ncclEpLayoutInfo_t&      dispatch_layout_info,
     unsigned int max_tokens_per_rank,
     const unsigned int*            num_tokens_per_rank,
     unsigned int hidden,
@@ -1516,7 +1529,10 @@ static ValidationResult validateDispatchOutputHTRankMaj(
             if (recv_topk_idx[j * top_k + k] >= 0) { valid_slot[j] = true; break; }
         }
     }
-    delete[] recv_topk_idx;
+
+    // recv_topk_idx numbering. Mirrors the kernel's AUTO -> LOCAL collapse.
+    ncclEpExpertIdKind_t kind = dispatch_layout_info.recv_topk_idx_kind;
+    if (kind == NCCL_EP_EXPERT_ID_AUTO) kind = NCCL_EP_EXPERT_ID_LOCAL;
 
     std::set<std::pair<int,int>> expected;
     for (int r = 0; r < nRanks; r++) {
@@ -1571,6 +1587,42 @@ static ValidationResult validateDispatchOutputHTRankMaj(
             errors++;
         }
         found.insert(key);
+
+        // Compare the set of expert ids written into recv_topk_idx[j, ...]
+        // against the set expected from src_topk[token_id, ...] restricted to
+        // myRank's experts. Position k within the slot is not meaningful (the
+        // kernel writes in local-expert ascending order, not src_topk order),
+        // so use set equality instead of per-k equality.
+        unsigned int sr_tokens = num_tokens_per_rank[source_rank];
+        if ((unsigned int)token_id < sr_tokens) {
+            int64_t* sr_topk = new int64_t[sr_tokens * top_k];
+            generateTopkIndicesHT(sr_topk, sr_tokens, num_experts, top_k, source_rank);
+            std::set<int64_t> expected_ids;
+            for (unsigned int k = 0; k < top_k; k++) {
+                int64_t eid = sr_topk[(unsigned int)token_id * top_k + k];
+                if (eid < 0) continue;
+                int expert_rank = static_cast<int>(eid) / static_cast<int>(num_local_experts);
+                if (expert_rank != myRank) continue;
+                int64_t expected_id = (kind == NCCL_EP_EXPERT_ID_GLOBAL)
+                    ? eid
+                    : (eid % num_local_experts);
+                expected_ids.insert(expected_id);
+            }
+            std::set<int64_t> found_ids;
+            for (unsigned int k = 0; k < top_k; k++) {
+                int64_t v = recv_topk_idx[(size_t)j * top_k + k];
+                if (v >= 0) found_ids.insert(v);
+            }
+            if (found_ids != expected_ids) {
+                if (errors_printed < max_errors_to_print) {
+                    printf("[Rank %d] HT dispatch: slot %u (rank=%d token=%d) topk_idx set mismatch (kind=%d)\n",
+                           myRank, j, source_rank, token_id, (int)kind);
+                    errors_printed++;
+                }
+                errors++;
+            }
+            delete[] sr_topk;
+        }
     }
 
     for (const auto& key : expected) {
@@ -1584,6 +1636,7 @@ static ValidationResult validateDispatchOutputHTRankMaj(
         }
     }
 
+    delete[] recv_topk_idx;
     delete[] valid_slot;
     delete[] recv_data;
     delete[] src_topk;
@@ -1754,7 +1807,7 @@ ValidationResult validateDispatchOutput(
                                                      num_experts, num_local_experts, myRank, nRanks,
                                                      meta_expert_counts_padded, meta_expert_offsets);
         }
-        return validateDispatchOutputHTRankMaj(alloc, dispatch_outputs,
+        return validateDispatchOutputHTRankMaj(alloc, dispatch_outputs, dispatch_layout_info,
                                                max_tokens_per_rank, num_tokens_per_rank,
                                                hidden, top_k,
                                                num_experts, num_local_experts, myRank, nRanks);
@@ -2798,6 +2851,7 @@ void printUsage(const char* programName, int myRank) {
         printf("  --topk-idx-int32        LL only: pass ncclInt32 topk_idx instead of ncclInt64\n");
         printf("  --fp8-dispatch          Send FP8 (e4m3) tokens + FP32 scales through dispatch (HT or LL, hidden%%128==0).\n");
         printf("                          Use --validate to verify byte-exact forwarding; omit for BW measurement.\n");
+        printf("  --expert-id-kind <k>    Numbering for recv_topk_idx writes: auto|local|global (LL-RM/HT-FLAT only; default: auto)\n");
         printf("  --help                  Show this help message\n");
     }
 }
@@ -2836,6 +2890,10 @@ int main(int argc, char* argv[]) {
     bool topk_idx_int32 = false;  // LL only: pass ncclInt32 topk_idx instead of ncclInt64
     bool em_nvlink_dup = false;       // HT+EM only: force nvlink_dup path (sender duplicates per-expert over NVLink)
     bool fp8_dispatch = false;    // EXTERN FP8 dispatch: pass FP8 tokens + scales; works with HT and LL
+    // Numbering selector for recv_topk_idx writes (LL rank-major / HT FLAT only).
+    // AUTO leaves the lib at its default (resolves to LOCAL today); LOCAL / GLOBAL pin
+    // a stable contract end-to-end.
+    ncclEpExpertIdKind_t recv_topk_idx_kind = NCCL_EP_EXPERT_ID_AUTO;
     // Initialize MPI
     MPICHECK(MPI_Init(&argc, &argv));
     MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
@@ -2868,6 +2926,7 @@ int main(int argc, char* argv[]) {
         {"non-uniform-tokens", no_argument, 0, 'N'},
         {"topk-idx-int32", no_argument, 0, 'I'},
         {"fp8-dispatch",   no_argument,       0, 0},
+        {"expert-id-kind", required_argument, 0, 1000},
         {"help",           no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -2994,6 +3053,21 @@ int main(int argc, char* argv[]) {
                 }
                 break;
             }
+            case 1000:  // --expert-id-kind
+                if (strcmp(optarg, "auto") == 0) {
+                    recv_topk_idx_kind = NCCL_EP_EXPERT_ID_AUTO;
+                } else if (strcmp(optarg, "local") == 0) {
+                    recv_topk_idx_kind = NCCL_EP_EXPERT_ID_LOCAL;
+                } else if (strcmp(optarg, "global") == 0) {
+                    recv_topk_idx_kind = NCCL_EP_EXPERT_ID_GLOBAL;
+                } else {
+                    if (myRank == 0) {
+                        printf("Error: Invalid --expert-id-kind '%s'. Use 'auto', 'local', or 'global'\n", optarg);
+                    }
+                    MPI_Finalize();
+                    return 1;
+                }
+                break;
             case 'h':
                 printUsage(argv[0], myRank);
                 MPI_Finalize();
@@ -3525,6 +3599,27 @@ int main(int argc, char* argv[]) {
         }
     }
     if (myRank == 0) { printf("[DEBUG] Tensors set up\n"); fflush(stdout); }
+
+    // Apply the CLI-selected recv_topk_idx numbering. The kind only matters for
+    // layouts that populate recv_topk_idx (LL rank-major, HT FLAT); other layouts
+    // ignore it. Setting the field on dispatch_layout_info is safe even when the
+    // layout doesn't read it, but only pass layout_info to dispatch when the
+    // layout actually needs it (has_dispatch_layout_info is set by the
+    // per-mode setup helpers).
+    dispatch_layout_info.recv_topk_idx_kind = recv_topk_idx_kind;
+    // Make sure layout_info reaches dispatch even when no tensor counters are
+    // required (e.g. HT FLAT in some configs), so the kind is honored.
+    if (recv_topk_idx_kind != NCCL_EP_EXPERT_ID_AUTO &&
+        (layout == NCCL_EP_LAYOUT_RANK_MAJOR || layout == NCCL_EP_LAYOUT_FLAT)) {
+        has_dispatch_layout_info = true;
+    }
+    if (myRank == 0) {
+        const char* kind_str = (recv_topk_idx_kind == NCCL_EP_EXPERT_ID_GLOBAL) ? "GLOBAL"
+                             : (recv_topk_idx_kind == NCCL_EP_EXPERT_ID_LOCAL)  ? "LOCAL"
+                             :                                                    "AUTO";
+        printf("[DEBUG] recv_topk_idx_kind = %s\n", kind_str);
+        fflush(stdout);
+    }
 
     // Initialize validation data if enabled (fills tensors with rank-based patterns)
     if (validate_data) {

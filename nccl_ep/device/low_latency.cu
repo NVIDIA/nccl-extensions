@@ -614,6 +614,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
                                                     int numWarpGroups,
                                                     int numWarpsPerGroup,
                                                     bool roundScale,
+                                                    ncclEpExpertIdKind_t recvTopkIdxKind,
                                                     int phases,
                                                     int numComms,
                                                     ncclDevComm* devComms,
@@ -1025,11 +1026,18 @@ LOW_LATENCY_DISPATCH_RECV:
                 }
 
                 // Each lane writes its own topk entry in parallel.
+                // outRecvTopkIdx: per-rank local expert id (LOCAL) or wire-format
+                // global expert id (GLOBAL) if routed here, else -1. recvTopkIdxKind
+                // must already be resolved (no AUTO) by the host wrapper.
                 EP_DEVICE_ASSERT(outRecvTopkIdx != nullptr && outRecvTopkWeights != nullptr);
+                EP_DEVICE_ASSERT(recvTopkIdxKind == NCCL_EP_EXPERT_ID_LOCAL ||
+                                 recvTopkIdxKind == NCCL_EP_EXPERT_ID_GLOBAL);
                 if (laneId < numTopk) {
-                    int localExpertIdx = (int)recvBufHdr->rtr[laneId].expert_id - globalExpertStartIdx;
+                    int globalExpertIdx = (int)recvBufHdr->rtr[laneId].expert_id;
+                    int localExpertIdx = globalExpertIdx - globalExpertStartIdx;
                     bool valid = (localExpertIdx >= 0 && localExpertIdx < numLocalExperts);
-                    outRecvTopkIdx[slot * numTopk + laneId] = valid ? (int32_t)localExpertIdx : (int32_t)-1;
+                    int writeIdx = (recvTopkIdxKind == NCCL_EP_EXPERT_ID_GLOBAL) ? globalExpertIdx : localExpertIdx;
+                    outRecvTopkIdx[slot * numTopk + laneId] = valid ? (int32_t)writeIdx : (int32_t)-1;
                     outRecvTopkWeights[slot * numTopk + laneId] = recvBufHdr->rtr[laneId].topk_weight;
                 }
 
@@ -1104,6 +1112,7 @@ void dispatch(const void* inData,
               bool roundScale,
               bool useUe8m0,
               ncclEpLayout_t layout,
+              ncclEpExpertIdKind_t recvTopkIdxKind,
               int phases,
               int numComms,
               ncclDevComm* devComms,
@@ -1180,6 +1189,7 @@ LAUNCH_KERNEL(&cfg, (dispatch<fp8, ue8m0, externFp8V, hidden, kLayout, nvlinkOnl
               numWarpGroups, \
               numWarpsPerGroup, \
               roundScale, \
+              recvTopkIdxKind, \
               phases, \
               numComms, \
               devComms, \
@@ -2417,6 +2427,7 @@ template void dispatch<int32_t>(
     void*, void*, const uint8_t*, int*, int*, int64_t*, int*, float*, int32_t*,
     void*, void*, int*, size_t, size_t, size_t, int*, int, int*, int64_t*,
     int, int, int, int, int, int, int, int, bool, bool, bool, ncclEpLayout_t,
+    ncclEpExpertIdKind_t,
     int, int, ncclDevComm*, const ncclWindow_t*, unsigned, void*, int,
     int*, int*, uint64_t, bool, ncclWindow_t, size_t, cudaStream_t);
 
@@ -2425,6 +2436,7 @@ template void dispatch<int64_t>(
     void*, void*, const uint8_t*, int*, int*, int64_t*, int*, float*, int32_t*,
     void*, void*, int*, size_t, size_t, size_t, int*, int, int*, int64_t*,
     int, int, int, int, int, int, int, int, bool, bool, bool, ncclEpLayout_t,
+    ncclEpExpertIdKind_t,
     int, int, ncclDevComm*, const ncclWindow_t*, unsigned, void*, int,
     int*, int*, uint64_t, bool, ncclWindow_t, size_t, cudaStream_t);
 

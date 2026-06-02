@@ -189,6 +189,9 @@ void sparse_to_dense_prob_combine(
 // One thread per token. Output by layout:
 //   FLAT/RM: recv_topk_weights[token, k_out] zero-filled tail; recv_topk_idx parallel.
 //   EM:      recv_topk_weights[token] (single scalar; slot = (token, local_expert)); recv_topk_idx unused.
+// recv_topk_idx numbering: per-rank local id when kind=LOCAL (default), or
+// wire-format global id (= global_expert_offset + local_expert) when kind=GLOBAL.
+// kind must be resolved (no AUTO) by the host wrapper.
 __global__ void dense_to_sparse_prob_kernel(
     const float* __restrict__ dense_prob,              // [num_recv_tokens, experts_per_node]
     const bool* __restrict__ local_expert_routing_map, // [num_recv_tokens, experts_per_rank]
@@ -199,6 +202,8 @@ __global__ void dense_to_sparse_prob_kernel(
     int experts_per_rank,
     int experts_per_node,
     int local_rank,
+    int global_expert_offset,                          // = group_rank * experts_per_rank; added to local id under GLOBAL
+    ncclEpExpertIdKind_t recv_topk_idx_kind,
     bool expert_major
 ) {
     int token = blockIdx.x * blockDim.x + threadIdx.x;
@@ -221,12 +226,19 @@ __global__ void dense_to_sparse_prob_kernel(
 
     int k_out = 0;
 
+    // Caller must resolve AUTO before kernel launch -- the kernel only
+    // understands LOCAL and GLOBAL.
+    EP_DEVICE_ASSERT(recv_topk_idx_kind == NCCL_EP_EXPERT_ID_LOCAL ||
+                     recv_topk_idx_kind == NCCL_EP_EXPERT_ID_GLOBAL);
+
     // Scan local experts (the ones this rank is responsible for)
     for (int e = 0; e < experts_per_rank && k_out < topk; e++) {
         // Check if this token is routed to expert e
         if (local_expert_routing_map[token * experts_per_rank + e]) {
-            // Use local expert id for NCCL API compatibility (expects 0-based local indices)
-            int64_t local_expert = static_cast<int64_t>(e);
+            // Numbering: LOCAL writes within-rank id e; GLOBAL adds the per-group offset.
+            int64_t expert_id = (recv_topk_idx_kind == NCCL_EP_EXPERT_ID_GLOBAL)
+                ? static_cast<int64_t>(global_expert_offset + e)
+                : static_cast<int64_t>(e);
 
             // Get weight from dense output (indexed by local expert within node)
             // dense_prob layout: [token, experts_per_node] where experts_per_node = experts_per_rank * ranks_per_node
@@ -236,7 +248,7 @@ __global__ void dense_to_sparse_prob_kernel(
 
             // Write outputs
             if (recv_topk_idx != nullptr) {
-                recv_topk_idx[token * topk + k_out] = local_expert;
+                recv_topk_idx[token * topk + k_out] = expert_id;
             }
             recv_topk_weights[token * topk + k_out] = weight;
             k_out++;
@@ -304,6 +316,8 @@ void dense_to_sparse_prob(
     int experts_per_rank,
     int experts_per_node,
     int local_rank,
+    int global_expert_offset,
+    ncclEpExpertIdKind_t recv_topk_idx_kind,
     bool expert_major,
     cudaStream_t stream
 ) {
@@ -313,7 +327,7 @@ void dense_to_sparse_prob(
     dense_to_sparse_prob_kernel<<<grid_size, block_size, 0, stream>>>(
         dense_prob, local_expert_routing_map, recv_topk_weights, recv_topk_idx,
         num_recv_tokens, topk, experts_per_rank, experts_per_node, local_rank,
-        expert_major);
+        global_expert_offset, recv_topk_idx_kind, expert_major);
 }
 
 // ============================================================================

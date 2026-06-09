@@ -17,8 +17,8 @@
 #undef NCCL_HOSTLIB_ONLY
 
 #include "reshard_types.h"
-#include "reshard_log.h"
-#include "reshard_checks.h"
+#include "m2n_log.h"
+#include "m2n_checks.h"
 #include "reshard_internal.h"
 
 struct DevCommCacheEntry {
@@ -45,7 +45,7 @@ static DevCommCacheEntry gDevcommCache[MAX_DEVCOMM_CACHE_ENTRIES];
 static int gDevcommCacheCount = 0;
 static int gDevcommCacheNextIdx = 0;
 
-/* CUDA handle lifetimes are tied to ncclXferReshardFinalize() (so we can
+/* CUDA handle lifetimes are tied to ncclM2nFinalize() (so we can
  * destroy them before the CUDA context tears down) — see cacheFinalize.
  * The vector itself just owns memory; handles inside it are released
  * explicitly there before the vector is cleared. */
@@ -66,7 +66,7 @@ static ncclResult_t cacheWindow(WindowCache* cache, ncclComm_t comm, void* windo
     idx = cache->nextIdx;
     WindowCacheEntry& old = cache->entries[idx];
     RESHARD_WARN(-1, "Window cache full (%d entries), replacing entry at index %d", MAX_WINDOW_CACHE_ENTRIES, idx);
-    if (old.valid) NCCLXFER_CHECK_WARN(ncclCommWindowDeregister(old.comm, old.window));
+    if (old.valid) NCCL_M2N_CHECK_WARN(ncclCommWindowDeregister(old.comm, old.window));
     cache->nextIdx = (cache->nextIdx + 1) % MAX_WINDOW_CACHE_ENTRIES;
   } else {
     idx = cache->count++;
@@ -104,7 +104,7 @@ ncclResult_t cacheDevComm(ncclComm_t comm, int numCtas, int signalCount, const n
     idx = gDevcommCacheNextIdx;
     DevCommCacheEntry& old = gDevcommCache[idx];
     RESHARD_WARN(-1, "DevComm cache full (%d entries), replacing entry at index %d", MAX_DEVCOMM_CACHE_ENTRIES, idx);
-    if (old.valid) NCCLXFER_CHECK_WARN(ncclDevCommDestroy(old.comm, &old.devComm));
+    if (old.valid) NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(old.comm, &old.devComm));
     gDevcommCacheNextIdx = (gDevcommCacheNextIdx + 1) % MAX_DEVCOMM_CACHE_ENTRIES;
   } else {
     idx = gDevcommCacheCount++;
@@ -123,7 +123,7 @@ void cacheFinalize() {
   for (int i = 0; i < gInternalWindowCache.count; i++) {
     WindowCacheEntry& e = gInternalWindowCache.entries[i];
     if (e.valid) {
-      NCCLXFER_CHECK_WARN(ncclCommWindowDeregister(e.comm, e.window));
+      NCCL_M2N_CHECK_WARN(ncclCommWindowDeregister(e.comm, e.window));
       e.valid = false;
     }
   }
@@ -133,22 +133,22 @@ void cacheFinalize() {
   for (int i = 0; i < gDevcommCacheCount; i++) {
     DevCommCacheEntry& e = gDevcommCache[i];
     if (e.valid) {
-      NCCLXFER_CHECK_WARN(ncclDevCommDestroy(e.comm, &e.devComm));
+      NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(e.comm, &e.devComm));
       e.valid = false;
     }
   }
   gDevcommCacheCount = 0;
 
   for (StreamPoolEntry& e : gStreamPool) {
-    if (e.event != nullptr) NCCLXFER_CUDACHECK_WARN(cudaEventDestroy(e.event));
-    if (e.stream != nullptr) NCCLXFER_CUDACHECK_WARN(cudaStreamDestroy(e.stream));
+    if (e.event != nullptr) NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(e.event));
+    if (e.stream != nullptr) NCCL_M2N_CUDACHECK_WARN(cudaStreamDestroy(e.stream));
   }
   gStreamPool.clear();
 }
 
 ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream, cudaEvent_t* outEvent) {
   if (outStream == nullptr || outEvent == nullptr) return ncclInvalidArgument;
-  /* Pool disabled (NCCLXFER_RESHARD_STREAM_POOL_SIZE <= 0) — caller
+  /* Pool disabled (NCCL_RESHARD_STREAM_POOL_SIZE <= 0) — caller
    * should have gated on reshardGetStreamPoolSize() > 0; defend
    * anyway so a forgotten gate doesn't UB. */
   const int maxEntries = reshardGetStreamPoolSize();
@@ -167,9 +167,9 @@ ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream
   if ((int)gStreamPool.size() >= maxEntries) {
     RESHARD_WARN(-1,
                  "Stream pool full (%d entries, "
-                 "NCCLXFER_RESHARD_STREAM_POOL_SIZE=%d); "
+                 "NCCL_RESHARD_STREAM_POOL_SIZE=%d); "
                  "falling through to the caller's default stream for this (comm, "
-                 "dev) pair.  Bump NCCLXFER_RESHARD_STREAM_POOL_SIZE if your "
+                 "dev) pair.  Bump NCCL_RESHARD_STREAM_POOL_SIZE if your "
                  "workload "
                  "uses more distinct (comm, dev) pairs.",
                  (int)gStreamPool.size(), maxEntries);
@@ -183,8 +183,8 @@ ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream
   fresh.dev = dev;
   if (cudaStreamCreateWithFlags(&fresh.stream, cudaStreamNonBlocking) != cudaSuccess ||
       cudaEventCreateWithFlags(&fresh.event, cudaEventDisableTiming) != cudaSuccess) {
-    if (fresh.event != nullptr) NCCLXFER_CUDACHECK_WARN(cudaEventDestroy(fresh.event));
-    if (fresh.stream != nullptr) NCCLXFER_CUDACHECK_WARN(cudaStreamDestroy(fresh.stream));
+    if (fresh.event != nullptr) NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(fresh.event));
+    if (fresh.stream != nullptr) NCCL_M2N_CUDACHECK_WARN(cudaStreamDestroy(fresh.stream));
     return ncclSystemError;
   }
   gStreamPool.push_back(fresh);

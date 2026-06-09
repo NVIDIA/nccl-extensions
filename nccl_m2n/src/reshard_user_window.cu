@@ -20,7 +20,7 @@
  *   - Window registered on the input comm (NOT a node-local sub-comm).
  *   - LSA fan-out walks the input comm's LSA team.
  *
- * Algorithm selection follows the NCCLXFER_RESHARD_ALGORITHM env var:
+ * Algorithm selection follows the NCCL_RESHARD_ALGORITHM env var:
  *   RING   -> reshardKernelUserWindow
  *   DIRECT -> directReshardKernelUserWindow
  *   AUTO   -> RING
@@ -36,21 +36,21 @@
 #include "nccl.h"
 #include "nccl_device.h"
 
-#include "nccl_xfer.h"
+#include "nccl_m2n.h"
 #include "reshard_types.h"
-#include "reshard_checks.h"
-#include "reshard_log.h"
+#include "m2n_checks.h"
+#include "m2n_log.h"
 #include "reshard_internal.h"
 #include "reshard_kernels.cuh"
 
-/* Error macros — aliases to the unified definitions in reshard_checks.h. */
-#define UW_NCCLCHECK NCCLXFER_CHECK
-#define UW_CUDACHECK NCCLXFER_CUDACHECK
+/* Error macros — aliases to the unified definitions in m2n_checks.h. */
+#define UW_NCCLCHECK NCCL_M2N_CHECK
+#define UW_CUDACHECK NCCL_M2N_CUDACHECK
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 5)
-#define NCCLXFER_RESHARD_GIN_FINAL_FENCE (ncclGinFenceLevel::Put | ncclGinFenceLevel::Get)
+#define NCCL_RESHARD_GIN_FINAL_FENCE (ncclGinFenceLevel::Put | ncclGinFenceLevel::Get)
 #else
-#define NCCLXFER_RESHARD_GIN_FINAL_FENCE ncclGinFenceLevel::Relaxed
+#define NCCL_RESHARD_GIN_FINAL_FENCE ncclGinFenceLevel::Relaxed
 #endif
 
 // ============================================================================
@@ -89,7 +89,7 @@ static void uwLaunchTranspose2DInner(const void* in, void* out, size_t D0, size_
 // peer pointers via world-rank arithmetic.
 // ============================================================================
 
-__global__ __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void reshardKernelUserWindow(ncclXferReshardParams params,
+__global__ __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void reshardKernelUserWindow(ncclReshardParams params,
                                                                                           struct ncclDevComm devComm) {
   int numContexts = min((int)gridDim.x, (int)devComm.ginContextCount);
   int ctasPerContext = (int)gridDim.x / numContexts;
@@ -133,8 +133,8 @@ __global__ __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void reshardKernelU
     int activeSrcWarps = min(MAX_SRC_WARPS, (int)(blockDim.x / 32));
     if (warpId < activeSrcWarps) {
       for (int t = warpId; t < params.numTargets; t += activeSrcWarps) {
-        ncclXferTargetInfo& target = params.targets[t];
-        ncclXferTransferPlan& plan = target.plan;
+        ncclReshardTargetInfo& target = params.targets[t];
+        ncclReshardTransferPlan& plan = target.plan;
 
         if (plan.totalInnerTransfers == 0) continue;
 
@@ -193,8 +193,8 @@ __global__ __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void reshardKernelU
     const int lsaStartRank = world.rank - lsa.rank;
 
     for (int srcOffset = mySourceGroup; srcOffset < params.numSources && isActive; srcOffset += activeSources) {
-      ncclXferSourceInfo& source = params.sources[srcOffset];
-      ncclXferTransferPlan& plan = source.plan;
+      ncclReshardSourceInfo& source = params.sources[srcOffset];
+      ncclReshardTransferPlan& plan = source.plan;
 
       int barrierId = mySourceGroup;
       ncclCoopWarpSpan warps(groupStartWarp, warpsPerSource, barrierId);
@@ -305,7 +305,7 @@ __global__ __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void reshardKernelU
 #endif
 
   // Final barrier
-  bar.sync(ncclCoopCta(), cuda::memory_order_acquire, NCCLXFER_RESHARD_GIN_FINAL_FENCE);
+  bar.sync(ncclCoopCta(), cuda::memory_order_acquire, NCCL_RESHARD_GIN_FINAL_FENCE);
 }
 
 // ============================================================================
@@ -316,7 +316,7 @@ __global__ __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void reshardKernelU
 __global__
 __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void
 directReshardKernelUserWindow(
-    ncclXferDirectReshardParams params,
+    ncclReshardDirectParams params,
     struct ncclDevComm      devComm)
 // clang-format on
 {
@@ -360,7 +360,7 @@ directReshardKernelUserWindow(
 
     if (isGinWarp) {
       for (int t = 0; t < params.numTargets; t++) {
-        ncclXferDirectTargetInfo& target = params.targets[t];
+        ncclReshardDirectTargetInfo& target = params.targets[t];
 
         if (target.isContiguous) {
           size_t totalBytes = target.totalBytes;
@@ -409,7 +409,7 @@ directReshardKernelUserWindow(
   if (params.isDest && params.numSources > 0) {
     if (warpId == 0) {
       for (int s = 0; s < params.numSources; s++) {
-        ncclXferDirectSourceInfo& source = params.sources[s];
+        ncclReshardDirectSourceInfo& source = params.sources[s];
         unsigned int signalIdx = source.signalBase + blockIdx.x;
         uint64_t initialSignal = initialSignals[s];
 
@@ -436,18 +436,18 @@ directReshardKernelUserWindow(
   gin.flush(ncclCoopCta());
 
   // Final barrier
-  bar.sync(ncclCoopCta(), cuda::memory_order_acquire, NCCLXFER_RESHARD_GIN_FINAL_FENCE);
+  bar.sync(ncclCoopCta(), cuda::memory_order_acquire, NCCL_RESHARD_GIN_FINAL_FENCE);
 }
 
 // ============================================================================
-// Host: ncclXferReshardWithWindow
+// Host: ncclReshardWithWindow
 // ============================================================================
 
-ncclResult_t ncclXferReshardWithWindow(ncclComm_t comm, ncclWindow_t window, const ncclXferDistTensor_t* src,
-                                       const ncclXferDistTensor_t* dst, cudaStream_t stream) {
+ncclResult_t ncclReshardWithWindow(ncclComm_t comm, ncclWindow_t window, const ncclDistTensor_t* src,
+                                       const ncclDistTensor_t* dst, cudaStream_t stream) {
   /* Required handles. */
   if (comm == nullptr || window == nullptr) {
-    fprintf(stderr, "[ncclXferReshardWithWindow] comm and window must both be "
+    fprintf(stderr, "[ncclReshardWithWindow] comm and window must both be "
                     "non-null\n");
     return ncclInvalidArgument;
   }
@@ -457,26 +457,26 @@ ncclResult_t ncclXferReshardWithWindow(ncclComm_t comm, ncclWindow_t window, con
      with dataPtr=NULL (the same convention PyTorch DTensor uses with
      a size-0 local tensor on non-participating ranks). */
   if (src == nullptr || dst == nullptr) {
-    fprintf(stderr, "[ncclXferReshardWithWindow] src and dst tensor descriptors "
+    fprintf(stderr, "[ncclReshardWithWindow] src and dst tensor descriptors "
                     "must both be non-null on every rank (use dataPtr=NULL "
                     "on the side this rank doesn't participate in)\n");
     return ncclInvalidArgument;
   }
   if (src->mesh == nullptr || dst->mesh == nullptr) {
-    fprintf(stderr, "[ncclXferReshardWithWindow] src->mesh and dst->mesh must "
+    fprintf(stderr, "[ncclReshardWithWindow] src->mesh and dst->mesh must "
                     "both be non-null on every rank\n");
     return ncclInvalidArgument;
   }
   if (src->ndims != dst->ndims) {
     fprintf(stderr,
-            "[ncclXferReshardWithWindow] src->ndims (%d) and dst->ndims (%d) "
+            "[ncclReshardWithWindow] src->ndims (%d) and dst->ndims (%d) "
             "must match\n",
             src->ndims, dst->ndims);
     return ncclInvalidArgument;
   }
   if (src->dtype != dst->dtype) {
     fprintf(stderr,
-            "[ncclXferReshardWithWindow] src->dtype (%d) and dst->dtype (%d) "
+            "[ncclReshardWithWindow] src->dtype (%d) and dst->dtype (%d) "
             "must match\n",
             (int)src->dtype, (int)dst->dtype);
     return ncclInvalidArgument;
@@ -487,15 +487,15 @@ ncclResult_t ncclXferReshardWithWindow(ncclComm_t comm, ncclWindow_t window, con
   void* dstBuffer = dst->dataPtr;
   const size_t* srcTensorDims = src->localShape;
   const size_t* dstTensorDims = dst->localShape;
-  const ncclXferReshardMesh_t* srcMesh = src->mesh;
-  const ncclXferReshardMesh_t* dstMesh = dst->mesh;
+  const ncclMesh_t* srcMesh = src->mesh;
+  const ncclMesh_t* dstMesh = dst->mesh;
   if (ndims < 1 || ndims > MAX_TENSOR_DIMS) {
-    fprintf(stderr, "[ncclXferReshardWithWindow] ndims (%d) out of range [1, %d]\n", ndims, MAX_TENSOR_DIMS);
+    fprintf(stderr, "[ncclReshardWithWindow] ndims (%d) out of range [1, %d]\n", ndims, MAX_TENSOR_DIMS);
     return ncclInvalidArgument;
   }
   size_t elementSize = getNcclDtSize(dtype);
   if (elementSize == 0) {
-    fprintf(stderr, "[ncclXferReshardWithWindow] unsupported data type %d\n", (int)dtype);
+    fprintf(stderr, "[ncclReshardWithWindow] unsupported data type %d\n", (int)dtype);
     return ncclInvalidArgument;
   }
 
@@ -503,23 +503,23 @@ ncclResult_t ncclXferReshardWithWindow(ncclComm_t comm, ncclWindow_t window, con
   // computeMeshGroupInfo loses track of the replication dimension.
   // Collapse dims to [total, 1] with placement[1] = SHARD(0) (a no-op
   // shard with count 1) so repMeshDim=0 is always well-defined.
-  auto fixFullyReplicated = [](ncclXferReshardMesh_t* mesh) {
-    if (mesh->placement[0] == NCCLXFER_RESHARD_REPLICATE && mesh->placement[1] == NCCLXFER_RESHARD_REPLICATE) {
+  auto fixFullyReplicated = [](ncclMesh_t* mesh) {
+    if (mesh->placement[0] == NCCL_RESHARD_REPLICATE && mesh->placement[1] == NCCL_RESHARD_REPLICATE) {
       int total = mesh->dims[0] * mesh->dims[1];
       mesh->dims[0] = total;
       mesh->dims[1] = 1;
-      mesh->placement[1] = NCCLXFER_RESHARD_SHARD(0);
+      mesh->placement[1] = NCCL_RESHARD_SHARD(0);
     }
   };
 
-  ncclXferReshardMesh_t srcMeshLocal = *srcMesh;
-  ncclXferReshardMesh_t dstMeshLocal = *dstMesh;
+  ncclMesh_t srcMeshLocal = *srcMesh;
+  ncclMesh_t dstMeshLocal = *dstMesh;
   fixFullyReplicated(&srcMeshLocal);
   fixFullyReplicated(&dstMeshLocal);
   srcMesh = &srcMeshLocal;
   dstMesh = &dstMeshLocal;
 
-  UW_NCCLCHECK(ncclXferReshardInit(nullptr));
+  UW_NCCLCHECK(ncclM2nInit(nullptr));
 
   int worldRank, worldSize;
   UW_NCCLCHECK(ncclCommUserRank(comm, &worldRank));
@@ -534,8 +534,8 @@ ncclResult_t ncclXferReshardWithWindow(ncclComm_t comm, ncclWindow_t window, con
 
   // Default-stream callers run on a library-owned non-blocking
   // stream from the pool; back-edge below makes subsequent default-
-  // stream work observe our completion.  See nccl_xfer.h for the
-  // full contract.  NCCLXFER_RESHARD_STREAM_POOL_SIZE=0 disables this
+  // stream work observe our completion.  See nccl_m2n.h for the
+  // full contract.  NCCL_RESHARD_STREAM_POOL_SIZE=0 disables this
   // (forces legacy synchronizing-default-stream behavior).
   const bool isDefaultStream = (stream == nullptr || stream == cudaStreamLegacy || stream == cudaStreamPerThread);
   const bool wantPool = isDefaultStream && reshardGetStreamPoolSize() > 0;
@@ -573,7 +573,7 @@ ncclResult_t ncclXferReshardWithWindow(ncclComm_t comm, ncclWindow_t window, con
     UW_NCCLCHECK(ncclWinGetUserPtr(comm, window, &winUserPtr));
     if (winUserPtr == nullptr) {
       RESHARD_FATAL(worldRank, "ncclWinGetUserPtr returned nullptr for the supplied window; "
-                               "ncclXferReshardWithWindow requires a symmetric-memory window "
+                               "ncclReshardWithWindow requires a symmetric-memory window "
                                "(NCCL_WIN_COLL_SYMMETRIC).");
     }
 
@@ -691,7 +691,7 @@ ncclResult_t ncclXferReshardWithWindow(ncclComm_t comm, ncclWindow_t window, con
                srcOverride, dstOverride, gpusPerNode, numCtas, ginSignalCount);
 
   // ------------------------------------------------------------------
-  // Convert dims to bytes (matches ncclXferReshardWithWindow's contract for
+  // Convert dims to bytes (matches ncclReshardWithWindow's contract for
   // prepareReshardParams / prepareDirectReshardParams).
   // ------------------------------------------------------------------
   size_t srcDimsBytes[MAX_TENSOR_DIMS] = {0};
@@ -736,8 +736,8 @@ ncclResult_t ncclXferReshardWithWindow(ncclComm_t comm, ncclWindow_t window, con
     effSrcDims[d] = srcDimsBytes[d];
     effDstDims[d] = dstDimsBytes[d];
   }
-  ncclXferReshardMesh_t effSrcMesh = *srcMesh;
-  ncclXferReshardMesh_t effDstMesh = *dstMesh;
+  ncclMesh_t effSrcMesh = *srcMesh;
+  ncclMesh_t effDstMesh = *dstMesh;
   void* effSrcBuffer = srcBuffer;
   void* effDstBuffer = dstBuffer;
   ncclWindow_t effWindow = window;
@@ -761,13 +761,13 @@ ncclResult_t ncclXferReshardWithWindow(ncclComm_t comm, ncclWindow_t window, con
     for (int i = 0; i < 2; i++) {
       if (IS_SHARD_PLACEMENT(effSrcMesh.placement[i])) {
         int td = GET_SHARD_TENSOR_DIM(effSrcMesh.placement[i]);
-        if (td == swapA) effSrcMesh.placement[i] = NCCLXFER_RESHARD_SHARD(swapB);
-        else if (td == swapB) effSrcMesh.placement[i] = NCCLXFER_RESHARD_SHARD(swapA);
+        if (td == swapA) effSrcMesh.placement[i] = NCCL_RESHARD_SHARD(swapB);
+        else if (td == swapB) effSrcMesh.placement[i] = NCCL_RESHARD_SHARD(swapA);
       }
       if (IS_SHARD_PLACEMENT(effDstMesh.placement[i])) {
         int td = GET_SHARD_TENSOR_DIM(effDstMesh.placement[i]);
-        if (td == swapA) effDstMesh.placement[i] = NCCLXFER_RESHARD_SHARD(swapB);
-        else if (td == swapB) effDstMesh.placement[i] = NCCLXFER_RESHARD_SHARD(swapA);
+        if (td == swapA) effDstMesh.placement[i] = NCCL_RESHARD_SHARD(swapB);
+        else if (td == swapB) effDstMesh.placement[i] = NCCL_RESHARD_SHARD(swapA);
       }
     }
 
@@ -841,7 +841,7 @@ ncclResult_t ncclXferReshardWithWindow(ncclComm_t comm, ncclWindow_t window, con
 
     // 6. Register the transpose buffer as a window on comm (cached).
     //    This is collective — all ranks reach it because
-    //    ncclXferReshardWithWindow is itself collective.
+    //    ncclReshardWithWindow is itself collective.
     ncclWindow_t* cached =
       findCachedInternalWindowByPtr(comm, getTransposeBuffer(comm), getTransposeBufferCapacity(comm));
     if (cached != nullptr) {
@@ -905,14 +905,14 @@ ncclResult_t ncclXferReshardWithWindow(ncclComm_t comm, ncclWindow_t window, con
   const size_t kernelOffset = doTranspose ? 0 : (size_t)localOffset;
   std::vector<size_t> allWindowOffsets(worldSize, kernelOffset);
   if (algo == RESHARD_ALGO_DIRECT) {
-    ncclXferDirectReshardParams directParams =
+    ncclReshardDirectParams directParams =
       prepareDirectReshardParams(worldRank, effSrcDims, effDstDims, ndims, &effSrcMesh, &effDstMesh, effWindow,
                                  elementsPerChunk, numCtas, allWindowOffsets.data());
     directParams.myWindowOffset = kernelOffset;
 
     directReshardKernelUserWindow<<<numCtas, threadsPerCta, 0, workStream>>>(directParams, *devCommPtr);
   } else {
-    ncclXferReshardParams ringParams = prepareReshardParams(
+    ncclReshardParams ringParams = prepareReshardParams(
       worldRank, effSrcBuffer, effSrcDims, ndims, &effSrcMesh, effDstBuffer, effDstDims, &effDstMesh, effWindow,
       elementsPerChunk, numCtas, srcGpusPerDomain, dstGpusPerDomain, allWindowOffsets.data());
 

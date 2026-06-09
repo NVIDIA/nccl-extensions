@@ -21,10 +21,10 @@
  *   Efficiency = Speedup / N           (100% = perfectly parallel)
  *
  * Differences from the legacy reshard_batch_bench.cu (MR !16):
- *   - Calls ncclXferReshardWithWindow with a caller-managed window per
+ *   - Calls ncclReshardWithWindow with a caller-managed window per
  *     (comm, buffer) pair, registered ONCE before the sweep and reused
  *     for every (tensor × shard) configuration.
- *   - No per-iteration ncclXferReshardFinalize / library-managed window
+ *   - No per-iteration ncclM2nFinalize / library-managed window
  *     cache — the user-window path skips both.
  *
  * Usage:
@@ -43,7 +43,7 @@
 #include <vector>
 
 #include "bench_common.h"
-#include "nccl_xfer.h"
+#include "nccl_m2n.h"
 
 // ============================================================================
 // Validation kernels (lifted from reshard_bench.cu — same byte pattern)
@@ -403,10 +403,10 @@ int main(int argc, char* argv[]) {
   CUDACHECK(cudaGetDeviceCount(&numDevices));
   CUDACHECK(cudaSetDevice(mpiRank % numDevices));
 
-  if (bVerbose) benchSetEnv("NCCLXFER_RESHARD_LOG_LEVEL", "DEBUG");
-  benchSetEnv("NCCLXFER_RESHARD_ALGORITHM", algorithm);
-  benchSetEnv("NCCLXFER_RESHARD_LB_MODE", lbMode);
-  NCCLCHECK(ncclXferReshardInit(NULL));
+  if (bVerbose) benchSetEnv("NCCL_RESHARD_LOG_LEVEL", "DEBUG");
+  benchSetEnv("NCCL_RESHARD_ALGORITHM", algorithm);
+  benchSetEnv("NCCL_RESHARD_LB_MODE", lbMode);
+  NCCLCHECK(ncclM2nInit(NULL));
 
   // ------------------------------------------------------------------------
   // Create numComms independent NCCL communicators (each covers all ranks)
@@ -477,12 +477,12 @@ int main(int argc, char* argv[]) {
   // Sweep: shard pattern × tensor size
   // ------------------------------------------------------------------------
   for (auto& sc : shardCfgs) {
-    ncclXferReshardMesh_t srcMesh = {.dims = {srcMdims[0], srcMdims[1]},
+    ncclMesh_t srcMesh = {.dims = {srcMdims[0], srcMdims[1]},
                                      .startRank = 0,
-                                     .placement = {NCCLXFER_RESHARD_REPLICATE, NCCLXFER_RESHARD_SHARD(sc.srcSd)}};
-    ncclXferReshardMesh_t dstMesh = {.dims = {dstMdims[0], dstMdims[1]},
+                                     .placement = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(sc.srcSd)}};
+    ncclMesh_t dstMesh = {.dims = {dstMdims[0], dstMdims[1]},
                                      .startRank = srcTotal,
-                                     .placement = {NCCLXFER_RESHARD_REPLICATE, NCCLXFER_RESHARD_SHARD(sc.dstSd)}};
+                                     .placement = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(sc.dstSd)}};
     const char* pattern = (sc.srcSd == sc.dstSd) ? "same-dim" : "cross-dim";
 
     for (auto& tc : tensorCfgs) {
@@ -521,7 +521,7 @@ int main(int argc, char* argv[]) {
 
       // --- one reshard for tensor i on stream s, comm[i % numComms]
       auto oneTransfer = [&](int i, cudaStream_t s) {
-        ncclXferDistTensor_t srcT = {};
+        ncclDistTensor_t srcT = {};
         srcT.ndims = tc.nDims;
         srcT.dtype = ncclInt8; // bench validates byte patterns
         srcT.mesh = &srcMesh;
@@ -529,7 +529,7 @@ int main(int argc, char* argv[]) {
         if (bIsSource)
           for (int d = 0; d < tc.nDims; d++) srcT.localShape[d] = srcLocal[d];
 
-        ncclXferDistTensor_t dstT = {};
+        ncclDistTensor_t dstT = {};
         dstT.ndims = tc.nDims;
         dstT.dtype = ncclInt8;
         dstT.mesh = &dstMesh;
@@ -537,7 +537,7 @@ int main(int argc, char* argv[]) {
         if (bIsDest)
           for (int d = 0; d < tc.nDims; d++) dstT.localShape[d] = dstLocal[d];
 
-        NCCLCHECK(ncclXferReshardWithWindow(comms[i % numComms], windows[i], &srcT, &dstT, s));
+        NCCLCHECK(ncclReshardWithWindow(comms[i % numComms], windows[i], &srcT, &dstT, s));
       };
 
       auto runSequential = [&]() {
@@ -650,7 +650,7 @@ int main(int argc, char* argv[]) {
   // Teardown — deregister windows BEFORE destroying comms.
   // ------------------------------------------------------------------------
   for (int i = 0; i < numTensors; i++) ncclCommWindowDeregister(comms[i % numComms], windows[i]);
-  ncclXferReshardFinalize();
+  ncclM2nFinalize();
   for (auto& b : bufs) NCCLCHECK(ncclMemFree(b));
   for (auto& s : streams) CUDACHECK(cudaStreamDestroy(s));
   CUDACHECK(cudaStreamDestroy(seqStream));

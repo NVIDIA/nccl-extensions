@@ -8,7 +8,7 @@
 /*************************************************************************
  * Tensor Reshard Benchmark (User Window API)
  *
- * Uses ncclXferReshardWithWindow with caller-registered ncclWindow_t.
+ * Uses ncclReshardWithWindow with caller-registered ncclWindow_t.
  *
  * Usage:
  *   mpirun -np <N> reshard_bench [options]
@@ -25,7 +25,7 @@
 #include "bench_common.h"
 #include "bench_common_kernels.h"
 
-#include "nccl_xfer.h"
+#include "nccl_m2n.h"
 
 static void printUsage(const char* prog) {
   printf("Usage: %s [options]\n", prog);
@@ -47,7 +47,7 @@ static void printUsage(const char* prog) {
   printf("  --verbose                        Enable debug output\n");
   printf("  --print-all-ranks                Print per-rank timing\n");
   printf("  --use-default-stream             Pass nullptr to "
-         "ncclXferReshardWithWindow so the\n");
+         "ncclReshardWithWindow so the\n");
   printf("                                   library substitutes a stream from "
          "its internal\n");
   printf("                                   pool — exercises the "
@@ -152,11 +152,11 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  // Configure reshard library via env vars (applied in ncclXferReshardInit).
-  if (verbose) benchSetEnv("NCCLXFER_RESHARD_LOG_LEVEL", "DEBUG");
-  benchSetEnv("NCCLXFER_RESHARD_ALGORITHM", algorithm);
-  benchSetEnv("NCCLXFER_RESHARD_LB_MODE", lbMode);
-  NCCLCHECK(ncclXferReshardInit(NULL));
+  // Configure reshard library via env vars (applied in ncclM2nInit).
+  if (verbose) benchSetEnv("NCCL_RESHARD_LOG_LEVEL", "DEBUG");
+  benchSetEnv("NCCL_RESHARD_ALGORITHM", algorithm);
+  benchSetEnv("NCCL_RESHARD_LB_MODE", lbMode);
+  NCCLCHECK(ncclM2nInit(NULL));
 
   // Validate required parameters
   if (srcMeshDims[0] <= 0 || srcMeshDims[1] <= 0 || dstMeshDims[0] <= 0 || dstMeshDims[1] <= 0 || ndims < 2 ||
@@ -201,7 +201,7 @@ int main(int argc, char* argv[]) {
   // Print configuration
   if (mpiRank == 0) {
     printf("=== Tensor Reshard Benchmark ===\n");
-    printf("Using: ncclXferReshardWithWindow (user window API)\n");
+    printf("Using: ncclReshardWithWindow (user window API)\n");
     printf("Global tensor: [%zu", globalTensorDims[0]);
     for (int d = 1; d < ndims; d++) printf(", %zu", globalTensorDims[d]);
     printf("] (%dD)\n", ndims);
@@ -253,19 +253,19 @@ int main(int argc, char* argv[]) {
   NCCLCHECK(ncclCommWindowRegister(worldComm, buffer, allocSize, &window, NCCL_WIN_COLL_SYMMETRIC));
 
   // Setup mesh structures
-  ncclXferReshardMesh_t srcMesh = {.dims = {srcMeshDims[0], srcMeshDims[1]},
+  ncclMesh_t srcMesh = {.dims = {srcMeshDims[0], srcMeshDims[1]},
                                    .startRank = 0,
-                                   .placement = {NCCLXFER_RESHARD_REPLICATE, NCCLXFER_RESHARD_SHARD(srcShardDim)}};
+                                   .placement = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(srcShardDim)}};
 
-  ncclXferReshardMesh_t dstMesh = {.dims = {dstMeshDims[0], dstMeshDims[1]},
+  ncclMesh_t dstMesh = {.dims = {dstMeshDims[0], dstMeshDims[1]},
                                    .startRank = srcTotal,
-                                   .placement = {NCCLXFER_RESHARD_REPLICATE, NCCLXFER_RESHARD_SHARD(dstShardDim)}};
+                                   .placement = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(dstShardDim)}};
 
   // Create CUDA stream
   cudaStream_t stream;
   CUDACHECK(cudaStreamCreate(&stream));
 
-  // Stream we actually pass to ncclXferReshardWithWindow.  When
+  // Stream we actually pass to ncclReshardWithWindow.  When
   // --use-default-stream is set we pass nullptr, exercising the
   // library's internal stream pool; otherwise we hand the explicit
   // stream through.  Init / validation kernels still use the
@@ -288,7 +288,7 @@ int main(int argc, char* argv[]) {
 
   // Build src/dst descriptors once. dataPtr=NULL is the role signal;
   // localShape entries are zeroed on the side this rank doesn't own.
-  ncclXferDistTensor_t srcTensor = {};
+  ncclDistTensor_t srcTensor = {};
   srcTensor.dataPtr = isSource ? buffer : nullptr;
   srcTensor.ndims = ndims;
   srcTensor.dtype = ncclInt8; // bench validates byte patterns
@@ -296,7 +296,7 @@ int main(int argc, char* argv[]) {
   if (isSource)
     for (int d = 0; d < ndims; d++) srcTensor.localShape[d] = srcLocalDims[d];
 
-  ncclXferDistTensor_t dstTensor = {};
+  ncclDistTensor_t dstTensor = {};
   dstTensor.dataPtr = isDest ? buffer : nullptr;
   dstTensor.ndims = ndims;
   dstTensor.dtype = ncclInt8;
@@ -308,7 +308,7 @@ int main(int argc, char* argv[]) {
   // return so a contract violation (null window, mismatched offsets, etc.)
   // fails the bench instead of being silently dropped.
   auto runOneIteration = [&]() {
-    NCCLCHECK(ncclXferReshardWithWindow(worldComm, window, &srcTensor, &dstTensor, reshardStream));
+    NCCLCHECK(ncclReshardWithWindow(worldComm, window, &srcTensor, &dstTensor, reshardStream));
   };
 
   // Warmup
@@ -463,7 +463,7 @@ int main(int argc, char* argv[]) {
   // Cleanup order matters: deregister window, finalize library, then free
   // the buffer.
   ncclCommWindowDeregister(worldComm, window);
-  ncclXferReshardFinalize();
+  ncclM2nFinalize();
   NCCLCHECK(ncclMemFree(buffer));
   CUDACHECK(cudaStreamDestroy(stream));
   ncclCommDestroy(worldComm);

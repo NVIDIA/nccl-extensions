@@ -15,21 +15,21 @@
  * Not part of the public C API — intentionally kept inside src/.
  ************************************************************************/
 
-#ifndef NCCLXFER_RESHARD_INTERNAL_H_
-#define NCCLXFER_RESHARD_INTERNAL_H_
+#ifndef NCCL_RESHARD_INTERNAL_H_
+#define NCCL_RESHARD_INTERNAL_H_
 
-#include "nccl_xfer.h"
+#include "nccl_m2n.h"
 #include "reshard_types.h"
-#include "reshard_log.h"
+#include "m2n_log.h"
 
 struct ncclDevComm;
 
 /* ======================================================================
  * Global configuration (inline — getters fold into a single load).
  *
- * Initial values are library defaults.  ncclXferReshardInit applies the
- * ncclXferReshardConfig_t (if non-NULL) and then env vars in
- * reshard_config.cc.  Env vars always win.
+ * Initial values are library defaults.  ncclM2nInit applies the
+ * ncclM2nConfig_t (if non-NULL) and then env vars in
+ * m2n_config.cc.  Env vars always win.
  * ====================================================================*/
 
 inline int gReshardGpusPerNode = 8;
@@ -41,13 +41,13 @@ inline ReshardLoadBalanceMode gReshardLbMode = RESHARD_LB_UNIFORM;
 /* Upper bound on pickNumCtas() output.  0 = unset (use DEFAULT_NUM_CTAS). */
 inline int gReshardMaxCta = 0;
 
-/* Resolved CTA count, computed once at ncclXferReshardInit from
+/* Resolved CTA count, computed once at ncclM2nInit from
  * gReshardMaxCta + DEFAULT_NUM_CTAS.  pickNumCtas reads this directly -
  * no per-call branch. */
 inline int gReshardNumCtas = DEFAULT_NUM_CTAS;
 
-/* Stream pool size populated at ncclXferReshardInit from
- *   NCCLXFER_RESHARD_STREAM_POOL_SIZE   (int, default 4)
+/* Stream pool size populated at ncclM2nInit from
+ *   NCCL_RESHARD_STREAM_POOL_SIZE   (int, default 4)
  * Maximum number of distinct (ncclComm_t, cuda device) pairs the
  * pool will hold a stream+event for.  1:1 mapping — one stream and
  * one back-edge event per entry.  Values <= 0 disable the pool
@@ -58,7 +58,7 @@ inline int gReshardNumCtas = DEFAULT_NUM_CTAS;
 inline int gReshardStreamPoolSize = 4;
 
 /* Byte-level chunk size used by the RING prepare path. Default is
- * CHUNK_SIZE_BYTES; overridable via NCCLXFER_RESHARD_CHUNK_SIZE.
+ * CHUNK_SIZE_BYTES; overridable via NCCL_RESHARD_CHUNK_SIZE.
  * Parsed once at init-time in applyReshardEnv — keeps prepareReshardParams
  * off the getenv path on every call. 0 means "use the compile-time default". */
 inline size_t gReshardChunkSizeBytes = 0;
@@ -83,14 +83,14 @@ inline int reshardGetStreamPoolSize() {
 }
 
 /* ======================================================================
- * reshard_config.cc — configuration appliers
+ * m2n_config.cc — configuration appliers
  *
- * Applied in order from ncclXferReshardInit; env always overrides config.
+ * Applied in order from ncclM2nInit; env always overrides config.
  * ====================================================================*/
-ncclResult_t applyReshardConfig(const ncclXferReshardConfig_t* config);
+ncclResult_t applyReshardConfig(const ncclM2nConfig_t* config);
 void applyReshardEnv();
 
-/* Element-size lookup for the dtypes accepted by ncclXferReshardWithWindow.
+/* Element-size lookup for the dtypes accepted by ncclReshardWithWindow.
  * Returns 0 for unsupported dtypes (the API rejects them at call time). */
 inline size_t getNcclDtSize(ncclDataType_t t) {
   switch (t) {
@@ -119,7 +119,7 @@ inline size_t getNcclDtSize(ncclDataType_t t) {
  * Picker stubs for numCtas / elementsPerChunk
  *
  * Currently constant — return the value resolved once at
- * ncclXferReshardInit.  Signature intentionally future-aware
+ * ncclM2nInit.  Signature intentionally future-aware
  * (`bytesPerRank`, `algo`) so an input-aware heuristic can drop in
  * without a caller change.
  * ====================================================================*/
@@ -158,7 +158,7 @@ ncclResult_t cacheInternalWindow(ncclComm_t comm, void* buffer, size_t size, ncc
  * Destroy} per reshard.
  *
  * Pool-full fall-through: if a new (comm, dev) entry would exceed
- * NCCLXFER_RESHARD_STREAM_POOL_SIZE, returns ncclSuccess with *outStream
+ * NCCL_RESHARD_STREAM_POOL_SIZE, returns ncclSuccess with *outStream
  * and *outEvent both set to nullptr (warns once).  Callers should
  * check that and run on the caller's default stream directly. */
 ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream, cudaEvent_t* outEvent);
@@ -171,9 +171,9 @@ void cacheFinalize();
 
 void computeStrides(const size_t dims[], int ndims, size_t strides[]);
 
-void computeMeshGroupInfo(const ncclXferReshardMesh_t* mesh, int worldRank, ncclXferMeshGroupInfo* info);
+void computeMeshGroupInfo(const ncclMesh_t* mesh, int worldRank, ncclReshardMeshGroupInfo* info);
 
-int getMeshRank(const ncclXferReshardMesh_t* mesh, const ncclXferMeshGroupInfo* info, int shardIdx, int repIdx);
+int getMeshRank(const ncclMesh_t* mesh, const ncclReshardMeshGroupInfo* info, int shardIdx, int repIdx);
 
 void computeGlobalRange(const size_t localDims[], int ndims, int shardTensorDim, int shardIdx, size_t globalStart[],
                         size_t globalEnd[]);
@@ -183,35 +183,35 @@ bool computeOverlap(const size_t srcStart[], const size_t srcEnd[], const size_t
 
 void computeTransferPlan(const size_t srcDims[], const size_t srcStrides[], int srcShardDim, int srcShardIdx,
                          const size_t dstDims[], const size_t dstStrides[], int dstShardDim, int dstShardIdx, int ndims,
-                         size_t elementsPerChunk, ncclXferTransferPlan* plan);
+                         size_t elementsPerChunk, ncclReshardTransferPlan* plan);
 
 /* ======================================================================
  * reshard_loadbalance.cc — Replication load balancer
  * ====================================================================*/
 
-int getNodeOfDestRep(const ncclXferRepLoadBalancer* lb, int dstRepIdx);
-int getNumDestNodes(const ncclXferRepLoadBalancer* lb);
+int getNodeOfDestRep(const ncclReshardRepLoadBalancer* lb, int dstRepIdx);
+int getNumDestNodes(const ncclReshardRepLoadBalancer* lb);
 
-void getDestRepsOnNode(const ncclXferRepLoadBalancer* lb, int targetNode, int* repStart, int* repEnd);
+void getDestRepsOnNode(const ncclReshardRepLoadBalancer* lb, int targetNode, int* repStart, int* repEnd);
 
-void getDestRepsOnNodeRange(const ncclXferRepLoadBalancer* lb, int firstNode, int lastNode, int* repStart, int* repEnd);
+void getDestRepsOnNodeRange(const ncclReshardRepLoadBalancer* lb, int firstNode, int lastNode, int* repStart, int* repEnd);
 
-void getTargetRepRange(const ncclXferRepLoadBalancer* lb, int srcRepIdx, int* repStart, int* repEnd);
+void getTargetRepRange(const ncclReshardRepLoadBalancer* lb, int srcRepIdx, int* repStart, int* repEnd);
 
-int getSourceRepForDest(const ncclXferRepLoadBalancer* lb, int dstRepIdx);
+int getSourceRepForDest(const ncclReshardRepLoadBalancer* lb, int dstRepIdx);
 
 /* ======================================================================
  * reshard_prepare.cc — Kernel parameter builders
  * ====================================================================*/
 
-ncclXferReshardParams prepareReshardParams(
-  int worldRank, const void* srcBuffer, const size_t srcTensorDims[], int ndims, const ncclXferReshardMesh_t* srcMesh,
-  const void* dstBuffer, const size_t dstTensorDims[], const ncclXferReshardMesh_t* dstMesh, ncclWindow_t window,
+ncclReshardParams prepareReshardParams(
+  int worldRank, const void* srcBuffer, const size_t srcTensorDims[], int ndims, const ncclMesh_t* srcMesh,
+  const void* dstBuffer, const size_t dstTensorDims[], const ncclMesh_t* dstMesh, ncclWindow_t window,
   size_t elementsPerChunk, int numCtas, int srcGpusPerDomain, int dstGpusPerDomain, const size_t* allWindowOffsets);
 
-ncclXferDirectReshardParams prepareDirectReshardParams(
+ncclReshardDirectParams prepareDirectReshardParams(
   int worldRank, const size_t srcTensorDims[], const size_t dstTensorDims[], int ndims,
-  const ncclXferReshardMesh_t* srcMesh, const ncclXferReshardMesh_t* dstMesh, ncclWindow_t window,
+  const ncclMesh_t* srcMesh, const ncclMesh_t* dstMesh, ncclWindow_t window,
   size_t elementsPerChunk, int numCtas, const size_t* allWindowOffsets);
 
 /* ======================================================================
@@ -227,4 +227,4 @@ size_t getTransposeBufferCapacity(ncclComm_t comm);
 void transposeBufferFinalize();
 ncclResult_t transposeBufferRecordEvent(ncclComm_t comm, cudaStream_t stream);
 
-#endif /* NCCLXFER_RESHARD_INTERNAL_H_ */
+#endif /* NCCL_RESHARD_INTERNAL_H_ */

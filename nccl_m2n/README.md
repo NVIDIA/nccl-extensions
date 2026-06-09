@@ -1,6 +1,6 @@
-# NCCL Xfer
+# NCCL M2N
 
-NCCL Xfer is an experimental, standalone NCCL-based library for cross-group
+NCCL M2N is an experimental, standalone NCCL-based library for cross-group
 GPU data movement. This preview contains the **reshard** functionality: redistribute a
 global tensor between two disjoint groups of GPU processes (the source group
 holds one sharding / replication layout, the destination group holds
@@ -8,10 +8,8 @@ another), with a single call that moves the data with no host involvement.
 
 The library is built on NCCL's user-window API (`ncclWindow_t` +
 `ncclMemAlloc`), so transfers are zero-copy and one-sided. The single public
-entry point for this release is `ncclXferReshardWithWindow`. The shared library is
-installed as `libnccl_xfer.so`; the public header is `nccl_xfer.h`, while the
-`ncclXferReshard*` symbols carry both the library prefix (`ncclXfer`) and the
-functional scope (`Reshard`).
+entry point for this release is `ncclReshardWithWindow`. The shared library is
+installed as `libnccl_m2n.so`; the public header is `nccl_m2n.h`.
 
 > **Status.** Experimental — see [RELEASE.md](RELEASE.md) for the full list of
 > known limitations and the supported tensor-rank / mesh-size envelope. Depends
@@ -34,10 +32,10 @@ functional scope (`Reshard`).
 A typical caller has two disjoint sets of ranks (e.g. trainer ranks and
 inference / generator ranks) inside one NCCL communicator. Each side owns a
 local tile of the same logical tensor under a different layout. One call to
-`ncclXferReshardWithWindow` reshapes the tile on every destination rank to match
+`ncclReshardWithWindow` reshapes the tile on every destination rank to match
 the destination layout.
 
-**Mesh** (`ncclXferReshardMesh_t`) — describes one side's rank topology. It is
+**Mesh** (`ncclMesh_t`) — describes one side's rank topology. It is
 always 2-axis:
 
 ```c
@@ -45,13 +43,13 @@ typedef struct {
     int dims[2];        // axis-0 size × axis-1 size = number of ranks on this side
     int startRank;     // first global rank that belongs to this mesh
     int placement[2];   // per-axis role: REPLICATE or SHARD(tensor_dim)
-} ncclXferReshardMesh_t;
+} ncclMesh_t;
 ```
 
 `placement[i]` is one of:
 
-- `NCCLXFER_RESHARD_REPLICATE` — the mesh axis replicates the tensor.
-- `NCCLXFER_RESHARD_SHARD(d)`  — the mesh axis shards along tensor dim `d`.
+- `NCCL_RESHARD_REPLICATE` — the mesh axis replicates the tensor.
+- `NCCL_RESHARD_SHARD(d)`  — the mesh axis shards along tensor dim `d`.
 
 Exactly **one** axis per mesh should be a SHARD (the other a REPLICATE) for a
 sharded layout. For full replication, encode it as a 1-shard layout (mesh axis
@@ -84,8 +82,8 @@ Two build paths are shipped side-by-side — pick either; both produce the
 same artifacts under `build/lib/` and `build/bin/`.
 
 ```bash
-git clone <repo-url> nccl-xfer
-cd nccl-xfer
+git clone <repo-url> nccl-m2n
+cd nccl-m2n
 
 # 1. Point at your NCCL build
 export NCCL_HOME=/path/to/nccl/build
@@ -95,7 +93,7 @@ export NCCL_HOME=/path/to/nccl/build
 
 ```bash
 # 2a. Build the shared library
-make                                       # → build/lib/libnccl_xfer.so
+make                                       # → build/lib/libnccl_m2n.so
 
 # 3a. Build the canonical single-layer benchmark (also a worked example)
 make reshard                               # → build/bin/reshard_bench
@@ -108,8 +106,8 @@ make reshard                               # → build/bin/reshard_bench
 ```bash
 # 2b. Configure + build everything (library + bench + tests)
 cmake -B build -DNCCL_HOME="$NCCL_HOME" \
-      -DNCCL_XFER_BUILD_BENCH=ON \
-      -DNCCL_XFER_BUILD_TESTS=ON
+      -DNCCL_M2N_BUILD_BENCH=ON \
+      -DNCCL_M2N_BUILD_TESTS=ON
 cmake --build build -j
 
 # Library only (faster):
@@ -126,7 +124,7 @@ A complete walk-through lives in `benchmarks/reshard_bench.cc`; a minimal
 sketch:
 
 ```cpp
-#include "nccl_xfer.h"
+#include "nccl_m2n.h"
 
 // Caller-allocated, communicator-wide symmetric buffer (sized to the worst
 // case across all reshard calls that will use this comm).
@@ -140,20 +138,20 @@ ncclCommWindowRegister(comm, buffer, max_local_bytes, &window,
 
 // Initialize the reshard library. Optional config struct lets you set
 // maxCta; everything else is env-driven (see "Tuning" below).
-ncclXferReshardConfig_t cfg = NCCLXFER_RESHARD_CONFIG_INITIALIZER;
+ncclM2nConfig_t cfg = NCCL_M2N_CONFIG_INITIALIZER;
 cfg.maxCta = 8;
-ncclResult_t r = ncclXferReshardInit(&cfg);  // or ncclXferReshardInit(NULL) for defaults
+ncclResult_t r = ncclM2nInit(&cfg);  // or ncclM2nInit(NULL) for defaults
 if (r != ncclSuccess) { /* handle */ }
 
 // Describe the two layouts. Example: 8 ranks split 4 src / 4 dst, both
 // 1×4 1-D meshes that shard the outer tensor dim.
-ncclXferReshardMesh_t src_mesh = {
+ncclMesh_t src_mesh = {
     .dims = {1, 4}, .startRank = 0,
-    .placement = {NCCLXFER_RESHARD_REPLICATE, NCCLXFER_RESHARD_SHARD(0)},
+    .placement = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(0)},
 };
-ncclXferReshardMesh_t dst_mesh = {
+ncclMesh_t dst_mesh = {
     .dims = {1, 4}, .startRank = 4,
-    .placement = {NCCLXFER_RESHARD_REPLICATE, NCCLXFER_RESHARD_SHARD(0)},
+    .placement = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(0)},
 };
 
 // Pack the per-side tensor descriptors. localShape entries are in
@@ -161,14 +159,14 @@ ncclXferReshardMesh_t dst_mesh = {
 // NULL on the side this rank doesn't participate in (mirroring PyTorch
 // DTensor's size-0 local tensor for non-participating ranks).  mesh is
 // always required.
-ncclXferDistTensor_t src = {
+ncclDistTensor_t src = {
     .dataPtr    = is_source ? buffer : NULL,
     .localShape = {256, 1024, 0},
     .ndims       = 2,
     .dtype       = ncclFloat32,
     .mesh        = &src_mesh,
 };
-ncclXferDistTensor_t dst = {
+ncclDistTensor_t dst = {
     .dataPtr    = is_dest ? buffer : NULL,
     .localShape = {256, 1024, 0},
     .ndims       = 2,
@@ -176,12 +174,12 @@ ncclXferDistTensor_t dst = {
     .mesh        = &dst_mesh,
 };
 
-ncclXferReshardWithWindow(comm, window, &src, &dst, stream);
+ncclReshardWithWindow(comm, window, &src, &dst, stream);
 
 // Tear down.
 ncclCommWindowDeregister(comm, window);
 ncclMemFree(buffer);
-ncclXferReshardFinalize();    // releases internal caches + transpose buffer
+ncclM2nFinalize();    // releases internal caches + transpose buffer
 ```
 
 The window must be registered on the **full** communicator regardless
@@ -192,12 +190,12 @@ of whether this rank's `dataPtr` is NULL on either side.
 ## Public API Reference
 
 ```c
-#include "nccl_xfer.h"
+#include "nccl_m2n.h"
 ```
 
 ### DistTensor
 
-`ncclXferDistTensor_t` ("Distributed Tensor") names the same abstraction
+`ncclDistTensor_t` ("Distributed Tensor") names the same abstraction
 training frameworks use: a logical tensor that is split across many
 GPUs under a per-rank layout (sharded along one or more dimensions,
 replicated on others), where each rank only ever holds and operates on
@@ -207,18 +205,18 @@ its local tile.  The closest public analogues are **PyTorch DTensor**
 here (`REPLICATE`, `SHARD(d)`) maps 1-to-1 onto PyTorch's `Replicate()`
 and `Shard(d)`.  Both PyTorch and JAX bundle the topology with the
 per-rank tile (DTensor's `_spec.mesh`, JAX's `Array.sharding.mesh`),
-and `ncclXferDistTensor_t` follows that convention: data + shape + dtype +
+and `ncclDistTensor_t` follows that convention: data + shape + dtype +
 mesh in one descriptor.
 
 ```c
 typedef struct {
     void*                     dataPtr;        // local buffer; NULL if this rank
                                                //   doesn't participate on this side
-    size_t                    localShape[NCCLXFER_RESHARD_MAX_TENSOR_DIMS];  // elements
+    size_t                    localShape[NCCL_RESHARD_MAX_TENSOR_DIMS];  // elements
     int                       ndims;           // 1..3
     ncclDataType_t            dtype;           // element type
-    const ncclXferReshardMesh_t*  mesh;            // topology + placement (caller-owned)
-} ncclXferDistTensor_t;
+    const ncclMesh_t*  mesh;            // topology + placement (caller-owned)
+} ncclDistTensor_t;
 ```
 
 `dtype` selects the element size. Supported: `ncclInt8`, `ncclUint8`,
@@ -237,25 +235,25 @@ which-shard.
 ### Reshard
 
 ```c
-ncclResult_t ncclXferReshardWithWindow(
+ncclResult_t ncclReshardWithWindow(
     ncclComm_t                comm,    // contains all ranks (src + dst)
     ncclWindow_t              window,  // registered on comm
-    const ncclXferDistTensor_t*   src,     // source-side descriptor
-    const ncclXferDistTensor_t*   dst,     // destination-side descriptor
+    const ncclDistTensor_t*   src,     // source-side descriptor
+    const ncclDistTensor_t*   dst,     // destination-side descriptor
     cudaStream_t              stream   // explicit stream, or default-stream sentinel
 );
 ```
 
 CTA count defaults to `DEFAULT_NUM_CTAS = 8` and can be capped with
-`config.maxCta` / `NCCLXFER_RESHARD_MAX_CTA`. Chunking defaults to
+`config.maxCta` / `NCCL_RESHARD_MAX_CTA`. Chunking defaults to
 `DEFAULT_ELEMENTS_PER_CHUNK = 32`; the RING path also honors
-`NCCLXFER_RESHARD_CHUNK_SIZE` as a byte-level chunk override.
+`NCCL_RESHARD_CHUNK_SIZE` as a byte-level chunk override.
 
 **Preconditions** (return `ncclInvalidArgument` if violated, except where
 noted otherwise):
 
 - `comm`, `window`, `src`, `dst`, `src->mesh`, `dst->mesh` are non-NULL.
-- `src->ndims == dst->ndims`, both in `1..NCCLXFER_RESHARD_MAX_TENSOR_DIMS`
+- `src->ndims == dst->ndims`, both in `1..NCCL_RESHARD_MAX_TENSOR_DIMS`
   (currently 3; 4-D is not supported).
 - `src->dtype == dst->dtype` and is a supported dtype (see list above).
 - `window` is registered on `comm` itself with `NCCL_WIN_COLL_SYMMETRIC`.
@@ -282,8 +280,8 @@ communicators for concurrent transfers; the batched benchmark does this with
 ### Lifecycle
 
 ```c
-ncclResult_t ncclXferReshardInit(ncclXferReshardConfig_t* config); // idempotent; NULL = defaults
-ncclResult_t ncclXferReshardFinalize(void); // releases caches + transpose buffer
+ncclResult_t ncclM2nInit(ncclM2nConfig_t* config); // idempotent; NULL = defaults
+ncclResult_t ncclM2nFinalize(void); // releases caches + transpose buffer
 ```
 
 `Finalize` should be called before the process exits to release the device
@@ -292,10 +290,10 @@ leaked device memory at process teardown.
 
 ### Library configuration
 
-Modeled after `ncclConfig_t`. Fill an `ncclXferReshardConfig_t` with
-`NCCLXFER_RESHARD_CONFIG_INITIALIZER`, override the fields you care about,
-and pass a pointer to `ncclXferReshardInit()`. `NULL` means "all defaults".
-Fields left at `NCCLXFER_RESHARD_CONFIG_UNDEF_INT` keep the library default.
+Modeled after `ncclConfig_t`. Fill an `ncclM2nConfig_t` with
+`NCCL_M2N_CONFIG_INITIALIZER`, override the fields you care about,
+and pass a pointer to `ncclM2nInit()`. `NULL` means "all defaults".
+Fields left at `NCCL_M2N_CONFIG_UNDEF_INT` keep the library default.
 
 | Field    | Purpose |
 |---|---|
@@ -311,31 +309,31 @@ Both Make and CMake are supported; pick the one that fits your toolchain.
 
 | Target | Output | Notes |
 |---|---|---|
-| `make` / `make lib`             | `build/lib/libnccl_xfer.so`                  | Library only; no MPI link. |
+| `make` / `make lib`             | `build/lib/libnccl_m2n.so`                  | Library only; no MPI link. |
 | `make reshard`                  | `build/bin/reshard_bench`                | Single-layer bench (links MPI). |
 | `make reshard_batch_user_window` | `build/bin/reshard_batch_bench_user_window` | Batched/concurrent comm sweep. |
 | `make reshard_model`            | `build/bin/reshard_model_bench`           | Config-driven model transfer bench (links MPI). |
 | `make bench`                    | All bench binaries above                    | |
 | `make bench reshard`            | Equivalent to `make reshard`                | Sub-name picker, see `make help`. |
 | `make tests`                    | `basic_api_test_{mpi,local}`                | C-level functional matrix. |
-| `make install`                  | Copies `lib` + `nccl_xfer.h` to `$PREFIX`  | Defaults `PREFIX=/usr/local`. |
+| `make install`                  | Copies `lib` + `nccl_m2n.h` to `$PREFIX`  | Defaults `PREFIX=/usr/local`. |
 | `make clean`                    | `rm -rf build/`                             | |
 
 ### CMake targets
 
 ```bash
 cmake -B build -DNCCL_HOME="$NCCL_HOME" \
-      [-DNCCL_XFER_BUILD_BENCH=ON] [-DNCCL_XFER_BUILD_TESTS=ON]
+      [-DNCCL_M2N_BUILD_BENCH=ON] [-DNCCL_M2N_BUILD_TESTS=ON]
 cmake --build build -j [--target <name>]
 ```
 
 | `--target` | Output | Notes |
 |---|---|---|
-| *(default)*           | `build/lib/libnccl_xfer.{so,a}`            | Builds all configured targets. |
-| `nccl_xfer_shared`    | `build/lib/libnccl_xfer.so`                | Library only. |
-| `nccl_xfer_static`    | `build/lib/libnccl_xfer.a`                 | Static archive. |
-| `reshard_bench` *etc.* | `build/bin/<name>`                        | Requires `-DNCCL_XFER_BUILD_BENCH=ON`. |
-| `basic_api_test_*`    | `build/bin/<name>`                         | Requires `-DNCCL_XFER_BUILD_TESTS=ON`. |
+| *(default)*           | `build/lib/libnccl_m2n.{so,a}`            | Builds all configured targets. |
+| `nccl_m2n_shared`    | `build/lib/libnccl_m2n.so`                | Library only. |
+| `nccl_m2n_static`    | `build/lib/libnccl_m2n.a`                 | Static archive. |
+| `reshard_bench` *etc.* | `build/bin/<name>`                        | Requires `-DNCCL_M2N_BUILD_BENCH=ON`. |
+| `basic_api_test_*`    | `build/bin/<name>`                         | Requires `-DNCCL_M2N_BUILD_TESTS=ON`. |
 | `unit_tests`          | `build/bin/unit_tests`                     | Private CI gtest suite; links library SRCs directly. |
 | `install`             | Copies `lib` + headers to `CMAKE_INSTALL_PREFIX` | Defaults `/usr/local`. |
 
@@ -644,27 +642,27 @@ not fail the run.
 
 **Algorithm**
 
-- `NCCLXFER_RESHARD_ALGORITHM=AUTO` (default) — currently falls through to `RING`; no
+- `NCCL_RESHARD_ALGORITHM=AUTO` (default) — currently falls through to `RING`; no
   NVL-domain auto-detection in this build.
-- `NCCLXFER_RESHARD_ALGORITHM=RING` — hierarchical ring + intra-NVL fan-out via the input
+- `NCCL_RESHARD_ALGORITHM=RING` — hierarchical ring + intra-NVL fan-out via the input
   comm's window. Best for cross-NVL transfers and scales linearly with
   bandwidth.
-- `NCCLXFER_RESHARD_ALGORITHM=DIRECT` — every src rank issues GIN puts directly to every
+- `NCCL_RESHARD_ALGORITHM=DIRECT` — every src rank issues GIN puts directly to every
   dst rank. Lower latency for small transfers; higher pressure on the NIC
   and on the prepare-time fan-out.
 
 **Load balance**
 
-- `NCCLXFER_RESHARD_LB_MODE=UNIFORM` (default) — splits work evenly by rank count.
-- `NCCLXFER_RESHARD_LB_MODE=NODE_AWARE` — bias the assignment so each NVL domain serves
+- `NCCL_RESHARD_LB_MODE=UNIFORM` (default) — splits work evenly by rank count.
+- `NCCL_RESHARD_LB_MODE=NODE_AWARE` — bias the assignment so each NVL domain serves
   its local peers first; benefits cross-NVL fan-in.
 
 **CTA count and chunk granularity** — CTA count resolves once during
-`ncclXferReshardInit`: built-in default 8, then optional `config.maxCta`, then
-`NCCLXFER_RESHARD_MAX_CTA` if set. `pickElementsPerChunk` currently returns the
+`ncclM2nInit`: built-in default 8, then optional `config.maxCta`, then
+`NCCL_RESHARD_MAX_CTA` if set. `pickElementsPerChunk` currently returns the
 compile-time default (`DEFAULT_ELEMENTS_PER_CHUNK = 32`). The RING prepare path
 also uses `CHUNK_SIZE_BYTES` (256 KB) as a byte-level chunk size, overridable
-per-process via `NCCLXFER_RESHARD_CHUNK_SIZE` (bytes).
+per-process via `NCCL_RESHARD_CHUNK_SIZE` (bytes).
 
 **Cross-dim transpose** — when cross-dim sharding would produce per-rank
 inner strides below `CROSS_DIM_TRANSPOSE_THRESHOLD` (256 KB), the library
@@ -675,19 +673,19 @@ large. Applies to both 2-D and 3-D tensors; transparent to callers.
 
 ## Runtime environment variables
 
-Most env vars are read once in `ncclXferReshardInit`. Env vars always override
-matching fields of `ncclXferReshardConfig_t` (matches upstream NCCL's
-`envConfigOverride` precedence). `NCCLXFER_RESHARD_CHUNK_SIZE` is read by the RING
+Most env vars are read once in `ncclM2nInit`. Env vars always override
+matching fields of `ncclM2nConfig_t` (matches upstream NCCL's
+`envConfigOverride` precedence). `NCCL_RESHARD_CHUNK_SIZE` is read by the RING
 prepare path for each call.
 
 | Variable | Effect |
 |---|---|
-| `NCCLXFER_RESHARD_LOG_LEVEL`        | One of `NONE`, `WARN` (default), `INFO`, `DEBUG`, `TRACE`. |
-| `NCCLXFER_RESHARD_ALGORITHM`        | `AUTO` (default), `RING`, or `DIRECT`. |
-| `NCCLXFER_RESHARD_LB_MODE`          | `UNIFORM` (default) or `NODE_AWARE`. |
-| `NCCLXFER_RESHARD_MAX_CTA`          | Overrides `config.maxCta`. |
-| `NCCLXFER_RESHARD_STREAM_POOL_SIZE` | Max distinct `(comm, dev)` entries in the internal stream pool (default 4). |
-| `NCCLXFER_RESHARD_CHUNK_SIZE`       | Override the library's default chunk size in **bytes**. |
+| `NCCL_RESHARD_LOG_LEVEL`        | One of `NONE`, `WARN` (default), `INFO`, `DEBUG`, `TRACE`. |
+| `NCCL_RESHARD_ALGORITHM`        | `AUTO` (default), `RING`, or `DIRECT`. |
+| `NCCL_RESHARD_LB_MODE`          | `UNIFORM` (default) or `NODE_AWARE`. |
+| `NCCL_RESHARD_MAX_CTA`          | Overrides `config.maxCta`. |
+| `NCCL_RESHARD_STREAM_POOL_SIZE` | Max distinct `(comm, dev)` entries in the internal stream pool (default 4). |
+| `NCCL_RESHARD_CHUNK_SIZE`       | Override the library's default chunk size in **bytes**. |
 
 ---
 
@@ -696,21 +694,21 @@ prepare path for each call.
 ```
 .
 ├── src/                                  # Library
-│   ├── nccl_xfer.h                    # Unified public C API (the only header callers need)
+│   ├── nccl_m2n.h                    # Unified public C API (the only header callers need)
 │   ├── reshard_internal.h                # Cross-TU function declarations (internal)
 │   ├── reshard_types.h                   # Internal struct definitions
 │   ├── reshard_limits.h                  # Compile-time constants (MAX_*, defaults)
-│   ├── reshard_log.h                     # RESHARD_LOG / RESHARD_DEBUG tier macros
-│   ├── reshard_checks.h                  # Error-checking macros
+│   ├── m2n_log.h                         # RESHARD_LOG / RESHARD_DEBUG tier macros
+│   ├── m2n_checks.h                      # Error-checking macros
 │   ├── reshard_kernels.cuh               # Header-only device helpers
-│   ├── reshard_config.cc                 # Config/env parsing                  (host)
-│   ├── reshard_init.cc                   # Init / Finalize                     (host)
+│   ├── m2n_config.cc                     # Config/env parsing                  (host)
+│   ├── m2n_init.cc                       # Init / Finalize                     (host)
 │   ├── reshard_cache.cc                  # DevComm + Window caches             (host)
 │   ├── reshard_mesh.cc                   # Mesh analysis helpers               (host)
 │   ├── reshard_loadbalance.cc            # Replication load balancer           (host)
 │   ├── reshard_prepare.cc                # Kernel-parameter builders           (host)
 │   ├── reshard_transpose.cc              # Cross-dim transpose buffer mgmt     (host)
-│   └── reshard_user_window.cu            # ncclXferReshardWithWindow + CUDA kernels
+│   └── reshard_user_window.cu            # ncclReshardWithWindow + CUDA kernels
 ├── benchmarks/
 │   ├── Makefile                          # Bench build rules (delegated to from root)
 │   ├── bench_common.h                    # Host-only macros + arg parsing
@@ -729,8 +727,7 @@ prepare path for each call.
 │   ├── README.md                         # Case matrix + CLI flags
 │   ├── basic_api_test_core.h             # Shared test descriptor table
 │   ├── basic_api_test_mpi.cc             # MPI-bootstrapped test binary
-│   ├── basic_api_test_local.cc           # Single-process pthreads test binary
-│   └── pytorch/                          # PyTorch mxn_cast binding tests
+│   └── basic_api_test_local.cc           # Single-process pthreads test binary
 ├── third_party/                          # Vendored deps (nlohmann/json for benchmark JSON parsers)
 ├── Makefile
 ├── README.md
@@ -745,10 +742,10 @@ prepare path for each call.
 
 | Symptom | Likely cause |
 |---|---|
-| `ncclInvalidArgument` from `ncclXferReshardWithWindow` | One of the preconditions failed: NULL comm/window/descriptor/mesh, mismatched `ndims`/dtype, `ndims` outside 1..3, or an unsupported dtype. |
-| Validation fails with destination still containing the pre-call bytes | The kernel did not write to dest. Re-run with `NCCLXFER_RESHARD_LOG_LEVEL=DEBUG` to see the prepared plan, then file an issue with the `reshard_bench` command line that reproduces the failure. |
+| `ncclInvalidArgument` from `ncclReshardWithWindow` | One of the preconditions failed: NULL comm/window/descriptor/mesh, mismatched `ndims`/dtype, `ndims` outside 1..3, or an unsupported dtype. |
+| Validation fails with destination still containing the pre-call bytes | The kernel did not write to dest. Re-run with `NCCL_RESHARD_LOG_LEVEL=DEBUG` to see the prepared plan, then file an issue with the `reshard_bench` command line that reproduces the failure. |
 | `nccl_device.h: No such file or directory` at compile time | `NCCL_HOME` points at a binary install rather than a from-source build. Build NCCL from source or point at one. |
-| Fast-but-wrong: `make` succeeds yet runtime crashes with "illegal instruction" | Often a downstream symptom of a kernel that completed with corrupt state on the previous reshard call. Re-run with `NCCLXFER_RESHARD_LOG_LEVEL=DEBUG` to see the prepared plan. |
+| Fast-but-wrong: `make` succeeds yet runtime crashes with "illegal instruction" | Often a downstream symptom of a kernel that completed with corrupt state on the previous reshard call. Re-run with `NCCL_RESHARD_LOG_LEVEL=DEBUG` to see the prepared plan. |
 
 ---
 

@@ -27,7 +27,7 @@
 #include <cuda_runtime.h>
 #include <nccl.h>
 
-#include "nccl_xfer.h"
+#include "nccl_m2n.h"
 #include "basic_api_test_core.h"
 
 namespace {
@@ -240,7 +240,7 @@ static int initLocalRuntime() {
   for (int i = 0; i < gWorldSize; ++i) devlist[i] = i;
 
   TEST_NCCLCHECK(ncclCommInitAll(gComms.data(), gWorldSize, devlist.data()));
-  TEST_NCCLCHECK(ncclXferReshardInit(NULL));
+  TEST_NCCLCHECK(ncclM2nInit(NULL));
 
   std::vector<TestCase> cases = basicApiSelectCases(gCases, gCli);
   gBufferBytes = computeMaxBufferBytes(cases, gWorldSize);
@@ -251,7 +251,7 @@ static int initLocalRuntime() {
 }
 
 static void shutdownLocalRuntime() {
-  TEST_NCCLCHECK(ncclXferReshardFinalize());
+  TEST_NCCLCHECK(ncclM2nFinalize());
   for (ncclComm_t comm : gComms)
     if (comm != nullptr) TEST_NCCLCHECK(ncclCommDestroy(comm));
   gComms.clear();

@@ -3,7 +3,7 @@
 # See LICENSE.txt for more license information.
 
 # ============================================================================
-# Shared configuration for the NCCL Xfer root Makefile and tests/Makefile.
+# Shared configuration for the NCCL M2N root Makefile and tests/Makefile.
 # ============================================================================
 #
 # Both Makefiles include this file; it auto-detects its own absolute location
@@ -15,7 +15,7 @@
 # ============================================================================
 
 # Project root = directory containing this Makefile.common.
-NCCLXFER_RESHARD_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+NCCL_RESHARD_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 
 # ── CUDA / NVCC ────────────────────────────────────────────────────────────
 CUDA_HOME ?= /usr/local/cuda
@@ -47,18 +47,18 @@ MPI_LDFLAGS = -lmpi
 endif
 
 # ── Output directories (single shared build/ at the project root) ─────────
-BUILDDIR ?= $(NCCLXFER_RESHARD_ROOT)/build
+BUILDDIR ?= $(NCCL_RESHARD_ROOT)/build
 LIBDIR := $(BUILDDIR)/lib
 BINDIR := $(BUILDDIR)/bin
 OBJDIR := $(BUILDDIR)/obj
 INCDIR := $(BUILDDIR)/include
-XFER_LIBNAME := libnccl_xfer.so
-XFER_LIBTARGET := $(LIBDIR)/$(XFER_LIBNAME)
-XFER_HEADER_TARGET := $(INCDIR)/nccl_xfer.h
+M2N_LIBNAME := libnccl_m2n.so
+M2N_LIBTARGET := $(LIBDIR)/$(M2N_LIBNAME)
+M2N_HEADER_TARGET := $(INCDIR)/nccl_m2n.h
 
-SRCDIR := $(NCCLXFER_RESHARD_ROOT)/src
-BENCHDIR := $(NCCLXFER_RESHARD_ROOT)/benchmarks
-TESTSDIR := $(NCCLXFER_RESHARD_ROOT)/tests
+SRCDIR := $(NCCL_RESHARD_ROOT)/src
+BENCHDIR := $(NCCL_RESHARD_ROOT)/benchmarks
+TESTSDIR := $(NCCL_RESHARD_ROOT)/tests
 
 # ── Compiler flags ─────────────────────────────────────────────────────────
 CXXSTD := -std=c++17
@@ -67,7 +67,7 @@ INCLUDES := -isystem $(NCCL_HOME)/include \
             -isystem $(NCCL_HOME)/include/nccl_device \
             -isystem $(CUDA_HOME)/include \
             -I$(SRCDIR) \
-            -isystem $(NCCLXFER_RESHARD_ROOT)/third_party
+            -isystem $(NCCL_RESHARD_ROOT)/third_party
 
 NVCUFLAGS := -ccbin $(CXX) \
              $(CXXSTD) \
@@ -100,9 +100,9 @@ endif
 # ── Linker flags ───────────────────────────────────────────────────────────
 LIB_LDFLAGS := -L$(NCCL_HOME)/lib -lnccl \
                -L$(CUDA_HOME)/lib64 -lcudart -lcuda
-XFER_LIB_LDFLAGS := $(LIB_LDFLAGS) -Xlinker -rpath -Xlinker '$$ORIGIN'
+M2N_LIB_LDFLAGS := $(LIB_LDFLAGS) -Xlinker -rpath -Xlinker '$$ORIGIN'
 
-# Benchmarks and tests link against libnccl_xfer.so + MPI (for bootstrap).
+# Benchmarks and tests link against libnccl_m2n.so + MPI (for bootstrap).
 # rpath '$ORIGIN/../lib' lets the binary find the .so relative to its own
 # location (build/bin → build/lib), so callers don't need to set
 # LD_LIBRARY_PATH for in-tree runs.  Notes:
@@ -112,7 +112,7 @@ XFER_LIB_LDFLAGS := $(LIB_LDFLAGS) -Xlinker -rpath -Xlinker '$$ORIGIN'
 #     g++ then sees as a bare `-Wl` flag and rejects.
 #   - $$  escapes Make → shell ($$ → $)
 #   - '…' protects $ORIGIN from shell expansion so it reaches the linker
-XFER_CLIENT_LDFLAGS := -L$(LIBDIR) -lnccl_xfer \
+M2N_CLIENT_LDFLAGS := -L$(LIBDIR) -lnccl_m2n \
                        -Xlinker -rpath -Xlinker '$$ORIGIN/../lib'
 BENCH_LDFLAGS := $(LIB_LDFLAGS) $(MPI_LDFLAGS)
 
@@ -123,22 +123,22 @@ BENCH_LDFLAGS := $(LIB_LDFLAGS) $(MPI_LDFLAGS)
 #                 __global__/__device__ code, no kernel launches.
 #   LIB_CU_SRCS — CUDA TUs. Contain device code (kernels, launches) and
 #                 require the full nvcc compilation pipeline.
-LIB_CC_SRCS := $(SRCDIR)/reshard_config.cc \
+LIB_CC_SRCS := $(SRCDIR)/m2n_config.cc \
                $(SRCDIR)/reshard_cache.cc \
                $(SRCDIR)/reshard_mesh.cc \
                $(SRCDIR)/reshard_loadbalance.cc \
                $(SRCDIR)/reshard_prepare.cc \
                $(SRCDIR)/reshard_transpose.cc \
-               $(SRCDIR)/reshard_init.cc
+               $(SRCDIR)/m2n_init.cc
 
 LIB_CU_SRCS := $(SRCDIR)/reshard_user_window.cu
 
 LIB_SRCS := $(LIB_CC_SRCS) $(LIB_CU_SRCS)
 
-LIB_HDRS := $(SRCDIR)/nccl_xfer.h \
+LIB_HDRS := $(SRCDIR)/nccl_m2n.h \
             $(SRCDIR)/reshard_types.h \
             $(SRCDIR)/reshard_limits.h \
-            $(SRCDIR)/reshard_checks.h \
-            $(SRCDIR)/reshard_log.h \
+            $(SRCDIR)/m2n_checks.h \
+            $(SRCDIR)/m2n_log.h \
             $(SRCDIR)/reshard_internal.h \
             $(SRCDIR)/reshard_kernels.cuh

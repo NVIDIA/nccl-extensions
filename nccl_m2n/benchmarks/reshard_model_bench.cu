@@ -46,7 +46,7 @@
 #include <string>
 #include <vector>
 
-#include "nccl_xfer.h"
+#include "nccl_m2n.h"
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -438,9 +438,9 @@ static std::map<std::string, ParamInfo> deduplicateParamsPP(
 }
 
 // ============================================================================
-// ncclXferReshardMesh_t Construction from Placements
+// ncclMesh_t Construction from Placements
 //
-// The ncclXferReshard API takes a 2D mesh: dims[2], startRank, placement[2].
+// The ncclReshardWithWindow API takes a 2D mesh: dims[2], startRank, placement[2].
 //   dims[0] = replicated count (product of non-sharding mesh axes)
 //   dims[1] = shard count     (mesh axis that shards the tensor)
 //   placement[0] = REPLICATE
@@ -709,10 +709,10 @@ int main(int argc, char* argv[]) {
   // ========================================================================
   // Configure reshard library via env vars
   // ========================================================================
-  if (verbose) benchSetEnv("NCCLXFER_RESHARD_LOG_LEVEL", "DEBUG");
-  benchSetEnv("NCCLXFER_RESHARD_ALGORITHM", algorithm);
-  benchSetEnv("NCCLXFER_RESHARD_LB_MODE", lbMode);
-  NCCLCHECK(ncclXferReshardInit(NULL));
+  if (verbose) benchSetEnv("NCCL_RESHARD_LOG_LEVEL", "DEBUG");
+  benchSetEnv("NCCL_RESHARD_ALGORITHM", algorithm);
+  benchSetEnv("NCCL_RESHARD_LB_MODE", lbMode);
+  NCCLCHECK(ncclM2nInit(NULL));
 
   // ========================================================================
   // Print configuration
@@ -877,25 +877,25 @@ int main(int argc, char* argv[]) {
     void* buffer = tbe.buffer;
     ncclWindow_t win = tbe.window;
 
-    ncclXferReshardMesh_t srcMesh;
+    ncclMesh_t srcMesh;
     srcMesh.dims[0] = td.srcMesh.repCount;
     srcMesh.dims[1] = td.srcMesh.shardCount;
     srcMesh.startRank = 0;
-    srcMesh.placement[0] = NCCLXFER_RESHARD_REPLICATE;
+    srcMesh.placement[0] = NCCL_RESHARD_REPLICATE;
     srcMesh.placement[1] =
-      (td.srcMesh.shardTensorDim >= 0) ? NCCLXFER_RESHARD_SHARD(td.srcMesh.shardTensorDim) : NCCLXFER_RESHARD_REPLICATE;
+      (td.srcMesh.shardTensorDim >= 0) ? NCCL_RESHARD_SHARD(td.srcMesh.shardTensorDim) : NCCL_RESHARD_REPLICATE;
 
-    ncclXferReshardMesh_t dstMesh;
+    ncclMesh_t dstMesh;
     dstMesh.dims[0] = td.dstMesh.repCount;
     dstMesh.dims[1] = td.dstMesh.shardCount;
     dstMesh.startRank = trainStageSize;
-    dstMesh.placement[0] = NCCLXFER_RESHARD_REPLICATE;
+    dstMesh.placement[0] = NCCL_RESHARD_REPLICATE;
     dstMesh.placement[1] =
-      (td.dstMesh.shardTensorDim >= 0) ? NCCLXFER_RESHARD_SHARD(td.dstMesh.shardTensorDim) : NCCLXFER_RESHARD_REPLICATE;
+      (td.dstMesh.shardTensorDim >= 0) ? NCCL_RESHARD_SHARD(td.dstMesh.shardTensorDim) : NCCL_RESHARD_REPLICATE;
 
     bool rankIsTrainInComm = (commIt->second.localRank < trainStageSize);
 
-    ncclXferDistTensor_t srcTensor = {};
+    ncclDistTensor_t srcTensor = {};
     srcTensor.dataPtr = rankIsTrainInComm ? buffer : nullptr;
     srcTensor.ndims = td.ndims;
     srcTensor.dtype = getNcclDtype(td.param.dtype);
@@ -903,7 +903,7 @@ int main(int argc, char* argv[]) {
     if (rankIsTrainInComm)
       for (int d = 0; d < td.ndims; d++) srcTensor.localShape[d] = td.srcLocalShape[d];
 
-    ncclXferDistTensor_t dstTensor = {};
+    ncclDistTensor_t dstTensor = {};
     dstTensor.dataPtr = rankIsTrainInComm ? nullptr : buffer;
     dstTensor.ndims = td.ndims;
     dstTensor.dtype = getNcclDtype(td.param.dtype);
@@ -911,7 +911,7 @@ int main(int argc, char* argv[]) {
     if (!rankIsTrainInComm)
       for (int d = 0; d < td.ndims; d++) dstTensor.localShape[d] = td.dstLocalShape[d];
 
-    NCCLCHECK(ncclXferReshardWithWindow(comm, win, &srcTensor, &dstTensor, stream));
+    NCCLCHECK(ncclReshardWithWindow(comm, win, &srcTensor, &dstTensor, stream));
   };
 
   auto syncAllStreams = [&]() {
@@ -1237,7 +1237,7 @@ int main(int argc, char* argv[]) {
   // ========================================================================
   // Cleanup
   // ========================================================================
-  ncclXferReshardFinalize();
+  ncclM2nFinalize();
 
   for (size_t i = 0; i < allTransfers.size(); i++) {
     auto& tbe = transferBuffers[i];

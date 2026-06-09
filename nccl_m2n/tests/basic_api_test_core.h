@@ -42,7 +42,7 @@
 #include <cuda_runtime.h>
 #include <nccl.h>
 
-#include "nccl_xfer.h"
+#include "nccl_m2n.h"
 #include "test_helpers.h"
 
 /* ======================================================================
@@ -676,16 +676,16 @@ static void buildMesh(MeshLayout* out, PlacementKind pl, int shardDim, int dim0,
      * lands in a degenerate prepare branch that the test suite does
      * not currently exercise.
      */
-    out->placement[0] = NCCLXFER_RESHARD_REPLICATE;
-    out->placement[1] = NCCLXFER_RESHARD_SHARD(0);
+    out->placement[0] = NCCL_RESHARD_REPLICATE;
+    out->placement[1] = NCCL_RESHARD_SHARD(0);
     out->shardCount = 1;
   } else if (pl == PL_RS) {
-    out->placement[0] = NCCLXFER_RESHARD_REPLICATE;
-    out->placement[1] = NCCLXFER_RESHARD_SHARD(shardDim);
+    out->placement[0] = NCCL_RESHARD_REPLICATE;
+    out->placement[1] = NCCL_RESHARD_SHARD(shardDim);
     out->shardCount = dim1;
   } else { /* PL_SR */
-    out->placement[0] = NCCLXFER_RESHARD_SHARD(shardDim);
-    out->placement[1] = NCCLXFER_RESHARD_REPLICATE;
+    out->placement[0] = NCCL_RESHARD_SHARD(shardDim);
+    out->placement[1] = NCCL_RESHARD_REPLICATE;
     out->shardCount = dim0;
   }
 }
@@ -921,9 +921,9 @@ static const char* basicApiRequestedAlgorithmEnv(const BasicApiCliArgs& cli, boo
 }
 
 static void basicApiConfigureReshardEnv(const BasicApiCliArgs& cli, const char* algorithmEnv) {
-  testSetEnv("NCCLXFER_RESHARD_ALGORITHM", algorithmEnv);
-  testSetEnv("NCCLXFER_RESHARD_LB_MODE", strcmp(cli.lbMode, "node") == 0 ? "NODE_AWARE" : "UNIFORM");
-  if (cli.verbose) testSetEnv("NCCLXFER_RESHARD_LOG_LEVEL", "DEBUG");
+  testSetEnv("NCCL_RESHARD_ALGORITHM", algorithmEnv);
+  testSetEnv("NCCL_RESHARD_LB_MODE", strcmp(cli.lbMode, "node") == 0 ? "NODE_AWARE" : "UNIFORM");
+  if (cli.verbose) testSetEnv("NCCL_RESHARD_LOG_LEVEL", "DEBUG");
 }
 
 static void basicApiPrintRuntimeSummary(const char* title, int worldSize, int deviceCount, const BasicApiCliArgs& cli,
@@ -1015,8 +1015,8 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   env->barrier(env);
 
   /* ----- 8. resharding call ----- */
-  ncclXferReshardMesh_t srcMesh{};
-  ncclXferReshardMesh_t dstMesh{};
+  ncclMesh_t srcMesh{};
+  ncclMesh_t dstMesh{};
   srcMesh.dims[0] = srcLayout.dims[0];
   srcMesh.dims[1] = srcLayout.dims[1];
   srcMesh.startRank = srcLayout.startRank;
@@ -1042,7 +1042,7 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   };
   ncclDataType_t dtype = (tc.elementSize <= 8) ? dtype_for_size[tc.elementSize] : ncclBfloat16;
 
-  ncclXferDistTensor_t srcT = {};
+  ncclDistTensor_t srcT = {};
   srcT.dataPtr = isSrc ? env->buffer : nullptr;
   srcT.ndims = tc.ndims;
   srcT.dtype = dtype;
@@ -1050,7 +1050,7 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   if (isSrc)
     for (int d = 0; d < tc.ndims; d++) srcT.localShape[d] = srcLocalDimsElems[d];
 
-  ncclXferDistTensor_t dstT = {};
+  ncclDistTensor_t dstT = {};
   dstT.dataPtr = isDst ? env->buffer : nullptr;
   dstT.ndims = tc.ndims;
   dstT.dtype = dtype;
@@ -1058,11 +1058,11 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   if (isDst)
     for (int d = 0; d < tc.ndims; d++) dstT.localShape[d] = dstLocalDimsElems[d];
 
-  ncclResult_t r = ncclXferReshardWithWindow(env->comm, window, &srcT, &dstT, env->stream);
+  ncclResult_t r = ncclReshardWithWindow(env->comm, window, &srcT, &dstT, env->stream);
 
   if (r != ncclSuccess) {
     TEST_NCCLCHECK(ncclCommWindowDeregister(env->comm, window));
-    return makeFail("ncclXferReshardWithWindow returned error");
+    return makeFail("ncclReshardWithWindow returned error");
   }
 
   TEST_CUDACHECK(cudaStreamSynchronize(env->stream));

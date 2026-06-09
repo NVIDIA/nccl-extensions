@@ -75,19 +75,19 @@ basic_api_test_mpi:   $(BINDIR)/basic_api_test_mpi   ; @:
 basic_api_test_local: $(BINDIR)/basic_api_test_local ; @:
 
 $(BINDIR)/basic_api_test_mpi: $(TEST_MPI_SRCS) $(GTEST_A) \
-                              $(XFER_LIBTARGET) $(LIB_HDRS) $(TEST_HDRS)
+                              $(M2N_LIBTARGET) $(LIB_HDRS) $(TEST_HDRS)
 	@printf "Building basic_api_test_mpi (gtest, MPI, GTEST_DIR=$(GTEST_DIR))...\n"
 	@mkdir -p $(BINDIR)
 	$(NVCC) -o $@ $(NVCUFLAGS) $(MPI_CFLAGS) -I$(TESTSDIR) -I$(GTEST_INC) \
-	    $(TEST_MPI_SRCS) $(GTEST_A) $(XFER_CLIENT_LDFLAGS) $(BENCH_LDFLAGS) -lpthread
+	    $(TEST_MPI_SRCS) $(GTEST_A) $(M2N_CLIENT_LDFLAGS) $(BENCH_LDFLAGS) -lpthread
 	@printf "Done! Test binary at: $@\n"
 
 $(BINDIR)/basic_api_test_local: $(TEST_LOCAL_SRCS) $(GTEST_A) \
-                                $(XFER_LIBTARGET) $(LIB_HDRS) $(TEST_HDRS)
+                                $(M2N_LIBTARGET) $(LIB_HDRS) $(TEST_HDRS)
 	@printf "Building basic_api_test_local (gtest, no MPI, GTEST_DIR=$(GTEST_DIR))...\n"
 	@mkdir -p $(BINDIR)
 	$(NVCC) -o $@ $(NVCUFLAGS) -I$(TESTSDIR) -I$(GTEST_INC) \
-	    $(TEST_LOCAL_SRCS) $(GTEST_A) $(XFER_CLIENT_LDFLAGS) $(LIB_LDFLAGS) -lpthread
+	    $(TEST_LOCAL_SRCS) $(GTEST_A) $(M2N_CLIENT_LDFLAGS) $(LIB_LDFLAGS) -lpthread
 	@printf "Done! Test binary at: $@\n"
 
 clean:
@@ -98,9 +98,9 @@ clean:
 endif
 
 # Convenience: building the lib triggers the parent Makefile, so the test
-# rules above resolve $(XFER_LIBTARGET) via the implicit chain.
-$(XFER_LIBTARGET):
-	@$(MAKE) --no-print-directory -C $(NCCLXFER_RESHARD_ROOT) lib
+# rules above resolve $(M2N_LIBTARGET) via the implicit chain.
+$(M2N_LIBTARGET):
+	@$(MAKE) --no-print-directory -C $(NCCL_RESHARD_ROOT) lib
 
 help:
 	@echo "tests/Makefile — public basic_api correctness suite"

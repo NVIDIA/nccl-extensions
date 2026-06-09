@@ -8,19 +8,19 @@
 #include "reshard_types.h"
 #include "reshard_internal.h"
 
-int getNodeOfDestRep(const ncclXferRepLoadBalancer* lb, int dstRepIdx) {
+int getNodeOfDestRep(const ncclReshardRepLoadBalancer* lb, int dstRepIdx) {
   int dstRank = lb->dstRepStartRank + dstRepIdx * lb->dstRepStride;
   return dstRank / lb->dstGpusPerDomain;
 }
 
-int getNumDestNodes(const ncclXferRepLoadBalancer* lb) {
+int getNumDestNodes(const ncclReshardRepLoadBalancer* lb) {
   if (lb->dstRepCount <= 0 || lb->dstGpusPerDomain <= 0) return 1;
   int firstNode = getNodeOfDestRep(lb, 0);
   int lastNode = getNodeOfDestRep(lb, lb->dstRepCount - 1);
   return lastNode - firstNode + 1;
 }
 
-void getDestRepsOnNode(const ncclXferRepLoadBalancer* lb, int targetNode, int* repStart, int* repEnd) {
+void getDestRepsOnNode(const ncclReshardRepLoadBalancer* lb, int targetNode, int* repStart, int* repEnd) {
   *repStart = -1;
   *repEnd = -1;
   for (int r = 0; r < lb->dstRepCount; r++) {
@@ -35,7 +35,7 @@ void getDestRepsOnNode(const ncclXferRepLoadBalancer* lb, int targetNode, int* r
   }
 }
 
-void getDestRepsOnNodeRange(const ncclXferRepLoadBalancer* lb, int firstNode, int lastNode, int* repStart,
+void getDestRepsOnNodeRange(const ncclReshardRepLoadBalancer* lb, int firstNode, int lastNode, int* repStart,
                             int* repEnd) {
   *repStart = -1;
   *repEnd = -1;
@@ -52,7 +52,7 @@ void getDestRepsOnNodeRange(const ncclXferRepLoadBalancer* lb, int firstNode, in
   }
 }
 
-void getTargetRepRange(const ncclXferRepLoadBalancer* lb, int srcRepIdx, int* repStart, int* repEnd) {
+void getTargetRepRange(const ncclReshardRepLoadBalancer* lb, int srcRepIdx, int* repStart, int* repEnd) {
   if (lb->mode == RESHARD_LB_NODE_AWARE) {
     int numDstNodes = getNumDestNodes(lb);
     int firstDstNode = getNodeOfDestRep(lb, 0);
@@ -118,7 +118,7 @@ void getTargetRepRange(const ncclXferRepLoadBalancer* lb, int srcRepIdx, int* re
   }
 }
 
-int getSourceRepForDest(const ncclXferRepLoadBalancer* lb, int dstRepIdx) {
+int getSourceRepForDest(const ncclReshardRepLoadBalancer* lb, int dstRepIdx) {
   if (lb->mode == RESHARD_LB_NODE_AWARE) {
     int numDstNodes = getNumDestNodes(lb);
     int firstDstNode = getNodeOfDestRep(lb, 0);

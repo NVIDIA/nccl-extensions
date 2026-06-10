@@ -6,17 +6,17 @@
  ************************************************************************/
 
 /*************************************************************************
- * NCCL Xfer — Public C API (reshard release)
+ * NCCL M2N — Public C API (reshard release)
  *
- * This header exposes the complete public API for the NCCL Xfer library.
- * The sole resharding entry point is ncclXferReshardWithWindow.
+ * This header exposes the complete public API for the NCCL M2N library.
+ * The sole resharding entry point is ncclReshardWithWindow.
  *
  * Callers include this one header; internal implementation details are
  * in src/reshard_*.h (not installed).
  ************************************************************************/
 
-#ifndef NCCL_XFER_H_
-#define NCCL_XFER_H_
+#ifndef NCCL_M2N_H_
+#define NCCL_M2N_H_
 
 #include <limits.h>
 #include <stddef.h>
@@ -42,27 +42,27 @@ extern "C" {
  *   startRank First world rank in this side's contiguous rank interval.
  *   placement  Per-mesh-axis tensor placement; use the helpers below.
  *              placement[i] is one of:
- *                  NCCLXFER_RESHARD_REPLICATE   Axis replicates the tensor slice.
- *                  NCCLXFER_RESHARD_SHARD(d)    Axis shards tensor dimension d.
+ *                  NCCL_RESHARD_REPLICATE   Axis replicates the tensor slice.
+ *                  NCCL_RESHARD_SHARD(d)    Axis shards tensor dimension d.
  *              Exactly one axis per mesh should be a SHARD.
  */
 typedef struct {
   int dims[2];
   int startRank;
   int placement[2];
-} ncclXferReshardMesh_t;
+} ncclMesh_t;
 
 /* Placement helpers for mesh.placement[]: */
-#define NCCLXFER_RESHARD_REPLICATE (-1)
-#define NCCLXFER_RESHARD_SHARD(td) (td)
+#define NCCL_RESHARD_REPLICATE (-1)
+#define NCCL_RESHARD_SHARD(td) (td)
 
 /* ======================================================================
  * Distributed Tensor Descriptor
  * ====================================================================*/
 
-/* Maximum tensor rank handled by ncclXferReshardWithWindow.  Mirrors the
+/* Maximum tensor rank handled by ncclReshardWithWindow.  Mirrors the
  * library-internal MAX_TENSOR_DIMS (kept in src/reshard_limits.h). */
-#define NCCLXFER_RESHARD_MAX_TENSOR_DIMS 3
+#define NCCL_RESHARD_MAX_TENSOR_DIMS 3
 
 /**
  * Distributed tensor descriptor — the per-rank tile + the topology under
@@ -73,7 +73,7 @@ typedef struct {
  *
  *   dataPtr    Local buffer for this rank, or NULL if this rank does
  *               not participate as this side.  The window passed to
- *               ncclXferReshardWithWindow must be registered with this
+ *               ncclReshardWithWindow must be registered with this
  *               buffer as its base (zero-offset contract).
  *   localShape Per-axis element count on this rank.  Only the first
  *               `ndims` entries are read.  Ignored when dataPtr is NULL.
@@ -89,38 +89,38 @@ typedef struct {
  */
 typedef struct {
   void* dataPtr;
-  size_t localShape[NCCLXFER_RESHARD_MAX_TENSOR_DIMS];
+  size_t localShape[NCCL_RESHARD_MAX_TENSOR_DIMS];
   int ndims;
   ncclDataType_t dtype;
-  const ncclXferReshardMesh_t* mesh;
-} ncclXferDistTensor_t;
+  const ncclMesh_t* mesh;
+} ncclDistTensor_t;
 
 /* ======================================================================
  * Library Configuration
  *
- * Modeled after ncclConfig_t.  Callers fill an ncclXferReshardConfig_t with
- * NCCLXFER_RESHARD_CONFIG_INITIALIZER, optionally override fields, and pass
- * a pointer to ncclXferReshardInit().  Passing NULL is equivalent to passing
+ * Modeled after ncclConfig_t.  Callers fill an ncclM2nConfig_t with
+ * NCCL_M2N_CONFIG_INITIALIZER, optionally override fields, and pass
+ * a pointer to ncclM2nInit().  Passing NULL is equivalent to passing
  * an all-default-initialized config.  Fields left at
- * NCCLXFER_RESHARD_CONFIG_UNDEF_INT keep the library default.
+ * NCCL_M2N_CONFIG_UNDEF_INT keep the library default.
  *
  *   maxCta    Max number of CTAs used by reshard kernel.
  * ====================================================================*/
 
-#define NCCLXFER_RESHARD_CONFIG_UNDEF_INT INT_MIN
-#define NCCLXFER_RESHARD_API_MAGIC 0x52455348u /* 'RESH' */
+#define NCCL_M2N_CONFIG_UNDEF_INT INT_MIN
+#define NCCL_M2N_API_MAGIC 0x4d324e00u /* 'M2N\0' */
 
-typedef struct ncclXferReshardConfig_v1 {
+typedef struct ncclM2nConfig_v1 {
   size_t size;
   unsigned int magic;
   int maxCta;
-} ncclXferReshardConfig_t;
+} ncclM2nConfig_t;
 
-#define NCCLXFER_RESHARD_CONFIG_INITIALIZER \
-  {                                         \
-    sizeof(ncclXferReshardConfig_t),        \
-    NCCLXFER_RESHARD_API_MAGIC,             \
-    NCCLXFER_RESHARD_CONFIG_UNDEF_INT,      \
+#define NCCL_M2N_CONFIG_INITIALIZER \
+  {                                \
+    sizeof(ncclM2nConfig_t),       \
+    NCCL_M2N_API_MAGIC,            \
+    NCCL_M2N_CONFIG_UNDEF_INT,     \
   }
 
 /* ======================================================================
@@ -129,14 +129,14 @@ typedef struct ncclXferReshardConfig_v1 {
 
 /* Initialize process-global reshard state.  Passing NULL uses defaults;
  * environment variables override matching config fields.  This call is
- * idempotent; ncclXferReshardWithWindow also initializes with defaults on
+ * idempotent; ncclReshardWithWindow also initializes with defaults on
  * first use if not already initialized. */
-ncclResult_t ncclXferReshardInit(ncclXferReshardConfig_t* config);
+ncclResult_t ncclM2nInit(ncclM2nConfig_t* config);
 
 /* Release library-owned caches and temporary transpose buffers.  This call is
  * idempotent and does not destroy caller-owned comms, windows, streams, or
  * buffers. */
-ncclResult_t ncclXferReshardFinalize(void);
+ncclResult_t ncclM2nFinalize(void);
 
 /* ======================================================================
  * Resharding Entry Point
@@ -172,11 +172,11 @@ ncclResult_t ncclXferReshardFinalize(void);
  * @return ncclSuccess on success, ncclInvalidArgument if any
  *         precondition is violated.
  */
-ncclResult_t ncclXferReshardWithWindow(ncclComm_t comm, ncclWindow_t window, const ncclXferDistTensor_t* src,
-                                       const ncclXferDistTensor_t* dst, cudaStream_t stream);
+ncclResult_t ncclReshardWithWindow(ncclComm_t comm, ncclWindow_t window, const ncclDistTensor_t* src,
+                                       const ncclDistTensor_t* dst, cudaStream_t stream);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* NCCL_XFER_H_ */
+#endif /* NCCL_M2N_H_ */

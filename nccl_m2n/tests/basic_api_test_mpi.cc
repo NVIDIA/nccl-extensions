@@ -28,7 +28,7 @@
 #include <cuda_runtime.h>
 #include <nccl.h>
 
-#include "nccl_xfer.h"
+#include "nccl_m2n.h"
 #include "basic_api_test_core.h"
 
 namespace {
@@ -146,8 +146,8 @@ static void activateAlgorithm(const std::string& algorithmEnv) {
   if (gActiveAlgorithm == algorithmEnv) return;
 
   basicApiConfigureReshardEnv(gCli, algorithmEnv.c_str());
-  TEST_NCCLCHECK(ncclXferReshardFinalize());
-  TEST_NCCLCHECK(ncclXferReshardInit(NULL));
+  TEST_NCCLCHECK(ncclM2nFinalize());
+  TEST_NCCLCHECK(ncclM2nInit(NULL));
   gActiveAlgorithm = algorithmEnv;
 }
 
@@ -209,7 +209,7 @@ static int initMpiRuntime() {
 
   const char* initialAlgorithm = requestedAlgorithmEnv();
   basicApiConfigureReshardEnv(gCli, initialAlgorithm);
-  TEST_NCCLCHECK(ncclXferReshardInit(NULL));
+  TEST_NCCLCHECK(ncclM2nInit(NULL));
   gActiveAlgorithm = initialAlgorithm;
 
   TEST_CUDACHECK(cudaStreamCreate(&gStream));
@@ -226,7 +226,7 @@ static int initMpiRuntime() {
 static void shutdownMpiRuntime() {
   if (gBuffer != nullptr) TEST_NCCLCHECK(ncclMemFree(gBuffer));
   if (gStream != nullptr) TEST_CUDACHECK(cudaStreamDestroy(gStream));
-  TEST_NCCLCHECK(ncclXferReshardFinalize());
+  TEST_NCCLCHECK(ncclM2nFinalize());
   if (gComm != nullptr) TEST_NCCLCHECK(ncclCommDestroy(gComm));
 }
 

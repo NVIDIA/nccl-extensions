@@ -5,8 +5,8 @@
  * See LICENSE.txt for more license information.
  ************************************************************************/
 
-#ifndef NCCLXFER_BENCH_COMMON_H_
-#define NCCLXFER_BENCH_COMMON_H_
+#ifndef NCCL_M2N_BENCH_COMMON_H_
+#define NCCL_M2N_BENCH_COMMON_H_
 
 #include <algorithm>
 #include <cerrno>
@@ -167,4 +167,4 @@ static inline MPI_Op benchMpiSum() {
   return MPI_SUM; // NOLINT(bugprone-casting-through-void)
 }
 
-#endif // NCCLXFER_BENCH_COMMON_H_
+#endif // NCCL_M2N_BENCH_COMMON_H_

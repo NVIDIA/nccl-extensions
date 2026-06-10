@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # See LICENSE.txt for more license information.
 
-# Makefile for the NCCL Xfer benchmarks (reshard release).
+# Makefile for the NCCL M2N benchmarks (reshard release).
 #
 # This Makefile is fully self-contained: it can be built standalone (`make`
 # from inside benchmarks/) or invoked from the project root via the delegation
@@ -76,30 +76,30 @@ reshard_batch_user_window:   $(BINDIR)/reshard_batch_bench_user_window   ; @:
 reshard_model:               $(BINDIR)/reshard_model_bench               ; @:
 
 # Single-layer benchmark
-$(BINDIR)/reshard_bench: $(BENCH_SRCS) $(BENCH_KERNELS_HDR) $(XFER_LIBTARGET) $(LIB_HDRS)
+$(BINDIR)/reshard_bench: $(BENCH_SRCS) $(BENCH_KERNELS_HDR) $(M2N_LIBTARGET) $(LIB_HDRS)
 	@printf "Building reshard_bench...\n"
 	@mkdir -p $(BINDIR)
-	$(NVCC) -o $@ $(NVCUFLAGS) $(MPI_CFLAGS) $(BENCH_SRCS) $(XFER_CLIENT_LDFLAGS) $(BENCH_LDFLAGS)
+	$(NVCC) -o $@ $(NVCUFLAGS) $(MPI_CFLAGS) $(BENCH_SRCS) $(M2N_CLIENT_LDFLAGS) $(BENCH_LDFLAGS)
 	@printf "Done! Benchmark binary at: $@\n"
 
 # Batched user-window benchmark
-$(BINDIR)/reshard_batch_bench_user_window: $(BATCH_BENCH_SRCS) $(XFER_LIBTARGET) $(LIB_HDRS)
+$(BINDIR)/reshard_batch_bench_user_window: $(BATCH_BENCH_SRCS) $(M2N_LIBTARGET) $(LIB_HDRS)
 	@printf "Building reshard_batch_bench_user_window...\n"
 	@mkdir -p $(BINDIR)
-	$(NVCC) -o $@ $(NVCUFLAGS) $(MPI_CFLAGS) $(BATCH_BENCH_SRCS) $(XFER_CLIENT_LDFLAGS) $(BENCH_LDFLAGS)
+	$(NVCC) -o $@ $(NVCUFLAGS) $(MPI_CFLAGS) $(BATCH_BENCH_SRCS) $(M2N_CLIENT_LDFLAGS) $(BENCH_LDFLAGS)
 	@printf "Done! Batch benchmark binary at: $@\n"
 
 # Model transfer benchmark (config-driven, real model/system JSON files)
-$(BINDIR)/reshard_model_bench: $(MODEL_BENCH_SRCS) $(BENCH_KERNELS_HDR) $(XFER_LIBTARGET) $(LIB_HDRS)
+$(BINDIR)/reshard_model_bench: $(MODEL_BENCH_SRCS) $(BENCH_KERNELS_HDR) $(M2N_LIBTARGET) $(LIB_HDRS)
 	@printf "Building reshard_model_bench...\n"
 	@mkdir -p $(BINDIR)
-	$(NVCC) -o $@ $(NVCUFLAGS) $(MPI_CFLAGS) $(MODEL_BENCH_SRCS) $(XFER_CLIENT_LDFLAGS) $(BENCH_LDFLAGS)
+	$(NVCC) -o $@ $(NVCUFLAGS) $(MPI_CFLAGS) $(MODEL_BENCH_SRCS) $(M2N_CLIENT_LDFLAGS) $(BENCH_LDFLAGS)
 	@printf "Done! Model benchmark binary at: $@\n"
 
 # Convenience: building the lib triggers the parent Makefile, so the bench
-# rules above resolve $(XFER_LIBTARGET) via the implicit chain.
-$(XFER_LIBTARGET):
-	@$(MAKE) --no-print-directory -C $(NCCLXFER_RESHARD_ROOT) lib
+# rules above resolve $(M2N_LIBTARGET) via the implicit chain.
+$(M2N_LIBTARGET):
+	@$(MAKE) --no-print-directory -C $(NCCL_RESHARD_ROOT) lib
 
 clean:
 	@printf "Cleaning bench binaries...\n"
@@ -107,7 +107,7 @@ clean:
 	      $(BINDIR)/reshard_model_bench
 
 help:
-	@echo "benchmarks/Makefile — NCCL Xfer benchmarks (reshard release)"
+	@echo "benchmarks/Makefile — NCCL M2N benchmarks (reshard release)"
 	@echo ""
 	@echo "Targets:"
 	@echo "  all (default)                    - Build all benches (same as bench)"

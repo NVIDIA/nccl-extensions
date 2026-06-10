@@ -9,8 +9,8 @@
 #include "cuda_runtime.h"
 #include "nccl.h"
 #include "reshard_types.h"
-#include "reshard_checks.h"
-#include "reshard_log.h"
+#include "m2n_checks.h"
+#include "m2n_log.h"
 #include "reshard_internal.h"
 
 /* ======================================================================
@@ -43,7 +43,7 @@ ncclResult_t ensureTransposeBuffer(ncclComm_t comm, size_t requiredBytes, cudaSt
 
   if (entry != nullptr) {
     if (entry->stream != stream) {
-      NCCLXFER_CUDACHECK(cudaStreamWaitEvent(stream, entry->event, 0));
+      NCCL_M2N_CUDACHECK(cudaStreamWaitEvent(stream, entry->event, 0));
       entry->stream = stream;
     }
 
@@ -65,7 +65,7 @@ ncclResult_t ensureTransposeBuffer(ncclComm_t comm, size_t requiredBytes, cudaSt
     entry->buffer = nullptr;
     entry->capacity = 0;
 
-    NCCLXFER_CHECK(ncclMemAlloc(&entry->buffer, requiredBytes));
+    NCCL_M2N_CHECK(ncclMemAlloc(&entry->buffer, requiredBytes));
     entry->capacity = requiredBytes;
     return ncclSuccess;
   }
@@ -87,9 +87,9 @@ ncclResult_t ensureTransposeBuffer(ncclComm_t comm, size_t requiredBytes, cudaSt
   e.capacity = 0;
   e.allocated = true;
 
-  NCCLXFER_CUDACHECK(cudaEventCreateWithFlags(&e.event, cudaEventDisableTiming));
+  NCCL_M2N_CUDACHECK(cudaEventCreateWithFlags(&e.event, cudaEventDisableTiming));
 
-  NCCLXFER_CHECK(ncclMemAlloc(&e.buffer, requiredBytes));
+  NCCL_M2N_CHECK(ncclMemAlloc(&e.buffer, requiredBytes));
   e.capacity = requiredBytes;
   RESHARD_DEBUG(-1, "Transpose buffer allocated for comm %p: %zu bytes (%p) [slot %d]", (void*)comm, requiredBytes,
                 e.buffer, gPoolCount - 1);
@@ -108,7 +108,7 @@ size_t getTransposeBufferCapacity(ncclComm_t comm) {
 
 ncclResult_t transposeBufferRecordEvent(ncclComm_t comm, cudaStream_t stream) {
   TransposeBufferEntry* e = findPoolEntry(comm);
-  if (e != nullptr) NCCLXFER_CUDACHECK(cudaEventRecord(e->event, stream));
+  if (e != nullptr) NCCL_M2N_CUDACHECK(cudaEventRecord(e->event, stream));
   return ncclSuccess;
 }
 

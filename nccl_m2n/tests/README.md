@@ -1,6 +1,6 @@
 # `tests/` — basic_api correctness suite
 
-Two gtest binaries exercise `ncclXferReshardWithWindow` across a parameter
+Two gtest binaries exercise `ncclReshardWithWindow` across a parameter
 matrix mirroring an external pytest reference suite. Both share the test
 descriptor table and per-case logic in `basic_api_test_core.h`; only the
 bootstrap differs.
@@ -10,12 +10,7 @@ bootstrap differs.
 | `build/bin/basic_api_test_mpi`   | MPI (`mpirun`)              | Multi-host MPI runs, large rank counts. |
 | `build/bin/basic_api_test_local` | Single-process pthreads via `ncclCommInitAll` | Dev workstation, no MPI install required. |
 
-Both use only the public API in `src/nccl_xfer.h`.
-
-A PyTorch-level binding matrix also lives in
-[`tests/pytorch/`](pytorch/README.md). It exercises
-`torch.distributed._symmetric_memory.mxn_cast` from a PyTorch build that
-contains the binding.
+Both use only the public API in `src/nccl_m2n.h`.
 
 ## Building
 

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # See LICENSE.txt for more license information.
 
-# Makefile for the NCCL Xfer library — reshard release.
+# Makefile for the NCCL M2N library — reshard release.
 #
 # Shared toolchain config lives in Makefile.common and is also pulled in by
 # benchmarks/Makefile and tests/Makefile so all binaries pick up the same
@@ -11,7 +11,7 @@
 #
 # Usage:
 #   make              - Build the shared library (default)
-#   make lib          - Build shared library (libnccl_xfer.so)
+#   make lib          - Build shared library (libnccl_m2n.so)
 #   make bench        - Delegate to benchmarks/Makefile (all benches)
 #   make bench <name> - Delegate to benchmarks/Makefile, named picker. <name> is:
 #                       reshard, reshard_batch_user_window, reshard_model
@@ -50,15 +50,15 @@ all: lib
 # ============================================================================
 # Library
 # ============================================================================
-lib: $(XFER_LIBTARGET) $(XFER_HEADER_TARGET)
+lib: $(M2N_LIBTARGET) $(M2N_HEADER_TARGET)
 
-$(XFER_LIBTARGET): $(LIB_SRCS) $(LIB_HDRS)
-	@printf "Building $(XFER_LIBNAME)...\n"
+$(M2N_LIBTARGET): $(LIB_SRCS) $(LIB_HDRS)
+	@printf "Building $(M2N_LIBNAME)...\n"
 	@mkdir -p $(LIBDIR)
-	$(NVCC) -shared -o $@ $(NVCUFLAGS) $(LIB_SRCS) $(XFER_LIB_LDFLAGS)
+	$(NVCC) -shared -o $@ $(NVCUFLAGS) $(LIB_SRCS) $(M2N_LIB_LDFLAGS)
 	@printf "Done! Library at: $@\n"
 
-$(XFER_HEADER_TARGET): $(SRCDIR)/nccl_xfer.h
+$(M2N_HEADER_TARGET): $(SRCDIR)/nccl_m2n.h
 	@mkdir -p $(INCDIR)
 	cp $< $@
 
@@ -100,8 +100,8 @@ PREFIX ?= /usr/local
 install: lib
 	@printf "Installing to $(PREFIX)...\n"
 	@mkdir -p $(PREFIX)/lib $(PREFIX)/include
-	cp $(XFER_LIBTARGET) $(PREFIX)/lib/
-	cp $(XFER_HEADER_TARGET) $(PREFIX)/include/
+	cp $(M2N_LIBTARGET) $(PREFIX)/lib/
+	cp $(M2N_HEADER_TARGET) $(PREFIX)/include/
 	@printf "Done!\n"
 
 # ============================================================================
@@ -111,11 +111,11 @@ clean:
 	rm -rf $(BUILDDIR)
 
 help:
-	@echo "NCCL Xfer Library Makefile — reshard release"
+	@echo "NCCL M2N Library Makefile — reshard release"
 	@echo ""
 	@echo "Targets:"
 	@echo "  all (default)         - Build shared library"
-	@echo "  lib                   - Build shared library (libnccl_xfer.so)"
+	@echo "  lib                   - Build shared library (libnccl_m2n.so)"
 	@echo "  bench                 - Build all benchmarks (delegates to benchmarks/)"
 	@echo "  bench <name>          - Build only named bench(es). <name> is one of:"
 	@echo "                          reshard, reshard_batch_user_window"

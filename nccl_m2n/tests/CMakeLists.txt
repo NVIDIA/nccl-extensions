@@ -4,10 +4,10 @@
 
 # tests/CMakeLists.txt
 #
-# Picked up by the root CMakeLists.txt when -DNCCL_XFER_BUILD_TESTS=ON.
+# Picked up by the root CMakeLists.txt when -DNCCL_M2N_BUILD_TESTS=ON.
 # Builds:
-#   basic_api_test_mpi    — MPI bootstrap, links libnccl_xfer.so
-#   basic_api_test_local  — pthread (no MPI), links libnccl_xfer.so
+#   basic_api_test_mpi    — MPI bootstrap, links libnccl_m2n.so
+#   basic_api_test_local  — pthread (no MPI), links libnccl_m2n.so
 #   unit_tests            — gtest, links library SRCS directly so the
 #                           tests exercise the same TUs (matches CI's
 #                           tests/ci/Makefile linkage choice).
@@ -29,51 +29,51 @@ find_package(Threads REQUIRED)
 # on gtest-all.cc). Resolve the source tree, then compile gtest-all.cc +
 # gtest_main.cc into static libs ourselves — matches the Makefile path 1:1.
 
-set(_NCCL_XFER_GTEST_DIR "")
+set(_NCCL_M2N_GTEST_DIR "")
 if(GTEST_DIR AND EXISTS "${GTEST_DIR}/include/gtest/gtest.h")
-  set(_NCCL_XFER_GTEST_DIR "${GTEST_DIR}")
+  set(_NCCL_M2N_GTEST_DIR "${GTEST_DIR}")
 elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/googletest/include/gtest/gtest.h")
-  set(_NCCL_XFER_GTEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/googletest")
+  set(_NCCL_M2N_GTEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/googletest")
 endif()
 
-if(NOT _NCCL_XFER_GTEST_DIR)
+if(NOT _NCCL_M2N_GTEST_DIR)
   message(STATUS
-    "nccl_xfer tests/: googletest not found — skipping basic_api + unit_tests. "
+    "nccl_m2n tests/: googletest not found — skipping basic_api + unit_tests. "
     "Pass -DGTEST_DIR=/path/to/googletest or vendor a copy at tests/googletest/.")
   return()
 endif()
 
-add_library(nccl_xfer_gtest STATIC
-    "${_NCCL_XFER_GTEST_DIR}/src/gtest-all.cc"
+add_library(nccl_m2n_gtest STATIC
+    "${_NCCL_M2N_GTEST_DIR}/src/gtest-all.cc"
 )
-target_include_directories(nccl_xfer_gtest
-    PUBLIC  "${_NCCL_XFER_GTEST_DIR}/include"
-    PRIVATE "${_NCCL_XFER_GTEST_DIR}"
+target_include_directories(nccl_m2n_gtest
+    PUBLIC  "${_NCCL_M2N_GTEST_DIR}/include"
+    PRIVATE "${_NCCL_M2N_GTEST_DIR}"
 )
-target_compile_options(nccl_xfer_gtest PRIVATE -Wno-uninitialized)
-set_target_properties(nccl_xfer_gtest PROPERTIES
+target_compile_options(nccl_m2n_gtest PRIVATE -Wno-uninitialized)
+set_target_properties(nccl_m2n_gtest PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
     POSITION_INDEPENDENT_CODE ON
 )
 
-add_library(nccl_xfer_gtest_main STATIC
-    "${_NCCL_XFER_GTEST_DIR}/src/gtest-all.cc"
-    "${_NCCL_XFER_GTEST_DIR}/src/gtest_main.cc"
+add_library(nccl_m2n_gtest_main STATIC
+    "${_NCCL_M2N_GTEST_DIR}/src/gtest-all.cc"
+    "${_NCCL_M2N_GTEST_DIR}/src/gtest_main.cc"
 )
-target_include_directories(nccl_xfer_gtest_main
-    PUBLIC  "${_NCCL_XFER_GTEST_DIR}/include"
-    PRIVATE "${_NCCL_XFER_GTEST_DIR}"
+target_include_directories(nccl_m2n_gtest_main
+    PUBLIC  "${_NCCL_M2N_GTEST_DIR}/include"
+    PRIVATE "${_NCCL_M2N_GTEST_DIR}"
 )
-target_compile_options(nccl_xfer_gtest_main PRIVATE -Wno-uninitialized)
-set_target_properties(nccl_xfer_gtest_main PROPERTIES
+target_compile_options(nccl_m2n_gtest_main PRIVATE -Wno-uninitialized)
+set_target_properties(nccl_m2n_gtest_main PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
     POSITION_INDEPENDENT_CODE ON
 )
 
-add_library(gtest      ALIAS nccl_xfer_gtest)
-add_library(gtest_main ALIAS nccl_xfer_gtest_main)
+add_library(gtest      ALIAS nccl_m2n_gtest)
+add_library(gtest_main ALIAS nccl_m2n_gtest_main)
 
 # ─── MPI (optional) ───────────────────────────────────────────────────────────
 find_package(MPI)
@@ -90,12 +90,12 @@ target_include_directories(basic_api_test_local PRIVATE
 )
 target_include_directories(basic_api_test_local SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party
-    ${_NCCL_XFER_NCCL_INCLUDES}
+    ${_NCCL_M2N_NCCL_INCLUDES}
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 target_link_libraries(basic_api_test_local PRIVATE
-    nccl_xfer_shared
-    ${_NCCL_XFER_NCCL_TARGET}
+    nccl_m2n_shared
+    ${_NCCL_M2N_NCCL_TARGET}
     CUDA::cudart
     gtest gtest_main
     Threads::Threads
@@ -114,19 +114,19 @@ if(MPI_FOUND)
   )
   target_include_directories(basic_api_test_mpi SYSTEM PRIVATE
       ${CMAKE_SOURCE_DIR}/third_party
-      ${_NCCL_XFER_NCCL_INCLUDES}
+      ${_NCCL_M2N_NCCL_INCLUDES}
       ${CUDAToolkit_INCLUDE_DIRS}
   )
   target_link_libraries(basic_api_test_mpi PRIVATE
-      nccl_xfer_shared
-      ${_NCCL_XFER_NCCL_TARGET}
+      nccl_m2n_shared
+      ${_NCCL_M2N_NCCL_TARGET}
       CUDA::cudart
       gtest gtest_main
       MPI::MPI_CXX
       Threads::Threads
   )
 else()
-  message(STATUS "nccl_xfer tests/: MPI not found — skipping basic_api_test_mpi.")
+  message(STATUS "nccl_m2n tests/: MPI not found — skipping basic_api_test_mpi.")
 endif()
 
 # ─── tests/ci/unit_tests ──────────────────────────────────────────────────────
@@ -147,7 +147,7 @@ set(CI_UNIT_TEST_SRCS
 
 add_executable(unit_tests
     ${CI_UNIT_TEST_SRCS}
-    ${NCCL_XFER_SRC_FULL_PATHS}
+    ${NCCL_M2N_SRC_FULL_PATHS}
 )
 target_include_directories(unit_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -155,7 +155,7 @@ target_include_directories(unit_tests PRIVATE
 )
 target_include_directories(unit_tests SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party
-    ${_NCCL_XFER_NCCL_INCLUDES}
+    ${_NCCL_M2N_NCCL_INCLUDES}
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 target_compile_definitions(unit_tests PRIVATE NCCL_OS_LINUX)
@@ -164,7 +164,7 @@ target_compile_options(unit_tests PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
 )
 target_link_libraries(unit_tests PRIVATE
-    ${_NCCL_XFER_NCCL_TARGET}
+    ${_NCCL_M2N_NCCL_TARGET}
     CUDA::cudart
     CUDA::cuda_driver
     gtest gtest_main

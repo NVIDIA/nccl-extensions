@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # See LICENSE.txt for more license information.
 
-# Common gtest build rules for NCCL Xfer tests.
+# Common gtest build rules for NCCL M2N tests.
 #
 # googletest is an optional dependency. The Makefile builds the tests when
 # a googletest source tree is available, and silently skips them when it

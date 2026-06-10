@@ -16,8 +16,8 @@
  * reshard_internal.h.
  ************************************************************************/
 
-#ifndef NCCLXFER_RESHARD_TYPES_H_
-#define NCCLXFER_RESHARD_TYPES_H_
+#ifndef NCCL_RESHARD_TYPES_H_
+#define NCCL_RESHARD_TYPES_H_
 
 #include <cstddef>
 
@@ -27,7 +27,7 @@
 #include "reshard_limits.h"
 
 /* Algorithm + load-balance mode are library-internal: callers configure
- * them via env vars only (NCCLXFER_RESHARD_ALGORITHM / NCCLXFER_RESHARD_LB_MODE). */
+ * them via env vars only (NCCL_RESHARD_ALGORITHM / NCCL_RESHARD_LB_MODE). */
 typedef enum {
   RESHARD_ALGO_AUTO = -1,
   RESHARD_ALGO_RING = 0,
@@ -61,7 +61,7 @@ typedef struct {
   int shardGroupStride;
   int repGroupStart;
   int repGroupStride;
-} ncclXferMeshGroupInfo;
+} ncclReshardMeshGroupInfo;
 
 /* ======================================================================
  * Transfer Plan
@@ -81,7 +81,7 @@ typedef struct {
 
   size_t overlapStart[MAX_TENSOR_DIMS];
   size_t overlapEnd[MAX_TENSOR_DIMS];
-} ncclXferTransferPlan;
+} ncclReshardTransferPlan;
 
 /* ======================================================================
  * RING (hierarchical) kernel param structs
@@ -90,11 +90,11 @@ typedef struct {
 typedef struct {
   unsigned int signalBase;
 
-  ncclXferTransferPlan plan;
+  ncclReshardTransferPlan plan;
 
   bool isContiguous;
   size_t totalBytes;
-} ncclXferSourceInfo;
+} ncclReshardSourceInfo;
 
 typedef struct {
   int dstShardIdx;
@@ -102,12 +102,12 @@ typedef struct {
   size_t overlapStart[MAX_TENSOR_DIMS];
   size_t overlapEnd[MAX_TENSOR_DIMS];
 
-  ncclXferTransferPlan plan;
+  ncclReshardTransferPlan plan;
 
   bool isContiguous;
   size_t totalBytes;
   size_t windowOffset;
-} ncclXferTargetInfo;
+} ncclReshardTargetInfo;
 
 typedef struct {
   ncclWindow_t window;
@@ -136,10 +136,10 @@ typedef struct {
   size_t chunkSizeBytes;
   int totalCtas;
 
-  ncclXferSourceInfo sources[MAX_SOURCES];
+  ncclReshardSourceInfo sources[MAX_SOURCES];
   int numSources;
 
-  ncclXferTargetInfo targets[MAX_TARGETS];
+  ncclReshardTargetInfo targets[MAX_TARGETS];
   int numTargets;
 
   int localFollowerWorldRanks[MAX_LOCAL_FOLLOWERS];
@@ -154,7 +154,7 @@ typedef struct {
   size_t myWindowOffset;
   size_t ringNextWindowOffset;
   size_t localFollowerWindowOffsets[MAX_LOCAL_FOLLOWERS];
-} ncclXferReshardParams;
+} ncclReshardParams;
 
 /* ======================================================================
  * DIRECT algorithm param structs
@@ -170,16 +170,16 @@ typedef struct {
   bool isContiguous;
   size_t windowOffset;
 
-  ncclXferTransferPlan plan;
-} ncclXferDirectTargetInfo;
+  ncclReshardTransferPlan plan;
+} ncclReshardDirectTargetInfo;
 
 typedef struct {
   unsigned int signalBase;
   size_t totalBytes;
   bool isContiguous;
 
-  ncclXferTransferPlan plan;
-} ncclXferDirectSourceInfo;
+  ncclReshardTransferPlan plan;
+} ncclReshardDirectSourceInfo;
 
 typedef struct {
   ncclWindow_t window;
@@ -208,12 +208,12 @@ typedef struct {
 
   size_t myWindowOffset;
 
-  ncclXferDirectTargetInfo targets[MAX_DIRECT_TARGETS];
+  ncclReshardDirectTargetInfo targets[MAX_DIRECT_TARGETS];
   int numTargets;
 
-  ncclXferDirectSourceInfo sources[MAX_DIRECT_SOURCES];
+  ncclReshardDirectSourceInfo sources[MAX_DIRECT_SOURCES];
   int numSources;
-} ncclXferDirectReshardParams;
+} ncclReshardDirectParams;
 
 /* ======================================================================
  * Load Balancer
@@ -226,7 +226,7 @@ typedef struct {
   int dstRepStartRank;
   int dstRepStride;
   ReshardLoadBalanceMode mode;
-} ncclXferRepLoadBalancer;
+} ncclReshardRepLoadBalancer;
 
 /* ======================================================================
  * Cache entry types (used by reshard_cache.cc)
@@ -268,4 +268,4 @@ struct TransposeBufferEntry {
   bool allocated;
 };
 
-#endif /* NCCLXFER_RESHARD_TYPES_H_ */
+#endif /* NCCL_RESHARD_TYPES_H_ */

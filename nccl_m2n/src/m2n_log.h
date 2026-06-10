@@ -5,15 +5,15 @@
  * See LICENSE.txt for more license information.
  ************************************************************************/
 
-#ifndef NCCLXFER_RESHARD_LOG_H_
-#define NCCLXFER_RESHARD_LOG_H_
+#ifndef NCCL_M2N_LOG_H_
+#define NCCL_M2N_LOG_H_
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 /*
- * Structured logging for the nccl-reshard library.
+ * Structured logging for the NCCL M2N library.
  *
  * Tiers:
  *   FATAL — correctness errors that must never be silenced (printed
@@ -26,7 +26,7 @@
  *     DEBUG — per-call parameter dumps, mesh analysis
  *     TRACE — per-target / per-source detail, transfer plan dumps
  *
- * The runtime level is controlled by the NCCLXFER_RESHARD_LOG_LEVEL env
+ * The runtime level is controlled by the NCCL_RESHARD_LOG_LEVEL env
  * var at init time.  Default level is WARN.
  */
 
@@ -133,4 +133,4 @@ __attribute__((format(printf, 4, 5))) void reshardFatalFmtCheck(int, const char*
 #define RESHARD_FATAL(rank, fmt, ...) ::reshardFatal((rank), __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 #endif
 
-#endif /* NCCLXFER_RESHARD_LOG_H_ */
+#endif /* NCCL_M2N_LOG_H_ */

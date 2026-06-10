@@ -15,13 +15,13 @@ void computeStrides(const size_t dims[], int ndims, size_t strides[]) {
   for (int d = ndims - 2; d >= 0; d--) strides[d] = strides[d + 1] * dims[d + 1];
 }
 
-void computeMeshGroupInfo(const ncclXferReshardMesh_t* mesh, int worldRank, ncclXferMeshGroupInfo* info) {
+void computeMeshGroupInfo(const ncclMesh_t* mesh, int worldRank, ncclReshardMeshGroupInfo* info) {
   memset(info, 0, sizeof(*info));
   info->shardMeshDim = -1;
   info->repMeshDim = -1;
   info->shardTensorDim = -1;
   for (int d = 0; d < 2; d++) {
-    if (mesh->placement[d] == NCCLXFER_RESHARD_REPLICATE) {
+    if (mesh->placement[d] == NCCL_RESHARD_REPLICATE) {
       info->repMeshDim = d;
     } else if (IS_SHARD_PLACEMENT(mesh->placement[d])) {
       info->shardMeshDim = d;
@@ -53,7 +53,7 @@ void computeMeshGroupInfo(const ncclXferReshardMesh_t* mesh, int worldRank, nccl
   }
 }
 
-int getMeshRank(const ncclXferReshardMesh_t* mesh, const ncclXferMeshGroupInfo* info, int shardIdx, int repIdx) {
+int getMeshRank(const ncclMesh_t* mesh, const ncclReshardMeshGroupInfo* info, int shardIdx, int repIdx) {
   int meshPos[2] = {0, 0};
   if (info->shardMeshDim >= 0) meshPos[info->shardMeshDim] = shardIdx;
   if (info->repMeshDim >= 0) meshPos[info->repMeshDim] = repIdx;
@@ -93,7 +93,7 @@ bool computeOverlap(const size_t srcStart[], const size_t srcEnd[], const size_t
 
 void computeTransferPlan(const size_t srcDims[], const size_t srcStrides[], int srcShardDim, int srcShardIdx,
                          const size_t dstDims[], const size_t dstStrides[], int dstShardDim, int dstShardIdx, int ndims,
-                         size_t elementsPerChunk, ncclXferTransferPlan* plan) {
+                         size_t elementsPerChunk, ncclReshardTransferPlan* plan) {
   (void)elementsPerChunk;
   memset(plan, 0, sizeof(*plan));
   if (ndims < 1 || ndims > MAX_TENSOR_DIMS) {

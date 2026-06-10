@@ -8,13 +8,13 @@
 /*
  * Library configuration sources, in increasing precedence:
  *   1. Built-in defaults (the inline initializers in reshard_internal.h).
- *   2. ncclXferReshardConfig_t passed to ncclXferReshardInit (optional, may be
+ *   2. ncclM2nConfig_t passed to ncclM2nInit (optional, may be
  *      NULL).
  *   3. Environment variables (always win when set; honors the
  *      "env-overrides-everything" convention used elsewhere in NCCL).
  *
  * applyReshardConfig() and applyReshardEnv() are called from
- * ncclXferReshardInit in that order.
+ * ncclM2nInit in that order.
  */
 
 #include <cstdlib>
@@ -22,7 +22,7 @@
 #include <climits>
 
 #include "reshard_internal.h"
-#include "reshard_log.h"
+#include "m2n_log.h"
 #include "reshard_types.h"
 
 namespace {
@@ -68,20 +68,20 @@ bool parsePositiveIntEnv(const char* s, int* out) {
 
 } // namespace
 
-ncclResult_t applyReshardConfig(const ncclXferReshardConfig_t* config) {
+ncclResult_t applyReshardConfig(const ncclM2nConfig_t* config) {
   if (config == nullptr) return ncclSuccess;
 
-  if (config->size != sizeof(ncclXferReshardConfig_t) || config->magic != NCCLXFER_RESHARD_API_MAGIC) {
+  if (config->size != sizeof(ncclM2nConfig_t) || config->magic != NCCL_M2N_API_MAGIC) {
     RESHARD_WARN(-1,
-                 "ncclXferReshardInit: ignoring malformed ncclXferReshardConfig_t "
-                 "(size=%zu, magic=0x%x). Use NCCLXFER_RESHARD_CONFIG_INITIALIZER.",
+                 "ncclM2nInit: ignoring malformed ncclM2nConfig_t "
+                 "(size=%zu, magic=0x%x). Use NCCL_M2N_CONFIG_INITIALIZER.",
                  config->size, config->magic);
     return ncclInvalidArgument;
   }
 
-  if (config->maxCta != NCCLXFER_RESHARD_CONFIG_UNDEF_INT) {
+  if (config->maxCta != NCCL_M2N_CONFIG_UNDEF_INT) {
     if (config->maxCta <= 0)
-      RESHARD_WARN(-1, "ncclXferReshardInit: ignoring config.maxCta=%d (must be > 0).", config->maxCta);
+      RESHARD_WARN(-1, "ncclM2nInit: ignoring config.maxCta=%d (must be > 0).", config->maxCta);
     else gReshardMaxCta = config->maxCta;
   }
 
@@ -90,33 +90,33 @@ ncclResult_t applyReshardConfig(const ncclXferReshardConfig_t* config) {
 
 // `getenv` is the only POSIX path to read process env vars; there is no portable
 // thread-safe alternative (`secure_getenv` is glibc-only). Library init runs
-// once on the calling thread before ncclXferReshardInit returns, so concurrent
+// once on the calling thread before ncclM2nInit returns, so concurrent
 // env mutation by user code is the caller's problem — scope the
 // concurrency-mt-unsafe suppression to just this function.
 //
 // NOLINTBEGIN(concurrency-mt-unsafe)
 void applyReshardEnv() {
   ReshardLogLevel lvl;
-  if (reshardLogLevelFromStr(getenv("NCCLXFER_RESHARD_LOG_LEVEL"), &lvl)) reshardSetLogLevel(lvl);
+  if (reshardLogLevelFromStr(getenv("NCCL_RESHARD_LOG_LEVEL"), &lvl)) reshardSetLogLevel(lvl);
 
   ReshardAlgorithm algo;
-  if (parseAlgorithmEnv(getenv("NCCLXFER_RESHARD_ALGORITHM"), &algo)) gReshardAlgorithm = algo;
+  if (parseAlgorithmEnv(getenv("NCCL_RESHARD_ALGORITHM"), &algo)) gReshardAlgorithm = algo;
 
   ReshardLoadBalanceMode lb;
-  if (parseLbModeEnv(getenv("NCCLXFER_RESHARD_LB_MODE"), &lb)) gReshardLbMode = lb;
+  if (parseLbModeEnv(getenv("NCCL_RESHARD_LB_MODE"), &lb)) gReshardLbMode = lb;
 
   int n;
-  if (parsePositiveIntEnv(getenv("NCCLXFER_RESHARD_MAX_CTA"), &n)) {
-    if (gReshardMaxCta > 0) RESHARD_INFO(-1, "Reshard config maxCta reset to NCCLXFER_RESHARD_MAX_CTA=%d.", n);
+  if (parsePositiveIntEnv(getenv("NCCL_RESHARD_MAX_CTA"), &n)) {
+    if (gReshardMaxCta > 0) RESHARD_INFO(-1, "Reshard config maxCta reset to NCCL_RESHARD_MAX_CTA=%d.", n);
     gReshardMaxCta = n;
   }
 
-  if (parsePositiveIntEnv(getenv("NCCLXFER_RESHARD_SRC_DOMAIN_SIZE"), &n)) gReshardSrcDomainSize = n;
-  if (parsePositiveIntEnv(getenv("NCCLXFER_RESHARD_DST_DOMAIN_SIZE"), &n)) gReshardDstDomainSize = n;
+  if (parsePositiveIntEnv(getenv("NCCL_RESHARD_SRC_DOMAIN_SIZE"), &n)) gReshardSrcDomainSize = n;
+  if (parsePositiveIntEnv(getenv("NCCL_RESHARD_DST_DOMAIN_SIZE"), &n)) gReshardDstDomainSize = n;
 
   /* Cache chunk-size override so prepareReshardParams doesn't touch
    * getenv on the hot path. */
-  if (const char* env = getenv("NCCLXFER_RESHARD_CHUNK_SIZE")) {
+  if (const char* env = getenv("NCCL_RESHARD_CHUNK_SIZE")) {
     char* end = nullptr;
     long long v = strtoll(env, &end, 10);
     if (end != env && v > 0) gReshardChunkSizeBytes = (size_t)v;

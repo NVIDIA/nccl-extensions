@@ -15,8 +15,8 @@
  * gets its own copy without ODR violations.
  ************************************************************************/
 
-#ifndef NCCLXFER_RESHARD_KERNELS_CUH
-#define NCCLXFER_RESHARD_KERNELS_CUH
+#ifndef NCCL_RESHARD_KERNELS_CUH
+#define NCCL_RESHARD_KERNELS_CUH
 
 #include "reshard_types.h"
 
@@ -29,7 +29,7 @@ static_assert(sizeof(uint32_t) == 4, "uint32_t must be 4 bytes for the aligned L
 // ============================================================================
 // Compute strided source / dest byte offsets for a single transfer iteration.
 // ============================================================================
-__device__ static inline void computeTransferOffset(const ncclXferTransferPlan& plan, size_t iterIdx, int ndims,
+__device__ static inline void computeTransferOffset(const ncclReshardTransferPlan& plan, size_t iterIdx, int ndims,
                                                     size_t* srcOffset, size_t* dstOffset) {
   *srcOffset = plan.srcBaseOffset;
   *dstOffset = plan.dstBaseOffset;
@@ -50,7 +50,7 @@ __device__ static inline void computeTransferOffset(const ncclXferTransferPlan& 
 // transfers at both ends of the byte range.
 // ============================================================================
 __device__ static inline void emitStridedChunkPuts(ncclGin& gin, ncclTeam world, int dstWorldRank, ncclWindow_t window,
-                                                   const ncclXferTransferPlan& plan, int ndims, size_t ctaIterStart,
+                                                   const ncclReshardTransferPlan& plan, int ndims, size_t ctaIterStart,
                                                    size_t byteStart, size_t numBytes, unsigned int signalIdx,
                                                    bool useDstAsSrc, size_t srcWindowOffset, size_t dstWindowOffset) {
   const size_t inner = plan.innerSize;
@@ -165,4 +165,4 @@ __device__ static inline void lsaReplicateChunk(const char* srcPtr, size_t chunk
   }
 }
 
-#endif // NCCLXFER_RESHARD_KERNELS_CUH
+#endif // NCCL_RESHARD_KERNELS_CUH

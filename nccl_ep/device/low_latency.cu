@@ -155,6 +155,23 @@ __forceinline__ __device__ void castAndWriteToSendBuf(
     }
 }
 
+// Copy pre-quantized FP8 token bytes and caller-supplied FP32 scales to send buffer.
+// Used for LL FP8 EXTERN dispatch (inputs->scales != nullptr on LL path).
+__forceinline__ __device__ void copyExternFP8ToSendBuf(
+    const int2* srcFP8,
+    int2* sendBufVec,
+    float* sendBufScales,
+    const float* inScales,
+    int threadId,
+    int numThreads,
+    int hiddenFP8Int2,
+    int numScales) {
+    for (int i = threadId; i < hiddenFP8Int2; i += numThreads)
+        sendBufVec[i] = srcFP8[i];
+    for (int i = threadId; i < numScales; i += numThreads)
+        sendBufScales[i] = inScales[i];
+}
+
 // Send a token to one peer.
 //
 // Picks the transport per dstRank:
@@ -171,6 +188,7 @@ __forceinline__ __device__ void castAndWriteToSendBuf(
 //
 // Templated on `kUseFP8` so the NVLink direct path can reuse
 // `castAndWriteToSendBuf` for the quantized-vs-bf16 split.
+// `kExternFP8`: when true, input is pre-quantized FP8 bytes (no quantization).
 //
 // `kNvlinkOnly` mirrors the dispatch kernel's compile-time gate: when true,
 // every dst is intra-LSA and the zero-copy output redirect (below) is the
@@ -181,11 +199,12 @@ __forceinline__ __device__ void castAndWriteToSendBuf(
 // staging recvBuf payload slot to the peer's user-provided recv_x tensor at
 // slot (currRank * maxTokensPerRank + slotIdx). Headers still flow through
 // the staging buffer.
-template <bool kUseFP8, bool kNvlinkOnly>
+template <bool kUseFP8, bool kNvlinkOnly, bool kExternFP8 = false>
 __forceinline__ __device__ void sendToken(
     // Local sources.
     const int4* sendDataInt4,        // local staging slot base (header + RDMA-path payload).
-    const int4* srcDataInt4,         // input bf16 data for this token (NVLink-path payload source).
+    const void* srcData,             // input data for this token (NVLink-path payload source):
+                                     //   const int4* for BF16/INTERN FP8, const int2* for EXTERN FP8.
     // Peer destination addressing: per-srcRank region base + slot index.
     uint64_t srcRankRegionLocalPtr,  // sender-view pointer at peer's per-srcRank region.
     size_t srcRankRegionOffset,      // window offset of that per-srcRank region.
@@ -211,6 +230,8 @@ __forceinline__ __device__ void sendToken(
     // target peer's recv_x window instead of peer's staging payload slot.
     ncclWindow_t recvDataWindow,
     size_t recvDataOffset,
+    // EXTERN FP8: caller-supplied scales for this token; nullptr for INTERN/BF16.
+    const float* inScales,
     int laneId) {
     using vec_t = std::conditional_t<kUseFP8, int2, int4>;
 
@@ -250,10 +271,18 @@ __forceinline__ __device__ void sendToken(
         auto* dstDataVec = reinterpret_cast<vec_t*>(payloadDst);
         auto* dstScales = reinterpret_cast<float*>(
             reinterpret_cast<uint8_t*>(payloadDst) + hiddenBytes);
-        castAndWriteToSendBuf<kUseFP8>(
-            srcDataInt4, dstDataVec, dstScales,
-            /*threadId=*/laneId, /*numThreads=*/32,
-            laneId, hiddenBf16Int4, roundScale);
+        if constexpr (kExternFP8) {
+            const int numScales = static_cast<int>(hiddenBf16Int4) / 16;
+            copyExternFP8ToSendBuf(
+                static_cast<const int2*>(srcData), dstDataVec, dstScales,
+                inScales, laneId, 32,
+                static_cast<int>(hiddenBf16Int4), numScales);
+        } else {
+            castAndWriteToSendBuf<kUseFP8>(
+                static_cast<const int4*>(srcData), dstDataVec, dstScales,
+                /*threadId=*/laneId, /*numThreads=*/32,
+                laneId, hiddenBf16Int4, roundScale);
+        }
     } else {
         // ---- RDMA path (interleaved layout) ----
         if (laneId == 0) {
@@ -547,9 +576,10 @@ __forceinline__ __device__ void copyRecvTokenData(
     }
 }
 
-template <bool kUseFP8, bool kUseUE8M0, int kHidden, ncclEpLayout_t kLayout, bool kNvlinkOnly, typename TopkIdxT>
+template <bool kUseFP8, bool kUseUE8M0, bool kExternFP8, int kHidden, ncclEpLayout_t kLayout, bool kNvlinkOnly, typename TopkIdxT>
 __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
                                                     const void* inData,
+                                                    const float* inScalesBuf, // non-null for EXTERN FP8
                                                     const TopkIdxT* inTopkIdx,
                                                     const float* inTopkWeights,
                                                     int* rankMask,
@@ -578,6 +608,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
                                                     int64_t* waitStats,
                                                     // CONFIG
                                                     int numTokens,
+                                                    int scalesPerToken,
                                                     int maxTokensPerRank,
                                                     int numTopk,
                                                     int numExperts,
@@ -660,7 +691,18 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
 
         // Split token processing across SMs
         for (int tokenIdx = smId; tokenIdx < numTokens; tokenIdx += numSms) {
-            const auto srcDataInt4 = static_cast<const int4*>(inData) + tokenIdx * hiddenBf16Int4;
+            // For EXTERN FP8: input is FP8 bytes (1 byte/elem), stride = kHidden/8 int2s.
+            // For BF16/INTERN: input is BF16 (2 bytes/elem), stride = kHidden/8 int4s.
+            // hiddenBf16Int4 = kHidden/8 serves both strides (int2 vs int4 differ in size).
+            const auto srcDataInt4 = kExternFP8
+                ? static_cast<const int4*>(nullptr)
+                : static_cast<const int4*>(inData) + tokenIdx * hiddenBf16Int4;
+            const auto srcDataFP8Extern = kExternFP8
+                ? static_cast<const int2*>(inData) + tokenIdx * hiddenBf16Int4
+                : static_cast<const int2*>(nullptr);
+            const float* inScalesTok = kExternFP8
+                ? inScalesBuf + tokenIdx * scalesPerToken
+                : nullptr;
 
             // Local staging slot. Header is always written here; data is
             // written here for the RDMA path only (NVLink writes data
@@ -693,9 +735,16 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
             // guaranteed to take the NVLink direct path so the staging-buffer
             // payload is never read and the cast can be skipped entirely.
             if constexpr (!kNvlinkOnly) {
-                castAndWriteToSendBuf<kUseFP8>(
-                    srcDataInt4, sendBufVec, sendBufScales,
-                    threadId, numWritingThreads, laneId, hiddenBf16Int4, roundScale);
+                if constexpr (kExternFP8) {
+                    copyExternFP8ToSendBuf(
+                        srcDataFP8Extern, sendBufVec, sendBufScales,
+                        inScalesTok, threadId, numWritingThreads,
+                        hiddenBf16Int4, numScales);
+                } else {
+                    castAndWriteToSendBuf<kUseFP8>(
+                        srcDataInt4, sendBufVec, sendBufScales,
+                        threadId, numWritingThreads, laneId, hiddenBf16Int4, roundScale);
+                }
             }
 
 
@@ -731,14 +780,18 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
                     const auto srcRankLocalPtr =
                         reinterpret_cast<uint64_t>(recvBuf) + srcRankOffset;
                     const auto sendBufInt4 = reinterpret_cast<const int4*>(sendBufBase);
-                    sendToken<kUseFP8, kNvlinkOnly>(
-                        sendBufInt4, srcDataInt4,
+                    const void* srcDataForSendToken = kExternFP8
+                        ? static_cast<const void*>(srcDataFP8Extern)
+                        : static_cast<const void*>(srcDataInt4);
+                    sendToken<kUseFP8, kNvlinkOnly, kExternFP8>(
+                        sendBufInt4, srcDataForSendToken,
                         srcRankLocalPtr, recvOff + srcRankOffset, slotIdx,
                         tokenIdx, sendOff,
                         numBytesPerMsg, dispatch_hdr_sz, hiddenBytes, hiddenBf16Int4, maxTokensPerRank,
                         dstRank, ctxHash, currRank, roundScale,
                         rankMask, windows, devComms,
-                        recvDataWindow, recvDataOffset, laneId);
+                        recvDataWindow, recvDataOffset,
+                        inScalesTok, laneId);
                     if (laneId == 0) {
                         // Mark that one more token is sent to the rank
                         atomic_add_release_global(rankDone + dstRank, 1);
@@ -1027,6 +1080,7 @@ void dispatch(const void* inData,
               const float* inTopkWeights,
               void* outDataBuf,
               void* outScalesBuf,
+              const float* inScalesBuf, // non-null for EXTERN FP8 (LL inputs->scales)
               int* outSrcInfo,
               int* outRecvRankCounter,
               int64_t* outLayout,
@@ -1044,6 +1098,7 @@ void dispatch(const void* inData,
               int* recvStats,
               int64_t* waitStats,
               int numTokens,
+              int scalesPerToken,
               int hidden,
               int maxTokensPerRank,
               int numTopk,
@@ -1089,10 +1144,13 @@ void dispatch(const void* inData,
     if (useUe8m0)
         EP_HOST_ASSERT(roundScale and "UE8M0 SF requires `round_scale=True`");
 
+    const bool externFp8 = (inScalesBuf != nullptr);
+
     SETUP_LAUNCH_CONFIG(numSms, numWarps * 32, stream);
-#define DISPATCH_DO_LAUNCH(fp8, ue8m0, nvlinkOnlyV, hidden, kLayout) \
-LAUNCH_KERNEL(&cfg, (dispatch<fp8, ue8m0, hidden, kLayout, nvlinkOnlyV, TopkIdxT>), \
+#define DISPATCH_DO_LAUNCH(fp8, ue8m0, externFp8V, nvlinkOnlyV, hidden, kLayout) \
+LAUNCH_KERNEL(&cfg, (dispatch<fp8, ue8m0, externFp8V, hidden, kLayout, nvlinkOnlyV, TopkIdxT>), \
               inData, \
+              inScalesBuf, \
               inTopkIdx, \
               inTopkWeights, \
               rankMask, \
@@ -1118,6 +1176,7 @@ LAUNCH_KERNEL(&cfg, (dispatch<fp8, ue8m0, hidden, kLayout, nvlinkOnlyV, TopkIdxT
               recvStats, \
               waitStats, \
               numTokens, \
+              scalesPerToken, \
               maxTokensPerRank, \
               numTopk, \
               numExperts, \
@@ -1135,14 +1194,17 @@ LAUNCH_KERNEL(&cfg, (dispatch<fp8, ue8m0, hidden, kLayout, nvlinkOnlyV, TopkIdxT
               recvDataWindow, \
               recvDataOffset)
 #define DISPATCH_LAUNCH_CASE_IMPL(hidden, kLayout) { \
-    if (nvlinkOnly) { \
-        if (useFp8 and useUe8m0)      { DISPATCH_DO_LAUNCH(true,  true,  true,  hidden, kLayout); } \
-        else if (useFp8)              { DISPATCH_DO_LAUNCH(true,  false, true,  hidden, kLayout); } \
-        else                          { DISPATCH_DO_LAUNCH(false, false, true,  hidden, kLayout); } \
+    if (externFp8) { \
+        if (nvlinkOnly) { DISPATCH_DO_LAUNCH(true, false, true,  true,  hidden, kLayout); } \
+        else            { DISPATCH_DO_LAUNCH(true, false, true,  false, hidden, kLayout); } \
+    } else if (nvlinkOnly) { \
+        if (useFp8 and useUe8m0)      { DISPATCH_DO_LAUNCH(true,  true,  false, true,  hidden, kLayout); } \
+        else if (useFp8)              { DISPATCH_DO_LAUNCH(true,  false, false, true,  hidden, kLayout); } \
+        else                          { DISPATCH_DO_LAUNCH(false, false, false, true,  hidden, kLayout); } \
     } else { \
-        if (useFp8 and useUe8m0)      { DISPATCH_DO_LAUNCH(true,  true,  false, hidden, kLayout); } \
-        else if (useFp8)              { DISPATCH_DO_LAUNCH(true,  false, false, hidden, kLayout); } \
-        else                          { DISPATCH_DO_LAUNCH(false, false, false, hidden, kLayout); } \
+        if (useFp8 and useUe8m0)      { DISPATCH_DO_LAUNCH(true,  true,  false, false, hidden, kLayout); } \
+        else if (useFp8)              { DISPATCH_DO_LAUNCH(true,  false, false, false, hidden, kLayout); } \
+        else                          { DISPATCH_DO_LAUNCH(false, false, false, false, hidden, kLayout); } \
     } \
 } break
 #define DISPATCH_LAUNCH_CASE_RM(hidden) DISPATCH_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_RANK_MAJOR)
@@ -2357,17 +2419,17 @@ void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
 // hybridep_adapter.cu and are untemplated).
 template void dispatch<int32_t>(
     const void*, const int32_t*, const float*,
-    void*, void*, int*, int*, int64_t*, int*, float*, int32_t*,
+    void*, void*, const float*, int*, int*, int64_t*, int*, float*, int32_t*,
     void*, void*, int*, size_t, size_t, size_t, int*, int, int*, int64_t*,
-    int, int, int, int, int, int, int, bool, bool, bool, ncclEpLayout_t,
+    int, int, int, int, int, int, int, int, bool, bool, bool, ncclEpLayout_t,
     int, int, ncclDevComm*, const ncclWindow_t*, unsigned, void*, int,
     int*, int*, uint64_t, bool, ncclWindow_t, size_t, cudaStream_t);
 
 template void dispatch<int64_t>(
     const void*, const int64_t*, const float*,
-    void*, void*, int*, int*, int64_t*, int*, float*, int32_t*,
+    void*, void*, const float*, int*, int*, int64_t*, int*, float*, int32_t*,
     void*, void*, int*, size_t, size_t, size_t, int*, int, int*, int64_t*,
-    int, int, int, int, int, int, int, bool, bool, bool, ncclEpLayout_t,
+    int, int, int, int, int, int, int, int, bool, bool, bool, ncclEpLayout_t,
     int, int, ncclDevComm*, const ncclWindow_t*, unsigned, void*, int,
     int*, int*, uint64_t, bool, ncclWindow_t, size_t, cudaStream_t);
 

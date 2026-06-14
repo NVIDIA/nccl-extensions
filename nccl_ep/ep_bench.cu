@@ -209,6 +209,7 @@ static cudaError_t cudaFreeCallback(void* ptr, void* /*context*/) {
 static size_t epDtypeBytes(ncclDataType_t dt) {
     switch (dt) {
         case ncclInt8:    case ncclUint8:                              return 1;
+        case ncclFloat8e4m3: case ncclFloat8e5m2:                      return 1;
         case ncclFloat16: case ncclBfloat16:                           return 2;
         case ncclFloat32: case ncclInt32: case ncclUint32:             return 4;
         case ncclInt64:   case ncclUint64: case ncclFloat64:           return 8;
@@ -411,9 +412,10 @@ static void setupLowLatencyTensorsSharedInputs(
     unsigned int num_tokens,
     unsigned int hidden,
     unsigned int top_k,
-    unsigned int num_local_experts
+    unsigned int num_local_experts,
+    ncclDataType_t dispatch_token_dtype = ncclBfloat16
 ) {
-    NCCLCHECK(epMakeTensor(&dispatch_inputs.tokens, 2, ncclBfloat16, num_tokens, hidden));
+    NCCLCHECK(epMakeTensor(&dispatch_inputs.tokens, 2, dispatch_token_dtype, num_tokens, hidden));
 
     NCCLCHECK(epMakeTensor(&topk_weights, 2, ncclFloat32, num_tokens, top_k));
 
@@ -500,12 +502,14 @@ void setupLowLatencyTensors(
     unsigned int max_dispatch_tokens_per_rank,
     int nRanks,
     ncclEpLayout_t layout,
-    const EpTensorAllocOptions* dispatch_out_window_opts = nullptr
+    const EpTensorAllocOptions* dispatch_out_window_opts = nullptr,
+    ncclDataType_t dispatch_token_dtype = ncclBfloat16
 ) {
 
     setupLowLatencyTensorsSharedInputs(dispatch_inputs, dispatch_layout_info,
                                        has_dispatch_layout_info, topk_weights,
-                                       num_tokens, hidden, top_k, num_local_experts);
+                                       num_tokens, hidden, top_k, num_local_experts,
+                                       dispatch_token_dtype);
 
     switch (layout) {
         case NCCL_EP_LAYOUT_EXPERT_MAJOR:
@@ -552,7 +556,8 @@ void setupHighThroughputTensors(
     unsigned int num_local_experts,
     unsigned int num_recv_tokens,
     ncclEpLayout_t layout,
-    bool zcopy
+    bool zcopy,
+    ncclDataType_t dispatch_token_dtype = ncclBfloat16
 ) {
     const bool em = (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
 
@@ -572,13 +577,13 @@ void setupHighThroughputTensors(
     const EpTensorAllocOptions* comm_window_opts = zcopy ? &zc_comm : nullptr;
     const EpTensorAllocOptions* no_window_opts = zcopy ? &zc_no_window : nullptr;
 
-    // Dispatch input: tokens - initialize with test pattern
-    NCCLCHECK(epMakeTensor(&dispatch_inputs.tokens, 2, ncclBfloat16,
+    // Dispatch input: tokens
+    NCCLCHECK(epMakeTensor(&dispatch_inputs.tokens, 2, dispatch_token_dtype,
                            num_tokens, hidden, 1, 1, 1, comm_window_opts));
     {
         void* input0_data;
         NCCLCHECK(epGetTensorData(alloc, dispatch_inputs.tokens, &input0_data));
-        CUDACHECK(cudaMemset(input0_data, 0, num_tokens * hidden * 2));
+        CUDACHECK(cudaMemset(input0_data, 0, num_tokens * hidden * epDtypeBytes(dispatch_token_dtype)));
     }
 
     // Dispatch input: topk_weights - initialize with equal weights
@@ -705,6 +710,20 @@ static const int RANK_OFFSET = 128;
 // Matches DeepEP's approach: last 128 columns store token index
 static const int TOKEN_ID_COLS = 128;
 
+// FP8 scale tensor: one scale per 128 hidden elements.
+static const unsigned FP8_BLOCK_SIZE = 128;
+
+static inline uint8_t fp8TokenByte(int rank, unsigned int t, unsigned int h) {
+    if (h == 0) return static_cast<uint8_t>(rank);
+    if (h == 1) return static_cast<uint8_t>(t / 256u);
+    if (h == 2) return static_cast<uint8_t>(t % 256u);
+    return static_cast<uint8_t>((static_cast<unsigned>(rank) * 131u + t * 17u + h) & 0xFFu);
+}
+
+static inline float fp8ScaleValue(int rank, unsigned int t, unsigned int b) {
+    return static_cast<float>(rank * 1000 + static_cast<int>(t) * 10 + static_cast<int>(b));
+}
+
 // Helper: Convert BF16 to float (CPU-side)
 static float bf16ToFloat(uint16_t bf16) {
     uint32_t bits = (static_cast<uint32_t>(bf16)) << 16;
@@ -741,8 +760,10 @@ static double calc_diff(const double* x, const double* y, size_t n) {
     return 1.0 - 2.0 * dot_xy / denom;
 }
 
-// Initialize input tensors with validation-friendly patterns (DeepEP style)
-// Pattern: each element = (rank - RANK_OFFSET) except last TOKEN_ID_COLS columns = token_index
+// Initialize dispatch input tensors with validation-friendly patterns.
+// When dispatch_inputs.tokens is BF16: fills with rank value + token ID in last TOKEN_ID_COLS cols.
+// When dispatch_inputs.tokens is FP8: fills with fp8TokenByte pattern; fills scales if present.
+// topk_weights are filled the same way for both.
 void initializeValidationData(
     const BenchmarkAllocState& alloc,
     ncclEpDispatchInputs_t&    dispatch_inputs,
@@ -753,42 +774,70 @@ void initializeValidationData(
     int myRank,
     bool is_ht_mode
 ) {
-    // Calculate the rank value to use (handles BF16 precision limits)
-    float rank_value = static_cast<float>(myRank - RANK_OFFSET);
-    uint16_t rank_bf16 = floatToBf16(rank_value);
+    const ncclDataType_t tok_dtype = dispatch_inputs.tokens ? dispatch_inputs.tokens->datatype
+                                                            : ncclBfloat16;
+    const bool is_fp8 = (tok_dtype == ncclFloat8e4m3 || tok_dtype == ncclFloat8e5m2);
 
-    // Allocate host buffer for token data
-    size_t token_size = num_tokens * hidden;
-    uint16_t* token_data_host = new uint16_t[token_size];
+    if (is_fp8) {
+        // FP8 EXTERN dispatch: fill 1-byte token data with fp8TokenByte pattern.
+        size_t token_size = static_cast<size_t>(num_tokens) * hidden;
+        uint8_t* token_data_host = new uint8_t[token_size];
+        for (unsigned int t = 0; t < num_tokens; t++)
+            for (unsigned int h = 0; h < hidden; h++)
+                token_data_host[static_cast<size_t>(t) * hidden + h] = fp8TokenByte(myRank, t, h);
+        {
+            void* input0_data;
+            NCCLCHECK(epGetTensorData(alloc, dispatch_inputs.tokens, &input0_data));
+            CUDACHECK(cudaMemcpy(input0_data, token_data_host,
+                                 token_size * sizeof(uint8_t), cudaMemcpyHostToDevice));
+        }
+        delete[] token_data_host;
 
-    // Fill token data with rank value, embed token index in last TOKEN_ID_COLS columns.
-    // Token ID is split into high (t/256) and low (t%256) bytes to stay within BF16's
-    // exact integer range (0-255). First TOKEN_ID column = high byte, rest = low byte.
-    for (unsigned int t = 0; t < num_tokens; t++) {
-        uint16_t token_hi = floatToBf16(static_cast<float>(t / 256));
-        uint16_t token_lo = floatToBf16(static_cast<float>(t % 256));
-        for (unsigned int h = 0; h < hidden; h++) {
-            if (h == hidden - TOKEN_ID_COLS) {
-                token_data_host[t * hidden + h] = token_hi;
-            } else if (h > hidden - TOKEN_ID_COLS) {
-                token_data_host[t * hidden + h] = token_lo;
-            } else {
-                token_data_host[t * hidden + h] = rank_bf16;
+        // Fill input scales if present.
+        if (dispatch_inputs.scales) {
+            const unsigned int numScales = hidden / FP8_BLOCK_SIZE;
+            size_t scale_size = static_cast<size_t>(num_tokens) * numScales;
+            float* scale_data_host = new float[scale_size];
+            for (unsigned int t = 0; t < num_tokens; t++)
+                for (unsigned int b = 0; b < numScales; b++)
+                    scale_data_host[static_cast<size_t>(t) * numScales + b] = fp8ScaleValue(myRank, t, b);
+            {
+                void* scales_data;
+                NCCLCHECK(epGetTensorData(alloc, dispatch_inputs.scales, &scales_data));
+                CUDACHECK(cudaMemcpy(scales_data, scale_data_host,
+                                     scale_size * sizeof(float), cudaMemcpyHostToDevice));
+            }
+            delete[] scale_data_host;
+        }
+    } else {
+        // BF16: fill with rank value; last TOKEN_ID_COLS columns carry token index.
+        float rank_value = static_cast<float>(myRank - RANK_OFFSET);
+        uint16_t rank_bf16 = floatToBf16(rank_value);
+        size_t token_size = num_tokens * hidden;
+        uint16_t* token_data_host = new uint16_t[token_size];
+        for (unsigned int t = 0; t < num_tokens; t++) {
+            uint16_t token_hi = floatToBf16(static_cast<float>(t / 256));
+            uint16_t token_lo = floatToBf16(static_cast<float>(t % 256));
+            for (unsigned int h = 0; h < hidden; h++) {
+                if (h == hidden - TOKEN_ID_COLS)
+                    token_data_host[t * hidden + h] = token_hi;
+                else if (h > hidden - TOKEN_ID_COLS)
+                    token_data_host[t * hidden + h] = token_lo;
+                else
+                    token_data_host[t * hidden + h] = rank_bf16;
             }
         }
+        {
+            void* input0_data;
+            NCCLCHECK(epGetTensorData(alloc, dispatch_inputs.tokens, &input0_data));
+            CUDACHECK(cudaMemcpy(input0_data, token_data_host,
+                                 token_size * sizeof(uint16_t), cudaMemcpyHostToDevice));
+        }
+        delete[] token_data_host;
     }
 
-    // Copy to GPU
-    {
-        void* input0_data;
-        NCCLCHECK(epGetTensorData(alloc, dispatch_inputs.tokens, &input0_data));
-        CUDACHECK(cudaMemcpy(input0_data, token_data_host,
-                             token_size * sizeof(uint16_t), cudaMemcpyHostToDevice));
-    }
-
-    // Generate random positive topk_weights: abs(randn)
-    // LL: weights applied during combine → affects combined output
-    // HT: weights forwarded during dispatch → does NOT affect combined output
+    // topk_weights — shared by both BF16 and FP8 paths.
+    // LL: weights applied during combine; HT: forwarded during dispatch.
     float* topk_weights_host = new float[num_tokens * top_k];
     std::mt19937 rng(42 + myRank);
     std::normal_distribution<float> normal(0.0f, 1.0f);
@@ -796,24 +845,25 @@ void initializeValidationData(
         topk_weights_host[i] = std::abs(normal(rng));
         if (topk_weights_host[i] < 1e-6f) topk_weights_host[i] = 1e-6f;
     }
-
-    if (is_ht_mode) {
+    if (is_ht_mode && dispatch_inputs.topk_weights) {
         void* dtw_data;
         NCCLCHECK(epGetTensorData(alloc, dispatch_inputs.topk_weights, &dtw_data));
         CUDACHECK(cudaMemcpy(dtw_data, topk_weights_host,
                              num_tokens * top_k * sizeof(float), cudaMemcpyHostToDevice));
     }
-    // Also initialize the combine topk_weights (used by both modes)
     {
         void* tw_data;
         NCCLCHECK(epGetTensorData(alloc, topk_weights, &tw_data));
         CUDACHECK(cudaMemcpy(tw_data, topk_weights_host,
                              num_tokens * top_k * sizeof(float), cudaMemcpyHostToDevice));
     }
-
     delete[] topk_weights_host;
-    delete[] token_data_host;
 }
+
+// FP8 EXTERN dispatch validation — simple byte-transport check.
+// Token row: byte[0]=rank, byte[1]=t/256, byte[2]=t%256, rest=(rank*131+t*17+h)&0xFF.
+// Identity is read from bytes 0-2; scales are FP32 deterministic pattern.
+// Dispatch is pure byte transport — we just verify the bytes arrive unchanged.
 
 // Validation result structure
 struct ValidationResult {
@@ -1275,6 +1325,155 @@ static void preReduceRankMajor(
     delete[] recv_wgt;
 }
 
+// ==================== HT EXTERN FP8 dispatch byte-equality validation ====================
+// Output tokens: 2D [buf_rows, hidden] uint8 (FP8 bytes); output scales: 2D [buf_rows, numScales] f32.
+// Dispatch is a pure byte transport (it never decodes FP8). For each valid recv slot we recover the
+// source (rank, token) from the f32 scale blocks 0/1/2, then memcmp the full token byte row and the
+// full scale row against the deterministic recompute (fp8TokenByte / fp8ScaleValue). Routing replay
+// (generateTopkIndicesHT) gives the expected (rank, token) set for missing/unexpected accounting.
+// Mirrors validateDispatchOutputHTRankMaj's valid-slot scan via recv_topk_idx.
+static ValidationResult validateDispatchOutputHTExtern(
+    const ncclEpDispatchOutputs_t& dispatch_outputs,
+    unsigned int max_tokens_per_rank,
+    const unsigned int*            num_tokens_per_rank,
+    unsigned int hidden,
+    unsigned int top_k,
+    unsigned int num_experts,
+    unsigned int num_local_experts,
+    int myRank,
+    int nRanks
+) {
+    ValidationResult result = {true, 0, 0.0, ""};
+    ErrorReporter rep;
+
+    const unsigned int numScales = hidden / FP8_BLOCK_SIZE;
+
+    const size_t* out0_sizes = dispatch_outputs.tokens->sizes;
+    unsigned int buf_rows = out0_sizes[0];
+
+    // Recv token bytes (uint8).
+    size_t recv_tok_size = static_cast<size_t>(buf_rows) * hidden;
+    uint8_t* recv_tok = new uint8_t[recv_tok_size];
+    CUDACHECK(cudaMemcpy(recv_tok, dispatch_outputs.tokens->data,
+                         recv_tok_size * sizeof(uint8_t), cudaMemcpyDeviceToHost));
+
+    // Recv scales (FP32).
+    size_t recv_sf_size = static_cast<size_t>(buf_rows) * numScales;
+    uint8_t* recv_sf_raw = new uint8_t[recv_sf_size * sizeof(float)];
+    CUDACHECK(cudaMemcpy(recv_sf_raw, dispatch_outputs.scales->data,
+                         recv_sf_size * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Valid-slot scan. For flat layout, topk_idx is available and some slots may be empty.
+    // For EM layout, topk_idx is not allocated; all output rows are valid tokens.
+    bool* valid_slot = new bool[buf_rows]();
+    if (dispatch_outputs.topk_idx != nullptr) {
+        int64_t* recv_topk_idx = new int64_t[static_cast<size_t>(buf_rows) * top_k];
+        CUDACHECK(cudaMemcpy(recv_topk_idx, dispatch_outputs.topk_idx->data,
+                             static_cast<size_t>(buf_rows) * top_k * sizeof(int64_t),
+                             cudaMemcpyDeviceToHost));
+        for (unsigned int j = 0; j < buf_rows; j++) {
+            for (unsigned int k = 0; k < top_k; k++) {
+                if (recv_topk_idx[j * top_k + k] >= 0) { valid_slot[j] = true; break; }
+            }
+        }
+        delete[] recv_topk_idx;
+    } else {
+        // EM: all rows are valid.
+        for (unsigned int j = 0; j < buf_rows; j++) valid_slot[j] = true;
+    }
+
+    // Expected (rank, token) set via routing replay.
+    int64_t* src_topk = new int64_t[static_cast<size_t>(max_tokens_per_rank) * top_k];
+    std::set<std::pair<int,int>> expected;
+    for (int r = 0; r < nRanks; r++) {
+        unsigned int r_tokens = num_tokens_per_rank[r];
+        generateTopkIndicesHT(src_topk, r_tokens, num_experts, top_k, r);
+        for (unsigned int t = 0; t < r_tokens; t++) {
+            for (unsigned int k = 0; k < top_k; k++) {
+                int64_t expert_id = src_topk[t * top_k + k];
+                int expert_rank = static_cast<int>(expert_id) / static_cast<int>(num_local_experts);
+                if (expert_rank == myRank) {
+                    expected.insert({r, static_cast<int>(t)});
+                    break;
+                }
+            }
+        }
+    }
+    delete[] src_topk;
+
+    // Per valid slot: decode identity from token bytes 0-2, memcmp token + scale rows.
+    std::set<std::pair<int,int>> found;
+    std::vector<uint8_t> exp_tok(hidden);
+    std::vector<float>   exp_sf(numScales);
+    const float* recv_sf = reinterpret_cast<const float*>(recv_sf_raw);
+    for (unsigned int j = 0; j < buf_rows; j++) {
+        if (!valid_slot[j]) continue;
+
+        const uint8_t* tok_row = recv_tok + static_cast<size_t>(j) * hidden;
+        const float*   sf_row  = recv_sf  + static_cast<size_t>(j) * numScales;
+
+        // Identity is in the first 3 bytes of the token row.
+        int src_rank = static_cast<int>(tok_row[0]);
+        int token_id = static_cast<int>(tok_row[1]) * 256 + static_cast<int>(tok_row[2]);
+
+        if (src_rank < 0 || src_rank >= nRanks ||
+            token_id < 0 || token_id >= static_cast<int>(max_tokens_per_rank)) {
+            rep.error("[Rank %d] FP8 dispatch: slot %u: invalid identity (rank=%d, token=%d)\n",
+                      myRank, j, src_rank, token_id);
+            continue;
+        }
+
+        auto key = std::make_pair(src_rank, token_id);
+        if (expected.find(key) == expected.end()) {
+            rep.error("[Rank %d] FP8 dispatch: slot %u: unexpected token (rank=%d, token=%d)\n",
+                      myRank, j, src_rank, token_id);
+        }
+        found.insert(key);
+
+        // Recompute and byte-compare the full token row.
+        for (unsigned int h = 0; h < hidden; h++)
+            exp_tok[h] = fp8TokenByte(src_rank, static_cast<unsigned>(token_id), h);
+        if (memcmp(tok_row, exp_tok.data(), hidden) != 0) {
+            unsigned int bad = 0;
+            for (; bad < hidden; bad++) if (tok_row[bad] != exp_tok[bad]) break;
+            rep.error("[Rank %d] FP8 dispatch: slot %u (rank=%d, token=%d): token mismatch "
+                      "at h=%u (got 0x%02x exp 0x%02x)\n",
+                      myRank, j, src_rank, token_id, bad, tok_row[bad], exp_tok[bad]);
+        }
+
+        // Recompute and compare the full scale row.
+        for (unsigned int b = 0; b < numScales; b++)
+            exp_sf[b] = fp8ScaleValue(src_rank, static_cast<unsigned>(token_id), b);
+        if (memcmp(sf_row, exp_sf.data(), numScales * sizeof(float)) != 0) {
+            unsigned int bad = 0;
+            for (; bad < numScales; bad++) if (sf_row[bad] != exp_sf[bad]) break;
+            rep.error("[Rank %d] FP8 dispatch: slot %u (rank=%d, token=%d): scale mismatch "
+                      "at block=%u (got %.9g exp %.9g)\n",
+                      myRank, j, src_rank, token_id, bad, sf_row[bad], exp_sf[bad]);
+        }
+    }
+
+    for (const auto& key : expected) {
+        if (found.find(key) == found.end()) {
+            rep.error("[Rank %d] HT FP8 dispatch: missing token (rank=%d, token=%d)\n",
+                      myRank, key.first, key.second);
+        }
+    }
+
+    delete[] valid_slot;
+    delete[] recv_sf_raw;
+    delete[] recv_tok;
+
+    result.errors = rep.errors;
+    result.passed = (rep.errors == 0);
+    if (!result.passed) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "HT FP8 dispatch validation: %d errors", rep.errors);
+        result.message = buf;
+    }
+    return result;
+}
+
 // ==================== HT rank-major dispatch validation ====================
 // Output: 2D [nRanks*max_tokens_per_rank, hidden]; row valid iff any recv_topk_idx[k] >= 0.
 // FIXME: ncclEpHandleGetNumRecvTokens returns buffer max, not actual count — scan recv_topk_idx as workaround.
@@ -1519,6 +1718,7 @@ static ValidationResult validateDispatchOutputHTExpertMaj(
 // Dispatcher: routes to the appropriate per-mode validation function.
 ValidationResult validateDispatchOutput(
     const BenchmarkAllocState&     alloc,
+    const ncclEpDispatchInputs_t&  dispatch_inputs,
     const ncclEpDispatchOutputs_t& dispatch_outputs,
     const ncclEpLayoutInfo_t&      dispatch_layout_info,
     unsigned int max_tokens_per_rank,
@@ -1537,6 +1737,15 @@ ValidationResult validateDispatchOutput(
 ) {
     (void)expert_major_alignment;
     if (is_ht_mode) {
+        // EXTERN FP8 dispatch (input tokens are FP8 + scales forwarded): byte-equality validation.
+        const ncclDataType_t in_dt = (dispatch_inputs.tokens != nullptr)
+                                         ? dispatch_inputs.tokens->datatype : ncclBfloat16;
+        if (in_dt == ncclFloat8e4m3 || in_dt == ncclFloat8e5m2) {
+            return validateDispatchOutputHTExtern(dispatch_outputs,
+                                                  max_tokens_per_rank, num_tokens_per_rank,
+                                                  hidden, top_k,
+                                                  num_experts, num_local_experts, myRank, nRanks);
+        }
         // EM requires both meta arrays; fall back to RM scan if missing.
         if (is_expert_major && meta_expert_offsets != nullptr && meta_expert_counts_padded != nullptr) {
             return validateDispatchOutputHTExpertMaj(alloc, dispatch_outputs,
@@ -1550,6 +1759,12 @@ ValidationResult validateDispatchOutput(
                                                hidden, top_k,
                                                num_experts, num_local_experts, myRank, nRanks);
     } else {
+        // LL FP8 EXTERN dispatch: byte-level validation not yet implemented for LL output layouts.
+        const ncclDataType_t in_dt = (dispatch_inputs.tokens != nullptr)
+                                         ? dispatch_inputs.tokens->datatype : ncclBfloat16;
+        if (in_dt == ncclFloat8e4m3 || in_dt == ncclFloat8e5m2) {
+            return {true, 0, 0.0, "skipped (LL FP8 dispatch validation not yet implemented)"};
+        }
         if (is_expert_major) {
             return validateDispatchOutputLLExpertMaj(alloc, dispatch_outputs, dispatch_layout_info,
                                                      max_tokens_per_rank, num_tokens_per_rank,
@@ -2581,6 +2796,8 @@ void printUsage(const char* programName, int myRank) {
                "                                         NVLink by the forwarding GPU (no separate local fan-out kernel).\n");
         printf("  --mask-test             Simulate rank failures and test active-mask (LL only, implies --validate)\n");
         printf("  --topk-idx-int32        LL only: pass ncclInt32 topk_idx instead of ncclInt64\n");
+        printf("  --fp8-dispatch          Send FP8 (e4m3) tokens + FP32 scales through dispatch (HT or LL, hidden%%128==0).\n");
+        printf("                          Use --validate to verify byte-exact forwarding; omit for BW measurement.\n");
         printf("  --help                  Show this help message\n");
     }
 }
@@ -2618,6 +2835,7 @@ int main(int argc, char* argv[]) {
     bool include_non_uniform_tokens    = false;
     bool topk_idx_int32 = false;  // LL only: pass ncclInt32 topk_idx instead of ncclInt64
     bool em_nvlink_dup = false;       // HT+EM only: force nvlink_dup path (sender duplicates per-expert over NVLink)
+    bool fp8_dispatch = false;    // EXTERN FP8 dispatch: pass FP8 tokens + scales; works with HT and LL
     // Initialize MPI
     MPICHECK(MPI_Init(&argc, &argv));
     MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
@@ -2649,6 +2867,7 @@ int main(int argc, char* argv[]) {
         {"dispatch-less-than-max-tokens", required_argument, 0, 'l'},
         {"non-uniform-tokens", no_argument, 0, 'N'},
         {"topk-idx-int32", no_argument, 0, 'I'},
+        {"fp8-dispatch",   no_argument,       0, 0},
         {"help",           no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -2767,6 +2986,14 @@ int main(int argc, char* argv[]) {
             case 'I':
                 topk_idx_int32 = true;
                 break;
+            case 0: {
+                // Long-only options dispatched by name.
+                const char* name = long_options[option_index].name;
+                if (strcmp(name, "fp8-dispatch") == 0) {
+                    fp8_dispatch = true;
+                }
+                break;
+            }
             case 'h':
                 printUsage(argv[0], myRank);
                 MPI_Finalize();
@@ -2805,6 +3032,23 @@ int main(int argc, char* argv[]) {
         layout = (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT)
                  ? NCCL_EP_LAYOUT_FLAT
                  : NCCL_EP_LAYOUT_EXPERT_MAJOR;
+    }
+
+    // --fp8-dispatch: pass FP8 tokens + FP32 scales through dispatch (HT or LL).
+    // Use --validate to verify byte-exact forwarding. Use without --validate to measure
+    // physical BW (FP8 bytes on wire) vs BF16 baseline.
+    if (fp8_dispatch) {
+        if (hidden % FP8_BLOCK_SIZE != 0) {
+            if (myRank == 0)
+                printf("Error: --fp8-dispatch requires hidden %% %u == 0 (got hidden=%u)\n",
+                       FP8_BLOCK_SIZE, hidden);
+            MPI_Finalize();
+            return 1;
+        }
+        // Combine inputs would be FP8-typed tokens; the combine copy and validation assume
+        // BF16.  When the user requests validation, restrict to dispatch-only automatically.
+        if (validate_data)
+            dispatch_only = true;
     }
 
     // Validate parameters
@@ -3237,6 +3481,7 @@ int main(int argc, char* argv[]) {
     const bool              is_ll_mode               = (algorithm == NCCL_EP_ALGO_LOW_LATENCY);
 
     if (myRank == 0) { printf("[DEBUG] Setting up tensors...\n"); fflush(stdout); }
+    const ncclDataType_t tok_dt = fp8_dispatch ? ncclFloat8e4m3 : ncclBfloat16;
     if (is_ll_mode) {
         // LL rank-major zero-copy: window-back dispatch_outputs.tokens so the
         // kernel can write payload directly into peer recv_x via P2P.
@@ -3254,7 +3499,7 @@ int main(int argc, char* argv[]) {
                                topk_weights,
                                num_tokens, hidden, top_k,
                                num_local_experts, config.max_dispatch_tokens_per_rank,
-                               nRanks, layout, ll_dispatch_out_opts);
+                               nRanks, layout, ll_dispatch_out_opts, tok_dt);
     } else {
         setupHighThroughputTensors(comm, alloc,
                                    dispatch_inputs, dispatch_outputs, dispatch_layout_info,
@@ -3262,7 +3507,22 @@ int main(int argc, char* argv[]) {
                                    combine_inputs, combine_outputs,
                                    topk_weights,
                                    num_tokens, hidden, top_k,
-                                   num_local_experts, num_recv_tokens, layout, zcopy);
+                                   num_local_experts, num_recv_tokens, layout, zcopy, tok_dt);
+    }
+
+    // --fp8-dispatch: allocate FP32 input/output scale tensors.
+    // Presence of inputs->scales selects EXTERN FP8 forwarding in the library (HT and LL).
+    // Input scales: 2D [num_tokens, numScales] for both HT and LL.
+    // Output scales: HT=2D [num_recv_tokens, numScales]; LL=3D [num_local_experts, nRanks*max_tokens_per_rank, numScales].
+    if (fp8_dispatch) {
+        const unsigned int numScales = hidden / FP8_BLOCK_SIZE;
+        NCCLCHECK(epMakeTensor(&dispatch_inputs.scales, 2, ncclFloat32, num_tokens, numScales));
+        if (is_ll_mode) {
+            NCCLCHECK(epMakeTensor(&dispatch_outputs.scales, 3, ncclFloat32,
+                                   num_local_experts, (unsigned)nRanks * max_tokens_per_rank, numScales));
+        } else {
+            NCCLCHECK(epMakeTensor(&dispatch_outputs.scales, 2, ncclFloat32, num_recv_tokens, numScales));
+        }
     }
     if (myRank == 0) { printf("[DEBUG] Tensors set up\n"); fflush(stdout); }
 
@@ -3509,7 +3769,7 @@ int main(int argc, char* argv[]) {
         }
 
         ValidationResult dispatch_valid = validateDispatchOutput(
-            alloc, dispatch_outputs, dispatch_layout_info,
+            alloc, dispatch_inputs, dispatch_outputs, dispatch_layout_info,
             max_tokens_per_rank, num_tokens_per_rank.data(),
             hidden, top_k, num_experts, num_local_experts, myRank, nRanks,
             !is_ll_mode,
@@ -3759,6 +4019,12 @@ int main(int argc, char* argv[]) {
 
         MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
         if (myRank == 0) { printf("=== Active-Mask Test Complete ===\n"); fflush(stdout); }
+    }
+
+    // Free FP8 scale tensors (cleanupBenchmarkTensors does not handle scales).
+    if (fp8_dispatch) {
+        epFreeTensor(&dispatch_inputs.scales);
+        epFreeTensor(&dispatch_outputs.scales);
     }
 
     // Cleanup (order matters: tensors -> handle -> group -> comm)

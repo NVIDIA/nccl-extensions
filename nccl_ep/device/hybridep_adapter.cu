@@ -1047,7 +1047,7 @@ std::vector<uint8_t> build_dispatch_arg_buffer(
 
     auto* token_ptrs = reinterpret_cast<TOKEN_DATA_TYPE**>(arg.data() + token_offset);
     auto* prob_ptrs = reinterpret_cast<float**>(arg.data() + prob_offset);
-    auto* sf_ptrs = reinterpret_cast<float**>(arg.data() + sf_offset);
+    auto* sf_ptrs = reinterpret_cast<uint8_t**>(arg.data() + sf_offset);
     for (int i = 0; i < params.num_ranks_per_node; i++) {
         token_ptrs[i] = reinterpret_cast<TOKEN_DATA_TYPE*>(params.expert_output_token_ptrs[i]);
         prob_ptrs[i] = params.expert_output_prob_ptrs ? params.expert_output_prob_ptrs[i] : nullptr;
@@ -1066,6 +1066,8 @@ void dispatch_impl(
     int num_nodes,
     bool use_fp8,
     int num_blocks,
+    int scale_block_size,
+    int scale_elem_bytes,
     cudaStream_t stream
 ) {
     HYBRIDEP_SWITCH_DATATYPE(use_fp8, {
@@ -1091,6 +1093,8 @@ void dispatch_impl(
         d_config.num_of_blocks           = num_blocks;
         d_config.forward_dispatch        = FORWARD_DISPATCH;
         d_config.token_data_type         = std::is_same_v<TOKEN_DATA_TYPE, uint16_t> ? 1 : 0;
+        d_config.scale_elem_bytes        = scale_elem_bytes;
+        d_config.scale_block_size        = scale_block_size;
         d_config.num_pipelines           = HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
         d_config.stages_per_pipeline     = HYBRIDEP_DISPATCH_NUM_OF_STAGES / HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
         d_config.s2d_inner_dim           = kp.s2d_inner_dim;
@@ -1127,6 +1131,8 @@ void dispatch_impl(
             params.layout,
             kUseFp8,
             kp.hidden_dim,
+            scale_block_size,
+            scale_elem_bytes,
             kernel_arg.data(),
             kernel_arg.size(),
             smem_size,
@@ -1146,18 +1152,20 @@ void call_dispatch(
     bool use_fp8,
     bool forward_dispatch,
     int num_blocks,
+    int scale_block_size,
+    int scale_elem_bytes,
     cudaStream_t stream
 ) {
     // Dispatch based on forward/backward and sync mode
     if (forward_dispatch) {
         dispatch_impl<true>(
             params, max_dispatch_tokens_per_rank,
-            num_nodes, use_fp8, num_blocks, stream);
+            num_nodes, use_fp8, num_blocks, scale_block_size, scale_elem_bytes, stream);
 
     } else {
         dispatch_impl<false>(
             params, max_dispatch_tokens_per_rank,
-            num_nodes, use_fp8, num_blocks, stream);
+            num_nodes, use_fp8, num_blocks, scale_block_size, scale_elem_bytes, stream);
 
     }
 }

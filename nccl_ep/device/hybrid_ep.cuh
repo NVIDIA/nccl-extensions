@@ -132,6 +132,8 @@ struct dispatch_config_t {
   int token_data_type;  // 0 = uint8_t (FP8), 1 = uint16_t (BF16)
   int num_pipelines;
   int stages_per_pipeline;
+  int scale_elem_bytes; // bytes per scale element: sizeof(float)=4 (FP32) or 1 (UE8M0)
+  int scale_block_size; // elements per scale block (inferred from caller's scales tensor)
 };
 
 struct combine_config_t {
@@ -304,7 +306,7 @@ struct combine_smem_layout_t {
 struct dispatch_smem_layout_t {
   void* intra_node_token_buffer;
   float* intra_node_prob_buffer;
-  float* intra_node_scaling_factor_buffer;
+  uint8_t* intra_node_scaling_factor_buffer;
   int32_t* sparse_to_dense_map_buffer;
   bool* attn_to_rdma_map_buffer;
   uint64_t* intra_node_mbarrier_buffer;
@@ -331,8 +333,8 @@ struct dispatch_smem_layout_t {
   __device__ __forceinline__ float* get_prob_buffer(int stage) const {
     return reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(intra_node_prob_buffer) + stage * prob_buffer_stage_stride);
   }
-  __device__ __forceinline__ float* get_sf_buffer(int stage) const {
-    return reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(intra_node_scaling_factor_buffer) + stage * sf_buffer_stage_stride);
+  __device__ __forceinline__ void* get_sf_buffer(int stage) const {
+    return reinterpret_cast<void*>(intra_node_scaling_factor_buffer + stage * sf_buffer_stage_stride);
   }
   __device__ __forceinline__ uint64_t* get_intra_node_mbarrier_producer(int stage) const {
     return intra_node_mbarrier_buffer + stage * 2;
@@ -348,7 +350,7 @@ struct dispatch_smem_layout_t {
   __device__ __forceinline__ float* get_prob_buffer(int pipeline_id, int local_stage) const {
     return get_prob_buffer(pipeline_id * stages_per_pipeline + local_stage);
   }
-  __device__ __forceinline__ float* get_sf_buffer(int pipeline_id, int local_stage) const {
+  __device__ __forceinline__ void* get_sf_buffer(int pipeline_id, int local_stage) const {
     return get_sf_buffer(pipeline_id * stages_per_pipeline + local_stage);
   }
   __device__ __forceinline__ uint64_t* get_intra_node_mbarrier_producer(int pipeline_id, int local_stage) const {
@@ -434,10 +436,9 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
 
   // Scaling factor buffer (only if FP8, 16B aligned) -- total stages unchanged
   if (config.token_data_type == 0) {
-    layout.sf_buffer_stage_stride = (model.hidden_dim / 128) * sizeof(float);
+    layout.sf_buffer_stage_stride = (model.hidden_dim / config.scale_block_size) * config.scale_elem_bytes;
     layout.sf_buffer_stage_stride = (layout.sf_buffer_stage_stride + 15) & ~15;
-    layout.intra_node_scaling_factor_buffer = reinterpret_cast<float*>(
-        reinterpret_cast<uint8_t*>(smem_base) + offset);
+    layout.intra_node_scaling_factor_buffer = reinterpret_cast<uint8_t*>(smem_base) + offset;
     offset += config.num_of_stages * layout.sf_buffer_stage_stride;
   } else {
     layout.intra_node_scaling_factor_buffer = nullptr;
@@ -524,7 +525,7 @@ static size_t calculate_dispatch_smem_layout_size(
 
   // Scaling factor buffer (16B aligned per stage, only if FP8) -- total stages unchanged
   if (config.token_data_type == 0) {
-    int sf_buffer_stage_stride = (model.hidden_dim / 128) * sizeof(float);
+    int sf_buffer_stage_stride = (model.hidden_dim / config.scale_block_size) * config.scale_elem_bytes;
     sf_buffer_stage_stride = (sf_buffer_stage_stride + 15) & ~15;
     total_size += config.num_of_stages * sf_buffer_stage_stride;
   }
@@ -835,7 +836,7 @@ struct dispatch_kernel_param_base_t {
   // Input buffers. These buffers are local buffers.
   const TOKEN_DATA_TYPE* attn_input_token;
   const float* attn_input_prob; // Needed by expert layer, so only valid in forward dispatch.
-  const float* attn_input_token_scaling_factor; // If input token is FP8 dtype, we need scaling factor for tokens.
+  const uint8_t* attn_input_token_scaling_factor; // FP8 EXTERN: per-token scales (float* for FP32, uint8_t* for UE8M0 — pure byte transport).
   // Internal temp buffers. These buffers are local buffers.
   uint64_t* rdma_inter_node_group_flags; // For RDMA Atomic flags.
   uint32_t* intra_node_write_completion_flags; // For intra-node S2G write completion notification.
@@ -887,7 +888,7 @@ struct dispatch_kernel_param_t : dispatch_kernel_param_base_t<TOKEN_DATA_TYPE> {
   // Keep embedded arrays here to avoid device-side pointer-table indirection.
   TOKEN_DATA_TYPE* expert_output_token[LSA_TEAM_SIZE];
   float* expert_output_prob[LSA_TEAM_SIZE]; // Only valid in forward dispatch.
-  float* expert_output_scaling_factor[LSA_TEAM_SIZE]; // Only valid for FP8 token type.
+  uint8_t* expert_output_scaling_factor[LSA_TEAM_SIZE]; // Only valid for FP8 token type.
 };
 
 // Fixed-size part of combine kernel parameters. Peer pointer arrays are appended
@@ -980,7 +981,8 @@ template<typename INTER_NODE_GROUP,
          int MAX_NUM_OF_TOKENS_PER_RANK,
          int NUM_LSA_TEAMS,
          int NUM_OF_BLOCKS,
-         bool FORWARD_DISPATCH>
+         bool FORWARD_DISPATCH,
+         int SCALE_ELEM_BYTES>
 __forceinline__ __device__ void N2N_warp_group_device_function(const int local_rank,
                                                       const int node_rank,
                                                       const int num_of_tokens_per_rank,
@@ -998,6 +1000,7 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
                                                       const struct dispatch_memory_region_info_t *mr_info,
                                                       SMEM_TYPE* smem_buffer_ptr,
                                                       const int HIDDEN_DIM,
+                                                      const int scale_block_size,
                                                       const int experts_per_rank)
 {
   // Load attn_to_rdma_map using LDG.128. Each token will need 1 bool from this map.
@@ -1028,7 +1031,7 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
   int n2n_warp_id = INTER_NODE_GROUP::thread_rank() / 32;
   size_t token_bytes = HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE);
   size_t prob_bytes = (experts_per_rank * num_of_ranks_per_node) * sizeof(float);
-  size_t sf_bytes = (HIDDEN_DIM / 128) * sizeof(float);
+  size_t sf_bytes = (HIDDEN_DIM / scale_block_size) * SCALE_ELEM_BYTES;
   constexpr int MAX_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
 
   // GIN device side setup
@@ -1144,17 +1147,19 @@ template<typename INTRA_NODE_G2S_GROUP,
          int NUM_LSA_TEAMS,
          int NUM_OF_BLOCKS,
          bool FORWARD_DISPATCH,
-         int NUM_PIPELINES>
+         int NUM_PIPELINES,
+         int SCALE_ELEM_BYTES>
 __forceinline__ __device__ void G2S_warp_group_device_function(const int local_rank,
                                                       const int node_rank,
                                                       const int num_of_tokens_per_rank,
                                                       const int num_of_ranks_per_node,
                                                       const uint64_t expected_flag_value,
                                                       const int HIDDEN_DIM,
+                                                      const int scale_block_size,
                                                       const bool* rdma_to_attn_map,
                                                       const TOKEN_DATA_TYPE* attn_input_token,
                                                       const float* attn_input_prob,
-                                                      const float* attn_input_token_scaling_factor,
+                                                      const uint8_t* attn_input_token_scaling_factor,
                                                       uint64_t* rdma_inter_node_group_flags,
                                                       ncclDevComm_t* dcomms,
                                                       unsigned signals_base,
@@ -1219,7 +1224,7 @@ __forceinline__ __device__ void G2S_warp_group_device_function(const int local_r
                                                                          (node_id * rdma_to_attn_map_size_per_node + i * NUM_OF_TOKENS_PER_CHUNK));
         const TOKEN_DATA_TYPE* token_load_base_addr = nullptr;
         const float* prob_load_base_addr = nullptr;
-        const float* scaling_factor_load_base_addr = nullptr;
+        const uint8_t* scaling_factor_load_base_addr = nullptr;
         const uint8_t* packed_base = nullptr;
         bool use_packed_layout = false;
 
@@ -1236,7 +1241,7 @@ __forceinline__ __device__ void G2S_warp_group_device_function(const int local_r
             prob_load_base_addr = attn_input_prob + chunk_first_token_id * (experts_per_rank * num_of_ranks_per_node * NUM_LSA_TEAMS);
           }
           if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
-            scaling_factor_load_base_addr = attn_input_token_scaling_factor + chunk_first_token_id * (HIDDEN_DIM / 128);
+            scaling_factor_load_base_addr = attn_input_token_scaling_factor + chunk_first_token_id * (HIDDEN_DIM / scale_block_size) * SCALE_ELEM_BYTES;
           }
         }
         int packed_dense_idx = 0;
@@ -1256,7 +1261,7 @@ __forceinline__ __device__ void G2S_warp_group_device_function(const int local_r
               uint32_t total_tx_size = 0;
               size_t token_bytes = HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE);
               size_t prob_bytes = (experts_per_rank * num_of_ranks_per_node) * sizeof(float);
-              size_t sf_bytes = (HIDDEN_DIM / 128) * sizeof(float);
+              size_t sf_bytes = (HIDDEN_DIM / scale_block_size) * SCALE_ELEM_BYTES;
 
               if (use_packed_layout) {
                 const uint8_t* packed_entry = packed_base + packed_dense_idx * mr_info->bytes_per_entry;
@@ -1311,7 +1316,7 @@ __forceinline__ __device__ void G2S_warp_group_device_function(const int local_r
                   cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
                                            cuda::ptx::space_global,
                                            reinterpret_cast<void*>(smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage)),
-                                           reinterpret_cast<const void*>(scaling_factor_load_base_addr + (current_token_id * (HIDDEN_DIM / 128))),
+                                           reinterpret_cast<const void*>(scaling_factor_load_base_addr + current_token_id * (HIDDEN_DIM / scale_block_size) * SCALE_ELEM_BYTES),
                                            (uint32_t)sf_bytes,
                                            smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage));
                   total_tx_size += (uint32_t)sf_bytes;
@@ -1361,17 +1366,19 @@ template<typename INTRA_NODE_S2G_GROUP,
          bool FORWARD_DISPATCH,
          int NUM_PIPELINES,
          int LSA_TEAM_SIZE,
-         ncclEpLayout_t kLayout>
+         ncclEpLayout_t kLayout,
+         int SCALE_ELEM_BYTES>
 __forceinline__ __device__ void S2G_warp_group_device_function(const int local_rank,
                                                       const int node_rank,
                                                       const int num_of_tokens_per_rank,
                                                       const int num_of_ranks_per_node,
                                                       const int HIDDEN_DIM,
+                                                      const int scale_block_size,
                                                       const bool* rdma_to_attn_map,
                                                       const int32_t* sparse_to_dense_map,
                                                       TOKEN_DATA_TYPE* const* remote_expert_output_token,
                                                       float* const* remote_expert_output_prob,
-                                                      float* const* remote_expert_output_scaling_factor,
+                                                      uint8_t* const* remote_expert_output_scaling_factor,
                                                       SMEM_TYPE* smem_buffer_ptr,
                                                       const int experts_per_rank,
                                                       const bool local_dup_enabled)
@@ -1576,12 +1583,12 @@ __forceinline__ __device__ void S2G_warp_group_device_function(const int local_r
                                                  (uint32_t)((experts_per_rank * num_of_ranks_per_node) * sizeof(float)));
                       }
                       if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
-                        float* remote_scaling_factor_addr = remote_expert_output_scaling_factor[remote_rank_id] + (output_buffer_index * (HIDDEN_DIM / 128));
+                        uint8_t* remote_scaling_factor_addr = remote_expert_output_scaling_factor[remote_rank_id] + output_buffer_index * (HIDDEN_DIM / scale_block_size) * SCALE_ELEM_BYTES;
                         cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
                                                  cuda::ptx::space_shared,
                                                  reinterpret_cast<void*>(remote_scaling_factor_addr),
-                                                 reinterpret_cast<const void*>(smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage)),
-                                                 (uint32_t)((HIDDEN_DIM / 128) * sizeof(float)));
+                                                 smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage),
+                                                 (uint32_t)((HIDDEN_DIM / scale_block_size) * SCALE_ELEM_BYTES));
                       }
                     }
                   }
@@ -3388,7 +3395,9 @@ template<typename TOKEN_DATA_TYPE,
          int NUM_PIPELINES,
          int LSA_TEAM_SIZE,
          ncclEpLayout_t kLayout,
-         int HIDDEN_DIM>
+         int HIDDEN_DIM,
+         int SCALE_BLOCK_SIZE,
+         int SCALE_ELEM_BYTES>
 __device__ __forceinline__ void dispatch_kernel_impl(
     const dispatch_kernel_param_t<TOKEN_DATA_TYPE, LSA_TEAM_SIZE>& param,
     uint8_t* smem_bytes)
@@ -3411,6 +3420,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
   d_config.num_of_blocks = NUM_OF_BLOCKS;
   d_config.forward_dispatch = FORWARD_DISPATCH;
   d_config.token_data_type = std::is_same_v<TOKEN_DATA_TYPE, uint16_t> ? 1 : 0;
+  d_config.scale_elem_bytes = SCALE_ELEM_BYTES;
+  d_config.scale_block_size = SCALE_BLOCK_SIZE;
   d_config.num_pipelines = NUM_PIPELINES;
   d_config.stages_per_pipeline = STAGES_PER_PIPELINE;
   d_config.s2d_inner_dim = param.s2d_inner_dim;
@@ -3448,24 +3459,24 @@ __device__ __forceinline__ void dispatch_kernel_impl(
   if(threadIdx_x_int < INTER_NODE_GROUP::size()){
     if constexpr(NUM_LSA_TEAMS != 1){
       N2N_warp_group_device_function
-      <INTER_NODE_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, FORWARD_DISPATCH>
+      <INTER_NODE_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, FORWARD_DISPATCH, SCALE_ELEM_BYTES>
       (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.attn_to_rdma_map,
        param.dcomms, param.token_window, param.prob_window, param.sf_window, param.dest_window,
        param.num_gin_comms, param.num_ctx_per_comm, param.gin_base_ptr, param.signals_base,
-       &param.mr_info, smem_buffer_ptr, HIDDEN_DIM, param.experts_per_rank);
+       &param.mr_info, smem_buffer_ptr, HIDDEN_DIM, SCALE_BLOCK_SIZE, param.experts_per_rank);
     }
   } else if (threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size()){
     G2S_warp_group_device_function
     <INTRA_NODE_G2S_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_TOKENS_PER_CHUNK,
-     MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, FORWARD_DISPATCH, NUM_PIPELINES>
-    (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, *param.expected_rdma_flag_value, HIDDEN_DIM, param.rdma_to_attn_map, param.attn_input_token,
+     MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, FORWARD_DISPATCH, NUM_PIPELINES, SCALE_ELEM_BYTES>
+    (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, *param.expected_rdma_flag_value, HIDDEN_DIM, SCALE_BLOCK_SIZE, param.rdma_to_attn_map, param.attn_input_token,
     param.attn_input_prob, param.attn_input_token_scaling_factor,
     param.rdma_inter_node_group_flags, param.dcomms, param.signals_base, param.num_gin_comms, param.num_ctx_per_comm,
     param.gin_base_ptr, &param.mr_info, smem_buffer_ptr, param.experts_per_rank);
   } else if (threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTRA_NODE_S2G_GROUP::size()){
     S2G_warp_group_device_function
-    <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_TOKENS_PER_CHUNK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, FORWARD_DISPATCH, NUM_PIPELINES, LSA_TEAM_SIZE, kLayout>
-    (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, HIDDEN_DIM, param.rdma_to_attn_map, param.sparse_to_dense_map, param.expert_output_token, param.expert_output_prob,
+    <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_TOKENS_PER_CHUNK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, FORWARD_DISPATCH, NUM_PIPELINES, LSA_TEAM_SIZE, kLayout, SCALE_ELEM_BYTES>
+    (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, HIDDEN_DIM, SCALE_BLOCK_SIZE, param.rdma_to_attn_map, param.sparse_to_dense_map, param.expert_output_token, param.expert_output_prob,
     param.expert_output_scaling_factor, smem_buffer_ptr, param.experts_per_rank, param.local_dup_enabled);
   } else if (PAD_GROUP::size() > 0 &&
              threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTRA_NODE_S2G_GROUP::size() + PAD_GROUP::size()){

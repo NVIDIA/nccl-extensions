@@ -84,7 +84,9 @@ inline std::string dispatch_jit_source(
     int lsa_team_size,
     ncclEpLayout_t layout,
     bool use_fp8,
-    int hidden_dim) {
+    int hidden_dim,
+    int scale_block_size,
+    int scale_elem_bytes) {
     const char* layout_literal =
         (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR)
             ? "NCCL_EP_LAYOUT_EXPERT_MAJOR"
@@ -95,6 +97,8 @@ inline std::string dispatch_jit_source(
         << "#include \"device/hybrid_ep.cuh\"\n"
         << "\n"
         << "using TOKEN_DATA_TYPE = " << token_type_literal << ";\n"
+        << "static constexpr int kScaleElemBytes = " << scale_elem_bytes << ";\n"
+        << "static constexpr int kScaleBlockSize = " << scale_block_size << ";\n"
         << "using INTER_NODE_GROUP     = hybrid_ep::warp_group<" << inter_node_group_warps    << ", " << inter_node_group_start    << ">;\n"
         << "using INTRA_NODE_G2S_GROUP = hybrid_ep::warp_group<" << intra_node_g2s_group_warps << ", " << intra_node_g2s_group_start << ">;\n"
         << "using INTRA_NODE_S2G_GROUP = hybrid_ep::warp_group<" << intra_node_s2g_group_warps << ", " << intra_node_s2g_group_start << ">;\n"
@@ -121,7 +125,9 @@ inline std::string dispatch_jit_source(
         << "      " << num_pipelines << ",\n"
         << "      " << lsa_team_size << ",\n"
         << "      " << layout_literal << ",\n"
-        << "      " << hidden_dim << ">(param, smem_bytes);\n"
+        << "      " << hidden_dim << ",\n"
+        << "      kScaleBlockSize,\n"
+        << "      kScaleElemBytes>(param, smem_bytes);\n"
         << "}\n";
     return src.str();
 }
@@ -137,6 +143,8 @@ inline void launch_dispatch(
     ncclEpLayout_t layout,
     bool use_fp8,
     int hidden_dim,
+    int scale_block_size,
+    int scale_elem_bytes,
     void* param,
     size_t param_size,
     int dynamic_smem_bytes,
@@ -159,7 +167,9 @@ inline void launch_dispatch(
             << "_blocks" << num_of_blocks
             << (forward_dispatch ? "_fwd" : "_bwd")
             << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_fl")
-            << (use_fp8 ? "_fp8" : "_bf16");
+            << (use_fp8 ? "_fp8" : "_bf16")
+            << "_sb" << scale_block_size
+            << "_se" << scale_elem_bytes;
         return name.str();
     }();
     const std::string source = dispatch_jit_source(
@@ -181,7 +191,9 @@ inline void launch_dispatch(
         lsa_team_size,
         layout,
         use_fp8,
-        hidden_dim);
+        hidden_dim,
+        scale_block_size,
+        scale_elem_bytes);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_dispatch";

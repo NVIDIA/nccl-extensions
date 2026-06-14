@@ -303,13 +303,13 @@ struct DispatchParams {
     int num_ranks_per_node;     // Ranks per node (NVLink domain size)
     const void* attn_input_token;
     const float* attn_input_prob;            // Forward dispatch only
-    const float* attn_input_scaling_factor;  // FP8 only
+    const uint8_t* attn_input_scaling_factor;  // FP8 only (float* for FP32, uint8_t* for UE8M0)
 
     // IPC-mapped output buffers (from ep_group)
     // Pointer tables are expected to be device-resident (d_* arrays).
     void* const* expert_output_token_ptrs;   // Array[num_ranks_per_node]
     float* const* expert_output_prob_ptrs;   // Forward only
-    float* const* expert_output_scaling_factor_ptrs; // FP8 only
+    uint8_t* const* expert_output_scaling_factor_ptrs; // FP8 only
 
     // Metadata (from handle->hybridep preprocessing outputs)
     const bool* rdma_to_attn_map;
@@ -361,6 +361,8 @@ void call_dispatch(
     bool use_fp8,               // false = BF16 (uint16_t), true = FP8 (uint8_t)
     bool forward_dispatch,      // True for forward, false for backward
     int num_blocks,             // Number of SMs/blocks for the kernel grid
+    int scale_block_size,       // Elements per FP8 scale block (inferred from scales tensor)
+    int scale_elem_bytes,       // Bytes per scale element: sizeof(float)=4 or 1 (UE8M0)
     cudaStream_t stream);
 
 // ============================================================================

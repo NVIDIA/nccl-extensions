@@ -312,7 +312,8 @@ typedef struct {
     ncclEpTensor_t* topk_weights; // optional; 2D [num_tokens, top_k], ncclFloat32
                                   //   LL rank-major: per-token routing weights
                                   //   HT forward: routing weights (topk_idx taken from handle)
-    ncclEpTensor_t* scales;       // Reserved for future use
+    ncclEpTensor_t* scales;       // required when tokens->datatype is FP8 (HT or LL EXTERN);
+                                  // 2D [num_tokens, hidden/128], ncclFloat32 or ncclUint8 (UE8M0)
 } ncclEpDispatchInputs_t;
 
 #define NCCL_EP_DISPATCH_INPUTS_INIT ((ncclEpDispatchInputs_t){ \

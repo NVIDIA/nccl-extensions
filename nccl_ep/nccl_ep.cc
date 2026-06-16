@@ -2864,7 +2864,7 @@ ncclResult_t ncclEpDispatch(
             auto launch_dispatch = [&](auto* topk_idx_data) {
                 const ncclEpTensor_t* in_scales = tensor_ptr(inputs->scales);
                 auto* in_scales_data = extern_fp8
-                    ? static_cast<const float*>(in_scales->data) : nullptr;
+                    ? static_cast<const uint8_t*>(in_scales->data) : nullptr;
                 nccl_ep::internode_ll::dispatch(
                     x_data,
                     topk_idx_data,
@@ -3220,6 +3220,7 @@ ncclResult_t ncclEpDispatch(
                                    ? static_cast<int>(group->prolog_epilog_sms) : 0;
 
         // Call dispatch kernel
+        const int sf_bytes_per_token = use_fp8 ? num_scales_per_token * scale_elem_bytes : 0;
         nccl_ep::hybridep::call_dispatch(
             params,
             group->config.max_dispatch_tokens_per_rank,
@@ -3227,8 +3228,7 @@ ncclResult_t ncclEpDispatch(
             use_fp8,
             forward_dispatch,
             static_cast<int>(group->max_num_sms),
-            use_fp8 ? hidden / num_scales_per_token : kFP8ExternScaleBlockSize,
-            scale_elem_bytes,
+            sf_bytes_per_token,
             stream
         );
 

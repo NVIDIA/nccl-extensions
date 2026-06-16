@@ -361,8 +361,7 @@ void call_dispatch(
     bool use_fp8,               // false = BF16 (uint16_t), true = FP8 (uint8_t)
     bool forward_dispatch,      // True for forward, false for backward
     int num_blocks,             // Number of SMs/blocks for the kernel grid
-    int scale_block_size,       // Elements per FP8 scale block (inferred from scales tensor)
-    int scale_elem_bytes,       // Bytes per scale element: sizeof(float)=4 or 1 (UE8M0)
+    int sf_bytes_per_token,     // Total scale bytes per token (pre-computed on host)
     cudaStream_t stream);
 
 // ============================================================================

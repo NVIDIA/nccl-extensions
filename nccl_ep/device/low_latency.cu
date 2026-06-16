@@ -102,74 +102,76 @@ __forceinline__ __device__ uint64_t ncclGetP2pPtr(const uint64_t& dstPtr,
 // Helper functions for dispatch kernel modularization
 // ============================================================================
 
-// Cast BF16 data to FP8 and write to send buffer, or copy BF16 data directly
-template<bool kUseFP8>
+// Cast BF16 data to FP8 and write to send buffer, copy BF16 data directly,
+// or byte-copy externally-quantized token bytes + caller-supplied scales.
+//
+// kUseFP8:     output is FP8 (INTERN or EXTERN).
+// kExternQuant: caller provides pre-quantized bytes (only meaningful when kUseFP8=true);
+//               srcData is int2* (FP8 bytes). When false and kUseFP8=true (INTERN),
+//               srcData is int4* (BF16 input to quantize in-kernel).
+template<bool kUseFP8, bool kExternQuant = false>
 __forceinline__ __device__ void castAndWriteToSendBuf(
-    const int4* srcDataInt4,
+    const typename std::conditional<kExternQuant, int2, int4>::type* srcData,
     typename std::conditional<kUseFP8, int2, int4>::type* sendBufVec,
     float* sendBufScales,
     int threadId,
     int numThreads,
     int laneId,
     int hiddenBf16Int4,
-    bool roundScale) {
+    bool roundScale,
+    const uint8_t* inScales = nullptr,  // EXTERN only: raw scale bytes for this token
+    int numScaleBytes = 0) {            // EXTERN only: total bytes to copy
     constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
     constexpr int kNumPerChannels = 128;
 
     EP_DEVICE_ASSERT(hiddenBf16Int4 % 32 == 0);
     #pragma unroll
     for (int i = threadId; i < hiddenBf16Int4; i += numThreads) {
-        auto dataInt4 = __ldg(srcDataInt4 + i);
-
         if constexpr (kUseFP8) {
-            // Calculate local amax
-            auto bf16Data = reinterpret_cast<nv_bfloat16*>(&dataInt4);
-            float fp32Data[kNumElemsPerRead];
-            float amax = kFP8Margin, scale, scaleInv;
-            #pragma unroll
-            for (int j = 0; j < kNumElemsPerRead; ++j) {
-                fp32Data[j] = static_cast<float>(bf16Data[j]);
-                amax = fmaxf(amax, fabsf(fp32Data[j]));
-            }
+            if constexpr (kExternQuant) {
+                // EXTERN: byte-copy pre-quantized FP8 token (dispatch forwards bytes unchanged)
+                sendBufVec[i] = __ldg(srcData + i);
+            } else {
+                // INTERN: quantize BF16→FP8 (E4M3 only)
+                auto dataInt4 = __ldg(srcData + i);
+                // Calculate local amax
+                auto bf16Data = reinterpret_cast<nv_bfloat16*>(&dataInt4);
+                float fp32Data[kNumElemsPerRead];
+                float amax = kFP8Margin, scale, scaleInv;
+                #pragma unroll
+                for (int j = 0; j < kNumElemsPerRead; ++j) {
+                    fp32Data[j] = static_cast<float>(bf16Data[j]);
+                    amax = fmaxf(amax, fabsf(fp32Data[j]));
+                }
 
-            // Reduce amax and scale
-            EP_STATIC_ASSERT(kNumElemsPerRead * 32 / kNumPerChannels == 2, "Invalid vectorization");
-            amax = warp_reduce_max<16>(amax);
-            calculate_fp8_scales(amax, scale, scaleInv, roundScale);
-            if (laneId == 0 or laneId == 16)
-                sendBufScales[i * kNumElemsPerRead / 128] = scaleInv;
+                // Reduce amax and scale
+                EP_STATIC_ASSERT(kNumElemsPerRead * 32 / kNumPerChannels == 2, "Invalid vectorization");
+                amax = warp_reduce_max<16>(amax);
+                calculate_fp8_scales(amax, scale, scaleInv, roundScale);
+                if (laneId == 0 or laneId == 16)
+                    sendBufScales[i * kNumElemsPerRead / 128] = scaleInv;
 
-            // Cast into send buffer
-            typename std::conditional<kUseFP8, int2, int4>::type dataInt2;
-            auto fp8x2Data = reinterpret_cast<__nv_fp8x2_storage_t*>(&dataInt2);
-            #pragma unroll
-            for (int j = 0; j < kNumElemsPerRead; j += 2) {
-                float2 fp32x2 = {fp32Data[j] * scale, fp32Data[j + 1] * scale};
-                fp8x2Data[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
+                int2 dataInt2;
+                auto fp8x2Data = reinterpret_cast<__nv_fp8x2_storage_t*>(&dataInt2);
+                #pragma unroll
+                for (int j = 0; j < kNumElemsPerRead; j += 2) {
+                    float2 fp32x2 = {fp32Data[j] * scale, fp32Data[j + 1] * scale};
+                    fp8x2Data[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
+                }
+                sendBufVec[i] = dataInt2;
             }
-            sendBufVec[i] = dataInt2;
         } else {
-            // Reinterpret-cast is for C++14 compatibility
-            sendBufVec[i] = *reinterpret_cast<typename std::conditional<kUseFP8, int2, int4>::type*>(&dataInt4);
+            // BF16: copy directly (reinterpret-cast is for C++14 compatibility)
+            auto dataInt4 = __ldg(srcData + i);
+            sendBufVec[i] = *reinterpret_cast<int4*>(&dataInt4);
         }
     }
-}
-
-// Copy pre-quantized FP8 token bytes and caller-supplied FP32 scales to send buffer.
-// Used for LL FP8 EXTERN dispatch (inputs->scales != nullptr on LL path).
-__forceinline__ __device__ void copyExternFP8ToSendBuf(
-    const int2* srcFP8,
-    int2* sendBufVec,
-    float* sendBufScales,
-    const float* inScales,
-    int threadId,
-    int numThreads,
-    int hiddenFP8Int2,
-    int numScales) {
-    for (int i = threadId; i < hiddenFP8Int2; i += numThreads)
-        sendBufVec[i] = srcFP8[i];
-    for (int i = threadId; i < numScales; i += numThreads)
-        sendBufScales[i] = inScales[i];
+    // EXTERN: byte-copy caller-supplied scale row after the token loop
+    if constexpr (kExternQuant) {
+        auto* dstBytes = reinterpret_cast<uint8_t*>(sendBufScales);
+        for (int i = threadId; i < numScaleBytes; i += numThreads)
+            dstBytes[i] = inScales[i];
+    }
 }
 
 // Send a token to one peer.
@@ -186,9 +188,8 @@ __forceinline__ __device__ void copyExternFP8ToSendBuf(
 //     [hdr | data | scales] message from the local staging slot into the
 //     peer's recvBuf at the corresponding per-slot offset.
 //
-// Templated on `kUseFP8` so the NVLink direct path can reuse
-// `castAndWriteToSendBuf` for the quantized-vs-bf16 split.
-// `kExternFP8`: when true, input is pre-quantized FP8 bytes (no quantization).
+// Templated on `kUseFP8`/`kExternQuant` so the NVLink direct path reuses
+// `castAndWriteToSendBuf` for all three modes (INTERN/EXTERN/BF16).
 //
 // `kNvlinkOnly` mirrors the dispatch kernel's compile-time gate: when true,
 // every dst is intra-LSA and the zero-copy output redirect (below) is the
@@ -199,12 +200,12 @@ __forceinline__ __device__ void copyExternFP8ToSendBuf(
 // staging recvBuf payload slot to the peer's user-provided recv_x tensor at
 // slot (currRank * maxTokensPerRank + slotIdx). Headers still flow through
 // the staging buffer.
-template <bool kUseFP8, bool kNvlinkOnly, bool kExternFP8 = false>
+template <bool kUseFP8, bool kNvlinkOnly, bool kExternQuant = false>
 __forceinline__ __device__ void sendToken(
     // Local sources.
     const int4* sendDataInt4,        // local staging slot base (header + RDMA-path payload).
     const void* srcData,             // input data for this token (NVLink-path payload source):
-                                     //   const int4* for BF16/INTERN FP8, const int2* for EXTERN FP8.
+                                     //   const int4* for BF16/INTERN; const int2* for EXTERN (caller-quantized).
     // Peer destination addressing: per-srcRank region base + slot index.
     uint64_t srcRankRegionLocalPtr,  // sender-view pointer at peer's per-srcRank region.
     size_t srcRankRegionOffset,      // window offset of that per-srcRank region.
@@ -230,8 +231,8 @@ __forceinline__ __device__ void sendToken(
     // target peer's recv_x window instead of peer's staging payload slot.
     ncclWindow_t recvDataWindow,
     size_t recvDataOffset,
-    // EXTERN FP8: caller-supplied scales for this token; nullptr for INTERN/BF16.
-    const float* inScales,
+    // EXTERN quant: caller-supplied raw scale bytes for this token; nullptr for INTERN/BF16.
+    const uint8_t* inScales,
     int laneId) {
     using vec_t = std::conditional_t<kUseFP8, int2, int4>;
 
@@ -271,18 +272,14 @@ __forceinline__ __device__ void sendToken(
         auto* dstDataVec = reinterpret_cast<vec_t*>(payloadDst);
         auto* dstScales = reinterpret_cast<float*>(
             reinterpret_cast<uint8_t*>(payloadDst) + hiddenBytes);
-        if constexpr (kExternFP8) {
-            const int numScales = static_cast<int>(hiddenBf16Int4) / 16;
-            copyExternFP8ToSendBuf(
-                static_cast<const int2*>(srcData), dstDataVec, dstScales,
-                inScales, laneId, 32,
-                static_cast<int>(hiddenBf16Int4), numScales);
-        } else {
-            castAndWriteToSendBuf<kUseFP8>(
-                static_cast<const int4*>(srcData), dstDataVec, dstScales,
-                /*threadId=*/laneId, /*numThreads=*/32,
-                laneId, hiddenBf16Int4, roundScale);
-        }
+        using src_t = const typename std::conditional<kExternQuant, int2, int4>::type*;
+        const int numScaleBytes = kExternQuant
+            ? static_cast<int>(hiddenBf16Int4) / 16 * static_cast<int>(sizeof(float)) : 0;
+        castAndWriteToSendBuf<kUseFP8, kExternQuant>(
+            static_cast<src_t>(srcData), dstDataVec, dstScales,
+            /*threadId=*/laneId, /*numThreads=*/32,
+            laneId, hiddenBf16Int4, roundScale,
+            inScales, numScaleBytes);
     } else {
         // ---- RDMA path (interleaved layout) ----
         if (laneId == 0) {
@@ -576,10 +573,10 @@ __forceinline__ __device__ void copyRecvTokenData(
     }
 }
 
-template <bool kUseFP8, bool kUseUE8M0, bool kExternFP8, int kHidden, ncclEpLayout_t kLayout, bool kNvlinkOnly, typename TopkIdxT>
+template <bool kUseFP8, bool kUseUE8M0, bool kExternQuant, int kHidden, ncclEpLayout_t kLayout, bool kNvlinkOnly, typename TopkIdxT>
 __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
                                                     const void* inData,
-                                                    const float* inScalesBuf, // non-null for EXTERN FP8
+                                                    const uint8_t* inScalesBuf, // non-null for EXTERN quant
                                                     const TopkIdxT* inTopkIdx,
                                                     const float* inTopkWeights,
                                                     int* rankMask,
@@ -691,16 +688,16 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
 
         // Split token processing across SMs
         for (int tokenIdx = smId; tokenIdx < numTokens; tokenIdx += numSms) {
-            // For EXTERN FP8: input is FP8 bytes (1 byte/elem), stride = kHidden/8 int2s.
+            // For EXTERN quant: input is pre-quantized bytes (1 byte/elem), stride = kHidden/8 int2s.
             // For BF16/INTERN: input is BF16 (2 bytes/elem), stride = kHidden/8 int4s.
             // hiddenBf16Int4 = kHidden/8 serves both strides (int2 vs int4 differ in size).
-            const auto srcDataInt4 = kExternFP8
+            const auto srcDataInt4 = kExternQuant
                 ? static_cast<const int4*>(nullptr)
                 : static_cast<const int4*>(inData) + tokenIdx * hiddenBf16Int4;
-            const auto srcDataFP8Extern = kExternFP8
+            const auto srcDataExternQuant = kExternQuant
                 ? static_cast<const int2*>(inData) + tokenIdx * hiddenBf16Int4
                 : static_cast<const int2*>(nullptr);
-            const float* inScalesTok = kExternFP8
+            const uint8_t* inScalesTok = kExternQuant
                 ? inScalesBuf + tokenIdx * scalesPerToken
                 : nullptr;
 
@@ -735,16 +732,14 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
             // guaranteed to take the NVLink direct path so the staging-buffer
             // payload is never read and the cast can be skipped entirely.
             if constexpr (!kNvlinkOnly) {
-                if constexpr (kExternFP8) {
-                    copyExternFP8ToSendBuf(
-                        srcDataFP8Extern, sendBufVec, sendBufScales,
-                        inScalesTok, threadId, numWritingThreads,
-                        hiddenBf16Int4, numScales);
-                } else {
-                    castAndWriteToSendBuf<kUseFP8>(
-                        srcDataInt4, sendBufVec, sendBufScales,
-                        threadId, numWritingThreads, laneId, hiddenBf16Int4, roundScale);
-                }
+                using src_t = const typename std::conditional<kExternQuant, int2, int4>::type*;
+                const void* srcRaw = kExternQuant
+                    ? static_cast<const void*>(srcDataExternQuant)
+                    : static_cast<const void*>(srcDataInt4);
+                castAndWriteToSendBuf<kUseFP8, kExternQuant>(
+                    static_cast<src_t>(srcRaw), sendBufVec, sendBufScales,
+                    threadId, numWritingThreads, laneId, hiddenBf16Int4, roundScale,
+                    inScalesTok, kExternQuant ? scalesPerToken * static_cast<int>(sizeof(float)) : 0);
             }
 
 
@@ -780,10 +775,10 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
                     const auto srcRankLocalPtr =
                         reinterpret_cast<uint64_t>(recvBuf) + srcRankOffset;
                     const auto sendBufInt4 = reinterpret_cast<const int4*>(sendBufBase);
-                    const void* srcDataForSendToken = kExternFP8
-                        ? static_cast<const void*>(srcDataFP8Extern)
+                    const void* srcDataForSendToken = kExternQuant
+                        ? static_cast<const void*>(srcDataExternQuant)
                         : static_cast<const void*>(srcDataInt4);
-                    sendToken<kUseFP8, kNvlinkOnly, kExternFP8>(
+                    sendToken<kUseFP8, kNvlinkOnly, kExternQuant>(
                         sendBufInt4, srcDataForSendToken,
                         srcRankLocalPtr, recvOff + srcRankOffset, slotIdx,
                         tokenIdx, sendOff,
@@ -1080,7 +1075,7 @@ void dispatch(const void* inData,
               const float* inTopkWeights,
               void* outDataBuf,
               void* outScalesBuf,
-              const float* inScalesBuf, // non-null for EXTERN FP8 (LL inputs->scales)
+              const uint8_t* inScalesBuf, // non-null for EXTERN quant (LL inputs->scales)
               int* outSrcInfo,
               int* outRecvRankCounter,
               int64_t* outLayout,
@@ -2419,7 +2414,7 @@ void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
 // hybridep_adapter.cu and are untemplated).
 template void dispatch<int32_t>(
     const void*, const int32_t*, const float*,
-    void*, void*, const float*, int*, int*, int64_t*, int*, float*, int32_t*,
+    void*, void*, const uint8_t*, int*, int*, int64_t*, int*, float*, int32_t*,
     void*, void*, int*, size_t, size_t, size_t, int*, int, int*, int64_t*,
     int, int, int, int, int, int, int, int, bool, bool, bool, ncclEpLayout_t,
     int, int, ncclDevComm*, const ncclWindow_t*, unsigned, void*, int,
@@ -2427,7 +2422,7 @@ template void dispatch<int32_t>(
 
 template void dispatch<int64_t>(
     const void*, const int64_t*, const float*,
-    void*, void*, const float*, int*, int*, int64_t*, int*, float*, int32_t*,
+    void*, void*, const uint8_t*, int*, int*, int64_t*, int*, float*, int32_t*,
     void*, void*, int*, size_t, size_t, size_t, int*, int, int*, int64_t*,
     int, int, int, int, int, int, int, int, bool, bool, bool, ncclEpLayout_t,
     int, int, ncclDevComm*, const ncclWindow_t*, unsigned, void*, int,

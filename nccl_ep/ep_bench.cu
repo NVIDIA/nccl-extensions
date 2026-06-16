@@ -3166,7 +3166,7 @@ int main(int argc, char* argv[]) {
         printf("  Experts:         %u (local: %u)\n", num_experts, num_local_experts);
         printf("  Warmup iters:    %d\n", num_warmup);
         printf("  Benchmark iters: %d\n", num_iters);
-        printf("  Dispatch dtype:  BF16\n");
+        printf("  Dispatch dtype:  %s\n", fp8_dispatch ? "FP8" : "BF16");
         printf("  Profile mode:    %s\n", profile_mode ? "enabled" : "disabled");
         printf("  NVLink:          %s\n", disable_nvlink ? "disabled (force RDMA intranode, LL only)" : "enabled");
         printf("  Validate mode:   %s\n", validate_data ? "enabled" : "disabled");

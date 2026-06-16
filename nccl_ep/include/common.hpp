@@ -167,7 +167,7 @@ void dispatch(const void* inData,
               const float* inTopkWeights,    // rank-major: written into dispatch message header
               void* outDataBuf,
               void* outScalesBuf,
-              const float* inScalesBuf, // non-null for LL FP8 EXTERN (inputs->scales)
+              const uint8_t* inScalesBuf, // non-null for LL EXTERN quant (inputs->scales)
               int* outSrcInfo,
               int* outRecvRankCounter,          // rank-major: RECV_RANK_COUNTER_DEVICE [nRanks]; nullptr for expert-major
               int64_t* outLayout,

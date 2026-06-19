@@ -2464,6 +2464,7 @@ template<typename SMEM_TYPE,
          int NUM_OF_TOKENS_PER_GROUP,
          bool BACKWARD_COMBINE,
          int HIDDEN_DIM,
+         int LSA_TEAM_SIZE,
          ncclEpLayout_t kLayout>
 __forceinline__ __device__ void inter_node_G2S_warp_group_device_function(const int local_rank,
                                                                  const int node_rank,
@@ -2541,6 +2542,7 @@ __forceinline__ __device__ void inter_node_G2S_warp_group_device_function(const 
   // which matches RED's sequential consumption.
   constexpr int WARP_SIZE = 32;
   const int lane_id = (int)(threadIdx.x & (WARP_SIZE - 1));
+  const int warp_idx = INTER_NODE_G2S_GROUP::warp_rank();
   const int ring_len = ending_G2S_index - starting_G2S_index;
   const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * sizeof(uint16_t));
   const uint32_t prob_bytes =
@@ -2554,6 +2556,22 @@ __forceinline__ __device__ void inter_node_G2S_warp_group_device_function(const 
       smem_buffer_ptr->s2d_inner_dim > WARP_SIZE) {
     __trap();
   }
+
+  // Per-warp staging for the LOCAL-tier s2d-row scan. The warp-cooperative
+  // load writes each lane's slot value here; the elected lane reads back
+  // by entry_idx during the single-thread issue phase. s2d_inner_dim is
+  // layout-dependent:
+  //   FLAT: s2d_inner_dim == num_ranks_per_node == LSA_TEAM_SIZE
+  //   EM:   s2d_inner_dim == top_k (today bounded by WARP_SIZE = 32)
+  // so the staging must be at least max(LSA_TEAM_SIZE, WARP_SIZE) deep
+  // to handle small-domain EM (e.g. LSA_TEAM_SIZE=8, top_k=22). A single
+  // uint64 bitmap suffices for the bitmap-iterated issue
+  // (static_assert below).
+  static constexpr int MAX_S2D_ENTRIES = (LSA_TEAM_SIZE > WARP_SIZE) ? LSA_TEAM_SIZE : WARP_SIZE;
+  static_assert(MAX_S2D_ENTRIES <= 64,
+                "LOCAL-tier bitmap is uint64; max(LSA_TEAM_SIZE, WARP_SIZE) must be <= 64.");
+  volatile __shared__ int32_t inter_node_s2d_staging
+      [INTER_NODE_G2S_GROUP::warp_size()][MAX_S2D_ENTRIES];
 
   // Total stages filled across all tokens (local + RDMA).
   int global_offset = 0;
@@ -2617,76 +2635,92 @@ __forceinline__ __device__ void inter_node_G2S_warp_group_device_function(const 
         bool token_needed_by_this_node = rdma_to_attn_map_load_base_addr[current_token_id];
 
         // ===== LOCAL TIER (always, when token_needed_by_this_node) =====
+        // Warp-cooperative s2d-row scan -> uint64 bitmap + per-warp smem
+        // staging, then one elected lane iterates the bitmap and issues
+        // the per-entry TMA. The warp keeps doing the scan in parallel;
+        // only the TMA issue is serialised.
         if (token_needed_by_this_node) {
           const int32_t* sparse_to_dense_row = sparse_to_dense_map_load_base_addr + (j * NUM_OF_TOKENS_PER_GROUP + k) * s2d_entries;
 
-          // Pass 1: count valid entries (skipping EM secondaries -- see
-          // is_em_secondary_entry; a no-op for FLAT).
-          int total_valid_count = 0;
+          // Phase 1: warp-coop scan. 32 lanes load up to WARP_SIZE
+          // entries per iteration; each lane writes its slot into the
+          // per-warp staging array, and the per-slice __ballot_sync
+          // masks (filtered by is_em_secondary_entry -- a no-op for
+          // FLAT) are OR'd into a uint64 bitmap whose bit p == the
+          // valid entry at row position p.
+          uint64_t local_bitmap = 0;
           for (int entry_base = 0; entry_base < s2d_entries; entry_base += WARP_SIZE) {
             const int entry_idx = entry_base + lane_id;
             const bool lane_active = (entry_idx < s2d_entries);
             const int32_t s2d_val = lane_active ? sparse_to_dense_row[entry_idx] : -1;
             const bool is_secondary = is_em_secondary_entry<kLayout>(s2d_val, lane_id, combine_local_reduce_enabled);
+
+            // Compute the valid mask for this entry and update the local_bitmap.
             const unsigned mask = __ballot_sync(0xffffffff, lane_active && s2d_val != -1 && !is_secondary);
-            total_valid_count += __popc(mask);
-          }
+            local_bitmap |= ((uint64_t)mask) << entry_base;
 
-          if (total_valid_count > 0) {
-            // Pass 2: issue TMA in batches of ring_len to prevent stage
-            // collisions when total_valid_count > ring_len.
-            int ranks_issued = 0;
-            while (ranks_issued < total_valid_count) {
-              const int batch_end = (ranks_issued + ring_len < total_valid_count)
-                                      ? ranks_issued + ring_len : total_valid_count;
-
-              int slice_offset = 0;
-              for (int entry_base = 0; entry_base < s2d_entries; entry_base += WARP_SIZE) {
-                const int entry_idx = entry_base + lane_id;
-                const bool lane_active = (entry_idx < s2d_entries);
-                const int32_t s2d_val = lane_active ? sparse_to_dense_row[entry_idx] : -1;
-                const bool is_secondary = is_em_secondary_entry<kLayout>(s2d_val, lane_id, combine_local_reduce_enabled);
-                const unsigned valid_mask = __ballot_sync(0xffffffff, lane_active && s2d_val != -1 && !is_secondary);
-                const int slice_valid = __popc(valid_mask);
-                const bool lane_valid = lane_active && s2d_val != -1 && !is_secondary;
-                const int local_lane_rank = __popc(valid_mask & ((1u << lane_id) - 1));
-                const int global_rank = slice_offset + local_lane_rank;
-                const bool in_batch = lane_valid && global_rank >= ranks_issued && global_rank < batch_end;
-
-                if (in_batch) {
-                  const int rank_in_batch = global_rank - ranks_issued;
-
-                  int rank_id;
-                  int slot;
-                  if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-                    rank_id = em_s2d_unpack_rank(s2d_val);
-                    slot = em_s2d_unpack_slot(s2d_val);
-                  } else {
-                    rank_id = entry_idx;
-                    slot = s2d_val;
-                  }
-                  const uint16_t* token_src = remote_expert_input_token[rank_id] + (slot * HIDDEN_DIM);
-                  const float* prob_src = nullptr;
-                  if constexpr (BACKWARD_COMBINE) {
-                    prob_src = remote_expert_input_prob[rank_id] + (slot * (experts_per_rank * num_of_ranks_per_node));
-                  }
-                  // LOCAL tier writes inter_node_flag_G2S_buffer on the
-                  // globally last valid entry of the token.
-                  issue_inter_node_g2s_entry<BACKWARD_COMBINE, /*WRITE_LAST_FLAG=*/true>(
-                      smem_buffer_ptr, global_offset, rank_in_batch,
-                      starting_G2S_index, ring_len,
-                      token_src, token_bytes,
-                      prob_src, prob_bytes,
-                      /*is_last_entry=*/(global_rank == total_valid_count - 1));
-                }
-
-                slice_offset += slice_valid;
-              }
-
-              global_offset += (batch_end - ranks_issued);
-              ranks_issued = batch_end;
+            // Cache s2d value in shared memory for Phase 2.
+            // NOTE: placing this write after the ballot_sync to make sure
+            // that elected lane has finished previous iteration before
+            // other lanes update the shared memory.
+            if (lane_active) {
+              inter_node_s2d_staging[warp_idx][entry_idx] = s2d_val;
             }
           }
+          const int total_valid_count = __popcll((unsigned long long)local_bitmap);
+
+          // Make sure staging writes are visible to the elected lane.
+          __syncwarp(0xffffffff);
+
+          // Phase 2: single-thread bitmap-iterated issue. Runs only on
+          // the elected lane; iterates set bits in ascending position
+          // order via __ffsll. The same elected lane handles every
+          // call site of `elect_sync(~0u)` within a non-divergent warp,
+          // so its register copy of `global_offset` persists across
+          // tiers; we still advance global_offset on all 32 lanes
+          // (uniformly with total_valid_count) below for safety.
+          if (total_valid_count > 0) {
+            if (cuda::ptx::elect_sync(~0u)) {
+              uint64_t b = local_bitmap;
+              int valid_seen = 0;
+              while (b != 0) {
+                const int entry_idx = __ffsll((long long)b) - 1;  // 0..s2d_entries-1
+                b &= (b - 1);
+
+                const int32_t s2d_val = inter_node_s2d_staging[warp_idx][entry_idx];
+
+                int rank_id;
+                int slot;
+                if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+                  rank_id = em_s2d_unpack_rank(s2d_val);
+                  slot = em_s2d_unpack_slot(s2d_val);
+                } else {
+                  rank_id = entry_idx;
+                  slot = s2d_val;
+                }
+                const uint16_t* token_src = remote_expert_input_token[rank_id] + (slot * HIDDEN_DIM);
+                const float* prob_src = nullptr;
+                if constexpr (BACKWARD_COMBINE) {
+                  prob_src = remote_expert_input_prob[rank_id] + (slot * (experts_per_rank * num_of_ranks_per_node));
+                }
+                issue_inter_node_g2s_entry<BACKWARD_COMBINE, /*WRITE_LAST_FLAG=*/true>(
+                    smem_buffer_ptr, global_offset, valid_seen,
+                    starting_G2S_index, ring_len,
+                    token_src, token_bytes,
+                    prob_src, prob_bytes,
+                    /*is_last_entry=*/(valid_seen == total_valid_count - 1));
+
+                valid_seen++;
+              }
+            }
+          }
+          // Update global_offset uniformly across the warp (only the
+          // elected lane ran the issue loop above, but every lane
+          // increments by the same total_valid_count -- which is a
+          // no-op when 0). This keeps subsequent reads of global_offset
+          // (e.g. the RDMA tier below at NUM_LSA_TEAMS > 1) consistent
+          // on every lane.
+          global_offset += total_valid_count;
         } // end LOCAL TIER
 
         // ===== RDMA TIER (NUM_LSA_TEAMS > 1 only) =====
@@ -3596,7 +3630,7 @@ __device__ __forceinline__ void combine_kernel_impl(
     // Inter-node G2S warp group.
     inter_node_G2S_warp_group_device_function
     <cur_smem_t, INTER_NODE_G2S_GROUP, NUM_OF_STAGES_G2S, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS,
-    NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE, HIDDEN_DIM, kLayout>
+    NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SIZE, kLayout>
     (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, *param.expected_rdma_flag_value, param.rdma_to_attn_map, param.attn_to_rdma_map, param.sparse_to_dense_map, param.expert_input_token, param.expert_input_prob,
     param.rdma_inter_node_group_token, param.rdma_inter_node_group_prob, param.dcomms, param.signals_base, param.combine_signal_offset, param.num_gin_comms, param.num_ctx_per_comm, param.rdma_inter_node_group_flags, smem_buffer_ptr, param.experts_per_rank, param.combine_local_reduce_enabled);
   }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size()){

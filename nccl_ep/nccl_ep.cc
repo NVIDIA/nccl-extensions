@@ -2298,6 +2298,44 @@ static ncclResult_t ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group
     return ncclSuccess;
 }
 
+// Scan kernels (scan_flat / scan_em / em_scan_kernel) can be untied from
+// dispatch/combine's max_num_sms via NCCL_EP_PREPROCESS_NUM_SMS=<N>. Falls back
+// to `default_sms` if unset/invalid. Hard cap is
+// HYBRIDEP_NUM_BLOCKS_PREPROCESSING_MAX (preprocessing tmp buffer is sized
+// for this max at handle alloc time, so larger values would overrun it).
+// Prints the resolved value once per process so the run log can confirm
+// the scan kernels actually launched with the requested SM count.
+static int get_scan_num_sms_override(int default_sms) {
+    const char* env = std::getenv("NCCL_EP_PREPROCESS_NUM_SMS");
+    static bool printed = false;
+    if (env == nullptr || *env == '\0') {
+        if (!printed) {
+            fprintf(stderr,
+                    "[nccl_ep] NCCL_EP_PREPROCESS_NUM_SMS not set; scan kernels using default %d SMs\n",
+                    default_sms);
+            printed = true;
+        }
+        return default_sms;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(env, &end, 10);
+    if (end == env || *end != '\0' || parsed <= 0 ||
+        parsed > HYBRIDEP_NUM_BLOCKS_PREPROCESSING_MAX) {
+        fprintf(stderr,
+                "[nccl_ep] NCCL_EP_PREPROCESS_NUM_SMS='%s' ignored "
+                "(must be integer in [1, %d]); using %d\n",
+                env, HYBRIDEP_NUM_BLOCKS_PREPROCESSING_MAX, default_sms);
+        return default_sms;
+    }
+    if (!printed) {
+        fprintf(stderr,
+                "[nccl_ep] NCCL_EP_PREPROCESS_NUM_SMS=%ld accepted; scan kernels launching with %ld SMs (default would be %d)\n",
+                parsed, parsed, default_sms);
+        printed = true;
+    }
+    return static_cast<int>(parsed);
+}
+
 static ncclResult_t ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor_t* handle_mem, int num_topk) {
     assert(ep_group->config.max_dispatch_tokens_per_rank > 0 && "HT requires max_dispatch_tokens_per_rank > 0");
     assert(num_topk > 0 && "HT mode requires num_topk > 0 (pass top_k to ncclEpInitHandle)");
@@ -2652,7 +2690,7 @@ ncclResult_t ncclEpUpdateHandle(
         handle->hybridep.emuf_group_count,
         handle->hybridep.emuf_group_stride,
         handle->hybridep.emuf_max_groups,
-        static_cast<int>(ep_group->max_num_sms),
+        get_scan_num_sms_override(static_cast<int>(ep_group->max_num_sms)),
         // EM cooperative scan scratch carved from ep_workspace.
         expert_major ? ep_group->ep_workspace : nullptr,
         // EM-permute mode: FLAT scan replaces scan_em and writes the unified

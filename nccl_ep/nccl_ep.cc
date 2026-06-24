@@ -1004,15 +1004,13 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
         return (sz + alignment - 1) & ~(alignment - 1);
     };
 
-    // These buffers are accessed with stride MAX_SUPPORTED_TOKENS_PER_RANK (compile-time constant
-    // used as rdma_remote_node_id * MAX_SUPPORTED_TOKENS_PER_RANK + token_offset in the kernel).
-    // They must be sized for that stride regardless of the runtime max_dispatch_tokens_per_rank.
-    size_t rdma_intra_node_red_token_sz = align_size(static_cast<size_t>(MAX_SUPPORTED_TOKENS_PER_RANK * (rdma_team_size - 1)) * ep_group->config.max_token_bytes, GIN_ALIGNMENT);
+    const int ht_max_tokens = ep_group->config.max_dispatch_tokens_per_rank;
+    size_t rdma_intra_node_red_token_sz = align_size(static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * ep_group->config.max_token_bytes, GIN_ALIGNMENT);
     size_t combine_rdma_inter_node_group_token_sz = rdma_intra_node_red_token_sz;
-    size_t rdma_intra_node_red_prob_sz = align_size(static_cast<size_t>(MAX_SUPPORTED_TOKENS_PER_RANK * (rdma_team_size - 1)) * (ep_group->num_local_experts * lsa_team_size) * sizeof(float), GIN_ALIGNMENT);
+    size_t rdma_intra_node_red_prob_sz = align_size(static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * (ep_group->num_local_experts * lsa_team_size) * sizeof(float), GIN_ALIGNMENT);
     size_t combine_rdma_inter_node_group_prob_sz = rdma_intra_node_red_prob_sz;
 
-    int max_chunks_per_rank = (MAX_SUPPORTED_TOKENS_PER_RANK + HT_OF_NUM_TOKENS_PER_CHUNK - 1) / HT_OF_NUM_TOKENS_PER_CHUNK;
+    int max_chunks_per_rank = (ht_max_tokens + HT_OF_NUM_TOKENS_PER_CHUNK - 1) / HT_OF_NUM_TOKENS_PER_CHUNK;
     size_t flags_sz = align_size(
         static_cast<size_t>(rdma_team_size - 1) * max_chunks_per_rank * sizeof(uint64_t),
         GIN_ALIGNMENT);
@@ -1304,9 +1302,12 @@ ncclResult_t ncclEpCreateGroup(
             "ncclEpCreateGroup: max_dispatch_tokens_per_rank must be greater than 0 for low latency mode");
     assert(!(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && in_config->max_dispatch_tokens_per_rank == 0) &&
              "ncclEpCreateGroup: max_dispatch_tokens_per_rank must be set for HT backend");
-    assert(!(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
-             in_config->max_dispatch_tokens_per_rank > MAX_SUPPORTED_TOKENS_PER_RANK) &&
-             "ncclEpCreateGroup: HT max_dispatch_tokens_per_rank exceeds build-time MAX_SUPPORTED_TOKENS_PER_RANK");
+    if (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
+        in_config->max_dispatch_tokens_per_rank % HT_OF_NUM_TOKENS_PER_CHUNK != 0) {
+        fprintf(stderr, "ncclEpCreateGroup: HT max_dispatch_tokens_per_rank (%d) must be a multiple of %d\n",
+                in_config->max_dispatch_tokens_per_rank, HT_OF_NUM_TOKENS_PER_CHUNK);
+        return ncclInvalidUsage;
+    }
     // Create teams: LSA and Rail
     ncclTeam lsa_team = ncclTeamLsa(comm);
     ncclTeam rail_team = ncclTeamRail(comm);

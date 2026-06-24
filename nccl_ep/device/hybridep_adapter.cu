@@ -1097,7 +1097,7 @@ void dispatch_impl(
         d_config.stages_per_pipeline     = HYBRIDEP_DISPATCH_NUM_OF_STAGES / HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
         d_config.s2d_inner_dim           = kp.s2d_inner_dim;
         d_model.hidden_dim               = kp.hidden_dim;
-        d_model.max_num_of_tokens_per_rank = MAX_SUPPORTED_TOKENS_PER_RANK;
+        d_model.max_num_of_tokens_per_rank = max_dispatch_tokens_per_rank;
         d_model.num_of_experts_per_rank  = kp.experts_per_rank;
         d_model.num_of_ranks_per_node    = kp.num_of_ranks_per_node;
         d_model.num_of_nodes             = num_nodes;
@@ -1122,6 +1122,7 @@ void dispatch_impl(
             HYBRIDEP_DISPATCH_NUM_OF_STAGES,
             HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
             HT_OF_NUM_TOKENS_PER_CHUNK,
+            max_dispatch_tokens_per_rank,
             num_blocks,
             FORWARD_DISPATCH,
             num_nodes,
@@ -1280,7 +1281,7 @@ void combine_impl(
 
     ::hybrid_ep::model_config_t model;
     model.hidden_dim = kp.hidden_dim;
-    model.max_num_of_tokens_per_rank = MAX_SUPPORTED_TOKENS_PER_RANK;
+    model.max_num_of_tokens_per_rank = max_dispatch_tokens_per_rank;
     model.num_of_experts_per_rank = kp.experts_per_rank;
     model.num_of_ranks_per_node = kp.num_of_ranks_per_node;
     model.num_of_nodes = num_nodes;
@@ -1288,7 +1289,7 @@ void combine_impl(
         num_stages_g2s,
         num_stages_s2g,
         HT_OF_NUM_TOKENS_PER_CHUNK,
-        MAX_SUPPORTED_TOKENS_PER_RANK,
+        max_dispatch_tokens_per_rank,
         num_nodes,
         BACKWARD_COMBINE,
         model);
@@ -1311,6 +1312,7 @@ void combine_impl(
         num_stages_g2s,
         num_stages_s2g,
         HT_OF_NUM_TOKENS_PER_CHUNK,
+        max_dispatch_tokens_per_rank,
         HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP,
         num_blocks,
         HYBRIDEP_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,

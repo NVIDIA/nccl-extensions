@@ -73,6 +73,7 @@ inline std::string combine_jit_source(
     int num_of_stages_s2g,
     int num_of_tokens_per_group,
     int num_of_tokens_per_chunk,
+    int max_tokens_per_rank,
     int num_lsa_teams,
     int num_of_blocks,
     int num_of_additional_in_flight_s2g,
@@ -110,7 +111,7 @@ inline std::string combine_jit_source(
         << "      " << num_of_stages_s2g << ",\n"
         << "      " << num_of_tokens_per_group << ",\n"
         << "      " << num_of_tokens_per_chunk << ",\n"
-        << "      " << MAX_SUPPORTED_TOKENS_PER_RANK << ",\n"
+        << "      " << max_tokens_per_rank << ",\n"
         << "      " << num_lsa_teams << ",\n"
         << "      " << num_of_blocks << ",\n"
         << "      " << num_of_additional_in_flight_s2g << ",\n"
@@ -126,6 +127,7 @@ inline void launch_combine(
     int num_of_stages_g2s,
     int num_of_stages_s2g,
     int num_of_tokens_per_chunk,
+    int max_tokens_per_rank,
     int num_of_tokens_per_group,
     int num_of_blocks,
     int num_of_additional_in_flight_s2g,
@@ -153,6 +155,7 @@ inline void launch_combine(
             << "_g2s" << num_of_stages_g2s
             << "_s2g" << num_of_stages_s2g
             << "_chunk" << num_of_tokens_per_chunk
+            << "_maxt" << max_tokens_per_rank
             << "_group" << num_of_tokens_per_group
             << "_blocks" << num_of_blocks
             << "_extra" << num_of_additional_in_flight_s2g
@@ -166,6 +169,7 @@ inline void launch_combine(
         num_of_stages_s2g,
         num_of_tokens_per_group,
         num_of_tokens_per_chunk,
+        max_tokens_per_rank,
         num_lsa_teams,
         num_of_blocks,
         num_of_additional_in_flight_s2g,

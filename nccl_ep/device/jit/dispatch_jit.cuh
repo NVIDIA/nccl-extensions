@@ -77,6 +77,7 @@ inline std::string dispatch_jit_source(
     int num_of_stages,
     int num_of_in_flight_s2g,
     int num_of_tokens_per_chunk,
+    int max_tokens_per_rank,
     int num_lsa_teams,
     int num_of_blocks,
     bool forward_dispatch,
@@ -116,7 +117,7 @@ inline std::string dispatch_jit_source(
         << "      " << num_of_stages << ",\n"
         << "      " << num_of_in_flight_s2g << ",\n"
         << "      " << num_of_tokens_per_chunk << ",\n"
-        << "      " << MAX_SUPPORTED_TOKENS_PER_RANK << ",\n"
+        << "      " << max_tokens_per_rank << ",\n"
         << "      " << num_lsa_teams << ",\n"
         << "      " << num_of_blocks << ",\n"
         << "      " << dispatch_bool_literal(forward_dispatch) << ",\n"
@@ -133,6 +134,7 @@ inline void launch_dispatch(
     int num_of_stages,
     int num_of_in_flight_s2g,
     int num_of_tokens_per_chunk,
+    int max_tokens_per_rank,
     int num_of_blocks,
     bool forward_dispatch,
     int num_lsa_teams,
@@ -160,6 +162,7 @@ inline void launch_dispatch(
             << "_stages" << num_of_stages
             << "_inflt" << num_of_in_flight_s2g
             << "_chunk" << num_of_tokens_per_chunk
+            << "_maxt" << max_tokens_per_rank
             << "_blocks" << num_of_blocks
             << (forward_dispatch ? "_fwd" : "_bwd")
             << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_fl")
@@ -179,6 +182,7 @@ inline void launch_dispatch(
         num_of_stages,
         num_of_in_flight_s2g,
         num_of_tokens_per_chunk,
+        max_tokens_per_rank,
         num_lsa_teams,
         num_of_blocks,
         forward_dispatch,

@@ -99,13 +99,23 @@ static constexpr int kFP8ExternScaleBlockSize = 128;
 static constexpr size_t kNcclEpLayoutInfoMinSize =
     offsetof(ncclEpLayoutInfo_t, recv_topk_idx_kind); // last legacy field end
 #define EP_OPTIONAL_LAYOUT_INFO(ptr) do { \
-    assert(((ptr) == nullptr || \
-            ((ptr)->size >= kNcclEpLayoutInfoMinSize && \
-             (ptr)->size <= sizeof(*(ptr)))) && \
-           "ncclEpLayoutInfo_t size out of supported range -- caller / libnccl_ep.so version skew exceeds tolerance"); \
-    assert(((ptr) == nullptr || (ptr)->magic == NCCL_EP_MAGIC) && \
-           "ncclEpLayoutInfo_t magic mismatch -- pointer is uninitialised or not an " \
-           "NCCL EP struct (initialise with NCCL_EP_LAYOUT_INFO_INIT)"); \
+    if ((ptr) != nullptr) { \
+        if ((ptr)->size < kNcclEpLayoutInfoMinSize || \
+            (ptr)->size > sizeof(*(ptr))) { \
+            fprintf(stderr, \
+                    "NCCL EP: ncclEpLayoutInfo_t size out of supported range: " \
+                    "got %u, expected [%zu, %zu]\n", \
+                    (ptr)->size, kNcclEpLayoutInfoMinSize, sizeof(*(ptr))); \
+            return ncclInvalidArgument; \
+        } \
+        if ((ptr)->magic != NCCL_EP_MAGIC) { \
+            fprintf(stderr, \
+                    "NCCL EP: ncclEpLayoutInfo_t magic mismatch: got 0x%x, " \
+                    "expected 0x%x (initialise with NCCL_EP_LAYOUT_INFO_INIT)\n", \
+                    (ptr)->magic, NCCL_EP_MAGIC); \
+            return ncclInvalidArgument; \
+        } \
+    } \
 } while (0)
 
 // Safe field reader for ncclEpLayoutInfo_t::recv_topk_idx_kind. Returns AUTO

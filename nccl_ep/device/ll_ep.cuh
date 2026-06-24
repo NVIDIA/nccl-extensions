@@ -9,9 +9,12 @@
  * See LICENSE.txt for more license information.
  */
 
+#pragma once
+
 #include <cooperative_groups.h>
 #include "nccl_device.h"
 #include "device_primitives.cuh"
+#include "common.hpp"
 
 namespace cg = cooperative_groups;
 
@@ -30,7 +33,11 @@ __forceinline__ __device__ bool isRankMasked(int* rankMask, int rank) {
         return ld_acquire_global(rankMask + rank) == 0;
     }
 }
-__device__ __constant__ bool dP2pDisabled = false;
+
+// Compile-time switch reserved for future runtime P2P-disable wiring.
+// Kept as constexpr so the dead branches are eliminated, while preserving the
+// code paths that would activate if it were ever toggled.
+constexpr bool dP2pDisabled = false;
 
 __device__ __forceinline__ int getCommId(int hashKey) {
     return hashKey / MAX_NCCL_GIN_CTX_PER_COMM;
@@ -577,7 +584,7 @@ __forceinline__ __device__ void copyRecvTokenData(
 // from size_u8<kTokenDtype>(); the read stride is the input element width whether or
 // not the output is FP8 (so FP32-input quantization reads the correct stride too).
 template <bool kUseFP8, bool kUseUE8M0, bool kExternQuant, int kHidden, ncclEpLayout_t kLayout, bool kNvlinkOnly, typename TopkIdxT, ncclDataType_t kTokenDtype = ncclBfloat16>
-__global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
+__device__ __forceinline__ void dispatch_kernel_impl(// INPUT
                                                     const void* inData,
                                                     const uint8_t* inScalesBuf, // non-null for EXTERN quant
                                                     const TopkIdxT* inTopkIdx,
@@ -1081,160 +1088,6 @@ LOW_LATENCY_DISPATCH_RECV:
     }
 }
 
-template <typename TopkIdxT>
-void dispatch(const void* inData,
-              const TopkIdxT* inTopkIdx,
-              const float* inTopkWeights,
-              void* outDataBuf,
-              void* outScalesBuf,
-              const uint8_t* inScalesBuf, // non-null for EXTERN quant (LL inputs->scales)
-              int* outSrcInfo,
-              int* outRecvRankCounter,
-              int64_t* outLayout,
-              int* outCnt,
-              float* outRecvTopkWeights,
-              int32_t* outRecvTopkIdx,
-              void* sendBuf,
-              void* recvBuf,
-              int* recvCntBuf,
-              size_t sendOff,
-              size_t recvOff,
-              size_t recvCntOff,
-              int* nextRecvCntBuf,
-              int nextRecvCntBufSize,
-              int* recvStats,
-              int64_t* waitStats,
-              int numTokens,
-              int scalesPerToken,
-              int hidden,
-              int maxTokensPerRank,
-              int numTopk,
-              int numExperts,
-              int currRank,
-              int numRanks,
-              bool useFp8,
-              bool roundScale,
-              bool useUe8m0,
-              ncclEpLayout_t layout,
-              ncclEpExpertIdKind_t recvTopkIdxKind,
-              int phases,
-              int numComms,
-              ncclDevComm* devComms,
-              const ncclWindow_t* windows,
-              unsigned signalsBase,
-              void* workspace,
-              int numDeviceSms,
-              int* rankMask,
-              int* asyncErrorFlag,
-              uint64_t timeoutCycles,
-              bool nvlinkOnly,
-              ncclWindow_t recvDataWindow,
-              size_t recvDataOffset,
-              cudaStream_t stream,
-              ncclDataType_t token_dtype) {
-    constexpr int kNumMaxTopK = 9;
-    const int numWarpGroups = ceil_div(numExperts, numDeviceSms);
-    const int numWarpsPerGroup = 32 / numWarpGroups;
-    EP_HOST_ASSERT(numWarpGroups > 0 and numWarpsPerGroup > 0);
-    EP_HOST_ASSERT(kNumMaxTopK + 1 <= numWarpGroups * numWarpsPerGroup);
-
-    const auto numWarps = numWarpGroups * numWarpsPerGroup;
-    const auto numSms = ceil_div(numExperts, numWarpGroups);
-    EP_HOST_ASSERT(numTopk <= kNumMaxTopK);
-
-    // Workspace checks
-    // rankCountersBase is used to track the number of tokens sent & received by each rank.
-    // expertDone is used to track the number of tokens sent to each expert.
-    auto rankCountersBase = static_cast<int*>(workspace);
-    auto expertDone = rankCountersBase + 2 * numRanks /* Using 2 arrays of per-rank flags */;
-    EP_HOST_ASSERT((2 * numRanks + numExperts) * sizeof(int) <= NUM_WORKSPACE_BYTES);
-
-    // FP8 checks
-    if (useUe8m0)
-        EP_HOST_ASSERT(roundScale and "UE8M0 SF requires `round_scale=True`");
-
-    const bool externFp8 = (inScalesBuf != nullptr);
-
-    SETUP_LAUNCH_CONFIG(numSms, numWarps * 32, stream);
-#define DISPATCH_DO_LAUNCH(fp8, ue8m0, externFp8V, nvlinkOnlyV, hidden, kLayout, kTokenDtypeV) \
-LAUNCH_KERNEL(&cfg, (dispatch<fp8, ue8m0, externFp8V, hidden, kLayout, nvlinkOnlyV, TopkIdxT, kTokenDtypeV>), \
-              inData, \
-              inScalesBuf, \
-              inTopkIdx, \
-              inTopkWeights, \
-              rankMask, \
-              asyncErrorFlag, \
-              outDataBuf, \
-              outScalesBuf, \
-              outSrcInfo, \
-              outRecvRankCounter, \
-              outLayout, \
-              outCnt, \
-              outRecvTopkWeights, \
-              outRecvTopkIdx, \
-              sendBuf, \
-              recvBuf, \
-              recvCntBuf, \
-              sendOff, \
-              recvOff, \
-              recvCntOff, \
-              rankCountersBase, \
-              expertDone, \
-              nextRecvCntBuf, \
-              nextRecvCntBufSize, \
-              recvStats, \
-              waitStats, \
-              numTokens, \
-              scalesPerToken, \
-              maxTokensPerRank, \
-              numTopk, \
-              numExperts, \
-              currRank, \
-              numRanks, \
-              numWarpGroups, \
-              numWarpsPerGroup, \
-              roundScale, \
-              recvTopkIdxKind, \
-              phases, \
-              numComms, \
-              devComms, \
-              windows, \
-              signalsBase, \
-              timeoutCycles, \
-              recvDataWindow, \
-              recvDataOffset)
-// Dispatch is a byte-copy, so FP16 and BF16 fold onto the ncclBfloat16 instantiation
-// (no redundant FP16 kernel); only FP32 is distinct. FP8 input is BF16 -> ncclBfloat16.
-#define DISPATCH_LAUNCH_CASE_IMPL(hidden, kLayout) { \
-    const bool isFp32 = (token_dtype == ncclFloat32); \
-    if (externFp8) { \
-        if (nvlinkOnly) { DISPATCH_DO_LAUNCH(true, false, true,  true,  hidden, kLayout, ncclBfloat16); } \
-        else            { DISPATCH_DO_LAUNCH(true, false, true,  false, hidden, kLayout, ncclBfloat16); } \
-    } else if (nvlinkOnly) { \
-        if (useFp8 and useUe8m0)      { DISPATCH_DO_LAUNCH(true,  true,  false, true,  hidden, kLayout, ncclBfloat16); } \
-        else if (useFp8)              { DISPATCH_DO_LAUNCH(true,  false, false, true,  hidden, kLayout, ncclBfloat16); } \
-        else if (isFp32)              { DISPATCH_DO_LAUNCH(false, false, false, true,  hidden, kLayout, ncclFloat32); } \
-        else                          { DISPATCH_DO_LAUNCH(false, false, false, true,  hidden, kLayout, ncclBfloat16); } \
-    } else { \
-        if (useFp8 and useUe8m0)      { DISPATCH_DO_LAUNCH(true,  true,  false, false, hidden, kLayout, ncclBfloat16); } \
-        else if (useFp8)              { DISPATCH_DO_LAUNCH(true,  false, false, false, hidden, kLayout, ncclBfloat16); } \
-        else if (isFp32)              { DISPATCH_DO_LAUNCH(false, false, false, false, hidden, kLayout, ncclFloat32); } \
-        else                          { DISPATCH_DO_LAUNCH(false, false, false, false, hidden, kLayout, ncclBfloat16); } \
-    } \
-} break
-#define DISPATCH_LAUNCH_CASE_RM(hidden) DISPATCH_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_RANK_MAJOR)
-#define DISPATCH_LAUNCH_CASE_EM(hidden) DISPATCH_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR)
-    if (layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
-        SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE_RM);
-    } else {
-        SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE_EM);
-    }
-#undef DISPATCH_DO_LAUNCH
-#undef DISPATCH_LAUNCH_CASE_IMPL
-#undef DISPATCH_LAUNCH_CASE_RM
-#undef DISPATCH_LAUNCH_CASE_EM
-}
-
 template <int kNumSendUnrolls>
 __forceinline__ __device__ int logfmtEncode(void* buffer, nv_bfloat162 *sharedAmaxmin, const int& laneId) {
     constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
@@ -1664,7 +1517,7 @@ __forceinline__ __device__ void processAndSendToken(
 }
 
 template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, ncclEpLayout_t kLayout, typename TopkIdxT, ncclDataType_t kTokenDtype = ncclBfloat16>
-__global__ __launch_bounds__(1024, 1) void combine(// INPUT
+__device__ __forceinline__ void combine_kernel_impl(// INPUT
                                                    const void* inData,
                                                    const int* srcInfo,
                                                    const int64_t* layoutRange,
@@ -2107,124 +1960,6 @@ LOW_LATENCY_COMBINE_RECV:
 constexpr int kCombineMaxTopk = 9;
 constexpr int kCombineMaxUnrolls = 4;
 
-template <typename TopkIdxT>
-void combine(const void* inData,
-             const int* srcInfo,
-             const int64_t* layoutRange,
-             const TopkIdxT* inTopkIdx,
-             const float* topkWeights,
-             void* outData,
-             void* sendBuf,
-             void* recvBuf,
-             int* recvFlagBuf,
-             size_t sendOff,
-             size_t recvOff,
-             size_t recvFlagOff,
-             int* nextRecvCntBuf,
-             int nextRecvCntBufSize,
-             int64_t* waitStats,
-             int numCombinedTokens,
-             int hidden,
-             int maxTokensPerRank,
-             int numTopk,
-             int numExperts,
-             int currRank,
-             int numRanks,
-             bool useLogfmt,
-             ncclEpLayout_t layout,
-             int phases,
-             bool zeroCopy,
-             int numComms,
-             ncclDevComm* devComms,
-             const ncclWindow_t* windows,
-             unsigned signalsBase,
-             void* workspace,
-             int numDeviceSms,
-             int* rankMask,
-             int* asyncErrorFlag,
-             uint64_t timeoutCycles,
-             cudaStream_t stream,
-             ncclDataType_t token_dtype) {
-    const int numWarpGroups = ceil_div(numExperts, numDeviceSms);
-    const int numWarpsPerGroup = 32 / numWarpGroups;
-    const int numRecvPerSm = ceil_div(numCombinedTokens, numDeviceSms);
-    EP_HOST_ASSERT(numWarpGroups > 0 and numWarpsPerGroup > 0 and numRecvPerSm >= 0);
-
-    const auto numWarps = numWarpGroups * numWarpsPerGroup;
-    const auto numSms = max(ceil_div(numExperts, numWarpGroups),
-                             numRecvPerSm == 0 ? 1 : ceil_div(numCombinedTokens, numRecvPerSm));
-
-    // Check workspace
-    auto atomicCleanFlag = static_cast<int*>(workspace);
-    EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
-    EP_HOST_ASSERT(numTopk <= kCombineMaxTopk);
-
-    // Online cast cannot use zero-copy
-    EP_HOST_ASSERT(not (zeroCopy and useLogfmt));
-
-    constexpr int kNumStages = 3;
-    // Must mirror the kernel's group count exactly (see combine<> kMaxNumGroups):
-    // FP32 doubles per-stage token bytes, so it runs 1 group to stay within the
-    // device dynamic-SMEM cap; BF16/FP16 run 2. Computing 2 here for FP32 would
-    // over-request SMEM and fail cudaFuncSetAttribute at large hidden dims.
-    const int elemBytes = (token_dtype == ncclFloat32) ? 4 : 2;
-    const int kMaxNumGroups = (elemBytes == 2) ? 2 : 1;
-
-    // Send buffer size
-    const int numMetaBytes = hidden / 128 * 4;
-    const int numSendTmaBytes = 32 * sizeof(int4) * kCombineMaxUnrolls + 16;
-    const int smemSendSize = numWarps * (kNumStages * numSendTmaBytes + numMetaBytes);
-
-    // Receive buffer size
-    const int numRecvTmaBytes = 16 + hidden * elemBytes;
-    const int smemRecvSize = kMaxNumGroups * (kNumStages * numRecvTmaBytes + hidden * elemBytes + kNumStages * numMetaBytes * 3);
-
-    // Total requirement
-    const int smem_size = max(smemSendSize, smemRecvSize);
-
-    SETUP_LAUNCH_CONFIG(numSms, numWarps * 32, stream);
-#define COMBINE_LAUNCH_CASE_IMPL(hidden, kLayout, kTokenDtypeV) { \
-if (useLogfmt) { \
-    SET_SHARED_MEMORY_FOR_TMA((combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout, TopkIdxT, kTokenDtypeV>)); \
-    LAUNCH_KERNEL(&cfg, (combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout, TopkIdxT, kTokenDtypeV>), \
-                  inData, srcInfo, layoutRange, inTopkIdx, topkWeights, rankMask, asyncErrorFlag, outData, \
-                  sendBuf, recvBuf, recvFlagBuf, sendOff, recvOff, recvFlagOff, atomicCleanFlag, \
-                  nextRecvCntBuf, nextRecvCntBufSize, waitStats, numCombinedTokens, hidden, numTopk, \
-                  maxTokensPerRank, numExperts, currRank, numRanks, numWarpGroups, numWarpsPerGroup, \
-                  phases, zeroCopy, numComms, devComms, windows, signalsBase, timeoutCycles); \
-} else { \
-    SET_SHARED_MEMORY_FOR_TMA((combine<false, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout, TopkIdxT, kTokenDtypeV>)); \
-    LAUNCH_KERNEL(&cfg, (combine<false, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout, TopkIdxT, kTokenDtypeV>), \
-                  inData, srcInfo, layoutRange, inTopkIdx, topkWeights, rankMask, asyncErrorFlag, outData, \
-                  sendBuf, recvBuf, recvFlagBuf, sendOff, recvOff, recvFlagOff, atomicCleanFlag, \
-                  nextRecvCntBuf, nextRecvCntBufSize, waitStats, numCombinedTokens, hidden, numTopk, \
-                  maxTokensPerRank, numExperts, currRank, numRanks, numWarpGroups, numWarpsPerGroup, \
-                  phases, zeroCopy, numComms, devComms, windows, signalsBase, timeoutCycles); \
-} } break
-#define COMBINE_LAUNCH_CASE_RM_BF16(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_RANK_MAJOR,   ncclBfloat16)
-#define COMBINE_LAUNCH_CASE_EM_BF16(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR, ncclBfloat16)
-#define COMBINE_LAUNCH_CASE_RM_FP16(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_RANK_MAJOR,   ncclFloat16)
-#define COMBINE_LAUNCH_CASE_EM_FP16(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR, ncclFloat16)
-#define COMBINE_LAUNCH_CASE_RM_FP32(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_RANK_MAJOR,   ncclFloat32)
-#define COMBINE_LAUNCH_CASE_EM_FP32(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR, ncclFloat32)
-    if (token_dtype == ncclFloat32) {
-        if (layout == NCCL_EP_LAYOUT_RANK_MAJOR) { SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_RM_FP32); }
-        else                                     { SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_EM_FP32); }
-    } else if (token_dtype == ncclFloat16) {
-        if (layout == NCCL_EP_LAYOUT_RANK_MAJOR) { SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_RM_FP16); }
-        else                                     { SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_EM_FP16); }
-    } else {
-        if (layout == NCCL_EP_LAYOUT_RANK_MAJOR) { SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_RM_BF16); }
-        else                                     { SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_EM_BF16); }
-    }
-#undef COMBINE_LAUNCH_CASE_IMPL
-#undef COMBINE_LAUNCH_CASE_RM_BF16
-#undef COMBINE_LAUNCH_CASE_EM_BF16
-#undef COMBINE_LAUNCH_CASE_RM_FP16
-#undef COMBINE_LAUNCH_CASE_EM_FP16
-#undef COMBINE_LAUNCH_CASE_RM_FP32
-#undef COMBINE_LAUNCH_CASE_EM_FP32
-}
 
 // ============================================================================
 // clean_low_latency_buffer: barrier → zero RDMA buffers → barrier
@@ -2349,8 +2084,7 @@ __forceinline__ __device__ void maskAwareBarrier(
 }
 
 template <int kNumThreads>
-__launch_bounds__(kNumThreads, 1)
-__global__ void cleanLowLatencyBufferKernel(
+__device__ __forceinline__ void clean_low_latency_buffer_kernel_impl(
     int* clean_0, int num_clean_int_0,
     int* clean_1, int num_clean_int_1,
     int* rankMask,
@@ -2397,57 +2131,6 @@ __global__ void cleanLowLatencyBufferKernel(
                                        devComms, timeoutCycles);
     }
 }
-
-void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
-                              int* clean_1, int num_clean_int_1,
-                              int* rankMask,
-                              int* syncBuffer, ncclWindow_t* syncWindow,
-                              ncclDevComm* devComms,
-                              unsigned barrierSignalBase,
-                              uint64_t timeoutCycles,
-                              cudaStream_t stream) {
-    constexpr int kNumThreads = 256;
-    SETUP_LAUNCH_CONFIG(1, kNumThreads, stream);
-    LAUNCH_KERNEL(&cfg, cleanLowLatencyBufferKernel<kNumThreads>,
-                  clean_0, num_clean_int_0, clean_1, num_clean_int_1,
-                  rankMask, syncBuffer, syncWindow, devComms,
-                  barrierSignalBase, timeoutCycles);
-}
-
-// Explicit instantiations so the two LL specialisations link from
-// nccl_ep.cc. HT remains strict int64 (its host wrappers live in
-// hybridep_adapter.cu and are untemplated).
-template void dispatch<int32_t>(
-    const void*, const int32_t*, const float*,
-    void*, void*, const uint8_t*, int*, int*, int64_t*, int*, float*, int32_t*,
-    void*, void*, int*, size_t, size_t, size_t, int*, int, int*, int64_t*,
-    int, int, int, int, int, int, int, int, bool, bool, bool, ncclEpLayout_t,
-    ncclEpExpertIdKind_t,
-    int, int, ncclDevComm*, const ncclWindow_t*, unsigned, void*, int,
-    int*, int*, uint64_t, bool, ncclWindow_t, size_t, cudaStream_t, ncclDataType_t);
-
-template void dispatch<int64_t>(
-    const void*, const int64_t*, const float*,
-    void*, void*, const uint8_t*, int*, int*, int64_t*, int*, float*, int32_t*,
-    void*, void*, int*, size_t, size_t, size_t, int*, int, int*, int64_t*,
-    int, int, int, int, int, int, int, int, bool, bool, bool, ncclEpLayout_t,
-    ncclEpExpertIdKind_t,
-    int, int, ncclDevComm*, const ncclWindow_t*, unsigned, void*, int,
-    int*, int*, uint64_t, bool, ncclWindow_t, size_t, cudaStream_t, ncclDataType_t);
-
-template void combine<int32_t>(
-    const void*, const int*, const int64_t*, const int32_t*, const float*,
-    void*, void*, void*, int*, size_t, size_t, size_t, int*, int, int64_t*,
-    int, int, int, int, int, int, int, bool, ncclEpLayout_t, int, bool,
-    int, ncclDevComm*, const ncclWindow_t*, unsigned, void*, int,
-    int*, int*, uint64_t, cudaStream_t, ncclDataType_t);
-
-template void combine<int64_t>(
-    const void*, const int*, const int64_t*, const int64_t*, const float*,
-    void*, void*, void*, int*, size_t, size_t, size_t, int*, int, int64_t*,
-    int, int, int, int, int, int, int, bool, ncclEpLayout_t, int, bool,
-    int, ncclDevComm*, const ncclWindow_t*, unsigned, void*, int,
-    int*, int*, uint64_t, cudaStream_t, ncclDataType_t);
 
 } // namespace internode_ll
 

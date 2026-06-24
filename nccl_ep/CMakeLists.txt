@@ -55,7 +55,7 @@ set(NCCL_EP_HOST_SRC
 )
 
 set(NCCL_EP_DEVICE_SRC
-    device/low_latency.cu
+    device/ll_ep_adapter.cu
     device/hybridep_adapter.cu
 )
 
@@ -119,6 +119,8 @@ set(NCCL_EP_JIT_HEADERS
     device/cuda_compat_shims.cuh
     device/scan_kernel.cuh
     device/macros.cuh
+    device/ll_ep.cuh
+    device/ll_ep_adapter.cuh
 )
 
 file(MAKE_DIRECTORY "${NCCL_EP_JIT_SOURCE_DIR}")

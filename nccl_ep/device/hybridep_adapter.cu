@@ -13,8 +13,8 @@
 #include "hybridep_adapter.cuh"
 #include "hybridep_configs.cuh"
 #include "common.hpp"
-#include "jit/combine_jit.cuh"
-#include "jit/dispatch_jit.cuh"
+#include "jit/ht_combine_jit.cuh"
+#include "jit/ht_dispatch_jit.cuh"
 #include "jit/preprocess_jit.cuh"
 
 #include <cassert>

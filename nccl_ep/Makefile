@@ -57,14 +57,16 @@ DST_DIR := $(NCCL_EP_BUILDDIR)/test/nccl_ep
 JIT_DIR := $(INCDIR)/nccl_ep
 JIT_CONFIG_HEADER := $(JIT_DIR)/config.h
 
-# NVCC JIT support is required for HT mode.
+# NVCC JIT support is required for HT and LL modes.
 NCCL_EP_JIT_HEADERS := \
     device/hybrid_ep.cuh \
     device/device_primitives.cuh \
     device/hybridep_configs.cuh \
     device/cuda_compat_shims.cuh \
     device/scan_kernel.cuh \
-    device/macros.cuh
+    device/macros.cuh \
+    device/ll_ep.cuh \
+    device/ll_ep_adapter.cuh
 NCCL_EP_JIT_STAGED_HEADERS := include/common.hpp include/ep_enums.h
 NCCL_EP_JIT_STAGED_TARGETS := $(NCCL_EP_JIT_STAGED_HEADERS:include/%=$(JIT_DIR)/%)
 NCCL_EP_JIT_HEADER_TARGETS := $(NCCL_EP_JIT_HEADERS:%=$(JIT_DIR)/%) $(NCCL_EP_JIT_STAGED_TARGETS)
@@ -104,7 +106,7 @@ DEPFLAGS = -MMD -MP
 
 # Source files for library
 HOST_SRC := nccl_ep.cc nccl_ep_env.cc
-DEVICE_SRC := device/low_latency.cu \
+DEVICE_SRC := device/ll_ep_adapter.cu \
               device/hybridep_adapter.cu
 HOST_SRC += device/jit/jit_utils.cc \
             device/jit/jit_cache.cc \

@@ -481,33 +481,65 @@ CUresult launch_function(
     cudaStream_t stream) {
     // A zero size means kernel_param points to one fixed-size kernel argument.
     // Non-zero size means kernel_param points to a byte buffer with all kernel arguments.
-    if (kernel_param_size == 0) {
-        void* kernel_args[] = {kernel_param};
+    const bool single_arg = (kernel_param_size == 0);
+    void* single_arg_array[] = {kernel_param};
+    void* extra[] = {
+        CU_LAUNCH_PARAM_BUFFER_POINTER, kernel_param,
+        CU_LAUNCH_PARAM_BUFFER_SIZE, &kernel_param_size,
+        CU_LAUNCH_PARAM_END
+    };
+
+    // Default path: plain cuLaunchKernel (no cooperative / cluster attributes).
+    const bool needs_cluster = (variant.cluster_dim_x > 1 ||
+                                variant.cluster_dim_y > 1 ||
+                                variant.cluster_dim_z > 1);
+    if (!variant.cooperative && !needs_cluster) {
         return cuLaunchKernel(
             function,
             variant.num_blocks, 1, 1,
             variant.block_dim, 1, 1,
             static_cast<unsigned int>(variant.dynamic_smem_bytes),
             reinterpret_cast<CUstream>(stream),
-            kernel_args,
-            nullptr);
+            single_arg ? single_arg_array : nullptr,
+            single_arg ? nullptr : extra);
     }
 
-    // This buffer already has the arguments laid out in the order the JIT kernel
-    // expects, so pass CUDA the buffer pointer and its size.
-    void* extra[] = {
-        CU_LAUNCH_PARAM_BUFFER_POINTER, kernel_param,
-        CU_LAUNCH_PARAM_BUFFER_SIZE, &kernel_param_size,
-        CU_LAUNCH_PARAM_END
-    };
-    return cuLaunchKernel(
+    // Attributes path: use cuLaunchKernelEx with cooperative and/or cluster dim.
+    // LL kernels need cooperative for cg::this_grid().sync() and use a cluster
+    // dim of 2 when num_blocks is even.
+    // Value-initialize attrs[] so the union/pad bytes are well-defined.
+    CUlaunchAttribute attrs[2]{};
+    unsigned int num_attrs = 0;
+    if (variant.cooperative) {
+        attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
+        attrs[num_attrs].value.cooperative = 1;
+        ++num_attrs;
+    }
+    if (needs_cluster) {
+        attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        attrs[num_attrs].value.clusterDim.x = static_cast<unsigned int>(variant.cluster_dim_x);
+        attrs[num_attrs].value.clusterDim.y = static_cast<unsigned int>(variant.cluster_dim_y);
+        attrs[num_attrs].value.clusterDim.z = static_cast<unsigned int>(variant.cluster_dim_z);
+        ++num_attrs;
+    }
+
+    CUlaunchConfig config{};
+    config.gridDimX = static_cast<unsigned int>(variant.num_blocks);
+    config.gridDimY = 1;
+    config.gridDimZ = 1;
+    config.blockDimX = static_cast<unsigned int>(variant.block_dim);
+    config.blockDimY = 1;
+    config.blockDimZ = 1;
+    config.sharedMemBytes = static_cast<unsigned int>(variant.dynamic_smem_bytes);
+    config.hStream = reinterpret_cast<CUstream>(stream);
+    config.attrs = attrs;
+    config.numAttrs = num_attrs;
+
+    return cuLaunchKernelEx(
+        &config,
         function,
-        variant.num_blocks, 1, 1,
-        variant.block_dim, 1, 1,
-        static_cast<unsigned int>(variant.dynamic_smem_bytes),
-        reinterpret_cast<CUstream>(stream),
-        nullptr,
-        extra);
+        single_arg ? single_arg_array : nullptr,
+        single_arg ? nullptr : extra);
 }
 
 JitKernelStatus try_fast_launch(

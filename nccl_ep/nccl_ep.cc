@@ -28,6 +28,7 @@
 // HT (High Throughput) includes
 #include "device/hybridep_adapter.cuh"
 #include "device/hybridep_configs.cuh"
+#include "device/ll_ep_adapter.cuh"
 
 // NCCLCHECK macro for public API error checking
 // Undef any existing definition from internal NCCL headers to avoid using ncclDebugLog
@@ -2980,80 +2981,77 @@ ncclResult_t ncclEpDispatch(
             const bool extern_fp8 = (x->datatype == ncclFloat8e4m3 || x->datatype == ncclFloat8e5m2);
             const bool use_fp8 = (scales != nullptr) || extern_fp8;
             const bool round_scale = config ? config->round_scales : false;
-            const bool use_ue8m0 = false;
             // recv_topk_idx numbering selector. Read in a version-safe way
             // (older callers' smaller layout_info reports AUTO), then resolve
             // AUTO -> LOCAL so the kernel sees only concrete kinds.
             const ncclEpExpertIdKind_t recv_topk_idx_kind =
                 resolveRecvTopkIdxKind(layoutInfoRecvTopkIdxKind(layout_info));
 
-            // LL accepts int32 or int64 topk_idx; cached dtype picks the
-            // kernel specialisation. The generic lambda body is shared and
-            // also threads dev's zero-copy gate args (recv_data_window /
-            // recv_data_offset) through.
-            auto launch_dispatch = [&](auto* topk_idx_data) {
-                const ncclEpTensor_t* in_scales = tensor_ptr(inputs->scales);
+            // LL accepts int32 or int64 topk_idx; the cached dtype picks the JIT
+            // kernel specialization (TopkIdxT). The lambda packs the shared
+            // DispatchParams and threads extern-FP8 + zero-copy through.
+            auto launch_dispatch = [&](auto* topk_idx_data, bool topk_is_int64) {
                 auto* in_scales_data = extern_fp8
-                    ? static_cast<const uint8_t*>(in_scales->data) : nullptr;
-                nccl_ep::internode_ll::dispatch(
-                    x_data,
-                    topk_idx_data,
-                    topk_weights_in_data,
-                    recv_x_data,
-                    scales_data,
-                    in_scales_data,
-                    expert_recv_source_indices_data,
-                    src_rank_counter_data,
-                    expert_dispatch_layout_data,
-                    recv_count_data,
-                    recv_topk_weights_data,
-                    recv_topk_idx_data,
-                    dispatch_send_ptr,
-                    dispatch_recv_ptr,
-                    dispatch_count_ptr,
-                    buffer.dispatch_rdma_send_buffer_offset,
-                    buffer.dispatch_rdma_recv_data_buffer_offset,
-                    buffer.dispatch_rdma_recv_count_buffer_offset,
-                    next_clean_ptr,
-                    next_clean_meta.second,
-                    nullptr, /*recv_send_sizes=*/
-                    nullptr, /*recv_send_offsets=*/
-                    handle->num_tokens,
-                    extern_fp8_outer ? static_cast<int>(in_scales_outer->sizes[1]) : (hidden / 128),
-                    hidden,
-                    group->config.max_dispatch_tokens_per_rank,
-                    handle->num_topk,
-                    group->config.num_experts,
-                    group->rank,
-                    group->nRanks,
-                    use_fp8,
-                    round_scale,
-                    use_ue8m0,
-                    handle->layout,
-                    recv_topk_idx_kind,
-                    phases,
-                    group->num_nccl_comms,
-                    group->nccl_dev_comms,
-                    group->nccl_wins,
-                    signal_base,
-                    group->ep_workspace,
-                    group->comm_num_sms,
-                    group->mask_buffer,
-                    group->async_error_flag,
-                    group->timeout_cycles,
-                    /*nvlinkOnly=*/nvlink_only,
-                    recv_data_window,
-                    recv_data_offset,
-                    stream,
-                    x->datatype
-                );
+                    ? static_cast<const uint8_t*>(in_scales_outer->data) : nullptr;
+                nccl_ep::internode_ll::DispatchParams params{};
+                params.inData = x_data;
+                params.inScalesBuf = in_scales_data;
+                params.inTopkIdx = topk_idx_data;
+                params.topkIdxIsInt64 = topk_is_int64;
+                params.scalesPerToken = extern_fp8
+                    ? static_cast<int>(in_scales_outer->sizes[1]) : (hidden / 128);
+                params.inTopkWeights = topk_weights_in_data;
+                params.outDataBuf = recv_x_data;
+                params.outScalesBuf = scales_data;
+                params.outSrcInfo = expert_recv_source_indices_data;
+                params.outRecvRankCounter = src_rank_counter_data;
+                params.outLayout = expert_dispatch_layout_data;
+                params.outCnt = recv_count_data;
+                params.outRecvTopkWeights = recv_topk_weights_data;
+                params.outRecvTopkIdx = recv_topk_idx_data;
+                params.sendBuf = dispatch_send_ptr;
+                params.recvBuf = dispatch_recv_ptr;
+                params.recvCntBuf = dispatch_count_ptr;
+                params.sendOff = buffer.dispatch_rdma_send_buffer_offset;
+                params.recvOff = buffer.dispatch_rdma_recv_data_buffer_offset;
+                params.recvCntOff = buffer.dispatch_rdma_recv_count_buffer_offset;
+                params.nextRecvCntBuf = next_clean_ptr;
+                params.nextRecvCntBufSize = next_clean_meta.second;
+                params.recvStats = nullptr;
+                params.waitStats = nullptr;
+                params.numTokens = handle->num_tokens;
+                params.hidden = hidden;
+                params.maxTokensPerRank = group->config.max_dispatch_tokens_per_rank;
+                params.numTopk = handle->num_topk;
+                params.numExperts = group->config.num_experts;
+                params.currRank = group->rank;
+                params.numRanks = group->nRanks;
+                params.layout = handle->layout;
+                params.numComms = group->num_nccl_comms;
+                params.devComms = group->nccl_dev_comms;
+                params.windows = group->nccl_wins;
+                params.signalsBase = signal_base;
+                params.workspace = group->ep_workspace;
+                params.numDeviceSms = group->comm_num_sms;
+                params.rankMask = group->mask_buffer;
+                params.asyncErrorFlag = group->async_error_flag;
+                params.timeoutCycles = group->timeout_cycles;
+                params.useUe8m0 = false;
+                params.roundScale = round_scale;
+                params.nvlinkOnly = nvlink_only;
+                params.recvDataWindow = recv_data_window;
+                params.recvDataOffset = recv_data_offset;
+                params.recvTopkIdxKind = recv_topk_idx_kind;
+                params.phases = phases;
+                params.tokenDtype = x->datatype;
+                nccl_ep::internode_ll::call_dispatch(params, use_fp8, stream);
             };
             switch (handle->topk_idx.datatype) {
                 case ncclInt32:
-                    launch_dispatch(static_cast<const int32_t*>(handle->topk_idx.data));
+                    launch_dispatch(static_cast<const int32_t*>(handle->topk_idx.data), /*topk_is_int64=*/false);
                     break;
                 case ncclInt64:
-                    launch_dispatch(static_cast<const int64_t*>(handle->topk_idx.data));
+                    launch_dispatch(static_cast<const int64_t*>(handle->topk_idx.data), /*topk_is_int64=*/true);
                     break;
                 default:
                     assert(false && "LL topk_idx must be ncclInt32 or ncclInt64");
@@ -3721,65 +3719,58 @@ ncclResult_t ncclEpCombine(
             auto* src_info_data = static_cast<int*>(src_info->data);
             auto* layout_range_data = static_cast<int64_t*>(layout_range->data);
 
-            const bool use_fp8 = false;
-            // LL combine reads `inData` (x_data) directly via pointer and
-            // uses windows only to translate peer recv-buffer ptrs in
-            // ncclGetP2pPtr (library-owned staging). The kernel's zeroCopy
-            // mode is dispatch-shaped (peer P2P writes); plumbing
-            // ncclEpGroupConfig_t::zero_copy through here would silently
-            // pick the wrong send-side path on combine. Hardcoded false
-            // matches origin/master and leaves config.zero_copy as a
-            // dispatch-only switch.
-            const bool zero_copy = false;
-
-            // LL accepts int32 or int64 topk_idx; same cached dtype as dispatch.
-            auto launch_combine = [&](auto* topk_idx_data) {
-                nccl_ep::internode_ll::combine(
-                    x_data,
-                    src_info_data,
-                    layout_range_data,
-                    topk_idx_data,
-                    topk_weights_data,
-                    out_data,
-                    combine_send_ptr,
-                    combine_recv_ptr,
-                    combine_flag_ptr,
-                    buffer.combine_rdma_send_buffer_offset,
-                    buffer.combine_rdma_recv_data_buffer_offset,
-                    buffer.combine_rdma_recv_flag_buffer_offset,
-                    next_clean_ptr,
-                    next_clean_meta.second,
-                    nullptr, /*recv_topk_idx=*/
-                    num_combined_tokens,
-                    hidden,
-                    num_max_dispatch_tokens_per_rank,
-                    num_topk,
-                    num_experts,
-                    handle->group->rank,
-                    handle->group->nRanks,
-                    use_fp8,
-                    handle->layout,
-                    phases,
-                    zero_copy,
-                    handle->group->num_nccl_comms,
-                    handle->group->nccl_dev_comms,
-                    handle->group->nccl_wins,
-                    signal_base,
-                    handle->group->ep_workspace,
-                    handle->group->comm_num_sms,
-                    handle->group->mask_buffer,
-                    handle->group->async_error_flag,
-                    handle->group->timeout_cycles,
-                    stream,
-                    x->datatype
-                );
+            // LL accepts int32 or int64 topk_idx; the cached dtype picks the JIT
+            // combine specialization (TopkIdxT), same as dispatch. zeroCopy stays
+            // false: combine reads inData directly and uses windows only to
+            // translate peer recv-buffer ptrs; the kernel's zeroCopy mode is
+            // dispatch-shaped, so config.zero_copy is a dispatch-only switch.
+            auto launch_combine = [&](auto* topk_idx_data, bool topk_is_int64) {
+                nccl_ep::internode_ll::CombineParams params{};
+                params.inData = x_data;
+                params.srcInfo = src_info_data;
+                params.layoutRange = layout_range_data;
+                params.inTopkIdx = topk_idx_data;
+                params.topkIdxIsInt64 = topk_is_int64;
+                params.topkWeights = topk_weights_data;
+                params.outData = out_data;
+                params.sendBuf = combine_send_ptr;
+                params.recvBuf = combine_recv_ptr;
+                params.recvFlagBuf = combine_flag_ptr;
+                params.sendOff = buffer.combine_rdma_send_buffer_offset;
+                params.recvOff = buffer.combine_rdma_recv_data_buffer_offset;
+                params.recvFlagOff = buffer.combine_rdma_recv_flag_buffer_offset;
+                params.nextRecvCntBuf = next_clean_ptr;
+                params.nextRecvCntBufSize = next_clean_meta.second;
+                params.waitStats = nullptr;
+                params.numCombinedTokens = num_combined_tokens;
+                params.hidden = hidden;
+                params.maxTokensPerRank = num_max_dispatch_tokens_per_rank;
+                params.numTopk = num_topk;
+                params.numExperts = num_experts;
+                params.currRank = handle->group->rank;
+                params.numRanks = handle->group->nRanks;
+                params.layout = handle->layout;
+                params.numComms = handle->group->num_nccl_comms;
+                params.devComms = handle->group->nccl_dev_comms;
+                params.windows = handle->group->nccl_wins;
+                params.signalsBase = signal_base;
+                params.workspace = handle->group->ep_workspace;
+                params.numDeviceSms = handle->group->comm_num_sms;
+                params.rankMask = handle->group->mask_buffer;
+                params.asyncErrorFlag = handle->group->async_error_flag;
+                params.timeoutCycles = handle->group->timeout_cycles;
+                params.useLogFmt = false;
+                params.zeroCopy = false;
+                params.phases = phases;
+                params.tokenDtype = x->datatype;
+                nccl_ep::internode_ll::call_combine(params, stream);
             };
             switch (topk_idx->datatype) {
                 case ncclInt32:
-                    launch_combine(static_cast<const int32_t*>(topk_idx->data));
+                    launch_combine(static_cast<const int32_t*>(topk_idx->data), /*topk_is_int64=*/false);
                     break;
                 case ncclInt64:
-                    launch_combine(static_cast<const int64_t*>(topk_idx->data));
+                    launch_combine(static_cast<const int64_t*>(topk_idx->data), /*topk_is_int64=*/true);
                     break;
                 default:
                     assert(false && "LL topk_idx must be ncclInt32 or ncclInt64");
@@ -4205,15 +4196,19 @@ ncclResult_t ncclEpMaskClean(
     int* clean_0_ptr = reinterpret_cast<int*>(rdma_base + clean_0.first);
     int* clean_1_ptr = reinterpret_cast<int*>(rdma_base + clean_1.first);
 
-    nccl_ep::internode_ll::clean_low_latency_buffer(
-        clean_0_ptr, clean_0.second,
-        clean_1_ptr, clean_1.second,
-        ep_group->mask_buffer,
-        static_cast<int*>(ep_group->sync_buffer), ep_group->sync_window,
-        ep_group->nccl_dev_comms,
-        ep_group->clean_barrier_signal_base,
-        ep_group->timeout_cycles,
-        stream);
+    nccl_ep::internode_ll::CleanLowLatencyBufferParams clean_params{};
+    clean_params.clean_0 = clean_0_ptr;
+    clean_params.num_clean_int_0 = clean_0.second;
+    clean_params.clean_1 = clean_1_ptr;
+    clean_params.num_clean_int_1 = clean_1.second;
+    clean_params.rankMask = ep_group->mask_buffer;
+    clean_params.syncBuffer = static_cast<int*>(ep_group->sync_buffer);
+    clean_params.syncWindow = ep_group->sync_window;
+    clean_params.devComms = ep_group->nccl_dev_comms;
+    clean_params.barrierSignalBase = ep_group->clean_barrier_signal_base;
+    clean_params.timeoutCycles = ep_group->timeout_cycles;
+
+    nccl_ep::internode_ll::call_clean_low_latency_buffer(clean_params, stream);
 
     // Reset all ranks to active (1 = active).
     // Sync the stream before returning so all_active outlives the async copy.

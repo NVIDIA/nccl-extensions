@@ -1226,6 +1226,45 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
   return src;
 }
 
+enum class copy_dir { to_smem, to_gmem };   // load into SMEM / store to gmem
+
+// One field copy between SMEM and gmem. to_smem loads (gmem->smem, mbar form);
+// to_gmem stores (smem->gmem). Returns bytes copied.
+template<copy_dir DIR>
+__forceinline__ __device__ uint32_t bulk_copy(void* smem_ptr, const void* gmem_ptr,
+                                               uint32_t bytes, uint64_t* mbar) {
+  if constexpr (DIR == copy_dir::to_smem) {
+    cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
+                             /*dst=*/smem_ptr, /*src=*/gmem_ptr, bytes, mbar);
+  } else {
+    cuda::ptx::cp_async_bulk(cuda::ptx::space_global, cuda::ptx::space_shared,
+                             /*dst=*/const_cast<void*>(gmem_ptr), /*src=*/smem_ptr, bytes);
+  }
+  return bytes;
+}
+
+// Copy a token bundle (token, +prob if FWD, +sf if FP8) between this stage's SMEM
+// and its gmem endpoints, in the given direction. Returns total bytes.
+template<typename TOKEN_DATA_TYPE, typename SMEM_TYPE, bool FORWARD_DISPATCH, copy_dir DIR>
+__forceinline__ __device__ uint32_t copy_token_bundle(
+    SMEM_TYPE* smem_buffer_ptr, const int pipeline_rank, const int stage,
+    const void* token_gmem_ptr, const void* prob_gmem_ptr, const void* sf_gmem_ptr,
+    const uint32_t token_bytes, const uint32_t prob_bytes, const uint32_t sf_bytes,
+    uint64_t* mbar)
+{
+  uint32_t tx = bulk_copy<DIR>(smem_buffer_ptr->get_token_buffer(pipeline_rank, stage),
+                               token_gmem_ptr, token_bytes, mbar);
+  if constexpr (FORWARD_DISPATCH) {
+    tx += bulk_copy<DIR>(reinterpret_cast<void*>(smem_buffer_ptr->get_prob_buffer(pipeline_rank, stage)),
+                         prob_gmem_ptr, prob_bytes, mbar);
+  }
+  if constexpr (std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
+    tx += bulk_copy<DIR>(reinterpret_cast<void*>(smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage)),
+                         sf_gmem_ptr, sf_bytes, mbar);
+  }
+  return tx;
+}
+
 // TMA-copy one token (+prob if FORWARD_DISPATCH, +sf if FP8) from a packed-remote
 // or strided-local source into its SMEM stage, then publish via arrive_expect_tx.
 template<typename TOKEN_DATA_TYPE,
@@ -1247,57 +1286,36 @@ __forceinline__ __device__ void dispatch_g2s_issue_token(
     const struct dispatch_memory_region_info_t* mr_info)
 {
   uint64_t* mbar = smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage);
-  uint32_t tx_bytes = 0;
-  size_t token_bytes = HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE);
-  size_t prob_bytes = (experts_per_rank * num_of_ranks_per_node) * sizeof(float);
+  const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE));
+  const uint32_t prob_bytes = (uint32_t)((experts_per_rank * num_of_ranks_per_node) * sizeof(float));
+  const uint32_t sf_bytes = (uint32_t)sf_bytes_per_token;
+  uint32_t tx_bytes;
 
   if (src.use_packed) {
-    const uint8_t* packed_entry = src.packed_base + packed_dense_idx * mr_info->bytes_per_entry;
-
-    void* token_dst = smem_buffer_ptr->get_token_buffer(pipeline_rank, stage);
-    const void* token_src = reinterpret_cast<const void*>(packed_entry);
-    cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
-                             token_dst, token_src, (uint32_t)token_bytes, mbar);
-    tx_bytes += (uint32_t)token_bytes;
-
-    if constexpr(FORWARD_DISPATCH) {
-      void* prob_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_prob_buffer(pipeline_rank, stage));
-      const void* prob_src = reinterpret_cast<const void*>(packed_entry + token_bytes);
-      cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
-                               prob_dst, prob_src, (uint32_t)prob_bytes, mbar);
-      tx_bytes += (uint32_t)prob_bytes;
-    }
-    if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
-      size_t sf_offset_in_entry = token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
-      void* sf_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage));
-      const void* sf_src = reinterpret_cast<const void*>(packed_entry + sf_offset_in_entry);
-      cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
-                               sf_dst, sf_src, (uint32_t)sf_bytes_per_token, mbar);
-      tx_bytes += (uint32_t)sf_bytes_per_token;
-    }
+    // Packed entry is contiguous [token | prob | sf].
+    const uint8_t* packed_src_base = src.packed_base + packed_dense_idx * mr_info->bytes_per_entry;
+    const void* token_src = packed_src_base;
+    const void* prob_src = packed_src_base + token_bytes;
+    const void* sf_src = packed_src_base + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
+    tx_bytes = copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH, copy_dir::to_smem>(
+        smem_buffer_ptr, pipeline_rank, stage, token_src, prob_src, sf_src,
+        token_bytes, prob_bytes, sf_bytes, mbar);
   } else {
-    void* token_dst = smem_buffer_ptr->get_token_buffer(pipeline_rank, stage);
-    const void* token_src = reinterpret_cast<const void*>(src.token_base + (current_token_id * HIDDEN_DIM));
-    cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
-                             token_dst, token_src, (uint32_t)token_bytes, mbar);
-    tx_bytes += (uint32_t)token_bytes;
-
+    // Strided-local: each field has its own base.
+    const void* token_src = src.token_base + (current_token_id * HIDDEN_DIM);
+    const void* prob_src = nullptr;
+    const void* sf_src = nullptr;
     if constexpr(FORWARD_DISPATCH) {
-      void* prob_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_prob_buffer(pipeline_rank, stage));
-      const void* prob_src = reinterpret_cast<const void*>(src.prob_base +
+      prob_src = src.prob_base +
           (current_token_id * (experts_per_rank * num_of_ranks_per_node * NUM_LSA_TEAMS)) +
-          (node_rank * (experts_per_rank * num_of_ranks_per_node)));
-      cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
-                               prob_dst, prob_src, (uint32_t)prob_bytes, mbar);
-      tx_bytes += (uint32_t)prob_bytes;
+          (node_rank * (experts_per_rank * num_of_ranks_per_node));
     }
     if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
-      void* sf_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage));
-      const void* sf_src = reinterpret_cast<const void*>(src.sf_base + current_token_id * sf_bytes_per_token);
-      cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
-                               sf_dst, sf_src, (uint32_t)sf_bytes_per_token, mbar);
-      tx_bytes += (uint32_t)sf_bytes_per_token;
+      sf_src = src.sf_base + current_token_id * sf_bytes_per_token;
     }
+    tx_bytes = copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH, copy_dir::to_smem>(
+        smem_buffer_ptr, pipeline_rank, stage, token_src, prob_src, sf_src,
+        token_bytes, prob_bytes, sf_bytes, mbar);
   }
 
   cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
@@ -1545,29 +1563,23 @@ __forceinline__ __device__ void dispatch_s2g_issue_token(
     float* const* remote_expert_output_prob,
     uint8_t* const* remote_expert_output_scaling_factor)
 {
-  TOKEN_DATA_TYPE* token_dst = remote_expert_output_token[dst.remote_rank_id] + (dst.output_buffer_index * HIDDEN_DIM);
-  cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
-                           cuda::ptx::space_shared,
-                           reinterpret_cast<void*>(token_dst),
-                           smem_buffer_ptr->get_token_buffer(pipeline_rank, stage),
-                           (uint32_t)(HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE)));
+  const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE));
+  const uint32_t prob_bytes = (uint32_t)((experts_per_rank * num_of_ranks_per_node) * sizeof(float));
+  const uint32_t sf_bytes = (uint32_t)sf_bytes_per_token;
 
+  // Remote fan-out: each field has its own output array, indexed [rank]+slot*stride.
+  const void* token_dst = remote_expert_output_token[dst.remote_rank_id] + (dst.output_buffer_index * HIDDEN_DIM);
+  const void* prob_dst = nullptr;
+  const void* sf_dst = nullptr;
   if constexpr(FORWARD_DISPATCH) {
-    float* prob_dst = remote_expert_output_prob[dst.remote_rank_id] + (dst.output_buffer_index * (experts_per_rank * num_of_ranks_per_node));
-    cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
-                             cuda::ptx::space_shared,
-                             reinterpret_cast<void*>(prob_dst),
-                             reinterpret_cast<const void*>(smem_buffer_ptr->get_prob_buffer(pipeline_rank, stage)),
-                             (uint32_t)((experts_per_rank * num_of_ranks_per_node) * sizeof(float)));
+    prob_dst = remote_expert_output_prob[dst.remote_rank_id] + (dst.output_buffer_index * (experts_per_rank * num_of_ranks_per_node));
   }
   if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
-    uint8_t* sf_dst = remote_expert_output_scaling_factor[dst.remote_rank_id] + dst.output_buffer_index * sf_bytes_per_token;
-    cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
-                             cuda::ptx::space_shared,
-                             reinterpret_cast<void*>(sf_dst),
-                             smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage),
-                             (uint32_t)sf_bytes_per_token);
+    sf_dst = remote_expert_output_scaling_factor[dst.remote_rank_id] + dst.output_buffer_index * sf_bytes_per_token;
   }
+  copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH, copy_dir::to_gmem>(
+      smem_buffer_ptr, pipeline_rank, stage, token_dst, prob_dst, sf_dst,
+      token_bytes, prob_bytes, sf_bytes, /*mbar=*/nullptr);
 }
 
 // Device function for intra-node S2G warp group for dispatch kernel.

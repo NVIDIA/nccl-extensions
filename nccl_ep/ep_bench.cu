@@ -1681,7 +1681,6 @@ static ValidationResult validateDispatchOutputHTRankMaj(
     int errors = 0;
     const int max_errors_to_print = 10;
     int errors_printed = 0;
-    int64_t* src_topk = new int64_t[max_tokens_per_rank * top_k];
 
     const size_t* out0_sizes = dispatch_outputs.tokens->sizes;
     unsigned int buf_rows = out0_sizes[0];
@@ -1714,13 +1713,18 @@ static ValidationResult validateDispatchOutputHTRankMaj(
     ncclEpExpertIdKind_t kind = dispatch_layout_info.recv_topk_idx_kind;
     if (kind == NCCL_EP_EXPERT_ID_AUTO) kind = NCCL_EP_EXPERT_ID_LOCAL;
 
+    // Save deterministic routing once per source rank. The flat expected set
+    // validates received token membership; per-slot topk_idx values are checked
+    // below against these same saved expert ids.
+    std::vector<std::vector<int64_t>> topk_by_rank(nRanks);
     std::set<std::pair<int, int>> expected;
     for (int r = 0; r < nRanks; r++) {
         unsigned int r_tokens = num_tokens_per_rank[r];
-        generateTopkIndicesHT(src_topk, r_tokens, num_experts, top_k, r);
+        topk_by_rank[r].resize(static_cast<size_t>(r_tokens) * top_k);
+        generateTopkIndicesHT(topk_by_rank[r].data(), r_tokens, num_experts, top_k, r);
         for (unsigned int t = 0; t < r_tokens; t++) {
             for (unsigned int k = 0; k < top_k; k++) {
-                int64_t expert_id = src_topk[t * top_k + k];
+                int64_t expert_id = topk_by_rank[r][static_cast<size_t>(t) * top_k + k];
                 int expert_rank = static_cast<int>(expert_id) / static_cast<int>(num_local_experts);
                 if (expert_rank == myRank) {
                     expected.insert({r, static_cast<int>(t)});
@@ -1764,6 +1768,17 @@ static ValidationResult validateDispatchOutputHTRankMaj(
             errors++;
         }
 
+        unsigned int sr_tokens = num_tokens_per_rank[source_rank];
+        if ((unsigned int)token_id >= sr_tokens) {
+            if (errors_printed < max_errors_to_print) {
+                printf("[Rank %d] HT dispatch: slot %u: token %d outside source rank %d count %u\n",
+                       myRank, j, token_id, source_rank, sr_tokens);
+                errors_printed++;
+            }
+            errors++;
+            continue;
+        }
+
         auto key = std::make_pair(source_rank, token_id);
         if (expected.find(key) == expected.end()) {
             if (errors_printed < max_errors_to_print) {
@@ -1780,33 +1795,42 @@ static ValidationResult validateDispatchOutputHTRankMaj(
         // myRank's experts. Position k within the slot is not meaningful (the
         // kernel writes in local-expert ascending order, not src_topk order),
         // so use set equality instead of per-k equality.
-        unsigned int sr_tokens = num_tokens_per_rank[source_rank];
-        if ((unsigned int)token_id < sr_tokens) {
-            int64_t* sr_topk = new int64_t[sr_tokens * top_k];
-            generateTopkIndicesHT(sr_topk, sr_tokens, num_experts, top_k, source_rank);
-            std::set<int64_t> expected_ids;
-            for (unsigned int k = 0; k < top_k; k++) {
-                int64_t eid = sr_topk[(unsigned int)token_id * top_k + k];
-                if (eid < 0) continue;
-                int expert_rank = static_cast<int>(eid) / static_cast<int>(num_local_experts);
-                if (expert_rank != myRank) continue;
-                int64_t expected_id = (kind == NCCL_EP_EXPERT_ID_GLOBAL) ? eid : (eid % num_local_experts);
-                expected_ids.insert(expected_id);
+        const std::vector<int64_t>& sr_topk = topk_by_rank[source_rank];
+        std::set<int64_t> expected_ids;
+        for (unsigned int k = 0; k < top_k; k++) {
+            int64_t eid = sr_topk[static_cast<size_t>(token_id) * top_k + k];
+            if (eid < 0) continue;
+            int expert_rank = static_cast<int>(eid) / static_cast<int>(num_local_experts);
+            if (expert_rank != myRank) continue;
+            int64_t expected_id = (kind == NCCL_EP_EXPERT_ID_GLOBAL)
+                ? eid
+                : (eid % num_local_experts);
+            expected_ids.insert(expected_id);
+        }
+        std::set<int64_t> found_ids;
+        for (unsigned int k = 0; k < top_k; k++) {
+            int64_t v = recv_topk_idx[(size_t)j * top_k + k];
+            if (v >= 0) found_ids.insert(v);
+        }
+        if (found_ids != expected_ids) {
+            if (errors_printed < max_errors_to_print) {
+                auto print_ids = [](const std::set<int64_t>& ids) {
+                    bool first = true;
+                    for (int64_t id : ids) {
+                        printf("%s%lld", first ? "" : ",", static_cast<long long>(id));
+                        first = false;
+                    }
+                };
+                printf("[Rank %d] HT dispatch: slot %u (rank=%d token=%d) topk_idx set mismatch "
+                       "(kind=%d expected={",
+                       myRank, j, source_rank, token_id, (int)kind);
+                print_ids(expected_ids);
+                printf("} found={");
+                print_ids(found_ids);
+                printf("})\n");
+                errors_printed++;
             }
-            std::set<int64_t> found_ids;
-            for (unsigned int k = 0; k < top_k; k++) {
-                int64_t v = recv_topk_idx[(size_t)j * top_k + k];
-                if (v >= 0) found_ids.insert(v);
-            }
-            if (found_ids != expected_ids) {
-                if (errors_printed < max_errors_to_print) {
-                    printf("[Rank %d] HT dispatch: slot %u (rank=%d token=%d) topk_idx set mismatch (kind=%d)\n",
-                           myRank, j, source_rank, token_id, (int)kind);
-                    errors_printed++;
-                }
-                errors++;
-            }
-            delete[] sr_topk;
+            errors++;
         }
     }
 
@@ -1823,7 +1847,6 @@ static ValidationResult validateDispatchOutputHTRankMaj(
     delete[] recv_topk_idx;
     delete[] valid_slot;
     delete[] recv_data;
-    delete[] src_topk;
 
     result.errors = errors;
     result.passed = (errors == 0);

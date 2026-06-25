@@ -279,6 +279,7 @@ struct dispatch_memory_region_info_t {
     unsigned signals_tail_base;               // Base signal ID for tail tracking (sender -> receiver)
     // Streaming buffer configuration
     int num_max_rdma_chunked_send_tokens;     // Batch size per RDMA put (default: 6)
+    size_t sync_guard_offset;  // RDMA sync-guard: offset of internal-buffer readiness flags (NUM_LSA_TEAMS uint64 slots)
 };
 
 struct combine_memory_region_info_t {
@@ -287,6 +288,7 @@ struct combine_memory_region_info_t {
     size_t combine_rdma_inter_node_group_token_offset; // Offset of combine rdma token buffer
     size_t rdma_intra_node_red_prob_offset;         // Offset of intra-node reduced prob buffer
     size_t combine_rdma_inter_node_group_prob_offset;  // Offset of combine rdma prob buffer
+    size_t sync_guard_offset;  // RDMA sync-guard: offset of combine's internal-buffer readiness flags
 };
 
 // ============================================================================

@@ -1059,7 +1059,8 @@ build_dispatch_param_base(const DispatchParams& params) {
                .max_tokens_per_dest = params.mr_info.max_tokens_per_dest,
                // Streaming signal parameters
                .signals_tail_base = params.mr_info.signals_tail_base,
-               .num_max_rdma_chunked_send_tokens = params.mr_info.num_max_rdma_chunked_send_tokens
+               .num_max_rdma_chunked_send_tokens = params.mr_info.num_max_rdma_chunked_send_tokens,
+               .sync_guard_offset = params.mr_info.sync_guard_offset
             };
 
     return kp;
@@ -1278,7 +1279,8 @@ build_combine_param_base(const CombineParams& params) {
                .rdma_intra_node_red_token_offset = params.mr_info.rdma_intra_node_red_token_offset,
                .combine_rdma_inter_node_group_token_offset = params.mr_info.combine_rdma_inter_node_group_token_offset,
                .rdma_intra_node_red_prob_offset = params.mr_info.rdma_intra_node_red_prob_offset,
-               .combine_rdma_inter_node_group_prob_offset = params.mr_info.combine_rdma_inter_node_group_prob_offset
+               .combine_rdma_inter_node_group_prob_offset = params.mr_info.combine_rdma_inter_node_group_prob_offset,
+               .sync_guard_offset = params.mr_info.sync_guard_offset
     };
 
     return kp;

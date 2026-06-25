@@ -1447,6 +1447,129 @@ __forceinline__ __device__ void G2S_warp_group_device_function(const int local_r
   }
 }
 
+// One destination decoded from a single s2d-map entry.
+struct s2g_dest_t {
+  bool issue;            // false for an empty entry or an EM secondary duplicate
+  int remote_rank_id;
+  int output_buffer_index;
+};
+
+// Issue the single TMA load of one (node, chunk)'s s2d-map slice into the given
+// SMEM stage and publish via arrive_expect_tx. Caller elects one lane.
+template<typename SMEM_TYPE,
+         int NUM_OF_TOKENS_PER_CHUNK>
+__forceinline__ __device__ void dispatch_s2g_prefetch_s2d_map(
+    SMEM_TYPE* smem_buffer_ptr,
+    const int32_t* sparse_to_dense_map,
+    const int pipeline_rank,
+    const uint32_t s2d_map_stage,
+    const int node_id,
+    const int chunk_id,
+    const int chunk_size,
+    const int num_of_tokens_per_rank,
+    const int s2d_inner_dim)
+{
+  const int32_t* s2d_base = sparse_to_dense_map +
+      (node_id * num_of_tokens_per_rank + chunk_id * NUM_OF_TOKENS_PER_CHUNK) * s2d_inner_dim;
+  void* smem_dst = reinterpret_cast<void*>(
+      smem_buffer_ptr->get_s2d_map_buffer_base(pipeline_rank, s2d_map_stage));
+  uint64_t* mbar = smem_buffer_ptr->get_s2d_map_mbar(pipeline_rank, s2d_map_stage);
+  // cp.async.bulk requires copy size to be a multiple of 16B. Round up; the
+  // source S2D buffer is over-allocated for max_tokens_per_rank and the smem
+  // dest stage is padded to 128B, so reading/writing the extra bytes is safe.
+  uint32_t copy_bytes = (uint32_t)(chunk_size * s2d_inner_dim * sizeof(int32_t));
+  copy_bytes = (copy_bytes + 15u) & ~15u;
+  cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
+                           cuda::ptx::space_global,
+                           smem_dst,
+                           reinterpret_cast<const void*>(s2d_base),
+                           copy_bytes, mbar);
+  cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
+                                       cuda::ptx::scope_cta,
+                                       cuda::ptx::space_shared,
+                                       mbar, copy_bytes);
+}
+
+// Decode one s2d-map entry into its remote destination. `issue` is false for an
+// empty entry (-1) or an EM secondary duplicate (the receiver's local_dup kernel
+// fills that secondary slot from the primary slot locally).
+template<ncclEpLayout_t kLayout>
+__forceinline__ __device__ s2g_dest_t dispatch_s2g_resolve_dest(
+    const int32_t* s2d_row,
+    const int flat_idx,
+    const bool local_dup_enabled)
+{
+  s2g_dest_t dst;
+  dst.issue = false;
+  dst.remote_rank_id = -1;
+  dst.output_buffer_index = -1;
+
+  const int32_t entry_val = s2d_row[flat_idx];
+  if (entry_val == -1) {
+    return dst;
+  }
+
+  // Rank-major: entry_idx=rank, value=slot. Expert-major: value packs (rank,slot).
+  if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+    dst.remote_rank_id = em_s2d_unpack_rank(entry_val);
+    dst.output_buffer_index = em_s2d_unpack_slot(entry_val);
+    if (local_dup_enabled && flat_idx > 0) {
+      const int32_t prev_val = s2d_row[flat_idx - 1];
+      if (prev_val != -1 && em_s2d_unpack_rank(prev_val) == dst.remote_rank_id) {
+        return dst;  // secondary dup: issue stays false
+      }
+    }
+  } else {
+    dst.remote_rank_id = flat_idx;
+    dst.output_buffer_index = entry_val;
+  }
+  dst.issue = true;
+  return dst;
+}
+
+// TMA-store one token (+prob if FORWARD_DISPATCH, +sf if FP8) from this stage's
+// SMEM buffers to one resolved remote destination.
+template<typename TOKEN_DATA_TYPE,
+         typename SMEM_TYPE,
+         bool FORWARD_DISPATCH>
+__forceinline__ __device__ void dispatch_s2g_issue_token(
+    const s2g_dest_t& dst,
+    SMEM_TYPE* smem_buffer_ptr,
+    const int pipeline_rank,
+    const int stage,
+    const int HIDDEN_DIM,
+    const int sf_bytes_per_token,
+    const int experts_per_rank,
+    const int num_of_ranks_per_node,
+    TOKEN_DATA_TYPE* const* remote_expert_output_token,
+    float* const* remote_expert_output_prob,
+    uint8_t* const* remote_expert_output_scaling_factor)
+{
+  TOKEN_DATA_TYPE* token_dst = remote_expert_output_token[dst.remote_rank_id] + (dst.output_buffer_index * HIDDEN_DIM);
+  cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
+                           cuda::ptx::space_shared,
+                           reinterpret_cast<void*>(token_dst),
+                           smem_buffer_ptr->get_token_buffer(pipeline_rank, stage),
+                           (uint32_t)(HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE)));
+
+  if constexpr(FORWARD_DISPATCH) {
+    float* prob_dst = remote_expert_output_prob[dst.remote_rank_id] + (dst.output_buffer_index * (experts_per_rank * num_of_ranks_per_node));
+    cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
+                             cuda::ptx::space_shared,
+                             reinterpret_cast<void*>(prob_dst),
+                             reinterpret_cast<const void*>(smem_buffer_ptr->get_prob_buffer(pipeline_rank, stage)),
+                             (uint32_t)((experts_per_rank * num_of_ranks_per_node) * sizeof(float)));
+  }
+  if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
+    uint8_t* sf_dst = remote_expert_output_scaling_factor[dst.remote_rank_id] + dst.output_buffer_index * sf_bytes_per_token;
+    cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
+                             cuda::ptx::space_shared,
+                             reinterpret_cast<void*>(sf_dst),
+                             smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage),
+                             (uint32_t)sf_bytes_per_token);
+  }
+}
+
 // Device function for intra-node S2G warp group for dispatch kernel.
 // With NUM_PIPELINES > 1, each warp is an independent pipeline consumer
 // paired with the G2S warp of the same pipeline_rank.
@@ -1479,19 +1602,20 @@ __forceinline__ __device__ void S2G_warp_group_device_function(const int local_r
 {
   constexpr int STAGES_PER_PIPELINE = NUM_OF_STAGES / NUM_PIPELINES;
   static_assert(NUM_OF_IN_FLIGHT_S2G < STAGES_PER_PIPELINE, "NUM_OF_IN_FLIGHT_S2G must be smaller than STAGES_PER_PIPELINE.");
-  using rdma_to_attn_map_load_t = uint4;
+  using routing_loads_t = uint4;
   static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
-  static_assert(NUM_OF_TOKENS_PER_CHUNK % sizeof(rdma_to_attn_map_load_t) == 0, "NUM_OF_TOKENS_PER_CHUNK must be multiple of rdma_to_attn_map_load_t.");
-  constexpr int NUM_OF_ROUTING_INFO_LOAD_ITER_PER_CHUNK = NUM_OF_TOKENS_PER_CHUNK / sizeof(rdma_to_attn_map_load_t);
-  constexpr int NUM_OF_TOKENS_PER_LOAD_ITER = sizeof(rdma_to_attn_map_load_t) / sizeof(bool);
+  static_assert(NUM_OF_TOKENS_PER_CHUNK % sizeof(routing_loads_t) == 0, "NUM_OF_TOKENS_PER_CHUNK must be multiple of routing_loads_t.");
+  constexpr int TOKENS_PER_ROUTING_LOAD = sizeof(routing_loads_t) / sizeof(bool);
+  constexpr int ROUTING_LOADS_PER_CHUNK = NUM_OF_TOKENS_PER_CHUNK / TOKENS_PER_ROUTING_LOAD;
 
   // S2D inner dim: mode-dependent, carried by SMEM layout struct.
   const int s2d_inner_dim = smem_buffer_ptr->s2d_inner_dim;
 
   const int pipeline_rank = INTRA_NODE_S2G_GROUP::warp_rank();
   const int remainder_chunk_size = num_of_tokens_per_rank % NUM_OF_TOKENS_PER_CHUNK;
-  const int num_of_chunks_per_rank = ((num_of_tokens_per_rank - 1) / NUM_OF_TOKENS_PER_CHUNK) + 1;
-  const int rdma_to_attn_map_size_per_node = (((num_of_tokens_per_rank - 1) / 16) + 1) * 16;
+  const int num_of_chunks_per_rank = nccl_ep::ceil_div(num_of_tokens_per_rank, NUM_OF_TOKENS_PER_CHUNK);
+  // TOKENS_PER_ROUTING_LOAD must match the producer's pad in scan_kernel.cuh
+  const int routing_map_node_stride = nccl_ep::align(num_of_tokens_per_rank, TOKENS_PER_ROUTING_LOAD);
   int in_flight_s2g = 0;
   int stage = 0;
   uint32_t producer_parity = 0;
@@ -1514,25 +1638,9 @@ __forceinline__ __device__ void S2G_warp_group_device_function(const int local_r
         } else {
           current_chunk_size = NUM_OF_TOKENS_PER_CHUNK;
         }
-        const int32_t* s2d_base = sparse_to_dense_map + (node_rank * num_of_tokens_per_rank + i * NUM_OF_TOKENS_PER_CHUNK) * s2d_inner_dim;
-        void* smem_dst = reinterpret_cast<void*>(
-            smem_buffer_ptr->get_s2d_map_buffer_base(pipeline_rank, sparse_to_dense_map_stage));
-        uint64_t* mbar =
-            smem_buffer_ptr->get_s2d_map_mbar(pipeline_rank, sparse_to_dense_map_stage);
-        // cp.async.bulk requires copy size to be a multiple of 16B. Round up; the
-        // source S2D buffer is over-allocated for max_tokens_per_rank and the smem
-        // dest stage is padded to 128B, so reading/writing the extra bytes is safe.
-        uint32_t copy_bytes = (uint32_t)(current_chunk_size * s2d_inner_dim * sizeof(int32_t));
-        copy_bytes = (copy_bytes + 15u) & ~15u;
-        cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
-                                 cuda::ptx::space_global,
-                                 smem_dst,
-                                 reinterpret_cast<const void*>(s2d_base),
-                                 copy_bytes, mbar);
-        cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
-                                             cuda::ptx::scope_cta,
-                                             cuda::ptx::space_shared,
-                                             mbar, copy_bytes);
+        dispatch_s2g_prefetch_s2d_map<SMEM_TYPE, NUM_OF_TOKENS_PER_CHUNK>(
+            smem_buffer_ptr, sparse_to_dense_map, pipeline_rank, sparse_to_dense_map_stage,
+            node_rank, i, current_chunk_size, num_of_tokens_per_rank, s2d_inner_dim);
         break;
       }
     }
@@ -1544,13 +1652,13 @@ __forceinline__ __device__ void S2G_warp_group_device_function(const int local_r
     for (int i = blockIdx.x; i < num_of_chunks_per_rank; i += NUM_OF_BLOCKS) {
       if ((chunk_iter++ % NUM_PIPELINES) != pipeline_rank) continue;
 
-      int num_of_routing_info_load_iter_for_current_chunk;
+      int routing_loads_in_chunk;
       int current_chunk_size;
       if (remainder_chunk_size != 0 && i == num_of_chunks_per_rank - 1) {
-        num_of_routing_info_load_iter_for_current_chunk = ((remainder_chunk_size - 1) / sizeof(rdma_to_attn_map_load_t)) + 1;
+        routing_loads_in_chunk = nccl_ep::ceil_div(remainder_chunk_size, (int)sizeof(routing_loads_t));
         current_chunk_size = remainder_chunk_size;
       } else {
-        num_of_routing_info_load_iter_for_current_chunk = NUM_OF_ROUTING_INFO_LOAD_ITER_PER_CHUNK;
+        routing_loads_in_chunk = ROUTING_LOADS_PER_CHUNK;
         current_chunk_size = NUM_OF_TOKENS_PER_CHUNK;
       }
       for (int j = 0; j < NUM_LSA_TEAMS; j++) {
@@ -1570,7 +1678,7 @@ __forceinline__ __device__ void S2G_warp_group_device_function(const int local_r
           int next_node_iter = j + 1;
           if (next_node_iter < NUM_LSA_TEAMS) {
             next_chunk_id = i;
-            next_node_id = node_rank >= next_node_iter ? node_rank - next_node_iter : node_rank + NUM_LSA_TEAMS - next_node_iter;
+            next_node_id = (node_rank + NUM_LSA_TEAMS - next_node_iter) % NUM_LSA_TEAMS;
           } else {
             // Find the next chunk this pipeline will process
             int future_chunk_iter = chunk_iter;  // chunk_iter was already incremented for current chunk
@@ -1591,28 +1699,16 @@ __forceinline__ __device__ void S2G_warp_group_device_function(const int local_r
             } else {
               next_chunk_size = NUM_OF_TOKENS_PER_CHUNK;
             }
-            const int32_t* s2d_base = sparse_to_dense_map + (next_node_id * num_of_tokens_per_rank + next_chunk_id * NUM_OF_TOKENS_PER_CHUNK) * s2d_inner_dim;
-            void* smem_dst = reinterpret_cast<void*>(
-                smem_buffer_ptr->get_s2d_map_buffer_base(pipeline_rank, sparse_to_dense_map_stage ^ 1));
-            uint64_t* mbar =
-                smem_buffer_ptr->get_s2d_map_mbar(pipeline_rank, sparse_to_dense_map_stage ^ 1);
-            uint32_t copy_bytes = (uint32_t)(next_chunk_size * s2d_inner_dim * sizeof(int32_t));
-            copy_bytes = (copy_bytes + 15u) & ~15u;
-            cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
-                                     cuda::ptx::space_global,
-                                     smem_dst,
-                                     reinterpret_cast<const void*>(s2d_base),
-                                     copy_bytes, mbar);
-            cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
-                                                 cuda::ptx::scope_cta,
-                                                 cuda::ptx::space_shared,
-                                                 mbar, copy_bytes);
+            dispatch_s2g_prefetch_s2d_map<SMEM_TYPE, NUM_OF_TOKENS_PER_CHUNK>(
+                smem_buffer_ptr, sparse_to_dense_map, pipeline_rank, sparse_to_dense_map_stage ^ 1,
+                next_node_id, next_chunk_id, next_chunk_size, num_of_tokens_per_rank, s2d_inner_dim);
           }
         }
 
-        int node_id = node_rank >= j ? node_rank - j : node_rank + NUM_LSA_TEAMS - j;
-        const rdma_to_attn_map_load_t* rdma_to_attn_map_load_base_addr = reinterpret_cast<const rdma_to_attn_map_load_t*>(rdma_to_attn_map +
-                                                                         (node_id * rdma_to_attn_map_size_per_node + i * NUM_OF_TOKENS_PER_CHUNK));
+        // Walk nodes backward from self around the ring (j=0 -> self, j>=1 -> remote)
+        int node_id = (node_rank + NUM_LSA_TEAMS - j) % NUM_LSA_TEAMS;
+        const routing_loads_t* routing_map_ptr = reinterpret_cast<const routing_loads_t*>(rdma_to_attn_map +
+                                                                         (node_id * routing_map_node_stride + i * NUM_OF_TOKENS_PER_CHUNK));
 
         {
           uint64_t* wait_mbar =
@@ -1620,71 +1716,29 @@ __forceinline__ __device__ void S2G_warp_group_device_function(const int local_r
           while (!cuda::ptx::mbarrier_try_wait_parity(wait_mbar, sparse_to_dense_map_parity)){}
         }
 
-        for (int k = 0; k < num_of_routing_info_load_iter_for_current_chunk; k++){
-          rdma_to_attn_map_load_t rdma_to_attn_map_data = rdma_to_attn_map_load_base_addr[k];
+        for (int k = 0; k < routing_loads_in_chunk; k++){
+          routing_loads_t routing_flags = routing_map_ptr[k];
           #pragma unroll
-          for (int n = 0; n < NUM_OF_TOKENS_PER_LOAD_ITER; n++){
-            int current_token_id = k * NUM_OF_TOKENS_PER_LOAD_ITER + n;
+          for (int n = 0; n < TOKENS_PER_ROUTING_LOAD; n++){
+            int current_token_id = k * TOKENS_PER_ROUTING_LOAD + n;
             if (current_token_id >= current_chunk_size){
               break;
             }
-            bool token_needed_by_this_node = *(reinterpret_cast<bool*>(&rdma_to_attn_map_data) + n);
-            if (token_needed_by_this_node){
-              const int token_smem_idx = k * NUM_OF_TOKENS_PER_LOAD_ITER + n;
+            bool token_needed = *(reinterpret_cast<bool*>(&routing_flags) + n);
+            if (token_needed){
+              const int token_smem_idx = k * TOKENS_PER_ROUTING_LOAD + n;
               const int32_t* s2d_smem_row = smem_buffer_ptr->get_s2d_map_buffer(pipeline_rank, sparse_to_dense_map_stage, token_smem_idx);
               while (!cuda::ptx::mbarrier_try_wait_parity(smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage), producer_parity)){}
 
               // Per-entry parallel issue: lane handles flat_idx=lane,lane+32,...
-              // Rank-major: entry_idx=rank, value=slot. Expert-major: value packs (rank,slot).
-              // When local_dup_enabled (EM only), suppress TMA stores for
-              // entries whose `dest` equals the previous entry's dest: the
-              // receiver's local_dup kernel will fill those secondary slots
-              // from the primary slot locally.
+              // Empty entries and EM secondary duplicates resolve to issue=false.
               for (int flat_idx = s2g_lane; flat_idx < s2d_inner_dim; flat_idx += 32){
-                  int32_t entry_val = s2d_smem_row[flat_idx];
-                  if (entry_val != -1) {
-                    int remote_rank_id;
-                    int output_buffer_index;
-                    if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-                      remote_rank_id = em_s2d_unpack_rank(entry_val);
-                      output_buffer_index = em_s2d_unpack_slot(entry_val);
-                    } else {
-                      remote_rank_id = flat_idx;
-                      output_buffer_index = entry_val;
-                    }
-                    bool is_secondary_dup = false;
-                    if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-                      if (local_dup_enabled && flat_idx > 0) {
-                        const int32_t prev_val = s2d_smem_row[flat_idx - 1];
-                        if (prev_val != -1 && em_s2d_unpack_rank(prev_val) == remote_rank_id) {
-                          is_secondary_dup = true;
-                        }
-                      }
-                    }
-                    if (!is_secondary_dup) {
-                      TOKEN_DATA_TYPE* remote_token_addr = remote_expert_output_token[remote_rank_id] + (output_buffer_index * HIDDEN_DIM);
-                      cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
-                                               cuda::ptx::space_shared,
-                                               reinterpret_cast<void*>(remote_token_addr),
-                                               smem_buffer_ptr->get_token_buffer(pipeline_rank, stage),
-                                               (uint32_t)(HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE)));
-                      if constexpr(FORWARD_DISPATCH) {
-                        float* remote_prob_addr = remote_expert_output_prob[remote_rank_id] + (output_buffer_index * (experts_per_rank * num_of_ranks_per_node));
-                        cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
-                                                 cuda::ptx::space_shared,
-                                                 reinterpret_cast<void*>(remote_prob_addr),
-                                                 reinterpret_cast<const void*>(smem_buffer_ptr->get_prob_buffer(pipeline_rank, stage)),
-                                                 (uint32_t)((experts_per_rank * num_of_ranks_per_node) * sizeof(float)));
-                      }
-                      if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
-                        uint8_t* remote_scaling_factor_addr = remote_expert_output_scaling_factor[remote_rank_id] + output_buffer_index * sf_bytes_per_token;
-                        cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
-                                                 cuda::ptx::space_shared,
-                                                 reinterpret_cast<void*>(remote_scaling_factor_addr),
-                                                 smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage),
-                                                 (uint32_t)sf_bytes_per_token);
-                      }
-                    }
+                  s2g_dest_t dst = dispatch_s2g_resolve_dest<kLayout>(s2d_smem_row, flat_idx, local_dup_enabled);
+                  if (dst.issue) {
+                    dispatch_s2g_issue_token<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH>(
+                        dst, smem_buffer_ptr, pipeline_rank, stage, HIDDEN_DIM, sf_bytes_per_token,
+                        experts_per_rank, num_of_ranks_per_node,
+                        remote_expert_output_token, remote_expert_output_prob, remote_expert_output_scaling_factor);
                   }
               }
               // S1: only issuing lanes commit/wait — idle lanes skip the empty pair.

@@ -1013,8 +1013,7 @@ __forceinline__ __device__ void mbarrier_wait(uint64_t* mbar, uint32_t parity) {
     while (!cuda::ptx::mbarrier_try_wait_parity(mbar, parity)) {}
 }
 
-// Put one token's bundle (token, +prob if FWD, +sf if FP8) to a remote node:
-// token at dst_offset, prob/sf packed immediately after.
+// Put one token's bundle (token, +prob if FWD, +sf if FP8) to a remote node, packed from dst_offset.
 template<typename TOKEN_DATA_TYPE, bool FORWARD_DISPATCH, int NUM_LSA_TEAMS>
 __forceinline__ __device__ void dispatch_n2n_put_token(
     ncclGin& net, const ncclTeam& rail, int remote_node_id,
@@ -1043,8 +1042,7 @@ __forceinline__ __device__ void dispatch_n2n_put_token(
   }
 }
 
-// Resolved source for one (node, chunk) pair in the dispatch G2S producer.
-// Either a packed remote (RDMA) entry base, or strided local base pointers.
+// Resolved G2S source for one (node, chunk): packed-remote entry base, or strided-local base pointers.
 template<typename TOKEN_DATA_TYPE>
 struct g2s_source_t {
   bool use_packed;
@@ -1054,8 +1052,7 @@ struct g2s_source_t {
   const uint8_t* sf_base;
 };
 
-// Resolve where this (node_id, chunk)'s tokens live: packed-remote base (after
-// waiting on the RDMA arrival signal) or strided-local token/prob/sf bases.
+// Resolve a (node, chunk) source: packed-remote base (after waiting the RDMA arrival signal) or strided-local bases.
 template<typename TOKEN_DATA_TYPE,
          int NUM_LSA_TEAMS,
          int LSA_TEAM_SIZE,
@@ -1125,8 +1122,7 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
 
 enum class copy_dir { to_smem, to_gmem };   // load into SMEM / store to gmem
 
-// One field copy between SMEM and gmem. to_smem loads (gmem->smem, mbar form);
-// to_gmem stores (smem->gmem). Returns bytes copied.
+// One field copy: to_smem loads (gmem->smem, mbar form), to_gmem stores (smem->gmem). Returns bytes copied.
 template<copy_dir DIR>
 __forceinline__ __device__ uint32_t bulk_copy(void* smem_ptr, const void* gmem_ptr,
                                                uint32_t bytes, uint64_t* mbar) {
@@ -1140,8 +1136,7 @@ __forceinline__ __device__ uint32_t bulk_copy(void* smem_ptr, const void* gmem_p
   return bytes;
 }
 
-// Copy a token bundle (token, +prob if FWD, +sf if FP8) between this stage's SMEM
-// and its gmem endpoints, in the given direction. Returns total bytes.
+// Copy a token bundle (token, +prob if FWD, +sf if FP8) between this stage's SMEM and gmem. Returns total bytes.
 template<typename TOKEN_DATA_TYPE, typename SMEM_TYPE, bool FORWARD_DISPATCH, copy_dir DIR>
 __forceinline__ __device__ uint32_t copy_token_bundle(
     SMEM_TYPE* smem_buffer_ptr, const int pipeline_rank, const int stage,
@@ -1162,8 +1157,7 @@ __forceinline__ __device__ uint32_t copy_token_bundle(
   return tx;
 }
 
-// TMA-copy one token (+prob if FORWARD_DISPATCH, +sf if FP8) from a packed-remote
-// or strided-local source into its SMEM stage, then publish via arrive_expect_tx.
+// TMA-copy one token (+prob if FWD, +sf if FP8) from a packed-remote or strided-local source into its SMEM stage, then publish.
 template<typename TOKEN_DATA_TYPE,
          typename SMEM_TYPE,
          int NUM_LSA_TEAMS,
@@ -1230,8 +1224,7 @@ struct s2g_dest_t {
   int output_buffer_index;
 };
 
-// Issue the single TMA load of one (node, chunk)'s s2d-map slice into the given
-// SMEM stage and publish via arrive_expect_tx. Caller elects one lane.
+// TMA-load one (node, chunk)'s s2d-map slice into the SMEM stage and publish. Caller elects one lane.
 template<typename SMEM_TYPE,
          int NUM_OF_TOKENS_PER_CHUNK>
 __forceinline__ __device__ void dispatch_s2g_prefetch_s2d_map(
@@ -1250,9 +1243,8 @@ __forceinline__ __device__ void dispatch_s2g_prefetch_s2d_map(
   void* smem_dst = reinterpret_cast<void*>(
       smem_buffer_ptr->get_s2d_map_buffer_base(pipeline_rank, s2d_map_stage));
   uint64_t* mbar = smem_buffer_ptr->get_s2d_map_mbar(pipeline_rank, s2d_map_stage);
-  // cp.async.bulk requires copy size to be a multiple of 16B. Round up; the
-  // source S2D buffer is over-allocated for max_tokens_per_rank and the smem
-  // dest stage is padded to 128B, so reading/writing the extra bytes is safe.
+  // cp.async.bulk needs a 16B-multiple size: round up. Safe because the source S2D buffer
+  // is over-allocated for max_tokens_per_rank and the smem dest stage is padded to 128B.
   uint32_t copy_bytes = (uint32_t)(chunk_size * s2d_inner_dim * sizeof(int32_t));
   copy_bytes = (copy_bytes + 15u) & ~15u;
   cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
@@ -1266,9 +1258,8 @@ __forceinline__ __device__ void dispatch_s2g_prefetch_s2d_map(
                                        mbar, copy_bytes);
 }
 
-// Decode one s2d-map entry into its remote destination. `issue` is false for an
-// empty entry (-1) or an EM secondary duplicate (the receiver's local_dup kernel
-// fills that secondary slot from the primary slot locally).
+// Decode one s2d-map entry into its remote destination. `issue` is false for an empty entry (-1)
+// or an EM secondary duplicate (the receiver's local_dup kernel fills it from the primary slot).
 template<ncclEpLayout_t kLayout>
 __forceinline__ __device__ s2g_dest_t dispatch_s2g_resolve_dest(
     const int32_t* s2d_row,
@@ -1303,8 +1294,7 @@ __forceinline__ __device__ s2g_dest_t dispatch_s2g_resolve_dest(
   return dst;
 }
 
-// TMA-store one token (+prob if FORWARD_DISPATCH, +sf if FP8) from this stage's
-// SMEM buffers to one resolved remote destination.
+// TMA-store one token (+prob if FWD, +sf if FP8) from this stage's SMEM to one resolved remote destination.
 template<typename TOKEN_DATA_TYPE,
          typename SMEM_TYPE,
          int LSA_TEAM_SIZE,
@@ -1455,9 +1445,8 @@ __forceinline__ __device__ void dispatch_N2N(
         dense_dst_offset += __popc(need_write_bitmask[word]) * entry_bytes;
       }
 
-      // Signal this chunk's completion on the SAME put comm.
-      // Same-QP ordering guarantees all preceding puts are visible at the
-      // remote before this signal arrives.
+      // Signal chunk completion on the SAME put comm: same-QP ordering makes all
+      // preceding puts visible at the remote before this signal arrives.
       unsigned tail_signal_id = dispatch_tail_signal_id(
           smem_mr_info_ptr->signals_tail_base, node_rank, remote_node_id, local_rank,
           chunk_idx, NUM_LSA_TEAMS, LSA_TEAM_SIZE, MAX_CHUNKS_PER_RANK);
@@ -1527,12 +1516,10 @@ __forceinline__ __device__ void dispatch_S2G(
   uint32_t s2d_stage = 0;
   uint32_t s2d_parity = 0;
 
-  // S2G on all 32 lanes (warp-uniform state); cp_async_bulk striped by lane=flat_idx
-  // for up to s2d_inner_dim concurrent TMA stores per token.
+  // S2G on all 32 lanes (warp-uniform state); cp_async_bulk striped by lane=flat_idx (up to s2d_inner_dim stores/token).
   const int s2g_lane = INTRA_NODE_S2G_GROUP::thread_rank() % 32;
 
-  // Each pipeline's S2G prefetches its own first s2d/em_s2d map for its first chunk.
-  // Single TMA load — issue from lane 0 only.
+  // Each pipeline prefetches its own first s2d map for its first chunk (single TMA load, lane 0 only).
   if (s2g_lane == 0) {
     int chunk_iter = 0;
     for (int chunk_idx = blockIdx.x; chunk_idx < num_of_chunks_per_rank; chunk_idx += NUM_OF_BLOCKS) {
@@ -1567,16 +1554,14 @@ __forceinline__ __device__ void dispatch_S2G(
         current_chunk_size = NUM_OF_TOKENS_PER_CHUNK;
       }
       for (int j = 0; j < NUM_LSA_TEAMS; j++) {
-        // Per-pipeline self-sync (arrival count = 1, trivially satisfied).
-        // Issue from lane 0 only — single mbarrier op.
+        // Per-pipeline self-sync (arrival count = 1, trivially satisfied); lane 0 only.
         if (s2g_lane == 0) {
           uint64_t state_token = cuda::ptx::mbarrier_arrive(smem_buffer_ptr->get_S2G_group_mbar(pipeline_rank));
           while (!cuda::ptx::mbarrier_try_wait(smem_buffer_ptr->get_S2G_group_mbar(pipeline_rank), state_token)) {}
         }
         __syncwarp();
 
-        // Prefetch s2d map for next (chunk, node) pair for THIS pipeline.
-        // Single TMA load — issue from lane 0 only.
+        // Prefetch next (chunk, node) s2d map for THIS pipeline (single TMA load, lane 0 only).
         if (s2g_lane == 0) {
           int next_chunk_id;
           int next_node_id;
@@ -1634,8 +1619,7 @@ __forceinline__ __device__ void dispatch_S2G(
               const int32_t* s2d_smem_row = smem_buffer_ptr->get_s2d_map_buffer(pipeline_rank, s2d_stage, current_token_id);
               mbarrier_wait(smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage), producer_parity);
 
-              // Per-entry parallel issue: lane handles flat_idx=lane,lane+32,...
-              // Empty entries and EM secondary duplicates resolve to issue=false.
+              // Per-entry parallel issue (lane handles flat_idx=lane,lane+32,...); empty/EM-dup entries resolve to issue=false.
               for (int flat_idx = s2g_lane; flat_idx < s2d_inner_dim; flat_idx += 32){
                   s2g_dest_t dst = dispatch_s2g_resolve_dest<kLayout>(s2d_smem_row, flat_idx, local_dup_enabled);
                   if (dst.issue) {

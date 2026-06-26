@@ -1144,6 +1144,169 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
 }
 
 
+// Resolved source for one (node, chunk) pair in the dispatch G2S producer.
+// Either a packed remote (RDMA) entry base, or strided local base pointers.
+template<typename TOKEN_DATA_TYPE>
+struct g2s_source_t {
+  bool use_packed;
+  const uint8_t* packed_base;
+  const TOKEN_DATA_TYPE* token_base;
+  const float* prob_base;
+  const uint8_t* sf_base;
+};
+
+// Resolve where this (node_id, chunk)'s tokens live: packed-remote base (after
+// waiting on the RDMA arrival signal) or strided-local token/prob/sf bases.
+template<typename TOKEN_DATA_TYPE,
+         int NUM_LSA_TEAMS,
+         int MAX_NUM_OF_TOKENS_PER_RANK,
+         int NUM_OF_TOKENS_PER_CHUNK,
+         int NUM_OF_BLOCKS,
+         bool FORWARD_DISPATCH>
+__forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_source(
+    const int node_id,
+    const int node_rank,
+    const int local_rank,
+    const int chunk_idx,
+    const int num_of_ranks_per_node,
+    const uint64_t expected_flag_value,
+    const int HIDDEN_DIM,
+    const int sf_bytes_per_token,
+    const int experts_per_rank,
+    const TOKEN_DATA_TYPE* attn_input_token,
+    const float* attn_input_prob,
+    const uint8_t* attn_input_token_scaling_factor,
+    ncclDevComm_t* dcomms,
+    int num_ctx_per_comm,
+    void* gin_base_ptr,
+    const struct dispatch_memory_region_info_t* mr_info)
+{
+  g2s_source_t<TOKEN_DATA_TYPE> src;
+  src.use_packed = false;
+  src.packed_base = nullptr;
+  src.token_base = nullptr;
+  src.prob_base = nullptr;
+  src.sf_base = nullptr;
+
+  if (node_id != node_rank) {
+    // Remote: wait for the RDMA arrival signal, then point at this tile+chunk in the packed buffer.
+    constexpr int MAX_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
+    unsigned tail_signal_id = mr_info->signals_tail_base +
+                               node_id * (NUM_LSA_TEAMS * num_of_ranks_per_node * MAX_CHUNKS_PER_RANK) +
+                               node_rank * (num_of_ranks_per_node * MAX_CHUNKS_PER_RANK) +
+                               local_rank * MAX_CHUNKS_PER_RANK +
+                               chunk_idx;
+    constexpr int N2N_WARPS = (NUM_LSA_TEAMS == 1) ? 1 : HYBRIDEP_DISPATCH_N2N_WARPS;
+    int signal_channel = chunk_idx % (NUM_OF_BLOCKS * N2N_WARPS);
+
+    int comm_idx, ctx_idx;
+    get_comm_ctx(signal_channel, num_ctx_per_comm, comm_idx, ctx_idx);
+    ncclGin net(dcomms[comm_idx], ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
+    net.waitSignal(ncclCoopThread(), tail_signal_id, expected_flag_value);
+
+    const int tile_id = node_id > node_rank ? node_id - 1 : node_id;
+    const uint8_t* packed_region = reinterpret_cast<const uint8_t*>(gin_base_ptr) +
+                                   mr_info->rdma_inter_node_group_packed_offset;
+    size_t tile_offset = tile_id * mr_info->max_tokens_per_dest * mr_info->bytes_per_entry;
+    size_t chunk_offset = static_cast<size_t>(chunk_idx * NUM_OF_TOKENS_PER_CHUNK) * mr_info->bytes_per_entry;
+
+    src.use_packed = true;
+    src.packed_base = packed_region + tile_offset + chunk_offset;
+  } else {
+    // Local: strided bases into this rank's own global mem arrays for this chunk.
+    int chunk_first_token = chunk_idx * NUM_OF_TOKENS_PER_CHUNK;
+    src.token_base = attn_input_token + chunk_first_token * HIDDEN_DIM;
+    if constexpr(FORWARD_DISPATCH) {
+      src.prob_base = attn_input_prob + chunk_first_token * (experts_per_rank * num_of_ranks_per_node * NUM_LSA_TEAMS);
+    }
+    if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
+      src.sf_base = attn_input_token_scaling_factor + chunk_first_token * sf_bytes_per_token;
+    }
+  }
+  return src;
+}
+
+// TMA-copy one token (+prob if FORWARD_DISPATCH, +sf if FP8) from a packed-remote
+// or strided-local source into its SMEM stage, then publish via arrive_expect_tx.
+template<typename TOKEN_DATA_TYPE,
+         typename SMEM_TYPE,
+         int NUM_LSA_TEAMS,
+         bool FORWARD_DISPATCH>
+__forceinline__ __device__ void dispatch_g2s_issue_token(
+    const g2s_source_t<TOKEN_DATA_TYPE>& src,
+    const int current_token_id,
+    const int packed_dense_idx,
+    SMEM_TYPE* smem_buffer_ptr,
+    const int pipeline_rank,
+    const int stage,
+    const int HIDDEN_DIM,
+    const int sf_bytes_per_token,
+    const int experts_per_rank,
+    const int num_of_ranks_per_node,
+    const int node_rank,
+    const struct dispatch_memory_region_info_t* mr_info)
+{
+  uint64_t* mbar = smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage);
+  uint32_t tx_bytes = 0;
+  size_t token_bytes = HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE);
+  size_t prob_bytes = (experts_per_rank * num_of_ranks_per_node) * sizeof(float);
+
+  if (src.use_packed) {
+    const uint8_t* packed_entry = src.packed_base + packed_dense_idx * mr_info->bytes_per_entry;
+
+    void* token_dst = smem_buffer_ptr->get_token_buffer(pipeline_rank, stage);
+    const void* token_src = reinterpret_cast<const void*>(packed_entry);
+    cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
+                             token_dst, token_src, (uint32_t)token_bytes, mbar);
+    tx_bytes += (uint32_t)token_bytes;
+
+    if constexpr(FORWARD_DISPATCH) {
+      void* prob_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_prob_buffer(pipeline_rank, stage));
+      const void* prob_src = reinterpret_cast<const void*>(packed_entry + token_bytes);
+      cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
+                               prob_dst, prob_src, (uint32_t)prob_bytes, mbar);
+      tx_bytes += (uint32_t)prob_bytes;
+    }
+    if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
+      size_t sf_offset_in_entry = token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
+      void* sf_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage));
+      const void* sf_src = reinterpret_cast<const void*>(packed_entry + sf_offset_in_entry);
+      cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
+                               sf_dst, sf_src, (uint32_t)sf_bytes_per_token, mbar);
+      tx_bytes += (uint32_t)sf_bytes_per_token;
+    }
+  } else {
+    void* token_dst = smem_buffer_ptr->get_token_buffer(pipeline_rank, stage);
+    const void* token_src = reinterpret_cast<const void*>(src.token_base + (current_token_id * HIDDEN_DIM));
+    cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
+                             token_dst, token_src, (uint32_t)token_bytes, mbar);
+    tx_bytes += (uint32_t)token_bytes;
+
+    if constexpr(FORWARD_DISPATCH) {
+      void* prob_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_prob_buffer(pipeline_rank, stage));
+      const void* prob_src = reinterpret_cast<const void*>(src.prob_base +
+          (current_token_id * (experts_per_rank * num_of_ranks_per_node * NUM_LSA_TEAMS)) +
+          (node_rank * (experts_per_rank * num_of_ranks_per_node)));
+      cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
+                               prob_dst, prob_src, (uint32_t)prob_bytes, mbar);
+      tx_bytes += (uint32_t)prob_bytes;
+    }
+    if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
+      void* sf_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage));
+      const void* sf_src = reinterpret_cast<const void*>(src.sf_base + current_token_id * sf_bytes_per_token);
+      cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
+                               sf_dst, sf_src, (uint32_t)sf_bytes_per_token, mbar);
+      tx_bytes += (uint32_t)sf_bytes_per_token;
+    }
+  }
+
+  cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
+                                       cuda::ptx::scope_cta,
+                                       cuda::ptx::space_shared,
+                                       mbar,
+                                       tx_bytes);
+}
+
 // Device function for intra-node G2S warp group for dispatch kernel.
 // With NUM_PIPELINES > 1, each warp within the group is an independent pipeline
 // processing disjoint chunks through its own partition of the shared memory FIFO.
@@ -1178,19 +1341,24 @@ __forceinline__ __device__ void G2S_warp_group_device_function(const int local_r
                                                       SMEM_TYPE* smem_buffer_ptr,
                                                       const int experts_per_rank)
 {
-  using rdma_to_attn_map_load_t = uint4;
+  using routing_loads_t = uint4;
+
   static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
-  static_assert(NUM_OF_TOKENS_PER_CHUNK % sizeof(rdma_to_attn_map_load_t) == 0, "NUM_OF_TOKENS_PER_CHUNK must be multiple of rdma_to_attn_map_load_t.");
-  static_assert(MAX_NUM_OF_TOKENS_PER_RANK % NUM_OF_TOKENS_PER_CHUNK == 0, "MAX_NUM_OF_TOKENS_PER_RANK must be multiple of NUM_OF_TOKENS_PER_CHUNK.");
-  constexpr int NUM_OF_ROUTING_INFO_LOAD_ITER_PER_CHUNK = NUM_OF_TOKENS_PER_CHUNK / sizeof(rdma_to_attn_map_load_t);
-  constexpr int NUM_OF_TOKENS_PER_LOAD_ITER = sizeof(rdma_to_attn_map_load_t) / sizeof(bool);
+  static_assert(NUM_OF_TOKENS_PER_CHUNK % sizeof(routing_loads_t) == 0,
+                "NUM_OF_TOKENS_PER_CHUNK must be multiple of routing_loads_t.");
+  static_assert(MAX_NUM_OF_TOKENS_PER_RANK % NUM_OF_TOKENS_PER_CHUNK == 0,
+                "MAX_NUM_OF_TOKENS_PER_RANK must be multiple of NUM_OF_TOKENS_PER_CHUNK.");
+
+  constexpr int TOKENS_PER_ROUTING_LOAD = sizeof(routing_loads_t) / sizeof(bool);
+  constexpr int ROUTING_LOADS_PER_CHUNK = NUM_OF_TOKENS_PER_CHUNK / TOKENS_PER_ROUTING_LOAD;
   constexpr int STAGES_PER_PIPELINE = NUM_OF_STAGES / NUM_PIPELINES;
 
   const int pipeline_rank = INTRA_NODE_G2S_GROUP::warp_rank();
   const int remainder_chunk_size = num_of_tokens_per_rank % NUM_OF_TOKENS_PER_CHUNK;
-  const int num_of_chunks_per_rank = ((num_of_tokens_per_rank - 1) / NUM_OF_TOKENS_PER_CHUNK) + 1;
-  const int max_num_of_chunks_per_rank = ((MAX_NUM_OF_TOKENS_PER_RANK - 1) / NUM_OF_TOKENS_PER_CHUNK) + 1;
-  const int rdma_to_attn_map_size_per_node = (((num_of_tokens_per_rank - 1) / 16) + 1) * 16;
+  const int num_of_chunks_per_rank = nccl_ep::ceil_div(num_of_tokens_per_rank, NUM_OF_TOKENS_PER_CHUNK);
+  const int max_num_of_chunks_per_rank = nccl_ep::ceil_div(MAX_NUM_OF_TOKENS_PER_RANK, NUM_OF_TOKENS_PER_CHUNK);
+  // TOKENS_PER_ROUTING_LOAD must match the producer's pad in scan_kernel.cuh
+  const int routing_map_node_stride = nccl_ep::align(num_of_tokens_per_rank, TOKENS_PER_ROUTING_LOAD);
   int stage = 0;
   uint32_t consumer_parity = 1;
   int tokens_produced = 0;
@@ -1200,141 +1368,58 @@ __forceinline__ __device__ void G2S_warp_group_device_function(const int local_r
     for(int i = blockIdx.x; i < num_of_chunks_per_rank; i += NUM_OF_BLOCKS){
       if ((chunk_iter++ % NUM_PIPELINES) != pipeline_rank) continue;
 
-      int num_of_routing_info_load_iter_for_current_chunk;
+      int routing_loads_in_chunk;
       int current_chunk_size;
       if(remainder_chunk_size != 0 && i == num_of_chunks_per_rank - 1){
-        num_of_routing_info_load_iter_for_current_chunk = ((remainder_chunk_size - 1) / sizeof(rdma_to_attn_map_load_t)) + 1;
+        routing_loads_in_chunk = nccl_ep::ceil_div(remainder_chunk_size, (int)sizeof(routing_loads_t));
         current_chunk_size = remainder_chunk_size;
       }else{
-        num_of_routing_info_load_iter_for_current_chunk = NUM_OF_ROUTING_INFO_LOAD_ITER_PER_CHUNK;
+        routing_loads_in_chunk = ROUTING_LOADS_PER_CHUNK;
         current_chunk_size = NUM_OF_TOKENS_PER_CHUNK;
       }
+
       for(int j = 0; j < NUM_LSA_TEAMS; j++){
-        int node_id = node_rank >= j ? node_rank - j : node_rank + NUM_LSA_TEAMS - j;
-        int rdma_buffer_tile_id = node_id > node_rank ? node_id - 1 : node_id;
-        if(node_id != node_rank){
-          constexpr int MAX_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
-          unsigned tail_signal_id = mr_info->signals_tail_base +
-                                     node_id * (NUM_LSA_TEAMS * num_of_ranks_per_node * MAX_CHUNKS_PER_RANK) +
-                                     node_rank * (num_of_ranks_per_node * MAX_CHUNKS_PER_RANK) +
-                                     local_rank * MAX_CHUNKS_PER_RANK +
-                                     i;
-          constexpr int N2N_WARPS = (NUM_LSA_TEAMS == 1) ? 1 : HYBRIDEP_DISPATCH_N2N_WARPS;
-          int sender_block_warp = i % (NUM_OF_BLOCKS * N2N_WARPS);
-          int signal_channel = sender_block_warp;
+        // Walk nodes backward from self around the ring (j=0 -> self, j>=1 -> remote)
+        int node_id = (node_rank + NUM_LSA_TEAMS - j) % NUM_LSA_TEAMS;
 
-          int comm_idx, ctx_idx;
-          get_comm_ctx(signal_channel, num_ctx_per_comm, comm_idx, ctx_idx);
-          ncclGin net(dcomms[comm_idx], ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
-          net.waitSignal(ncclCoopThread(), tail_signal_id, expected_flag_value);
-        }
-        const rdma_to_attn_map_load_t* rdma_to_attn_map_load_base_addr = reinterpret_cast<const rdma_to_attn_map_load_t*>(rdma_to_attn_map +
-                                                                         (node_id * rdma_to_attn_map_size_per_node + i * NUM_OF_TOKENS_PER_CHUNK));
-        const TOKEN_DATA_TYPE* token_load_base_addr = nullptr;
-        const float* prob_load_base_addr = nullptr;
-        const uint8_t* scaling_factor_load_base_addr = nullptr;
-        const uint8_t* packed_base = nullptr;
-        bool use_packed_layout = false;
+        g2s_source_t<TOKEN_DATA_TYPE> src =
+            dispatch_g2s_resolve_source<TOKEN_DATA_TYPE, NUM_LSA_TEAMS, MAX_NUM_OF_TOKENS_PER_RANK,
+                                        NUM_OF_TOKENS_PER_CHUNK, NUM_OF_BLOCKS, FORWARD_DISPATCH>(
+                node_id, node_rank, local_rank, i, num_of_ranks_per_node, expected_flag_value,
+                HIDDEN_DIM, sf_bytes_per_token, experts_per_rank,
+                attn_input_token, attn_input_prob, attn_input_token_scaling_factor,
+                dcomms, num_ctx_per_comm, gin_base_ptr, mr_info);
 
-        if (node_id != node_rank) {
-          use_packed_layout = true;
-          packed_base = reinterpret_cast<const uint8_t*>(gin_base_ptr) +
-                        mr_info->rdma_inter_node_group_packed_offset +
-                        rdma_buffer_tile_id * mr_info->max_tokens_per_dest * mr_info->bytes_per_entry +
-                        static_cast<size_t>(i * NUM_OF_TOKENS_PER_CHUNK) * mr_info->bytes_per_entry;
-        } else {
-          int chunk_first_token_id = i * NUM_OF_TOKENS_PER_CHUNK;
-          token_load_base_addr = attn_input_token + chunk_first_token_id * HIDDEN_DIM;
-          if constexpr(FORWARD_DISPATCH) {
-            prob_load_base_addr = attn_input_prob + chunk_first_token_id * (experts_per_rank * num_of_ranks_per_node * NUM_LSA_TEAMS);
-          }
-          if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
-            scaling_factor_load_base_addr = attn_input_token_scaling_factor + chunk_first_token_id * sf_bytes_per_token;
-          }
-        }
+        const routing_loads_t* routing_map_ptr = reinterpret_cast<const routing_loads_t*>(rdma_to_attn_map +
+                                                                         (node_id * routing_map_node_stride) +
+                                                                         (i * NUM_OF_TOKENS_PER_CHUNK));
+
         int packed_dense_idx = 0;
-        for (int k = 0; k < num_of_routing_info_load_iter_for_current_chunk; k++) {
-          rdma_to_attn_map_load_t rdma_to_attn_map_data = rdma_to_attn_map_load_base_addr[k];
+        for (int k = 0; k < routing_loads_in_chunk; k++) {
+          routing_loads_t routing_flags = routing_map_ptr[k];
+
           #pragma unroll
-          for (int n = 0; n < NUM_OF_TOKENS_PER_LOAD_ITER; n++){
-            int current_token_id = k * NUM_OF_TOKENS_PER_LOAD_ITER + n;
+          for (int n = 0; n < TOKENS_PER_ROUTING_LOAD; n++){
+            int current_token_id = k * TOKENS_PER_ROUTING_LOAD + n;
             if (current_token_id >= current_chunk_size){
               break;
             }
-            bool token_needed_by_this_node = *(reinterpret_cast<bool*>(&rdma_to_attn_map_data) + n);
-            if (token_needed_by_this_node){
+
+            bool token_needed = *(reinterpret_cast<bool*>(&routing_flags) + n);
+            if (token_needed){
               if (tokens_produced >= STAGES_PER_PIPELINE){
-                while(!cuda::ptx::mbarrier_try_wait_parity(smem_buffer_ptr->get_intra_node_mbarrier_consumer(pipeline_rank, stage), consumer_parity)){}
+                uint64_t* mbar = smem_buffer_ptr->get_intra_node_mbarrier_consumer(pipeline_rank, stage);
+                while(!cuda::ptx::mbarrier_try_wait_parity(mbar, consumer_parity)){}
               }
-              uint32_t total_tx_size = 0;
-              size_t token_bytes = HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE);
-              size_t prob_bytes = (experts_per_rank * num_of_ranks_per_node) * sizeof(float);
-
-              if (use_packed_layout) {
-                const uint8_t* packed_entry = packed_base + packed_dense_idx * mr_info->bytes_per_entry;
-                cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
-                                         cuda::ptx::space_global,
-                                         smem_buffer_ptr->get_token_buffer(pipeline_rank, stage),
-                                         reinterpret_cast<const void*>(packed_entry),
-                                         (uint32_t)token_bytes,
-                                         smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage));
-                total_tx_size += (uint32_t)token_bytes;
-                if constexpr(FORWARD_DISPATCH) {
-                  cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
-                                           cuda::ptx::space_global,
-                                           reinterpret_cast<void*>(smem_buffer_ptr->get_prob_buffer(pipeline_rank, stage)),
-                                           reinterpret_cast<const void*>(packed_entry + token_bytes),
-                                           (uint32_t)prob_bytes,
-                                           smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage));
-                  total_tx_size += (uint32_t)prob_bytes;
-                }
-                if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
-                  size_t sf_offset_in_entry = token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
-                  cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
-                                           cuda::ptx::space_global,
-                                           reinterpret_cast<void*>(smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage)),
-                                           reinterpret_cast<const void*>(packed_entry + sf_offset_in_entry),
-                                           (uint32_t)sf_bytes_per_token,
-                                           smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage));
-                  total_tx_size += (uint32_t)sf_bytes_per_token;
-                }
+              
+              dispatch_g2s_issue_token<TOKEN_DATA_TYPE, SMEM_TYPE, NUM_LSA_TEAMS, FORWARD_DISPATCH>(
+                  src, current_token_id, packed_dense_idx, smem_buffer_ptr, pipeline_rank, stage,
+                  HIDDEN_DIM, sf_bytes_per_token, experts_per_rank, num_of_ranks_per_node, node_rank, mr_info);
+              
+              if (src.use_packed) {
                 packed_dense_idx++;
-              } else {
-                cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
-                                         cuda::ptx::space_global,
-                                         smem_buffer_ptr->get_token_buffer(pipeline_rank, stage),
-                                         reinterpret_cast<const void*>(token_load_base_addr + (current_token_id * HIDDEN_DIM)),
-                                         (uint32_t)token_bytes,
-                                         smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage));
-                total_tx_size += (uint32_t)token_bytes;
-                if constexpr(FORWARD_DISPATCH) {
-                  const float* prob_load_token_addr = prob_load_base_addr +
-                      (current_token_id * (experts_per_rank * num_of_ranks_per_node * NUM_LSA_TEAMS)) +
-                      (node_rank * (experts_per_rank * num_of_ranks_per_node));
-                  cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
-                                           cuda::ptx::space_global,
-                                           reinterpret_cast<void*>(smem_buffer_ptr->get_prob_buffer(pipeline_rank, stage)),
-                                           reinterpret_cast<const void*>(prob_load_token_addr),
-                                           (uint32_t)prob_bytes,
-                                           smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage));
-                  total_tx_size += (uint32_t)prob_bytes;
-                }
-                if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
-                  cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
-                                           cuda::ptx::space_global,
-                                           reinterpret_cast<void*>(smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage)),
-                                           reinterpret_cast<const void*>(scaling_factor_load_base_addr + current_token_id * sf_bytes_per_token),
-                                           (uint32_t)sf_bytes_per_token,
-                                           smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage));
-                  total_tx_size += (uint32_t)sf_bytes_per_token;
-                }
               }
-
-              cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
-                                                   cuda::ptx::scope_cta,
-                                                   cuda::ptx::space_shared,
-                                                   smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage),
-                                                   total_tx_size);
+              
               tokens_produced += 1;
               stage += 1;
               if (stage == STAGES_PER_PIPELINE) {
@@ -1350,8 +1435,11 @@ __forceinline__ __device__ void G2S_warp_group_device_function(const int local_r
   // Update residue flags (only pipeline 0 does this to avoid duplicate writes).
   if (INTRA_NODE_G2S_GROUP::warp_rank() == 0) {
     int residue_flag_count = max_num_of_chunks_per_rank - num_of_chunks_per_rank;
+
     for (int node_id = blockIdx.x; node_id < NUM_LSA_TEAMS - 1; node_id += gridDim.x) {
-      uint64_t *residue_flag_base_ptr = rdma_inter_node_group_flags + (node_id * max_num_of_chunks_per_rank + num_of_chunks_per_rank);
+      uint64_t *residue_flag_base_ptr = rdma_inter_node_group_flags +
+                                        (node_id * max_num_of_chunks_per_rank) +
+                                        num_of_chunks_per_rank;
       if (INTRA_NODE_G2S_GROUP::thread_rank() < residue_flag_count) {
         residue_flag_base_ptr[INTRA_NODE_G2S_GROUP::thread_rank()] = expected_flag_value;
       }

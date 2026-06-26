@@ -432,6 +432,10 @@ struct ncclEpGroup {
     size_t rdma_buffer_size_alloc;
     ncclEpGroupConfig_t config;         // Stored configuration
 
+    // HT inter-node RDMA stride: max_dispatch_tokens_per_rank rounded up to a whole
+    // number of dispatch chunks so a partial final chunk stays within a node's region.
+    int ht_aligned_max_tokens = 0;
+
     struct {
         // Device communicator (single comm, multiple contexts)
         // HT internode uses ncclTeamRail on the base communicator
@@ -1050,7 +1054,11 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
         return (sz + alignment - 1) & ~(alignment - 1);
     };
 
-    const int ht_max_tokens = ep_group->config.max_dispatch_tokens_per_rank;
+    // Chunk-aligned stride for the inter-node RDMA buffers; cached on the group for
+    // the dispatch/combine kernels, which must use the same stride.
+    const int ht_max_tokens = ((ep_group->config.max_dispatch_tokens_per_rank + HT_OF_NUM_TOKENS_PER_CHUNK - 1)
+                               / HT_OF_NUM_TOKENS_PER_CHUNK) * HT_OF_NUM_TOKENS_PER_CHUNK;
+    ep_group->ht_aligned_max_tokens = ht_max_tokens;
     size_t rdma_intra_node_red_token_sz = align_size(static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * ep_group->config.max_token_bytes, GIN_ALIGNMENT);
     size_t combine_rdma_inter_node_group_token_sz = rdma_intra_node_red_token_sz;
     size_t rdma_intra_node_red_prob_sz = align_size(static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * (ep_group->num_local_experts * lsa_team_size) * sizeof(float), GIN_ALIGNMENT);
@@ -1348,12 +1356,8 @@ ncclResult_t ncclEpCreateGroup(
             "ncclEpCreateGroup: max_dispatch_tokens_per_rank must be greater than 0 for low latency mode");
     assert(!(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && in_config->max_dispatch_tokens_per_rank == 0) &&
              "ncclEpCreateGroup: max_dispatch_tokens_per_rank must be set for HT backend");
-    if (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
-        in_config->max_dispatch_tokens_per_rank % HT_OF_NUM_TOKENS_PER_CHUNK != 0) {
-        fprintf(stderr, "ncclEpCreateGroup: HT max_dispatch_tokens_per_rank (%d) must be a multiple of %d\n",
-                in_config->max_dispatch_tokens_per_rank, HT_OF_NUM_TOKENS_PER_CHUNK);
-        return ncclInvalidUsage;
-    }
+    // HT max_dispatch_tokens_per_rank need not be a chunk multiple; the inter-node
+    // stride is chunk-aligned internally (ep_group->ht_aligned_max_tokens).
     // Create teams: LSA and Rail
     ncclTeam lsa_team = ncclTeamLsa(comm);
     ncclTeam rail_team = ncclTeamRail(comm);
@@ -3276,7 +3280,7 @@ ncclResult_t ncclEpDispatch(
         const int sf_bytes_per_token = use_fp8 ? num_scales_per_token * scale_elem_bytes : 0;
         nccl_ep::hybridep::call_dispatch(
             params,
-            group->config.max_dispatch_tokens_per_rank,
+            group->ht_aligned_max_tokens,
             group->rdma_team_size,
             use_fp8,
             forward_dispatch,
@@ -3983,7 +3987,7 @@ ncclResult_t ncclEpCombine(
         /* ===== Call combine kernel ===== */
         nccl_ep::hybridep::call_combine(
             params,
-            group->config.max_dispatch_tokens_per_rank, // max_dispatch_tokens_per_rank
+            group->ht_aligned_max_tokens, // chunk-aligned stride
             group->rdma_team_size, // num_nodes (RDMA domain size)
             backward_combine, // backward mode flag
             static_cast<int>(group->max_num_sms),

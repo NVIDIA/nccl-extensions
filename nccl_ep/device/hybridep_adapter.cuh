@@ -326,15 +326,13 @@ struct DispatchParams {
     uint32_t* dispatch_grid_barrier_counter;
 
     // GIN context (from ep_group, multi-node only)
-    ncclDevComm_t* dcomms;              // Device communicators array
+    ncclDevComm dcomm;                  // Device communicator (single comm, by value)
     ncclWindow_t nccl_token_window;     // Source window handle for token data
     ncclWindow_t nccl_prob_window;      // Registered window handle for probability data
     ncclWindow_t nccl_sf_window;        // Registered window handle for scaling-factor data
     ncclWindow_t nccl_internal_window;  // Internal destination window handle
-    int num_gin_comms;                  // Number of GIN communicators
     int num_ctx_per_comm;               // Number of contexts per communicator
     void* gin_base_ptr;                 // Base pointer for offset calculations
-    unsigned signals_base;              // Base signal ID
     dispatch_memory_region_info_t mr_info;
 
     // Runtime config

@@ -3301,15 +3301,14 @@ ncclResult_t ncclEpDispatch(
         params.intra_node_write_completion_flags = group->ht_buffers.intra_node_write_completion_flags;
         params.dispatch_grid_barrier_counter = group->ht_buffers.dispatch_grid_barrier_counter;
         // Pass device communicators and windows
-        params.dcomms = is_single_node ? nullptr : group->gin_config.d_dcomms;
+        //TODO: remove multiple gin comm notion from group
+        params.dcomm = is_single_node ? ncclDevComm{} : group->gin_config.dcomms[0];
         params.nccl_token_window = x->win_hdl;
         params.nccl_prob_window = forward_dispatch ? group->gin_config.nccl_window : ncclWindow_t{};
         params.nccl_sf_window = use_fp8 ? scales->win_hdl : ncclWindow_t{};
         params.nccl_internal_window = group->gin_config.nccl_window;
-        params.num_gin_comms = is_single_node ? 0 : group->gin_config.num_comms;
         params.num_ctx_per_comm = is_single_node ? 0 : group->gin_config.num_ctx_per_comm;
         params.gin_base_ptr = is_single_node ? nullptr : group->gin_config.gin_base_ptr;
-        params.signals_base = group->gin_config.signals_base;
         // Use offsets relative to gin_base_ptr
         // All buffers are part of one large registered window
         // Calculate bytes_per_entry for batched staging

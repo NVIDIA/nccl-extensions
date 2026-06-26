@@ -870,15 +870,13 @@ struct dispatch_kernel_param_base_t {
   // The number of token output by attn layer on a rank/GPU.
   int num_of_tokens_per_rank;
   // NCCL GIN context
-  ncclDevComm_t* dcomms;             // Device communicators array (1 element, on device)
+  ncclDevComm dcomm;                 // Device communicator
   ncclWindow_t token_window;         // Source window handle for token data
   ncclWindow_t prob_window;          // Source window handle for probability data
   ncclWindow_t sf_window;            // Source window handle for scaling-factor data
   ncclWindow_t dest_window;          // Destination window handle
-  int num_gin_comms;                 // Number of GIN communicators (1)
   int num_ctx_per_comm;              // Number of contexts per communicator
   void* gin_base_ptr;                // Base pointer for offset calculations
-  unsigned signals_base;             // Base signal ID
   // Memory Region info
   struct dispatch_memory_region_info_t mr_info;
   // Grid barrier counter for fused device_sync in dispatch tail (per-rank, not IPC-shared)
@@ -1028,15 +1026,12 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
                                                       const int num_of_tokens_per_rank,
                                                       const int num_of_ranks_per_node,
                                                       const bool *attn_to_rdma_map,
-                                                      ncclDevComm_t* dcomms,
+                                                      const ncclDevComm& dcomm,
                                                       ncclWindow_t nccl_token_window,
                                                       ncclWindow_t nccl_prob_window,
                                                       ncclWindow_t nccl_sf_window,
                                                       ncclWindow_t nccl_internal_window,
-                                                      int num_gin_comms,
                                                       int num_ctx_per_comm,
-                                                      void* gin_base_ptr,
-                                                      unsigned signals_base,
                                                       const struct dispatch_memory_region_info_t *mr_info,
                                                       SMEM_TYPE* smem_buffer_ptr,
                                                       const int HIDDEN_DIM,
@@ -1066,13 +1061,12 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
   size_t prob_bytes = (experts_per_rank * num_of_ranks_per_node) * sizeof(float);
   constexpr int MAX_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
 
-  // GIN device side setup
-  int comm_idx, ctx_idx;
+  // GIN device side setup. Single communicator; ctx_idx spreads QP traffic.
   int global_channel = blockIdx.x * N2N_WARPS + n2n_warp_id;
-  get_comm_ctx(global_channel, num_ctx_per_comm, comm_idx, ctx_idx);
+  int ctx_idx = global_channel % num_ctx_per_comm;
 
-  ncclGin net(dcomms[comm_idx], ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
-  ncclTeam rail = ncclTeamRail(dcomms[comm_idx]);
+  ncclGin net(dcomm, ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
+  ncclTeam rail = ncclTeamRail(dcomm);
 
   for (int chunk_idx = blockIdx.x * N2N_WARPS + n2n_warp_id;
        chunk_idx < MAX_CHUNKS_PER_RANK;
@@ -1181,7 +1175,7 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     const TOKEN_DATA_TYPE* attn_input_token,
     const float* attn_input_prob,
     const uint8_t* attn_input_token_scaling_factor,
-    ncclDevComm_t* dcomms,
+    const ncclDevComm& dcomm,
     int num_ctx_per_comm,
     void* gin_base_ptr,
     const struct dispatch_memory_region_info_t* mr_info)
@@ -1204,9 +1198,8 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     constexpr int N2N_WARPS = (NUM_LSA_TEAMS == 1) ? 1 : HYBRIDEP_DISPATCH_N2N_WARPS;
     int signal_channel = chunk_idx % (NUM_OF_BLOCKS * N2N_WARPS);
 
-    int comm_idx, ctx_idx;
-    get_comm_ctx(signal_channel, num_ctx_per_comm, comm_idx, ctx_idx);
-    ncclGin net(dcomms[comm_idx], ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
+    int ctx_idx = signal_channel % num_ctx_per_comm;
+    ncclGin net(dcomm, ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
     net.waitSignal(ncclCoopThread(), tail_signal_id, expected_flag_value);
 
     const int tile_id = node_id > node_rank ? node_id - 1 : node_id;
@@ -1355,9 +1348,7 @@ __forceinline__ __device__ void G2S_warp_group_device_function(const int local_r
                                                       const float* attn_input_prob,
                                                       const uint8_t* attn_input_token_scaling_factor,
                                                       uint64_t* rdma_inter_node_group_flags,
-                                                      ncclDevComm_t* dcomms,
-                                                      unsigned signals_base,
-                                                      int num_gin_comms,
+                                                      const ncclDevComm& dcomm,
                                                       int num_ctx_per_comm,
                                                       void* gin_base_ptr,
                                                       const struct dispatch_memory_region_info_t* mr_info,
@@ -1411,7 +1402,7 @@ __forceinline__ __device__ void G2S_warp_group_device_function(const int local_r
                 node_id, node_rank, local_rank, i, num_of_ranks_per_node, expected_flag_value,
                 HIDDEN_DIM, sf_bytes_per_token, experts_per_rank,
                 attn_input_token, attn_input_prob, attn_input_token_scaling_factor,
-                dcomms, num_ctx_per_comm, gin_base_ptr, mr_info);
+                dcomm, num_ctx_per_comm, gin_base_ptr, mr_info);
 
         const routing_loads_t* routing_map_ptr = reinterpret_cast<const routing_loads_t*>(rdma_to_attn_map +
                                                                          (node_id * routing_map_node_stride) +
@@ -1743,8 +1734,7 @@ __forceinline__ __device__ void S2G_warp_group_device_function(const int local_r
             }
             bool token_needed = *(reinterpret_cast<bool*>(&routing_flags) + n);
             if (token_needed){
-              const int token_smem_idx = k * TOKENS_PER_ROUTING_LOAD + n;
-              const int32_t* s2d_smem_row = smem_buffer_ptr->get_s2d_map_buffer(pipeline_rank, sparse_to_dense_map_stage, token_smem_idx);
+              const int32_t* s2d_smem_row = smem_buffer_ptr->get_s2d_map_buffer(pipeline_rank, sparse_to_dense_map_stage, current_token_id);
               while (!cuda::ptx::mbarrier_try_wait_parity(smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage), producer_parity)){}
 
               // Per-entry parallel issue: lane handles flat_idx=lane,lane+32,...
@@ -3536,8 +3526,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
       N2N_warp_group_device_function
       <INTER_NODE_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, FORWARD_DISPATCH>
       (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.attn_to_rdma_map,
-       param.dcomms, param.token_window, param.prob_window, param.sf_window, param.dest_window,
-       param.num_gin_comms, param.num_ctx_per_comm, param.gin_base_ptr, param.signals_base,
+       param.dcomm, param.token_window, param.prob_window, param.sf_window, param.dest_window,
+       param.num_ctx_per_comm,
        &param.mr_info, smem_buffer_ptr, HIDDEN_DIM, SF_BYTES_PER_TOKEN, param.experts_per_rank);
     }
   } else if (threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size()){
@@ -3546,7 +3536,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
      MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, FORWARD_DISPATCH, NUM_PIPELINES>
     (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, *param.expected_rdma_flag_value, HIDDEN_DIM, SF_BYTES_PER_TOKEN, param.rdma_to_attn_map, param.attn_input_token,
     param.attn_input_prob, param.attn_input_token_scaling_factor,
-    param.rdma_inter_node_group_flags, param.dcomms, param.signals_base, param.num_gin_comms, param.num_ctx_per_comm,
+    param.rdma_inter_node_group_flags, param.dcomm, param.num_ctx_per_comm,
     param.gin_base_ptr, &param.mr_info, smem_buffer_ptr, param.experts_per_rank);
   } else if (threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTRA_NODE_S2G_GROUP::size()){
     S2G_warp_group_device_function

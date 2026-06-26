@@ -1018,15 +1018,13 @@ build_dispatch_param_base(const DispatchParams& params) {
     kp.local_dup_enabled = (params.local_dup_num_sms > 0);
 
     // Pass device communicators and windows
-    kp.dcomms = params.dcomms;
+    kp.dcomm = params.dcomm;
     kp.token_window = params.nccl_token_window;
     kp.prob_window = params.nccl_prob_window;
     kp.sf_window = params.nccl_sf_window;
     kp.dest_window = params.nccl_internal_window;
-    kp.num_gin_comms = params.num_gin_comms;
     kp.num_ctx_per_comm = params.num_ctx_per_comm;
     kp.gin_base_ptr = params.gin_base_ptr;
-    kp.signals_base = params.signals_base;
     // Use offsets relative to gin_base_ptr
     kp.mr_info = {
                .attn_input_token_offset = params.mr_info.attn_input_token_offset,

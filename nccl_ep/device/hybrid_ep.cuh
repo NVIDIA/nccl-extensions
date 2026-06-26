@@ -1058,6 +1058,7 @@ struct g2s_source_t {
 // waiting on the RDMA arrival signal) or strided-local token/prob/sf bases.
 template<typename TOKEN_DATA_TYPE,
          int NUM_LSA_TEAMS,
+         int LSA_TEAM_SIZE,
          int MAX_NUM_OF_TOKENS_PER_RANK,
          int NUM_OF_TOKENS_PER_CHUNK,
          int NUM_OF_BLOCKS,
@@ -1070,7 +1071,6 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     const int node_rank,
     const int local_rank,
     const int chunk_idx,
-    const int num_of_ranks_per_node,
     const uint64_t expected_flag_value,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
@@ -1092,7 +1092,7 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     constexpr int MAX_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
     unsigned tail_signal_id = dispatch_tail_signal_id(
         mr_info->signals_tail_base, node_id, node_rank, local_rank,
-        chunk_idx, NUM_LSA_TEAMS, num_of_ranks_per_node, MAX_CHUNKS_PER_RANK);
+        chunk_idx, NUM_LSA_TEAMS, LSA_TEAM_SIZE, MAX_CHUNKS_PER_RANK);
     constexpr int N2N_WARPS = (NUM_LSA_TEAMS == 1) ? 1 : HYBRIDEP_DISPATCH_N2N_WARPS;
     int signal_channel = chunk_idx % (NUM_OF_BLOCKS * N2N_WARPS);
 
@@ -1112,7 +1112,7 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     src.token_base = attn_input_token + chunk_first_token * HIDDEN_DIM;
     if constexpr(FORWARD_DISPATCH) {
       // attn_input_prob is laid out per token as NUM_LSA_TEAMS blocks of experts_per_node floats.
-      const int experts_per_node = experts_per_rank * num_of_ranks_per_node;
+      const int experts_per_node = experts_per_rank * LSA_TEAM_SIZE;
       const int prob_row_stride = experts_per_node * NUM_LSA_TEAMS;
       src.prob_base = attn_input_prob + chunk_first_token * prob_row_stride;
     }
@@ -1167,6 +1167,7 @@ __forceinline__ __device__ uint32_t copy_token_bundle(
 template<typename TOKEN_DATA_TYPE,
          typename SMEM_TYPE,
          int NUM_LSA_TEAMS,
+         int LSA_TEAM_SIZE,
          bool FORWARD_DISPATCH>
 __forceinline__ __device__ void dispatch_g2s_issue_token(
     const g2s_source_t<TOKEN_DATA_TYPE>& src,
@@ -1178,13 +1179,12 @@ __forceinline__ __device__ void dispatch_g2s_issue_token(
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
     const int experts_per_rank,
-    const int num_of_ranks_per_node,
     const int node_rank,
     const struct dispatch_memory_region_info_t* mr_info)
 {
   uint64_t* mbar = smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage);
   const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE));
-  const uint32_t prob_bytes = (uint32_t)((experts_per_rank * num_of_ranks_per_node) * sizeof(float));
+  const uint32_t prob_bytes = (uint32_t)((experts_per_rank * LSA_TEAM_SIZE) * sizeof(float));
   const uint32_t sf_bytes = (uint32_t)sf_bytes_per_token;
   uint32_t tx_bytes;
 
@@ -1204,7 +1204,7 @@ __forceinline__ __device__ void dispatch_g2s_issue_token(
     const void* sf_src = nullptr;
     if constexpr(FORWARD_DISPATCH) {
       // Advance by whole token rows, then pick this node's expert slice within the row.
-      const int experts_per_node = experts_per_rank * num_of_ranks_per_node;
+      const int experts_per_node = experts_per_rank * LSA_TEAM_SIZE;
       const int prob_row_stride = experts_per_node * NUM_LSA_TEAMS;
       prob_src = src.prob_base + current_token_id * prob_row_stride + node_rank * experts_per_node;
     }
@@ -1307,6 +1307,7 @@ __forceinline__ __device__ s2g_dest_t dispatch_s2g_resolve_dest(
 // SMEM buffers to one resolved remote destination.
 template<typename TOKEN_DATA_TYPE,
          typename SMEM_TYPE,
+         int LSA_TEAM_SIZE,
          bool FORWARD_DISPATCH>
 __forceinline__ __device__ void dispatch_s2g_issue_token(
     const s2g_dest_t& dst,
@@ -1318,11 +1319,10 @@ __forceinline__ __device__ void dispatch_s2g_issue_token(
     const int stage,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
-    const int experts_per_rank,
-    const int num_of_ranks_per_node)
+    const int experts_per_rank)
 {
   const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE));
-  const uint32_t prob_bytes = (uint32_t)((experts_per_rank * num_of_ranks_per_node) * sizeof(float));
+  const uint32_t prob_bytes = (uint32_t)((experts_per_rank * LSA_TEAM_SIZE) * sizeof(float));
   const uint32_t sf_bytes = (uint32_t)sf_bytes_per_token;
 
   // Remote fan-out: each field has its own output array, indexed [rank]+slot*stride.
@@ -1330,7 +1330,7 @@ __forceinline__ __device__ void dispatch_s2g_issue_token(
   const void* prob_dst = nullptr;
   const void* sf_dst = nullptr;
   if constexpr(FORWARD_DISPATCH) {
-    prob_dst = remote_expert_output_prob[dst.remote_rank_id] + (dst.output_buffer_index * (experts_per_rank * num_of_ranks_per_node));
+    prob_dst = remote_expert_output_prob[dst.remote_rank_id] + (dst.output_buffer_index * (experts_per_rank * LSA_TEAM_SIZE));
   }
   if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
     sf_dst = remote_expert_output_scaling_factor[dst.remote_rank_id] + dst.output_buffer_index * sf_bytes_per_token;
@@ -1348,6 +1348,7 @@ template<typename INTER_NODE_GROUP,
          int NUM_OF_TOKENS_PER_CHUNK,
          int MAX_NUM_OF_TOKENS_PER_RANK,
          int NUM_LSA_TEAMS,
+         int LSA_TEAM_SIZE,
          int NUM_OF_BLOCKS,
          bool FORWARD_DISPATCH>
 __forceinline__ __device__ void dispatch_N2N(
@@ -1357,7 +1358,6 @@ __forceinline__ __device__ void dispatch_N2N(
     const int local_rank,
     const int node_rank,
     const int num_of_tokens_per_rank,
-    const int num_of_ranks_per_node,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
     const int experts_per_rank,
@@ -1390,7 +1390,7 @@ __forceinline__ __device__ void dispatch_N2N(
   constexpr int N2N_WARPS = INTER_NODE_GROUP::size() / 32;
   int n2n_warp_id = INTER_NODE_GROUP::thread_rank() / 32;
   size_t token_bytes = HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE);
-  size_t prob_bytes = (experts_per_rank * num_of_ranks_per_node) * sizeof(float);
+  size_t prob_bytes = (experts_per_rank * LSA_TEAM_SIZE) * sizeof(float);
   constexpr int MAX_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
   constexpr int NUM_REMOTE_NODES = NUM_LSA_TEAMS - 1;
 
@@ -1460,7 +1460,7 @@ __forceinline__ __device__ void dispatch_N2N(
       // remote before this signal arrives.
       unsigned tail_signal_id = dispatch_tail_signal_id(
           smem_mr_info_ptr->signals_tail_base, node_rank, remote_node_id, local_rank,
-          chunk_idx, NUM_LSA_TEAMS, num_of_ranks_per_node, MAX_CHUNKS_PER_RANK);
+          chunk_idx, NUM_LSA_TEAMS, LSA_TEAM_SIZE, MAX_CHUNKS_PER_RANK);
       net.signal(rail, remote_node_id,
                   ncclGin_SignalAdd{tail_signal_id, 1},
                   ncclCoopWarp(),
@@ -1483,10 +1483,10 @@ template<typename INTRA_NODE_S2G_GROUP,
          int NUM_OF_IN_FLIGHT_S2G,
          int NUM_OF_TOKENS_PER_CHUNK,
          int NUM_LSA_TEAMS,
-         int NUM_OF_BLOCKS,
-         bool FORWARD_DISPATCH,
-         int NUM_PIPELINES,
          int LSA_TEAM_SIZE,
+         int NUM_OF_BLOCKS,
+         int NUM_PIPELINES,
+         bool FORWARD_DISPATCH,
          ncclEpLayout_t kLayout>
 __forceinline__ __device__ void dispatch_S2G(
     // INPUT
@@ -1499,7 +1499,6 @@ __forceinline__ __device__ void dispatch_S2G(
     // CONFIG
     const int node_rank,
     const int num_of_tokens_per_rank,
-    const int num_of_ranks_per_node,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
     const int experts_per_rank,
@@ -1640,11 +1639,11 @@ __forceinline__ __device__ void dispatch_S2G(
               for (int flat_idx = s2g_lane; flat_idx < s2d_inner_dim; flat_idx += 32){
                   s2g_dest_t dst = dispatch_s2g_resolve_dest<kLayout>(s2d_smem_row, flat_idx, local_dup_enabled);
                   if (dst.issue) {
-                    dispatch_s2g_issue_token<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH>(
+                    dispatch_s2g_issue_token<TOKEN_DATA_TYPE, SMEM_TYPE, LSA_TEAM_SIZE, FORWARD_DISPATCH>(
                         dst, smem_buffer_ptr,
                         remote_expert_output_token, remote_expert_output_prob, remote_expert_output_scaling_factor,
                         pipeline_rank, stage, HIDDEN_DIM, sf_bytes_per_token,
-                        experts_per_rank, num_of_ranks_per_node);
+                        experts_per_rank);
                   }
               }
               // S1: only issuing lanes commit/wait — idle lanes skip the empty pair.
@@ -1687,9 +1686,10 @@ template<typename INTRA_NODE_G2S_GROUP,
          int NUM_OF_TOKENS_PER_CHUNK,
          int MAX_NUM_OF_TOKENS_PER_RANK,
          int NUM_LSA_TEAMS,
+         int LSA_TEAM_SIZE,
          int NUM_OF_BLOCKS,
-         bool FORWARD_DISPATCH,
-         int NUM_PIPELINES>
+         int NUM_PIPELINES,
+         bool FORWARD_DISPATCH>
 __forceinline__ __device__ void dispatch_G2S(
     // INPUT
     const bool* rdma_to_attn_map,
@@ -1702,7 +1702,6 @@ __forceinline__ __device__ void dispatch_G2S(
     const int local_rank,
     const int node_rank,
     const int num_of_tokens_per_rank,
-    const int num_of_ranks_per_node,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
     const int experts_per_rank,
@@ -1755,10 +1754,10 @@ __forceinline__ __device__ void dispatch_G2S(
         int node_id = (node_rank + NUM_LSA_TEAMS - j) % NUM_LSA_TEAMS;
 
         g2s_source_t<TOKEN_DATA_TYPE> src =
-            dispatch_g2s_resolve_source<TOKEN_DATA_TYPE, NUM_LSA_TEAMS, MAX_NUM_OF_TOKENS_PER_RANK,
+            dispatch_g2s_resolve_source<TOKEN_DATA_TYPE, NUM_LSA_TEAMS, LSA_TEAM_SIZE, MAX_NUM_OF_TOKENS_PER_RANK,
                                         NUM_OF_TOKENS_PER_CHUNK, NUM_OF_BLOCKS, FORWARD_DISPATCH>(
                 attn_input_token, attn_input_prob, attn_input_token_scaling_factor,
-                node_id, node_rank, local_rank, chunk_idx, num_of_ranks_per_node, expected_flag_value,
+                node_id, node_rank, local_rank, chunk_idx, expected_flag_value,
                 HIDDEN_DIM, sf_bytes_per_token, experts_per_rank,
                 dcomm, num_ctx_per_comm, gin_base_ptr, mr_info);
 
@@ -1784,9 +1783,9 @@ __forceinline__ __device__ void dispatch_G2S(
                 mbarrier_wait(mbar, consumer_parity);
               }
 
-              dispatch_g2s_issue_token<TOKEN_DATA_TYPE, SMEM_TYPE, NUM_LSA_TEAMS, FORWARD_DISPATCH>(
+              dispatch_g2s_issue_token<TOKEN_DATA_TYPE, SMEM_TYPE, NUM_LSA_TEAMS, LSA_TEAM_SIZE, FORWARD_DISPATCH>(
                   src, current_token_id, packed_dense_idx, smem_buffer_ptr, pipeline_rank, stage,
-                  HIDDEN_DIM, sf_bytes_per_token, experts_per_rank, num_of_ranks_per_node, node_rank, mr_info);
+                  HIDDEN_DIM, sf_bytes_per_token, experts_per_rank, node_rank, mr_info);
 
               if (src.use_packed) {
                 packed_dense_idx++;
@@ -3552,10 +3551,10 @@ __device__ __forceinline__ void dispatch_kernel_impl(
   if(threadIdx_x_int < INTER_NODE_GROUP::size()){
     if constexpr(NUM_LSA_TEAMS != 1){
       dispatch_N2N
-      <INTER_NODE_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, FORWARD_DISPATCH>
+      <INTER_NODE_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, LSA_TEAM_SIZE, NUM_OF_BLOCKS, FORWARD_DISPATCH>
       (param.attn_to_rdma_map,
        param.local_rank, param.node_rank,
-       param.num_of_tokens_per_rank, param.num_of_ranks_per_node,
+       param.num_of_tokens_per_rank,
        HIDDEN_DIM, SF_BYTES_PER_TOKEN, param.experts_per_rank,
        param.dcomm, param.num_ctx_per_comm,
        param.token_window, param.prob_window, param.sf_window, param.dest_window,
@@ -3565,23 +3564,23 @@ __device__ __forceinline__ void dispatch_kernel_impl(
   } else if (threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size()){
     dispatch_G2S
     <INTRA_NODE_G2S_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_TOKENS_PER_CHUNK,
-     MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, FORWARD_DISPATCH, NUM_PIPELINES>
+     MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, LSA_TEAM_SIZE, NUM_OF_BLOCKS, NUM_PIPELINES, FORWARD_DISPATCH>
     (param.rdma_to_attn_map,
      param.attn_input_token, param.attn_input_prob, param.attn_input_token_scaling_factor,
      param.rdma_inter_node_group_flags,
      param.local_rank, param.node_rank,
-     param.num_of_tokens_per_rank, param.num_of_ranks_per_node,
+     param.num_of_tokens_per_rank,
      HIDDEN_DIM, SF_BYTES_PER_TOKEN, param.experts_per_rank,
      *param.expected_rdma_flag_value,
      param.dcomm, param.num_ctx_per_comm, param.gin_base_ptr, &param.mr_info,
      smem_buffer_ptr);
   } else if (threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTRA_NODE_S2G_GROUP::size()){
     dispatch_S2G
-    <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_TOKENS_PER_CHUNK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, FORWARD_DISPATCH, NUM_PIPELINES, LSA_TEAM_SIZE, kLayout>
+    <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_TOKENS_PER_CHUNK, NUM_LSA_TEAMS, LSA_TEAM_SIZE, NUM_OF_BLOCKS, NUM_PIPELINES, FORWARD_DISPATCH, kLayout>
     (param.rdma_to_attn_map, param.sparse_to_dense_map,
      param.expert_output_token, param.expert_output_prob, param.expert_output_scaling_factor,
      param.node_rank,
-     param.num_of_tokens_per_rank, param.num_of_ranks_per_node,
+     param.num_of_tokens_per_rank,
      HIDDEN_DIM, SF_BYTES_PER_TOKEN, param.experts_per_rank,
      param.local_dup_enabled, smem_buffer_ptr);
   } else if (PAD_GROUP::size() > 0 &&

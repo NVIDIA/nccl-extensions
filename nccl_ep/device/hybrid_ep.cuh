@@ -982,8 +982,38 @@ __forceinline__ __device__ void get_comm_ctx(int global_channel, int num_ctx_per
     ctx_idx = global_channel % num_ctx_per_comm;
 }
 
-// Device function for inter-node node2node(RDMA) warp for dispatch kernel. There can be only 1 inter-node warp per CUDA block!
-// Uses ncclGin API (net.put, net.signal)
+// Put one token's bundle (token, +prob if FWD, +sf if FP8) to a remote node:
+// token at dst_offset, prob/sf packed immediately after.
+template<typename TOKEN_DATA_TYPE, bool FORWARD_DISPATCH, int NUM_LSA_TEAMS>
+__forceinline__ __device__ void dispatch_n2n_put_token(
+    ncclGin& net, const ncclTeam& rail, int remote_node_id,
+    const struct dispatch_memory_region_info_t* mr_info,
+    ncclWindow_t internal_window, ncclWindow_t token_window,
+    ncclWindow_t prob_window, ncclWindow_t sf_window,
+    size_t dst_offset, int token_idx,
+    size_t token_bytes, size_t prob_bytes, int sf_bytes_per_token) {
+  size_t token_src = mr_info->attn_input_token_offset + token_idx * token_bytes;
+  net.put(rail, remote_node_id, internal_window, dst_offset,
+          token_window, token_src, token_bytes,
+          ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{},
+          cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
+  if constexpr(FORWARD_DISPATCH) {
+    size_t prob_src = mr_info->attn_input_prob_offset + (token_idx * NUM_LSA_TEAMS + remote_node_id) * prob_bytes;
+    net.put(rail, remote_node_id, internal_window, dst_offset + token_bytes,
+            prob_window, prob_src, prob_bytes,
+            ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{},
+            cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
+  }
+  if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
+    size_t sf_src = mr_info->attn_input_scaling_factor_offset + token_idx * sf_bytes_per_token;
+    net.put(rail, remote_node_id, internal_window, dst_offset + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0),
+            sf_window, sf_src, sf_bytes_per_token,
+            ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{},
+            cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
+  }
+}
+
+// Device function for inter-node node2node(RDMA) warp for dispatch kernel.
 template<typename INTER_NODE_GROUP,
          typename TOKEN_DATA_TYPE,
          typename SMEM_TYPE,
@@ -1013,16 +1043,13 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
                                                       const int sf_bytes_per_token,
                                                       const int experts_per_rank)
 {
-  // Load attn_to_rdma_map using LDG.128. Each token will need 1 bool from this map.
-  int NUM_OF_CHUNKS_PER_RANK = (num_of_tokens_per_rank - 1) / NUM_OF_TOKENS_PER_CHUNK + 1;
-  constexpr int GIN_NUM_RATIO = 1 + std::is_same<TOKEN_DATA_TYPE, uint8_t>::value + FORWARD_DISPATCH;
+  const int num_of_chunks_per_rank = nccl_ep::ceil_div(num_of_tokens_per_rank, NUM_OF_TOKENS_PER_CHUNK);
 
   static_assert(INTER_NODE_GROUP::size() >= NUM_LSA_TEAMS - 1, "mr_info should be loaded at once.");
   static_assert(NUM_OF_TOKENS_PER_CHUNK % 32 == 0, "NUM_OF_TOKENS_PER_CHUNK must be multiple of 32.");
   static_assert(MAX_NUM_OF_TOKENS_PER_RANK % NUM_OF_TOKENS_PER_CHUNK == 0, "MAX_NUM_OF_TOKENS_PER_RANK must be multiple of NUM_OF_TOKENS_PER_CHUNK.");
-  // The (NUM_LSA_TEAMS - 1) queue pairs of one block were arranged together.
-  // int block_offset = blockIdx.x * (NUM_LSA_TEAMS - 1);
-  // Loading mr_infos to shared memory for faster access in Put calls.
+
+  // Load mr_info into shared memory for faster access in Put calls.
   int lane_id = INTER_NODE_GROUP::thread_rank() % 32;
   struct dispatch_memory_region_info_t *smem_mr_info_ptr = nullptr;
   if constexpr(NUM_LSA_TEAMS != 1) {
@@ -1033,10 +1060,6 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
     __syncwarp();
   }
 
-  // Batched chunk processing: issue all puts + signals across all chunks,
-  // then flush once at the end. Staging is per-chunk (no aliasing).
-  // Signals use the same comm as puts (same-QP ordering: put before signal).
-  // With multiple N2N warps, chunks are partitioned by warp_id for parallelism.
   constexpr int N2N_WARPS = INTER_NODE_GROUP::size() / 32;
   int n2n_warp_id = INTER_NODE_GROUP::thread_rank() / 32;
   size_t token_bytes = HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE);
@@ -1054,17 +1077,18 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
   for (int chunk_idx = blockIdx.x * N2N_WARPS + n2n_warp_id;
        chunk_idx < MAX_CHUNKS_PER_RANK;
        chunk_idx += NUM_OF_BLOCKS * N2N_WARPS) {
-    int chunk_base_token_idx = chunk_idx * NUM_OF_TOKENS_PER_CHUNK;
-    int token_range = 0;
-    if (chunk_idx < NUM_OF_CHUNKS_PER_RANK) {
-      token_range = NUM_OF_TOKENS_PER_CHUNK;
-      if (chunk_base_token_idx + token_range > num_of_tokens_per_rank) {
-        token_range = num_of_tokens_per_rank - chunk_base_token_idx;
+    int chunk_first_token_idx = chunk_idx * NUM_OF_TOKENS_PER_CHUNK;
+    int current_chunk_size = 0;
+    if (chunk_idx < num_of_chunks_per_rank) {
+      current_chunk_size = NUM_OF_TOKENS_PER_CHUNK;
+      if (chunk_first_token_idx + current_chunk_size > num_of_tokens_per_rank) {
+        current_chunk_size = num_of_tokens_per_rank - chunk_first_token_idx;
       }
     }
 
-    for (int idx = 0; idx < NUM_LSA_TEAMS - 1; ++idx) {
-      int remote_idx = (idx + node_rank) % (NUM_LSA_TEAMS - 1);
+    for (int j = 0; j < NUM_LSA_TEAMS - 1; ++j) {
+      // Skip-self ring over the other nodes, load-balanced start at node_rank.
+      int remote_idx = (j + node_rank) % (NUM_LSA_TEAMS - 1);
       int remote_node_id = remote_idx < node_rank ? remote_idx : remote_idx + 1;
       int rank_in_remote = remote_idx < node_rank ? node_rank - 1 : node_rank;
 
@@ -1078,11 +1102,11 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
       int32_t need_write_bitmask[NUM_OF_TOKENS_PER_CHUNK / 32];
       for (int i = 0; i < NUM_OF_TOKENS_PER_CHUNK / 32; i++) {
         int token_idx_in_chunk = i * 32 + ncclCoopWarp().thread_rank();
-        bool need_write = token_idx_in_chunk < token_range && attn_to_rdma_map[((token_idx_in_chunk + chunk_base_token_idx) * (NUM_LSA_TEAMS - 1)) + remote_idx];
+        bool need_write = token_idx_in_chunk < current_chunk_size && attn_to_rdma_map[((token_idx_in_chunk + chunk_first_token_idx) * (NUM_LSA_TEAMS - 1)) + remote_idx];
         need_write_bitmask[i] = __ballot_sync(~0u, need_write);
       }
 
-      for (int token_idx_in_chunk = ncclCoopWarp().thread_rank(); token_idx_in_chunk < token_range; token_idx_in_chunk += ncclCoopWarp().size()) {
+      for (int token_idx_in_chunk = ncclCoopWarp().thread_rank(); token_idx_in_chunk < current_chunk_size; token_idx_in_chunk += ncclCoopWarp().size()) {
         size_t dst_offset = dense_dst_offset;
 
         // Adjust offset according to the need_write values of previous tokens in the word.
@@ -1091,32 +1115,13 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
           dst_offset += __popc(prev_token_need_write_bitmask) * smem_mr_info_ptr->bytes_per_entry;
         }
 
-        bool need_write = attn_to_rdma_map[((chunk_base_token_idx + token_idx_in_chunk) * (NUM_LSA_TEAMS - 1)) + remote_idx];
+        bool need_write = attn_to_rdma_map[((chunk_first_token_idx + token_idx_in_chunk) * (NUM_LSA_TEAMS - 1)) + remote_idx];
         if (need_write) {
-          int token_idx = chunk_base_token_idx + token_idx_in_chunk;
-          net.put(rail, remote_node_id,
-                  nccl_internal_window, dst_offset,
-                  nccl_token_window, smem_mr_info_ptr->attn_input_token_offset + token_idx * token_bytes,
-                  token_bytes,
-                  ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
-
-          if constexpr(FORWARD_DISPATCH) {
-            size_t offset = dst_offset + token_bytes;
-            net.put(rail, remote_node_id,
-                    nccl_internal_window, offset,
-                    nccl_prob_window, smem_mr_info_ptr->attn_input_prob_offset + (token_idx * NUM_LSA_TEAMS + remote_node_id) * prob_bytes,
-                    prob_bytes,
-                    ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
-          }
-
-          if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
-            size_t offset = dst_offset + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
-            net.put(rail, remote_node_id,
-                    nccl_internal_window, offset,
-                    nccl_sf_window, smem_mr_info_ptr->attn_input_scaling_factor_offset + (token_idx * sf_bytes_per_token),
-                    sf_bytes_per_token,
-                    ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{},  cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
-          }
+          int token_idx = chunk_first_token_idx + token_idx_in_chunk;
+          dispatch_n2n_put_token<TOKEN_DATA_TYPE, FORWARD_DISPATCH, NUM_LSA_TEAMS>(
+              net, rail, remote_node_id, smem_mr_info_ptr,
+              nccl_internal_window, nccl_token_window, nccl_prob_window, nccl_sf_window,
+              dst_offset, token_idx, token_bytes, prob_bytes, sf_bytes_per_token);
         }
         // Adjsut dense_dst_offset based on the need_write values of this entire word.
         dense_dst_offset += __popc(need_write_bitmask[token_idx_in_chunk / 32]) * smem_mr_info_ptr->bytes_per_entry;

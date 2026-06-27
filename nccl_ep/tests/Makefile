@@ -34,7 +34,7 @@ NVCUFLAGS := $(NVCC_GENCODE) \
 
 NVLDFLAGS := -L$(NCCL_EP_LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -lnccl -lpthread -lrt -ldl -lcuda
 
-TEST_BINARIES := $(DST_DIR)/test_output_layout $(DST_DIR)/test_handle_maps $(DST_DIR)/test_lifecycle $(DST_DIR)/test_ht_bwd $(DST_DIR)/test_tensor_create $(DST_DIR)/test_zero_copy $(DST_DIR)/test_ht_stale_routing_map $(DST_DIR)/test_ht_overflow_drop $(DST_DIR)/test_quantization_recipe $(DST_DIR)/test_recv_topk_idx_flags
+TEST_BINARIES := $(DST_DIR)/test_output_layout $(DST_DIR)/test_handle_maps $(DST_DIR)/test_lifecycle $(DST_DIR)/test_ht_bwd $(DST_DIR)/test_tensor_create $(DST_DIR)/test_zero_copy $(DST_DIR)/test_ht_stale_routing_map $(DST_DIR)/test_ht_overflow_drop $(DST_DIR)/test_quantization_recipe $(DST_DIR)/test_recv_topk_idx_flags $(DST_DIR)/test_elastic_buffer
 
 .PHONY: all clean
 all: $(TEST_BINARIES)
@@ -57,7 +57,9 @@ $(DST_DIR):
 	@mkdir -p $@
 
 INTERNAL_HEADERS := $(abspath ../nccl_ep_test_internal.h) \
-                    $(abspath ../quantization_recipe.hpp) test_common.h \
+                    $(abspath ../quantization_recipe.hpp) \
+                    $(abspath ../examples/nccl_ep_elastic_buffer.h) \
+                    test_common.h \
                     $(wildcard $(NCCL_EP_INCDIR)/nccl_ep*.h $(NCCL_EP_INCDIR)/ep_*.h)
 
 $(DST_DIR)/%.o: %.cu $(INTERNAL_HEADERS) | $(DST_DIR)

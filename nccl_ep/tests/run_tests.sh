@@ -98,6 +98,7 @@ SUITES=(
     "test_quantization_recipe|EP Quantization Recipe Tests|1"
     "test_zero_copy|EP Zero-Copy forced|0"
     "test_recv_topk_idx_flags|EP Recv Topk Idx Flags Tests|0"
+    "test_elastic_buffer|EP Elastic Buffer Tests|0"
 )
 
 for entry in "${SUITES[@]}"; do

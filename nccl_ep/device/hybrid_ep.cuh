@@ -1341,7 +1341,7 @@ template<typename INTER_NODE_GROUP,
          int LSA_TEAM_SIZE,
          int NUM_OF_BLOCKS,
          bool FORWARD_DISPATCH>
-__forceinline__ __device__ void dispatch_N2N(
+__forceinline__ __device__ void dispatch_N2N_warp(
     // INPUT
     const bool* attn_to_rdma_map,
     // CONFIG
@@ -1477,7 +1477,7 @@ template<typename INTRA_NODE_S2G_GROUP,
          int NUM_PIPELINES,
          bool FORWARD_DISPATCH,
          ncclEpLayout_t kLayout>
-__forceinline__ __device__ void dispatch_S2G(
+__forceinline__ __device__ void dispatch_S2G_warp(
     // INPUT
     const bool* rdma_to_attn_map,
     const int32_t* sparse_to_dense_map,
@@ -1674,7 +1674,7 @@ template<typename INTRA_NODE_G2S_GROUP,
          int NUM_OF_BLOCKS,
          int NUM_PIPELINES,
          bool FORWARD_DISPATCH>
-__forceinline__ __device__ void dispatch_G2S(
+__forceinline__ __device__ void dispatch_G2S_warp(
     // INPUT
     const bool* rdma_to_attn_map,
     const TOKEN_DATA_TYPE* attn_input_token,
@@ -3534,7 +3534,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
   int threadIdx_x_int = (int)threadIdx.x;
   if(threadIdx_x_int < INTER_NODE_GROUP::size()){
     if constexpr(NUM_LSA_TEAMS != 1){
-      dispatch_N2N
+      dispatch_N2N_warp
       <INTER_NODE_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, LSA_TEAM_SIZE, NUM_OF_BLOCKS, FORWARD_DISPATCH>
       (param.attn_to_rdma_map,
        param.local_rank, param.node_rank,
@@ -3546,7 +3546,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
        smem_buffer_ptr);
     }
   } else if (threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size()){
-    dispatch_G2S
+    dispatch_G2S_warp
     <INTRA_NODE_G2S_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_TOKENS_PER_CHUNK,
      MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, LSA_TEAM_SIZE, NUM_OF_BLOCKS, NUM_PIPELINES, FORWARD_DISPATCH>
     (param.rdma_to_attn_map,
@@ -3559,7 +3559,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
      param.dcomm, param.num_ctx_per_comm, param.gin_base_ptr, &param.mr_info,
      smem_buffer_ptr);
   } else if (threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTRA_NODE_S2G_GROUP::size()){
-    dispatch_S2G
+    dispatch_S2G_warp
     <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_TOKENS_PER_CHUNK, NUM_LSA_TEAMS, LSA_TEAM_SIZE, NUM_OF_BLOCKS, NUM_PIPELINES, FORWARD_DISPATCH, kLayout>
     (param.rdma_to_attn_map, param.sparse_to_dense_map,
      param.expert_output_token, param.expert_output_prob, param.expert_output_scaling_factor,

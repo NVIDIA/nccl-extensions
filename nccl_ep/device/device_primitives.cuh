@@ -12,6 +12,8 @@
 #pragma once
 
 #include "common.hpp"
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 //==============================================================================
 // Macros
@@ -53,6 +55,77 @@ namespace nccl_ep {
 //==============================================================================
 // Type Traits and Helper Types
 //==============================================================================
+
+// Compile-time wire-dtype helpers — single source of truth for token element width
+// and semantics, shared by the LL and HT dispatch/combine paths. Keyed on the
+// ncclDataType_t so FP16 and BF16 (same 2 B width) stay distinguishable for the
+// combine decode/encode. Primary size_* templates are intentionally undefined:
+// an unsupported dtype is a compile error.
+template <ncclDataType_t kDt> __host__ __device__ constexpr bool is_fp32() { return kDt == ncclFloat32; }
+template <ncclDataType_t kDt> __host__ __device__ constexpr bool is_fp16() { return kDt == ncclFloat16; }
+
+// Bytes per wire element.
+template <ncclDataType_t kDt> __host__ __device__ constexpr int size_u8();
+template <> __host__ __device__ constexpr int size_u8<ncclFloat32>()    { return sizeof(uint32_t); }
+template <> __host__ __device__ constexpr int size_u8<ncclFloat16>()    { return sizeof(uint16_t); }
+template <> __host__ __device__ constexpr int size_u8<ncclBfloat16>()   { return sizeof(uint16_t); }
+template <> __host__ __device__ constexpr int size_u8<ncclFloat8e4m3>() { return sizeof(uint8_t); }
+template <> __host__ __device__ constexpr int size_u8<ncclFloat8e5m2>() { return sizeof(uint8_t); }
+
+// Wire element width in uint16_t units (token buffers use a uint16_t* base; FP8 has no
+// uint16_t-unit stride, so it is intentionally not specialized here).
+template <ncclDataType_t kDt> __host__ __device__ constexpr int size_u16();
+template <> __host__ __device__ constexpr int size_u16<ncclFloat32>()  { return sizeof(uint32_t) / sizeof(uint16_t); }
+template <> __host__ __device__ constexpr int size_u16<ncclFloat16>()  { return sizeof(uint16_t) / sizeof(uint16_t); }
+template <> __host__ __device__ constexpr int size_u16<ncclBfloat16>() { return sizeof(uint16_t) / sizeof(uint16_t); }
+
+// Unsigned integer "wire type" of the same width as a token dtype, for the
+// byte-copy dispatch path (which moves tokens by raw width, never decoding
+// values). FP16 and BF16 collapse to uint16_t (identical byte transport);
+// FP32 -> uint32_t, FP8 -> uint8_t. Primary template is undefined so an
+// unsupported dtype is a compile error (mirrors size_u8).
+template <ncclDataType_t kDt> struct wire_type;
+template <> struct wire_type<ncclFloat32>    { using type = uint32_t; };
+template <> struct wire_type<ncclFloat16>    { using type = uint16_t; };
+template <> struct wire_type<ncclBfloat16>   { using type = uint16_t; };
+template <> struct wire_type<ncclFloat8e4m3> { using type = uint8_t;  };
+template <> struct wire_type<ncclFloat8e5m2> { using type = uint8_t;  };
+template <ncclDataType_t kDt> using wire_t = typename wire_type<kDt>::type;
+
+// Decode/encode one token "pair" (2 elements) at pair-index idx, against a raw
+// token buffer base. Centralizes the per-dtype conversion used by the combine
+// reduce paths. Pair stride is dtype-implicit: float2 (8 B) for FP32, half2 /
+// bf162 (4 B) for the 16-bit types. Primary undefined -> unsupported dtype is a
+// compile error (mirrors size_u8 / size_u16).
+template <ncclDataType_t kTokenDtype>
+__device__ __forceinline__ float2 ld_token_pair(const void* base, int idx);
+template <> __device__ __forceinline__
+float2 ld_token_pair<ncclFloat32>(const void* base, int idx) {
+    return reinterpret_cast<const float2*>(base)[idx];
+}
+template <> __device__ __forceinline__
+float2 ld_token_pair<ncclFloat16>(const void* base, int idx) {
+    return __half22float2(reinterpret_cast<const __half2*>(base)[idx]);
+}
+template <> __device__ __forceinline__
+float2 ld_token_pair<ncclBfloat16>(const void* base, int idx) {
+    return __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(base)[idx]);
+}
+
+template <ncclDataType_t kTokenDtype>
+__device__ __forceinline__ void st_token_pair(void* base, int idx, float2 v);
+template <> __device__ __forceinline__
+void st_token_pair<ncclFloat32>(void* base, int idx, float2 v) {
+    reinterpret_cast<float2*>(base)[idx] = v;
+}
+template <> __device__ __forceinline__
+void st_token_pair<ncclFloat16>(void* base, int idx, float2 v) {
+    reinterpret_cast<__half2*>(base)[idx] = __float22half2_rn(v);
+}
+template <> __device__ __forceinline__
+void st_token_pair<ncclBfloat16>(void* base, int idx, float2 v) {
+    reinterpret_cast<__nv_bfloat162*>(base)[idx] = __float22bfloat162_rn(v);
+}
 
 template <int kBytes>
 struct VecInt {};

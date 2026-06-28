@@ -26,8 +26,8 @@ constexpr const char* kDispatchJitEntryName = "nccl_ep_jit_ht_dispatch_kernel";
 
 inline const char* dispatch_bool_literal(bool value) { return value ? "true" : "false"; }
 
-inline const char* dispatch_token_data_type_literal(bool use_fp8) {
-    return use_fp8 ? "uint8_t" : "uint16_t";
+inline const char* dispatch_token_data_type_literal(bool use_fp8, ncclDataType_t token_dtype = ncclBfloat16) {
+    return use_fp8 ? "uint8_t" : (token_dtype == ncclFloat32 ? "uint32_t" : "uint16_t");
 }
 
 struct dispatch_warp_layout_t {
@@ -86,12 +86,19 @@ inline std::string dispatch_jit_source(
     ncclEpLayout_t layout,
     bool use_fp8,
     int hidden_dim,
-    int sf_bytes_per_token) {
+    int sf_bytes_per_token,
+    ncclDataType_t token_dtype = ncclBfloat16) {
     const char* layout_literal =
         (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR)
             ? "NCCL_EP_LAYOUT_EXPERT_MAJOR"
             : "NCCL_EP_LAYOUT_FLAT";
-    const char* token_type_literal = dispatch_token_data_type_literal(use_fp8);
+    const char* token_type_literal = dispatch_token_data_type_literal(use_fp8, token_dtype);
+    // Canonical wire-dtype enum for the kernel template arg: FP8 -> e4m3 (1 B),
+    // FP32 -> 4 B, everything else (BF16/FP16) -> BF16 (2 B). Mirrors
+    // token_type_literal so wire_t<kWireDtype> == TOKEN_DATA_TYPE. Dispatch is a
+    // byte copy, so FP16 and BF16 intentionally share one (2-byte) kernel.
+    const char* wire_dtype_literal =
+        use_fp8 ? "ncclFloat8e4m3" : (token_dtype == ncclFloat32 ? "ncclFloat32" : "ncclBfloat16");
     std::ostringstream src;
     src
         << "#include \"device/hybrid_ep.cuh\"\n"
@@ -109,7 +116,7 @@ inline std::string dispatch_jit_source(
         << lsa_team_size << "> param) {\n"
         << "  extern __shared__ uint8_t smem_bytes[];\n"
         << "  hybrid_ep::dispatch_kernel_impl<\n"
-        << "      TOKEN_DATA_TYPE,\n"
+        << "      " << wire_dtype_literal << ",\n"
         << "      INTER_NODE_GROUP,\n"
         << "      INTRA_NODE_G2S_GROUP,\n"
         << "      INTRA_NODE_S2G_GROUP,\n"
@@ -146,7 +153,8 @@ inline void launch_dispatch(
     void* param,
     size_t param_size,
     int dynamic_smem_bytes,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    ncclDataType_t token_dtype = ncclBfloat16) {
     const dispatch_warp_layout_t L = compute_dispatch_warp_layout(num_lsa_teams, layout);
 
     static const int fwd_variant_identity = 0;
@@ -166,7 +174,9 @@ inline void launch_dispatch(
             << "_blocks" << num_of_blocks
             << (forward_dispatch ? "_fwd" : "_bwd")
             << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_fl")
-            << (use_fp8 ? "_fp8" : "_bf16")
+            // Dispatch is a pure byte-copy: FP16 and BF16 both map to a uint16_t kernel,
+            // so they share one cache entry ("_16b"); only the 32-bit width is distinct.
+            << (use_fp8 ? "_fp8" : token_dtype == ncclFloat32 ? "_fp32" : "_16b")
             << "_sf" << sf_bytes_per_token;
         return name.str();
     }();
@@ -191,7 +201,8 @@ inline void launch_dispatch(
         layout,
         use_fp8,
         hidden_dim,
-        sf_bytes_per_token);
+        sf_bytes_per_token,
+        token_dtype);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_dispatch";
@@ -294,12 +305,13 @@ constexpr const char* kLocalDupJitEntryName = "nccl_ep_jit_ht_local_dup_kernel";
 inline std::string local_dup_jit_source(
     int hidden_dim,
     int pipe_depth,
-    bool forward_dispatch) {
+    bool forward_dispatch,
+    const char* token_type_literal = "uint16_t") {
     std::ostringstream src;
     src
         << "#include \"device/hybrid_ep.cuh\"\n"
         << "\n"
-        << "using TOKEN_DATA_TYPE = uint16_t;\n"
+        << "using TOKEN_DATA_TYPE = " << token_type_literal << ";\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(64, 1)\n"
         << "__global__ void " << kLocalDupJitEntryName << "(\n"
@@ -323,16 +335,20 @@ inline void launch_local_dup(
     int dynamic_smem_bytes,
     cudaStream_t stream) {
     static const int variant_identity = 0;
+    const char* token_type_literal =
+        sizeof(T) == 4 ? "uint32_t" : sizeof(T) == 1 ? "uint8_t" : "uint16_t";
     const std::string variant_name = [&] {
         std::ostringstream name;
         name
             << "local_dup"
             << "_hdim" << hidden_dim
             << "_pipe" << pipe_depth
+            << "_b" << static_cast<int>(sizeof(T))
             << (forward_dispatch ? "_fwd" : "_bwd");
         return name.str();
     }();
-    const std::string source = local_dup_jit_source(hidden_dim, pipe_depth, forward_dispatch);
+    const std::string source =
+        local_dup_jit_source(hidden_dim, pipe_depth, forward_dispatch, token_type_literal);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_local_dup";
@@ -343,7 +359,8 @@ inline void launch_local_dup(
     variant.runtime_key =
         (static_cast<std::uint64_t>(hidden_dim) & 0xFFFFFFu) |
         (static_cast<std::uint64_t>(pipe_depth & 0xFFu) << 24) |
-        (static_cast<std::uint64_t>(forward_dispatch ? 1u : 0u) << 32);
+        (static_cast<std::uint64_t>(forward_dispatch ? 1u : 0u) << 32) |
+        (static_cast<std::uint64_t>(sizeof(T)) << 33);
     variant.num_blocks = num_blocks;
     variant.block_dim = 64;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;

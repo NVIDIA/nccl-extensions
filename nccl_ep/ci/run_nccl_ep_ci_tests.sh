@@ -72,24 +72,36 @@ run_nccl_ep_srun "$EP_TEST" "$TIME" -a ll              -t 128  -d 7168
 run_nccl_ep_srun "$EP_TEST" "$TIME" -a ht -L fl        -t 4096 -d 7168
 run_nccl_ep_srun "$EP_TEST" "$TIME" -a ht -L em        -t 4096 -d 7168
 
-# ep_bench: layout × batch-size cross-product (override bench wall time with NCCL_EP_BENCH_SLURM_TIME if needed)
+# ep_bench: layout × batch-size × datatype cross-product (override bench wall time with NCCL_EP_BENCH_SLURM_TIME if needed)
 # LL supports {expert-major, rank-major}; HT supports {flat, expert-major}.
 # Batch sizes (tokens per rank): 128, 256, 1K, 4K, 8K.
+# Datatypes: NONE-mode wire formats. bf16 is the baseline; fp16/fp32 exercise the
+# distinct decode/encode (fp16) and larger-SMEM combine (fp32) paths.
+# The datatype list and hidden dim are globals the caller sets before each sweep,
+# so HT fp32 can run at a reduced hidden (see HT block below).
 EP_BENCH_TOKEN_SIZES=(128 256 1024 4096)
+EP_BENCH_DATATYPES=(bf16 fp16 fp32)
+EP_BENCH_HIDDEN=7168
 
 run_ep_bench_layout_size_sweep() {
   local algorithm="$1"; shift
   local layouts=("$@")
-  local layout tokens
+  local layout tokens dtype
   for layout in "${layouts[@]}"; do
     for tokens in "${EP_BENCH_TOKEN_SIZES[@]}"; do
-      run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
-        --algorithm "$algorithm" --layout "$layout" \
-        --tokens "$tokens" --hidden 7168 --top-k 8 --experts 256 --validate
+      for dtype in "${EP_BENCH_DATATYPES[@]}"; do
+        run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+          --algorithm "$algorithm" --layout "$layout" \
+          --tokens "$tokens" --hidden "$EP_BENCH_HIDDEN" --top-k 8 --experts 256 --validate \
+          --datatype "$dtype"
+      done
     done
   done
 }
 
+# LL: all three NONE-mode dtypes at the full hidden dim.
+EP_BENCH_DATATYPES=(bf16 fp16 fp32)
+EP_BENCH_HIDDEN=7168
 run_ep_bench_layout_size_sweep low-latency em rm
 # Token-distribution variants stay at the canonical LL batch size (cover the variant axis,
 # not the size axis — already swept above).
@@ -97,6 +109,21 @@ run_ep_bench_variants low-latency 128
 
 # High-throughput ep_bench (set NCCL_EP_BENCH_HT=1 to run; off by default — cluster-dependent)
 if [[ "${NCCL_EP_BENCH_HT:-0}" == "1" ]]; then
+  # bf16/fp16 at the full hidden dim.
+  EP_BENCH_DATATYPES=(bf16 fp16)
+  EP_BENCH_HIDDEN=7168
   run_ep_bench_layout_size_sweep high-throughput fl em
   run_ep_bench_variants high-throughput 4096
+
+  # FOLLOW-UP: HT fp32 dispatch SMEM exceeds the device cap (~227KB on H100) at
+  # hidden=7168 with the default stages/pipelines, and currently std::abort()s in
+  # check_dispatch_smem_limit (device/hybridep_adapter.cu:806). That abort should be
+  # turned into a clean ncclInvalidArgument rejection (tracked separately). Until then,
+  # exercise HT fp32 at half the hidden dim: fp32 is 4 B/elem vs 2 B for 16-bit, so
+  # hidden=3584 gives the SAME per-token byte footprint as the 16-bit hidden=7168 runs
+  # (3584*4 == 7168*2 == 14336 B) — both an apples-to-apples comparison and a guaranteed
+  # SMEM fit. (Dispatch SMEM scales with hidden, not tokens, so hidden is the knob.)
+  EP_BENCH_DATATYPES=(fp32)
+  EP_BENCH_HIDDEN=3584
+  run_ep_bench_layout_size_sweep high-throughput fl em
 fi

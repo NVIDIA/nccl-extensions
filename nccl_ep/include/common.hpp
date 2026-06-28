@@ -210,7 +210,8 @@ void dispatch(const void* inData,
               bool nvlinkOnly = false,
               ncclWindow_t recvDataWindow = ncclWindow_t{},
               size_t recvDataOffset = 0,
-              cudaStream_t stream = 0);
+              cudaStream_t stream = 0,
+              ncclDataType_t token_dtype = ncclBfloat16);
 
 template <typename TopkIdxT>
 void combine(const void* inData,
@@ -248,7 +249,8 @@ void combine(const void* inData,
              int* rankMask = nullptr,
              int* asyncErrorFlag = nullptr,
              uint64_t timeoutCycles = NUM_TIMEOUT_CYCLES,
-             cudaStream_t stream = 0);
+             cudaStream_t stream = 0,
+             ncclDataType_t token_dtype = ncclBfloat16);
 
 } // namespace internode_ll
 

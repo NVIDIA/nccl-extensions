@@ -333,7 +333,7 @@ void dense_to_sparse_prob(
 // ============================================================================
 // Call metadata preprocessing
 // ============================================================================
-void call_metadata_preprocessing(
+ncclResult_t call_metadata_preprocessing(
     const uint8_t* global_routing_map,
     int32_t* sparse_to_dense_map,
     bool* rdma_to_attn_map,
@@ -372,11 +372,12 @@ void call_metadata_preprocessing(
     cudaStream_t stream
 ) {
     if (expert_major && per_expert_token_counts == nullptr) {
-        EP_HOST_ASSERT(false && "EXPERT_MAJOR remap requires per_expert_token_counts != nullptr");
+        std::fprintf(stderr, "[nccl_ep] EXPERT_MAJOR remap requires per_expert_token_counts != nullptr\n");
+        return ncclInvalidArgument;
     }
-    if (expert_major) {
-        EP_HOST_ASSERT(scan_gscratch != nullptr &&
-                       "EM scan requires scan_gscratch != nullptr");
+    if (expert_major && scan_gscratch == nullptr) {
+        std::fprintf(stderr, "[nccl_ep] EM scan requires scan_gscratch != nullptr\n");
+        return ncclInvalidArgument;
     }
 
     constexpr int NUM_THREADS_PER_BLOCK = HYBRIDEP_NUM_THREADS_PER_BLOCK_PREPROCESSING;
@@ -483,7 +484,7 @@ void call_metadata_preprocessing(
             em_permute ? flat2em_slot_map : nullptr,
             em_permute ? em_top_k : 0,
             stream);
-        return;
+        return ncclSuccess;
     }
 
     // FLAT path.
@@ -528,6 +529,7 @@ void call_metadata_preprocessing(
     (void)internal_offsets; (void)padded_out_counts; (void)out_offsets;
     (void)actual_counts_out; (void)alignment; (void)s2d_inner_dim;
     (void)scan_gscratch;
+    return ncclSuccess;
 }
 
 size_t get_preprocessing_scan_tmp_size(int num_ranks_per_node) {
@@ -960,11 +962,11 @@ int get_device_max_dynamic_smem() {
     return max_smem;
 }
 
-void check_dispatch_smem_limit(
+ncclResult_t check_dispatch_smem_limit(
     const ::hybrid_ep::dispatch_config_t& config,
     size_t smem_size) {
     const int max_smem = get_device_max_dynamic_smem();
-    if (smem_size <= static_cast<size_t>(max_smem)) return;
+    if (smem_size <= static_cast<size_t>(max_smem)) return ncclSuccess;
 
     std::fprintf(
         stderr,
@@ -974,7 +976,7 @@ void check_dispatch_smem_limit(
         max_smem,
         config.num_of_stages,
         config.num_pipelines);
-    std::abort();
+    return ncclInvalidArgument;
 }
 
 // ============================================================================
@@ -1074,16 +1076,22 @@ std::vector<uint8_t> build_dispatch_arg_buffer(
 
 // Template dispatch launcher for forward/backward and sync modes
 template<bool FORWARD_DISPATCH>
-void dispatch_impl(
+ncclResult_t dispatch_impl(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank,
     int num_nodes,
     bool use_fp8,
     int num_blocks,
     int sf_bytes_per_token,
-    cudaStream_t stream
+    cudaStream_t stream,
+    ncclDataType_t token_dtype = ncclBfloat16
 ) {
-    HYBRIDEP_SWITCH_DATATYPE(use_fp8, {
+    {
+        // The dispatch param/arg buffers are pointer-only (wire-width-invariant), so the
+        // host packs with one fixed type; the JIT specializes the actual kernel by
+        // token_dtype (dispatch_token_data_type_literal in launch_dispatch). No host-side
+        // compile-time token-type switch is needed -- rely on the JIT.
+        using TOKEN_DATA_TYPE = uint16_t;
         // TMA requires prob buffer (experts_per_node * sizeof(float)) to be 16B aligned
         // Check alignment at runtime now that experts_per_rank is dynamic
         const int experts_per_node = params.experts_per_rank * params.num_ranks_per_node;
@@ -1095,7 +1103,6 @@ void dispatch_impl(
                "multiple of 4 (flat layout with lsa_team_size <= 3 requires even num_tokens_per_rank)");
 
         auto kp = build_dispatch_param_base<TOKEN_DATA_TYPE>(params);
-        constexpr bool kUseFp8 = std::is_same_v<TOKEN_DATA_TYPE, uint8_t>;
 
         // Compute dynamic SMEM size at host (was done inside hybrid_ep::dispatch).
         ::hybrid_ep::dispatch_config_t d_config;
@@ -1105,7 +1112,6 @@ void dispatch_impl(
         d_config.num_of_tokens_per_chunk = HT_OF_NUM_TOKENS_PER_CHUNK;
         d_config.num_of_blocks           = num_blocks;
         d_config.forward_dispatch        = FORWARD_DISPATCH;
-        d_config.token_data_type         = std::is_same_v<TOKEN_DATA_TYPE, uint16_t> ? 1 : 0;
         d_config.sf_bytes_per_token      = sf_bytes_per_token;
         d_config.num_pipelines           = HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
         d_config.stages_per_pipeline     = HYBRIDEP_DISPATCH_NUM_OF_STAGES / HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
@@ -1116,10 +1122,19 @@ void dispatch_impl(
         d_model.num_of_ranks_per_node    = kp.num_of_ranks_per_node;
         d_model.num_of_nodes             = num_nodes;
 
-        const int smem_size = (params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR)
-            ? ::hybrid_ep::calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_EXPERT_MAJOR>(d_config, d_model)
-            : ::hybrid_ep::calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_FLAT>(d_config, d_model);
-        check_dispatch_smem_limit(d_config, smem_size);
+        // Layout size depends only on the wire byte width; pick the canonical
+        // instantiation by dtype (FP8=1 B, FP32=4 B, BF16/FP16=2 B) -- mirrors
+        // dispatch_jit's kernel specialization so host and device agree.
+#define HYBRIDEP_DISP_SMEM(DT) (                                                                       \
+            (params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR)                                             \
+                ? ::hybrid_ep::calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_EXPERT_MAJOR, DT>(d_config, d_model) \
+                : ::hybrid_ep::calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_FLAT, DT>(d_config, d_model))
+        const int smem_size = static_cast<int>(
+            use_fp8                      ? HYBRIDEP_DISP_SMEM(ncclFloat8e4m3) :
+            token_dtype == ncclFloat32   ? HYBRIDEP_DISP_SMEM(ncclFloat32)    :
+                                           HYBRIDEP_DISP_SMEM(ncclBfloat16));
+#undef HYBRIDEP_DISP_SMEM
+        if (ncclResult_t r = check_dispatch_smem_limit(d_config, smem_size); r != ncclSuccess) return r;
 
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
         const jit::dispatch_warp_layout_t dispatch_layout =
@@ -1142,22 +1157,24 @@ void dispatch_impl(
             num_nodes,
             params.num_ranks_per_node,
             params.layout,
-            kUseFp8,
+            use_fp8,
             kp.hidden_dim,
             sf_bytes_per_token,
             kernel_arg.data(),
             kernel_arg.size(),
             smem_size,
-            stream);
+            stream,
+            token_dtype);
 
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
         jit::dispatch_dump_warp_timing(dispatch_layout, num_blocks, d_wt, stream);
         CUDA_CHECK(cudaFree(d_wt));
 #endif
-    });
+    }
+    return ncclSuccess;
 }
 
-void call_dispatch(
+ncclResult_t call_dispatch(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank,
     int num_nodes,
@@ -1165,19 +1182,17 @@ void call_dispatch(
     bool forward_dispatch,
     int num_blocks,
     int sf_bytes_per_token,
-    cudaStream_t stream
+    cudaStream_t stream,
+    ncclDataType_t token_dtype
 ) {
-    // Dispatch based on forward/backward and sync mode
     if (forward_dispatch) {
-        dispatch_impl<true>(
+        return dispatch_impl<true>(
             params, max_dispatch_tokens_per_rank,
-            num_nodes, use_fp8, num_blocks, sf_bytes_per_token, stream);
-
+            num_nodes, use_fp8, num_blocks, sf_bytes_per_token, stream, token_dtype);
     } else {
-        dispatch_impl<false>(
+        return dispatch_impl<false>(
             params, max_dispatch_tokens_per_rank,
-            num_nodes, use_fp8, num_blocks, sf_bytes_per_token, stream);
-
+            num_nodes, use_fp8, num_blocks, sf_bytes_per_token, stream, token_dtype);
     }
 }
 
@@ -1299,14 +1314,16 @@ void combine_impl(
     model.num_of_experts_per_rank = kp.experts_per_rank;
     model.num_of_ranks_per_node = kp.num_of_ranks_per_node;
     model.num_of_nodes = num_nodes;
-    const int smem_size = ::hybrid_ep::calculate_combine_smem_layout_size(
-        num_stages_g2s,
-        num_stages_s2g,
-        HT_OF_NUM_TOKENS_PER_CHUNK,
-        max_dispatch_tokens_per_rank,
-        num_nodes,
-        BACKWARD_COMBINE,
-        model);
+    // Pick the layout-size instantiation by wire dtype; the width is derived inside the
+    // template. Layout size depends only on element width, so FP16 and BF16 (both 2 B)
+    // share the BF16 instantiation; only FP32 (4 B) is distinct.
+    const int smem_size = (params.token_dtype == ncclFloat32)
+        ? static_cast<int>(::hybrid_ep::calculate_combine_smem_layout_size<ncclFloat32>(
+              num_stages_g2s, num_stages_s2g, HT_OF_NUM_TOKENS_PER_CHUNK,
+              max_dispatch_tokens_per_rank, num_nodes, BACKWARD_COMBINE, model))
+        : static_cast<int>(::hybrid_ep::calculate_combine_smem_layout_size<ncclBfloat16>(
+              num_stages_g2s, num_stages_s2g, HT_OF_NUM_TOKENS_PER_CHUNK,
+              max_dispatch_tokens_per_rank, num_nodes, BACKWARD_COMBINE, model));
 
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
     const jit::combine_warp_layout_t combine_layout = jit::compute_combine_warp_layout(num_nodes);
@@ -1338,7 +1355,8 @@ void combine_impl(
         kernel_arg.data(),
         kernel_arg.size(),
         smem_size,
-        stream);
+        stream,
+        params.token_dtype);
 
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
     jit::combine_dump_warp_timing(combine_layout, num_blocks, d_wt, d_bt, stream);
@@ -1361,27 +1379,35 @@ void call_local_dup(
     int num_of_ranks_per_node,
     bool forward_dispatch,
     int num_blocks,
-    cudaStream_t stream
+    cudaStream_t stream,
+    ncclDataType_t token_dtype
 ) {
     constexpr int kPipeDepth = NCCLEP_LOCAL_DUP_PIPE_DEPTH;
-    using TOKEN_DATA_TYPE = uint16_t;
-    const int smem_bytes = ::hybrid_ep::local_dup_dynamic_smem_bytes(
-        hidden_dim, kPipeDepth, forward_dispatch,
-        experts_per_rank, num_of_ranks_per_node, sizeof(TOKEN_DATA_TYPE));
+    // local_dup is a byte-relocation fan-out: the wire type only sets the
+    // per-token width (FP16/BF16 -> uint16_t, FP32 -> uint32_t). FP8 is rejected
+    // upstream on this path.
+    auto run = [&](auto tag) {
+        using TOKEN_DATA_TYPE = decltype(tag);
+        const int smem_bytes = ::hybrid_ep::local_dup_dynamic_smem_bytes(
+            hidden_dim, kPipeDepth, forward_dispatch,
+            experts_per_rank, num_of_ranks_per_node, sizeof(TOKEN_DATA_TYPE));
 
-    ::hybrid_ep::local_dup_kernel_param_t<TOKEN_DATA_TYPE> pp{};
-    pp.expert_output_token = reinterpret_cast<TOKEN_DATA_TYPE*>(expert_output_token);
-    pp.expert_output_prob = expert_output_prob;
-    pp.emuf_group_buf = emuf_group_buf;
-    pp.emuf_group_count = emuf_group_count;
-    pp.emuf_group_stride = emuf_group_stride;
-    pp.intra_node_write_completion_flag = intra_node_write_completion_flag;
-    pp.expected_intra_node_flag_value = expected_intra_node_flag_value;
-    pp.grid_barrier_counter = grid_barrier_counter;
-    pp.experts_per_rank = experts_per_rank;
-    pp.num_of_ranks_per_node = num_of_ranks_per_node;
-    jit::launch_local_dup<TOKEN_DATA_TYPE>(hidden_dim, kPipeDepth, forward_dispatch,
-                                           num_blocks, pp, smem_bytes, stream);
+        ::hybrid_ep::local_dup_kernel_param_t<TOKEN_DATA_TYPE> pp{};
+        pp.expert_output_token = reinterpret_cast<TOKEN_DATA_TYPE*>(expert_output_token);
+        pp.expert_output_prob = expert_output_prob;
+        pp.emuf_group_buf = emuf_group_buf;
+        pp.emuf_group_count = emuf_group_count;
+        pp.emuf_group_stride = emuf_group_stride;
+        pp.intra_node_write_completion_flag = intra_node_write_completion_flag;
+        pp.expected_intra_node_flag_value = expected_intra_node_flag_value;
+        pp.grid_barrier_counter = grid_barrier_counter;
+        pp.experts_per_rank = experts_per_rank;
+        pp.num_of_ranks_per_node = num_of_ranks_per_node;
+        jit::launch_local_dup<TOKEN_DATA_TYPE>(hidden_dim, kPipeDepth, forward_dispatch,
+                                               num_blocks, pp, smem_bytes, stream);
+    };
+    if (token_dtype == ncclFloat32) run(uint32_t{});
+    else                            run(uint16_t{});
 }
 
 void call_local_reduce(
@@ -1395,17 +1421,25 @@ void call_local_reduce(
     int num_of_ranks_per_node,
     bool backward_combine,
     int num_blocks,
-    cudaStream_t stream
+    cudaStream_t stream,
+    ncclDataType_t token_dtype
 ) {
-    ::hybrid_ep::local_reduce_kernel_param_t<uint16_t> lp{};
-    lp.expert_input_token = reinterpret_cast<uint16_t*>(expert_input_token);
-    lp.expert_input_prob = expert_input_prob;
-    lp.emuf_group_buf = emuf_group_buf;
-    lp.emuf_group_count = emuf_group_count;
-    lp.emuf_group_stride = emuf_group_stride;
-    lp.experts_per_rank = experts_per_rank;
-    lp.num_of_ranks_per_node = num_of_ranks_per_node;
-    jit::launch_local_reduce<uint16_t>(hidden_dim, backward_combine, num_blocks, lp, stream);
+    // The reduce decodes/accumulates/re-encodes per token_dtype; the param/sizeof
+    // type collapses FP16->uint16_t (layout-identical), FP32 -> uint32_t.
+    auto run = [&](auto tag) {
+        using T = decltype(tag);
+        ::hybrid_ep::local_reduce_kernel_param_t<T> lp{};
+        lp.expert_input_token = reinterpret_cast<T*>(expert_input_token);
+        lp.expert_input_prob = expert_input_prob;
+        lp.emuf_group_buf = emuf_group_buf;
+        lp.emuf_group_count = emuf_group_count;
+        lp.emuf_group_stride = emuf_group_stride;
+        lp.experts_per_rank = experts_per_rank;
+        lp.num_of_ranks_per_node = num_of_ranks_per_node;
+        jit::launch_local_reduce<T>(hidden_dim, backward_combine, num_blocks, lp, stream, token_dtype);
+    };
+    if (token_dtype == ncclFloat32) run(uint32_t{});
+    else                            run(uint16_t{});
 }
 
 void call_combine(
@@ -1489,7 +1523,8 @@ void launch_combine_reduce(
     int row_bytes,
     int sm_count,
     unsigned int prolog_epilog_sms,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    ncclDataType_t token_dtype)
 {
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
@@ -1509,7 +1544,7 @@ void launch_combine_reduce(
     p.row_bytes           = row_bytes;
 
     ::nccl_ep::hybridep::jit::launch_local_permute_reduce(
-        top_k, row_bytes, static_cast<int>(grid), p, stream);
+        top_k, row_bytes, static_cast<int>(grid), p, stream, token_dtype);
 }
 
 } // namespace hybridep

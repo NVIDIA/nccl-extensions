@@ -179,6 +179,16 @@ static size_t ncclTypeSize(ncclDataType_t nccl_type) {
     }
 }
 
+// Supported token wire dtypes (runtime, since x->datatype comes from the descriptor).
+// NONE mode is BF16/FP16/FP32; FP8 (e4m3/e5m2) is a separate dispatch wire format.
+// Single source of truth for the accepted sets.
+static bool validate_dtype(ncclDataType_t dt) {
+    return dt == ncclBfloat16 || dt == ncclFloat16 || dt == ncclFloat32;
+}
+static bool validate_fp8_dtype(ncclDataType_t dt) {
+    return dt == ncclFloat8e4m3 || dt == ncclFloat8e5m2;
+}
+
 // Dynamic NDTensor allocation
 // Dynamic allocation is used for tensors that are returned by ncclEpTensorAlloc
 // and must be released with ncclEpTensorDestroy.
@@ -2609,7 +2619,7 @@ ncclResult_t ncclEpUpdateHandle(
 
     const bool em_permute_active = em_local_permute_enabled(ep_group, handle);
 
-    nccl_ep::hybridep::call_metadata_preprocessing(
+    NCCLCHECK(nccl_ep::hybridep::call_metadata_preprocessing(
         global_routing_map,
         handle->hybridep.sparse_to_dense_map,
         handle->hybridep.rdma_to_attn_map,
@@ -2655,7 +2665,7 @@ ncclResult_t ncclEpUpdateHandle(
         em_permute_active ? handle->hybridep.token_to_recv_slot : nullptr,
         em_permute_active ? handle->hybridep.flat2em_slot_map : nullptr,
         em_permute_active ? handle->num_topk : 0,
-        stream);
+        stream));
 
     return ncclSuccess;
 }
@@ -2737,12 +2747,21 @@ ncclResult_t ncclEpDispatch(
         handle->num_tokens_set = true;
     }
 
+    // Consolidated token-dtype gate for all dispatch paths (LL/HT): NONE-mode
+    // (bf16/fp16/fp32) or FP8 EXTERN (e4m3/e5m2). Checked once here so the
+    // per-mode branches below need not re-validate.
+    {
+        const ncclEpTensor_t* xt = tensor_required(inputs->tokens);
+        if (!validate_dtype(xt->datatype) && !validate_fp8_dtype(xt->datatype)) {
+            fprintf(stderr, "NCCL EP: dispatch unsupported token dtype %d\n",
+                    static_cast<int>(xt->datatype));
+            return ncclInvalidArgument;
+        }
+    }
+
     if (group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         const ncclEpTensor_t* x = tensor_required(inputs->tokens);
         assert(x->ndim == 2);
-        assert(x->datatype == ncclBfloat16 ||
-               x->datatype == ncclFloat8e4m3 ||
-               x->datatype == ncclFloat8e5m2);
         assert(x->sizes[0] == handle->num_tokens);
         assert(x->sizes[0] <= group->config.max_dispatch_tokens_per_rank);
         assert(x->sizes[1] % sizeof(int4) == 0);
@@ -2754,6 +2773,15 @@ ncclResult_t ncclEpDispatch(
         const ncclEpTensor_t* recv_x = tensor_required(outputs->tokens);
         const ncclEpTensor_t* scales = tensor_ptr(outputs->scales);
         assert(recv_x->ndim > 0);
+
+        // The FP8 wire path is selected by the presence of a scales tensor, not by
+        // x->datatype. An FP8 input dtype with no scales would otherwise fall through
+        // to the NONE path and be read at 2 B/elem instead of 1 B — out-of-bounds /
+        // corruption. Require scales for FP8 inputs (mirrors the HT dispatch guard).
+        if ((x->datatype == ncclFloat8e4m3 || x->datatype == ncclFloat8e5m2) && scales == nullptr) {
+            fprintf(stderr, "NCCL EP: LL dispatch with FP8 token dtype requires an outputs->scales tensor\n");
+            return ncclInvalidArgument;
+        }
 
         // Read rank-major-specific tensors unconditionally so we can assert
         // their presence (rank-major) or absence (expert-major) in the switch below.
@@ -2970,7 +2998,8 @@ ncclResult_t ncclEpDispatch(
                     /*nvlinkOnly=*/nvlink_only,
                     recv_data_window,
                     recv_data_offset,
-                    stream
+                    stream,
+                    x->datatype
                 );
             };
             switch (handle->topk_idx.datatype) {
@@ -3071,9 +3100,7 @@ ncclResult_t ncclEpDispatch(
             CUDA_CHECK(cudaMemcpyAsync(handle->hybridep.scaling_factor_staging_buffer, scales->data, scales_size, cudaMemcpyDeviceToDevice, stream));
             scales_ptr = handle->hybridep.scaling_factor_staging_buffer;
         }
-        if (!use_fp8) {
-            assert(x->datatype == ncclBfloat16);
-        } else {
+        if (use_fp8) {
             assert(scales->ndim == 2);
             assert(scales->datatype == ncclFloat32 || scales->datatype == ncclUint8);
         }
@@ -3278,7 +3305,7 @@ ncclResult_t ncclEpDispatch(
 
         // Call dispatch kernel
         const int sf_bytes_per_token = use_fp8 ? num_scales_per_token * scale_elem_bytes : 0;
-        nccl_ep::hybridep::call_dispatch(
+        NCCLCHECK(nccl_ep::hybridep::call_dispatch(
             params,
             group->ht_aligned_max_tokens,
             group->rdma_team_size,
@@ -3286,8 +3313,9 @@ ncclResult_t ncclEpDispatch(
             forward_dispatch,
             static_cast<int>(group->max_num_sms),
             sf_bytes_per_token,
-            stream
-        );
+            stream,
+            x->datatype
+        ));
 
         // Fan primaries out to secondary em_slots in this rank's recv buffer.
         if (em_unfused_active) {
@@ -3309,7 +3337,8 @@ ncclResult_t ncclEpDispatch(
                 params.num_ranks_per_node,
                 forward_dispatch,
                 params.local_dup_num_sms,
-                stream);
+                stream,
+                x->datatype);
         }
 
         const unsigned int max_recv_tokens = static_cast<unsigned int>(handle->group->max_recv_tokens);
@@ -3442,8 +3471,10 @@ ncclResult_t ncclEpDispatch(
         if (em_permute_active) {
             // BWD passes recv_topk_weights == nullptr (weights are FWD-only).
             assert(forward_dispatch ? (recv_topk_weights != nullptr) : (recv_topk_weights == nullptr));
-            if (recv_x->datatype != ncclBfloat16) {
-                return ncclInvalidArgument;  // local_permute_dup is bf16-only
+            if (!validate_dtype(recv_x->datatype)) {
+                // local_permute_dup is a byte-relocation kernel: any NONE-mode
+                // wire dtype (bf16/fp16/fp32) works; FP8 is not supported here.
+                return ncclInvalidArgument;
             }
             // local_permute_dup writes recv_x by em_slot up to max_recv_tokens.
             if (recv_x->sizes[0] < max_recv_tokens) {
@@ -3520,6 +3551,17 @@ ncclResult_t ncclEpCombine(
         handle->num_tokens_set = true;
     }
 
+    // Consolidated token-dtype gate for all combine paths (LL/HT): NONE-mode
+    // (bf16/fp16/fp32). There is no FP8 combine. Checked once here.
+    {
+        const ncclEpTensor_t* xt = tensor_required(inputs->tokens);
+        if (!validate_dtype(xt->datatype)) {
+            fprintf(stderr, "NCCL EP: combine unsupported token dtype %d\n",
+                    static_cast<int>(xt->datatype));
+            return ncclInvalidArgument;
+        }
+    }
+
     if (handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         // Find and validate input tensors
         const ncclEpTensor_t* x = tensor_required(inputs->tokens);
@@ -3545,8 +3587,7 @@ ncclResult_t ncclEpCombine(
         const int num_ranks = handle->group->nRanks;
         const int num_max_dispatch_tokens_per_rank = handle->group->config.max_dispatch_tokens_per_rank;
 
-        // Validate input tensor x; extract hidden dimension (index differs by layout).
-        assert(x->datatype == ncclBfloat16);
+        // Extract hidden dimension (index differs by layout).
         int hidden;
         switch (handle->layout) {
             case NCCL_EP_LAYOUT_RANK_MAJOR:
@@ -3673,7 +3714,8 @@ ncclResult_t ncclEpCombine(
                     handle->group->mask_buffer,
                     handle->group->async_error_flag,
                     handle->group->timeout_cycles,
-                    stream
+                    stream,
+                    x->datatype
                 );
             };
             switch (topk_idx->datatype) {
@@ -3711,7 +3753,6 @@ ncclResult_t ncclEpCombine(
             return ncclInvalidArgument;
         }
         assert(x->ndim == 2);
-        assert(x->datatype == ncclBfloat16); // HT combine only supports BF16
         // Local copies for tensors that need window resolution; only populated when used.
         ncclEpTensor_t x_local, topk_weights_local, combined_topk_weights_local, combined_x_local;
         NCCLCHECK(resolveTensorWindowBinding(
@@ -3811,9 +3852,8 @@ ncclResult_t ncclEpCombine(
         // (caller EM x -> FLAT staging), regardless of external-window — x->data
         // is the resolved device pointer either way.
         if (em_permute_combine) {
-            if (x->datatype != ncclBfloat16) {
-                return ncclInvalidArgument;  // local_permute_reduce is bf16-only
-            }
+            // x dtype already validated as NONE-mode at the combine entry gate;
+            // local_permute_reduce handles bf16/fp16/fp32.
             const int row_bytes = hidden * ncclTypeSize(x->datatype);
             if (row_bytes <= 0 || (row_bytes % 16) != 0) {
                 return ncclInvalidArgument;  // int4-vectorized row copy requires 16B-aligned row
@@ -3831,7 +3871,8 @@ ncclResult_t ncclEpCombine(
                 row_bytes,
                 static_cast<int>(group->device_sm_count),
                 group->prolog_epilog_sms,
-                stream);
+                stream,
+                x->datatype);
         } else if (!combine_x_uses_external_window) {
             // Clamp to staging capacity (nvlink_dup/local_dup EM only).
             const size_t clamped_tokens =
@@ -3981,10 +4022,12 @@ ncclResult_t ncclEpCombine(
                 params.num_ranks_per_node,
                 backward_combine,
                 static_cast<int>(group->prolog_epilog_sms),
-                stream);
+                stream,
+                x->datatype);
         }
 
         /* ===== Call combine kernel ===== */
+        params.token_dtype = x->datatype;
         nccl_ep::hybridep::call_combine(
             params,
             group->ht_aligned_max_tokens, // chunk-aligned stride

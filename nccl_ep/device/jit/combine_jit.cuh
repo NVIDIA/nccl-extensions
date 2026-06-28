@@ -80,11 +80,15 @@ inline std::string combine_jit_source(
     bool backward_combine,
     int lsa_team_size,
     ncclEpLayout_t layout,
-    int hidden_dim) {
+    int hidden_dim,
+    ncclDataType_t token_dtype = ncclBfloat16) {
     const char* layout_literal =
         (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR)
             ? "NCCL_EP_LAYOUT_EXPERT_MAJOR"
             : "NCCL_EP_LAYOUT_FLAT";
+    const char* token_dtype_literal =
+        token_dtype == ncclFloat32 ? "ncclFloat32" :
+        token_dtype == ncclFloat16 ? "ncclFloat16" : "ncclBfloat16";
     std::ostringstream src;
     src
         << "#include \"device/hybrid_ep.cuh\"\n"
@@ -118,7 +122,8 @@ inline std::string combine_jit_source(
         << "      " << bool_literal(backward_combine) << ",\n"
         << "      " << hidden_dim << ",\n"
         << "      " << lsa_team_size << ",\n"
-        << "      " << layout_literal << ">(param, smem_bytes);\n"
+        << "      " << layout_literal << ",\n"
+        << "      " << token_dtype_literal << ">(param, smem_bytes);\n"
         << "}\n";
     return src.str();
 }
@@ -139,7 +144,8 @@ inline void launch_combine(
     void* param, // ptr to the packed kernel arguments buffer
     size_t param_size, // size of packed kernel arguments buffer
     int dynamic_smem_bytes,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    ncclDataType_t token_dtype = ncclBfloat16) {
     const combine_warp_layout_t L = compute_combine_warp_layout(num_lsa_teams);
 
     static const int fwd_variant_identity = 0;
@@ -160,7 +166,8 @@ inline void launch_combine(
             << "_blocks" << num_of_blocks
             << "_extra" << num_of_additional_in_flight_s2g
             << (backward_combine ? "_bwd" : "_fwd")
-            << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_fl");
+            << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_fl")
+            << (token_dtype == ncclFloat32 ? "_fp32" : token_dtype == ncclFloat16 ? "_fp16" : "_bf16");
         return name.str();
     }();
     const std::string source = combine_jit_source(
@@ -176,7 +183,8 @@ inline void launch_combine(
         backward_combine,
         lsa_team_size,
         layout,
-        hidden_dim);
+        hidden_dim,
+        token_dtype);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_combine";
@@ -297,12 +305,19 @@ constexpr int kLocalReduceBlockDim = 128;
 
 inline std::string local_reduce_jit_source(
     int hidden_dim,
-    bool backward_combine) {
+    bool backward_combine,
+    ncclDataType_t token_dtype = ncclBfloat16) {
+    // Param/sizeof type collapses FP16->uint16_t (layout-identical); the decode
+    // template arg keeps the real dtype so the reduce math is correct.
+    const char* token_type_literal = (token_dtype == ncclFloat32) ? "uint32_t" : "uint16_t";
+    const char* token_dtype_literal =
+        token_dtype == ncclFloat32 ? "ncclFloat32" :
+        token_dtype == ncclFloat16 ? "ncclFloat16" : "ncclBfloat16";
     std::ostringstream src;
     src
         << "#include \"device/hybrid_ep.cuh\"\n"
         << "\n"
-        << "using TOKEN_DATA_TYPE = uint16_t;\n"
+        << "using TOKEN_DATA_TYPE = " << token_type_literal << ";\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(" << kLocalReduceBlockDim << ", 1)\n"
         << "__global__ void " << kLocalReduceJitEntryName << "(\n"
@@ -311,7 +326,8 @@ inline std::string local_reduce_jit_source(
         << "      TOKEN_DATA_TYPE,\n"
         << "      " << hidden_dim << ",\n"
         << "      " << kLocalReduceBlockDim << ",\n"
-        << "      " << bool_literal(backward_combine) << ">(p);\n"
+        << "      " << bool_literal(backward_combine) << ",\n"
+        << "      " << token_dtype_literal << ">(p);\n"
         << "}\n";
     return src.str();
 }
@@ -322,17 +338,19 @@ inline void launch_local_reduce(
     bool backward_combine,
     int num_blocks,
     ::hybrid_ep::local_reduce_kernel_param_t<T>& param,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    ncclDataType_t token_dtype = ncclBfloat16) {
     static const int variant_identity = 0;
     const std::string variant_name = [&] {
         std::ostringstream name;
         name
             << "local_reduce"
             << "_hdim" << hidden_dim
-            << (backward_combine ? "_bwd" : "_fwd");
+            << (backward_combine ? "_bwd" : "_fwd")
+            << (token_dtype == ncclFloat32 ? "_fp32" : token_dtype == ncclFloat16 ? "_fp16" : "_bf16");
         return name.str();
     }();
-    const std::string source = local_reduce_jit_source(hidden_dim, backward_combine);
+    const std::string source = local_reduce_jit_source(hidden_dim, backward_combine, token_dtype);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_local_reduce";
@@ -342,10 +360,12 @@ inline void launch_local_reduce(
     variant.identity = &variant_identity;
     variant.runtime_key =
         (static_cast<std::uint64_t>(hidden_dim) & 0xFFFFFFu) |
-        (static_cast<std::uint64_t>(backward_combine ? 1u : 0u) << 24);
+        (static_cast<std::uint64_t>(backward_combine ? 1u : 0u) << 24) |
+        (static_cast<std::uint64_t>(token_dtype) << 32);
     variant.num_blocks = num_blocks;
     variant.block_dim = kLocalReduceBlockDim;
-    variant.dynamic_smem_bytes = ::hybrid_ep::local_reduce_dynamic_smem_bytes(hidden_dim);
+    variant.dynamic_smem_bytes =
+        ::hybrid_ep::local_reduce_dynamic_smem_bytes(hidden_dim, static_cast<int>(sizeof(T)));
 
     std::string error;
     const ::nccl_ep::jit::JitKernelStatus status =
@@ -376,7 +396,11 @@ inline int pick_reduce_blocks_per_sm(int hidden_int4) {
 }
 
 inline std::string local_permute_reduce_jit_source(
-    int top_k, int hidden_int4, int blocks_per_sm) {
+    int top_k, int hidden_int4, int blocks_per_sm,
+    ncclDataType_t token_dtype = ncclBfloat16) {
+    const char* token_dtype_literal =
+        token_dtype == ncclFloat32 ? "ncclFloat32" :
+        token_dtype == ncclFloat16 ? "ncclFloat16" : "ncclBfloat16";
     std::ostringstream src;
     src
         << "#include \"device/hybrid_ep.cuh\"\n"
@@ -386,7 +410,7 @@ inline std::string local_permute_reduce_jit_source(
         << "__global__ void " << kLocalPermuteReduceJitEntryName << "(\n"
         << "    const __grid_constant__ ::hybrid_ep::local_permute_reduce_param_t p) {\n"
         << "  ::hybrid_ep::local_permute_reduce<"
-        << top_k << ", " << hidden_int4 << ">(\n"
+        << top_k << ", " << hidden_int4 << ", " << token_dtype_literal << ">(\n"
         << "      reinterpret_cast<uint8_t*>(p.flat_staging),\n"
         << "      reinterpret_cast<const uint8_t*>(p.recv_x_em),\n"
         << "      p.flat2em_slot_map,\n"
@@ -404,7 +428,8 @@ inline void launch_local_permute_reduce(
     int row_bytes,
     int num_blocks,
     ::hybrid_ep::local_permute_reduce_param_t& param,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    ncclDataType_t token_dtype = ncclBfloat16)
 {
     static const int variant_identity = 0;
     assert((row_bytes % 16) == 0);
@@ -414,11 +439,12 @@ inline void launch_local_permute_reduce(
         std::ostringstream name;
         name << "local_permute_reduce_topk" << top_k
              << "_h" << hidden_int4
-             << "_b" << blocks_per_sm;
+             << "_b" << blocks_per_sm
+             << (token_dtype == ncclFloat32 ? "_fp32" : token_dtype == ncclFloat16 ? "_fp16" : "_bf16");
         return name.str();
     }();
     const std::string source =
-        local_permute_reduce_jit_source(top_k, hidden_int4, blocks_per_sm);
+        local_permute_reduce_jit_source(top_k, hidden_int4, blocks_per_sm, token_dtype);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "local_permute_reduce";
@@ -427,6 +453,7 @@ inline void launch_local_permute_reduce(
     variant.entry_name = kLocalPermuteReduceJitEntryName;
     variant.identity = &variant_identity;
     variant.runtime_key =
+        (static_cast<std::uint64_t>(token_dtype) << 48) |
         (static_cast<std::uint64_t>(hidden_int4) << 32) |
         (static_cast<std::uint64_t>(blocks_per_sm) << 16) |
         static_cast<std::uint64_t>(top_k);

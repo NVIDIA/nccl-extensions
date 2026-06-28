@@ -573,7 +573,10 @@ __forceinline__ __device__ void copyRecvTokenData(
     }
 }
 
-template <bool kUseFP8, bool kUseUE8M0, bool kExternQuant, int kHidden, ncclEpLayout_t kLayout, bool kNvlinkOnly, typename TopkIdxT>
+// Templated on the wire dtype (kTokenDtype) like combine/HT. All element widths come
+// from size_u8<kTokenDtype>(); the read stride is the input element width whether or
+// not the output is FP8 (so FP32-input quantization reads the correct stride too).
+template <bool kUseFP8, bool kUseUE8M0, bool kExternQuant, int kHidden, ncclEpLayout_t kLayout, bool kNvlinkOnly, typename TopkIdxT, ncclDataType_t kTokenDtype = ncclBfloat16>
 __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
                                                     const void* inData,
                                                     const uint8_t* inScalesBuf, // non-null for EXTERN quant
@@ -647,7 +650,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
     // FP8 staffs
     constexpr int kNumPerChannels = 128;
     const int numScales = kHidden / kNumPerChannels;
-    const size_t hiddenBytes = kHidden * (kUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(nv_bfloat16));
+    const size_t hiddenBytes = kHidden * (kUseFP8 ? sizeof(__nv_fp8_storage_t) : size_u8<kTokenDtype>());
     const size_t hiddenInt4 = hiddenBytes / sizeof(int4);
 
     // Message package: header, hidden data, FP8 scales
@@ -656,7 +659,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
     const size_t dispatch_hdr_sz = get_dispatch_hdr_sz<kLayout>(numTopk);
     const size_t numBytesPerMsg = dispatch_hdr_sz + (kUseFP8 ?
                                                      (kHidden + numScales * sizeof(float)) :
-                                                     (kHidden * sizeof(nv_bfloat16)));
+                                                     (kHidden * size_u8<kTokenDtype>()));
 
     EP_DEVICE_ASSERT(numBytesPerMsg % sizeof(int4) == 0);
 
@@ -674,7 +677,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(// INPUT
     // 1. The first-kind warps for FP8 cast and sending top-k tokens
     // 2. The last warp for reading `topk_idx` and count for per-expert information
     if (warpId < numWarps - 1) {
-        constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
+        // Read stride is the input element width regardless of FP8 output (no BF16 assumption).
+        constexpr int kNumElemsPerRead = sizeof(int4) / size_u8<kTokenDtype>();
         EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerRead) == 0, "Invalid hidden");
         EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
         const auto numWritingThreads = (numWarps - 1) * 32;
@@ -1126,7 +1130,8 @@ void dispatch(const void* inData,
               bool nvlinkOnly,
               ncclWindow_t recvDataWindow,
               size_t recvDataOffset,
-              cudaStream_t stream) {
+              cudaStream_t stream,
+              ncclDataType_t token_dtype) {
     constexpr int kNumMaxTopK = 9;
     const int numWarpGroups = ceil_div(numExperts, numDeviceSms);
     const int numWarpsPerGroup = 32 / numWarpGroups;
@@ -1151,8 +1156,8 @@ void dispatch(const void* inData,
     const bool externFp8 = (inScalesBuf != nullptr);
 
     SETUP_LAUNCH_CONFIG(numSms, numWarps * 32, stream);
-#define DISPATCH_DO_LAUNCH(fp8, ue8m0, externFp8V, nvlinkOnlyV, hidden, kLayout) \
-LAUNCH_KERNEL(&cfg, (dispatch<fp8, ue8m0, externFp8V, hidden, kLayout, nvlinkOnlyV, TopkIdxT>), \
+#define DISPATCH_DO_LAUNCH(fp8, ue8m0, externFp8V, nvlinkOnlyV, hidden, kLayout, kTokenDtypeV) \
+LAUNCH_KERNEL(&cfg, (dispatch<fp8, ue8m0, externFp8V, hidden, kLayout, nvlinkOnlyV, TopkIdxT, kTokenDtypeV>), \
               inData, \
               inScalesBuf, \
               inTopkIdx, \
@@ -1198,18 +1203,23 @@ LAUNCH_KERNEL(&cfg, (dispatch<fp8, ue8m0, externFp8V, hidden, kLayout, nvlinkOnl
               timeoutCycles, \
               recvDataWindow, \
               recvDataOffset)
+// Dispatch is a byte-copy, so FP16 and BF16 fold onto the ncclBfloat16 instantiation
+// (no redundant FP16 kernel); only FP32 is distinct. FP8 input is BF16 -> ncclBfloat16.
 #define DISPATCH_LAUNCH_CASE_IMPL(hidden, kLayout) { \
+    const bool isFp32 = (token_dtype == ncclFloat32); \
     if (externFp8) { \
-        if (nvlinkOnly) { DISPATCH_DO_LAUNCH(true, false, true,  true,  hidden, kLayout); } \
-        else            { DISPATCH_DO_LAUNCH(true, false, true,  false, hidden, kLayout); } \
+        if (nvlinkOnly) { DISPATCH_DO_LAUNCH(true, false, true,  true,  hidden, kLayout, ncclBfloat16); } \
+        else            { DISPATCH_DO_LAUNCH(true, false, true,  false, hidden, kLayout, ncclBfloat16); } \
     } else if (nvlinkOnly) { \
-        if (useFp8 and useUe8m0)      { DISPATCH_DO_LAUNCH(true,  true,  false, true,  hidden, kLayout); } \
-        else if (useFp8)              { DISPATCH_DO_LAUNCH(true,  false, false, true,  hidden, kLayout); } \
-        else                          { DISPATCH_DO_LAUNCH(false, false, false, true,  hidden, kLayout); } \
+        if (useFp8 and useUe8m0)      { DISPATCH_DO_LAUNCH(true,  true,  false, true,  hidden, kLayout, ncclBfloat16); } \
+        else if (useFp8)              { DISPATCH_DO_LAUNCH(true,  false, false, true,  hidden, kLayout, ncclBfloat16); } \
+        else if (isFp32)              { DISPATCH_DO_LAUNCH(false, false, false, true,  hidden, kLayout, ncclFloat32); } \
+        else                          { DISPATCH_DO_LAUNCH(false, false, false, true,  hidden, kLayout, ncclBfloat16); } \
     } else { \
-        if (useFp8 and useUe8m0)      { DISPATCH_DO_LAUNCH(true,  true,  false, false, hidden, kLayout); } \
-        else if (useFp8)              { DISPATCH_DO_LAUNCH(true,  false, false, false, hidden, kLayout); } \
-        else                          { DISPATCH_DO_LAUNCH(false, false, false, false, hidden, kLayout); } \
+        if (useFp8 and useUe8m0)      { DISPATCH_DO_LAUNCH(true,  true,  false, false, hidden, kLayout, ncclBfloat16); } \
+        else if (useFp8)              { DISPATCH_DO_LAUNCH(true,  false, false, false, hidden, kLayout, ncclBfloat16); } \
+        else if (isFp32)              { DISPATCH_DO_LAUNCH(false, false, false, false, hidden, kLayout, ncclFloat32); } \
+        else                          { DISPATCH_DO_LAUNCH(false, false, false, false, hidden, kLayout, ncclBfloat16); } \
     } \
 } break
 #define DISPATCH_LAUNCH_CASE_RM(hidden) DISPATCH_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_RANK_MAJOR)
@@ -1339,7 +1349,7 @@ __forceinline__ __device__ void logfmtCheckAmaxmin(uint8_t* metaBuffer, float2* 
     __syncwarp();
 }
 
-template <int kNumRecvUnrolls>
+template <int kNumRecvUnrolls, ncclDataType_t kTokenDtype = ncclBfloat16>
 __forceinline__ __device__ void decodeAndAccumulate(uint32_t* ldBuffer, float* accum,
                                                     const float& logAmax, const float& logAmin,
                                                     const bool& enableCast, const float& weight) {
@@ -1371,6 +1381,18 @@ __forceinline__ __device__ void decodeAndAccumulate(uint32_t* ldBuffer, float* a
                 accum[i * 16 + k * 3 + 2] += decode((concatData[k] >> 18) & 0x1ff, (localSigns >> (k * 3 + 2)) & 1) * weight;
             }
             accum[i * 16 + 15] += decode(concatData[5] & 0x1ff, (localSigns >> 15) & 1) * weight;
+        }
+    } else if constexpr (kTokenDtype == ncclFloat32) {
+        #pragma unroll
+        for (int k = 0; k < kNumRecvUnrolls * 4; ++ k) {
+            accum[k] += *reinterpret_cast<float*>(ldBuffer + k) * weight;
+        }
+    } else if constexpr (kTokenDtype == ncclFloat16) {
+        #pragma unroll
+        for (int k = 0; k < kNumRecvUnrolls * 4; ++ k) {
+            auto fp16Pack = *reinterpret_cast<__half2*>(ldBuffer + k);
+            accum[k * 2 + 0] += static_cast<float>(fp16Pack.x) * weight;
+            accum[k * 2 + 1] += static_cast<float>(fp16Pack.y) * weight;
         }
     } else {
         #pragma unroll
@@ -1641,7 +1663,7 @@ __forceinline__ __device__ void processAndSendToken(
     }
 }
 
-template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, ncclEpLayout_t kLayout, typename TopkIdxT>
+template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, ncclEpLayout_t kLayout, typename TopkIdxT, ncclDataType_t kTokenDtype = ncclBfloat16>
 __global__ __launch_bounds__(1024, 1) void combine(// INPUT
                                                    const void* inData,
                                                    const int* srcInfo,
@@ -1680,6 +1702,9 @@ __global__ __launch_bounds__(1024, 1) void combine(// INPUT
                                                    const ncclWindow_t* windows,
                                                    unsigned signalsBase,
                                                    uint64_t timeoutCycles) {
+    // Token dtype derivations
+    constexpr int kElemBytes = (kTokenDtype == ncclFloat32) ? 4 : 2;
+
     const auto smId = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto numSms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
     const auto threadId = static_cast<int>(threadIdx.x);
@@ -1693,14 +1718,14 @@ __global__ __launch_bounds__(1024, 1) void combine(// INPUT
     extern __shared__ __align__(1024) uint8_t smemBuffer[];
 
     // Data type staffs
-    constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
+    constexpr int kNumElemsPerInt4 = sizeof(int4) / kElemBytes;
     constexpr int64_t hiddenBf16Int4 = kHidden / kNumElemsPerInt4;
 
     // Use different unroll factors for send and recv phases
-    constexpr int kNumSendUnrolls = kHidden % (32 * 4 * sizeof(int4) / sizeof(nv_bfloat16)) == 0 ? 4 : 2;
+    constexpr int kNumSendUnrolls = kHidden % (32 * 4 * sizeof(int4) / kElemBytes) == 0 ? 4 : 2;
     constexpr int kNumRecvUnrolls = 2;
     constexpr int hiddenBf16Int4Pad = align(static_cast<int>(hiddenBf16Int4), 32 * kNumSendUnrolls);
-    EP_STATIC_ASSERT(kHidden % (32 * 2 * sizeof(int4) / sizeof(nv_bfloat16)) == 0, "Invalid hidden");
+    EP_STATIC_ASSERT(kHidden % (32 * 2 * sizeof(int4) / kElemBytes) == 0, "Invalid hidden");
     EP_STATIC_ASSERT(kNumSendUnrolls <= kNumMaxUnrolls and kNumRecvUnrolls <= kNumMaxUnrolls, "Invalid unrolls");
     EP_STATIC_ASSERT(hiddenBf16Int4 % kNumSendUnrolls == 0, "Invalid hidden");
     EP_STATIC_ASSERT(kNumSendUnrolls >= kNumRecvUnrolls, "Invalid unroll factors");
@@ -1709,7 +1734,7 @@ __global__ __launch_bounds__(1024, 1) void combine(// INPUT
     EP_STATIC_ASSERT(kHidden % 128 == 0, "Invalid hidden");
     constexpr int kNumDivisions = kHidden / 128;
     constexpr int kNumMetaBytes = kNumDivisions * sizeof(nv_bfloat162);
-    constexpr size_t numBytesPerSlot = kHidden * sizeof(nv_bfloat16) + kNumMetaBytes;
+    constexpr size_t numBytesPerSlot = kHidden * kElemBytes + kNumMetaBytes;
     EP_STATIC_ASSERT(numBytesPerSlot % sizeof(int4) == 0, "Invalid vectorization");
 
     // Sending phase
@@ -1898,8 +1923,8 @@ LOW_LATENCY_COMBINE_RECV:
     }
     cg::this_grid().sync();
 
-    // Reassign warp groups
-    constexpr int kMaxNumGroups = 2;
+    // Reassign warp groups; FP32 doubles SMEM per group, drop to 1 group to stay within limits
+    constexpr int kMaxNumGroups = (kElemBytes == 2) ? 2 : 1;
     const int numDecodeWarps = hiddenBf16Int4Pad / (kNumRecvUnrolls * 32);
     const int numGroups = min(kMaxNumGroups, (numThreads / 32) / (numDecodeWarps + 1));
     const int decodeWarpIdx = __shfl_sync(0xffffffff, warpId % (numDecodeWarps + 1), 0);
@@ -1911,11 +1936,11 @@ LOW_LATENCY_COMBINE_RECV:
 
     if (groupIdx < numGroups) {
         constexpr int kNumStages = 3;
-        constexpr int kNumTMABufferBytes = 16 * 2 + kHidden * 2;
-        constexpr int kNumBF16PerWarpBytes = 32 * kNumRecvUnrolls * kNumElemsPerInt4 * 2;
+        constexpr int kNumTMABufferBytes = 16 * 2 + kHidden * kElemBytes;
+        constexpr int kNumBF16PerWarpBytes = 32 * kNumRecvUnrolls * kNumElemsPerInt4 * kElemBytes;
         constexpr int kNumLogFMTPerWarpBytes = kNumBF16PerWarpBytes / 16 * 10;
         constexpr int kNumDivisionBytes = kNumDivisions * sizeof(uint32_t);
-        constexpr int kNumBytesPerGroup = kNumStages * kNumTMABufferBytes + kHidden * 2 + kNumStages * kNumDivisionBytes * 3;
+        constexpr int kNumBytesPerGroup = kNumStages * kNumTMABufferBytes + kHidden * kElemBytes + kNumStages * kNumDivisionBytes * 3;
 
         // Reallocate shared memory
         const auto smemGroupBuffer = smemBuffer + kNumBytesPerGroup * groupIdx;
@@ -1925,7 +1950,7 @@ LOW_LATENCY_COMBINE_RECV:
         auto tmaStBuffers = PatternVisitor([=](const int& i) { return reinterpret_cast<uint32_t*>(smemGroupBuffer + kNumStages * kNumTMABufferBytes + i * kNumBF16PerWarpBytes); });
 
         // Redundant when logfmt is disabled
-        const auto smemGroupPtr = smemGroupBuffer + kNumStages * kNumTMABufferBytes + kHidden * 2;
+        const auto smemGroupPtr = smemGroupBuffer + kNumStages * kNumTMABufferBytes + kHidden * kElemBytes;
         auto logAmaxBuffers  = PatternVisitor([=](const int& i) { return reinterpret_cast<float*>(smemGroupPtr + i * kNumDivisionBytes); });
         auto logAminBuffers  = PatternVisitor([=](const int& i) { return reinterpret_cast<float*>(smemGroupPtr + kNumStages * kNumDivisionBytes + i * kNumDivisionBytes); });
         auto castInfoBuffers = PatternVisitor([=](const int& i) { return reinterpret_cast<int*>  (smemGroupPtr + kNumStages * kNumDivisionBytes * 2 + i * kNumDivisionBytes); });
@@ -2027,7 +2052,7 @@ LOW_LATENCY_COMBINE_RECV:
                         int numCastedPrefix = info >> 1;
                         int tmaOffset = kNumLogFMTPerWarpBytes * numCastedPrefix + kNumBF16PerWarpBytes * (decodeWarpIdx - numCastedPrefix);
                         int divisionIdx = decodeWarpIdx * (kNumRecvUnrolls * 2) + laneId * kNumRecvUnrolls / 16;
-                        decodeAndAccumulate<kNumRecvUnrolls>(
+                        decodeAndAccumulate<kNumRecvUnrolls, kTokenDtype>(
                             reinterpret_cast<uint32_t*>(tmaLdBuffers[stageIdx] + tmaOffset +
                                                         (enableCast ? kNumLogFMTPerWarpBytes : kNumBF16PerWarpBytes) / 32 * laneId),
                             combinedData,
@@ -2037,7 +2062,7 @@ LOW_LATENCY_COMBINE_RECV:
                             topkWeight);
                     } else {
                         int tmaOffset = kNumBF16PerWarpBytes * decodeWarpIdx;
-                        decodeAndAccumulate<kNumRecvUnrolls>(
+                        decodeAndAccumulate<kNumRecvUnrolls, kTokenDtype>(
                             reinterpret_cast<uint32_t*>(tmaLdBuffers[stageIdx] + tmaOffset + kNumBF16PerWarpBytes / 32 * laneId),
                             combinedData,
                             0,
@@ -2054,8 +2079,17 @@ LOW_LATENCY_COMBINE_RECV:
 
                 #pragma unroll
                 for (int k = 0; k < kNumRecvUnrolls * 4; ++ k) {
-                    auto combinedPack = __nv_bfloat162(combinedData[k * 2], combinedData[k * 2 + 1]);
-                    tmaStBuffers[decodeWarpIdx][kNumRecvUnrolls * 4 * laneId + k] = *reinterpret_cast<uint32_t*>(&combinedPack);
+                    uint32_t packed;
+                    if constexpr (kTokenDtype == ncclFloat32) {
+                        packed = *reinterpret_cast<uint32_t*>(&combinedData[k]);
+                    } else if constexpr (kTokenDtype == ncclFloat16) {
+                        auto fp16Pack = __half2(__float2half(combinedData[k * 2]), __float2half(combinedData[k * 2 + 1]));
+                        packed = *reinterpret_cast<uint32_t*>(&fp16Pack);
+                    } else {
+                        auto bf16Pack = __nv_bfloat162(combinedData[k * 2], combinedData[k * 2 + 1]);
+                        packed = *reinterpret_cast<uint32_t*>(&bf16Pack);
+                    }
+                    tmaStBuffers[decodeWarpIdx][kNumRecvUnrolls * 4 * laneId + k] = packed;
                 }
                 tma_store_fence();
                 if (elect_one_sync()) {
@@ -2109,7 +2143,8 @@ void combine(const void* inData,
              int* rankMask,
              int* asyncErrorFlag,
              uint64_t timeoutCycles,
-             cudaStream_t stream) {
+             cudaStream_t stream,
+             ncclDataType_t token_dtype) {
     const int numWarpGroups = ceil_div(numExperts, numDeviceSms);
     const int numWarpsPerGroup = 32 / numWarpGroups;
     const int numRecvPerSm = ceil_div(numCombinedTokens, numDeviceSms);
@@ -2128,7 +2163,12 @@ void combine(const void* inData,
     EP_HOST_ASSERT(not (zeroCopy and useLogfmt));
 
     constexpr int kNumStages = 3;
-    constexpr int kMaxNumGroups = 2;
+    // Must mirror the kernel's group count exactly (see combine<> kMaxNumGroups):
+    // FP32 doubles per-stage token bytes, so it runs 1 group to stay within the
+    // device dynamic-SMEM cap; BF16/FP16 run 2. Computing 2 here for FP32 would
+    // over-request SMEM and fail cudaFuncSetAttribute at large hidden dims.
+    const int elemBytes = (token_dtype == ncclFloat32) ? 4 : 2;
+    const int kMaxNumGroups = (elemBytes == 2) ? 2 : 1;
 
     // Send buffer size
     const int numMetaBytes = hidden / 128 * 4;
@@ -2136,99 +2176,54 @@ void combine(const void* inData,
     const int smemSendSize = numWarps * (kNumStages * numSendTmaBytes + numMetaBytes);
 
     // Receive buffer size
-    const int numRecvTmaBytes = 16 + hidden * 2;
-    const int smemRecvSize = kMaxNumGroups * (kNumStages * numRecvTmaBytes + hidden * 2 + kNumStages * numMetaBytes * 3);
+    const int numRecvTmaBytes = 16 + hidden * elemBytes;
+    const int smemRecvSize = kMaxNumGroups * (kNumStages * numRecvTmaBytes + hidden * elemBytes + kNumStages * numMetaBytes * 3);
 
     // Total requirement
     const int smem_size = max(smemSendSize, smemRecvSize);
 
     SETUP_LAUNCH_CONFIG(numSms, numWarps * 32, stream);
-#define COMBINE_LAUNCH_CASE_IMPL(hidden, kLayout) { \
+#define COMBINE_LAUNCH_CASE_IMPL(hidden, kLayout, kTokenDtypeV) { \
 if (useLogfmt) { \
-    SET_SHARED_MEMORY_FOR_TMA((combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout, TopkIdxT>)); \
-    LAUNCH_KERNEL(&cfg, (combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout, TopkIdxT>), \
-                  inData, \
-                  srcInfo, \
-                  layoutRange, \
-                  inTopkIdx, \
-                  topkWeights, \
-                  rankMask, \
-                  asyncErrorFlag, \
-                  outData, \
-                  sendBuf, \
-                  recvBuf, \
-                  recvFlagBuf, \
-                  sendOff, \
-                  recvOff, \
-                  recvFlagOff, \
-                  atomicCleanFlag, \
-                  nextRecvCntBuf, \
-                  nextRecvCntBufSize, \
-                  waitStats, \
-                  numCombinedTokens, \
-                  hidden, \
-                  numTopk, \
-                  maxTokensPerRank, \
-                  numExperts, \
-                  currRank, \
-                  numRanks, \
-                  numWarpGroups, \
-                  numWarpsPerGroup, \
-                  phases, \
-                  zeroCopy, \
-                  numComms, \
-                  devComms, \
-                  windows, \
-                  signalsBase, \
-                  timeoutCycles); \
+    SET_SHARED_MEMORY_FOR_TMA((combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout, TopkIdxT, kTokenDtypeV>)); \
+    LAUNCH_KERNEL(&cfg, (combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout, TopkIdxT, kTokenDtypeV>), \
+                  inData, srcInfo, layoutRange, inTopkIdx, topkWeights, rankMask, asyncErrorFlag, outData, \
+                  sendBuf, recvBuf, recvFlagBuf, sendOff, recvOff, recvFlagOff, atomicCleanFlag, \
+                  nextRecvCntBuf, nextRecvCntBufSize, waitStats, numCombinedTokens, hidden, numTopk, \
+                  maxTokensPerRank, numExperts, currRank, numRanks, numWarpGroups, numWarpsPerGroup, \
+                  phases, zeroCopy, numComms, devComms, windows, signalsBase, timeoutCycles); \
 } else { \
-    SET_SHARED_MEMORY_FOR_TMA((combine<false, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout, TopkIdxT>)); \
-    LAUNCH_KERNEL(&cfg, (combine<false, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout, TopkIdxT>), \
-                  inData, \
-                  srcInfo, \
-                  layoutRange, \
-                  inTopkIdx, \
-                  topkWeights, \
-                  rankMask, \
-                  asyncErrorFlag, \
-                  outData, \
-                  sendBuf, \
-                  recvBuf, \
-                  recvFlagBuf, \
-                  sendOff, \
-                  recvOff, \
-                  recvFlagOff, \
-                  atomicCleanFlag, \
-                  nextRecvCntBuf, \
-                  nextRecvCntBufSize, \
-                  waitStats, \
-                  numCombinedTokens, \
-                  hidden, \
-                  numTopk, \
-                  maxTokensPerRank, \
-                  numExperts, \
-                  currRank, \
-                  numRanks, \
-                  numWarpGroups, \
-                  numWarpsPerGroup, \
-                  phases, \
-                  zeroCopy, \
-                  numComms, \
-                  devComms, \
-                  windows, \
-                  signalsBase, \
-                  timeoutCycles); \
+    SET_SHARED_MEMORY_FOR_TMA((combine<false, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout, TopkIdxT, kTokenDtypeV>)); \
+    LAUNCH_KERNEL(&cfg, (combine<false, hidden, kCombineMaxTopk, kCombineMaxUnrolls, kLayout, TopkIdxT, kTokenDtypeV>), \
+                  inData, srcInfo, layoutRange, inTopkIdx, topkWeights, rankMask, asyncErrorFlag, outData, \
+                  sendBuf, recvBuf, recvFlagBuf, sendOff, recvOff, recvFlagOff, atomicCleanFlag, \
+                  nextRecvCntBuf, nextRecvCntBufSize, waitStats, numCombinedTokens, hidden, numTopk, \
+                  maxTokensPerRank, numExperts, currRank, numRanks, numWarpGroups, numWarpsPerGroup, \
+                  phases, zeroCopy, numComms, devComms, windows, signalsBase, timeoutCycles); \
 } } break
-#define COMBINE_LAUNCH_CASE_RM(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_RANK_MAJOR)
-#define COMBINE_LAUNCH_CASE_EM(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR)
-    if (layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
-        SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_RM);
+#define COMBINE_LAUNCH_CASE_RM_BF16(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_RANK_MAJOR,   ncclBfloat16)
+#define COMBINE_LAUNCH_CASE_EM_BF16(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR, ncclBfloat16)
+#define COMBINE_LAUNCH_CASE_RM_FP16(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_RANK_MAJOR,   ncclFloat16)
+#define COMBINE_LAUNCH_CASE_EM_FP16(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR, ncclFloat16)
+#define COMBINE_LAUNCH_CASE_RM_FP32(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_RANK_MAJOR,   ncclFloat32)
+#define COMBINE_LAUNCH_CASE_EM_FP32(hidden) COMBINE_LAUNCH_CASE_IMPL(hidden, NCCL_EP_LAYOUT_EXPERT_MAJOR, ncclFloat32)
+    if (token_dtype == ncclFloat32) {
+        if (layout == NCCL_EP_LAYOUT_RANK_MAJOR) { SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_RM_FP32); }
+        else                                     { SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_EM_FP32); }
+    } else if (token_dtype == ncclFloat16) {
+        if (layout == NCCL_EP_LAYOUT_RANK_MAJOR) { SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_RM_FP16); }
+        else                                     { SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_EM_FP16); }
     } else {
-        SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_EM);
+        if (layout == NCCL_EP_LAYOUT_RANK_MAJOR) { SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_RM_BF16); }
+        else                                     { SWITCH_HIDDEN(COMBINE_LAUNCH_CASE_EM_BF16); }
     }
 #undef COMBINE_LAUNCH_CASE_IMPL
-#undef COMBINE_LAUNCH_CASE_RM
-#undef COMBINE_LAUNCH_CASE_EM
+#undef COMBINE_LAUNCH_CASE_RM_BF16
+#undef COMBINE_LAUNCH_CASE_EM_BF16
+#undef COMBINE_LAUNCH_CASE_RM_FP16
+#undef COMBINE_LAUNCH_CASE_EM_FP16
+#undef COMBINE_LAUNCH_CASE_RM_FP32
+#undef COMBINE_LAUNCH_CASE_EM_FP32
 }
 
 // ============================================================================
@@ -2429,7 +2424,7 @@ template void dispatch<int32_t>(
     int, int, int, int, int, int, int, int, bool, bool, bool, ncclEpLayout_t,
     ncclEpExpertIdKind_t,
     int, int, ncclDevComm*, const ncclWindow_t*, unsigned, void*, int,
-    int*, int*, uint64_t, bool, ncclWindow_t, size_t, cudaStream_t);
+    int*, int*, uint64_t, bool, ncclWindow_t, size_t, cudaStream_t, ncclDataType_t);
 
 template void dispatch<int64_t>(
     const void*, const int64_t*, const float*,
@@ -2438,21 +2433,21 @@ template void dispatch<int64_t>(
     int, int, int, int, int, int, int, int, bool, bool, bool, ncclEpLayout_t,
     ncclEpExpertIdKind_t,
     int, int, ncclDevComm*, const ncclWindow_t*, unsigned, void*, int,
-    int*, int*, uint64_t, bool, ncclWindow_t, size_t, cudaStream_t);
+    int*, int*, uint64_t, bool, ncclWindow_t, size_t, cudaStream_t, ncclDataType_t);
 
 template void combine<int32_t>(
     const void*, const int*, const int64_t*, const int32_t*, const float*,
     void*, void*, void*, int*, size_t, size_t, size_t, int*, int, int64_t*,
     int, int, int, int, int, int, int, bool, ncclEpLayout_t, int, bool,
     int, ncclDevComm*, const ncclWindow_t*, unsigned, void*, int,
-    int*, int*, uint64_t, cudaStream_t);
+    int*, int*, uint64_t, cudaStream_t, ncclDataType_t);
 
 template void combine<int64_t>(
     const void*, const int*, const int64_t*, const int64_t*, const float*,
     void*, void*, void*, int*, size_t, size_t, size_t, int*, int, int64_t*,
     int, int, int, int, int, int, int, bool, ncclEpLayout_t, int, bool,
     int, ncclDevComm*, const ncclWindow_t*, unsigned, void*, int,
-    int*, int*, uint64_t, cudaStream_t);
+    int*, int*, uint64_t, cudaStream_t, ncclDataType_t);
 
 } // namespace internode_ll
 

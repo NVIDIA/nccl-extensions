@@ -129,7 +129,6 @@ struct dispatch_config_t {
   bool forward_dispatch;
   bool device_side_sync;
   int s2d_inner_dim;    // flat: num_ranks_per_node, expert-major: num_topk
-  int token_data_type;  // 0 = uint8_t (FP8), 1 = uint16_t (BF16)
   int num_pipelines;
   int stages_per_pipeline;
   int sf_bytes_per_token; // total scale bytes per token (pre-computed on host)
@@ -390,7 +389,7 @@ struct dispatch_smem_layout_t {
   }
 };
 
-template<ncclEpLayout_t kLayout>
+template<ncclEpLayout_t kLayout, ncclDataType_t kTokenDtype>
 __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
   dispatch_smem_layout_t &layout,
   void* smem_base,
@@ -403,7 +402,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
   layout.stages_per_pipeline = config.stages_per_pipeline;
 
   // Token buffer (aligned to 128B for TMA) -- total stages unchanged
-  int token_size = (config.token_data_type == 0) ? 1 : 2;
+  const int token_size = nccl_ep::size_u8<kTokenDtype>();
   layout.token_buffer_stage_stride = model.hidden_dim * token_size;
   layout.token_buffer_stage_stride = (layout.token_buffer_stage_stride + 127) & ~127;
   layout.intra_node_token_buffer = reinterpret_cast<void*>(
@@ -434,7 +433,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
   }
 
   // Scaling factor buffer (only if FP8, 16B aligned) -- total stages unchanged
-  if (config.token_data_type == 0) {
+  if constexpr (nccl_ep::size_u8<kTokenDtype>() == sizeof(uint8_t)) {
     layout.sf_buffer_stage_stride = config.sf_bytes_per_token;
     layout.sf_buffer_stage_stride = (layout.sf_buffer_stage_stride + 15) & ~15;
     layout.intra_node_scaling_factor_buffer = reinterpret_cast<uint8_t*>(smem_base) + offset;
@@ -482,7 +481,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
   // PAD warp TMA slot: one zeroed token row, broadcast to padding slots.
   // Only allocated for expert-major; flat leaves the pointer null.
   if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-    int pad_bytes = model.hidden_dim * ((config.token_data_type == 0) ? 1 : 2);
+    int pad_bytes = model.hidden_dim * nccl_ep::size_u8<kTokenDtype>();
     layout.pad_tma_slot_bytes = (pad_bytes + 127) & ~127;
     offset = (offset + 127) & ~127;
     layout.pad_tma_buffer = reinterpret_cast<void*>(
@@ -495,14 +494,14 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
 
   return layout;
 }
-template<ncclEpLayout_t kLayout>
+template<ncclEpLayout_t kLayout, ncclDataType_t kTokenDtype>
 static size_t calculate_dispatch_smem_layout_size(
   const dispatch_config_t& config,
   const model_config_t& model)
 {
   size_t total_size = 0;
   const int num_pipelines = config.num_pipelines;
-  int token_size = (config.token_data_type == 0) ? 1 : 2;
+  const int token_size = nccl_ep::size_u8<kTokenDtype>();
 
   // Token buffer (aligned to 128B for TMA) -- total stages unchanged
   int token_buffer_stage_stride = model.hidden_dim * token_size;
@@ -523,7 +522,7 @@ static size_t calculate_dispatch_smem_layout_size(
   }
 
   // Scaling factor buffer (16B aligned per stage, only if FP8) -- total stages unchanged
-  if (config.token_data_type == 0) {
+  if constexpr (nccl_ep::size_u8<kTokenDtype>() == sizeof(uint8_t)) {
     int sf_buffer_stage_stride = config.sf_bytes_per_token;
     sf_buffer_stage_stride = (sf_buffer_stage_stride + 15) & ~15;
     total_size += config.num_of_stages * sf_buffer_stage_stride;
@@ -549,7 +548,7 @@ static size_t calculate_dispatch_smem_layout_size(
   }
   // PAD warp TMA slot (expert-major only, 128B aligned)
   if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-    int pad_bytes = model.hidden_dim * ((config.token_data_type == 0) ? 1 : 2);
+    int pad_bytes = model.hidden_dim * nccl_ep::size_u8<kTokenDtype>();
     pad_bytes = (pad_bytes + 127) & ~127;
     total_size = (total_size + 127) & ~127;
     total_size += pad_bytes;
@@ -559,6 +558,10 @@ static size_t calculate_dispatch_smem_layout_size(
   return total_size;
 }
 
+// kTokenDtype drives the per-stage token-buffer stride via the derived element width
+// (2 B for BF16/FP16, 4 B for FP32); everything else (prob, mbarriers, scales) is
+// element-width-invariant.
+template <ncclDataType_t kTokenDtype = ncclBfloat16>
 __device__ combine_smem_layout_t create_combine_smem_layout(
   combine_smem_layout_t &layout,
   void* smem_base,
@@ -582,24 +585,30 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
   // intra-node staging buffers. Skipping these buffers can cut SMEM roughly in half.
   const bool multinode = (model.num_of_nodes > 1);
 
-  // Calculate stage strides (in elements, not bytes)
-  layout.token_G2S_stage_stride = model.hidden_dim;
-  layout.token_S2G_stage_stride = model.hidden_dim;
+  // Per-token wire size: bytes for buffer offsets, uint16_t units for stage strides (the
+  // token buffer base is uint16_t*). FP32 doubles both vs BF16/FP16.
+  const int token_bytes = model.hidden_dim * nccl_ep::size_u8<kTokenDtype>();
+  const int token_stride_u16 = model.hidden_dim * nccl_ep::size_u16<kTokenDtype>();
+
+  // Stage strides in uint16_t units, so FP32 stages advance 2× and don't overlap.
+  layout.token_G2S_stage_stride = token_stride_u16;
+  layout.token_S2G_stage_stride = token_stride_u16;
   layout.prob_G2S_stage_stride = model.num_of_experts_per_rank * model.num_of_ranks_per_node;
   layout.prob_S2G_stage_stride = model.num_of_experts_per_rank * model.num_of_ranks_per_node;
   layout.prob_S2G_inter_stage_stride = layout.prob_S2G_stage_stride * model.num_of_nodes;
 
-  // intra_node_token_* buffers (128B aligned, multi-node only)
+  // intra_node_token_* buffers (128B aligned, multi-node only). Stage stride scales
+  // with the on-wire element width (2 B for BF16/FP16, 4 B for FP32).
   if (multinode) {
     align_offset(128);
   layout.intra_node_token_G2S_buffer = reinterpret_cast<uint16_t*>(
       reinterpret_cast<uint8_t*>(smem_base) + offset);
-    offset += num_of_stages_g2s * model.hidden_dim * sizeof(uint16_t);
+    offset += num_of_stages_g2s * token_bytes;
 
     align_offset(128);
   layout.intra_node_token_S2G_buffer = reinterpret_cast<uint16_t*>(
       reinterpret_cast<uint8_t*>(smem_base) + offset);
-    offset += num_of_stages_s2g * model.hidden_dim * sizeof(uint16_t);
+    offset += num_of_stages_s2g * token_bytes;
   } else {
     layout.intra_node_token_G2S_buffer = nullptr;
     layout.intra_node_token_S2G_buffer = nullptr;
@@ -609,13 +618,13 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
   align_offset(128);
   layout.inter_node_token_G2S_buffer = reinterpret_cast<uint16_t*>(
       reinterpret_cast<uint8_t*>(smem_base) + offset);
-  offset += num_of_stages_g2s * model.hidden_dim * sizeof(uint16_t);
+  offset += num_of_stages_g2s * token_bytes;
 
   // inter_node_token_S2G_buffer (128B aligned)
   align_offset(128);
   layout.inter_node_token_S2G_buffer = reinterpret_cast<uint16_t*>(
       reinterpret_cast<uint8_t*>(smem_base) + offset);
-  offset += num_of_stages_s2g * model.hidden_dim * sizeof(uint16_t);
+  offset += num_of_stages_s2g * token_bytes;
 
   // Prob buffers (only if backward_combine, 16B aligned)
   if (backward_combine) {
@@ -725,6 +734,7 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
 
 }
 
+template <ncclDataType_t kTokenDtype = ncclBfloat16>
 static size_t calculate_combine_smem_layout_size(
   int num_of_stages_g2s,
   int num_of_stages_s2g,
@@ -740,28 +750,30 @@ static size_t calculate_combine_smem_layout_size(
 
   // Compute max number of chunks per rank
   const int hidden_dim = model.hidden_dim;
+  const int token_bytes = hidden_dim * nccl_ep::size_u8<kTokenDtype>();  // per-token wire bytes
   const int max_num_of_chunks_per_rank = (max_num_of_tokens_per_rank +
                                           num_of_tokens_per_chunk - 1) /
                                          num_of_tokens_per_chunk;
   const bool multinode = (num_lsa_teams > 1);
 
-  // Token buffers (128B aligned for TMA)
+  // Token buffers (128B aligned for TMA). Stage stride scales with the wire element
+  // width (2 B for BF16/FP16, 4 B for FP32).
   // intra_node_token_* buffers (multi-node only)
   if (multinode) {
   total_size = (total_size + 127) & ~127;
-    total_size += num_of_stages_g2s * hidden_dim * sizeof(uint16_t);
+    total_size += num_of_stages_g2s * token_bytes;
 
   total_size = (total_size + 127) & ~127;
-    total_size += num_of_stages_s2g * hidden_dim * sizeof(uint16_t);
+    total_size += num_of_stages_s2g * token_bytes;
   }
 
   // inter_node_token_G2S_buffer
   total_size = (total_size + 127) & ~127;
-  total_size += num_of_stages_g2s * hidden_dim * sizeof(uint16_t);
+  total_size += num_of_stages_g2s * token_bytes;
 
   // inter_node_token_S2G_buffer
   total_size = (total_size + 127) & ~127;
-  total_size += num_of_stages_s2g * hidden_dim * sizeof(uint16_t);
+  total_size += num_of_stages_s2g * token_bytes;
 
   // Prob buffers (16B aligned, only if backward_combine)
   if (backward_combine) {
@@ -1720,7 +1732,7 @@ __forceinline__ __device__ void issue_g2s_entry(SMEM_TYPE* smem_buffer_ptr,
 //    * NOTE: Using single lane allows to ensure the ordering of TMA loads so
 //      they are aligned with the RED process.      
 template<bool INTER_NODE, bool BACKWARD_COMBINE, ncclEpLayout_t kLayout,
-         int HIDDEN_DIM, typename SMEM_TYPE>
+         int HIDDEN_DIM, ncclDataType_t kTokenDtype, typename SMEM_TYPE>
 __forceinline__ __device__ void issue_local_g2s_row(SMEM_TYPE* smem_buffer_ptr,
                                                     const int32_t* sparse_to_dense_row,
                                                     int s2d_entries,
@@ -1754,7 +1766,7 @@ __forceinline__ __device__ void issue_local_g2s_row(SMEM_TYPE* smem_buffer_ptr,
       rank_id = pending_entry_idx;
       slot = pending_s2d;
     }
-    const uint16_t* token_src = remote_expert_input_token[rank_id] + (slot * HIDDEN_DIM);
+    const uint16_t* token_src = remote_expert_input_token[rank_id] + (slot * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>());
     const float* prob_src = nullptr;
     if constexpr (BACKWARD_COMBINE) {
       prob_src = remote_expert_input_prob[rank_id] + (slot * (experts_per_rank * num_of_ranks_per_node));
@@ -1817,7 +1829,8 @@ template<typename SMEM_TYPE,
          int NUM_OF_BLOCKS,
          bool BACKWARD_COMBINE,
          int HIDDEN_DIM,
-         ncclEpLayout_t kLayout>
+         ncclEpLayout_t kLayout,
+         ncclDataType_t kTokenDtype>
 __forceinline__ __device__ void 
 combine_warps_G2S_intra(const int node_rank,
                         const int num_of_tokens_per_rank,
@@ -1860,7 +1873,8 @@ combine_warps_G2S_intra(const int node_rank,
   constexpr int WARP_SIZE = 32;
   const int lane_id = (int)(threadIdx.x & (WARP_SIZE - 1));
   constexpr int ring_len = NUM_OF_STAGES_G2S;
-  const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * sizeof(uint16_t));
+  // Wire token width: 2 B for BF16/FP16 (default), 4 B for FP32 NONE.
+  const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>()));
   const uint32_t prob_bytes =
       (uint32_t)((experts_per_rank * num_of_ranks_per_node) * sizeof(float));
 
@@ -1906,7 +1920,7 @@ combine_warps_G2S_intra(const int node_rank,
 
       // Warp-cooperative s2d-row scan with inline broadcast-issue; advances
       // global_offset by the number of entries issued. See issue_local_g2s_row.
-      issue_local_g2s_row</*INTER_NODE=*/false, BACKWARD_COMBINE, kLayout, HIDDEN_DIM>(
+      issue_local_g2s_row</*INTER_NODE=*/false, BACKWARD_COMBINE, kLayout, HIDDEN_DIM, kTokenDtype>(
           smem_buffer_ptr, sparse_to_dense_row, s2d_entries_g2s,
           global_offset, /*starting_G2S_index=*/0, ring_len, lane_id,
           remote_expert_input_token, remote_expert_input_prob,
@@ -1929,7 +1943,8 @@ template<typename INTRA_NODE_RED_GROUP,
          int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
          bool BACKWARD_COMBINE,
          int HIDDEN_DIM,
-         int LSA_TEAM_SIZE>
+         int LSA_TEAM_SIZE,
+         ncclDataType_t kTokenDtype>
 __forceinline__ __device__ void intra_node_red_warp_group_device_function(const int node_rank,
                                                                  const int num_of_tokens_per_rank,
                                                                  const int num_of_ranks_per_node,
@@ -2008,7 +2023,8 @@ __forceinline__ __device__ void intra_node_red_warp_group_device_function(const 
     const rdma_to_attn_map_load_t* rdma_to_attn_map_load_base_addr = reinterpret_cast<const rdma_to_attn_map_load_t*>(rdma_to_attn_map +
                                                                       (node_id * rdma_to_attn_map_size_per_node + chunk_id * NUM_OF_TOKENS_PER_CHUNK));
 
-    uint16_t* rdma_intra_node_red_token_base_ptr = rdma_intra_node_red_token + rdma_intra_node_red_id * HIDDEN_DIM;
+    // Per-token stride in uint16_t units: HIDDEN_DIM for BF16/FP16, 2*HIDDEN_DIM for FP32.
+    uint16_t* rdma_intra_node_red_token_base_ptr = rdma_intra_node_red_token + rdma_intra_node_red_id * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
     float* rdma_intra_node_red_prob_base_ptr;
     if constexpr(BACKWARD_COMBINE) {
       const int experts_per_node = experts_per_rank * num_of_ranks_per_node;
@@ -2077,13 +2093,15 @@ __forceinline__ __device__ void intra_node_red_warp_group_device_function(const 
             }
             arrive_and_wait(INTRA_NODE_RED_GROUP::size(), 1);
 
-            // Accumulate the register-resident token.
+            // Accumulate the register-resident token. NONE-FP16 reinterprets the same 4
+            // SMEM bytes as __half2 instead of __nv_bfloat162. NONE-FP32 reads a float2
+            // (8 SMEM bytes per slot) and skips precision conversion. Predicates are
+            // launch-uniform so branching costs nothing per warp.
             #pragma unroll
             for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD_INTRA; n++) {
               int element_id = (n * INTRA_NODE_RED_GROUP::size()) + INTRA_NODE_RED_GROUP::thread_rank();
               if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
-                __nv_bfloat162 src_data = load_token_base_ptr[element_id];
-                float2 src_data_fp32 = __bfloat1622float2(src_data);
+                float2 src_data_fp32 = nccl_ep::ld_token_pair<kTokenDtype>(load_token_base_ptr, element_id);
                 acc_token_fp32[n].x += src_data_fp32.x;
                 acc_token_fp32[n].y += src_data_fp32.y;
               }
@@ -2137,11 +2155,14 @@ __forceinline__ __device__ void intra_node_red_warp_group_device_function(const 
           arrive_and_wait(INTRA_NODE_RED_GROUP::size(), 1);
 
           // Store the register-resident token.
+          //   NONE-FP16: pack via __float22half2_rn into the same 4 SMEM bytes.
+          //   NONE-FP32: write float2 verbatim (8 SMEM bytes per slot) — no precision
+          //   conversion. TMA later copies bytes verbatim to global.
           #pragma unroll
           for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD_INTRA; n++) {
             int element_id = (n * INTRA_NODE_RED_GROUP::size()) + INTRA_NODE_RED_GROUP::thread_rank();
             if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
-              store_token_base_ptr[element_id] = __float22bfloat162_rn(acc_token_fp32[n]);
+              nccl_ep::st_token_pair<kTokenDtype>(store_token_base_ptr, element_id, acc_token_fp32[n]);
             }
           }
           // Store the token tail from the SMEM accumulator, or zeros if no tail element was touched.
@@ -2165,13 +2186,16 @@ __forceinline__ __device__ void intra_node_red_warp_group_device_function(const 
           // Warp 0 issues the S2G copies for this reduced destination token.
           if (INTRA_NODE_RED_GROUP::warp_rank() == 0) {
             if (cuda::ptx::elect_sync(~0)) {
-              uint16_t* current_token_addr = rdma_intra_node_red_token_base_ptr + (j * NUM_OF_TOKENS_PER_RDMA_TO_ATTN_LOAD_ITER + k) * HIDDEN_DIM;
+              // Wire token width: 4 B for FP32, 2 B for BF16/FP16. The global buffer base is
+              // uint16_t*, so the per-token stride is scaled into uint16_t units.
+              const size_t red_token_bytes = HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>());
+              uint16_t* current_token_addr = rdma_intra_node_red_token_base_ptr + (j * NUM_OF_TOKENS_PER_RDMA_TO_ATTN_LOAD_ITER + k) * red_token_bytes / sizeof(uint16_t);
               // Copy the reduced token from the S2G shared stage to the per-destination global buffer.
               cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
                                        cuda::ptx::space_shared,
                                        reinterpret_cast<void*>(current_token_addr),
                                        reinterpret_cast<const void*>(smem_buffer_ptr->get_intra_node_token_S2G(dst_token_stage)),
-                                       (uint32_t)(HIDDEN_DIM * sizeof(uint16_t)));
+                                       (uint32_t)(red_token_bytes));
 
               // Store the prob from shared to global(Optional).
               if constexpr(BACKWARD_COMBINE) {
@@ -2260,7 +2284,8 @@ template<typename INTER_NODE_RDMA_GROUP,
          int NUM_LSA_TEAMS,
          int NUM_OF_BLOCKS,
          bool BACKWARD_COMBINE,
-         int HIDDEN_DIM>
+         int HIDDEN_DIM,
+         ncclDataType_t kTokenDtype>
 __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const int local_rank,
                                                                  const int node_rank,
                                                                  const int num_of_tokens_per_rank,
@@ -2279,6 +2304,8 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const 
                                                                  SMEM_TYPE* smem_buffer_ptr,
                                                                  const int experts_per_rank)
 {
+  // Token RDMA offsets/sizes below scale by size_u8 (4 B for FP32, 2 B for BF16/FP16);
+  // prob is always float and is unaffected.
   // Load rdma_to_attn_map using LDG.128. Each token will need 1 bool from this map.
   using rdma_to_attn_map_load_t = uint4;
   static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
@@ -2341,6 +2368,8 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const 
       }
     }
     constexpr int STREAMING_BATCH = HYBRIDEP_COMBINE_RDMA_STREAMING_BATCH;
+    // Per-token wire bytes (compile-time): hidden x element width.
+    constexpr size_t token_bytes = static_cast<size_t>(HIDDEN_DIM) * nccl_ep::size_u8<kTokenDtype>();
     if constexpr(STREAMING_BATCH > 0) {
       // ---- STREAMING PATH: process tokens as reduction warp produces them ----
       // cumulative_sent tracks total active tokens across all chunks (no reset).
@@ -2366,15 +2395,13 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const 
 
             int batch_start_token = batch_start_in_chunk + chunk_id * NUM_OF_TOKENS_PER_CHUNK;
             size_t token_src_offset = smem_mr_info_ptr->rdma_intra_node_red_token_offset +
-                (rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) *
-                HIDDEN_DIM * sizeof(uint16_t);
+                (rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * token_bytes;
             size_t token_dst_offset = smem_mr_info_ptr->combine_rdma_inter_node_group_token_offset +
-                (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) *
-                HIDDEN_DIM * sizeof(uint16_t);
+                (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * token_bytes;
             net.put(rail, node_id,
                     nccl_internal_window, token_dst_offset,
                     nccl_token_window, token_src_offset,
-                    batch_count * HIDDEN_DIM * sizeof(uint16_t),
+                    batch_count * token_bytes,
                     ncclGin_None{}, ncclGin_None{}, ncclCoopThread());
 
             if constexpr(BACKWARD_COMBINE) {
@@ -2449,15 +2476,13 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(const 
           if (should_flush) {
             int batch_start_token = batch_start_in_chunk + chunk_id * NUM_OF_TOKENS_PER_CHUNK;
             size_t token_src_offset = smem_mr_info_ptr->rdma_intra_node_red_token_offset +
-                (rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) *
-                HIDDEN_DIM * sizeof(uint16_t);
+                (rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * token_bytes;
             size_t token_dst_offset = smem_mr_info_ptr->combine_rdma_inter_node_group_token_offset +
-                (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) *
-                HIDDEN_DIM * sizeof(uint16_t);
+                (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * token_bytes;
             net.put(rail, node_id,
                     nccl_internal_window, token_dst_offset,
                     nccl_token_window, token_src_offset,
-                    batch_count * HIDDEN_DIM * sizeof(uint16_t),
+                    batch_count * token_bytes,
                     ncclGin_None{}, ncclGin_None{}, ncclCoopThread());
 
             if constexpr(BACKWARD_COMBINE) {
@@ -2510,7 +2535,8 @@ template<typename SMEM_TYPE,
          bool BACKWARD_COMBINE,
          int HIDDEN_DIM,
          int LSA_TEAM_SIZE,
-         ncclEpLayout_t kLayout>
+         ncclEpLayout_t kLayout,
+         ncclDataType_t kTokenDtype>
 __forceinline__ __device__ void 
 combine_warps_G2S_inter(const int local_rank,
                         const int node_rank,
@@ -2589,7 +2615,7 @@ combine_warps_G2S_inter(const int local_rank,
   constexpr int WARP_SIZE = 32;
   const int lane_id = (int)(threadIdx.x & (WARP_SIZE - 1));
   const int ring_len = ending_G2S_index - starting_G2S_index;
-  const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * sizeof(uint16_t));
+  const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>()));
   const uint32_t prob_bytes =
       (uint32_t)((experts_per_rank * num_of_ranks_per_node) * sizeof(float));
 
@@ -2686,7 +2712,7 @@ combine_warps_G2S_inter(const int local_rank,
           // global_offset by the number of entries issued, keeping subsequent
           // reads (e.g. the RDMA tier below at NUM_LSA_TEAMS > 1) consistent on
           // every lane. See issue_local_g2s_row.
-          issue_local_g2s_row</*INTER_NODE=*/true, BACKWARD_COMBINE, kLayout, HIDDEN_DIM>(
+          issue_local_g2s_row</*INTER_NODE=*/true, BACKWARD_COMBINE, kLayout, HIDDEN_DIM, kTokenDtype>(
               smem_buffer_ptr, sparse_to_dense_row, s2d_entries,
               global_offset, starting_G2S_index, ring_len, lane_id,
               remote_expert_input_token, remote_expert_input_prob,
@@ -2752,7 +2778,7 @@ combine_warps_G2S_inter(const int local_rank,
                 const uint16_t* token_src = rdma_inter_node_group_token +
                                             (rdma_buffer_tile_id * MAX_NUM_OF_TOKENS_PER_RANK +
                                              i * NUM_OF_TOKENS_PER_CHUNK +
-                                             j * NUM_OF_TOKENS_PER_GROUP + k) * HIDDEN_DIM;
+                                             j * NUM_OF_TOKENS_PER_GROUP + k) * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
                 const float* prob_src = nullptr;
                 if constexpr (BACKWARD_COMBINE) {
                   prob_src = rdma_inter_node_group_prob +
@@ -2806,7 +2832,8 @@ template<typename SMEM_TYPE,
          int NUM_OF_TOKENS_PER_GROUP,
          bool BACKWARD_COMBINE,
          int HIDDEN_DIM,
-         int LSA_TEAM_SIZE>
+         int LSA_TEAM_SIZE,
+         ncclDataType_t kTokenDtype>
 __forceinline__ __device__ void inter_node_red_warp_group_device_function(const int node_rank,
                                                                  const int num_of_tokens_per_rank,
                                                                  const int num_real_tokens,
@@ -2901,7 +2928,11 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(const 
     if constexpr (NUM_LSA_TEAMS > 1) {
       attn_to_rdma_map_load_base_addr = attn_to_rdma_map + (i * NUM_OF_TOKENS_PER_CHUNK) * (NUM_LSA_TEAMS - 1);
     }
-    uint16_t* attn_output_token_base_ptr = attn_output_token + (i * NUM_OF_TOKENS_PER_CHUNK) * HIDDEN_DIM;
+    // Per-token stride: HIDDEN_DIM uint16_t units (BF16/FP16) or HIDDEN_DIM*2 (FP32).
+    // out_token_stride_u16 is the dtype-aware stride captured here.
+    const size_t elem_bytes = nccl_ep::size_u8<kTokenDtype>();
+    const size_t out_token_stride_u16 = (size_t)HIDDEN_DIM * elem_bytes / sizeof(uint16_t);
+    uint16_t* attn_output_token_base_ptr = attn_output_token + (size_t)(i * NUM_OF_TOKENS_PER_CHUNK) * out_token_stride_u16;
     float* attn_output_prob_base_ptr;
     if constexpr(BACKWARD_COMBINE) {
       attn_output_prob_base_ptr = attn_output_prob + (i * NUM_OF_TOKENS_PER_CHUNK) * (experts_per_rank * num_of_ranks_per_node * NUM_LSA_TEAMS);
@@ -2971,13 +3002,13 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(const 
             // named barrier: we wait for number of threads(all threads in the pipline) that must arrive before any can proceed
             arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank);
 
-            // Accumulate token and prob(optional).
+            // Accumulate token and prob(optional). NONE-FP16: reinterpret as __half2;
+            // NONE-FP32: read float2 directly (8 SMEM bytes per slot).
             #pragma unroll
             for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD; n++) {
               int element_id = (n * NUM_OF_THREADS_PER_PIPELINE) + thread_rank_within_pipeline;
               if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
-                __nv_bfloat162 src_data = load_token_base_ptr[element_id];
-                float2 src_data_fp32 = __bfloat1622float2(src_data);
+                float2 src_data_fp32 = nccl_ep::ld_token_pair<kTokenDtype>(load_token_base_ptr, element_id);
               acc_token_fp32[n].x += src_data_fp32.x;
               acc_token_fp32[n].y += src_data_fp32.y;
               }
@@ -3041,13 +3072,13 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(const 
             }
             arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank); // named barrier, we wait for number of threads that must arrive before any can proceed
 
-            // Accumulate token and prob(optional).
+            // Accumulate token and prob(optional). NONE-FP16: reinterpret as __half2;
+            // NONE-FP32: read float2 directly (8 SMEM bytes per slot).
             #pragma unroll
             for (int m = 0; m < NUM_OF_ACC_ELEMENTS_PER_THREAD; m++){
               int element_id = (m * NUM_OF_THREADS_PER_PIPELINE) + thread_rank_within_pipeline;
               if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN){
-                __nv_bfloat162 src_data = load_token_base_ptr[element_id];
-                float2 src_data_fp32 = __bfloat1622float2(src_data);
+                float2 src_data_fp32 = nccl_ep::ld_token_pair<kTokenDtype>(load_token_base_ptr, element_id);
               acc_token_fp32[m].x += src_data_fp32.x;
               acc_token_fp32[m].y += src_data_fp32.y;
               }
@@ -3100,12 +3131,14 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(const 
         arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank);
 
         // Store the token.
+        //   NONE-FP16: pack via __float22half2_rn into the same 4 SMEM bytes.
+        //   NONE-FP32: write float2 verbatim (8 SMEM bytes per slot).
+        // TMA later copies bytes verbatim to global so the wire dtype matches the kernel pack.
         #pragma unroll
         for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD; n++) {
           int element_id = (n * NUM_OF_THREADS_PER_PIPELINE) + thread_rank_within_pipeline;
           if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
-            // Convert accumulated token back to BF16 and store the result back to shared memory token entry.
-            store_token_base_ptr[element_id] = __float22bfloat162_rn(acc_token_fp32[n]);
+            nccl_ep::st_token_pair<kTokenDtype>(store_token_base_ptr, element_id, acc_token_fp32[n]);
           }
         }
         // Store the prob(optional).
@@ -3135,13 +3168,15 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(const 
         if (warp_rank_within_pipeline == 0) {
           int absolute_token_id = i * NUM_OF_TOKENS_PER_CHUNK + j * NUM_OF_TOKENS_PER_GROUP + k;
           if (cuda::ptx::elect_sync(~0) && absolute_token_id < num_real_tokens) {
-            uint16_t* current_token_addr = attn_output_token_base_ptr + (j * NUM_OF_TOKENS_PER_GROUP + k) * HIDDEN_DIM;
-            // Store the token from shared to global output.
+            // Per-token stride: HIDDEN_DIM uint16_t units (BF16/FP16) or HIDDEN_DIM*2 (FP32).
+            // out_token_stride_u16 is the dtype-aware stride captured above.
+            uint16_t* current_token_addr = attn_output_token_base_ptr + (size_t)(j * NUM_OF_TOKENS_PER_GROUP + k) * out_token_stride_u16;
+            // Store the token from shared to global output. Bytes scale with elem width.
             cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
                                      cuda::ptx::space_shared,
                                      reinterpret_cast<void*>(current_token_addr),
                                      reinterpret_cast<const void*>(smem_buffer_ptr->get_inter_node_token_S2G(dst_token_stage)),
-                                     (uint32_t)(HIDDEN_DIM * sizeof(uint16_t)));
+                                     (uint32_t)(HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>())));
 
             // Store the prob from shared to global output.
             if constexpr(BACKWARD_COMBINE) {
@@ -3263,7 +3298,7 @@ __forceinline__ __device__ void PAD_warp_group_device_function(
 }
 
 
-template<typename TOKEN_DATA_TYPE,
+template<ncclDataType_t kTokenDtype,
          typename INTER_NODE_GROUP,
          typename INTRA_NODE_G2S_GROUP,
          typename INTRA_NODE_S2G_GROUP,
@@ -3281,9 +3316,10 @@ template<typename TOKEN_DATA_TYPE,
          int HIDDEN_DIM,
          int SF_BYTES_PER_TOKEN>
 __device__ __forceinline__ void dispatch_kernel_impl(
-    const dispatch_kernel_param_t<TOKEN_DATA_TYPE, LSA_TEAM_SIZE>& param,
+    const dispatch_kernel_param_t<nccl_ep::wire_t<kTokenDtype>, LSA_TEAM_SIZE>& param,
     uint8_t* smem_bytes)
 {
+  using TOKEN_DATA_TYPE = nccl_ep::wire_t<kTokenDtype>;
   if constexpr (NUM_LSA_TEAMS != 1) {
     static_assert(INTER_NODE_GROUP::size() % 32 == 0 && INTER_NODE_GROUP::size() <= 64,
                   "Dispatch kernel supports 1 or 2 N2N warps.");
@@ -3301,7 +3337,6 @@ __device__ __forceinline__ void dispatch_kernel_impl(
   d_config.num_of_tokens_per_chunk = NUM_OF_TOKENS_PER_CHUNK;
   d_config.num_of_blocks = NUM_OF_BLOCKS;
   d_config.forward_dispatch = FORWARD_DISPATCH;
-  d_config.token_data_type = std::is_same_v<TOKEN_DATA_TYPE, uint16_t> ? 1 : 0;
   d_config.sf_bytes_per_token = SF_BYTES_PER_TOKEN;
   d_config.num_pipelines = NUM_PIPELINES;
   d_config.stages_per_pipeline = STAGES_PER_PIPELINE;
@@ -3311,7 +3346,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
   d_model.num_of_experts_per_rank = param.experts_per_rank;
   d_model.num_of_ranks_per_node = param.num_of_ranks_per_node;
   d_model.num_of_nodes = NUM_LSA_TEAMS;
-  create_dispatch_smem_layout<kLayout>(smem_layout, smem_bytes, d_config, d_model);
+  create_dispatch_smem_layout<kLayout, kTokenDtype>(smem_layout, smem_bytes, d_config, d_model);
   cur_smem_t* smem_buffer_ptr = &smem_layout;
 
   if (threadIdx.x == 0) {
@@ -3456,7 +3491,10 @@ template<// This type represent intra-node reduction warp group.
          bool BACKWARD_COMBINE,
          int HIDDEN_DIM,
          int LSA_TEAM_SIZE,
-         ncclEpLayout_t kLayout>
+         ncclEpLayout_t kLayout,
+         // NONE output dtype, resolved at compile time (JIT literal) so the per-element
+         // reduction branches fold away — BF16 (default) pays zero dtype-branch cost.
+         ncclDataType_t kTokenDtype = ncclBfloat16>
 // Each CUDA block of combine kernel has 5 warp groups and has the following layout:
 // 1. intra-node reduction warp group(4 warps, only valid for multinode scenario). 2. inter-node reduction warp group(4 warps, 1 pipeline for multinode scenario, 2 pipeline otherwise).
 // 3. intra-node G2S warp group(1 warp, only valid for multinode scenario). 4. inter-node G2S warp group(1 warp for multinode scenario, 2 warps otherwise). 5. inter-node N2N rdma warp group(1 warp, only valid for multinode scenario).
@@ -3498,7 +3536,9 @@ __device__ __forceinline__ void combine_kernel_impl(
     c_model.num_of_experts_per_rank = param.experts_per_rank;
     c_model.num_of_ranks_per_node = param.num_of_ranks_per_node;
     c_model.num_of_nodes = NUM_LSA_TEAMS;
-    create_combine_smem_layout(smem_layout,
+    // Layout derives the element width from kTokenDtype (FP32 doubles the per-stage
+    // token-buffer bytes vs BF16/FP16).
+    create_combine_smem_layout<kTokenDtype>(smem_layout,
                                smem_bytes,
                                NUM_OF_STAGES_G2S,
                                NUM_OF_STAGES_S2G,
@@ -3582,21 +3622,21 @@ __device__ __forceinline__ void combine_kernel_impl(
     // Intra-node reduction warp group.
       intra_node_red_warp_group_device_function
       <INTRA_NODE_RED_GROUP, cur_smem_t, NUM_OF_STAGES_G2S, NUM_OF_STAGES_S2G, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK,
-      NUM_LSA_TEAMS, NUM_OF_BLOCKS, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SIZE>
+      NUM_LSA_TEAMS, NUM_OF_BLOCKS, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SIZE, kTokenDtype>
       (param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.rdma_to_attn_map, param.rdma_intra_node_red_token, param.rdma_intra_node_red_prob, smem_buffer_ptr, param.experts_per_rank);
     }
   }else if (threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size()) {
     // Inter-node reduction warp group.
     inter_node_red_warp_group_device_function
     <cur_smem_t, INTER_NODE_RED_GROUP, NUM_OF_DATA_PIPELINE_PER_BLOCK, NUM_OF_STAGES_G2S, NUM_OF_STAGES_S2G, NUM_OF_TOKENS_PER_CHUNK,
-    NUM_LSA_TEAMS, NUM_OF_BLOCKS, NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SIZE>
+    NUM_LSA_TEAMS, NUM_OF_BLOCKS, NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SIZE, kTokenDtype>
     (param.node_rank, param.num_of_tokens_per_rank, param.num_real_tokens, param.num_of_ranks_per_node, param.rdma_to_attn_map, param.attn_to_rdma_map, param.attn_output_token, param.attn_output_prob, smem_buffer_ptr, param.experts_per_rank);
   }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size()){
     // Intra-node G2S warp group.
     if constexpr(NUM_LSA_TEAMS != 1) {
       combine_warps_G2S_intra
               <cur_smem_t, NUM_OF_STAGES_G2S, NUM_OF_TOKENS_PER_CHUNK, NUM_LSA_TEAMS, 
-                        NUM_OF_BLOCKS, BACKWARD_COMBINE, HIDDEN_DIM, kLayout> (
+                        NUM_OF_BLOCKS, BACKWARD_COMBINE, HIDDEN_DIM, kLayout, kTokenDtype> (
               param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node,
                          param.rdma_to_attn_map, param.sparse_to_dense_map, param.expert_input_token, 
                          param.expert_input_prob, smem_buffer_ptr, param.experts_per_rank, 
@@ -3607,7 +3647,7 @@ __device__ __forceinline__ void combine_kernel_impl(
     combine_warps_G2S_inter
            <cur_smem_t, INTER_NODE_G2S_GROUP, NUM_OF_STAGES_G2S, NUM_OF_TOKENS_PER_CHUNK, 
                      MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS,
-                     NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SIZE, kLayout>
+                     NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SIZE, kLayout, kTokenDtype>
            (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, 
             *param.expected_rdma_flag_value, param.rdma_to_attn_map, param.attn_to_rdma_map, 
             param.sparse_to_dense_map, param.expert_input_token, param.expert_input_prob,
@@ -3618,7 +3658,7 @@ __device__ __forceinline__ void combine_kernel_impl(
     // Inter-node rdma warp group.
     if constexpr(NUM_LSA_TEAMS != 1){
       inter_node_N2N_warp_group_device_function
-      <INTER_NODE_RDMA_GROUP, cur_smem_t, NUM_OF_STAGES_S2G, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, BACKWARD_COMBINE, HIDDEN_DIM>
+      <INTER_NODE_RDMA_GROUP, cur_smem_t, NUM_OF_STAGES_S2G, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, BACKWARD_COMBINE, HIDDEN_DIM, kTokenDtype>
       (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.rdma_to_attn_map,
        param.dcomms, param.token_window, param.prob_window, param.dest_window,
        param.num_gin_comms, param.num_ctx_per_comm, param.gin_base_ptr, param.signals_base, param.combine_signal_offset,
@@ -3862,23 +3902,22 @@ struct local_reduce_kernel_param_t {
 
 // Dynamic shared-memory bytes required by local_reduce_kernel_impl for the
 // given hidden_dim (token dtype is BF16/uint16_t).
-inline int local_reduce_dynamic_smem_bytes(int hidden_dim) {
+inline int local_reduce_dynamic_smem_bytes(int hidden_dim, int token_elem_bytes) {
   constexpr int kPipeDepth = NCCLEP_LOCAL_REDUCE_PIPE_DEPTH;
   constexpr int kOutStages = NCCLEP_LOCAL_REDUCE_OUT_STAGES;
-  return (kPipeDepth + kOutStages) * hidden_dim * static_cast<int>(sizeof(uint16_t))
+  return (kPipeDepth + kOutStages) * hidden_dim * token_elem_bytes
        + 2 * kPipeDepth * static_cast<int>(sizeof(uint64_t)) + 8;
 }
 
 template<typename T,
          int HIDDEN_DIM,
          int BLOCK_DIM,
-         bool BACKWARD_COMBINE>
+         bool BACKWARD_COMBINE,
+         ncclDataType_t kTokenDtype = ncclBfloat16>
 __device__ __forceinline__ void local_reduce_kernel_impl(
     const local_reduce_kernel_param_t<T>& p) {
-  static_assert(std::is_same<T, uint16_t>::value,
-                "local_reduce_kernel: T must be BF16 (uint16_t) for HT combine");
   static_assert(HIDDEN_DIM % 8 == 0,
-                "HIDDEN_DIM must be a multiple of 8 (uint4 = 8 BF16 per vector)");
+                "HIDDEN_DIM must be a multiple of 8 (uint4 = 8 elems @2 B / 4 @4 B per vector)");
   static_assert(BLOCK_DIM % 32 == 0 && BLOCK_DIM >= 64,
                 "BLOCK_DIM must be a multiple of 32 and at least 2 warps");
 
@@ -3890,8 +3929,8 @@ __device__ __forceinline__ void local_reduce_kernel_impl(
   constexpr int kConsThreads   = kConsWarpCount * 32;
   constexpr int kConsBarId     = 1;
 
-  // 8 BF16 = 4 __nv_bfloat162 = uint4 (16B vector load/store).
-  constexpr int VEC_DIM        = HIDDEN_DIM / 8;
+  // uint4 (16 B) holds 8 elems for 2-byte dtypes, 4 for FP32.
+  constexpr int VEC_DIM        = HIDDEN_DIM * static_cast<int>(sizeof(T)) / 16;
   constexpr int VEC_PER_THREAD = (VEC_DIM + kConsThreads - 1) / kConsThreads;
   constexpr int kTokenBytes    = HIDDEN_DIM * sizeof(T);
 
@@ -4025,12 +4064,27 @@ __device__ __forceinline__ void local_reduce_kernel_impl(
           const int e = n * kConsThreads + cons_tid;
           if (e < VEC_DIM) {
             uint4 v = in_vec[e];
-            const __nv_bfloat162* bf = reinterpret_cast<const __nv_bfloat162*>(&v);
-            #pragma unroll
-            for (int kk = 0; kk < 4; kk++) {
-              float2 f = __bfloat1622float2(bf[kk]);
-              acc[n][kk].x += f.x;
-              acc[n][kk].y += f.y;
+            if constexpr (nccl_ep::is_fp32<kTokenDtype>()) {
+              // uint4 == 4 FP32: accumulate into the first two acc lanes.
+              const float* sf = reinterpret_cast<const float*>(&v);
+              acc[n][0].x += sf[0]; acc[n][0].y += sf[1];
+              acc[n][1].x += sf[2]; acc[n][1].y += sf[3];
+            } else if constexpr (nccl_ep::is_fp16<kTokenDtype>()) {
+              const __half2* hf = reinterpret_cast<const __half2*>(&v);
+              #pragma unroll
+              for (int kk = 0; kk < 4; kk++) {
+                float2 f = __half22float2(hf[kk]);
+                acc[n][kk].x += f.x;
+                acc[n][kk].y += f.y;
+              }
+            } else {
+              const __nv_bfloat162* bf = reinterpret_cast<const __nv_bfloat162*>(&v);
+              #pragma unroll
+              for (int kk = 0; kk < 4; kk++) {
+                float2 f = __bfloat1622float2(bf[kk]);
+                acc[n][kk].x += f.x;
+                acc[n][kk].y += f.y;
+              }
             }
           }
         }
@@ -4055,9 +4109,19 @@ __device__ __forceinline__ void local_reduce_kernel_impl(
         const int e = n * kConsThreads + cons_tid;
         if (e < VEC_DIM) {
           uint4 out;
-          __nv_bfloat162* bf = reinterpret_cast<__nv_bfloat162*>(&out);
-          #pragma unroll
-          for (int kk = 0; kk < 4; kk++) bf[kk] = __float22bfloat162_rn(acc[n][kk]);
+          if constexpr (nccl_ep::is_fp32<kTokenDtype>()) {
+            float* of = reinterpret_cast<float*>(&out);
+            of[0] = acc[n][0].x; of[1] = acc[n][0].y;
+            of[2] = acc[n][1].x; of[3] = acc[n][1].y;
+          } else if constexpr (nccl_ep::is_fp16<kTokenDtype>()) {
+            __half2* oh = reinterpret_cast<__half2*>(&out);
+            #pragma unroll
+            for (int kk = 0; kk < 4; kk++) oh[kk] = __float22half2_rn(acc[n][kk]);
+          } else {
+            __nv_bfloat162* bf = reinterpret_cast<__nv_bfloat162*>(&out);
+            #pragma unroll
+            for (int kk = 0; kk < 4; kk++) bf[kk] = __float22bfloat162_rn(acc[n][kk]);
+          }
           out_vec[e] = out;
         }
       }
@@ -4303,7 +4367,7 @@ struct local_permute_reduce_param_t {
 // direct cached global loads, then write the packed bf16 result back to
 // flat_staging. HiddenInt4 = row_bytes / 16 is templated so the per-thread
 // strided element loop is a compile-time bound.
-template <int MaxTopK, int HiddenInt4>
+template <int MaxTopK, int HiddenInt4, ncclDataType_t kTokenDtype = ncclBfloat16>
 __device__ __forceinline__ void local_permute_reduce(
     uint8_t* __restrict__ flat_staging,
     const uint8_t* __restrict__ recv_x_em,
@@ -4401,13 +4465,31 @@ __device__ __forceinline__ void local_permute_reduce(
                     #pragma unroll
                     for (int u = 0; u < kHiddenVec; u++) {
                         if (!valid_u[u]) continue;
-                        const __nv_bfloat162* bf =
-                            reinterpret_cast<const __nv_bfloat162*>(&buf[u]);
-                        #pragma unroll
-                        for (int p = 0; p < 4; p++) {
-                            float2 f = __bfloat1622float2(bf[p]);
-                            acc[u][p].x += f.x;
-                            acc[u][p].y += f.y;
+                        // int4 holds 4 fp32 (one float per acc lane) or 8 2-byte
+                        // elements (4 packed pairs) depending on the wire dtype.
+                        if constexpr (nccl_ep::is_fp32<kTokenDtype>()) {
+                            const float* sf = reinterpret_cast<const float*>(&buf[u]);
+                            acc[u][0].x += sf[0];
+                            acc[u][0].y += sf[1];
+                            acc[u][1].x += sf[2];
+                            acc[u][1].y += sf[3];
+                        } else if constexpr (nccl_ep::is_fp16<kTokenDtype>()) {
+                            const __half2* hf = reinterpret_cast<const __half2*>(&buf[u]);
+                            #pragma unroll
+                            for (int p = 0; p < 4; p++) {
+                                float2 f = __half22float2(hf[p]);
+                                acc[u][p].x += f.x;
+                                acc[u][p].y += f.y;
+                            }
+                        } else {
+                            const __nv_bfloat162* bf =
+                                reinterpret_cast<const __nv_bfloat162*>(&buf[u]);
+                            #pragma unroll
+                            for (int p = 0; p < 4; p++) {
+                                float2 f = __bfloat1622float2(bf[p]);
+                                acc[u][p].x += f.x;
+                                acc[u][p].y += f.y;
+                            }
                         }
                     }
                 }
@@ -4416,10 +4498,24 @@ __device__ __forceinline__ void local_permute_reduce(
                 for (int u = 0; u < kHiddenVec; u++) {
                     if (!valid_u[u]) continue;
                     int4 out;
-                    __nv_bfloat162* obf = reinterpret_cast<__nv_bfloat162*>(&out);
-                    #pragma unroll
-                    for (int p = 0; p < 4; p++) {
-                        obf[p] = __float22bfloat162_rn(acc[u][p]);
+                    if constexpr (nccl_ep::is_fp32<kTokenDtype>()) {
+                        float* of = reinterpret_cast<float*>(&out);
+                        of[0] = acc[u][0].x;
+                        of[1] = acc[u][0].y;
+                        of[2] = acc[u][1].x;
+                        of[3] = acc[u][1].y;
+                    } else if constexpr (nccl_ep::is_fp16<kTokenDtype>()) {
+                        __half2* oh = reinterpret_cast<__half2*>(&out);
+                        #pragma unroll
+                        for (int p = 0; p < 4; p++) {
+                            oh[p] = __float22half2_rn(acc[u][p]);
+                        }
+                    } else {
+                        __nv_bfloat162* obf = reinterpret_cast<__nv_bfloat162*>(&out);
+                        #pragma unroll
+                        for (int p = 0; p < 4; p++) {
+                            obf[p] = __float22bfloat162_rn(acc[u][p]);
+                        }
                     }
                     // Keep the FLAT recv row in L2 for the host-side D2D
                     // that reads it next.

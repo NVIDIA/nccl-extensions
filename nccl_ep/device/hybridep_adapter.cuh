@@ -16,6 +16,7 @@
 #include <nccl.h>
 #include "nccl_device.h"
 #include "ep_enums.h"
+#include "common.hpp"
 
 namespace nccl_ep {
 namespace hybridep {
@@ -117,30 +118,13 @@ void dense_to_sparse_prob_combine(
     cudaStream_t stream);
 
 // ============================================================================
-// Switch macros for compile-time template instantiation
-// ============================================================================
-
-// Switch on token data type (BF16 = uint16_t, FP8 = uint8_t).
-// LSA team size and node count are now runtime parameters (no compile-time switching).
-#define HYBRIDEP_SWITCH_DATATYPE(use_fp8, ...) \
-    do { \
-        if (use_fp8) { \
-            using TOKEN_DATA_TYPE = uint8_t; \
-            __VA_ARGS__; \
-        } else { \
-            using TOKEN_DATA_TYPE = uint16_t; \
-            __VA_ARGS__; \
-        } \
-    } while(0)
-
-// ============================================================================
 // Preprocessing wrapper with template parameter resolution
 // ============================================================================
 
 // Helper to call metadata_preprocessing with resolved template parameters.
 // Caller must provide a pre-allocated scan temp buffer (see get_preprocessing_scan_tmp_size).
 // When alignment > 0, the kernel also fuses the expert-major remap pass.
-void call_metadata_preprocessing(
+ncclResult_t call_metadata_preprocessing(
     const uint8_t* global_routing_map,  // Already allgathered bitmap routing map
     int32_t* sparse_to_dense_map,       // Output: unified S2D — flat stores token->rank->slot; expert-major stores packed (rank, slot) entries
     bool* rdma_to_attn_map,             // Output: which tokens come from RDMA
@@ -264,7 +248,8 @@ void launch_combine_reduce(
     int row_bytes,
     int sm_count,
     unsigned int prolog_epilog_sms,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    ncclDataType_t token_dtype = ncclBfloat16);
 
 // ============================================================================
 // Memory region info structs for GIN
@@ -358,16 +343,18 @@ struct DispatchParams {
     int local_dup_num_sms = 0;
 };
 
-// Call dispatch kernel with runtime template parameter resolution
-void call_dispatch(
+// Call dispatch kernel with runtime template parameter resolution.
+// Returns ncclInvalidArgument if the dispatch SMEM exceeds the device limit.
+ncclResult_t call_dispatch(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank,    // Max tokens for buffer sizing
     int num_nodes,              // Number of nodes (RDMA domain size)
-    bool use_fp8,               // false = BF16 (uint16_t), true = FP8 (uint8_t)
+    bool use_fp8,               // true = FP8 (uint8_t); mutually exclusive with token_dtype != BF16
     bool forward_dispatch,      // True for forward, false for backward
     int num_blocks,             // Number of SMs/blocks for the kernel grid
     int sf_bytes_per_token,     // Total scale bytes per token (pre-computed on host)
-    cudaStream_t stream);
+    cudaStream_t stream,
+    ncclDataType_t token_dtype = ncclBfloat16);
 
 // ============================================================================
 // Combine wrapper with template parameter resolution
@@ -433,10 +420,10 @@ struct CombineParams {
     // EM unfused-combine: combine skips secondary em_slots; primaries hold the
     // pre-reduced sum written by local_reduce.
     bool combine_local_reduce_enabled = false;
+    ncclDataType_t token_dtype = ncclBfloat16;  // BF16/FP16/FP32 wire (NONE mode); ignored when use_fp8
 };
 
 // Call combine kernel with runtime template parameter resolution
-// Note: HT combine doesn't support FP8, only BF16
 void call_combine(
     const CombineParams& params,
     int max_dispatch_tokens_per_rank,    // Max tokens for buffer sizing
@@ -460,7 +447,8 @@ void call_local_dup(
     int           num_of_ranks_per_node,
     bool          forward_dispatch,
     int           num_blocks,
-    cudaStream_t  stream);
+    cudaStream_t  stream,
+    ncclDataType_t token_dtype = ncclBfloat16);
 
 // EM local-fanout: pre-sum secondaries into primaries before combine.
 void call_local_reduce(
@@ -474,7 +462,8 @@ void call_local_reduce(
     int            num_of_ranks_per_node,
     bool           backward_combine,
     int            num_blocks,
-    cudaStream_t   stream);
+    cudaStream_t   stream,
+    ncclDataType_t token_dtype = ncclBfloat16);
 
 } // namespace hybridep
 } // namespace nccl_ep

@@ -1020,6 +1020,14 @@ struct ValidationResult {
     std::string message;
 };
 
+// When true, generateRandomTopkIndicesLL() skips the random -1 masking that
+// simulates dropped tokens. Set once from --disable-token-dropping after option
+// parsing, before any topk generation. A file-scope flag (rather than a function
+// argument) keeps the real-run generation and the --validate regeneration paths
+// in lock-step, since the latter live inside validation helpers that do not
+// otherwise carry benchmark options.
+static bool g_disable_token_dropping = false;
+
 // Forward declaration (defined later in the file)
 void generateRandomTopkIndicesLL(
     int64_t* topk_idx_host,
@@ -3415,7 +3423,8 @@ void generateRandomTopkIndicesLL(
     // the distribution upper bound `num_tokens - 1` would underflow to
     // UINT_MAX on an unsigned 0, then index out-of-bounds into the empty
     // topk_idx_host buffer.
-    if (num_tokens > 0) {
+    // Skipped entirely under --disable-token-dropping for deterministic, drop-free runs.
+    if (num_tokens > 0 && !g_disable_token_dropping) {
         std::uniform_int_distribution<unsigned int> token_dist(0, num_tokens - 1);
         std::uniform_int_distribution<unsigned int> topk_dist(0, top_k - 1);
         for (int i = 0; i < 10; i++) {
@@ -3515,6 +3524,8 @@ void printUsage(const char* programName, int myRank) {
             "  --expert-id-kind <k>    Numbering for recv_topk_idx writes: auto|local|global (LL-RM/HT-FLAT only; "
             "default: auto)\n");
         printf("  --datatype <dtype>      Wire dtype for token tensors: bf16 (default), fp16, fp32\n");
+        printf("  --disable-token-dropping LL only: do not insert random -1 sentinels in the topk table\n");
+        printf("                          (drop-free, deterministic routing; useful for debugging/validation)\n");
         printf("  --help                  Show this help message\n");
     }
 }
@@ -3592,6 +3603,7 @@ int main(int argc, char* argv[]) {
         {"dispatch-quantization", required_argument, 0, 0},
         {"expert-id-kind", required_argument, 0, 1000},
         {"datatype", required_argument, 0, 0},
+        {"disable-token-dropping", no_argument, 0, 1001},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
@@ -3762,6 +3774,9 @@ int main(int argc, char* argv[]) {
                 MPI_Finalize();
                 return 1;
             }
+            break;
+        case 1001:  // --disable-token-dropping
+            g_disable_token_dropping = true;
             break;
         case 'h':
             printUsage(argv[0], myRank);
@@ -4129,7 +4144,8 @@ int main(int argc, char* argv[]) {
     } else {
         generateRandomTopkIndicesLL(topk_idx_host, num_tokens, num_experts, top_k, myRank);
         if (myRank == 0) {
-            printf("Using random topk_idx for LL mode (with -1 masking)\n\n");
+            printf("Using random topk_idx for LL mode (%s)\n\n",
+                   g_disable_token_dropping ? "token dropping disabled" : "with -1 masking");
         }
     }
 

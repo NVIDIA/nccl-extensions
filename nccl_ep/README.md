@@ -90,6 +90,9 @@ nccl_lib = NCCLLibrary()
 ### Reference performance numbers
 
 For microbenchmarking, NCCL EP provides the performance evaluation tool [`ep_bench`](ep_bench.cu).
+Run `ep_bench --help` for the full option list. For debugging, `--disable-token-dropping`
+makes Low-Latency runs route every token (no random `-1` sentinels in the topk table),
+giving deterministic, drop-free routing.
 
 Below, the reference performance numbers collected
 on NVIDIA H100 platform for Low-Latency mode

@@ -490,8 +490,13 @@ struct ncclEpGroup {
 
     int num_local_experts;    // Number of local experts (num_experts / comm->nRanks)
     int max_recv_tokens;      // Resolved per-rank IPC slot budget (= config.max_recv_tokens_per_rank).
-    unsigned int device_sm_count; // Number of SMs on the device
-    unsigned int max_num_sms; // Resolved SM count for EP kernels (from config.max_num_sms)
+
+    // SM-count configuration, all resolved once at ncclEpCreateGroup.
+    unsigned int device_sm_count;   // Number of SMs on the device
+    unsigned int comm_num_sms;      // Resolved SM count for EP kernels (from config.max_num_sms)
+    unsigned int prolog_epilog_sms; // Resolved SM count for the prolog/epilog kernels (local_dup, local_reduce).
+    unsigned int preprocess_num_sms;         // Resolved SM count for the preprocessing scan kernels (NCCL_EP_PREPROCESS_NUM_SMS).
+
     // HT EM dispatch/combine code path. Resolved once at ncclEpCreateGroup.
     enum class HtEmMode : uint8_t {
         kLocalPermute = 0,  // FLAT-dispatch + local_permute kernels
@@ -499,8 +504,6 @@ struct ncclEpGroup {
         kNvlinkDup    = 2,  // in-kernel Expert-major scatter (sender duplicates over NVLink)
     };
     HtEmMode ht_em_mode;
-    unsigned int prolog_epilog_sms; // Resolved SM count for the prolog/epilog kernels (local_dup, local_reduce).
-    int preprocess_num_sms;         // Resolved SM count for the preprocessing scan kernels (NCCL_EP_PREPROCESS_NUM_SMS).
 
     ncclEpAllocConfig_t alloc;
 
@@ -619,9 +622,10 @@ struct ncclEpGroup {
         num_local_experts(0),
         max_recv_tokens(0),
         device_sm_count(0),
-        max_num_sms(0),
-        ht_em_mode(HtEmMode::kLocalPermute),
+        comm_num_sms(0),
         prolog_epilog_sms(0),
+        preprocess_num_sms(0),
+        ht_em_mode(HtEmMode::kLocalPermute),
         alloc{},
         gpus_per_node(0),
         rank_in_node(0),
@@ -1191,7 +1195,7 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
     }
 
     int qps_per_rank = ep_group->config.num_qp_per_rank;
-    int min_required_ctx = ep_group->config.max_num_sms * HYBRIDEP_DISPATCH_N2N_WARPS;
+    int min_required_ctx = ep_group->comm_num_sms * HYBRIDEP_DISPATCH_N2N_WARPS;
     if (qps_per_rank == 0) qps_per_rank = min_required_ctx;
     if (qps_per_rank < min_required_ctx) {
         fprintf(stderr, "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d for dedicated N2N warp contexts\n",
@@ -1420,12 +1424,16 @@ ncclResult_t ncclEpCreateGroup(
     cudaDeviceProp device_prop = {};
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, ep_group->cuda_device_id));
     ep_group->device_sm_count = device_prop.multiProcessorCount;
+
+    // Resolve SM counts for EP kernels (dispatch, combine, preprocessing)
     if (in_config->max_num_sms == NCCL_EP_AUTO) {
         if (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
-            ep_group->max_num_sms = HYBRIDEP_MAX_NUM_SMS_PER_RANK;
+            ep_group->comm_num_sms = HYBRIDEP_MAX_NUM_SMS_PER_RANK;
         } else {
-            ep_group->max_num_sms = ep_group->device_sm_count;
+            ep_group->comm_num_sms = ep_group->device_sm_count;
         }
+        ep_group->prolog_epilog_sms = ep_group->device_sm_count;
+        ep_group->preprocess_num_sms = ep_group->device_sm_count;
     } else {
         if (in_config->max_num_sms > ep_group->device_sm_count) {
             fprintf(stderr, "Error: NCCL EP requires max_num_sms <= device_sm_count\n");
@@ -1442,15 +1450,12 @@ ncclResult_t ncclEpCreateGroup(
                 return ncclInvalidUsage;
             }
         }
-        ep_group->max_num_sms = in_config->max_num_sms;
+        ep_group->comm_num_sms = in_config->max_num_sms;
+        ep_group->prolog_epilog_sms = in_config->max_num_sms;
+        ep_group->preprocess_num_sms = in_config->max_num_sms;
     }
-    // Keep config in sync with the resolved value so consumers of ep_group->config.max_num_sms
-    // (e.g. the qps_per_rank validation in init_hybridep_internode) see the real count, not NCCL_EP_AUTO.
-    ep_group->config.max_num_sms = ep_group->max_num_sms;
 
-    // Prolog/epilog SM count: default to the device SM count, overridden by
-    // NCCL_EP_PROLOG_EPILOG_SMS when it is set to a value in [1, device_sm_count].
-    ep_group->prolog_epilog_sms = ep_group->device_sm_count;
+    // Override Prolog/epilog SM count if provided via environment
     if (ep_group->env.prolog_epilog_sms_set) {
         const long env_pe = ep_group->env.prolog_epilog_sms;
         if (env_pe > 0 && env_pe <= static_cast<long>(ep_group->device_sm_count)) {
@@ -1463,21 +1468,16 @@ ncclResult_t ncclEpCreateGroup(
         }
     }
 
-    // Preprocessing scan SM count: default to dispatch/combine's max_num_sms,
-    // overridden by NCCL_EP_PREPROCESS_NUM_SMS when it is set to a value in
-    // [1, HYBRIDEP_NUM_BLOCKS_PREPROCESSING_MAX]. The hard cap exists because
-    // the preprocessing tmp buffer is sized for that max at handle alloc time,
-    // so a larger value would overrun it.
-    ep_group->preprocess_num_sms = static_cast<int>(ep_group->max_num_sms);
+    // Override Preprocessing scan SM count if provided via environment
     if (ep_group->env.preprocess_num_sms_set) {
         const long env_pp = ep_group->env.preprocess_num_sms;
-        if (env_pp >= 1 && env_pp <= HYBRIDEP_NUM_BLOCKS_PREPROCESSING_MAX) {
+        if (env_pp >= 1 && env_pp <= ep_group->device_sm_count) {
             ep_group->preprocess_num_sms = static_cast<int>(env_pp);
         } else {
             fprintf(stderr,
                     "[nccl_ep] NCCL_EP_PREPROCESS_NUM_SMS=%ld out of range "
-                    "(must be in [1, %d]); using %d\n",
-                    env_pp, HYBRIDEP_NUM_BLOCKS_PREPROCESSING_MAX,
+                    "(must be in [1, %u]); using %u\n",
+                    env_pp, ep_group->device_sm_count,
                     ep_group->preprocess_num_sms);
         }
     }
@@ -1528,7 +1528,7 @@ ncclResult_t ncclEpCreateGroup(
 
 
     if (ep_group->config.num_qp_per_rank == NCCL_EP_AUTO) {
-        ep_group->config.num_qp_per_rank = ep_group->max_num_sms * HYBRIDEP_DISPATCH_N2N_WARPS;
+        ep_group->config.num_qp_per_rank = ep_group->comm_num_sms * HYBRIDEP_DISPATCH_N2N_WARPS;
     }
 
     // Resolve timeout_cycles: env var > config field > compile-time default
@@ -2135,7 +2135,11 @@ struct HtBlockLayout {
         const int s2d_inner_dim = (has_expert_major && !em_permute) ? num_topk : lsa_team_size;
         L.sz_s2d       = align256(static_cast<size_t>(rdma_team_size) * max_tokens * s2d_inner_dim * sizeof(int32_t));
         L.sz_rank_mask = align256(static_cast<size_t>(rdma_team_size) * max_tokens * lsa_team_size * nccl_ep::hybridep::get_rank_mask_elem_size(lsa_team_size));
-        L.sz_scan_tmp  = align256(nccl_ep::hybridep::get_preprocessing_scan_tmp_size(lsa_team_size));
+        // Size for device_sm_count blocks: the upper bound on the preprocessing
+        // scan's block count (ep_group->preprocess_num_sms, incl. any
+        // NCCL_EP_PREPROCESS_NUM_SMS override) so the buffer always fits.
+        L.sz_scan_tmp  = align256(nccl_ep::hybridep::get_preprocessing_scan_tmp_size(
+                             static_cast<int>(ep_group->device_sm_count), lsa_team_size));
         L.sz_prob      = !is_internode_available(ep_group) ?
                              align256(static_cast<size_t>(max_tokens) * num_experts * sizeof(float)) : 0;
         L.sz_topk_idx  = (num_topk > 0)
@@ -3029,7 +3033,7 @@ ncclResult_t ncclEpDispatch(
                     group->nccl_wins,
                     signal_base,
                     group->ep_workspace,
-                    group->max_num_sms,
+                    group->comm_num_sms,
                     group->mask_buffer,
                     group->async_error_flag,
                     group->timeout_cycles,
@@ -3349,7 +3353,7 @@ ncclResult_t ncclEpDispatch(
             group->rdma_team_size,
             use_fp8,
             forward_dispatch,
-            static_cast<int>(group->max_num_sms),
+            static_cast<int>(group->comm_num_sms),
             sf_bytes_per_token,
             stream,
             x->datatype
@@ -3748,7 +3752,7 @@ ncclResult_t ncclEpCombine(
                     handle->group->nccl_wins,
                     signal_base,
                     handle->group->ep_workspace,
-                    handle->group->max_num_sms,
+                    handle->group->comm_num_sms,
                     handle->group->mask_buffer,
                     handle->group->async_error_flag,
                     handle->group->timeout_cycles,
@@ -4071,7 +4075,7 @@ ncclResult_t ncclEpCombine(
             group->ht_aligned_max_tokens, // chunk-aligned stride
             group->rdma_team_size, // num_nodes (RDMA domain size)
             backward_combine, // backward mode flag
-            static_cast<int>(group->max_num_sms),
+            static_cast<int>(group->comm_num_sms),
             stream
         );
 

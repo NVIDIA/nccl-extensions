@@ -532,8 +532,8 @@ ncclResult_t call_metadata_preprocessing(
     return ncclSuccess;
 }
 
-size_t get_preprocessing_scan_tmp_size(int num_ranks_per_node) {
-    return HYBRIDEP_NUM_BLOCKS_PREPROCESSING * num_ranks_per_node * sizeof(::hybrid_ep::tmp_state_t);
+size_t get_preprocessing_scan_tmp_size(int num_blocks, int num_ranks_per_node) {
+    return static_cast<size_t>(num_blocks) * num_ranks_per_node * sizeof(::hybrid_ep::tmp_state_t);
 }
 
 size_t get_rank_mask_elem_size(int lsa_team_size) {

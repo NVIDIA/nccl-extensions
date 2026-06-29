@@ -167,7 +167,10 @@ ncclResult_t call_metadata_preprocessing(
 
 // Returns required size in bytes for the scan temp buffer used by call_metadata_preprocessing.
 // Caller must allocate at least this many bytes and pass the pointer to call_metadata_preprocessing.
-size_t get_preprocessing_scan_tmp_size(int num_ranks_per_node);
+// num_blocks must be >= the block count the scan is launched with (see the
+// preprocessing SM count resolved in ncclEpCreateGroup); size with the device
+// SM count to cover any NCCL_EP_PREPROCESS_NUM_SMS override.
+size_t get_preprocessing_scan_tmp_size(int num_blocks, int num_ranks_per_node);
 
 // Returns sizeof(rank_mask_t<ceil(lsa_team_size/64)>) for the given lsa_team_size.
 // Formula: ceil(lsa_team_size / 64) * sizeof(uint64_t).

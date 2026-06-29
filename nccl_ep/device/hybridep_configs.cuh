@@ -51,12 +51,6 @@
 // Preprocessing kernel configuration
 // ============================================================================
 #define HYBRIDEP_NUM_THREADS_PER_BLOCK_PREPROCESSING 512
-// Preprocessing scan (scan_flat / scan_em / em_scan_kernel) decoupled from
-// HYBRIDEP_MAX_NUM_SMS_PER_RANK so it can be sized larger than dispatch/combine.
-// The runtime block count is selected by NCCL_EP_PREPROCESS_NUM_SMS env var (capped
-// at this max); the preprocessing tmp buffer is allocated at this max.
-#define HYBRIDEP_NUM_BLOCKS_PREPROCESSING_MAX 128
-#define HYBRIDEP_NUM_BLOCKS_PREPROCESSING HYBRIDEP_NUM_BLOCKS_PREPROCESSING_MAX
 
 // Max local experts per rank for expert-major remap kernel register arrays (runtime-asserted).
 #define HYBRIDEP_MAX_LOCAL_EXPERTS_PER_RANK 64

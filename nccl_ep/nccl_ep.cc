@@ -1341,7 +1341,7 @@ static void showVersion() {
         // populated later in ncclEpCreateGroup.
         ncclEpEnvConfig cfg;
         nccl_ep_env_init(&cfg);
-        if (cfg.debug) {
+        if (nccl_ep_env_flag_on(cfg.debug)) {
             fprintf(stderr, "%s\n", NCCL_EP_VERSION_STRING);
         }
     });
@@ -1399,10 +1399,11 @@ ncclResult_t ncclEpCreateGroup(
     ep_group->config = *in_config;
 
     // Populate this group's environment configuration once; all of this
-    // group's handles read it back via the nccl_ep_env_* accessors. Print it
-    // when NCCL_EP_ENV_VERBOSE is set.
+    // group's handles read it back from ep_group->env. Dump it when
+    // NCCL_EP_ENV_VERBOSE is set.
     nccl_ep_env_init(&ep_group->env);
-    nccl_ep_env_print(ep_group->env);
+    if (nccl_ep_env_flag_on(ep_group->env.verbose))
+        nccl_ep_env_print(ep_group->env);
 
     ep_group->alloc.alloc_fn = default_alloc_fn;
     ep_group->alloc.free_fn  = default_free_fn;
@@ -1455,45 +1456,25 @@ ncclResult_t ncclEpCreateGroup(
         ep_group->preprocess_num_sms = in_config->max_num_sms;
     }
 
-    // Override comm SM count if provided via environment
-    if (ep_group->env.comm_num_sms_set) {
-        const long env_cs = ep_group->env.comm_num_sms;
-        if (env_cs >= 1 && env_cs <= ep_group->device_sm_count) {
-            ep_group->comm_num_sms = static_cast<unsigned int>(env_cs);
+    // Apply an env-provided SM-count override, validated against [1, device_sm_count].
+    // Out-of-range values are warned about and the resolved default is kept.
+    const unsigned int dev_sms = ep_group->device_sm_count;
+    auto apply_sms_override = [dev_sms, &env = ep_group->env](const ncclEpEnvVar& var,
+                                                              unsigned int& target) {
+        if (!var.is_set) return;
+        if (var.value.ul >= 1 && var.value.ul <= dev_sms) {
+            target = static_cast<unsigned int>(var.value.ul);
         } else {
             fprintf(stderr,
-                    "[nccl_ep] NCCL_EP_COMM_SMS=%ld out of range "
-                    "(must be in [1, %u]); using %u\n",
-                    env_cs, ep_group->device_sm_count, ep_group->comm_num_sms);
+                    "[nccl_ep] %s=%lu out of range (must be in [1, %u]); using %u\n",
+                    var.name, var.value.ul, dev_sms, target);
+            // Dump the full env configuration to help diagnose the misconfig.
+            nccl_ep_env_print(env);
         }
-    }
-
-    // Override Prolog/epilog SM count if provided via environment
-    if (ep_group->env.prolog_epilog_sms_set) {
-        const long env_pe = ep_group->env.prolog_epilog_sms;
-        if (env_pe > 0 && env_pe <= static_cast<long>(ep_group->device_sm_count)) {
-            ep_group->prolog_epilog_sms = static_cast<unsigned int>(env_pe);
-        } else if (env_pe != 0) {  // env_pe == 0 silently keeps the default
-            fprintf(stderr,
-                    "[nccl_ep] NCCL_EP_PROLOG_EPILOG_SMS=%ld out of range "
-                    "(expected 1..%u); keeping %u\n",
-                    env_pe, ep_group->device_sm_count, ep_group->prolog_epilog_sms);
-        }
-    }
-
-    // Override Preprocessing scan SM count if provided via environment
-    if (ep_group->env.preprocess_num_sms_set) {
-        const long env_pp = ep_group->env.preprocess_num_sms;
-        if (env_pp >= 1 && env_pp <= ep_group->device_sm_count) {
-            ep_group->preprocess_num_sms = static_cast<int>(env_pp);
-        } else {
-            fprintf(stderr,
-                    "[nccl_ep] NCCL_EP_PREPROCESS_NUM_SMS=%ld out of range "
-                    "(must be in [1, %u]); using %u\n",
-                    env_pp, ep_group->device_sm_count,
-                    ep_group->preprocess_num_sms);
-        }
-    }
+    };
+    apply_sms_override(ep_group->env.comm_num_sms, ep_group->comm_num_sms);
+    apply_sms_override(ep_group->env.prolog_epilog_sms, ep_group->prolog_epilog_sms);
+    apply_sms_override(ep_group->env.preprocess_num_sms, ep_group->preprocess_num_sms);
 
     // Determine number of nodes by gathering hostnames and counting unique ones
     constexpr size_t HOSTNAME_LEN = 256;
@@ -1554,8 +1535,8 @@ ncclResult_t ncclEpCreateGroup(
 
         uint64_t resolved = NUM_TIMEOUT_CYCLES;
         const char* source = "compile-time default";
-        const bool have_env_ms = ep_group->env.timeout_ms_set;
-        const uint64_t env_ms = ep_group->env.timeout_ms;
+        const bool have_env_ms = ep_group->env.timeout_ms.is_set;
+        const uint64_t env_ms = static_cast<uint64_t>(ep_group->env.timeout_ms.value.ul);
 
         if (have_env_ms) {
             resolved = clock_khz * 1000ULL * env_ms / 1000ULL;
@@ -1617,8 +1598,8 @@ ncclResult_t ncclEpCreateGroup(
     //   zero_copy, lsa > 1      -> kNvlinkDup    (sender duplicates per-expert over NVLink)
     //   zero_copy, lsa == 1     -> kLocalDup     (receiver-side fan-out via local_dup)
     {
-        const bool want_local_dup  = ep_group->env.ht_em_local_dup;
-        const bool want_nvlink_dup = ep_group->env.ht_em_nvlink_dup;
+        const bool want_local_dup  = nccl_ep_env_flag_on(ep_group->env.ht_em_local_dup);
+        const bool want_nvlink_dup = nccl_ep_env_flag_on(ep_group->env.ht_em_nvlink_dup);
         if (want_local_dup && want_nvlink_dup) {
             fprintf(stderr,
                     "NCCL EP: NCCL_EP_HT_EM_LOCAL_DUP and NCCL_EP_HT_EM_NVLINK_DUP are mutually exclusive\n");

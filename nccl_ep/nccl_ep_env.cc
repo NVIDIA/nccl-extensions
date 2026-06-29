@@ -12,95 +12,81 @@
 
 namespace {
 
-// Truthy values for boolean-style flags: "1"/"true"/"yes"/"on"
-// (case-insensitive), or any non-zero integer. Empty/unset => false.
-bool parse_truthy(const char* v) {
-    if (v == nullptr || v[0] == '\0') return false;
-    if (strcasecmp(v, "true") == 0 || strcasecmp(v, "yes") == 0 ||
-        strcasecmp(v, "on") == 0)
-        return true;
-    if (strcasecmp(v, "false") == 0 || strcasecmp(v, "no") == 0 ||
-        strcasecmp(v, "off") == 0)
-        return false;
-    return std::atol(v) != 0;
+// Parse a boolean flag environment variable into var (is_set + value.flag).
+// Accepts only "1"/"on"/"true" (=> true) or "0"/"off"/"false" (=> false),
+// case-insensitive. Unset/empty leaves it not-set; any other value is warned
+// about and also left not-set.
+void parse_flag(ncclEpEnvVar& var) {
+    const char* v = std::getenv(var.name);
+    if (v == nullptr || v[0] == '\0') return;  // unset -> is_set stays false
+    if (strcasecmp(v, "1") == 0 || strcasecmp(v, "on") == 0 ||
+        strcasecmp(v, "true") == 0) {
+        var.is_set = true;
+        var.value.flag = true;
+    } else if (strcasecmp(v, "0") == 0 || strcasecmp(v, "off") == 0 ||
+               strcasecmp(v, "false") == 0) {
+        var.is_set = true;
+        var.value.flag = false;
+    } else {
+        std::fprintf(stderr,
+                     "[nccl_ep] %s=%s ignored (expected 1/on/true or 0/off/false)\n",
+                     var.name, v);
+    }
+}
+
+// Parse an unsigned-long environment variable into var (is_set + value.ul).
+// Unset/empty leaves it not-set; otherwise the raw strtoul() value is stored
+// without interpretation — validity/range is the consumer's responsibility.
+void parse_ulong(ncclEpEnvVar& var) {
+    const char* v = std::getenv(var.name);
+    if (v == nullptr || v[0] == '\0') return;  // unset/empty -> not set
+    var.is_set = true;
+    var.value.ul = std::strtoul(v, nullptr, 10);
 }
 
 }  // namespace
 
 void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     if (cfg == nullptr) return;
-    *cfg = ncclEpEnvConfig{};  // reset to defaults before (re)reading
+    *cfg = ncclEpEnvConfig{};  // reset to defaults (re-binds the names) before reading
 
-    cfg->verbose = parse_truthy(std::getenv("NCCL_EP_ENV_VERBOSE"));
+    // Boolean flags: is_set means present-and-valid, value.flag holds the bool.
+    parse_flag(cfg->verbose);
+    parse_flag(cfg->debug);
+    parse_flag(cfg->ht_em_local_dup);
+    parse_flag(cfg->ht_em_nvlink_dup);
 
-    const char* dbg = std::getenv("NCCL_EP_DEBUG");
-    cfg->debug = (dbg != nullptr && dbg[0] != '\0');
-
-    if (const char* e = std::getenv("NCCL_EP_HT_EM_LOCAL_DUP"))
-        cfg->ht_em_local_dup = std::atol(e) != 0;
-    if (const char* e = std::getenv("NCCL_EP_HT_EM_NVLINK_DUP"))
-        cfg->ht_em_nvlink_dup = std::atol(e) != 0;
-
-    if (const char* e = std::getenv("NCCL_EP_TIMEOUT_MS")) {
-        const uint64_t ms = std::strtoull(e, nullptr, 10);
-        if (ms > 0) {
-            cfg->timeout_ms_set = true;
-            cfg->timeout_ms = ms;
-        }
-    }
-
-    if (const char* e = std::getenv("NCCL_EP_COMM_SMS")) {
-        cfg->comm_num_sms_set = true;
-        cfg->comm_num_sms = std::atol(e);
-    }
-
-    if (const char* e = std::getenv("NCCL_EP_PROLOG_EPILOG_SMS")) {
-        cfg->prolog_epilog_sms_set = true;
-        cfg->prolog_epilog_sms = std::atol(e);
-    }
-
-    if (const char* e = std::getenv("NCCL_EP_PREPROCESS_NUM_SMS");
-        e != nullptr && e[0] != '\0') {
-        cfg->preprocess_num_sms_set = true;
-        cfg->preprocess_num_sms = std::atol(e);
-    }
+    // Numeric (ulong) vars: is_set means present, value.ul holds the raw integer
+    // (no range checks here — consumers in nccl_ep.cc validate per their needs).
+    parse_ulong(cfg->timeout_ms);
+    parse_ulong(cfg->comm_num_sms);
+    parse_ulong(cfg->prolog_epilog_sms);
+    parse_ulong(cfg->preprocess_num_sms);
 }
 
 void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
-    if (!cfg.verbose) return;
+    // Every variable, so the user can see exactly what was provided. Adding a
+    // field to ncclEpEnvConfig only requires adding it to this list.
+    const ncclEpEnvVar* vars[] = {
+        &cfg.verbose, &cfg.debug, &cfg.ht_em_local_dup, &cfg.ht_em_nvlink_dup,
+        &cfg.timeout_ms, &cfg.comm_num_sms, &cfg.prolog_epilog_sms,
+        &cfg.preprocess_num_sms,
+    };
 
     std::fprintf(stderr, "[nccl_ep][env] NCCL EP environment configuration:\n");
-    std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_ENV_VERBOSE      = enabled\n");
-    std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_DEBUG            = %s\n",
-                 cfg.debug ? "enabled" : "unset");
-
-    if (cfg.timeout_ms_set)
-        std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_TIMEOUT_MS       = %llu ms\n",
-                     (unsigned long long)cfg.timeout_ms);
-    else
-        std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_TIMEOUT_MS       = unset "
-                             "(config / compile-time default)\n");
-
-    if (cfg.comm_num_sms_set)
-        std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_COMM_SMS         = %ld\n",
-                     cfg.comm_num_sms);
-    else
-        std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_COMM_SMS         = unset\n");
-
-    if (cfg.prolog_epilog_sms_set)
-        std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_PROLOG_EPILOG_SMS = %ld\n",
-                     cfg.prolog_epilog_sms);
-    else
-        std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_PROLOG_EPILOG_SMS = unset\n");
-
-    if (cfg.preprocess_num_sms_set)
-        std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_PREPROCESS_NUM_SMS = %ld\n",
-                     cfg.preprocess_num_sms);
-    else
-        std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_PREPROCESS_NUM_SMS = unset\n");
-
-    std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_HT_EM_LOCAL_DUP  = %s\n",
-                 cfg.ht_em_local_dup ? "on" : "off");
-    std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_HT_EM_NVLINK_DUP = %s\n",
-                 cfg.ht_em_nvlink_dup ? "on" : "off");
+    for (const ncclEpEnvVar* v : vars) {
+        if (!v->is_set) {
+            std::fprintf(stderr, "[nccl_ep][env]   %-28s = unset\n", v->name);
+            continue;
+        }
+        switch (v->type) {
+        case ncclEpEnvType::flag:
+            std::fprintf(stderr, "[nccl_ep][env]   %-28s = %s\n", v->name,
+                         v->value.flag ? "enabled" : "disabled");
+            break;
+        case ncclEpEnvType::ulong:
+            std::fprintf(stderr, "[nccl_ep][env]   %-28s = %lu\n", v->name, v->value.ul);
+            break;
+        }
+    }
 }

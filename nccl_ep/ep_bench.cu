@@ -2907,6 +2907,8 @@ void printUsage(const char* programName, int myRank) {
         printf("  --max-recv-token-slots-per-rank <N>  Per-rank recv-slot budget (0 = auto; HT default: FLAT=nRanks*tokens, Expert-major=nRanks*tokens*top_k)\n");
         printf("  --zcopy                 Use ncclMemAlloc buffers + windows for HT tensors that need peer access\n");
         printf("  --max-num-sms <N>       Maximum SMs for EP kernels (0 = auto, default: 0)\n");
+        printf("  --prolog-epilog-sms <N> SMs for the prolog/epilog kernels (0 = auto, default: 0)\n");
+        printf("  --preprocess-num-sms <N> SMs for the preprocessing scan kernels (0 = auto, default: 0)\n");
         printf("  --ht-em-mode <mode>     HT + Expert-major only: select the dispatch/combine code path (default: local_permute)\n"
                "                          local_permute: tokens are delivered in the FLAT layout (single instance per rank);\n"
                "                                         a separate permutation kernel then distributes each token to its\n"
@@ -2952,6 +2954,7 @@ int main(int argc, char* argv[]) {
     unsigned int max_num_sms = NCCL_EP_AUTO;  // Automatic SM assignment for different EP stages
     bool ht_em_local_dup = false;
     unsigned int prolog_epilog_sms = NCCL_EP_AUTO;  // 0 = auto (all SMs) for local EM permute kernels
+    unsigned int preprocess_num_sms = NCCL_EP_AUTO;  // 0 = auto for the preprocessing scan kernels
     bool mask_test = false;       // Simulate rank failures and test active-mask (LL only)
     bool include_uniform_less_than_max = false;
     bool include_non_uniform_tokens    = false;
@@ -2990,6 +2993,7 @@ int main(int argc, char* argv[]) {
         {"max-num-sms",    required_argument, 0, 'S'},
         {"ht-em-mode",     required_argument, 0, 'm'},
         {"prolog-epilog-sms", required_argument, 0, 'X'},
+        {"preprocess-num-sms", required_argument, 0, 'P'},
         {"mask-test",      no_argument,       0, 'T'},
         {"dispatch-less-than-max-tokens", required_argument, 0, 'l'},
         {"non-uniform-tokens", no_argument, 0, 'N'},
@@ -3003,7 +3007,7 @@ int main(int argc, char* argv[]) {
 
     int opt;
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "a:L:t:d:k:e:w:i:pnfUVDMA:R:zS:X:m:Tl:NIh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "a:L:t:d:k:e:w:i:pnfUVDMA:R:zS:X:P:m:Tl:NIh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'a':
                 if (strcmp(optarg, "ll") == 0 || strcmp(optarg, "low-latency") == 0) {
@@ -3100,6 +3104,9 @@ int main(int argc, char* argv[]) {
                 break;
             case 'X':
                 prolog_epilog_sms = static_cast<unsigned int>(atoi(optarg));
+                break;
+            case 'P':
+                preprocess_num_sms = static_cast<unsigned int>(atoi(optarg));
                 break;
             case 'T':
                 mask_test = true;
@@ -3426,6 +3433,11 @@ int main(int argc, char* argv[]) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%u", prolog_epilog_sms);
         setenv("NCCL_EP_PROLOG_EPILOG_SMS", buf, 1);
+    }
+    if (preprocess_num_sms != NCCL_EP_AUTO) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%u", preprocess_num_sms);
+        setenv("NCCL_EP_PREPROCESS_NUM_SMS", buf, 1);
     }
     config.alloc.alloc_fn = cudaAllocCallback;
     config.alloc.free_fn  = cudaFreeCallback;

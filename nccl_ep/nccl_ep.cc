@@ -22,6 +22,7 @@
 #include <nccl.h>
 #include <nccl_device.h>
 #include "nccl_ep.h"
+#include "nccl_ep_env.h"
 #include "common.hpp"
 
 // HT (High Throughput) includes
@@ -442,6 +443,11 @@ struct ncclEpGroup {
     size_t rdma_buffer_size_alloc;
     ncclEpGroupConfig_t config;         // Stored configuration
 
+    // Environment-variable configuration, populated once at group creation
+    // (nccl_ep_env_init) and read by this group's handles via the
+    // nccl_ep_env_* accessors.
+    ncclEpEnvConfig env;
+
     // HT inter-node RDMA stride: max_dispatch_tokens_per_rank rounded up to a whole
     // number of dispatch chunks so a partial final chunk stays within a node's region.
     int ht_aligned_max_tokens = 0;
@@ -494,6 +500,7 @@ struct ncclEpGroup {
     };
     HtEmMode ht_em_mode;
     unsigned int prolog_epilog_sms; // Resolved SM count for the prolog/epilog kernels (local_dup, local_reduce).
+    int preprocess_num_sms;         // Resolved SM count for the preprocessing scan kernels (NCCL_EP_PREPROCESS_NUM_SMS).
 
     ncclEpAllocConfig_t alloc;
 
@@ -1325,7 +1332,12 @@ ncclResult_t ncclEpGetVersion(int* version) {
 static void showVersion() {
     static std::once_flag once;
     std::call_once(once, []() {
-        if (const char* dbg = getenv("NCCL_EP_DEBUG"); dbg != nullptr && dbg[0] != '\0') {
+        // No EP group exists at library-load time, so read a transient config
+        // just to honor NCCL_EP_DEBUG for the banner. Per-group state is
+        // populated later in ncclEpCreateGroup.
+        ncclEpEnvConfig cfg;
+        nccl_ep_env_init(&cfg);
+        if (cfg.debug) {
             fprintf(stderr, "%s\n", NCCL_EP_VERSION_STRING);
         }
     });
@@ -1382,6 +1394,12 @@ ncclResult_t ncclEpCreateGroup(
     ep_group->comm = comm;
     ep_group->config = *in_config;
 
+    // Populate this group's environment configuration once; all of this
+    // group's handles read it back via the nccl_ep_env_* accessors. Print it
+    // when NCCL_EP_ENV_VERBOSE is set.
+    nccl_ep_env_init(&ep_group->env);
+    nccl_ep_env_print(ep_group->env);
+
     ep_group->alloc.alloc_fn = default_alloc_fn;
     ep_group->alloc.free_fn  = default_free_fn;
     if (in_config->alloc.alloc_fn || in_config->alloc.free_fn) {
@@ -1430,16 +1448,37 @@ ncclResult_t ncclEpCreateGroup(
     // (e.g. the qps_per_rank validation in init_hybridep_internode) see the real count, not NCCL_EP_AUTO.
     ep_group->config.max_num_sms = ep_group->max_num_sms;
 
+    // Prolog/epilog SM count: default to the device SM count, overridden by
+    // NCCL_EP_PROLOG_EPILOG_SMS when it is set to a value in [1, device_sm_count].
     ep_group->prolog_epilog_sms = ep_group->device_sm_count;
-    if (const char* env = std::getenv("NCCL_EP_PROLOG_EPILOG_SMS")) {
-        const long v = std::atol(env);
-        if (v > 0 && v <= static_cast<long>(ep_group->device_sm_count)) {
-            ep_group->prolog_epilog_sms = static_cast<unsigned int>(v);
-        } else if (v != 0) {
+    if (ep_group->env.prolog_epilog_sms_set) {
+        const long env_pe = ep_group->env.prolog_epilog_sms;
+        if (env_pe > 0 && env_pe <= static_cast<long>(ep_group->device_sm_count)) {
+            ep_group->prolog_epilog_sms = static_cast<unsigned int>(env_pe);
+        } else if (env_pe != 0) {  // env_pe == 0 silently keeps the default
             fprintf(stderr,
-                    "Warning: NCCL_EP_PROLOG_EPILOG_SMS=%s out of range "
-                    "(expected 0..%u); keeping prolog_epilog_sms=%u\n",
-                    env, ep_group->device_sm_count, ep_group->prolog_epilog_sms);
+                    "[nccl_ep] NCCL_EP_PROLOG_EPILOG_SMS=%ld out of range "
+                    "(expected 1..%u); keeping %u\n",
+                    env_pe, ep_group->device_sm_count, ep_group->prolog_epilog_sms);
+        }
+    }
+
+    // Preprocessing scan SM count: default to dispatch/combine's max_num_sms,
+    // overridden by NCCL_EP_PREPROCESS_NUM_SMS when it is set to a value in
+    // [1, HYBRIDEP_NUM_BLOCKS_PREPROCESSING_MAX]. The hard cap exists because
+    // the preprocessing tmp buffer is sized for that max at handle alloc time,
+    // so a larger value would overrun it.
+    ep_group->preprocess_num_sms = static_cast<int>(ep_group->max_num_sms);
+    if (ep_group->env.preprocess_num_sms_set) {
+        const long env_pp = ep_group->env.preprocess_num_sms;
+        if (env_pp >= 1 && env_pp <= HYBRIDEP_NUM_BLOCKS_PREPROCESSING_MAX) {
+            ep_group->preprocess_num_sms = static_cast<int>(env_pp);
+        } else {
+            fprintf(stderr,
+                    "[nccl_ep] NCCL_EP_PREPROCESS_NUM_SMS=%ld out of range "
+                    "(must be in [1, %d]); using %d\n",
+                    env_pp, HYBRIDEP_NUM_BLOCKS_PREPROCESSING_MAX,
+                    ep_group->preprocess_num_sms);
         }
     }
 
@@ -1502,17 +1541,15 @@ ncclResult_t ncclEpCreateGroup(
 
         uint64_t resolved = NUM_TIMEOUT_CYCLES;
         const char* source = "compile-time default";
-        const char* env_val = getenv("NCCL_EP_TIMEOUT_MS");
+        const bool have_env_ms = ep_group->env.timeout_ms_set;
+        const uint64_t env_ms = ep_group->env.timeout_ms;
 
-        if (env_val != nullptr) {
-            uint64_t ms = strtoull(env_val, nullptr, 10);
-            if (ms > 0) {
-                resolved = clock_khz * 1000ULL * ms / 1000ULL;
-                source = "NCCL_EP_TIMEOUT_MS env var";
-                if (ep_group->config.timeout_ns != 0 && ep_group->rank == 0)
-                    fprintf(stderr, "NCCL EP: NCCL_EP_TIMEOUT_MS=%lu overrides config.timeout_ns=%lu\n",
-                            (unsigned long)ms, (unsigned long)ep_group->config.timeout_ns);
-            }
+        if (have_env_ms) {
+            resolved = clock_khz * 1000ULL * env_ms / 1000ULL;
+            source = "NCCL_EP_TIMEOUT_MS env var";
+            if (ep_group->config.timeout_ns != 0 && ep_group->rank == 0)
+                fprintf(stderr, "NCCL EP: NCCL_EP_TIMEOUT_MS=%lu overrides config.timeout_ns=%lu\n",
+                        (unsigned long)env_ms, (unsigned long)ep_group->config.timeout_ns);
         } else if (ep_group->config.timeout_ns != 0) {
             resolved = clock_khz * 1000ULL *
                        (ep_group->config.timeout_ns / 1000000ULL) / 1000ULL;
@@ -1522,9 +1559,14 @@ ncclResult_t ncclEpCreateGroup(
         ep_group->timeout_cycles = resolved;
         if (ep_group->rank == 0) {
             uint64_t timeout_ms = resolved / (clock_khz * 1000ULL / 1000ULL);
+            char env_str[32];
+            if (have_env_ms)
+                snprintf(env_str, sizeof(env_str), "%llu", (unsigned long long)env_ms);
+            else
+                snprintf(env_str, sizeof(env_str), "unset");
             fprintf(stderr, "NCCL EP: using timeout=%llums (env=%s, config.timeout_ns=%llu, source=%s)\n",
                     (unsigned long long)timeout_ms,
-                    env_val ? env_val : "unset",
+                    env_str,
                     (unsigned long long)ep_group->config.timeout_ns,
                     source);
         }
@@ -1562,12 +1604,8 @@ ncclResult_t ncclEpCreateGroup(
     //   zero_copy, lsa > 1      -> kNvlinkDup    (sender duplicates per-expert over NVLink)
     //   zero_copy, lsa == 1     -> kLocalDup     (receiver-side fan-out via local_dup)
     {
-        auto env_truthy = [](const char* name) {
-            const char* v = std::getenv(name);
-            return v && std::atol(v) != 0;
-        };
-        const bool want_local_dup = env_truthy("NCCL_EP_HT_EM_LOCAL_DUP");
-        const bool want_nvlink_dup     = env_truthy("NCCL_EP_HT_EM_NVLINK_DUP");
+        const bool want_local_dup  = ep_group->env.ht_em_local_dup;
+        const bool want_nvlink_dup = ep_group->env.ht_em_nvlink_dup;
         if (want_local_dup && want_nvlink_dup) {
             fprintf(stderr,
                     "NCCL EP: NCCL_EP_HT_EM_LOCAL_DUP and NCCL_EP_HT_EM_NVLINK_DUP are mutually exclusive\n");
@@ -2298,44 +2336,6 @@ static ncclResult_t ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group
     return ncclSuccess;
 }
 
-// Scan kernels (scan_flat / scan_em / em_scan_kernel) can be untied from
-// dispatch/combine's max_num_sms via NCCL_EP_PREPROCESS_NUM_SMS=<N>. Falls back
-// to `default_sms` if unset/invalid. Hard cap is
-// HYBRIDEP_NUM_BLOCKS_PREPROCESSING_MAX (preprocessing tmp buffer is sized
-// for this max at handle alloc time, so larger values would overrun it).
-// Prints the resolved value once per process so the run log can confirm
-// the scan kernels actually launched with the requested SM count.
-static int get_scan_num_sms_override(int default_sms) {
-    const char* env = std::getenv("NCCL_EP_PREPROCESS_NUM_SMS");
-    static bool printed = false;
-    if (env == nullptr || *env == '\0') {
-        if (!printed) {
-            fprintf(stderr,
-                    "[nccl_ep] NCCL_EP_PREPROCESS_NUM_SMS not set; scan kernels using default %d SMs\n",
-                    default_sms);
-            printed = true;
-        }
-        return default_sms;
-    }
-    char* end = nullptr;
-    const long parsed = std::strtol(env, &end, 10);
-    if (end == env || *end != '\0' || parsed <= 0 ||
-        parsed > HYBRIDEP_NUM_BLOCKS_PREPROCESSING_MAX) {
-        fprintf(stderr,
-                "[nccl_ep] NCCL_EP_PREPROCESS_NUM_SMS='%s' ignored "
-                "(must be integer in [1, %d]); using %d\n",
-                env, HYBRIDEP_NUM_BLOCKS_PREPROCESSING_MAX, default_sms);
-        return default_sms;
-    }
-    if (!printed) {
-        fprintf(stderr,
-                "[nccl_ep] NCCL_EP_PREPROCESS_NUM_SMS=%ld accepted; scan kernels launching with %ld SMs (default would be %d)\n",
-                parsed, parsed, default_sms);
-        printed = true;
-    }
-    return static_cast<int>(parsed);
-}
-
 static ncclResult_t ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor_t* handle_mem, int num_topk) {
     assert(ep_group->config.max_dispatch_tokens_per_rank > 0 && "HT requires max_dispatch_tokens_per_rank > 0");
     assert(num_topk > 0 && "HT mode requires num_topk > 0 (pass top_k to ncclEpInitHandle)");
@@ -2690,7 +2690,7 @@ ncclResult_t ncclEpUpdateHandle(
         handle->hybridep.emuf_group_count,
         handle->hybridep.emuf_group_stride,
         handle->hybridep.emuf_max_groups,
-        get_scan_num_sms_override(static_cast<int>(ep_group->max_num_sms)),
+        ep_group->preprocess_num_sms,
         // EM cooperative scan scratch carved from ep_workspace.
         expert_major ? ep_group->ep_workspace : nullptr,
         // EM-permute mode: FLAT scan replaces scan_em and writes the unified

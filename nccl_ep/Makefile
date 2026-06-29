@@ -103,7 +103,7 @@ endif
 DEPFLAGS = -MMD -MP
 
 # Source files for library
-HOST_SRC := nccl_ep.cc
+HOST_SRC := nccl_ep.cc nccl_ep_env.cc
 DEVICE_SRC := device/low_latency.cu \
               device/hybridep_adapter.cu
 HOST_SRC += device/jit/jit_utils.cc \

@@ -47,6 +47,7 @@ set(NCCL_EP_LIBDIR "${NCCL_EP_BUILDDIR}/lib")
 # Source files
 set(NCCL_EP_HOST_SRC
     nccl_ep.cc
+    nccl_ep_env.cc
     device/jit/jit_utils.cc
     device/jit/jit_cache.cc
     device/jit/nvcc_compiler.cc

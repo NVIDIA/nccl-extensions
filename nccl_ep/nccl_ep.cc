@@ -1428,7 +1428,7 @@ ncclResult_t ncclEpCreateGroup(
     // Resolve SM counts for EP kernels (dispatch, combine, preprocessing)
     if (in_config->max_num_sms == NCCL_EP_AUTO) {
         if (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
-            ep_group->comm_num_sms = HYBRIDEP_MAX_NUM_SMS_PER_RANK;
+            ep_group->comm_num_sms = NCCL_EP_HT_DFLT_NUM_SMS;
         } else {
             ep_group->comm_num_sms = ep_group->device_sm_count;
         }
@@ -1453,6 +1453,19 @@ ncclResult_t ncclEpCreateGroup(
         ep_group->comm_num_sms = in_config->max_num_sms;
         ep_group->prolog_epilog_sms = in_config->max_num_sms;
         ep_group->preprocess_num_sms = in_config->max_num_sms;
+    }
+
+    // Override comm SM count if provided via environment
+    if (ep_group->env.comm_num_sms_set) {
+        const long env_cs = ep_group->env.comm_num_sms;
+        if (env_cs >= 1 && env_cs <= ep_group->device_sm_count) {
+            ep_group->comm_num_sms = static_cast<unsigned int>(env_cs);
+        } else {
+            fprintf(stderr,
+                    "[nccl_ep] NCCL_EP_COMM_SMS=%ld out of range "
+                    "(must be in [1, %u]); using %u\n",
+                    env_cs, ep_group->device_sm_count, ep_group->comm_num_sms);
+        }
     }
 
     // Override Prolog/epilog SM count if provided via environment

@@ -32,6 +32,9 @@ struct ncclEpEnvConfig {
     bool     timeout_ms_set = false;          // NCCL_EP_TIMEOUT_MS present and > 0
     uint64_t timeout_ms = 0;
 
+    bool     comm_num_sms_set = false;        // NCCL_EP_COMM_SMS present
+    long     comm_num_sms = 0;                // raw atol() value
+
     bool     prolog_epilog_sms_set = false;   // NCCL_EP_PROLOG_EPILOG_SMS present
     long     prolog_epilog_sms = 0;           // raw atol() value
 

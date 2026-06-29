@@ -49,6 +49,11 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
         }
     }
 
+    if (const char* e = std::getenv("NCCL_EP_COMM_SMS")) {
+        cfg->comm_num_sms_set = true;
+        cfg->comm_num_sms = std::atol(e);
+    }
+
     if (const char* e = std::getenv("NCCL_EP_PROLOG_EPILOG_SMS")) {
         cfg->prolog_epilog_sms_set = true;
         cfg->prolog_epilog_sms = std::atol(e);
@@ -75,6 +80,12 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
     else
         std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_TIMEOUT_MS       = unset "
                              "(config / compile-time default)\n");
+
+    if (cfg.comm_num_sms_set)
+        std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_COMM_SMS         = %ld\n",
+                     cfg.comm_num_sms);
+    else
+        std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_COMM_SMS         = unset\n");
 
     if (cfg.prolog_epilog_sms_set)
         std::fprintf(stderr, "[nccl_ep][env]   NCCL_EP_PROLOG_EPILOG_SMS = %ld\n",

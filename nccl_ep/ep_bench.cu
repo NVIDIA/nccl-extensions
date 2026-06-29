@@ -2949,9 +2949,7 @@ int main(int argc, char* argv[]) {
     size_t expert_major_alignment = 0;  // 0 = no padding; >1 aligns each expert zone
     unsigned int max_recv_tokens_per_rank = UINT_MAX;  // UINT_MAX = unset -> bench auto; 0 = lib auto (worst case)
     bool zcopy = false;  // Use ncclMemAlloc + windows for HT tensors that need peer access
-    unsigned int max_num_sms = NCCL_EP_AUTO;  // 0 = auto (resolved to HYBRIDEP_MAX_NUM_SMS_PER_RANK)
-    // HT EM only: when true, dedup token duplication on the receiver in a separate prolog kernel
-    // (default: forwarding rank duplicates tokens to per-expert slots over NVLink).
+    unsigned int max_num_sms = NCCL_EP_AUTO;  // Automatic SM assignment for different EP stages
     bool ht_em_local_dup = false;
     unsigned int prolog_epilog_sms = NCCL_EP_AUTO;  // 0 = auto (all SMs) for local EM permute kernels
     bool mask_test = false;       // Simulate rank failures and test active-mask (LL only)

@@ -386,6 +386,9 @@ __device__ __forceinline__ void assign_recv_slots(
     bool expert_major,
     bool out_is_int64,
     int max_recv_tokens_per_rank,
+    bool allow_overflow_drop,
+    bool* rdma_to_attn_map,
+    int rdma_to_attn_map_size_per_node,
     int32_t* token_to_recv_slot = nullptr,
     // EM-permute outputs (ENABLE_EM_PERMUTE only)
     int32_t* flat2em_slot_map = nullptr,
@@ -411,6 +414,8 @@ __device__ __forceinline__ void assign_recv_slots(
         bool token_needed_by_local_rank = false;
         int32_t local_rank_slot = -1;
         int32_t local_rank_prefix_after_scan = 0;
+        // Drop policy: track whether any destination slot for this token survived.
+        bool token_any_slot_kept = false;
 
 #pragma unroll NUM_RANK_TILES
         for (int tile = 0; tile < NUM_RANK_TILES; tile++) {
@@ -435,10 +440,14 @@ __device__ __forceinline__ void assign_recv_slots(
 
                 if (!expert_major && token_out_of_bound == 0 && src_local_rank == local_rank &&
                     rank < LSA_TEAM_SIZE) {
+                    // Drop policy: slot at/above capacity OOBs the recv buffer; mark -1.
+                    int32_t slot = final_ex_scan;
+                    if (allow_overflow_drop && slot >= max_recv_tokens_per_rank) slot = -1;
                     sparse_to_dense_map
                         [(src_lsa_team * tokens_per_rank + src_token_id) *
                              LSA_TEAM_SIZE +
-                         rank] = final_ex_scan;
+                         rank] = slot;
+                    if (slot != -1) token_any_slot_kept = true;
                 }
 
                 if (rank == local_rank) {
@@ -455,6 +464,13 @@ __device__ __forceinline__ void assign_recv_slots(
                 }
             }
             __syncwarp();
+        }
+
+        // Drop policy: clear combine gate for fully-dropped tokens to avoid combine deadlock.
+        if (!expert_major && allow_overflow_drop && token_out_of_bound == 0 &&
+            src_local_rank == local_rank && rank_mask.any() && !token_any_slot_kept) {
+            rdma_to_attn_map[src_lsa_team * rdma_to_attn_map_size_per_node +
+                             src_token_id] = false;
         }
 
         write_local_routing<ENABLE_PER_EXPERT_COUNTS, ENABLE_EM_PERMUTE>(
@@ -478,33 +494,40 @@ __device__ __forceinline__ void assign_recv_slots(
         if constexpr (ENABLE_EM_PERMUTE)
             __syncwarp();
 
-        // em-permute: persist per-global-token recv slot (-1 = no local-rank hit).
+        // em-permute: persist recv slot; -1 if no local hit or dropped.
         if (token_to_recv_slot != nullptr && token_out_of_bound == 0) {
-            token_to_recv_slot[current_token_id] = token_needed_by_local_rank ? local_rank_slot : -1;
+            int32_t slot = token_needed_by_local_rank ? local_rank_slot : -1;
+            if (allow_overflow_drop && slot >= max_recv_tokens_per_rank) slot = -1;
+            token_to_recv_slot[current_token_id] = slot;
         }
 
         if (!expert_major && current_token_id == g.num_of_total_attn_tokens - 1) {
-            if (local_rank_prefix_after_scan > max_recv_tokens_per_rank) {
+            const int32_t true_total = local_rank_prefix_after_scan;
+            const bool overflow = true_total > max_recv_tokens_per_rank;
+            if (overflow && !allow_overflow_drop) {
                 printf(
                     "ncclEpUpdateHandle: HT FLAT actual recv tokens %d > "
                     "max_recv_tokens_per_rank %d on (node %d local %d); "
-                    "increase ncclEpGroupConfig_t::max_recv_tokens_per_rank\n",
-                    local_rank_prefix_after_scan,
+                    "increase ncclEpGroupConfig_t::max_recv_tokens_per_rank "
+                    "or set ncclEpGroupConfig_t::overflow_policy = NCCL_EP_OVERFLOW_DROP\n",
+                    true_total,
                     max_recv_tokens_per_rank,
                     node_rank,
                     local_rank);
                 __trap();
             }
-            *num_of_tokens_for_experts = local_rank_prefix_after_scan;
+            // Internal count drives recv processing, so clamp to capacity (slots above
+            // it were dropped). recv_total_counter reports the true pre-drop total.
+            *num_of_tokens_for_experts = overflow ? max_recv_tokens_per_rank : true_total;
             // EM-permute reports the padded total via recv_total_counter (written
             // in scan_impl_flat's EM block); don't clobber it with the unpadded
             // FLAT count here.
             if constexpr (!ENABLE_EM_PERMUTE) {
                 if (recv_total_counter) {
                     if (out_is_int64) {
-                        *static_cast<int64_t*>(recv_total_counter) = static_cast<int64_t>(local_rank_prefix_after_scan);
+                        *static_cast<int64_t*>(recv_total_counter) = static_cast<int64_t>(true_total);
                     } else {
-                        *static_cast<int32_t*>(recv_total_counter) = local_rank_prefix_after_scan;
+                        *static_cast<int32_t*>(recv_total_counter) = true_total;
                     }
                 }
             }
@@ -765,6 +788,7 @@ __device__ __forceinline__ void scan_impl_flat(
     void* recv_total_counter,
     bool out_is_int64,
     int max_recv_tokens_per_rank,
+    bool allow_overflow_drop,
     int32_t* token_to_recv_slot,
     uint8_t* smem_bytes,
     // EM-permute inputs/outputs; ignored unless ENABLE_EM_PERMUTE.
@@ -879,6 +903,9 @@ __device__ __forceinline__ void scan_impl_flat(
         /*expert_major=*/false,
         out_is_int64,
         max_recv_tokens_per_rank,
+        allow_overflow_drop,
+        rdma_to_attn_map,
+        g.rdma_to_attn_map_size_per_node,
         token_to_recv_slot,
         flat2em_slot_map,
         em_top_k);
@@ -971,6 +998,7 @@ struct scan_flat_kernel_param_t {
     void* recv_total_counter;
     bool out_is_int64;
     int max_recv_tokens_per_rank;
+    bool allow_overflow_drop;     // NCCL_EP_OVERFLOW_DROP: drop overflowing tokens instead of trapping.
     int32_t* token_to_recv_slot;  // em-permute scratch; null otherwise.
 
     // ---- EM-permute fusion outputs (scan_impl_flat<ENABLE_EM_PERMUTE=true> only; null on FLAT path) ----
@@ -1011,6 +1039,9 @@ struct build_em_tables_param_t {
     int max_recv_tokens_per_rank;
     int em_alignment;
     int32_t* sparse_to_dense_map;
+    // NCCL_EP_OVERFLOW_DROP: combine gate; non-null (only under drop) lets the
+    // kernel clear it for fully-dropped send tokens. See allow_overflow_drop.
+    bool*    rdma_to_attn_map;
     bool*    local_expert_routing_map;
     int32_t* num_tokens_for_experts;
     int64_t* em_internal_offsets;
@@ -1030,6 +1061,8 @@ struct build_em_tables_param_t {
     const int32_t* token_to_recv_slot;
     int32_t* flat2em_slot_map;
     int      em_top_k;
+    // NCCL_EP_OVERFLOW_DROP: drop overflowing tokens instead of trapping.
+    bool     allow_overflow_drop;
 };
 
 template<int MAX_EXPERTS_PER_RANK, int LSA_TEAM_SIZE>
@@ -1047,6 +1080,8 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
     int32_t* g_block_count = p.gscratch;
 
     const int local_per_node_bytes = ((nrpn * epr) + 7) / 8;
+    // Matches the combine kernels' rdma_to_attn_map row padding (16 bools/node).
+    const int rdma_to_attn_map_size_per_node = (((p.num_tokens_per_rank - 1) / 16) + 1) * 16;
     const int tid       = threadIdx.x;
     const int lane      = tid & 31;
     const int warp      = tid >> 5;
@@ -1130,30 +1165,46 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
                     const int padded = (align > 1 && c > 0) ? ((c + align - 1) / align) * align : c;
                     s_offsets[d * epr + k] = cum;
                     if (write_em) {
+                        // Drop policy: clamp counts to budget; offsets unchanged so emit-phase slots still match.
+                        int rep_actual = c;
+                        int rep_padded = padded;
+                        if (p.allow_overflow_drop) {
+                            const int room = (cum < p.max_recv_tokens_per_rank)
+                                                 ? (p.max_recv_tokens_per_rank - cum) : 0;
+                            rep_actual = (c < room) ? c : room;
+                            rep_padded = (padded < room) ? padded : room;
+                        }
                         if (p.em_internal_offsets) p.em_internal_offsets[k] = cum;
-                        if (p.em_actual_counts_out) p.em_actual_counts_out[k] = c;
+                        if (p.em_actual_counts_out) p.em_actual_counts_out[k] = rep_actual;
                         if (p.out_is_int64) {
-                            if (p.em_padded_out_counts_i64) p.em_padded_out_counts_i64[k] = (int64_t)padded;
+                            if (p.em_padded_out_counts_i64) p.em_padded_out_counts_i64[k] = (int64_t)rep_padded;
                             if (p.em_out_offsets_i64) p.em_out_offsets_i64[k] = (int64_t)cum;
                         } else {
-                            if (p.em_padded_out_counts_i32) p.em_padded_out_counts_i32[k] = (int32_t)padded;
+                            if (p.em_padded_out_counts_i32) p.em_padded_out_counts_i32[k] = (int32_t)rep_padded;
                             if (p.em_out_offsets_i32) p.em_out_offsets_i32[k] = (int32_t)cum;
                         }
                     }
                     cum += padded;
                 }
-                if (cum > p.max_recv_tokens_per_rank) {
-                    printf("build_em_tables: dest %d padded slots %d > max_recv_tokens_per_rank %d\n",
-                           d, cum, p.max_recv_tokens_per_rank);
+                const int true_total = cum;
+                const bool overflow = true_total > p.max_recv_tokens_per_rank;
+                if (overflow && !p.allow_overflow_drop) {
+                    printf("build_em_tables: dest %d padded slots %d > "
+                           "max_recv_tokens_per_rank %d; "
+                           "increase ncclEpGroupConfig_t::max_recv_tokens_per_rank "
+                           "or set overflow_policy = NCCL_EP_OVERFLOW_DROP\n",
+                           d, true_total, p.max_recv_tokens_per_rank);
                     __trap();
                 }
                 if (write_em) {
-                    if (p.em_internal_offsets) p.em_internal_offsets[epr] = (int64_t)cum;
-                    if (p.num_tokens_for_experts) *p.num_tokens_for_experts = (int32_t)cum;
+                    // Clamp to capacity for internal processing; report true total externally.
+                    const int kept_total = overflow ? p.max_recv_tokens_per_rank : true_total;
+                    if (p.em_internal_offsets) p.em_internal_offsets[epr] = (int64_t)kept_total;
+                    if (p.num_tokens_for_experts) *p.num_tokens_for_experts = (int32_t)kept_total;
                     if (p.out_is_int64) {
-                        if (p.recv_total_counter_i64) *p.recv_total_counter_i64 = (int64_t)cum;
+                        if (p.recv_total_counter_i64) *p.recv_total_counter_i64 = (int64_t)true_total;
                     } else {
-                        if (p.recv_total_counter_i32) *p.recv_total_counter_i32 = (int32_t)cum;
+                        if (p.recv_total_counter_i32) *p.recv_total_counter_i32 = (int32_t)true_total;
                     }
                 }
             }
@@ -1180,6 +1231,8 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
         const uint8_t* row_local = nullptr;
         int send_idx = 0;
         bool is_our_send = false;
+        int src_node = 0;
+        int src_local_id = 0;
         if (any_hit) {
             row_local = p.input_routing_map + (size_t)tok * packed_row_bytes
                       + (size_t)p.node_rank * local_per_node_bytes;
@@ -1189,9 +1242,13 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
             const int lti = tok % p.num_tokens_per_rank;
             send_idx = sn * p.num_tokens_per_rank + lti;
             is_our_send = (slr == p.local_rank);
+            src_node = sn;
+            src_local_id = lti;
         }
 
         int my_packed_idx = 0;
+        // Drop policy: whether any local-node slot for this send token survived.
+        bool token_any_slot_kept = false;
         int primary_em_slot = -1;
         int n_local_sec = 0;
         int local_secondaries[MAX_EXPERTS_PER_RANK];
@@ -1226,11 +1283,13 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
                 if (my_hit) {
                     const int within = __popc(mask & ((1u << lane) - 1u));
                     const int em_slot = s_offsets[dle] + s_warp_state[warp * s_warp_stride + dle] + within;
+                    // Drop policy: slot at/above capacity would OOB recv buffer; mark dropped.
+                    const bool dropped = p.allow_overflow_drop && (em_slot >= p.max_recv_tokens_per_rank);
                     if (d == p.local_rank) {
-                        if (p.local_expert_routing_map) {
+                        if (p.local_expert_routing_map && !dropped) {
                             p.local_expert_routing_map[em_slot * epr + le] = true;
                         }
-                        if (p.emuf_group_buf != nullptr) {
+                        if (p.emuf_group_buf != nullptr && !dropped) {
                             if (primary_em_slot < 0) {
                                 primary_em_slot = em_slot;
                             } else {
@@ -1240,15 +1299,16 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
                         if (p.flat2em_slot_map && my_recv_s >= 0 &&
                             my_local_packed_idx < p.em_top_k) {
                             p.flat2em_slot_map[(size_t)my_recv_s * p.em_top_k + my_local_packed_idx] =
-                                em_slot;
+                                dropped ? -1 : em_slot;
                             my_local_packed_idx++;
                         }
                     }
                     if (is_our_send) {
                         if (p.sparse_to_dense_map) {
                             p.sparse_to_dense_map[(size_t)send_idx * p.s2d_inner_dim + my_packed_idx] =
-                                em_s2d_pack(d, em_slot);
+                                dropped ? -1 : em_s2d_pack(d, em_slot);
                         }
+                        if (!dropped) token_any_slot_kept = true;
                         my_packed_idx++;
                     }
                 }
@@ -1263,6 +1323,12 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
             for (int k = my_local_packed_idx; k < p.em_top_k; k++) {
                 p.flat2em_slot_map[(size_t)my_recv_s * p.em_top_k + k] = -1;
             }
+        }
+
+        // Drop policy: clear combine gate for fully-dropped send tokens; em-permute delegates this to FLAT scan.
+        if (p.allow_overflow_drop && p.rdma_to_attn_map != nullptr && p.sparse_to_dense_map != nullptr &&
+            is_our_send && my_packed_idx > 0 && !token_any_slot_kept) {
+            p.rdma_to_attn_map[src_node * rdma_to_attn_map_size_per_node + src_local_id] = false;
         }
 
         if (p.emuf_group_buf != nullptr && n_local_sec > 0) {

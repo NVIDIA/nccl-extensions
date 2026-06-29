@@ -232,6 +232,9 @@ typedef struct {
     // dispatch-output and combine-input tensors must be window-backed,
     // else ncclInvalidArgument. AUTO (zero-init default) resolves to OFF.
     ncclEpZeroCopyMode_t zero_copy;
+    // Policy on recv overflow (HT only). Zero-init default = NCCL_EP_OVERFLOW_AUTO
+    // (resolves to TRAP). NCCL_EP_OVERFLOW_DROP drops overflowing tokens and continues.
+    ncclEpOverflowPolicy_t overflow_policy;
 } ncclEpGroupConfig_t;
 
 #define NCCL_EP_GROUP_CONFIG_INIT \

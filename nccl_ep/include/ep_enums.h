@@ -17,6 +17,18 @@ typedef enum {
     NCCL_EP_ALGO_HIGH_THROUGHPUT = 1
 } ncclEpAlgorithm_t;
 
+// Policy applied when a rank receives more tokens than max_recv_tokens_per_rank.
+// HT only; ignored by LL.
+typedef enum {
+    // Zero-init default: resolves to NCCL_EP_OVERFLOW_TRAP.
+    NCCL_EP_OVERFLOW_AUTO = NCCL_EP_AUTO,
+    // Device trap (process abort) on recv overflow. Safe for capacity-planned deployments.
+    NCCL_EP_OVERFLOW_TRAP,
+    // Drop the overflowing tokens and continue. The per-rank true (pre-drop) recv
+    // total is reported via ncclEpLayoutInfo_t::recv_total_counter when provided.
+    NCCL_EP_OVERFLOW_DROP
+} ncclEpOverflowPolicy_t;
+
 /**
  * Dispatch output layout
  *

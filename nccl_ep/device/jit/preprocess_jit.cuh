@@ -62,7 +62,7 @@ inline std::string scan_flat_jit_source(
         << "      p.num_of_tokens_for_experts, p.local_expert_routing_map, p.per_expert_token_counts,\n"
         << "      p.node_rank, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank,\n"
         << "      p.recv_total_counter, p.out_is_int64, p.max_recv_tokens_per_rank,\n"
-        << "      p.token_to_recv_slot, smem_bytes";
+        << "      p.allow_overflow_drop, p.token_to_recv_slot, smem_bytes";
     if (enable_em_permute) {
         src << ",\n"
             << "      p.expert_scan_tmp, p.flat2em_slot_map, p.em_top_k, p.em_alignment, p.em_internal_offsets,\n"

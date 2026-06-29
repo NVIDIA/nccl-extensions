@@ -404,6 +404,7 @@ ncclResult_t call_metadata_preprocessing(
     int32_t* token_to_recv_slot,
     int32_t* flat2em_slot_map,
     int em_top_k,
+    bool allow_overflow_drop,
     cudaStream_t stream) {
     if (expert_major && per_expert_token_counts == nullptr) {
         std::fprintf(stderr, "[nccl_ep] EXPERT_MAJOR remap requires per_expert_token_counts != nullptr\n");
@@ -465,6 +466,7 @@ ncclResult_t call_metadata_preprocessing(
             sp.recv_total_counter = recv_total_counter;
             sp.out_is_int64 = out_is_int64;
             sp.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
+            sp.allow_overflow_drop = allow_overflow_drop;
             sp.token_to_recv_slot = nullptr;  // not needed: recv slot known at emit
             // EM-permute outputs.
             sp.expert_scan_tmp = expert_scan_tmp;
@@ -532,6 +534,10 @@ ncclResult_t call_metadata_preprocessing(
             // em-permute: scan_flat_kernel already wrote the unified s2d in
             // FLAT shape; suppress em_scan_kernel's EM-shape writes.
             em_permute ? nullptr : sparse_to_dense_map,
+            // Combine gate: em_scan_kernel clears it for fully-dropped send tokens
+            // in the non-permute path (where it owns the s2d); the null s2d above
+            // disables the clear under em-permute, leaving the gate to the FLAT scan.
+            rdma_to_attn_map,
             // em-permute: scan_flat_kernel already wrote the unified FLAT LERM;
             // suppress em_scan_kernel's EM-shape writes.
             em_permute ? nullptr : local_expert_routing_map,
@@ -552,6 +558,7 @@ ncclResult_t call_metadata_preprocessing(
             em_permute ? token_to_recv_slot : nullptr,
             em_permute ? flat2em_slot_map : nullptr,
             em_permute ? em_top_k : 0,
+            allow_overflow_drop,
             stream);
         return ncclSuccess;
     }
@@ -586,6 +593,7 @@ ncclResult_t call_metadata_preprocessing(
     sp.recv_total_counter = recv_total_counter;
     sp.out_is_int64 = out_is_int64;
     sp.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
+    sp.allow_overflow_drop = allow_overflow_drop;
     sp.token_to_recv_slot = nullptr;
 
     jit::launch_scan_flat(
@@ -636,6 +644,7 @@ void launch_build_em_tables(
     int max_recv_tokens_per_rank,
     int em_alignment,
     int32_t* sparse_to_dense_map,
+    bool* rdma_to_attn_map,
     bool* local_expert_routing_map,
     int32_t* num_tokens_for_experts,
     int64_t* em_internal_offsets,
@@ -653,6 +662,7 @@ void launch_build_em_tables(
     const int32_t* token_to_recv_slot,
     int32_t* flat2em_slot_map,
     int em_top_k,
+    bool allow_overflow_drop,
     cudaStream_t stream) {
     if (num_total_attn_tokens <= 0 || lsa_team_size <= 0 || experts_per_rank <= 0) return;
     assert((experts_per_rank & (experts_per_rank - 1)) == 0 && "experts_per_rank must be a power of two");
@@ -676,6 +686,9 @@ void launch_build_em_tables(
     p.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
     p.em_alignment             = em_alignment;
     p.sparse_to_dense_map      = sparse_to_dense_map;
+    // Drop policy: em_scan owns the combine gate here; pass the map only when
+    // dropping is enabled so the device side clears it for fully-dropped tokens.
+    p.rdma_to_attn_map         = allow_overflow_drop ? rdma_to_attn_map : nullptr;
     p.local_expert_routing_map = local_expert_routing_map;
     p.num_tokens_for_experts   = num_tokens_for_experts;
     p.em_internal_offsets      = em_internal_offsets;
@@ -695,6 +708,7 @@ void launch_build_em_tables(
     p.token_to_recv_slot       = token_to_recv_slot;
     p.flat2em_slot_map         = flat2em_slot_map;
     p.em_top_k                 = em_top_k;
+    p.allow_overflow_drop      = allow_overflow_drop;
 
     jit::launch_build_em_tables_jit(experts_per_rank, lsa_team_size, p, static_cast<int>(smem_bytes),
                                     num_sms, stream);

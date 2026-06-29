@@ -171,6 +171,9 @@ ncclResult_t call_metadata_preprocessing(
     int32_t* token_to_recv_slot = nullptr,
     int32_t* flat2em_slot_map = nullptr,
     int em_top_k = 0,
+    // NCCL_EP_OVERFLOW_DROP: drop tokens whose recv slot exceeds the budget
+    // instead of trapping on overflow.
+    bool allow_overflow_drop = false,
     cudaStream_t stream = 0);
 
 // Returns required size in bytes for the scan temp buffer used by call_metadata_preprocessing.
@@ -203,6 +206,7 @@ void launch_build_em_tables(
     int max_recv_tokens_per_rank,
     int em_alignment,
     int32_t* sparse_to_dense_map,
+    bool* rdma_to_attn_map,
     bool* local_expert_routing_map,
     int32_t* num_tokens_for_experts,
     int64_t* em_internal_offsets,
@@ -221,6 +225,7 @@ void launch_build_em_tables(
     const int32_t* token_to_recv_slot,
     int32_t* flat2em_slot_map,
     int em_top_k,
+    bool allow_overflow_drop,
     cudaStream_t stream);
 
 // The size of gscratch (ep_workspace) consumed by the EM scan

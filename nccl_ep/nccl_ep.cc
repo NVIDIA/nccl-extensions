@@ -2768,6 +2768,7 @@ ncclResult_t ncclEpUpdateHandle(
             em_permute_active ? handle->hybridep.token_to_recv_slot : nullptr,
             em_permute_active ? handle->hybridep.flat2em_slot_map : nullptr,
             em_permute_active ? handle->num_topk : 0,
+            ep_group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP,
             stream));
 
     return ncclSuccess;
@@ -3254,6 +3255,11 @@ ncclResult_t ncclEpDispatch(
             return ncclInvalidArgument;
         }
         NCCLCHECK(resolveTensorWindowBinding(group, recv_x, &recv_x_local, 0, &recv_x));
+        // HT dispatch indexes recv slots up to max_recv_tokens; recv_x must be large enough.
+        if (recv_x->ndim < 2 ||
+            recv_x->sizes[0] < static_cast<unsigned>(group->max_recv_tokens)) {
+            return ncclInvalidArgument;
+        }
         if (use_fp8) {
             recv_scales = tensor_ptr(outputs->scales);
             if (recv_scales == nullptr) {

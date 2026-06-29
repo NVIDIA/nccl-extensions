@@ -99,9 +99,15 @@ run_ep_bench_layout_size_sweep() {
   done
 }
 
-# LL: all three NONE-mode dtypes at the full hidden dim.
-EP_BENCH_DATATYPES=(bf16 fp16 fp32)
+# LL bf16/fp16: full hidden, full batch range.
+EP_BENCH_DATATYPES=(bf16 fp16)
+EP_BENCH_TOKEN_SIZES=(128 256 1024 4096)
 EP_BENCH_HIDDEN=7168
+run_ep_bench_layout_size_sweep low-latency em rm
+# LL fp32: 4 B/elem -> cap the max batch at 2048 (half of 4096) to keep the
+# per-rank byte footprint on par with the 16-bit runs.
+EP_BENCH_DATATYPES=(fp32)
+EP_BENCH_TOKEN_SIZES=(128 256 1024 2048)
 run_ep_bench_layout_size_sweep low-latency em rm
 # Token-distribution variants stay at the canonical LL batch size (cover the variant axis,
 # not the size axis — already swept above).
@@ -109,8 +115,9 @@ run_ep_bench_variants low-latency 128
 
 # High-throughput ep_bench (set NCCL_EP_BENCH_HT=1 to run; off by default — cluster-dependent)
 if [[ "${NCCL_EP_BENCH_HT:-0}" == "1" ]]; then
-  # bf16/fp16 at the full hidden dim.
+  # bf16/fp16 at the full hidden dim, full batch range.
   EP_BENCH_DATATYPES=(bf16 fp16)
+  EP_BENCH_TOKEN_SIZES=(128 256 1024 4096)
   EP_BENCH_HIDDEN=7168
   run_ep_bench_layout_size_sweep high-throughput fl em
   run_ep_bench_variants high-throughput 4096
@@ -123,7 +130,10 @@ if [[ "${NCCL_EP_BENCH_HT:-0}" == "1" ]]; then
   # hidden=3584 gives the SAME per-token byte footprint as the 16-bit hidden=7168 runs
   # (3584*4 == 7168*2 == 14336 B) — both an apples-to-apples comparison and a guaranteed
   # SMEM fit. (Dispatch SMEM scales with hidden, not tokens, so hidden is the knob.)
+  # fp32: hidden halved to 3584 (dispatch SMEM cap) and batch capped at 2048
+  # (4 B/elem), matching the fp32 batch used everywhere else.
   EP_BENCH_DATATYPES=(fp32)
+  EP_BENCH_TOKEN_SIZES=(128 256 1024 2048)
   EP_BENCH_HIDDEN=3584
   run_ep_bench_layout_size_sweep high-throughput fl em
 fi

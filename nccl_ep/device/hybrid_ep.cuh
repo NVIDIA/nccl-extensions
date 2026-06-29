@@ -91,11 +91,11 @@ __forceinline__ __device__ unsigned dispatch_tail_signal_id(
 }
 
 // Byte offset (from the packed inter-node receive region start) of one source slot's chunk.
-// Packed layout is [tile_id][token-in-tile], each entry bytes_per_entry (token + prob + sf).
+// Packed layout is [remote_only_node_id][token-in-slot], each entry bytes_per_entry (token + prob + sf).
 __forceinline__ __device__ size_t dispatch_packed_entry_offset(
-    const dispatch_memory_region_info_t* mr, int tile_id, int chunk_first_token) {
+    const dispatch_memory_region_info_t* mr, int remote_only_node_id, int chunk_first_token) {
   return mr->rdma_inter_node_group_packed_offset +
-         (static_cast<size_t>(tile_id) * mr->max_tokens_per_dest +
+         (static_cast<size_t>(remote_only_node_id) * mr->max_tokens_per_dest +
           static_cast<size_t>(chunk_first_token)) * mr->bytes_per_entry;
 }
 
@@ -186,6 +186,9 @@ constexpr uint32_t EM_S2D_SLOT_MASK = (1u << EM_S2D_SLOT_BITS) - 1u;
 // Slot field must hold values up to MAX_SUPPORTED_TOKENS_PER_RANK; -1 sentinel must not collide.
 static_assert(MAX_SUPPORTED_TOKENS_PER_RANK < (1 << EM_S2D_SLOT_BITS),
               "MAX_SUPPORTED_TOKENS_PER_RANK exceeds em_s2d slot field width");
+
+// s2d-map double-buffer depth: consume one stage while prefetching the next (chunk, node) row.
+constexpr int S2D_MAP_RING_STAGES = 2;
 
 __host__ __device__ __forceinline__
 int32_t em_s2d_pack(int rank_id, int slot) {
@@ -376,13 +379,13 @@ struct dispatch_smem_layout_t {
     return get_intra_node_mbarrier_consumer(pipeline_id * stages_per_pipeline + local_stage);
   }
 
-  // Per-pipeline s2d_map accessors: each pipeline has its own 2 ping-pong stages
+  // Per-pipeline s2d_map accessors: each pipeline has its own S2D_MAP_RING_STAGES ping-pong stages
   __device__ __forceinline__ int32_t* get_s2d_map_buffer(int pipeline_id, int stage, int token_idx) const {
-    int abs_stage = pipeline_id * 2 + stage;
+    int abs_stage = pipeline_id * S2D_MAP_RING_STAGES + stage;
     return reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(sparse_to_dense_map_buffer) + abs_stage * s2d_map_stage_stride) + token_idx * s2d_inner_dim;
   }
   __device__ __forceinline__ int32_t* get_s2d_map_buffer_base(int pipeline_id, int stage) const {
-    int abs_stage = pipeline_id * 2 + stage;
+    int abs_stage = pipeline_id * S2D_MAP_RING_STAGES + stage;
     return reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(sparse_to_dense_map_buffer) + abs_stage * s2d_map_stage_stride);
   }
   // Legacy s2d accessors (pipeline_id=0)
@@ -393,9 +396,9 @@ struct dispatch_smem_layout_t {
     return get_s2d_map_buffer_base(0, stage);
   }
 
-  // Per-pipeline s2d_map mbarrier: each pipeline has 2 ping-pong mbarriers
+  // Per-pipeline s2d_map mbarrier: each pipeline has S2D_MAP_RING_STAGES ping-pong mbarriers
   __device__ __forceinline__ uint64_t* get_s2d_map_mbar(int pipeline_id, int stage) const {
-    return sparse_to_dense_map_mbarrier_buffer + pipeline_id * 2 + stage;
+    return sparse_to_dense_map_mbarrier_buffer + pipeline_id * S2D_MAP_RING_STAGES + stage;
   }
   // Per-pipeline S2G group mbarrier
   __device__ __forceinline__ uint64_t* get_S2G_group_mbar(int pipeline_id) const {
@@ -427,7 +430,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
       reinterpret_cast<uint8_t*>(smem_base) + offset);
   offset += config.num_of_stages * layout.token_buffer_stage_stride;
 
-  // Sparse to dense map buffer: 2 ping-pong stages PER PIPELINE (128B aligned)
+  // Sparse to dense map buffer: S2D_MAP_RING_STAGES ping-pong stages PER PIPELINE (128B aligned)
   // Inner dim is mode-dependent: flat = num_ranks_per_node, expert-major = num_topk.
   layout.s2d_inner_dim = config.s2d_inner_dim;
   layout.s2d_map_stage_stride = config.num_of_tokens_per_chunk *
@@ -435,7 +438,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
   layout.s2d_map_stage_stride = (layout.s2d_map_stage_stride + 127) & ~127;
   layout.sparse_to_dense_map_buffer = reinterpret_cast<int32_t*>(
       reinterpret_cast<uint8_t*>(smem_base) + offset);
-  offset += 2 * num_pipelines * layout.s2d_map_stage_stride;
+  offset += S2D_MAP_RING_STAGES * num_pipelines * layout.s2d_map_stage_stride;
 
   // Prob buffer (only if forward dispatch, 16B aligned) -- total stages unchanged
   if (config.forward_dispatch) {
@@ -450,8 +453,8 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     layout.prob_buffer_stage_stride = 0;
   }
 
-  // Scaling factor buffer (only if FP8, 16B aligned) -- total stages unchanged
-  if constexpr (nccl_ep::size_u8<kTokenDtype>() == sizeof(uint8_t)) {
+  // Scaling factor buffer (only if quantized, 16B aligned) -- total stages unchanged
+  if (config.sf_bytes_per_token > 0) {
     layout.sf_buffer_stage_stride = config.sf_bytes_per_token;
     layout.sf_buffer_stage_stride = (layout.sf_buffer_stage_stride + 15) & ~15;
     layout.intra_node_scaling_factor_buffer = reinterpret_cast<uint8_t*>(smem_base) + offset;
@@ -526,11 +529,11 @@ static size_t calculate_dispatch_smem_layout_size(
   token_buffer_stage_stride = (token_buffer_stage_stride + 127) & ~127;
   total_size += config.num_of_stages * token_buffer_stage_stride;
 
-  // Sparse to dense map buffer: 2 ping-pong stages PER PIPELINE (128B aligned)
+  // Sparse to dense map buffer: S2D_MAP_RING_STAGES ping-pong stages PER PIPELINE (128B aligned)
   // Inner dim is mode-dependent: flat = num_ranks_per_node, expert-major = num_topk.
   int s2d_map_stage_stride = config.num_of_tokens_per_chunk * config.s2d_inner_dim * sizeof(int32_t);
   s2d_map_stage_stride = (s2d_map_stage_stride + 127) & ~127;
-  total_size += 2 * num_pipelines * s2d_map_stage_stride;
+  total_size += S2D_MAP_RING_STAGES * num_pipelines * s2d_map_stage_stride;
 
   // Prob buffer (16B aligned per stage) -- total stages unchanged
   if (config.forward_dispatch) {
@@ -539,8 +542,8 @@ static size_t calculate_dispatch_smem_layout_size(
     total_size += config.num_of_stages * prob_buffer_stage_stride;
   }
 
-  // Scaling factor buffer (16B aligned per stage, only if FP8) -- total stages unchanged
-  if constexpr (nccl_ep::size_u8<kTokenDtype>() == sizeof(uint8_t)) {
+  // Scaling factor buffer (16B aligned per stage, only if quantized) -- total stages unchanged
+  if (config.sf_bytes_per_token > 0) {
     int sf_buffer_stage_stride = config.sf_bytes_per_token;
     sf_buffer_stage_stride = (sf_buffer_stage_stride + 15) & ~15;
     total_size += config.num_of_stages * sf_buffer_stage_stride;
@@ -1013,8 +1016,8 @@ __forceinline__ __device__ void mbarrier_wait(uint64_t* mbar, uint32_t parity) {
     while (!cuda::ptx::mbarrier_try_wait_parity(mbar, parity)) {}
 }
 
-// Put one token's bundle (token, +prob if FWD, +sf if FP8) to a remote node, packed from dst_offset.
-template<typename TOKEN_DATA_TYPE, bool FORWARD_DISPATCH, int NUM_LSA_TEAMS>
+// Put one token's bundle (token, +prob if FWD, +sf if quantized) to a remote node, packed from dst_offset.
+template<typename TOKEN_DATA_TYPE, bool FORWARD_DISPATCH, bool HAS_SF, int NUM_LSA_TEAMS>
 __forceinline__ __device__ void dispatch_n2n_put_token(
     ncclGin& net, const ncclTeam& rail, int remote_node_id,
     ncclWindow_t internal_window, size_t dst_offset,
@@ -1033,7 +1036,7 @@ __forceinline__ __device__ void dispatch_n2n_put_token(
             ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{},
             cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
   }
-  if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
+  if constexpr(HAS_SF) {
     size_t sf_src = mr_info->attn_input_scaling_factor_offset + token_idx * sf_bytes_per_token;
     net.put(rail, remote_node_id, internal_window, dst_offset + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0),
             sf_window, sf_src, sf_bytes_per_token,
@@ -1059,7 +1062,8 @@ template<typename TOKEN_DATA_TYPE,
          int MAX_NUM_OF_TOKENS_PER_RANK,
          int NUM_OF_TOKENS_PER_CHUNK,
          int NUM_OF_BLOCKS,
-         bool FORWARD_DISPATCH>
+         bool FORWARD_DISPATCH,
+         bool HAS_SF>
 __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_source(
     const TOKEN_DATA_TYPE* attn_input_token,
     const float* attn_input_prob,
@@ -1097,12 +1101,12 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     ncclGin net(dcomm, ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
     net.waitSignal(ncclCoopThread(), tail_signal_id, expected_flag_value);
 
-    const int tile_id = node_id > node_rank ? node_id - 1 : node_id;
+    const int remote_only_node_id = node_id > node_rank ? node_id - 1 : node_id;
     const int chunk_first_token = chunk_idx * NUM_OF_TOKENS_PER_CHUNK;
 
     src.use_packed = true;
     src.packed_base = reinterpret_cast<const uint8_t*>(gin_base_ptr) +
-                      dispatch_packed_entry_offset(mr_info, tile_id, chunk_first_token);
+                      dispatch_packed_entry_offset(mr_info, remote_only_node_id, chunk_first_token);
   } else {
     // Local: strided bases into this rank's own global mem arrays for this chunk.
     int chunk_first_token = chunk_idx * NUM_OF_TOKENS_PER_CHUNK;
@@ -1113,7 +1117,7 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
       const int prob_row_stride = experts_per_node * NUM_LSA_TEAMS;
       src.prob_base = attn_input_prob + chunk_first_token * prob_row_stride;
     }
-    if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
+    if constexpr(HAS_SF) {
       src.sf_base = attn_input_token_scaling_factor + chunk_first_token * sf_bytes_per_token;
     }
   }
@@ -1136,8 +1140,8 @@ __forceinline__ __device__ uint32_t bulk_copy(void* smem_ptr, const void* gmem_p
   return bytes;
 }
 
-// Copy a token bundle (token, +prob if FWD, +sf if FP8) between this stage's SMEM and gmem. Returns total bytes.
-template<typename TOKEN_DATA_TYPE, typename SMEM_TYPE, bool FORWARD_DISPATCH, copy_dir DIR>
+// Copy a token bundle (token, +prob if FWD, +sf if quantized) between this stage's SMEM and gmem. Returns total bytes.
+template<typename TOKEN_DATA_TYPE, typename SMEM_TYPE, bool FORWARD_DISPATCH, bool HAS_SF, copy_dir DIR>
 __forceinline__ __device__ uint32_t copy_token_bundle(
     SMEM_TYPE* smem_buffer_ptr, const int pipeline_rank, const int stage,
     const void* token_gmem_ptr, const void* prob_gmem_ptr, const void* sf_gmem_ptr,
@@ -1150,19 +1154,20 @@ __forceinline__ __device__ uint32_t copy_token_bundle(
     tx += bulk_copy<DIR>(reinterpret_cast<void*>(smem_buffer_ptr->get_prob_buffer(pipeline_rank, stage)),
                          prob_gmem_ptr, prob_bytes, mbar);
   }
-  if constexpr (std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
+  if constexpr (HAS_SF) {
     tx += bulk_copy<DIR>(reinterpret_cast<void*>(smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage)),
                          sf_gmem_ptr, sf_bytes, mbar);
   }
   return tx;
 }
 
-// TMA-copy one token (+prob if FWD, +sf if FP8) from a packed-remote or strided-local source into its SMEM stage, then publish.
+// TMA-copy one token (+prob if FWD, +sf if quantized) from a packed-remote or strided-local source into its SMEM stage, then publish.
 template<typename TOKEN_DATA_TYPE,
          typename SMEM_TYPE,
          int NUM_LSA_TEAMS,
          int LSA_TEAM_SIZE,
-         bool FORWARD_DISPATCH>
+         bool FORWARD_DISPATCH,
+         bool HAS_SF>
 __forceinline__ __device__ void dispatch_g2s_issue_token(
     const g2s_source_t<TOKEN_DATA_TYPE>& src,
     const int current_token_id,
@@ -1188,7 +1193,7 @@ __forceinline__ __device__ void dispatch_g2s_issue_token(
     const void* token_src = packed_src_base;
     const void* prob_src = packed_src_base + token_bytes;
     const void* sf_src = packed_src_base + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
-    tx_bytes = copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH, copy_dir::to_smem>(
+    tx_bytes = copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH, HAS_SF, copy_dir::to_smem>(
         smem_buffer_ptr, pipeline_rank, stage, token_src, prob_src, sf_src,
         token_bytes, prob_bytes, sf_bytes, mbar);
   } else {
@@ -1202,10 +1207,10 @@ __forceinline__ __device__ void dispatch_g2s_issue_token(
       const int prob_row_stride = experts_per_node * NUM_LSA_TEAMS;
       prob_src = src.prob_base + current_token_id * prob_row_stride + node_rank * experts_per_node;
     }
-    if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
+    if constexpr(HAS_SF) {
       sf_src = src.sf_base + current_token_id * sf_bytes_per_token;
     }
-    tx_bytes = copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH, copy_dir::to_smem>(
+    tx_bytes = copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH, HAS_SF, copy_dir::to_smem>(
         smem_buffer_ptr, pipeline_rank, stage, token_src, prob_src, sf_src,
         token_bytes, prob_bytes, sf_bytes, mbar);
   }
@@ -1294,11 +1299,12 @@ __forceinline__ __device__ s2g_dest_t dispatch_s2g_resolve_dest(
   return dst;
 }
 
-// TMA-store one token (+prob if FWD, +sf if FP8) from this stage's SMEM to one resolved remote destination.
+// TMA-store one token (+prob if FWD, +sf if quantized) from this stage's SMEM to one resolved remote destination.
 template<typename TOKEN_DATA_TYPE,
          typename SMEM_TYPE,
          int LSA_TEAM_SIZE,
-         bool FORWARD_DISPATCH>
+         bool FORWARD_DISPATCH,
+         bool HAS_SF>
 __forceinline__ __device__ void dispatch_s2g_issue_token(
     const s2g_dest_t& dst,
     SMEM_TYPE* smem_buffer_ptr,
@@ -1322,10 +1328,10 @@ __forceinline__ __device__ void dispatch_s2g_issue_token(
   if constexpr(FORWARD_DISPATCH) {
     prob_dst = remote_expert_output_prob[dst.remote_rank_id] + (dst.output_buffer_index * (experts_per_rank * LSA_TEAM_SIZE));
   }
-  if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
+  if constexpr(HAS_SF) {
     sf_dst = remote_expert_output_scaling_factor[dst.remote_rank_id] + dst.output_buffer_index * sf_bytes_per_token;
   }
-  copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH, copy_dir::to_gmem>(
+  copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH, HAS_SF, copy_dir::to_gmem>(
       smem_buffer_ptr, pipeline_rank, stage, token_dst, prob_dst, sf_dst,
       token_bytes, prob_bytes, sf_bytes, /*mbar=*/nullptr);
 }
@@ -1340,7 +1346,8 @@ template<typename INTER_NODE_GROUP,
          int NUM_LSA_TEAMS,
          int LSA_TEAM_SIZE,
          int NUM_OF_BLOCKS,
-         bool FORWARD_DISPATCH>
+         bool FORWARD_DISPATCH,
+         bool HAS_SF>
 __forceinline__ __device__ void dispatch_N2N_warp(
     // INPUT
     const bool* attn_to_rdma_map,
@@ -1407,10 +1414,10 @@ __forceinline__ __device__ void dispatch_N2N_warp(
       // Skip-self ring over the other nodes, load-balanced start at node_rank.
       int remote_idx = (j + node_rank) % NUM_REMOTE_NODES;
       int remote_node_id = remote_idx < node_rank ? remote_idx : remote_idx + 1;
-      int rank_in_remote = remote_idx < node_rank ? node_rank - 1 : node_rank;
+      int remote_only_node_id = remote_idx < node_rank ? node_rank - 1 : node_rank;
 
       size_t dense_dst_offset = dispatch_packed_entry_offset(
-          smem_mr_info_ptr, rank_in_remote, chunk_first_token_idx);
+          smem_mr_info_ptr, remote_only_node_id, chunk_first_token_idx);
       const size_t entry_bytes = smem_mr_info_ptr->bytes_per_entry;
 
       // Create a bitmask of tokens that need to be written. One word per 32 tokens.
@@ -1435,7 +1442,7 @@ __forceinline__ __device__ void dispatch_N2N_warp(
         bool need_write = attn_to_rdma_map[((chunk_first_token_idx + token_idx_in_chunk) * NUM_REMOTE_NODES) + remote_idx];
         if (need_write) {
           int token_idx = chunk_first_token_idx + token_idx_in_chunk;
-          dispatch_n2n_put_token<TOKEN_DATA_TYPE, FORWARD_DISPATCH, NUM_LSA_TEAMS>(
+          dispatch_n2n_put_token<TOKEN_DATA_TYPE, FORWARD_DISPATCH, HAS_SF, NUM_LSA_TEAMS>(
               net, rail, remote_node_id,
               nccl_internal_window, dst_offset,
               smem_mr_info_ptr, nccl_token_window, nccl_prob_window, nccl_sf_window, token_idx,
@@ -1476,6 +1483,7 @@ template<typename INTRA_NODE_S2G_GROUP,
          int NUM_OF_BLOCKS,
          int NUM_PIPELINES,
          bool FORWARD_DISPATCH,
+         bool HAS_SF,
          ncclEpLayout_t kLayout>
 __forceinline__ __device__ void dispatch_S2G_warp(
     // INPUT
@@ -1623,7 +1631,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
               for (int flat_idx = s2g_lane; flat_idx < s2d_inner_dim; flat_idx += 32){
                   s2g_dest_t dst = dispatch_s2g_resolve_dest<kLayout>(s2d_smem_row, flat_idx, local_dup_enabled);
                   if (dst.issue) {
-                    dispatch_s2g_issue_token<TOKEN_DATA_TYPE, SMEM_TYPE, LSA_TEAM_SIZE, FORWARD_DISPATCH>(
+                    dispatch_s2g_issue_token<TOKEN_DATA_TYPE, SMEM_TYPE, LSA_TEAM_SIZE, FORWARD_DISPATCH, HAS_SF>(
                         dst, smem_buffer_ptr,
                         remote_expert_output_token, remote_expert_output_prob, remote_expert_output_scaling_factor,
                         pipeline_rank, stage, HIDDEN_DIM, sf_bytes_per_token,
@@ -1651,7 +1659,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
             }
           }
         }
-        ring_advance(s2d_stage, s2d_parity, 2);
+        ring_advance(s2d_stage, s2d_parity, S2D_MAP_RING_STAGES);
       }
     }
     // Drain in-flight TMA S2G writes before returning (each lane drains its own commit groups).
@@ -1673,7 +1681,8 @@ template<typename INTRA_NODE_G2S_GROUP,
          int LSA_TEAM_SIZE,
          int NUM_OF_BLOCKS,
          int NUM_PIPELINES,
-         bool FORWARD_DISPATCH>
+         bool FORWARD_DISPATCH,
+         bool HAS_SF>
 __forceinline__ __device__ void dispatch_G2S_warp(
     // INPUT
     const bool* rdma_to_attn_map,
@@ -1739,7 +1748,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
 
         g2s_source_t<TOKEN_DATA_TYPE> src =
             dispatch_g2s_resolve_source<TOKEN_DATA_TYPE, NUM_LSA_TEAMS, LSA_TEAM_SIZE, MAX_NUM_OF_TOKENS_PER_RANK,
-                                        NUM_OF_TOKENS_PER_CHUNK, NUM_OF_BLOCKS, FORWARD_DISPATCH>(
+                                        NUM_OF_TOKENS_PER_CHUNK, NUM_OF_BLOCKS, FORWARD_DISPATCH, HAS_SF>(
                 attn_input_token, attn_input_prob, attn_input_token_scaling_factor,
                 node_id, node_rank, local_rank, chunk_idx, expected_flag_value,
                 HIDDEN_DIM, sf_bytes_per_token, experts_per_rank,
@@ -1767,7 +1776,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                 mbarrier_wait(mbar, consumer_parity);
               }
 
-              dispatch_g2s_issue_token<TOKEN_DATA_TYPE, SMEM_TYPE, NUM_LSA_TEAMS, LSA_TEAM_SIZE, FORWARD_DISPATCH>(
+              dispatch_g2s_issue_token<TOKEN_DATA_TYPE, SMEM_TYPE, NUM_LSA_TEAMS, LSA_TEAM_SIZE, FORWARD_DISPATCH, HAS_SF>(
                   src, current_token_id, packed_dense_idx, smem_buffer_ptr, pipeline_rank, stage,
                   HIDDEN_DIM, sf_bytes_per_token, experts_per_rank, node_rank, mr_info);
 
@@ -3531,11 +3540,12 @@ __device__ __forceinline__ void dispatch_kernel_impl(
   long long _wt_start = 0;
   if (threadIdx.x % 32 == 0) _wt_start = clock64();
 #endif
+  constexpr bool HAS_SF = (SF_BYTES_PER_TOKEN > 0);
   int threadIdx_x_int = (int)threadIdx.x;
   if(threadIdx_x_int < INTER_NODE_GROUP::size()){
     if constexpr(NUM_LSA_TEAMS != 1){
       dispatch_N2N_warp
-      <INTER_NODE_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, LSA_TEAM_SIZE, NUM_OF_BLOCKS, FORWARD_DISPATCH>
+      <INTER_NODE_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, LSA_TEAM_SIZE, NUM_OF_BLOCKS, FORWARD_DISPATCH, HAS_SF>
       (param.attn_to_rdma_map,
        param.local_rank, param.node_rank,
        param.num_of_tokens_per_rank,
@@ -3548,7 +3558,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
   } else if (threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size()){
     dispatch_G2S_warp
     <INTRA_NODE_G2S_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_TOKENS_PER_CHUNK,
-     MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, LSA_TEAM_SIZE, NUM_OF_BLOCKS, NUM_PIPELINES, FORWARD_DISPATCH>
+     MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, LSA_TEAM_SIZE, NUM_OF_BLOCKS, NUM_PIPELINES, FORWARD_DISPATCH, HAS_SF>
     (param.rdma_to_attn_map,
      param.attn_input_token, param.attn_input_prob, param.attn_input_token_scaling_factor,
      param.rdma_inter_node_group_flags,
@@ -3560,7 +3570,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
      smem_buffer_ptr);
   } else if (threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTRA_NODE_S2G_GROUP::size()){
     dispatch_S2G_warp
-    <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_TOKENS_PER_CHUNK, NUM_LSA_TEAMS, LSA_TEAM_SIZE, NUM_OF_BLOCKS, NUM_PIPELINES, FORWARD_DISPATCH, kLayout>
+    <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_TOKENS_PER_CHUNK, NUM_LSA_TEAMS, LSA_TEAM_SIZE, NUM_OF_BLOCKS, NUM_PIPELINES, FORWARD_DISPATCH, HAS_SF, kLayout>
     (param.rdma_to_attn_map, param.sparse_to_dense_map,
      param.expert_output_token, param.expert_output_prob, param.expert_output_scaling_factor,
      param.node_rank,

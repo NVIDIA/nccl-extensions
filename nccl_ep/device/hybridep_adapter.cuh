@@ -17,6 +17,7 @@
 #include "nccl_device.h"
 #include "ep_enums.h"
 #include "common.hpp"
+#include "nccl_ep_env.h"
 
 namespace nccl_ep {
 namespace hybridep {
@@ -359,6 +360,7 @@ ncclResult_t call_dispatch(
     bool forward_dispatch,      // True for forward, false for backward
     int num_blocks,             // Number of SMs/blocks for the kernel grid
     int sf_bytes_per_token,     // Total scale bytes per token (pre-computed on host)
+    const ncclEpEnvConfig* env, // Group env config; gates rank-0 verbose param dump (may be null)
     cudaStream_t stream,
     ncclDataType_t token_dtype = ncclBfloat16);
 
@@ -437,6 +439,7 @@ void call_combine(
     int num_nodes,              // Number of nodes (RDMA domain size)
     bool backward_combine,      // True for backward (training), false for forward
     int num_blocks,             // Number of SMs/blocks for the kernel grid
+    const ncclEpEnvConfig* env, // Group env config; gates rank-0 verbose param dump (may be null)
     cudaStream_t stream);
 
 // EM local-fanout: fill secondary em_slots from primaries after dispatch.

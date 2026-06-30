@@ -47,6 +47,7 @@ struct ncclEpEnvVar {
 };
 
 struct ncclEpEnvConfig {
+    int rank = 0;
     ncclEpEnvVar verbose            {"NCCL_EP_ENV_VERBOSE",        ncclEpEnvType::flag};
     ncclEpEnvVar debug              {"NCCL_EP_DEBUG",              ncclEpEnvType::flag};
     ncclEpEnvVar ht_em_local_dup    {"NCCL_EP_HT_EM_LOCAL_DUP",    ncclEpEnvType::flag};
@@ -62,6 +63,17 @@ struct ncclEpEnvConfig {
 // Unset, invalid, or explicitly-off all yield false.
 inline bool nccl_ep_env_flag_on(const ncclEpEnvVar& var) {
     return var.is_set && var.value.flag;
+}
+
+// Verbose diagnostics was requested by the user
+inline bool nccl_ep_env_verbose(const ncclEpEnvConfig& cfg) {
+    return nccl_ep_env_flag_on(cfg.verbose) && cfg.rank == 0;
+}
+
+// Stamp this process's rank into *cfg.
+inline void nccl_ep_env_set_rank(ncclEpEnvConfig* cfg, int rank) {
+    if (cfg != nullptr)
+        cfg->rank = rank;
 }
 
 // Read every NCCL EP environment variable into *cfg (resetting it first).

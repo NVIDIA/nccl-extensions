@@ -16,6 +16,8 @@
 #include <functional>
 #include <fcntl.h>
 #include <iterator>
+#include <mutex>
+#include <set>
 #include <sstream>
 #include <sys/file.h>
 #include <thread>
@@ -36,6 +38,14 @@ bool env_flag_enabled(const char* name, bool default_value) {
            value != "FALSE" &&
            value != "off" &&
            value != "OFF";
+}
+
+bool announce_once(const std::string& key) {
+    // Returns true the first time each distinct `key` is seen.
+    static std::mutex mtx;
+    static std::set<std::string> announced;
+    std::lock_guard<std::mutex> lock(mtx);
+    return announced.insert(key).second;
 }
 
 void jit_log(std::string_view message) {

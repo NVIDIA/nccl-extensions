@@ -8,6 +8,8 @@
 
 #include "device/hybrid_ep.cuh"
 #include "device/jit/jit_runtime.hpp"
+#include "device/jit/jit_utils.hpp"
+#include "nccl_ep_env.h"
 
 #include <cassert>
 #include <climits>
@@ -141,6 +143,7 @@ inline void launch_combine(
     int lsa_team_size,
     ncclEpLayout_t layout,
     int hidden_dim,
+    const ncclEpEnvConfig* env,  // for rank-0-gated verbose param dump; may be null
     void* param, // ptr to the packed kernel arguments buffer
     size_t param_size, // size of packed kernel arguments buffer
     int dynamic_smem_bytes,
@@ -196,6 +199,28 @@ inline void launch_combine(
     variant.num_blocks = num_of_blocks;
     variant.block_dim = L.block_dim;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
+
+    // Dump the effective kernel parameters once per distinct variant, just before
+    // the launch, when the env config asks for verbose output on this rank.
+    if (env != nullptr && nccl_ep_env_verbose(*env) &&
+        ::nccl_ep::jit::announce_once(variant_name)) {
+        std::fprintf(
+            stderr,
+            "[nccl_ep][env] HT combine kernel (%s):\n"
+            "[nccl_ep][env]   nodes(lsa_teams)=%d lsa_team_size=%d hidden_dim=%d\n"
+            "[nccl_ep][env]   stages_g2s=%d stages_s2g=%d extra_in_flight_s2g=%d\n"
+            "[nccl_ep][env]   tokens_per_chunk=%d tokens_per_group=%d max_tokens_per_rank=%d\n"
+            "[nccl_ep][env]   num_blocks=%d block_dim=%d dynamic_smem_bytes=%d\n"
+            "[nccl_ep][env]   backward=%s layout=%s dtype=%s\n",
+            variant_name.c_str(),
+            num_lsa_teams, lsa_team_size, hidden_dim,
+            num_of_stages_g2s, num_of_stages_s2g, num_of_additional_in_flight_s2g,
+            num_of_tokens_per_chunk, num_of_tokens_per_group, max_tokens_per_rank,
+            num_of_blocks, L.block_dim, dynamic_smem_bytes,
+            (backward_combine ? "true" : "false"),
+            (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "EXPERT_MAJOR" : "FLAT"),
+            (token_dtype == ncclFloat32 ? "fp32" : token_dtype == ncclFloat16 ? "fp16" : "bf16"));
+    }
 
     std::string error;
     const ::nccl_ep::jit::JitKernelStatus status =

@@ -1104,6 +1104,7 @@ ncclResult_t dispatch_impl(
     bool use_fp8,
     int num_blocks,
     int sf_bytes_per_token,
+    const ncclEpEnvConfig* env,
     cudaStream_t stream,
     ncclDataType_t token_dtype = ncclBfloat16
 ) {
@@ -1181,6 +1182,7 @@ ncclResult_t dispatch_impl(
             use_fp8,
             kp.hidden_dim,
             sf_bytes_per_token,
+            env,
             kernel_arg.data(),
             kernel_arg.size(),
             smem_size,
@@ -1204,17 +1206,18 @@ ncclResult_t call_dispatch(
     bool forward_dispatch,
     int num_blocks,
     int sf_bytes_per_token,
+    const ncclEpEnvConfig* env,
     cudaStream_t stream,
     ncclDataType_t token_dtype
 ) {
     if (forward_dispatch) {
         return dispatch_impl<true>(
             params, max_dispatch_tokens_per_rank, num_tokens_per_chunk,
-            num_nodes, use_fp8, num_blocks, sf_bytes_per_token, stream, token_dtype);
+            num_nodes, use_fp8, num_blocks, sf_bytes_per_token, env, stream, token_dtype);
     } else {
         return dispatch_impl<false>(
             params, max_dispatch_tokens_per_rank, num_tokens_per_chunk,
-            num_nodes, use_fp8, num_blocks, sf_bytes_per_token, stream, token_dtype);
+            num_nodes, use_fp8, num_blocks, sf_bytes_per_token, env, stream, token_dtype);
     }
 }
 
@@ -1314,6 +1317,7 @@ void combine_impl(
     int num_tokens_per_chunk,
     int num_nodes,
     int num_blocks,
+    const ncclEpEnvConfig* env,
     cudaStream_t stream
 ) {
     // TMA requires prob buffer (experts_per_node * sizeof(float)) to be 16B aligned
@@ -1375,6 +1379,7 @@ void combine_impl(
         params.num_ranks_per_node,
         params.layout,
         kp.hidden_dim,
+        env,
         kernel_arg.data(),
         kernel_arg.size(),
         smem_size,
@@ -1472,16 +1477,17 @@ void call_combine(
     int num_nodes,
     bool backward_combine,
     int num_blocks,
+    const ncclEpEnvConfig* env,
     cudaStream_t stream
 ) {
     if (backward_combine) {
         combine_impl<true>(
             params, max_dispatch_tokens_per_rank, num_tokens_per_chunk,
-            num_nodes, num_blocks, stream);
+            num_nodes, num_blocks, env, stream);
     } else {
         combine_impl<false>(
             params, max_dispatch_tokens_per_rank, num_tokens_per_chunk,
-            num_nodes, num_blocks, stream);
+            num_nodes, num_blocks, env, stream);
     }
 }
 

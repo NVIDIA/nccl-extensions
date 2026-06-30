@@ -8,6 +8,8 @@
 
 #include "device/hybrid_ep.cuh"
 #include "device/jit/jit_runtime.hpp"
+#include "device/jit/jit_utils.hpp"
+#include "nccl_ep_env.h"
 
 #include <climits>
 #include <cstdio>
@@ -150,6 +152,7 @@ inline void launch_dispatch(
     bool use_fp8,
     int hidden_dim,
     int sf_bytes_per_token,
+    const ncclEpEnvConfig* env,  // for rank-0-gated verbose param dump; may be null
     void* param,
     size_t param_size,
     int dynamic_smem_bytes,
@@ -214,6 +217,29 @@ inline void launch_dispatch(
     variant.num_blocks = num_of_blocks;
     variant.block_dim = L.block_dim;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
+
+    // Dump the effective kernel parameters once per distinct variant, just before
+    // the launch, when the env config asks for verbose output on this rank.
+    if (env != nullptr && nccl_ep_env_verbose(*env) &&
+        ::nccl_ep::jit::announce_once(variant_name)) {
+        std::fprintf(
+            stderr,
+            "[nccl_ep][env] HT dispatch kernel (%s):\n"
+            "[nccl_ep][env]   nodes(lsa_teams)=%d lsa_team_size=%d hidden_dim=%d\n"
+            "[nccl_ep][env]   stages=%d in_flight_s2g=%d pipelines=%d tokens_per_chunk=%d max_tokens_per_rank=%d\n"
+            "[nccl_ep][env]   num_blocks=%d block_dim=%d dynamic_smem_bytes=%d\n"
+            "[nccl_ep][env]   forward=%s layout=%s dtype=%s use_fp8=%s sf_bytes_per_token=%d\n",
+            variant_name.c_str(),
+            num_lsa_teams, lsa_team_size, hidden_dim,
+            num_of_stages, num_of_in_flight_s2g, L.num_pipelines,
+            num_of_tokens_per_chunk, max_tokens_per_rank,
+            num_of_blocks, L.block_dim, dynamic_smem_bytes,
+            dispatch_bool_literal(forward_dispatch),
+            (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "EXPERT_MAJOR" : "FLAT"),
+            (use_fp8 ? "fp8" : token_dtype == ncclFloat32 ? "fp32" : "16b"),
+            dispatch_bool_literal(use_fp8),
+            sf_bytes_per_token);
+    }
 
     std::string error;
     const ::nccl_ep::jit::JitKernelStatus status =

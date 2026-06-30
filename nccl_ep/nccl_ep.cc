@@ -1405,12 +1405,8 @@ ncclResult_t ncclEpCreateGroup(
     ep_group->comm = comm;
     ep_group->config = *in_config;
 
-    // Populate this group's environment configuration once; all of this
-    // group's handles read it back from ep_group->env. Dump it when
-    // NCCL_EP_ENV_VERBOSE is set.
+    // Populate this group's environment configuration once.
     nccl_ep_env_init(&ep_group->env);
-    if (nccl_ep_env_flag_on(ep_group->env.verbose))
-        nccl_ep_env_print(ep_group->env);
 
     ep_group->alloc.alloc_fn = default_alloc_fn;
     ep_group->alloc.free_fn  = default_free_fn;
@@ -1427,6 +1423,13 @@ ncclResult_t ncclEpCreateGroup(
     NCCL_CHECK_RESULT(ncclCommCount(comm, &ep_group->nRanks));
     NCCL_CHECK_RESULT(ncclCommUserRank(comm, &ep_group->rank));
     NCCL_CHECK_RESULT(ncclCommCuDevice(comm, &ep_group->cuda_device_id));
+
+    // Stamp this process's rank into the env config 
+    nccl_ep_env_set_rank(&ep_group->env, ep_group->rank);
+
+    // Dump the resolved environment configuration once if requested
+    if (nccl_ep_env_verbose(ep_group->env))
+        nccl_ep_env_print(ep_group->env);
 
     CUDA_CHECK(cudaSetDevice(ep_group->cuda_device_id));
     cudaDeviceProp device_prop = {};
@@ -3403,6 +3406,7 @@ ncclResult_t ncclEpDispatch(
             forward_dispatch,
             static_cast<int>(group->comm_num_sms),
             sf_bytes_per_token,
+            &group->env,
             stream,
             x->datatype
         ));
@@ -4118,6 +4122,7 @@ ncclResult_t ncclEpCombine(
             group->rdma_team_size, // num_nodes (RDMA domain size)
             backward_combine, // backward mode flag
             static_cast<int>(group->comm_num_sms),
+            &group->env,
             stream
         );
 

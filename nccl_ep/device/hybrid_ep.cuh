@@ -4247,27 +4247,14 @@ __device__ __forceinline__ void local_reduce_kernel_impl(
           const int e = n * kConsThreads + cons_tid;
           if (e < VEC_DIM) {
             uint4 v = in_vec[e];
-            if constexpr (nccl_ep::is_fp32<kTokenDtype>()) {
-              // uint4 == 4 FP32: accumulate into the first two acc lanes.
-              const float* sf = reinterpret_cast<const float*>(&v);
-              acc[n][0].x += sf[0]; acc[n][0].y += sf[1];
-              acc[n][1].x += sf[2]; acc[n][1].y += sf[3];
-            } else if constexpr (nccl_ep::is_fp16<kTokenDtype>()) {
-              const __half2* hf = reinterpret_cast<const __half2*>(&v);
-              #pragma unroll
-              for (int kk = 0; kk < 4; kk++) {
-                float2 f = __half22float2(hf[kk]);
-                acc[n][kk].x += f.x;
-                acc[n][kk].y += f.y;
-              }
-            } else {
-              const __nv_bfloat162* bf = reinterpret_cast<const __nv_bfloat162*>(&v);
-              #pragma unroll
-              for (int kk = 0; kk < 4; kk++) {
-                float2 f = __bfloat1622float2(bf[kk]);
-                acc[n][kk].x += f.x;
-                acc[n][kk].y += f.y;
-              }
+            // uint4 holds 2 FP32 pairs or 4 packed 16-bit pairs; decode each pair
+            // to FP32 and accumulate (the helper picks the per-dtype unpack).
+            constexpr int kPairs = nccl_ep::pairs_per_int4<kTokenDtype>();
+            #pragma unroll
+            for (int kk = 0; kk < kPairs; kk++) {
+              float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&v, kk);
+              acc[n][kk].x += f.x;
+              acc[n][kk].y += f.y;
             }
           }
         }
@@ -4292,19 +4279,10 @@ __device__ __forceinline__ void local_reduce_kernel_impl(
         const int e = n * kConsThreads + cons_tid;
         if (e < VEC_DIM) {
           uint4 out;
-          if constexpr (nccl_ep::is_fp32<kTokenDtype>()) {
-            float* of = reinterpret_cast<float*>(&out);
-            of[0] = acc[n][0].x; of[1] = acc[n][0].y;
-            of[2] = acc[n][1].x; of[3] = acc[n][1].y;
-          } else if constexpr (nccl_ep::is_fp16<kTokenDtype>()) {
-            __half2* oh = reinterpret_cast<__half2*>(&out);
-            #pragma unroll
-            for (int kk = 0; kk < 4; kk++) oh[kk] = __float22half2_rn(acc[n][kk]);
-          } else {
-            __nv_bfloat162* bf = reinterpret_cast<__nv_bfloat162*>(&out);
-            #pragma unroll
-            for (int kk = 0; kk < 4; kk++) bf[kk] = __float22bfloat162_rn(acc[n][kk]);
-          }
+          constexpr int kPairs = nccl_ep::pairs_per_int4<kTokenDtype>();
+          #pragma unroll
+          for (int kk = 0; kk < kPairs; kk++)
+            nccl_ep::st_token_pair<kTokenDtype>(&out, kk, acc[n][kk]);
           out_vec[e] = out;
         }
       }
@@ -4648,31 +4626,14 @@ __device__ __forceinline__ void local_permute_reduce(
                     #pragma unroll
                     for (int u = 0; u < kHiddenVec; u++) {
                         if (!valid_u[u]) continue;
-                        // int4 holds 4 fp32 (one float per acc lane) or 8 2-byte
-                        // elements (4 packed pairs) depending on the wire dtype.
-                        if constexpr (nccl_ep::is_fp32<kTokenDtype>()) {
-                            const float* sf = reinterpret_cast<const float*>(&buf[u]);
-                            acc[u][0].x += sf[0];
-                            acc[u][0].y += sf[1];
-                            acc[u][1].x += sf[2];
-                            acc[u][1].y += sf[3];
-                        } else if constexpr (nccl_ep::is_fp16<kTokenDtype>()) {
-                            const __half2* hf = reinterpret_cast<const __half2*>(&buf[u]);
-                            #pragma unroll
-                            for (int p = 0; p < 4; p++) {
-                                float2 f = __half22float2(hf[p]);
-                                acc[u][p].x += f.x;
-                                acc[u][p].y += f.y;
-                            }
-                        } else {
-                            const __nv_bfloat162* bf =
-                                reinterpret_cast<const __nv_bfloat162*>(&buf[u]);
-                            #pragma unroll
-                            for (int p = 0; p < 4; p++) {
-                                float2 f = __bfloat1622float2(bf[p]);
-                                acc[u][p].x += f.x;
-                                acc[u][p].y += f.y;
-                            }
+                        // int4 holds 2 FP32 pairs or 4 packed 16-bit pairs; decode
+                        // each pair to FP32 and accumulate.
+                        constexpr int kPairs = nccl_ep::pairs_per_int4<kTokenDtype>();
+                        #pragma unroll
+                        for (int p = 0; p < kPairs; p++) {
+                            float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&buf[u], p);
+                            acc[u][p].x += f.x;
+                            acc[u][p].y += f.y;
                         }
                     }
                 }
@@ -4681,24 +4642,10 @@ __device__ __forceinline__ void local_permute_reduce(
                 for (int u = 0; u < kHiddenVec; u++) {
                     if (!valid_u[u]) continue;
                     int4 out;
-                    if constexpr (nccl_ep::is_fp32<kTokenDtype>()) {
-                        float* of = reinterpret_cast<float*>(&out);
-                        of[0] = acc[u][0].x;
-                        of[1] = acc[u][0].y;
-                        of[2] = acc[u][1].x;
-                        of[3] = acc[u][1].y;
-                    } else if constexpr (nccl_ep::is_fp16<kTokenDtype>()) {
-                        __half2* oh = reinterpret_cast<__half2*>(&out);
-                        #pragma unroll
-                        for (int p = 0; p < 4; p++) {
-                            oh[p] = __float22half2_rn(acc[u][p]);
-                        }
-                    } else {
-                        __nv_bfloat162* obf = reinterpret_cast<__nv_bfloat162*>(&out);
-                        #pragma unroll
-                        for (int p = 0; p < 4; p++) {
-                            obf[p] = __float22bfloat162_rn(acc[u][p]);
-                        }
+                    constexpr int kPairs = nccl_ep::pairs_per_int4<kTokenDtype>();
+                    #pragma unroll
+                    for (int p = 0; p < kPairs; p++) {
+                        nccl_ep::st_token_pair<kTokenDtype>(&out, p, acc[u][p]);
                     }
                     // Keep the FLAT recv row in L2 for the host-side D2D
                     // that reads it next.

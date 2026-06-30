@@ -127,6 +127,15 @@ void st_token_pair<ncclBfloat16>(void* base, int idx, float2 v) {
     reinterpret_cast<__nv_bfloat162*>(base)[idx] = __float22bfloat162_rn(v);
 }
 
+// Number of token pairs packed into one 16-byte int4/uint4 chunk for this wire
+// dtype: FP32 -> 2, the 16-bit types -> 4. Bounds the ld/st_token_pair loops
+// over a vectorized token chunk.
+template <ncclDataType_t kTokenDtype>
+__device__ __host__ constexpr int pairs_per_int4() {
+    constexpr int kElemsPerPair = 2;                 // float2 / half2 / bf162
+    return sizeof(int4) / (kElemsPerPair * size_u8<kTokenDtype>());
+}
+
 template <int kBytes>
 struct VecInt {};
 template<> struct VecInt<1>  { using vec_t = int8_t; };

@@ -278,6 +278,22 @@ export NCCL_DEBUG=INFO        # Enable NCCL debug output
 export NCCL_DEBUG_SUBSYS=ALL  # All subsystems
 ```
 
+### High-Throughput tuning
+
+```bash
+# Override the HT dispatch/combine tokens-per-chunk. HT mode only; resolved once
+# per group at ncclEpCreateGroup. Must be a multiple of 32 (non-conforming values
+# are rounded up with a warning). When unset, the chunk size defaults to:
+#   - RDMA / multi-node configs:  64
+#   - LSA-only / single-node:     NUM_OF_TOKENS_PER_GROUP (4) * resolved SM count,
+#                                 rounded up to a multiple of 32
+export NCCL_EP_TOKENS_PER_CHUNK=128
+
+# Dump every resolved NCCL EP environment variable (name + value, or "unset")
+# at group creation, including NCCL_EP_TOKENS_PER_CHUNK.
+export NCCL_EP_ENV_VERBOSE=1
+```
+
 
 # Core Concepts
 

@@ -352,7 +352,8 @@ struct DispatchParams {
 // Returns ncclInvalidArgument if the dispatch SMEM exceeds the device limit.
 ncclResult_t call_dispatch(
     const DispatchParams& params,
-    int max_dispatch_tokens_per_rank,    // Max tokens for buffer sizing
+    int max_dispatch_tokens_per_rank,    // Max tokens for buffer sizing (chunk-aligned)
+    int num_tokens_per_chunk,   // Dispatch/combine tokens per chunk (resolved per group)
     int num_nodes,              // Number of nodes (RDMA domain size)
     bool use_fp8,               // true = FP8 (uint8_t); mutually exclusive with token_dtype != BF16
     bool forward_dispatch,      // True for forward, false for backward
@@ -431,7 +432,8 @@ struct CombineParams {
 // Call combine kernel with runtime template parameter resolution
 void call_combine(
     const CombineParams& params,
-    int max_dispatch_tokens_per_rank,    // Max tokens for buffer sizing
+    int max_dispatch_tokens_per_rank,    // Max tokens for buffer sizing (chunk-aligned)
+    int num_tokens_per_chunk,   // Dispatch/combine tokens per chunk (resolved per group)
     int num_nodes,              // Number of nodes (RDMA domain size)
     bool backward_combine,      // True for backward (training), false for forward
     int num_blocks,             // Number of SMs/blocks for the kernel grid

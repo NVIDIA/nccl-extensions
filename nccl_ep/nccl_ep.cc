@@ -453,6 +453,12 @@ struct ncclEpGroup {
     // number of dispatch chunks so a partial final chunk stays within a node's region.
     int ht_aligned_max_tokens = 0;
 
+    // Resolved HT dispatch/combine tokens-per-chunk for this group. RDMA configs
+    // default to HT_TOKENS_PER_CHUNK_RDMA_DEFAULT (64); LSA-only configs default to
+    // a grid-proportional size (NUM_OF_TOKENS_PER_GROUP * comm_num_sms, rounded up
+    // to a multiple of 32). Either may be overridden by NCCL_EP_TOKENS_PER_CHUNK.
+    int ht_tokens_per_chunk = 0;
+
     struct {
         // Device communicator (single comm, multiple contexts)
         // HT internode uses ncclTeamRail on the base communicator
@@ -1076,17 +1082,17 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
         return (sz + alignment - 1) & ~(alignment - 1);
     };
 
-    // Chunk-aligned stride for the inter-node RDMA buffers; cached on the group for
-    // the dispatch/combine kernels, which must use the same stride.
-    const int ht_max_tokens = ((ep_group->config.max_dispatch_tokens_per_rank + HT_OF_NUM_TOKENS_PER_CHUNK - 1)
-                               / HT_OF_NUM_TOKENS_PER_CHUNK) * HT_OF_NUM_TOKENS_PER_CHUNK;
-    ep_group->ht_aligned_max_tokens = ht_max_tokens;
+    // Chunk-aligned stride for the inter-node RDMA buffers, resolved once at group
+    // creation (ep_group->ht_aligned_max_tokens / ht_tokens_per_chunk); the
+    // dispatch/combine kernels must use the same stride and chunk size.
+    const int ht_max_tokens = ep_group->ht_aligned_max_tokens;
+    const int ht_tokens_per_chunk = ep_group->ht_tokens_per_chunk;
     size_t rdma_intra_node_red_token_sz = align_size(static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * ep_group->config.max_token_bytes, GIN_ALIGNMENT);
     size_t combine_rdma_inter_node_group_token_sz = rdma_intra_node_red_token_sz;
     size_t rdma_intra_node_red_prob_sz = align_size(static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * (ep_group->num_local_experts * lsa_team_size) * sizeof(float), GIN_ALIGNMENT);
     size_t combine_rdma_inter_node_group_prob_sz = rdma_intra_node_red_prob_sz;
 
-    int max_chunks_per_rank = (ht_max_tokens + HT_OF_NUM_TOKENS_PER_CHUNK - 1) / HT_OF_NUM_TOKENS_PER_CHUNK;
+    int max_chunks_per_rank = (ht_max_tokens + ht_tokens_per_chunk - 1) / ht_tokens_per_chunk;
     size_t flags_sz = align_size(
         static_cast<size_t>(rdma_team_size - 1) * max_chunks_per_rank * sizeof(uint64_t),
         GIN_ALIGNMENT);
@@ -1237,7 +1243,7 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
         reqs.ginSignalCount = ep_group->gin_config.num_total_signals;
         reqs.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
         reqs.ginContextCount = ep_group->gin_config.num_ctx_per_comm;
-        reqs.ginQueueDepth = 3 * HT_OF_NUM_TOKENS_PER_CHUNK + 1;
+        reqs.ginQueueDepth = 3 * ht_tokens_per_chunk + 1;
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
     }
 
@@ -1536,8 +1542,9 @@ ncclResult_t ncclEpCreateGroup(
 
         uint64_t resolved = NUM_TIMEOUT_CYCLES;
         const char* source = "compile-time default";
-        const bool have_env_ms = ep_group->env.timeout_ms.is_set;
         const uint64_t env_ms = static_cast<uint64_t>(ep_group->env.timeout_ms.value.ul);
+        // Only a positive timeout overrides the default.
+        const bool have_env_ms = ep_group->env.timeout_ms.is_set && env_ms > 0;
 
         if (have_env_ms) {
             resolved = clock_khz * 1000ULL * env_ms / 1000ULL;
@@ -1633,6 +1640,34 @@ ncclResult_t ncclEpCreateGroup(
 
     // Initialize HT intranode buffers (windows, completion flags, etc.)
     if (hybridep_mode) {
+        // Resolve the dispatch/combine tokens-per-chunk for this group. RDMA
+        // (multi-node) configs use the tuned 64-token default; LSA-only configs
+        // use a grid-proportional size so one chunk is one wave across all SMs
+        // (NUM_OF_TOKENS_PER_GROUP tokens per SM). Either may be overridden by
+        // NCCL_EP_TOKENS_PER_CHUNK. The chunk must be a multiple of 32 (warp width;
+        // also covers the uint4 routing-map-load and token-group granularities), so
+        // non-conforming values are rounded up with a warning.
+        auto round_up_32 = [](int v) { return (v + 31) & ~31; };
+        int chunk = (ep_group->rdma_team_size > 1)
+            ? HT_TOKENS_PER_CHUNK_RDMA_DEFAULT
+            : round_up_32(HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP *
+                          static_cast<int>(ep_group->comm_num_sms));
+        if (ep_group->env.tokens_per_chunk.is_set &&
+            ep_group->env.tokens_per_chunk.value.ul > 0) {
+            const int requested = static_cast<int>(ep_group->env.tokens_per_chunk.value.ul);
+            chunk = round_up_32(requested);
+            if (chunk != requested) {
+                fprintf(stderr,
+                        "[nccl_ep] %s=%d rounded up to %d (must be a multiple of 32)\n",
+                        ep_group->env.tokens_per_chunk.name, requested, chunk);
+            }
+        }
+        ep_group->ht_tokens_per_chunk = chunk;
+        // Chunk-aligned inter-node RDMA stride; also the max-tokens template arg for
+        // the dispatch/combine kernels (guarantees MAX_NUM_OF_TOKENS_PER_RANK % chunk == 0).
+        ep_group->ht_aligned_max_tokens =
+            ((ep_group->config.max_dispatch_tokens_per_rank + chunk - 1) / chunk) * chunk;
+
         NCCL_CHECK_RESULT(init_hybridep_intranode(ep_group, in_config, stream));
         NCCL_CHECK_RESULT(init_hybridep_internode(ep_group, in_config, stream));
 
@@ -3362,6 +3397,7 @@ ncclResult_t ncclEpDispatch(
         NCCLCHECK(nccl_ep::hybridep::call_dispatch(
             params,
             group->ht_aligned_max_tokens,
+            group->ht_tokens_per_chunk,
             group->rdma_team_size,
             use_fp8,
             forward_dispatch,
@@ -4078,6 +4114,7 @@ ncclResult_t ncclEpCombine(
         nccl_ep::hybridep::call_combine(
             params,
             group->ht_aligned_max_tokens, // chunk-aligned stride
+            group->ht_tokens_per_chunk,   // tokens per dispatch/combine chunk
             group->rdma_team_size, // num_nodes (RDMA domain size)
             backward_combine, // backward mode flag
             static_cast<int>(group->comm_num_sms),

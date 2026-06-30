@@ -55,6 +55,7 @@ struct ncclEpEnvConfig {
     ncclEpEnvVar comm_num_sms       {"NCCL_EP_COMM_SMS",           ncclEpEnvType::ulong};
     ncclEpEnvVar prolog_epilog_sms  {"NCCL_EP_PROLOG_EPILOG_SMS",  ncclEpEnvType::ulong};
     ncclEpEnvVar preprocess_num_sms {"NCCL_EP_PREPROCESS_NUM_SMS", ncclEpEnvType::ulong};
+    ncclEpEnvVar tokens_per_chunk   {"NCCL_EP_TOKENS_PER_CHUNK",   ncclEpEnvType::ulong};
 };
 
 // True iff a flag variable was explicitly set to an "on" value (1/on/true).

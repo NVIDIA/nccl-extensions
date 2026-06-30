@@ -1099,6 +1099,7 @@ template<bool FORWARD_DISPATCH>
 ncclResult_t dispatch_impl(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank,
+    int num_tokens_per_chunk,
     int num_nodes,
     bool use_fp8,
     int num_blocks,
@@ -1129,7 +1130,7 @@ ncclResult_t dispatch_impl(
         ::hybrid_ep::model_config_t   d_model;
         d_config.num_of_stages           = HYBRIDEP_DISPATCH_NUM_OF_STAGES;
         d_config.num_of_in_flight_s2g    = HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G;
-        d_config.num_of_tokens_per_chunk = HT_OF_NUM_TOKENS_PER_CHUNK;
+        d_config.num_of_tokens_per_chunk = num_tokens_per_chunk;
         d_config.num_of_blocks           = num_blocks;
         d_config.forward_dispatch        = FORWARD_DISPATCH;
         d_config.sf_bytes_per_token      = sf_bytes_per_token;
@@ -1170,7 +1171,7 @@ ncclResult_t dispatch_impl(
         jit::launch_dispatch(
             HYBRIDEP_DISPATCH_NUM_OF_STAGES,
             HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
-            HT_OF_NUM_TOKENS_PER_CHUNK,
+            num_tokens_per_chunk,
             max_dispatch_tokens_per_rank,
             num_blocks,
             FORWARD_DISPATCH,
@@ -1197,6 +1198,7 @@ ncclResult_t dispatch_impl(
 ncclResult_t call_dispatch(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank,
+    int num_tokens_per_chunk,
     int num_nodes,
     bool use_fp8,
     bool forward_dispatch,
@@ -1207,11 +1209,11 @@ ncclResult_t call_dispatch(
 ) {
     if (forward_dispatch) {
         return dispatch_impl<true>(
-            params, max_dispatch_tokens_per_rank,
+            params, max_dispatch_tokens_per_rank, num_tokens_per_chunk,
             num_nodes, use_fp8, num_blocks, sf_bytes_per_token, stream, token_dtype);
     } else {
         return dispatch_impl<false>(
-            params, max_dispatch_tokens_per_rank,
+            params, max_dispatch_tokens_per_rank, num_tokens_per_chunk,
             num_nodes, use_fp8, num_blocks, sf_bytes_per_token, stream, token_dtype);
     }
 }
@@ -1309,6 +1311,7 @@ template<bool BACKWARD_COMBINE>
 void combine_impl(
     const CombineParams& params,
     int max_dispatch_tokens_per_rank,
+    int num_tokens_per_chunk,
     int num_nodes,
     int num_blocks,
     cudaStream_t stream
@@ -1339,10 +1342,10 @@ void combine_impl(
     // share the BF16 instantiation; only FP32 (4 B) is distinct.
     const int smem_size = (params.token_dtype == ncclFloat32)
         ? static_cast<int>(::hybrid_ep::calculate_combine_smem_layout_size<ncclFloat32>(
-              num_stages_g2s, num_stages_s2g, HT_OF_NUM_TOKENS_PER_CHUNK,
+              num_stages_g2s, num_stages_s2g, num_tokens_per_chunk,
               max_dispatch_tokens_per_rank, num_nodes, BACKWARD_COMBINE, model))
         : static_cast<int>(::hybrid_ep::calculate_combine_smem_layout_size<ncclBfloat16>(
-              num_stages_g2s, num_stages_s2g, HT_OF_NUM_TOKENS_PER_CHUNK,
+              num_stages_g2s, num_stages_s2g, num_tokens_per_chunk,
               max_dispatch_tokens_per_rank, num_nodes, BACKWARD_COMBINE, model));
 
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
@@ -1362,7 +1365,7 @@ void combine_impl(
     jit::launch_combine(
         num_stages_g2s,
         num_stages_s2g,
-        HT_OF_NUM_TOKENS_PER_CHUNK,
+        num_tokens_per_chunk,
         max_dispatch_tokens_per_rank,
         HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP,
         num_blocks,
@@ -1465,6 +1468,7 @@ void call_local_reduce(
 void call_combine(
     const CombineParams& params,
     int max_dispatch_tokens_per_rank,
+    int num_tokens_per_chunk,
     int num_nodes,
     bool backward_combine,
     int num_blocks,
@@ -1472,11 +1476,11 @@ void call_combine(
 ) {
     if (backward_combine) {
         combine_impl<true>(
-            params, max_dispatch_tokens_per_rank,
+            params, max_dispatch_tokens_per_rank, num_tokens_per_chunk,
             num_nodes, num_blocks, stream);
     } else {
         combine_impl<false>(
-            params, max_dispatch_tokens_per_rank,
+            params, max_dispatch_tokens_per_rank, num_tokens_per_chunk,
             num_nodes, num_blocks, stream);
     }
 }

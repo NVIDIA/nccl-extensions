@@ -29,10 +29,12 @@ namespace hybridep {
 // ============================================================================
 // Kernel: Convert sparse topk_idx to dense routing map
 // ============================================================================
+// cached_topk_idx mirrors topk_idx in its native width (int32 or int64).
+template <typename TopkIdxT>
 __global__ void convert_topk_to_routing_map_kernel(
-    const int64_t* __restrict__ topk_idx,    // [num_tokens, num_topk]
+    const TopkIdxT* __restrict__ topk_idx,    // [num_tokens, num_topk]
     uint8_t* __restrict__ routing_bitmap,     // [max_tokens, num_experts_packed]
-    int64_t* __restrict__ cached_topk_idx,    // [num_tokens, num_topk]; nullable
+    TopkIdxT* __restrict__ cached_topk_idx,   // [num_tokens, num_topk]; nullable
     int num_tokens,
     int max_tokens,                           // tail-zero bound (>= num_tokens)
     int num_topk,
@@ -48,10 +50,10 @@ __global__ void convert_topk_to_routing_map_kernel(
     uint8_t* row = routing_bitmap + token * num_experts_packed;
     for (int b = 0; b < num_experts_packed; b++) row[b] = 0;
     if (token >= num_tokens) return;
-    const int64_t* in_row  = topk_idx + token * num_topk;
-    int64_t*       out_row = cached_topk_idx ? cached_topk_idx + token * num_topk : nullptr;
+    const TopkIdxT* in_row  = topk_idx + token * num_topk;
+    TopkIdxT*       out_row = cached_topk_idx ? cached_topk_idx + token * num_topk : nullptr;
     for (int k = 0; k < num_topk; k++) {
-        int64_t expert = in_row[k];
+        TopkIdxT expert = in_row[k];
         if (out_row) out_row[k] = expert;
         if (expert >= 0) {
             row[expert / 8] |= (1u << (expert % 8));
@@ -62,10 +64,11 @@ __global__ void convert_topk_to_routing_map_kernel(
 // ============================================================================
 // Convert topk to bitmap routing map
 // ============================================================================
+template <typename TopkIdxT>
 void convert_topk_to_routing_map(
-    const int64_t* topk_idx,
+    const TopkIdxT* topk_idx,
     uint8_t* routing_bitmap,
-    int64_t* cached_topk_idx,
+    TopkIdxT* cached_topk_idx,
     int num_tokens,
     int max_tokens,
     int num_topk,
@@ -79,11 +82,17 @@ void convert_topk_to_routing_map(
         topk_idx, routing_bitmap, cached_topk_idx, num_tokens, max_tokens, num_topk, num_experts_packed);
 }
 
+template void convert_topk_to_routing_map<int32_t>(
+    const int32_t*, uint8_t*, int32_t*, int, int, int, int, cudaStream_t);
+template void convert_topk_to_routing_map<int64_t>(
+    const int64_t*, uint8_t*, int64_t*, int, int, int, int, cudaStream_t);
+
 // ============================================================================
 // Kernel: Convert sparse topk_weights to dense prob
 // ============================================================================
+template <typename TopkIdxT>
 __global__ void sparse_to_dense_prob_kernel(
-    const int64_t* __restrict__ topk_idx,      // [num_tokens, topk]
+    const TopkIdxT* __restrict__ topk_idx,     // [num_tokens, topk]
     const float* __restrict__ topk_weights,    // [num_tokens, topk]
     float* __restrict__ dense_prob,            // [num_tokens, num_experts]
     int num_tokens,
@@ -96,7 +105,7 @@ __global__ void sparse_to_dense_prob_kernel(
 
     if (token >= num_tokens) return;
 
-    int64_t expert = topk_idx[token * num_topk + k];
+    int64_t expert = static_cast<int64_t>(topk_idx[token * num_topk + k]);
     float weight = topk_weights[token * num_topk + k];
 
     // Scatter weight to the correct expert position
@@ -108,8 +117,9 @@ __global__ void sparse_to_dense_prob_kernel(
 // ============================================================================
 // Convert sparse to dense prob
 // ============================================================================
+template <typename TopkIdxT>
 void sparse_to_dense_prob(
-    const int64_t* topk_idx,
+    const TopkIdxT* topk_idx,
     const float* topk_weights,
     float* dense_prob,
     int num_tokens,
@@ -124,6 +134,11 @@ void sparse_to_dense_prob(
     sparse_to_dense_prob_kernel<<<grid_size, block_size, 0, stream>>>(
         topk_idx, topk_weights, dense_prob, num_tokens, num_topk, num_experts);
 }
+
+template void sparse_to_dense_prob<int32_t>(
+    const int32_t*, const float*, float*, int, int, int, cudaStream_t);
+template void sparse_to_dense_prob<int64_t>(
+    const int64_t*, const float*, float*, int, int, int, cudaStream_t);
 
 // ============================================================================
 // Kernel: Convert sparse topk_weights to dense prob for combine input
@@ -265,9 +280,10 @@ __global__ void dense_to_sparse_prob_kernel(
 }
 
 // O(top_k) lookup from cached_topk_idx; k-slot order preserves FWD input.
+template <typename TopkIdxT>
 __global__ void dense_to_sparse_prob_combine_kernel(
     const float* __restrict__ dense_prob,         // [num_tokens, num_experts]
-    const int64_t* __restrict__ cached_topk_idx,  // [num_tokens, topk]
+    const TopkIdxT* __restrict__ cached_topk_idx, // [num_tokens, topk]
     float* __restrict__ combined_topk_weights,    // [num_tokens, topk]
     int num_tokens,
     int topk,
@@ -277,7 +293,7 @@ __global__ void dense_to_sparse_prob_combine_kernel(
     if (token >= num_tokens) return;
 
     for (int k = 0; k < topk; k++) {
-        int64_t e = cached_topk_idx[token * topk + k];
+        int64_t e = static_cast<int64_t>(cached_topk_idx[token * topk + k]);
         float weight = (e >= 0 && e < num_experts)
             ? dense_prob[token * num_experts + e]
             : 0.0f;
@@ -285,9 +301,10 @@ __global__ void dense_to_sparse_prob_combine_kernel(
     }
 }
 
+template <typename TopkIdxT>
 void dense_to_sparse_prob_combine(
     const float* dense_prob,
-    const int64_t* cached_topk_idx,
+    const TopkIdxT* cached_topk_idx,
     float* combined_topk_weights,
     int num_tokens,
     int topk,
@@ -301,6 +318,11 @@ void dense_to_sparse_prob_combine(
         dense_prob, cached_topk_idx, combined_topk_weights,
         num_tokens, topk, num_experts);
 }
+
+template void dense_to_sparse_prob_combine<int32_t>(
+    const float*, const int32_t*, float*, int, int, int, cudaStream_t);
+template void dense_to_sparse_prob_combine<int64_t>(
+    const float*, const int64_t*, float*, int, int, int, cudaStream_t);
 
 
 // ============================================================================

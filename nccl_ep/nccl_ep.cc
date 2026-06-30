@@ -2004,7 +2004,8 @@ struct ncclEpHandle {
             int                       emuf_max_groups;
 
             // Cached user topk_idx; persists across dispatch/combine.
-            int64_t*                  topk_idx;
+            // Native width matches handle->topk_idx.datatype (int32 or int64).
+            void*                     topk_idx;
 
             // FLAT-dispatch + local-permute scratch (EM-permute path only).
             // flat2em_slot_map, recv_topk_weights_flat and token_to_recv_slot
@@ -2389,7 +2390,7 @@ static ncclResult_t ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group
         handle->hybridep.dense_prob_buffer     = nullptr;
     }
     handle->hybridep.topk_idx                  = (L.sz_topk_idx > 0)
-        ? reinterpret_cast<int64_t*>(ptr + offset) : nullptr;
+        ? reinterpret_cast<void*>(ptr + offset) : nullptr;
     offset += L.sz_topk_idx;
     // EM remap counts/offsets live in handle_mem (EM only; FLAT must not read them).
     handle->hybridep.per_expert_counts_active  = (L.sz_pec_active > 0)
@@ -2499,14 +2500,10 @@ ncclResult_t ncclEpUpdateHandle(
     ncclEpGroup_t ep_group = handle->group;
     assert(ep_group != nullptr);
 
-    // LL accepts ncclInt32 or ncclInt64; HT remains strict ncclInt64.
-    if (ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        assert((topk_idx->datatype == ncclInt32 || topk_idx->datatype == ncclInt64)
-               && "LL topk_idx must be ncclInt32 or ncclInt64");
-    } else {
-        assert(topk_idx->datatype == ncclInt64
-               && "HT topk_idx must be ncclInt64");
-    }
+    // LL and HT both accept ncclInt32 or ncclInt64; the cached idx keeps the
+    // caller's native width.
+    assert((topk_idx->datatype == ncclInt32 || topk_idx->datatype == ncclInt64)
+           && "topk_idx must be ncclInt32 or ncclInt64");
 
     // Take ownership of the descriptor with a library-owned tensor to
     // ensure no dependency on the caller's descriptor.
@@ -2561,15 +2558,28 @@ ncclResult_t ncclEpUpdateHandle(
     // Pass max_tokens so the kernel zeroes the tail rows in the local send slot;
     // ncclAllGather below ships max_tokens rows and stale tail bits would otherwise
     // be interpreted as live routing by peers.
-    nccl_ep::hybridep::convert_topk_to_routing_map(
-        static_cast<const int64_t*>(handle->topk_idx.data),
-        local_routing_send_ptr,
-        handle->hybridep.topk_idx,
-        handle->num_tokens,
-        max_tokens,
-        handle->num_topk,
-        num_experts_packed,
-        stream);
+    // Cache the idx in the caller's native width (int32 or int64).
+    if (handle->topk_idx.datatype == ncclInt32) {
+        nccl_ep::hybridep::convert_topk_to_routing_map(
+            static_cast<const int32_t*>(handle->topk_idx.data),
+            local_routing_send_ptr,
+            static_cast<int32_t*>(handle->hybridep.topk_idx),
+            handle->num_tokens,
+            max_tokens,
+            handle->num_topk,
+            num_experts_packed,
+            stream);
+    } else {
+        nccl_ep::hybridep::convert_topk_to_routing_map(
+            static_cast<const int64_t*>(handle->topk_idx.data),
+            local_routing_send_ptr,
+            static_cast<int64_t*>(handle->hybridep.topk_idx),
+            handle->num_tokens,
+            max_tokens,
+            handle->num_topk,
+            num_experts_packed,
+            stream);
+    }
 
     // ===== Step 2: Allgather bitmap routing maps =====
     NCCL_CHECK_RESULT(ncclAllGather(
@@ -3210,14 +3220,25 @@ ncclResult_t ncclEpDispatch(
             size_t dense_prob_size = static_cast<size_t>(handle->num_tokens) * group->config.num_experts * sizeof(float);
             CUDA_CHECK(cudaMemsetAsync(dense_prob, 0, dense_prob_size, stream));
 
-            nccl_ep::hybridep::sparse_to_dense_prob(
-                handle->hybridep.topk_idx,
-                static_cast<const float*>(topk_weights->data),
-                dense_prob,
-                handle->num_tokens,
-                handle->num_topk,
-                group->config.num_experts,
-                stream);
+            if (handle->topk_idx.datatype == ncclInt32) {
+                nccl_ep::hybridep::sparse_to_dense_prob(
+                    static_cast<const int32_t*>(handle->hybridep.topk_idx),
+                    static_cast<const float*>(topk_weights->data),
+                    dense_prob,
+                    handle->num_tokens,
+                    handle->num_topk,
+                    group->config.num_experts,
+                    stream);
+            } else {
+                nccl_ep::hybridep::sparse_to_dense_prob(
+                    static_cast<const int64_t*>(handle->hybridep.topk_idx),
+                    static_cast<const float*>(topk_weights->data),
+                    dense_prob,
+                    handle->num_tokens,
+                    handle->num_topk,
+                    group->config.num_experts,
+                    stream);
+            }
         }
 
         /* ===== Build DispatchParams ===== */
@@ -4076,14 +4097,25 @@ ncclResult_t ncclEpCombine(
         if (backward_combine) {
             assert(handle->hybridep.topk_idx != nullptr &&
                    "HT BWD combine: hybridep.topk_idx missing (ncclEpUpdateHandle not called?)");
-            nccl_ep::hybridep::dense_to_sparse_prob_combine(
-                dense_output_prob,
-                handle->hybridep.topk_idx,
-                static_cast<float*>(combined_topk_weights->data),
-                num_combined_tokens,
-                num_topk,
-                group->config.num_experts,
-                stream);
+            if (handle->topk_idx.datatype == ncclInt32) {
+                nccl_ep::hybridep::dense_to_sparse_prob_combine(
+                    dense_output_prob,
+                    static_cast<const int32_t*>(handle->hybridep.topk_idx),
+                    static_cast<float*>(combined_topk_weights->data),
+                    num_combined_tokens,
+                    num_topk,
+                    group->config.num_experts,
+                    stream);
+            } else {
+                nccl_ep::hybridep::dense_to_sparse_prob_combine(
+                    dense_output_prob,
+                    static_cast<const int64_t*>(handle->hybridep.topk_idx),
+                    static_cast<float*>(combined_topk_weights->data),
+                    num_combined_tokens,
+                    num_topk,
+                    group->config.num_experts,
+                    stream);
+            }
         }
 
         handle->cached_mode = true;

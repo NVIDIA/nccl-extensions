@@ -39,10 +39,12 @@ namespace hybridep {
 // ============================================================================
 // NCCL API uses sparse format: topk_idx[token][k] = expert_id
 // HT uses bitmap format: routing_bitmap[token][expert/8] has bit (expert%8) set
+// cached_topk_idx mirrors topk_idx in its native width (int32 or int64).
+template <typename TopkIdxT>
 void convert_topk_to_routing_map(
-    const int64_t* topk_idx,
+    const TopkIdxT* topk_idx,
     uint8_t* routing_bitmap,
-    int64_t* cached_topk_idx,  // nullable; when non-null, mirrors topk_idx in the same pass
+    TopkIdxT* cached_topk_idx,  // nullable; when non-null, mirrors topk_idx in the same pass
     int num_tokens,
     int max_tokens,            // tail bound; rows [num_tokens, max_tokens) are zeroed
     int num_topk,
@@ -54,8 +56,9 @@ void convert_topk_to_routing_map(
 // ============================================================================
 // NCCL API uses sparse format: topk_weights[token][k] = weight, topk_idx[token][k] = expert_id
 // HT uses dense format: prob[token][expert] = weight (0 for non-selected)
+template <typename TopkIdxT>
 void sparse_to_dense_prob(
-    const int64_t* topk_idx,      // [num_tokens, topk] - which experts
+    const TopkIdxT* topk_idx,     // [num_tokens, topk] - which experts
     const float* topk_weights,    // [num_tokens, topk] - weights for those experts
     float* dense_prob,            // [num_tokens, num_experts] - output dense prob (pre-zeroed)
     int num_tokens,
@@ -108,9 +111,10 @@ void dense_to_sparse_prob(
     cudaStream_t stream);
 
 // Combine BWD output: sparse k-slot writeback keyed by FWD-input cached_topk_idx.
+template <typename TopkIdxT>
 void dense_to_sparse_prob_combine(
     const float* dense_prob,              // [num_tokens, num_experts]
-    const int64_t* cached_topk_idx,       // [num_tokens, topk]
+    const TopkIdxT* cached_topk_idx,      // [num_tokens, topk]
     float* combined_topk_weights,         // [num_tokens, topk]
     int num_tokens,
     int topk,

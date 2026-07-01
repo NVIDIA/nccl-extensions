@@ -1038,6 +1038,7 @@ build_dispatch_param_base(const DispatchParams& params) {
     kp.node_rank = params.node_rank;
     kp.num_of_tokens_per_rank = params.num_tokens_per_rank;
     kp.local_dup_enabled = (params.local_dup_num_sms > 0);
+    kp.guard_enabled = params.guard_enabled;
 
     // Pass device communicators and windows
     kp.dcomm = params.dcomm;
@@ -1055,12 +1056,12 @@ build_dispatch_param_base(const DispatchParams& params) {
                // Batched staging parameters (packed layout)
                .rdma_send_staging_offset = params.mr_info.rdma_send_staging_offset,
                .rdma_inter_node_group_packed_offset = params.mr_info.rdma_inter_node_group_packed_offset,
+               .guard_offset = params.mr_info.guard_offset,
                .bytes_per_entry = params.mr_info.bytes_per_entry,
                .max_tokens_per_dest = params.mr_info.max_tokens_per_dest,
                // Streaming signal parameters
                .signals_tail_base = params.mr_info.signals_tail_base,
-               .num_max_rdma_chunked_send_tokens = params.mr_info.num_max_rdma_chunked_send_tokens,
-               .sync_guard_offset = params.mr_info.sync_guard_offset
+               .num_max_rdma_chunked_send_tokens = params.mr_info.num_max_rdma_chunked_send_tokens
             };
 
     return kp;
@@ -1256,6 +1257,7 @@ build_combine_param_base(const CombineParams& params) {
     kp.rdma_inter_node_group_flags = params.combine_rdma_inter_node_group_flags;
     kp.intra_node_write_completion_flags = params.combine_intra_node_write_completion_flags;
     kp.combine_grid_barrier_counter = params.combine_grid_barrier_counter;
+    kp.guard_enabled = params.guard_enabled;
 
     // Runtime config
     kp.local_rank = params.local_rank;
@@ -1280,7 +1282,7 @@ build_combine_param_base(const CombineParams& params) {
                .combine_rdma_inter_node_group_token_offset = params.mr_info.combine_rdma_inter_node_group_token_offset,
                .rdma_intra_node_red_prob_offset = params.mr_info.rdma_intra_node_red_prob_offset,
                .combine_rdma_inter_node_group_prob_offset = params.mr_info.combine_rdma_inter_node_group_prob_offset,
-               .sync_guard_offset = params.mr_info.sync_guard_offset
+               .guard_offset = params.mr_info.guard_offset
     };
 
     return kp;

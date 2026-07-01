@@ -294,6 +294,12 @@ export NCCL_EP_TOKENS_PER_CHUNK=128
 export NCCL_EP_ENV_VERBOSE=1
 ```
 
+By default EP guards its internal communication buffers so that neighboring
+dispatch/combine calls cannot corrupt each other's data; this is safe and needs
+no configuration. Advanced callers that can already guarantee consecutive EP
+operations will not race on these buffers may disable the guard to reclaim its
+overhead with `export NCCL_EP_DISABLE_GUARD=1`.
+
 
 # Core Concepts
 

@@ -55,6 +55,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_flag(cfg->debug);
     parse_flag(cfg->ht_em_local_dup);
     parse_flag(cfg->ht_em_nvlink_dup);
+    parse_flag(cfg->disable_guard);
 
     // Numeric (ulong) vars: is_set means present, value.ul holds the raw integer
     // (no range checks here — consumers in nccl_ep.cc validate per their needs).
@@ -69,7 +70,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
     // Every variable, so the user can see exactly what was provided. Adding a
     // field to ncclEpEnvConfig only requires adding it to this list.
     const ncclEpEnvVar* vars[] = {
-        &cfg.verbose, &cfg.debug, &cfg.ht_em_local_dup, &cfg.ht_em_nvlink_dup,
+        &cfg.verbose, &cfg.debug, &cfg.ht_em_local_dup, &cfg.ht_em_nvlink_dup, &cfg.disable_guard,
         &cfg.timeout_ms, &cfg.comm_num_sms, &cfg.prolog_epilog_sms,
         &cfg.preprocess_num_sms, &cfg.tokens_per_chunk,
     };

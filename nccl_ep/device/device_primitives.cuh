@@ -288,6 +288,12 @@ __device__ __forceinline__ uint32_t ld_relaxed_sys_global(const uint32_t* ptr) {
     return ret;
 }
 
+__device__ __forceinline__ uint64_t ld_relaxed_sys_global(const uint64_t* ptr) {
+    uint64_t ret;
+    asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr) : "memory");
+    return ret;
+}
+
 __device__ __forceinline__ uint64_t ld_relaxed_gpu_global(const uint64_t* ptr) {
     uint64_t ret;
     asm volatile("ld.relaxed.gpu.global.b64 %0, [%1];"

@@ -73,13 +73,13 @@ struct dispatch_memory_region_info_t {
   // Batched RDMA staging (packed layout: token+prob+sf per entry)
   size_t rdma_send_staging_offset;           // Offset of per-destination staging buffer
   size_t rdma_inter_node_group_packed_offset; // Offset of packed receive buffer (token+prob+sf per entry)
+  size_t guard_offset;                       // Offset of RDMA sync-guard readiness flags (NUM_LSA_TEAMS uint64 slots)
   size_t bytes_per_entry;                    // Size of packed entry (token + prob + sf)
   size_t max_tokens_per_dest;                // Max tokens that can be staged per destination
   // Streaming RDMA signals
   unsigned signals_tail_base;               // Base signal ID for tail tracking (sender -> receiver)
   // Streaming buffer configuration
   int num_max_rdma_chunked_send_tokens;     // Batch size per RDMA put (default: 6)
-  size_t sync_guard_offset;  // RDMA sync-guard: offset of internal-buffer readiness flags (NUM_LSA_TEAMS uint64 slots)
 } __attribute__((__aligned__(8)));
 
 // Tail-signal id for the (src_node -> dst_node) edge of (local_rank, chunk); namespace [src][dst][local_rank][chunk].
@@ -105,7 +105,7 @@ struct combine_memory_region_info_t {
   size_t combine_rdma_inter_node_group_token_offset; // Offset of combine rdma token buffer
   size_t rdma_intra_node_red_prob_offset;         // Offset of intra-node reduced prob buffer
   size_t combine_rdma_inter_node_group_prob_offset;  // Offset of combine rdma prob buffer
-  size_t sync_guard_offset;  // RDMA sync-guard: offset of combine's internal-buffer readiness flags
+  size_t guard_offset;  // RDMA sync-guard: offset of combine's internal-buffer readiness flags
 } __attribute__((__aligned__(8)));
 
 // ============================================================================
@@ -908,6 +908,9 @@ struct dispatch_kernel_param_base_t {
   // sender S2G dedups consecutive same-dest entries; secondary slots are filled
   // afterwards by the local_dup kernel.
   bool local_dup_enabled;
+  // Cross-round WAR sync-guards: LSA (intra-node staging) uses the NCCL LSA barrier; RDMA
+  // (inter-node staging) is hand-rolled. Only the enable flags are needed on the device now.
+  bool guard_enabled;   // cross-round WAR guard (LSA + RDMA share one enable)
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
   dispatch_warp_timing_entry_t* warp_timing;
 #endif
@@ -972,6 +975,9 @@ struct combine_kernel_param_base_t {
   unsigned combine_signal_offset;    // Signal offset for combine operations
   // qp info and mr info
   struct combine_memory_region_info_t mr_info;
+  // Cross-round WAR sync-guards: LSA (intra-node staging) uses the NCCL LSA barrier; RDMA
+  // (inter-node staging) is hand-rolled. Only the enable flags are needed on the device now.
+  bool guard_enabled;   // cross-round WAR guard (LSA + RDMA share one enable)
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
   combine_warp_timing_entry_t* warp_timing;
   combine_block_timing_entry_t* block_timing;
@@ -3469,6 +3475,38 @@ __forceinline__ __device__ void PAD_warp_group_device_function(
 }
 
 
+// Inter-node RDMA (GIN) cross-round WAR guard, warp-collective (lane i -> peer i), relaxed (WAR only).
+
+// Wait until every rail peer's flag reaches the expected round.
+__device__ __forceinline__ void warp_rdma_guard_wait(
+    const uint64_t* peer_flags, int node_rank, int num_lsa_teams, uint64_t expected) {
+    for (int peer = (threadIdx.x & 31); peer < num_lsa_teams; peer += 32) {
+        if (peer == node_rank) continue;
+        while (nccl_ep::ld_relaxed_sys_global(&peer_flags[peer]) + 1ull < expected) { /* busy-wait */ }
+    }
+}
+
+// Publish the expected round into this rank's slot (my_slot) of every rail peer's window.
+__device__ __forceinline__ void warp_rdma_guard_publish(
+    ncclDevComm dcomm, ncclWindow_t dest_window, size_t my_slot,
+    int node_rank, int num_lsa_teams, uint64_t expected) {
+    ncclGin net(dcomm, /*contextIndex=*/0, NCCL_GIN_RESOURCE_SHARING_THREAD);
+    ncclTeam rail = ncclTeamRail(dcomm);
+    for (int peer = (threadIdx.x & 31); peer < num_lsa_teams; peer += 32) {
+        if (peer == node_rank) continue;
+        net.putValue(rail, peer, dest_window, my_slot, expected, ncclGin_None{}, ncclCoopThread());
+    }
+}
+
+// Elect the last block to arrive at *counter (result broadcast to all threads in the block).
+__device__ __forceinline__ bool elect_last_block(const int* counter, int num_blocks) {
+    __syncthreads();
+    int arrived = -1;
+    if (threadIdx.x == 0)
+        arrived = static_cast<int>(nccl_ep::atomic_add_acqrel_global(counter, 1));
+    return __syncthreads_or(arrived == num_blocks - 1);
+}
+
 template<ncclDataType_t kTokenDtype,
          typename INTER_NODE_GROUP,
          typename INTRA_NODE_G2S_GROUP,
@@ -3520,34 +3558,46 @@ __device__ __forceinline__ void dispatch_kernel_impl(
   create_dispatch_smem_layout<kLayout, kTokenDtype>(smem_layout, smem_bytes, d_config, d_model);
   cur_smem_t* smem_buffer_ptr = &smem_layout;
 
-  // RDMA sync-guard (dispatch head): wait until each rail peer's internal staging buffer is ready (prev round consumed) before reusing it.
-  if constexpr (NUM_LSA_TEAMS != 1) {
-    if (threadIdx.x == 0) {
-      const uint64_t target = *param.expected_rdma_flag_value - 1ull;  // previous round
-      const uint64_t* guard = reinterpret_cast<const uint64_t*>(
-          reinterpret_cast<uint8_t*>(param.gin_base_ptr) + param.mr_info.sync_guard_offset);
-      for (int peer = 0; peer < NUM_LSA_TEAMS; ++peer) {
-        if (peer == param.node_rank) continue;
-        // sys-scope acquire load: slot is written by the rail peer's NIC (RDMA).
-        while (nccl_ep::ld_acquire_sys_global(&guard[peer]) < target) { /* busy-wait */ }
+  using head_init_warp = warp_group<1, 0>;
+  using head_rdma_warp = warp_group<1, 1>;
+  using head_lsa_warp  = warp_group<1, 2>;
+  static_assert(INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() +
+                INTRA_NODE_S2G_GROUP::size() + PAD_GROUP::size() >= 3 * 32,
+                "dispatch head needs 3 warps");
+  const int head_tid = (int)threadIdx.x;
+  if (head_tid < head_init_warp::size()) {
+    // warp 0: per-pipeline mbarrier init (both producer/consumer arrival counts = 1).
+    if (head_tid == 0) {
+      for (int p = 0; p < NUM_PIPELINES; p++) {
+        for (int s = 0; s < STAGES_PER_PIPELINE; s++) {
+          int abs_stage = p * STAGES_PER_PIPELINE + s;
+          cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_mbarrier_buffer + 2 * abs_stage, 1);
+          cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_mbarrier_buffer + 2 * abs_stage + 1, 1);
+        }
+        cuda::ptx::mbarrier_init(smem_buffer_ptr->get_s2d_map_mbar(p, 0), 1);
+        cuda::ptx::mbarrier_init(smem_buffer_ptr->get_s2d_map_mbar(p, 1), 1);
+        cuda::ptx::mbarrier_init(smem_buffer_ptr->get_S2G_group_mbar(p), 1);
+      }
+      cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+    }
+  } else if (head_tid < head_init_warp::size() + head_rdma_warp::size()) {
+    // warp 1: inter-node RDMA guard wait.
+    if constexpr (NUM_LSA_TEAMS != 1) {
+      if (param.guard_enabled)
+        warp_rdma_guard_wait(
+            reinterpret_cast<const uint64_t*>(
+                reinterpret_cast<const uint8_t*>(param.gin_base_ptr) + param.mr_info.guard_offset),
+            param.node_rank, NUM_LSA_TEAMS, *param.expected_rdma_flag_value);
+    }
+  } else if (head_tid < head_init_warp::size() + head_rdma_warp::size() + head_lsa_warp::size()) {
+    // warp 2: intra-node LSA barrier.
+    if constexpr (LSA_TEAM_SIZE != 1) {
+      if (param.guard_enabled) {
+        ncclLsaBarrierSession<ncclCoopWarp> bar(ncclCoopWarp(), param.dcomm, ncclTeamTagLsa(),
+                                                (uint32_t)blockIdx.x);
+        bar.sync(ncclCoopWarp(), cuda::memory_order_relaxed);
       }
     }
-  }
-
-  if (threadIdx.x == 0) {
-    // Per-pipeline mbarrier initialization.
-    // CRITICAL: both producer and consumer arrival counts = 1 per pipeline.
-    for (int p = 0; p < NUM_PIPELINES; p++) {
-      for (int s = 0; s < STAGES_PER_PIPELINE; s++) {
-        int abs_stage = p * STAGES_PER_PIPELINE + s;
-        cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_mbarrier_buffer + 2 * abs_stage, 1);
-        cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_mbarrier_buffer + 2 * abs_stage + 1, 1);
-      }
-      cuda::ptx::mbarrier_init(smem_buffer_ptr->get_s2d_map_mbar(p, 0), 1);
-      cuda::ptx::mbarrier_init(smem_buffer_ptr->get_s2d_map_mbar(p, 1), 1);
-      cuda::ptx::mbarrier_init(smem_buffer_ptr->get_S2G_group_mbar(p), 1);
-    }
-    cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
   }
 
   __syncthreads();
@@ -3615,56 +3665,33 @@ __device__ __forceinline__ void dispatch_kernel_impl(
 #endif
 
   // ===== FUSED DEVICE SYNC (dispatch tail) =====
-  // All threads in this block must finish G2S/S2G/N2N work before we signal completion.
-  __syncthreads();
-
-  if (threadIdx.x == 0) {
-      // Load the expected counter BEFORE the grid-barrier atom_add. The
-      // release on this thread's atom_add then synchronizes-with the last
-      // block's acquire, ordering this load before the last block's tail bump.
-      uint32_t expected_val = *param.expected_intra_node_flag_value;
-
-      // Grid barrier: each block release-adds to publish its TMA stores (already proxy-drained
-      // in S2G warp, propagated here by __syncthreads). Last block acquires peers' releases.
-      uint32_t arrived = static_cast<uint32_t>(nccl_ep::atomic_add_acqrel_global(
-                          reinterpret_cast<const int*>(param.dispatch_grid_barrier_counter), 1));
-
-      // Last block: signal inter-rank completion. Acquire-load the counter to pair with peers'
-      // release-adds (the prior atom.add.release alone is not acquire on the load side).
-      if (arrived == NUM_OF_BLOCKS - 1) {
-          nccl_ep::red_add_release_sys_global(param.intra_node_write_completion_flags, 1u);
-      }
-
-      // Poll inter-rank flag (relaxed in loop; single fence.acq_rel.sys after orders subsequent reads).
-      uint32_t flag_data;
-      do {
-          flag_data = nccl_ep::ld_relaxed_sys_global(param.intra_node_write_completion_flags);
-      } while (flag_data != expected_val);
-      nccl_ep::memory_fence();
-
-      // Last block resets the grid counter and bumps the expected counters
-      // for the next invocation; folding it here keeps CUDA-graph replays
-      // self-sequencing. When local_dup_enabled, dispatch writes only
-      // primaries -- the intra-node bump moves to local_dup's tail so peers
-      // don't observe it before secondaries land.
-      if (arrived == NUM_OF_BLOCKS - 1) {
-          atomicExch((unsigned int*)param.dispatch_grid_barrier_counter, 0u);
-          if constexpr (NUM_LSA_TEAMS != 1) {
-              // RDMA sync-guard (dispatch tail): publish "round R consumed" to rail peers (plain RDMA write, no atomic/flush).
-              ncclGin net(param.dcomms[0], 0);
-              ncclTeam rail = ncclTeamRail(param.dcomms[0]);
-              const uint64_t R = *param.expected_rdma_flag_value;  // pre-increment round
-              const size_t my_slot = param.mr_info.sync_guard_offset +
-                                     static_cast<size_t>(param.node_rank) * sizeof(uint64_t);
-              for (int peer = 0; peer < NUM_LSA_TEAMS; ++peer) {
-                  if (peer == param.node_rank) continue;
-                  net.putValue(rail, peer, param.dest_window, my_slot, R,
-                               ncclGin_None{}, ncclCoopThread());
-              }
-              *param.expected_rdma_flag_value += 1ull;
+  if (elect_last_block(reinterpret_cast<const int*>(param.dispatch_grid_barrier_counter), NUM_OF_BLOCKS)) {
+      using tail_completion_warp = warp_group<1, 0>;   // warp 0
+      using tail_rdma_warp       = warp_group<1, 1>;   // warp 1
+      const int tail_tid = (int)threadIdx.x;
+      if (tail_tid < tail_completion_warp::size()) {
+          // warp 0 (thread 0): inter-rank completion barrier, then reset + bump the intra-node round
+          // (local_dup defers that bump to its own tail).
+          if (tail_tid == 0) {
+              const uint32_t expected_val = *param.expected_intra_node_flag_value;
+              nccl_ep::red_add_release_sys_global(param.intra_node_write_completion_flags, 1u);
+              uint32_t flag_data;
+              do { flag_data = nccl_ep::ld_relaxed_sys_global(param.intra_node_write_completion_flags); }
+              while (flag_data != expected_val);
+              nccl_ep::memory_fence();
+              atomicExch((unsigned int*)param.dispatch_grid_barrier_counter, 0u);
+              if (!param.local_dup_enabled)
+                  *param.expected_intra_node_flag_value += static_cast<uint32_t>(param.num_of_ranks_per_node);
           }
-          if (!param.local_dup_enabled) {
-              *param.expected_intra_node_flag_value += static_cast<uint32_t>(param.num_of_ranks_per_node);
+      } else if (tail_tid < tail_completion_warp::size() + tail_rdma_warp::size()) {
+          // warp 1: publish the inter-node RDMA guard + bump the RDMA round.
+          if constexpr (NUM_LSA_TEAMS != 1) {
+              const uint64_t expected = *param.expected_rdma_flag_value;
+              if (param.guard_enabled)
+                  warp_rdma_guard_publish(param.dcomm, param.dest_window,
+                                          param.mr_info.guard_offset + static_cast<size_t>(param.node_rank) * sizeof(uint64_t),
+                                          param.node_rank, NUM_LSA_TEAMS, expected);
+              if (tail_rdma_warp::thread_rank() == 0) *param.expected_rdma_flag_value = expected + 1ull;
           }
       }
   }
@@ -3759,73 +3786,53 @@ __device__ __forceinline__ void combine_kernel_impl(
     cur_smem_t* smem_buffer_ptr = &smem_layout;
 
   // ===== FUSED DEVICE SYNC (combine head) =====
-  // Wait for all ranks' dispatch S2G writes to complete before reading them.
-  // Block 0 signals this rank's arrival at the inter-rank barrier.
+  using head_init_warp = warp_group<1, 0>;   // warp 0
+  using head_rdma_warp = warp_group<1, 1>;   // warp 1
+  const int head_tid = (int)threadIdx.x;
+  if (head_tid < head_init_warp::size()) {
+    if (head_tid == 0) {
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
-  if (threadIdx.x == 0) _wt_head_start = clock64();
+      _wt_head_start = clock64();
 #endif
-  // red.release.sys orders prior generic stores before the flag.
-  if (threadIdx.x == 0 && blockIdx.x == 0) {
-      nccl_ep::red_add_release_sys_global(param.intra_node_write_completion_flags, 1u);
-  }
-  // Poll inter-rank flag (relaxed in loop; single fence.acq_rel.sys after orders subsequent reads).
-  if (threadIdx.x == 0) {
+      // Inter-rank completion barrier: block 0 signals (red.release orders prior stores), every block polls.
+      if (blockIdx.x == 0)
+        nccl_ep::red_add_release_sys_global(param.intra_node_write_completion_flags, 1u);
+      const uint32_t expected_val = *param.expected_intra_node_flag_value;
       uint32_t flag_data;
-      uint32_t expected_val = *param.expected_intra_node_flag_value;
-      do {
-          flag_data = nccl_ep::ld_relaxed_sys_global(param.intra_node_write_completion_flags);
-      } while (flag_data != expected_val);
+      do { flag_data = nccl_ep::ld_relaxed_sys_global(param.intra_node_write_completion_flags); }
+      while (flag_data != expected_val);
       nccl_ep::memory_fence();
-  }
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
-  if (threadIdx.x == 0) {
-    _wt_head_end = clock64();
-    param.block_timing[blockIdx.x].head_sync_start_clock = _wt_head_start;
-    param.block_timing[blockIdx.x].head_sync_end_clock = _wt_head_end;
-  }
+      _wt_head_end = clock64();
+      param.block_timing[blockIdx.x].head_sync_start_clock = _wt_head_start;
+      param.block_timing[blockIdx.x].head_sync_end_clock = _wt_head_end;
 #endif
-  // The __syncthreads() below (for mbarrier init) also ensures all threads
-  // see the poll completion before proceeding with combine work.
-
-  // RDMA sync-guard (combine head): see dispatch head; combine's own counter/region.
-  if constexpr (NUM_LSA_TEAMS != 1) {
-    if (threadIdx.x == 0) {
-      const uint64_t target = *param.expected_rdma_flag_value - 1ull;  // previous round
-      const uint64_t* guard = reinterpret_cast<const uint64_t*>(
-          reinterpret_cast<uint8_t*>(param.gin_base_ptr) + param.mr_info.sync_guard_offset);
-      for (int peer = 0; peer < NUM_LSA_TEAMS; ++peer) {
-        if (peer == param.node_rank) continue;
-        // sys-scope acquire load: slot is written by the rail peer's NIC (RDMA).
-        while (nccl_ep::ld_acquire_sys_global(&guard[peer]) < target) { /* busy-wait */ }
-      }
-    }
-  }
-
-  // Let first thread of each CUDA block initialize the mbarrier.
-  if (threadIdx.x == 0) {
-    for (int i = 0; i < NUM_OF_STAGES_G2S; i++) {
-      // Initialize mbarrier
-      if constexpr(NUM_LSA_TEAMS != 1) {
-        cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_mbarrier_G2S_buffer + 2 * i, 1);
-        cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_mbarrier_G2S_buffer + 2 * i + 1, 1);
-      }
-      cuda::ptx::mbarrier_init(smem_buffer_ptr->inter_node_mbarrier_G2S_buffer + 2 * i, 1);
-      cuda::ptx::mbarrier_init(smem_buffer_ptr->inter_node_mbarrier_G2S_buffer + 2 * i + 1, 1);
-    }
-    if constexpr(NUM_LSA_TEAMS != 1) {
-      // Initialize mbarrier
-      for (int i = 0; i < NUM_LSA_TEAMS - 1; i++) {
-        for (int j = 0; j < MAX_NUM_OF_CHUNKS_PER_RANK; j++) {
-          cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_to_rdma_mbarrier_buffer + i * MAX_NUM_OF_CHUNKS_PER_RANK + j, 1);
+      // mbarrier init (both producer/consumer arrival counts = 1).
+      for (int i = 0; i < NUM_OF_STAGES_G2S; i++) {
+        if constexpr(NUM_LSA_TEAMS != 1) {
+          cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_mbarrier_G2S_buffer + 2 * i, 1);
+          cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_mbarrier_G2S_buffer + 2 * i + 1, 1);
         }
+        cuda::ptx::mbarrier_init(smem_buffer_ptr->inter_node_mbarrier_G2S_buffer + 2 * i, 1);
+        cuda::ptx::mbarrier_init(smem_buffer_ptr->inter_node_mbarrier_G2S_buffer + 2 * i + 1, 1);
       }
+      if constexpr(NUM_LSA_TEAMS != 1) {
+        for (int i = 0; i < NUM_LSA_TEAMS - 1; i++)
+          for (int j = 0; j < MAX_NUM_OF_CHUNKS_PER_RANK; j++)
+            cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_to_rdma_mbarrier_buffer + i * MAX_NUM_OF_CHUNKS_PER_RANK + j, 1);
+        *(smem_buffer_ptr->rdma_streaming_counter) = 0u;
+      }
+      cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);  // make mbarrier init visible to the async (TMA) proxy
     }
-    // Initialize streaming overlap fields (cumulative counter, never reset between chunks)
-    if constexpr(NUM_LSA_TEAMS != 1) {
-      *(smem_buffer_ptr->rdma_streaming_counter) = 0u;
+  } else if (head_tid < head_init_warp::size() + head_rdma_warp::size()) {
+    // warp 1: inter-node RDMA guard wait.
+    if constexpr (NUM_LSA_TEAMS != 1) {
+      if (param.guard_enabled)
+        warp_rdma_guard_wait(
+            reinterpret_cast<const uint64_t*>(
+                reinterpret_cast<const uint8_t*>(param.gin_base_ptr) + param.mr_info.guard_offset),
+            param.node_rank, NUM_LSA_TEAMS, *param.expected_rdma_flag_value);
     }
-    // Make mbarriers initialization visible to async proxy(TMA).
-    cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
   }
 
   // Make sure all the warps wait for mbarriers to be initialized before producing/consuming data.
@@ -3900,31 +3907,40 @@ __device__ __forceinline__ void combine_kernel_impl(
   }
 #endif
 
-  // Combine tail: elect the last block via a grid barrier and bump the
-  // expected counters for the next invocation. Reads of the expected counters
-  // all happen at the kernel head, sequenced before each block's atom_add,
-  // so the bump can't be observed by any block in this kernel.
-  __syncthreads();
-  if (threadIdx.x == 0) {
-      uint32_t arrived = static_cast<uint32_t>(nccl_ep::atomic_add_acqrel_global(
-                          reinterpret_cast<const int*>(param.combine_grid_barrier_counter), 1));
-      if (arrived == NUM_OF_BLOCKS - 1) {
-          atomicExch((unsigned int*)param.combine_grid_barrier_counter, 0u);
-          if constexpr (NUM_LSA_TEAMS != 1) {
-              // RDMA sync-guard (combine tail): see dispatch tail; combine's own counter/region.
-              ncclGin net(param.dcomms[0], 0);
-              ncclTeam rail = ncclTeamRail(param.dcomms[0]);
-              const uint64_t R = *param.expected_rdma_flag_value;  // pre-increment round
-              const size_t my_slot = param.mr_info.sync_guard_offset +
-                                     static_cast<size_t>(param.node_rank) * sizeof(uint64_t);
-              for (int peer = 0; peer < NUM_LSA_TEAMS; ++peer) {
-                  if (peer == param.node_rank) continue;
-                  net.putValue(rail, peer, param.dest_window, my_slot, R,
-                               ncclGin_None{}, ncclCoopThread());
-              }
-              *param.expected_rdma_flag_value += 1ull;
+  if (elect_last_block(reinterpret_cast<const int*>(param.combine_grid_barrier_counter), NUM_OF_BLOCKS)) {
+      using tail_reset_warp = warp_group<1, 0>;   // warp 0
+      using tail_rdma_warp  = warp_group<1, 1>;   // warp 1
+      using tail_lsa_warp   = warp_group<1, 2>;   // warp 2
+      static_assert(INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() +
+                    INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size() >= 3 * 32,
+                    "combine tail needs 3 warps");
+      const int tail_tid = (int)threadIdx.x;
+      if (tail_tid < tail_reset_warp::size()) {
+          // warp 0: reset the grid counter + bump the intra-node round.
+          if (tail_tid == 0) {
+              atomicExch((unsigned int*)param.combine_grid_barrier_counter, 0u);
+              *param.expected_intra_node_flag_value += static_cast<uint32_t>(param.num_of_ranks_per_node);
           }
-          *param.expected_intra_node_flag_value += static_cast<uint32_t>(param.num_of_ranks_per_node);
+      } else if (tail_tid < tail_reset_warp::size() + tail_rdma_warp::size()) {
+          // warp 1: publish the inter-node RDMA guard, then bump the RDMA round.
+          if constexpr (NUM_LSA_TEAMS != 1) {
+              const uint64_t expected = *param.expected_rdma_flag_value;
+              if (param.guard_enabled)
+                  warp_rdma_guard_publish(param.dcomms[0], param.dest_window,
+                                          param.mr_info.guard_offset + static_cast<size_t>(param.node_rank) * sizeof(uint64_t),
+                                          param.node_rank, NUM_LSA_TEAMS, expected);
+              if (tail_rdma_warp::thread_rank() == 0) *param.expected_rdma_flag_value = expected + 1ull;
+          }
+      } else if (tail_tid < tail_reset_warp::size() + tail_rdma_warp::size() + tail_lsa_warp::size()) {
+          // warp 2: intra-node LSA WAR barrier. Relaxed -- the tail __syncthreads already drained this
+          // round's reads. Index = dispatch's block count (disjoint from dispatch's per-block [0, NB)).
+          if constexpr (LSA_TEAM_SIZE != 1) {
+              if (param.guard_enabled) {
+                  ncclLsaBarrierSession<ncclCoopWarp> bar(ncclCoopWarp(), param.dcomms[0],
+                                                          ncclTeamTagLsa(), (uint32_t)HYBRIDEP_DISPATCH_NUM_OF_BLOCKS);
+                  bar.sync(ncclCoopWarp(), cuda::memory_order_relaxed);
+              }
+          }
       }
   }
 }

@@ -273,13 +273,13 @@ struct dispatch_memory_region_info_t {
     // Batched RDMA staging (packed layout: token+prob+sf per entry)
     size_t rdma_send_staging_offset;           // Offset of per-destination staging buffer
     size_t rdma_inter_node_group_packed_offset;// Offset of packed receive buffer (token+prob+sf per entry)
+    size_t guard_offset;                       // Offset of RDMA sync-guard readiness flags (NUM_LSA_TEAMS uint64 slots)
     size_t bytes_per_entry;                    // Size of packed entry (token + prob + sf)
     size_t max_tokens_per_dest;                // Max tokens that can be staged per destination
     // Streaming RDMA signals
     unsigned signals_tail_base;               // Base signal ID for tail tracking (sender -> receiver)
     // Streaming buffer configuration
     int num_max_rdma_chunked_send_tokens;     // Batch size per RDMA put (default: 6)
-    size_t sync_guard_offset;  // RDMA sync-guard: offset of internal-buffer readiness flags (NUM_LSA_TEAMS uint64 slots)
 };
 
 struct combine_memory_region_info_t {
@@ -288,7 +288,7 @@ struct combine_memory_region_info_t {
     size_t combine_rdma_inter_node_group_token_offset; // Offset of combine rdma token buffer
     size_t rdma_intra_node_red_prob_offset;         // Offset of intra-node reduced prob buffer
     size_t combine_rdma_inter_node_group_prob_offset;  // Offset of combine rdma prob buffer
-    size_t sync_guard_offset;  // RDMA sync-guard: offset of combine's internal-buffer readiness flags
+    size_t guard_offset;                               // Offset of combine's RDMA sync-guard readiness flags
 };
 
 // ============================================================================
@@ -349,6 +349,8 @@ struct DispatchParams {
 
     // EM local-fanout: > 0 enables sender S2G dedup + a receiver local_dup kernel.
     int local_dup_num_sms = 0;
+
+    bool guard_enabled = false;   // RDMA + LSA buffer guard on/off
 };
 
 // Call dispatch kernel with runtime template parameter resolution.
@@ -431,6 +433,8 @@ struct CombineParams {
     // pre-reduced sum written by local_reduce.
     bool combine_local_reduce_enabled = false;
     ncclDataType_t token_dtype = ncclBfloat16;  // BF16/FP16/FP32 wire (NONE mode); ignored when use_fp8
+
+    bool guard_enabled = false;   // RDMA + LSA buffer guard on/off
 };
 
 // Call combine kernel with runtime template parameter resolution

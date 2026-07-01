@@ -491,8 +491,8 @@ struct ncclEpGroup {
         size_t rdma_inter_node_group_packed_offset = 0;  // Packed receive buffer (token+prob+sf)
 
         // RDMA sync-guard readiness-flag regions (per direction)
-        size_t dispatch_sync_guard_offset = 0;
-        size_t combine_sync_guard_offset = 0;
+        size_t dispatch_guard_offset = 0;
+        size_t combine_guard_offset = 0;
 
         unsigned signals_tail_base = 0;         // Base signal ID for tail tracking (sender -> receiver)
         int num_max_rdma_chunked_send_tokens = HYBRIDEP_DISPATCH_RDMA_BATCH_SIZE;
@@ -1071,7 +1071,16 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
     ep_group->ht_buffers.internode_initialized = false;
 
     if (rdma_team_size <= 1) {
-        // Single HT outer-domain node — no internode RDMA needed.
+        // Single HT outer-domain node — no internode RDMA, but the LSA guard needs a minimal devComm.
+        ep_group->gin_config.num_dcomms = 1;
+        ep_group->gin_config.dcomms = new ncclDevComm_t[1];
+        ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+        reqs.lsaBarrierCount = HYBRIDEP_DISPATCH_NUM_OF_BLOCKS + 1;  // dispatch per-block [0,NB) + elected combine [NB]
+        NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
+        CUDACHECK_RET(cudaMalloc(reinterpret_cast<void**>(&ep_group->gin_config.d_dcomms),
+                                 sizeof(ncclDevComm_t) * ep_group->gin_config.num_dcomms));
+        CUDACHECK_RET(cudaMemcpy(ep_group->gin_config.d_dcomms, ep_group->gin_config.dcomms,
+                                 sizeof(ncclDevComm_t) * ep_group->gin_config.num_dcomms, cudaMemcpyHostToDevice));
         return ncclSuccess;
     }
 
@@ -1101,7 +1110,7 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
         static_cast<size_t>(rdma_team_size - 1) * max_chunks_per_rank * sizeof(uint64_t),
         GIN_ALIGNMENT);
     // RDMA sync-guard: NUM_LSA_TEAMS uint64 internal-buffer readiness slots per direction.
-    size_t sync_guard_sz = align_size(static_cast<size_t>(rdma_team_size) * sizeof(uint64_t), GIN_ALIGNMENT);
+    size_t guard_sz = align_size(static_cast<size_t>(rdma_team_size) * sizeof(uint64_t), GIN_ALIGNMENT);
     size_t token_staging_sz = align_size(static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * ep_group->config.max_token_bytes, GIN_ALIGNMENT);
     size_t dense_prob_sz = align_size(static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * ep_group->config.num_experts * sizeof(float), GIN_ALIGNMENT);
     size_t scaling_factor_staging_sz = align_size(static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * sizeof(float), GIN_ALIGNMENT);
@@ -1121,7 +1130,7 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
     total_gin_buffer_size += rdma_intra_node_red_prob_sz;
     total_gin_buffer_size += combine_rdma_inter_node_group_prob_sz;
     total_gin_buffer_size += flags_sz * 2;
-    total_gin_buffer_size += sync_guard_sz * 2;
+    total_gin_buffer_size += guard_sz * 2;
     total_gin_buffer_size += token_staging_sz;
     total_gin_buffer_size += dense_prob_sz;
     total_gin_buffer_size += scaling_factor_staging_sz;
@@ -1155,10 +1164,10 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
     offset += flags_sz;
 
     // RDMA sync-guard regions (dispatch, combine): addressed by window+offset only.
-    CUDACHECK_RET(cudaMemset(ptr + offset, 0, sync_guard_sz));
-    offset += sync_guard_sz;
-    CUDACHECK_RET(cudaMemset(ptr + offset, 0, sync_guard_sz));
-    offset += sync_guard_sz;
+    CUDACHECK_RET(cudaMemset(ptr + offset, 0, guard_sz));
+    offset += guard_sz;
+    CUDACHECK_RET(cudaMemset(ptr + offset, 0, guard_sz));
+    offset += guard_sz;
 
     ep_group->ht_buffers.token_staging_buffer = reinterpret_cast<void*>(ptr + offset);
     offset += token_staging_sz;
@@ -1187,10 +1196,10 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
 
     cur_offset += flags_sz * 2;
 
-    ep_group->gin_config.dispatch_sync_guard_offset = cur_offset;
-    cur_offset += sync_guard_sz;
-    ep_group->gin_config.combine_sync_guard_offset = cur_offset;
-    cur_offset += sync_guard_sz;
+    ep_group->gin_config.dispatch_guard_offset = cur_offset;
+    cur_offset += guard_sz;
+    ep_group->gin_config.combine_guard_offset = cur_offset;
+    cur_offset += guard_sz;
 
     ep_group->gin_config.token_staging_offset = cur_offset;
     cur_offset += token_staging_sz;
@@ -1262,6 +1271,9 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
         reqs.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
         reqs.ginContextCount = ep_group->gin_config.num_ctx_per_comm;
         reqs.ginQueueDepth = 3 * ht_tokens_per_chunk + 1;
+        // LSA barriers for the HT sync-guard: per-block dispatch [0, NUM_OF_BLOCKS) + one
+        // for the elected combine-tail block [NUM_OF_BLOCKS]. NUM_OF_BLOCKS <= HYBRIDEP_DISPATCH_NUM_OF_BLOCKS.
+        reqs.lsaBarrierCount = HYBRIDEP_DISPATCH_NUM_OF_BLOCKS + 1;  // dispatch per-block [0,NB) + elected combine [NB]
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
     }
 
@@ -3375,9 +3387,12 @@ ncclResult_t ncclEpDispatch(
         params.expected_intra_node_flag_value = group->ht_buffers.dev_dispatch_expected_intra;
         params.intra_node_write_completion_flags = group->ht_buffers.intra_node_write_completion_flags;
         params.dispatch_grid_barrier_counter = group->ht_buffers.dispatch_grid_barrier_counter;
+        params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
         // Pass device communicators and windows
+        // Always pass a valid devComm (single-node too): the HT LSA sync-guard uses the NCCL LSA
+        // barrier (needs comm.lsaBarrier). GIN/RDMA paths stay if-constexpr-gated (out single-node).
         //TODO: remove multiple gin comm notion from group
-        params.dcomm = is_single_node ? ncclDevComm{} : group->gin_config.dcomms[0];
+        params.dcomm = group->gin_config.dcomms[0];
         params.nccl_token_window = x->win_hdl;
         params.nccl_prob_window = forward_dispatch ? group->gin_config.nccl_window : ncclWindow_t{};
         params.nccl_sf_window = use_fp8 ? scales->win_hdl : ncclWindow_t{};
@@ -3399,12 +3414,12 @@ ncclResult_t ncclEpDispatch(
             // Batched staging parameters (packed layout)
             .rdma_send_staging_offset = is_single_node ? 0 : group->gin_config.rdma_send_staging_offset,
             .rdma_inter_node_group_packed_offset = is_single_node ? 0 : group->gin_config.rdma_inter_node_group_packed_offset,
+            .guard_offset = is_single_node ? 0 : group->gin_config.dispatch_guard_offset,
             .bytes_per_entry = bytes_per_entry,
             .max_tokens_per_dest = static_cast<size_t>(group->config.max_dispatch_tokens_per_rank),
             // Streaming signal parameters
             .signals_tail_base = is_single_node ? 0 : static_cast<unsigned>(group->gin_config.signals_tail_base),
             .num_max_rdma_chunked_send_tokens = is_single_node ? 0 : group->gin_config.num_max_rdma_chunked_send_tokens,
-            .sync_guard_offset = is_single_node ? 0 : group->gin_config.dispatch_sync_guard_offset,
         };
         params.local_rank = group->lsa_rank;
         params.node_rank = group->rdma_rank;
@@ -4080,6 +4095,7 @@ ncclResult_t ncclEpCombine(
         params.combine_expected_intra_node_flag_value = group->ht_buffers.dev_combine_expected_intra;
         params.combine_grid_barrier_counter = group->ht_buffers.combine_grid_barrier_counter;
         params.combine_intra_node_write_completion_flags = group->ht_buffers.combine_intra_node_write_completion_flags;
+        params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
         const ncclWindow_t combine_token_window =
             !combine_x_uses_external_window ? x->win_hdl : group->gin_config.nccl_window;
         const size_t combine_token_offset =
@@ -4087,7 +4103,9 @@ ncclResult_t ncclEpCombine(
             (!combine_x_uses_external_window ? static_cast<size_t>(x->win_offset)
                                              : group->gin_config.rdma_intra_node_red_token_offset);
         // Pass device communicators and windows
-        params.dcomms = is_single_node ? nullptr : group->gin_config.d_dcomms;
+        // Always pass the devComm (single-node too): the HT LSA sync-guard now uses the
+        // NCCL LSA barrier (needs comm.lsaBarrier). RDMA paths stay if-constexpr-gated.
+        params.dcomms = group->gin_config.d_dcomms;
         params.nccl_token_window = combine_token_window;
         params.nccl_prob_window = !backward_combine ? ncclWindow_t{} : group->gin_config.nccl_window;
         params.nccl_internal_window = group->gin_config.nccl_window;
@@ -4102,7 +4120,7 @@ ncclResult_t ncclEpCombine(
             .combine_rdma_inter_node_group_token_offset = is_single_node ? 0 : group->gin_config.combine_rdma_inter_node_group_token_offset,
             .rdma_intra_node_red_prob_offset = is_single_node ? 0 : group->gin_config.rdma_intra_node_red_prob_offset,
             .combine_rdma_inter_node_group_prob_offset = is_single_node ? 0 : group->gin_config.combine_rdma_inter_node_group_prob_offset,
-            .sync_guard_offset = is_single_node ? 0 : group->gin_config.combine_sync_guard_offset,
+            .guard_offset = is_single_node ? 0 : group->gin_config.combine_guard_offset,
         };
         params.local_rank = group->lsa_rank;
         params.node_rank = group->rdma_rank;

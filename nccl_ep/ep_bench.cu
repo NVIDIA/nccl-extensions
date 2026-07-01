@@ -285,14 +285,8 @@ static ncclResult_t epMakeTensor(
         ncclResult_t r = ncclMemAlloc(&data, bytes);
         if (r != ncclSuccess) {
             printf("epMakeTensor: failed to allocate NCCL buffer\n");
-            fprintf(
-                stderr,
-                "ncclMemAlloc failed at %s:%d: %s — requested %zu bytes (%.2f MiB)\n",
-                __FILE__,
-                __LINE__,
-                ncclGetErrorString(r),
-                bytes,
-                bytes / (1024.0 * 1024.0));
+            fprintf(stderr, "ncclMemAlloc failed at %s:%d: %s — requested %zu bytes (%.2f MiB)\n", __FILE__, __LINE__,
+                    ncclGetErrorString(r), bytes, bytes / (1024.0 * 1024.0));
             exit(EXIT_FAILURE);
         }
         if (opts->nccl_mem_ptrs) opts->nccl_mem_ptrs->push_back(data);
@@ -300,15 +294,8 @@ static ncclResult_t epMakeTensor(
         cudaError_t e = cudaMalloc(&data, bytes);
         if (e != cudaSuccess) {
             printf("epMakeTensor: failed to allocate CUDA buffer\n");
-            fprintf(
-                stderr,
-                "cudaMalloc failed at %s:%d: %s (%s) — requested %zu bytes (%.2f MiB)\n",
-                __FILE__,
-                __LINE__,
-                cudaGetErrorString(e),
-                cudaGetErrorName(e),
-                bytes,
-                bytes / (1024.0 * 1024.0));
+            fprintf(stderr, "cudaMalloc failed at %s:%d: %s (%s) — requested %zu bytes (%.2f MiB)\n", __FILE__,
+                    __LINE__, cudaGetErrorString(e), cudaGetErrorName(e), bytes, bytes / (1024.0 * 1024.0));
             exit(EXIT_FAILURE);
         }
     }
@@ -1332,23 +1319,15 @@ static ValidationResult validateDispatchOutputLLRankMaj(
 
             if (source_rank != r) {
                 if (errors_printed++ < max_errors_to_print)
-                    printf(
-                        "[Rank %d] LL-RM dispatch: rank %d slot %u: wrong source rank %d\n",
-                        myRank,
-                        r,
-                        s,
-                        source_rank);
+                    printf("[Rank %d] LL-RM dispatch: rank %d slot %u: wrong source rank %d\n", myRank, r, s,
+                           source_rank);
                 errors++;
                 continue;
             }
             if (!verifyTokenIntegrity(recv_data, row_elem_offset, hidden, token_dtype)) {
                 if (errors_printed++ < max_errors_to_print)
-                    printf(
-                        "[Rank %d] LL-RM dispatch: rank %d slot %u (token %d): data corruption\n",
-                        myRank,
-                        r,
-                        s,
-                        token_id);
+                    printf("[Rank %d] LL-RM dispatch: rank %d slot %u (token %d): data corruption\n", myRank, r, s,
+                           token_id);
                 errors++;
             }
 
@@ -1393,15 +1372,8 @@ static ValidationResult validateDispatchOutputLLRankMaj(
                 float expected_w = src_wgt[token_id * top_k + k];
                 if (std::abs(wgt[k] - expected_w) > 1e-5f * expected_w) {
                     if (errors_printed++ < max_errors_to_print)
-                        printf(
-                            "[Rank %d] LL-RM dispatch: rank %d slot %u token %d: weight[%u]=%.6f expected=%.6f\n",
-                            myRank,
-                            r,
-                            s,
-                            token_id,
-                            k,
-                            wgt[k],
-                            expected_w);
+                        printf("[Rank %d] LL-RM dispatch: rank %d slot %u token %d: weight[%u]=%.6f expected=%.6f\n",
+                               myRank, r, s, token_id, k, wgt[k], expected_w);
                     errors++;
                 }
             }
@@ -1412,21 +1384,13 @@ static ValidationResult validateDispatchOutputLLRankMaj(
         // Verify token count: recv_cnt[r] must match expected
         if (expected_slot_count != (int)expected_tokens.size()) {
             if (errors_printed++ < max_errors_to_print)
-                printf(
-                    "[Rank %d] LL-RM dispatch: rank %d: recv_cnt=%d, expected %d\n",
-                    myRank,
-                    r,
-                    expected_slot_count,
-                    (int)expected_tokens.size());
+                printf("[Rank %d] LL-RM dispatch: rank %d: recv_cnt=%d, expected %d\n", myRank, r, expected_slot_count,
+                       (int)expected_tokens.size());
             errors++;
         } else if (slot_count != expected_slot_count) {
             if (errors_printed++ < max_errors_to_print)
-                printf(
-                    "[Rank %d] LL-RM dispatch: rank %d: decoded %d valid slots of %d\n",
-                    myRank,
-                    r,
-                    slot_count,
-                    expected_slot_count);
+                printf("[Rank %d] LL-RM dispatch: rank %d: decoded %d valid slots of %d\n", myRank, r, slot_count,
+                       expected_slot_count);
             errors++;
         }
 
@@ -1783,12 +1747,8 @@ static ValidationResult validateDispatchOutputHTRankMaj(
                 &source_rank,
                 &token_id)) {
             if (errors_printed < max_errors_to_print) {
-                printf(
-                    "[Rank %d] HT dispatch: slot %u: invalid identity (rank=%d, token=%d)\n",
-                    myRank,
-                    j,
-                    source_rank,
-                    token_id);
+                printf("[Rank %d] HT dispatch: slot %u: invalid identity (rank=%d, token=%d)\n", myRank, j, source_rank,
+                       token_id);
                 errors_printed++;
             }
             errors++;
@@ -1797,12 +1757,8 @@ static ValidationResult validateDispatchOutputHTRankMaj(
 
         if (!verifyTokenIntegrity(recv_data, row_elem_offset, hidden, token_dtype)) {
             if (errors_printed < max_errors_to_print) {
-                printf(
-                    "[Rank %d] HT dispatch: slot %u: data corruption (rank=%d, token=%d)\n",
-                    myRank,
-                    j,
-                    source_rank,
-                    token_id);
+                printf("[Rank %d] HT dispatch: slot %u: data corruption (rank=%d, token=%d)\n", myRank, j, source_rank,
+                       token_id);
                 errors_printed++;
             }
             errors++;
@@ -1811,12 +1767,8 @@ static ValidationResult validateDispatchOutputHTRankMaj(
         auto key = std::make_pair(source_rank, token_id);
         if (expected.find(key) == expected.end()) {
             if (errors_printed < max_errors_to_print) {
-                printf(
-                    "[Rank %d] HT dispatch: slot %u: unexpected token (rank=%d, token=%d)\n",
-                    myRank,
-                    j,
-                    source_rank,
-                    token_id);
+                printf("[Rank %d] HT dispatch: slot %u: unexpected token (rank=%d, token=%d)\n", myRank, j, source_rank,
+                       token_id);
                 errors_printed++;
             }
             errors++;
@@ -1848,13 +1800,8 @@ static ValidationResult validateDispatchOutputHTRankMaj(
             }
             if (found_ids != expected_ids) {
                 if (errors_printed < max_errors_to_print) {
-                    printf(
-                        "[Rank %d] HT dispatch: slot %u (rank=%d token=%d) topk_idx set mismatch (kind=%d)\n",
-                        myRank,
-                        j,
-                        source_rank,
-                        token_id,
-                        (int)kind);
+                    printf("[Rank %d] HT dispatch: slot %u (rank=%d token=%d) topk_idx set mismatch (kind=%d)\n",
+                           myRank, j, source_rank, token_id, (int)kind);
                     errors_printed++;
                 }
                 errors++;
@@ -2262,13 +2209,8 @@ ValidationResult validateCombineOutputLL(
 
     if (!result.passed) {
         char buf[256];
-        snprintf(
-            buf,
-            sizeof(buf),
-            "LL combine: calc_diff=%.6e (threshold=%.2e)%s",
-            diff,
-            kCombineLLThreshold,
-            has_nan ? ", NaN detected" : "");
+        snprintf(buf, sizeof(buf), "LL combine: calc_diff=%.6e (threshold=%.2e)%s", diff, kCombineLLThreshold,
+                 has_nan ? ", NaN detected" : "");
         result.message = buf;
     }
 
@@ -2355,13 +2297,8 @@ ValidationResult validateCombineOutputHT(
 
     if (!result.passed) {
         char buf[256];
-        snprintf(
-            buf,
-            sizeof(buf),
-            "HT combine: calc_diff=%.6e (threshold=%.2e)%s",
-            diff,
-            kCombineHTThreshold,
-            has_nan ? ", NaN detected" : "");
+        snprintf(buf, sizeof(buf), "HT combine: calc_diff=%.6e (threshold=%.2e)%s", diff, kCombineHTThreshold,
+                 has_nan ? ", NaN detected" : "");
         result.message = buf;
     }
 
@@ -2813,74 +2750,42 @@ void printLowLatencyResults(
 
         printf("\n--- Host-observed performance ---\n");
 
-        printf(
-            "Dispatch:  avg=%.2f us, min=%.2f us, max=%.2f us\n",
-            global_dispatch_avg * 1000,
-            global_dispatch_min * 1000,
-            global_dispatch_max * 1000);
-        printf(
-            "                  throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
-            avg_dispatch_tp,
-            global_dispatch_tp_min.value,
-            global_dispatch_tp_min.rank,
-            global_dispatch_tp_max.value,
-            global_dispatch_tp_max.rank);
-        printf(
-            "Combine:   avg=%.2f us, min=%.2f us, max=%.2f us\n",
-            global_combine_avg * 1000,
-            global_combine_min * 1000,
-            global_combine_max * 1000);
-        printf(
-            "                  throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
-            avg_combine_tp,
-            global_combine_tp_min.value,
-            global_combine_tp_min.rank,
-            global_combine_tp_max.value,
-            global_combine_tp_max.rank);
-        printf(
-            "Total (D+C):      avg=%.2f us, min=%.2f us, max=%.2f us\n",
-            global_total_avg * 1000,
-            global_total_min * 1000,
-            global_total_max * 1000);
-        printf(
-            "                  throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
-            avg_total_tp,
-            global_total_tp_min.value,
-            global_total_tp_min.rank,
-            global_total_tp_max.value,
-            global_total_tp_max.rank);
+        printf("Dispatch:  avg=%.2f us, min=%.2f us, max=%.2f us\n", global_dispatch_avg * 1000,
+               global_dispatch_min * 1000, global_dispatch_max * 1000);
+        printf("                  throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
+               avg_dispatch_tp, global_dispatch_tp_min.value, global_dispatch_tp_min.rank, global_dispatch_tp_max.value,
+               global_dispatch_tp_max.rank);
+        printf("Combine:   avg=%.2f us, min=%.2f us, max=%.2f us\n", global_combine_avg * 1000,
+               global_combine_min * 1000, global_combine_max * 1000);
+        printf("                  throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
+               avg_combine_tp, global_combine_tp_min.value, global_combine_tp_min.rank, global_combine_tp_max.value,
+               global_combine_tp_max.rank);
+        printf("Total (D+C):      avg=%.2f us, min=%.2f us, max=%.2f us\n", global_total_avg * 1000,
+               global_total_min * 1000, global_total_max * 1000);
+        printf("                  throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
+               avg_total_tp, global_total_tp_min.value, global_total_tp_min.rank, global_total_tp_max.value,
+               global_total_tp_max.rank);
 
         printf("\n--- Kernel-only performance ---\n");
         if (ktimer.is_valid()) {
-            printf(
-                "Dispatch:    avg=%.2f us, min=%.2f us, max=%.2f us\n",
-                dispatch_kernel_avg,
-                dispatch_kernel_min,
-                dispatch_kernel_max);
-            printf(
-                "                  throughput: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
-                (ll_bytes.dispatch_bytes / 1e9) / (dispatch_kernel_avg / 1e6),
-                (ll_bytes.dispatch_bytes / 1e9) / (dispatch_kernel_min / 1e6),
-                (ll_bytes.dispatch_bytes / 1e9) / (dispatch_kernel_max / 1e6));
-            printf(
-                "Combine:     avg=%.2f us, min=%.2f us, max=%.2f us\n",
-                combine_kernel_avg,
-                combine_kernel_min,
-                combine_kernel_max);
-            printf(
-                "                  throughput: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
-                (ll_bytes.combine_bytes / 1e9) / (combine_kernel_avg / 1e6),
-                (ll_bytes.combine_bytes / 1e9) / (combine_kernel_min / 1e6),
-                (ll_bytes.combine_bytes / 1e9) / (combine_kernel_max / 1e6));
+            printf("Dispatch:    avg=%.2f us, min=%.2f us, max=%.2f us\n", dispatch_kernel_avg, dispatch_kernel_min,
+                   dispatch_kernel_max);
+            printf("                  throughput: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
+                   (ll_bytes.dispatch_bytes / 1e9) / (dispatch_kernel_avg / 1e6),
+                   (ll_bytes.dispatch_bytes / 1e9) / (dispatch_kernel_min / 1e6),
+                   (ll_bytes.dispatch_bytes / 1e9) / (dispatch_kernel_max / 1e6));
+            printf("Combine:     avg=%.2f us, min=%.2f us, max=%.2f us\n", combine_kernel_avg, combine_kernel_min,
+                   combine_kernel_max);
+            printf("                  throughput: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
+                   (ll_bytes.combine_bytes / 1e9) / (combine_kernel_avg / 1e6),
+                   (ll_bytes.combine_bytes / 1e9) / (combine_kernel_min / 1e6),
+                   (ll_bytes.combine_bytes / 1e9) / (combine_kernel_max / 1e6));
         } else {
             printf("  NOTE: CUPTI support was not compiled.\n");
         }
 
-        printf(
-            "\nByte counts: dispatch=%.2f MB, combine=%.2f MB, selections=%u\n",
-            ll_bytes.dispatch_bytes / 1e6,
-            ll_bytes.combine_bytes / 1e6,
-            ll_bytes.num_valid_selections);
+        printf("\nByte counts: dispatch=%.2f MB, combine=%.2f MB, selections=%u\n", ll_bytes.dispatch_bytes / 1e6,
+               ll_bytes.combine_bytes / 1e6, ll_bytes.num_valid_selections);
         fflush(stdout);
     }
 }
@@ -2980,45 +2885,28 @@ void printHighThroughputResults(
 
         // --- BW based on total time ---
         printf("--- BW based on total time ---\n");
-        printf(
-            "Dispatch:    total=%.2f us (min=%.2f, max=%.2f)\n",
-            global_dispatch_avg * 1000,
-            global_dispatch_min * 1000,
-            global_dispatch_max * 1000);
+        printf("Dispatch:    total=%.2f us (min=%.2f, max=%.2f)\n", global_dispatch_avg * 1000,
+               global_dispatch_min * 1000, global_dispatch_max * 1000);
         if (dk_total_s > 0) {
-            printf(
-                "             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
-                (avg_total_recv / 1e9) / dk_total_s,
-                (avg_nvl_recv / 1e9) / dk_total_s,
-                (avg_rdma_recv / 1e9) / dk_total_s);
-            printf(
-                "             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
-                (avg_total_send / 1e9) / dk_total_s,
-                (avg_nvl_send / 1e9) / dk_total_s,
-                (avg_rdma_send / 1e9) / dk_total_s);
+            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                   (avg_total_recv / 1e9) / dk_total_s, (avg_nvl_recv / 1e9) / dk_total_s,
+                   (avg_rdma_recv / 1e9) / dk_total_s);
+            printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                   (avg_total_send / 1e9) / dk_total_s, (avg_nvl_send / 1e9) / dk_total_s,
+                   (avg_rdma_send / 1e9) / dk_total_s);
         }
-        printf(
-            "Combine:     total=%.2f us (min=%.2f, max=%.2f)\n",
-            global_combine_avg * 1000,
-            global_combine_min * 1000,
-            global_combine_max * 1000);
+        printf("Combine:     total=%.2f us (min=%.2f, max=%.2f)\n", global_combine_avg * 1000,
+               global_combine_min * 1000, global_combine_max * 1000);
         if (ck_total_s > 0) {
-            printf(
-                "             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
-                (avg_total_recv / 1e9) / ck_total_s,
-                (avg_nvl_recv / 1e9) / ck_total_s,
-                (avg_rdma_recv / 1e9) / ck_total_s);
-            printf(
-                "             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
-                (avg_total_send / 1e9) / ck_total_s,
-                (avg_nvl_send / 1e9) / ck_total_s,
-                (avg_rdma_send / 1e9) / ck_total_s);
+            printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                   (avg_total_recv / 1e9) / ck_total_s, (avg_nvl_recv / 1e9) / ck_total_s,
+                   (avg_rdma_recv / 1e9) / ck_total_s);
+            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                   (avg_total_send / 1e9) / ck_total_s, (avg_nvl_send / 1e9) / ck_total_s,
+                   (avg_rdma_send / 1e9) / ck_total_s);
         }
-        printf(
-            "Total (D+C): avg=%.2f us, min=%.2f us, max=%.2f us\n",
-            global_total_avg * 1000,
-            global_total_min * 1000,
-            global_total_max * 1000);
+        printf("Total (D+C): avg=%.2f us, min=%.2f us, max=%.2f us\n", global_total_avg * 1000, global_total_min * 1000,
+               global_total_max * 1000);
 
         // --- BW based on kernel time ---
         printf("\n--- BW based on kernel time ---\n");
@@ -3030,31 +2918,19 @@ void printHighThroughputResults(
             double dk_s = avg_kernel_dk_us / 1e6;
             double ck_s = avg_kernel_ck_us / 1e6;
             printf("Dispatch:    kernel=%.2f us\n", avg_kernel_dk_us);
-            printf(
-                "             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
-                (avg_total_recv / 1e9) / dk_s,
-                (avg_nvl_recv / 1e9) / dk_s,
-                (avg_rdma_recv / 1e9) / dk_s);
-            printf(
-                "             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
-                (avg_total_send / 1e9) / dk_s,
-                (avg_nvl_send / 1e9) / dk_s,
-                (avg_rdma_send / 1e9) / dk_s);
+            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n", (avg_total_recv / 1e9) / dk_s,
+                   (avg_nvl_recv / 1e9) / dk_s, (avg_rdma_recv / 1e9) / dk_s);
+            printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n", (avg_total_send / 1e9) / dk_s,
+                   (avg_nvl_send / 1e9) / dk_s, (avg_rdma_send / 1e9) / dk_s);
             if (avg_dispatch_epi_us > 0.0) {
                 printf("DispatchEpilogue: kernel=%.2f us\n", avg_dispatch_epi_us);
             }
 
             printf("Combine:     kernel=%.2f us\n", avg_kernel_ck_us);
-            printf(
-                "             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
-                (avg_total_recv / 1e9) / ck_s,
-                (avg_nvl_recv / 1e9) / ck_s,
-                (avg_rdma_recv / 1e9) / ck_s);
-            printf(
-                "             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
-                (avg_total_send / 1e9) / ck_s,
-                (avg_nvl_send / 1e9) / ck_s,
-                (avg_rdma_send / 1e9) / ck_s);
+            printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n", (avg_total_recv / 1e9) / ck_s,
+                   (avg_nvl_recv / 1e9) / ck_s, (avg_rdma_recv / 1e9) / ck_s);
+            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n", (avg_total_send / 1e9) / ck_s,
+                   (avg_nvl_send / 1e9) / ck_s, (avg_rdma_send / 1e9) / ck_s);
             if (avg_combine_pro_us > 0.0) {
                 printf("CombinePrologue: kernel=%.2f us\n", avg_combine_pro_us);
             }
@@ -3366,9 +3242,8 @@ int main(int argc, char* argv[]) {
                 algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
             } else {
                 if (myRank == 0) {
-                    printf(
-                        "Error: Invalid algorithm '%s'. Use 'll', 'low-latency', 'ht', or 'high-throughput'\n",
-                        optarg);
+                    printf("Error: Invalid algorithm '%s'. Use 'll', 'low-latency', 'ht', or 'high-throughput'\n",
+                           optarg);
                 }
                 MPI_Finalize();
                 return 1;
@@ -3384,9 +3259,8 @@ int main(int argc, char* argv[]) {
                 layout = NCCL_EP_LAYOUT_FLAT;
             } else {
                 if (myRank == 0) {
-                    printf(
-                        "Error: Invalid layout '%s'. Use 'em'/'expert-major', 'rm'/'rank-major', or 'fl'/'flat'\n",
-                        optarg);
+                    printf("Error: Invalid layout '%s'. Use 'em'/'expert-major', 'rm'/'rank-major', or 'fl'/'flat'\n",
+                           optarg);
                 }
                 MPI_Finalize();
                 return 1;
@@ -3450,9 +3324,8 @@ int main(int argc, char* argv[]) {
                 em_nvlink_dup = true;
             } else {
                 if (myRank == 0) {
-                    printf(
-                        "Error: --ht-em-mode must be one of {local_permute, local_dup, nvlink_dup}, got '%s'\n",
-                        optarg);
+                    printf("Error: --ht-em-mode must be one of {local_permute, local_dup, nvlink_dup}, got '%s'\n",
+                           optarg);
                 }
                 MPI_Finalize();
                 return 1;
@@ -3538,10 +3411,8 @@ int main(int argc, char* argv[]) {
     }
     if (include_uniform_less_than_max && (num_dispatch_tokens == 0 || num_dispatch_tokens > max_tokens_per_rank)) {
         if (myRank == 0) {
-            printf(
-                "Error: --dispatch-less-than-max-tokens (%u) must be > 0 and <= --tokens (%u)\n",
-                num_dispatch_tokens,
-                max_tokens_per_rank);
+            printf("Error: --dispatch-less-than-max-tokens (%u) must be > 0 and <= --tokens (%u)\n",
+                   num_dispatch_tokens, max_tokens_per_rank);
         }
         MPI_Finalize();
         return 1;
@@ -3799,11 +3670,9 @@ int main(int argc, char* argv[]) {
     config.alloc.context = nullptr;
     config.enable_mask = mask_test;
 
-    printf(
-        "Rank %d: Testing ncclEpCreateGroup with algorithm: %s%s\n",
-        myRank,
-        (algorithm == NCCL_EP_ALGO_LOW_LATENCY) ? "LOW_LATENCY" : "HIGH_THROUGHPUT",
-        mask_test ? " (mask-test mode)" : "");
+    printf("Rank %d: Testing ncclEpCreateGroup with algorithm: %s%s\n", myRank,
+           (algorithm == NCCL_EP_ALGO_LOW_LATENCY) ? "LOW_LATENCY" : "HIGH_THROUGHPUT",
+           mask_test ? " (mask-test mode)" : "");
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     // Baseline GPU memory before any EP allocations (group buffer, handle mem,
     // staging tensors). Compared against a post-combine snapshot below.
@@ -3995,13 +3864,9 @@ int main(int argc, char* argv[]) {
 
     // HT recv bytes are pre-computed in calculateHighThroughputBytes via routing simulation
     if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && myRank == 0) {
-        printf(
-            "[DEBUG] HT bytes: send=%u tokens, rdma_send=%u, total_recv=%u tokens, rdma_recv=%u (buffer=%u)\n",
-            ht_bytes.total_send_tokens,
-            ht_bytes.rdma_send_tokens,
-            ht_bytes.total_recv_tokens,
-            ht_bytes.rdma_recv_tokens,
-            num_recv_tokens);
+        printf("[DEBUG] HT bytes: send=%u tokens, rdma_send=%u, total_recv=%u tokens, rdma_recv=%u (buffer=%u)\n",
+               ht_bytes.total_send_tokens, ht_bytes.rdma_send_tokens, ht_bytes.total_recv_tokens,
+               ht_bytes.rdma_recv_tokens, num_recv_tokens);
         fflush(stdout);
     }
 
@@ -4346,16 +4211,10 @@ int main(int argc, char* argv[]) {
             global_handle_avg /= nRanks;
 
             printf("\n=== Setup Timing (across %d ranks) ===\n", nRanks);
-            printf(
-                "ncclEpCreateGroup:   avg=%.2f ms, min=%.2f ms, max=%.2f ms\n",
-                global_group_avg,
-                global_group_min,
-                global_group_max);
-            printf(
-                "Handle creation:     avg=%.2f ms, min=%.2f ms, max=%.2f ms\n",
-                global_handle_avg,
-                global_handle_min,
-                global_handle_max);
+            printf("ncclEpCreateGroup:   avg=%.2f ms, min=%.2f ms, max=%.2f ms\n", global_group_avg, global_group_min,
+                   global_group_max);
+            printf("Handle creation:     avg=%.2f ms, min=%.2f ms, max=%.2f ms\n", global_handle_avg, global_handle_min,
+                   global_handle_max);
         }
     }
 
@@ -4532,10 +4391,8 @@ int main(int argc, char* argv[]) {
             if (dispatch_only) {
                 printf("\nGlobal validation: Dispatch=%s\n", global_dispatch_pass ? "PASSED" : "FAILED");
             } else {
-                printf(
-                    "\nGlobal validation: Dispatch=%s, Combine=%s\n",
-                    global_dispatch_pass ? "PASSED" : "FAILED",
-                    global_combine_pass ? "PASSED" : "FAILED");
+                printf("\nGlobal validation: Dispatch=%s, Combine=%s\n", global_dispatch_pass ? "PASSED" : "FAILED",
+                       global_combine_pass ? "PASSED" : "FAILED");
             }
             fflush(stdout);
         }
@@ -4603,12 +4460,8 @@ int main(int argc, char* argv[]) {
 
             // 0 = masked/failed, 1 = active
             bool dispatch_mask_ok = (mask_status_h[dispatch_fail_rank] == 0);
-            printf(
-                "Rank %d: dispatch mask check: %s (rank %d mask=%d)\n",
-                myRank,
-                dispatch_mask_ok ? "PASSED" : "FAILED",
-                dispatch_fail_rank,
-                mask_status_h[dispatch_fail_rank]);
+            printf("Rank %d: dispatch mask check: %s (rank %d mask=%d)\n", myRank,
+                   dispatch_mask_ok ? "PASSED" : "FAILED", dispatch_fail_rank, mask_status_h[dispatch_fail_rank]);
             fflush(stdout);
 
             delete[] mask_status_h;
@@ -4659,14 +4512,9 @@ int main(int argc, char* argv[]) {
 
             // 0 = masked/failed, 1 = active
             bool combine_mask_ok = (mask_status_h[dispatch_fail_rank] == 0) && (mask_status_h[combine_fail_rank] == 0);
-            printf(
-                "Rank %d: combine mask check: %s (rank %d=%d, rank %d=%d)\n",
-                myRank,
-                combine_mask_ok ? "PASSED" : "FAILED",
-                dispatch_fail_rank,
-                mask_status_h[dispatch_fail_rank],
-                combine_fail_rank,
-                mask_status_h[combine_fail_rank]);
+            printf("Rank %d: combine mask check: %s (rank %d=%d, rank %d=%d)\n", myRank,
+                   combine_mask_ok ? "PASSED" : "FAILED", dispatch_fail_rank, mask_status_h[dispatch_fail_rank],
+                   combine_fail_rank, mask_status_h[combine_fail_rank]);
             fflush(stdout);
 
             delete[] mask_status_h;
@@ -4700,11 +4548,8 @@ int main(int argc, char* argv[]) {
             // Verify async error flag is cleared after ncclEpErrorClear
             int async_err = 0;
             NCCLCHECK(ncclEpGetAsyncError(ep_group, &async_err));
-            printf(
-                "Rank %d: async error after clean: %d (%s)\n",
-                myRank,
-                async_err,
-                async_err == 0 ? "PASSED" : "FAILED");
+            printf("Rank %d: async error after clean: %d (%s)\n", myRank, async_err,
+                   async_err == 0 ? "PASSED" : "FAILED");
             fflush(stdout);
 
             delete[] mask_status_h;

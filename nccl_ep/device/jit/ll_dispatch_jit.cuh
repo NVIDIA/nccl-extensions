@@ -136,13 +136,9 @@ inline void launch_ll_dispatch(
         ::nccl_ep::jit::launch_jit_kernel(variant, const_cast<dispatch_kernel_args_t*>(&args), stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
-        std::fprintf(
-            stderr,
-            "[nccl_ep jit] fatal LL dispatch JIT launch failure for %s: %s%s%s\n",
-            variant_name.c_str(),
-            ::nccl_ep::jit::jit_kernel_status_name(status),
-            error.empty() ? "" : ": ",
-            error.empty() ? "" : error.c_str());
+        std::fprintf(stderr, "[nccl_ep jit] fatal LL dispatch JIT launch failure for %s: %s%s%s\n",
+                     variant_name.c_str(), ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
+                     error.empty() ? "" : error.c_str());
         std::abort();
     }
 }

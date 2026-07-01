@@ -71,12 +71,9 @@ inline void launch_ll_clean_low_latency_buffer(
         &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
-        std::fprintf(
-            stderr,
-            "[nccl_ep jit] fatal LL clean JIT launch failure: %s%s%s\n",
-            ::nccl_ep::jit::jit_kernel_status_name(status),
-            error.empty() ? "" : ": ",
-            error.empty() ? "" : error.c_str());
+        std::fprintf(stderr, "[nccl_ep jit] fatal LL clean JIT launch failure: %s%s%s\n",
+                     ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
+                     error.empty() ? "" : error.c_str());
         std::abort();
     }
 }

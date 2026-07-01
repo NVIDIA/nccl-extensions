@@ -397,10 +397,8 @@ int main(int argc, char* argv[]) {
     }
     if (num_experts < top_k * static_cast<unsigned int>(nRanks)) {
         if (myRank == 0)
-            printf(
-                "Error: num_experts (%u) must be >= top_k * nRanks (%u)\n",
-                num_experts,
-                top_k * static_cast<unsigned int>(nRanks));
+            printf("Error: num_experts (%u) must be >= top_k * nRanks (%u)\n", num_experts,
+                   top_k * static_cast<unsigned int>(nRanks));
         MPI_Finalize();
         exit(EXIT_FAILURE);
     }
@@ -449,11 +447,8 @@ int main(int argc, char* argv[]) {
     config.alloc.context = nullptr;
 
     const char* algorithm_name = (algorithm == NCCL_EP_ALGO_LOW_LATENCY) ? "LOW_LATENCY" : "HIGH_THROUGHPUT";
-    printf(
-        "Rank %d: Testing ncclEpCreateGroup with algorithm: %s%s\n",
-        myRank,
-        algorithm_name,
-        disable_max_tokens ? " (no max_dispatch_tokens_per_rank)" : "");
+    printf("Rank %d: Testing ncclEpCreateGroup with algorithm: %s%s\n", myRank, algorithm_name,
+           disable_max_tokens ? " (no max_dispatch_tokens_per_rank)" : "");
     NCCLCHECK(ncclEpCreateGroup(&ep_group, comm, &config));
 
     ncclEpTensor_t* topk_idx = nullptr;
@@ -766,12 +761,8 @@ int main(int argc, char* argv[]) {
         for (unsigned int e = 0; e < num_local_experts; e++) {
             int expected_count = static_cast<int>(num_tokens) * top_k / num_local_experts;
             if (recv_count_host[e] != expected_count) {
-                printf(
-                    "Recv_count check failed! Rank %d, expert %d: expected %d, got %d\n",
-                    myRank,
-                    e,
-                    expected_count,
-                    recv_count_host[e]);
+                printf("Recv_count check failed! Rank %d, expert %d: expected %d, got %d\n", myRank, e, expected_count,
+                       recv_count_host[e]);
                 dispatch_check_passed = false;
                 break;
             }
@@ -811,12 +802,8 @@ int main(int argc, char* argv[]) {
             for (unsigned int e = 0; e < num_local_experts; e++) {
                 int expected_count = static_cast<int>(num_tokens) * top_k / num_local_experts;
                 if (recv_count_host[e] != expected_count) {
-                    printf(
-                        "Recv_count check failed! Rank %d, expert %d: expected %d, got %d\n",
-                        myRank,
-                        e,
-                        expected_count,
-                        recv_count_host[e]);
+                    printf("Recv_count check failed! Rank %d, expert %d: expected %d, got %d\n", myRank, e,
+                           expected_count, recv_count_host[e]);
                     dispatch_check_passed = false;
                     break;
                 }
@@ -834,13 +821,8 @@ int main(int argc, char* argv[]) {
                 uint16_t expected = static_cast<uint16_t>(0x1000 + recv_rank);
                 uint16_t actual = output_host[row + j];
                 if (actual != expected) {
-                    printf(
-                        "Dispatch check failed! Rank %d, token %d, element %d: expected %d, got %d\n",
-                        myRank,
-                        i,
-                        j,
-                        expected,
-                        actual);
+                    printf("Dispatch check failed! Rank %d, token %d, element %d: expected %d, got %d\n", myRank, i, j,
+                           expected, actual);
                     dispatch_check_passed = false;
                     break;
                 }
@@ -881,10 +863,8 @@ int main(int argc, char* argv[]) {
         }
 
         bool ht_outputs_valid = true;
-        printf(
-            "Rank %d: Verifying recv_topk_weights%s\n",
-            myRank,
-            ht_em ? " (HT+EM, 1D)" : " and recv_topk_idx (HT+FLAT, 2D)");
+        printf("Rank %d: Verifying recv_topk_weights%s\n", myRank,
+               ht_em ? " (HT+EM, 1D)" : " and recv_topk_idx (HT+FLAT, 2D)");
 
         float expected_weight = 1.0f / top_k;
         int weight_errors = 0;
@@ -912,26 +892,16 @@ int main(int argc, char* argv[]) {
                     int offset = i * top_k + j;
                     if (recv_topk_weights_host[offset] != expected_weight) {
                         if (weight_errors < 5)
-                            printf(
-                                "Rank %d: recv_topk_weights[%d][%d] = %f, expected %f\n",
-                                myRank,
-                                i,
-                                j,
-                                recv_topk_weights_host[offset],
-                                expected_weight);
+                            printf("Rank %d: recv_topk_weights[%d][%d] = %f, expected %f\n", myRank, i, j,
+                                   recv_topk_weights_host[offset], expected_weight);
                         weight_errors++;
                         ht_outputs_valid = false;
                     }
                     int64_t idx_val = recv_topk_idx_host[offset];
                     if (idx_val < 0 || idx_val >= static_cast<int64_t>(num_experts)) {
                         if (idx_errors < 5)
-                            printf(
-                                "Rank %d: recv_topk_idx[%d][%d] = %ld, expected range [0, %u)\n",
-                                myRank,
-                                i,
-                                j,
-                                static_cast<long>(idx_val),
-                                num_experts);
+                            printf("Rank %d: recv_topk_idx[%d][%d] = %ld, expected range [0, %u)\n", myRank, i, j,
+                                   static_cast<long>(idx_val), num_experts);
                         idx_errors++;
                         ht_outputs_valid = false;
                     }
@@ -947,11 +917,8 @@ int main(int argc, char* argv[]) {
         }
 
         if (ht_outputs_valid) {
-            printf(
-                "Rank %d: %s mode recv_topk_weights%s verification passed\n",
-                myRank,
-                algorithm_name,
-                ht_em ? "" : " and recv_topk_idx");
+            printf("Rank %d: %s mode recv_topk_weights%s verification passed\n", myRank, algorithm_name,
+                   ht_em ? "" : " and recv_topk_idx");
         } else {
             dispatch_check_passed = false;
         }
@@ -990,13 +957,8 @@ int main(int argc, char* argv[]) {
                 uint16_t expected = float_to_bf16(static_cast<float>(slot_count * (j + 1) * 2));
                 uint16_t actual = (combined_output_host[i * hidden + j]);
                 if (actual != expected) {
-                    printf(
-                        "Combine check failed! Rank %d, token %d, element %d: expected %d, got %d\n",
-                        myRank,
-                        i,
-                        j,
-                        expected,
-                        actual);
+                    printf("Combine check failed! Rank %d, token %d, element %d: expected %d, got %d\n", myRank, i, j,
+                           expected, actual);
                     combine_errors++;
                     if (combine_errors >= 5) break; // Limit error output
                 }
@@ -1009,11 +971,8 @@ int main(int argc, char* argv[]) {
     if (random_mode) {
         printf("Rank %d: Combine flow completed (random mode, checks skipped)\n", myRank);
     } else if (combine_errors == 0) {
-        printf(
-            "Rank %d: Combine verification PASSED! All %d tokens with %d elements each correctly combined\n",
-            myRank,
-            num_tokens,
-            hidden);
+        printf("Rank %d: Combine verification PASSED! All %d tokens with %d elements each correctly combined\n", myRank,
+               num_tokens, hidden);
     } else {
         printf("Rank %d: Combine verification FAILED with %d errors\n", myRank, combine_errors);
         printf("Rank %d: Exiting test due to combine failure\n", myRank);
@@ -1162,10 +1121,8 @@ int main(int argc, char* argv[]) {
             cached_combine_inputs.tokens = expert_outputs;
             cached_combine_inputs.topk_weights = cached_combine_topk_weights_input;
 
-            printf(
-                "Rank %d: Testing cached mode - second ncclEpDispatch call (send_only=%s)\n",
-                myRank,
-                dispatch_send_only ? "true" : "false");
+            printf("Rank %d: Testing cached mode - second ncclEpDispatch call (send_only=%s)\n", myRank,
+                   dispatch_send_only ? "true" : "false");
             NCCLCHECK(
                 ncclEpDispatch(ep_handle, &dispatch_inputs, &cached_dispatch_outputs, nullptr, &dispatch_config, s));
 
@@ -1173,10 +1130,8 @@ int main(int argc, char* argv[]) {
             NCCLCHECK(ncclEpComplete(ep_handle, nullptr, s));
             CUDACHECK(cudaStreamSynchronize(s));
 
-            printf(
-                "Rank %d: Testing cached mode - second ncclEpCombine call (send_only=%s)\n",
-                myRank,
-                combine_send_only ? "true" : "false");
+            printf("Rank %d: Testing cached mode - second ncclEpCombine call (send_only=%s)\n", myRank,
+                   combine_send_only ? "true" : "false");
             // Cached combine exercises the BWD path: topk_weights provided on both sides.
             ncclEpCombineConfig_t cached_combine_config = combine_config;
             cached_combine_config.pass_direction = NCCL_EP_BWD_PASS;
@@ -1222,12 +1177,8 @@ int main(int argc, char* argv[]) {
                 for (size_t i = 0; i < recv_x_elems; ++i) {
                     if (first_dispatch_output0[i] != second_dispatch_output0[i]) {
                         if (cached_dispatch_errors < 5) {
-                            printf(
-                                "Rank %d: Cached dispatch output0 mismatch at %zu: first=%u, second=%u\n",
-                                myRank,
-                                i,
-                                first_dispatch_output0[i],
-                                second_dispatch_output0[i]);
+                            printf("Rank %d: Cached dispatch output0 mismatch at %zu: first=%u, second=%u\n", myRank, i,
+                                   first_dispatch_output0[i], second_dispatch_output0[i]);
                         }
                         cached_dispatch_errors++;
                     }
@@ -1237,12 +1188,8 @@ int main(int argc, char* argv[]) {
                 for (unsigned int i = 0; i < num_tokens * hidden; ++i) {
                     if (first_combine_output[i] != second_combine_output[i]) {
                         if (cached_combine_errors < 5) {
-                            printf(
-                                "Rank %d: Cached combine output mismatch at %u: first=%u, second=%u\n",
-                                myRank,
-                                i,
-                                first_combine_output[i],
-                                second_combine_output[i]);
+                            printf("Rank %d: Cached combine output mismatch at %u: first=%u, second=%u\n", myRank, i,
+                                   first_combine_output[i], second_combine_output[i]);
                         }
                         cached_combine_errors++;
                     }
@@ -1253,12 +1200,8 @@ int main(int argc, char* argv[]) {
                 for (int i = 0; i < num_tokens * top_k; ++i) {
                     if (second_combine_topk_weights[i] != expected_weight) {
                         if (cached_combine_errors < 5) {
-                            printf(
-                                "Rank %d: Cached combine topk_weights mismatch at %d: expected=%f, got=%f\n",
-                                myRank,
-                                i,
-                                expected_weight,
-                                second_combine_topk_weights[i]);
+                            printf("Rank %d: Cached combine topk_weights mismatch at %d: expected=%f, got=%f\n", myRank,
+                                   i, expected_weight, second_combine_topk_weights[i]);
                         }
                         cached_combine_errors++;
                     }
@@ -1274,11 +1217,8 @@ int main(int argc, char* argv[]) {
             } else if (cached_dispatch_errors == 0 && cached_combine_errors == 0) {
                 printf("Rank %d: Cached mode verification PASSED - dispatch and combine outputs match\n", myRank);
             } else {
-                printf(
-                    "Rank %d: Cached mode verification FAILED - dispatch errors: %d, combine errors: %d\n",
-                    myRank,
-                    cached_dispatch_errors,
-                    cached_combine_errors);
+                printf("Rank %d: Cached mode verification FAILED - dispatch errors: %d, combine errors: %d\n", myRank,
+                       cached_dispatch_errors, cached_combine_errors);
                 exit(EXIT_FAILURE);
             }
 

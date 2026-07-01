@@ -485,11 +485,8 @@ __forceinline__ __device__ int waitForRecvTokensRelaxed(
 
     // Mask rank if timeout
     if (waitRecvCost > timeoutCycles) {
-        printf(
-            "Warning: NCCL EP timeout for dispatch receive, rank %d, local_expert_idx %d, src_rank %d\n",
-            currRank,
-            rankLaneIdx,
-            srcRank);
+        printf("Warning: NCCL EP timeout for dispatch receive, rank %d, local_expert_idx %d, src_rank %d\n", currRank,
+               rankLaneIdx, srcRank);
         if (rankMask == nullptr) trap();
         atomicExch(rankMask + srcRank, 0);
         if (asyncErrorFlag != nullptr) atomicExch_system(asyncErrorFlag, 1);
@@ -1377,11 +1374,8 @@ __forceinline__ __device__ void waitForRecvFlag(
     }
     // Mask rank if timeout
     if (waitRecvCost > timeoutCycles) {
-        printf(
-            "Warning: NCCL EP timeout for combine receive, rank %d, local_expert_idx %d, src_rank %d\n",
-            currRank,
-            responsibleExpertIdx % numLocalExperts,
-            srcRank);
+        printf("Warning: NCCL EP timeout for combine receive, rank %d, local_expert_idx %d, src_rank %d\n", currRank,
+               responsibleExpertIdx % numLocalExperts, srcRank);
         if (rankMask == nullptr) trap();
         atomicExch(rankMask + srcRank, 0);
         if (asyncErrorFlag != nullptr) atomicExch_system(asyncErrorFlag, 1);

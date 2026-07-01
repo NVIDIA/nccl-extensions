@@ -871,13 +871,8 @@ TEST_F(TopK2MixedRoutingTest, ExpertMajorAlignZeroPadVerified) {
                 memcpy(&raw, &h_recv[s * kHidden + hh], sizeof(raw));
                 if (raw != 0) {
                     if (pad_errors < 5)
-                        printf(
-                            "[Rank %d] zone %d slot %zu h=%d: expected 0x0000, got 0x%04x\n",
-                            g_rank,
-                            zone,
-                            s,
-                            hh,
-                            raw);
+                        printf("[Rank %d] zone %d slot %zu h=%d: expected 0x0000, got 0x%04x\n", g_rank, zone, s, hh,
+                               raw);
                     pad_errors++;
                 }
             }

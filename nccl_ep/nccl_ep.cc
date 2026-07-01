@@ -1212,11 +1212,8 @@ init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
     // Verify that configured HT node count matches NCCL rail team size.
     ncclTeam rail_team = ncclTeamRail(ep_group->comm);
     if (rail_team.nRanks != rdma_team_size) {
-        fprintf(
-            stderr,
-            "[HT GIN] Error: rail team size (%d) must equal number of LSA domains (%d)\n",
-            rail_team.nRanks,
-            rdma_team_size);
+        fprintf(stderr, "[HT GIN] Error: rail team size (%d) must equal number of LSA domains (%d)\n", rail_team.nRanks,
+                rdma_team_size);
         return ncclInvalidUsage;
     }
 
@@ -1224,11 +1221,8 @@ init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
     int min_required_ctx = ep_group->comm_num_sms * HYBRIDEP_DISPATCH_N2N_WARPS;
     if (qps_per_rank == 0) qps_per_rank = min_required_ctx;
     if (qps_per_rank < min_required_ctx) {
-        fprintf(
-            stderr,
-            "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d for dedicated N2N warp contexts\n",
-            qps_per_rank,
-            min_required_ctx);
+        fprintf(stderr, "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d for dedicated N2N warp contexts\n",
+                qps_per_rank, min_required_ctx);
         return ncclInvalidUsage;
     }
     ep_group->gin_config.qps_per_rank = qps_per_rank;
@@ -1485,10 +1479,9 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             const int numWarpGroups = (in_config->num_experts + (in_config->max_num_sms - 1)) / in_config->max_num_sms;
             if (numWarpGroups > llMaxWarpGroupsLimit) {
                 const int required_sms = (in_config->num_experts + (llMaxWarpGroupsLimit - 1)) / llMaxWarpGroupsLimit;
-                fprintf(
-                    stderr,
-                    "Error: insufficient 'max_num_sms'. In Low-Latency mode, NCCL EP requires at least %d SMs\n",
-                    required_sms);
+                fprintf(stderr,
+                        "Error: insufficient 'max_num_sms'. In Low-Latency mode, NCCL EP requires at least %d SMs\n",
+                        required_sms);
                 return ncclInvalidUsage;
             }
         }
@@ -1505,13 +1498,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         if (var.value.ul >= 1 && var.value.ul <= dev_sms) {
             target = static_cast<unsigned int>(var.value.ul);
         } else {
-            fprintf(
-                stderr,
-                "[nccl_ep] %s=%lu out of range (must be in [1, %u]); using %u\n",
-                var.name,
-                var.value.ul,
-                dev_sms,
-                target);
+            fprintf(stderr, "[nccl_ep] %s=%lu out of range (must be in [1, %u]); using %u\n", var.name, var.value.ul,
+                    dev_sms, target);
             // Dump the full env configuration to help diagnose the misconfig.
             nccl_ep_env_print(env);
         }
@@ -1585,11 +1573,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             resolved = clock_khz * 1000ULL * env_ms / 1000ULL;
             source = "NCCL_EP_TIMEOUT_MS env var";
             if (ep_group->config.timeout_ns != 0 && ep_group->rank == 0)
-                fprintf(
-                    stderr,
-                    "NCCL EP: NCCL_EP_TIMEOUT_MS=%lu overrides config.timeout_ns=%lu\n",
-                    (unsigned long)env_ms,
-                    (unsigned long)ep_group->config.timeout_ns);
+                fprintf(stderr, "NCCL EP: NCCL_EP_TIMEOUT_MS=%lu overrides config.timeout_ns=%lu\n",
+                        (unsigned long)env_ms, (unsigned long)ep_group->config.timeout_ns);
         } else if (ep_group->config.timeout_ns != 0) {
             resolved = clock_khz * 1000ULL * (ep_group->config.timeout_ns / 1000000ULL) / 1000ULL;
             source = "config.timeout_ns";
@@ -1601,13 +1586,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             char env_str[32];
             if (have_env_ms) snprintf(env_str, sizeof(env_str), "%llu", (unsigned long long)env_ms);
             else snprintf(env_str, sizeof(env_str), "unset");
-            fprintf(
-                stderr,
-                "NCCL EP: using timeout=%llums (env=%s, config.timeout_ns=%llu, source=%s)\n",
-                (unsigned long long)timeout_ms,
-                env_str,
-                (unsigned long long)ep_group->config.timeout_ns,
-                source);
+            fprintf(stderr, "NCCL EP: using timeout=%llums (env=%s, config.timeout_ns=%llu, source=%s)\n",
+                    (unsigned long long)timeout_ms, env_str, (unsigned long long)ep_group->config.timeout_ns, source);
         }
     }
 
@@ -1693,12 +1673,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             const int requested = static_cast<int>(ep_group->env.tokens_per_chunk.value.ul);
             chunk = round_up_32(requested);
             if (chunk != requested) {
-                fprintf(
-                    stderr,
-                    "[nccl_ep] %s=%d rounded up to %d (must be a multiple of 32)\n",
-                    ep_group->env.tokens_per_chunk.name,
-                    requested,
-                    chunk);
+                fprintf(stderr, "[nccl_ep] %s=%d rounded up to %d (must be a multiple of 32)\n",
+                        ep_group->env.tokens_per_chunk.name, requested, chunk);
             }
         }
         ep_group->ht_tokens_per_chunk = chunk;
@@ -2855,10 +2831,8 @@ ncclResult_t ncclEpDispatch(
     const unsigned int send_only = config ? config->send_only : 0;
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
     if (pass_direction != NCCL_EP_FWD_PASS && handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        fprintf(
-            stderr,
-            "ncclEpDispatch: backward pass (pass_direction=%d) is not supported in LL mode\n",
-            (int)pass_direction);
+        fprintf(stderr, "ncclEpDispatch: backward pass (pass_direction=%d) is not supported in LL mode\n",
+                (int)pass_direction);
         return ncclInvalidUsage;
     }
     ncclEpGroup_t group = handle->group;
@@ -3688,10 +3662,8 @@ ncclResult_t ncclEpCombine(
     const unsigned int send_only = config ? config->send_only : 0;
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
     if (pass_direction != NCCL_EP_FWD_PASS && handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        fprintf(
-            stderr,
-            "ncclEpCombine: backward pass (pass_direction=%d) is not supported in LL mode\n",
-            (int)pass_direction);
+        fprintf(stderr, "ncclEpCombine: backward pass (pass_direction=%d) is not supported in LL mode\n",
+                (int)pass_direction);
         return ncclInvalidUsage;
     }
 

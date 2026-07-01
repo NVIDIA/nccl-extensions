@@ -247,13 +247,9 @@ inline void launch_dispatch(
         ::nccl_ep::jit::launch_jit_kernel(variant, param, param_size, stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
-        std::fprintf(
-            stderr,
-            "[nccl_ep jit] fatal dispatch JIT launch failure for %s: %s%s%s\n",
-            variant_name.c_str(),
-            ::nccl_ep::jit::jit_kernel_status_name(status),
-            error.empty() ? "" : ": ",
-            error.empty() ? "" : error.c_str());
+        std::fprintf(stderr, "[nccl_ep jit] fatal dispatch JIT launch failure for %s: %s%s%s\n", variant_name.c_str(),
+                     ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
+                     error.empty() ? "" : error.c_str());
         std::abort();
     }
 }
@@ -295,15 +291,8 @@ inline void dispatch_dump_warp_timing(
                 n++;
             }
         }
-        std::printf(
-            "  %-9s (%d warp%s x %d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n",
-            name,
-            warp_count,
-            warp_count > 1 ? "s" : " ",
-            num_of_blocks,
-            _wt_us(mn),
-            _wt_us(mx),
-            _wt_us(sum / n));
+        std::printf("  %-9s (%d warp%s x %d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n", name, warp_count,
+                    warp_count > 1 ? "s" : " ", num_of_blocks, _wt_us(mn), _wt_us(mx), _wt_us(sum / n));
     };
     auto _wt_print_block_span = [&]() {
         long long mn = LLONG_MAX, mx = 0, sum = 0;
@@ -320,19 +309,11 @@ inline void dispatch_dump_warp_timing(
             if (d > mx) mx = d;
             sum += d;
         }
-        std::printf(
-            "[DISPATCH BLOCK SPAN TIMING] (%d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n",
-            num_of_blocks,
-            _wt_us(mn),
-            _wt_us(mx),
-            _wt_us(sum / num_of_blocks));
+        std::printf("[DISPATCH BLOCK SPAN TIMING] (%d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n",
+                    num_of_blocks, _wt_us(mn), _wt_us(mx), _wt_us(sum / num_of_blocks));
     };
-    std::printf(
-        "[DISPATCH WORK WARP TIMING] (%d blocks, %d warps/block, %d pipelines, clock=%d kHz)\n",
-        num_of_blocks,
-        wt_warps_per_block,
-        L.num_pipelines,
-        _wt_clock_khz);
+    std::printf("[DISPATCH WORK WARP TIMING] (%d blocks, %d warps/block, %d pipelines, clock=%d kHz)\n", num_of_blocks,
+                wt_warps_per_block, L.num_pipelines, _wt_clock_khz);
     _wt_print_group("INTER_N2N", L.inter_node_group_start, L.inter_node_group_warps);
     _wt_print_group("INTRA_G2S", L.intra_node_g2s_group_start, L.intra_node_g2s_group_warps);
     _wt_print_group("INTRA_S2G", L.intra_node_s2g_group_start, L.intra_node_s2g_group_warps);
@@ -405,13 +386,9 @@ inline void launch_local_dup(
     const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
-        std::fprintf(
-            stderr,
-            "[nccl_ep jit] fatal duplicate JIT launch failure for %s: %s%s%s\n",
-            variant_name.c_str(),
-            ::nccl_ep::jit::jit_kernel_status_name(status),
-            error.empty() ? "" : ": ",
-            error.empty() ? "" : error.c_str());
+        std::fprintf(stderr, "[nccl_ep jit] fatal duplicate JIT launch failure for %s: %s%s%s\n", variant_name.c_str(),
+                     ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
+                     error.empty() ? "" : error.c_str());
         std::abort();
     }
 }
@@ -492,13 +469,9 @@ launch_local_permute_dup(int num_blocks, ::hybrid_ep::local_permute_dup_param_t&
     const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
-        std::fprintf(
-            stderr,
-            "[nccl_ep jit] fatal local-permute-dup JIT launch failure for %s: %s%s%s\n",
-            variant_name.c_str(),
-            ::nccl_ep::jit::jit_kernel_status_name(status),
-            error.empty() ? "" : ": ",
-            error.empty() ? "" : error.c_str());
+        std::fprintf(stderr, "[nccl_ep jit] fatal local-permute-dup JIT launch failure for %s: %s%s%s\n",
+                     variant_name.c_str(), ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
+                     error.empty() ? "" : error.c_str());
         std::abort();
     }
 }

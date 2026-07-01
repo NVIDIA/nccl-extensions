@@ -228,13 +228,9 @@ inline void launch_combine(
         ::nccl_ep::jit::launch_jit_kernel(variant, param, param_size, stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
-        std::fprintf(
-            stderr,
-            "[nccl_ep jit] fatal combine JIT launch failure for %s: %s%s%s\n",
-            variant_name.c_str(),
-            ::nccl_ep::jit::jit_kernel_status_name(status),
-            error.empty() ? "" : ": ",
-            error.empty() ? "" : error.c_str());
+        std::fprintf(stderr, "[nccl_ep jit] fatal combine JIT launch failure for %s: %s%s%s\n", variant_name.c_str(),
+                     ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
+                     error.empty() ? "" : error.c_str());
         std::abort();
     }
 }
@@ -278,12 +274,8 @@ inline void combine_dump_warp_timing(
             if (d > mx) mx = d;
             sum += d;
         }
-        std::printf(
-            "[COMBINE HEAD SYNC TIMING] (%d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n",
-            num_of_blocks,
-            _wt_us(mn),
-            _wt_us(mx),
-            _wt_us(sum / num_of_blocks));
+        std::printf("[COMBINE HEAD SYNC TIMING] (%d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n",
+                    num_of_blocks, _wt_us(mn), _wt_us(mx), _wt_us(sum / num_of_blocks));
     };
     auto _wt_print_work_group = [&](const char* name, int warp_start, int warp_count) {
         if (warp_count == 0) return;
@@ -299,15 +291,8 @@ inline void combine_dump_warp_timing(
                 n++;
             }
         }
-        std::printf(
-            "  %-9s (%d warp%s x %d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n",
-            name,
-            warp_count,
-            warp_count > 1 ? "s" : " ",
-            num_of_blocks,
-            _wt_us(mn),
-            _wt_us(mx),
-            _wt_us(sum / n));
+        std::printf("  %-9s (%d warp%s x %d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n", name, warp_count,
+                    warp_count > 1 ? "s" : " ", num_of_blocks, _wt_us(mn), _wt_us(mx), _wt_us(sum / n));
     };
     auto _wt_print_block_span = [&]() {
         long long mn = LLONG_MAX, mx = 0, sum = 0;
@@ -324,20 +309,12 @@ inline void combine_dump_warp_timing(
             if (d > mx) mx = d;
             sum += d;
         }
-        std::printf(
-            "[COMBINE BLOCK SPAN TIMING] (%d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n",
-            num_of_blocks,
-            _wt_us(mn),
-            _wt_us(mx),
-            _wt_us(sum / num_of_blocks));
+        std::printf("[COMBINE BLOCK SPAN TIMING] (%d blocks):  min=%8.2f us  max=%8.2f us  avg=%8.2f us\n",
+                    num_of_blocks, _wt_us(mn), _wt_us(mx), _wt_us(sum / num_of_blocks));
     };
     _wt_print_head_sync();
-    std::printf(
-        "[COMBINE WORK WARP TIMING] (%d blocks, %d warps/block, %d pipelines, clock=%d kHz)\n",
-        num_of_blocks,
-        wt_warps_per_block,
-        L.num_of_data_pipeline_per_block,
-        _wt_clock_khz);
+    std::printf("[COMBINE WORK WARP TIMING] (%d blocks, %d warps/block, %d pipelines, clock=%d kHz)\n", num_of_blocks,
+                wt_warps_per_block, L.num_of_data_pipeline_per_block, _wt_clock_khz);
     _wt_print_work_group("INTRA_RED", L.intra_node_red_group_start, L.intra_node_red_group_warps);
     _wt_print_work_group("INTER_RED", L.inter_node_red_group_start, L.inter_node_red_group_warps);
     _wt_print_work_group("INTRA_G2S", L.intra_node_g2s_group_start, L.intra_node_g2s_group_warps);
@@ -418,13 +395,9 @@ inline void launch_local_reduce(
     const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
-        std::fprintf(
-            stderr,
-            "[nccl_ep jit] fatal local_reduce JIT launch failure for %s: %s%s%s\n",
-            variant_name.c_str(),
-            ::nccl_ep::jit::jit_kernel_status_name(status),
-            error.empty() ? "" : ": ",
-            error.empty() ? "" : error.c_str());
+        std::fprintf(stderr, "[nccl_ep jit] fatal local_reduce JIT launch failure for %s: %s%s%s\n",
+                     variant_name.c_str(), ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
+                     error.empty() ? "" : error.c_str());
         std::abort();
     }
 }
@@ -508,13 +481,9 @@ inline void launch_local_permute_reduce(
     const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
-        std::fprintf(
-            stderr,
-            "[nccl_ep jit] fatal local-permute-reduce JIT launch failure for %s: %s%s%s\n",
-            variant_name.c_str(),
-            ::nccl_ep::jit::jit_kernel_status_name(status),
-            error.empty() ? "" : ": ",
-            error.empty() ? "" : error.c_str());
+        std::fprintf(stderr, "[nccl_ep jit] fatal local-permute-reduce JIT launch failure for %s: %s%s%s\n",
+                     variant_name.c_str(), ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
+                     error.empty() ? "" : error.c_str());
         std::abort();
     }
 }

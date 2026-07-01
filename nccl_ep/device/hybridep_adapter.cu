@@ -752,12 +752,8 @@ __global__ void em_scan_kernel(
                     cum += padded;
                 }
                 if (cum > max_recv_tokens_per_rank) {
-                    printf(
-                        "em_scan_kernel: dest %d padded slots %d > "
-                        "max_recv_tokens_per_rank %d\n",
-                        d,
-                        cum,
-                        max_recv_tokens_per_rank);
+                    printf("em_scan_kernel: dest %d padded slots %d > " "max_recv_tokens_per_rank %d\n", d, cum,
+                           max_recv_tokens_per_rank);
                     __trap();
                 }
                 if (write_em) {

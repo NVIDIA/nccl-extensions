@@ -119,13 +119,9 @@ inline void launch_scan_flat(
     const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
-        std::fprintf(
-            stderr,
-            "[nccl_ep jit] fatal scan-flat JIT launch failure for %s: %s%s%s\n",
-            variant_name.c_str(),
-            ::nccl_ep::jit::jit_kernel_status_name(status),
-            error.empty() ? "" : ": ",
-            error.empty() ? "" : error.c_str());
+        std::fprintf(stderr, "[nccl_ep jit] fatal scan-flat JIT launch failure for %s: %s%s%s\n", variant_name.c_str(),
+                     ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
+                     error.empty() ? "" : error.c_str());
         std::abort();
     }
 }
@@ -162,13 +158,9 @@ inline void launch_scan_em(
     const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
-        std::fprintf(
-            stderr,
-            "[nccl_ep jit] fatal scan-em JIT launch failure for %s: %s%s%s\n",
-            variant_name.c_str(),
-            ::nccl_ep::jit::jit_kernel_status_name(status),
-            error.empty() ? "" : ": ",
-            error.empty() ? "" : error.c_str());
+        std::fprintf(stderr, "[nccl_ep jit] fatal scan-em JIT launch failure for %s: %s%s%s\n", variant_name.c_str(),
+                     ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
+                     error.empty() ? "" : error.c_str());
         std::abort();
     }
 }

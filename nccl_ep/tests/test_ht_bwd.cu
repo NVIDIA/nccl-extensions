@@ -632,13 +632,8 @@ TEST_F(HtBwdTopK2Test, CombineWithGradExpertMajor) {
             float got = h_combined_w[i * kTopK2 + k];
             if (std::abs(got - expected) > 1e-4f) {
                 if (errors < 8) {
-                    printf(
-                        "[Rank %d] EM TopK2 1D-in token %d k %d: expected %.6f got %.6f\n",
-                        g_rank,
-                        i,
-                        k,
-                        expected,
-                        got);
+                    printf("[Rank %d] EM TopK2 1D-in token %d k %d: expected %.6f got %.6f\n", g_rank, i, k, expected,
+                           got);
                 }
                 errors++;
             }

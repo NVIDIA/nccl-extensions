@@ -25,8 +25,7 @@ constexpr int kLlCleanNumThreads = 256;
 
 inline std::string ll_clean_jit_source() {
     std::ostringstream src;
-    src
-        << "#include \"device/ll_ep.cuh\"\n"
+    src << "#include \"device/ll_ep.cuh\"\n"
         << "#include \"device/ll_ep_adapter.cuh\"\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(" << kLlCleanNumThreads << ", 1)\n"
@@ -65,12 +64,11 @@ inline void launch_ll_clean_low_latency_buffer(
     variant.cluster_dim_x = 1;
 
     std::string error;
-    const ::nccl_ep::jit::JitKernelStatus status =
-        ::nccl_ep::jit::launch_jit_kernel(
-            variant,
-            const_cast<clean_low_latency_buffer_kernel_args_t*>(&args),
-            stream,
-            &error);
+    const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(
+        variant,
+        const_cast<clean_low_latency_buffer_kernel_args_t*>(&args),
+        stream,
+        &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
         std::fprintf(

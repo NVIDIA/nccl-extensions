@@ -35,19 +35,21 @@
 #ifdef NCCLCHECK
 #undef NCCLCHECK
 #endif
-#define NCCLCHECK(cmd) do {                                 \
-    ncclResult_t res = cmd;                                 \
-    if (res != ncclSuccess) {                               \
-        fprintf(stderr, "NCCL error %s:%d '%s'\n",          \
-                __FILE__, __LINE__, ncclGetErrorString(res));\
-        return res;                                          \
-    }                                                        \
-} while(0)
+#define NCCLCHECK(cmd) \
+    do { \
+        ncclResult_t res = cmd; \
+        if (res != ncclSuccess) { \
+            fprintf(stderr, "NCCL error %s:%d '%s'\n", __FILE__, __LINE__, ncclGetErrorString(res)); \
+            return res; \
+        } \
+    } while (0)
 
 // Forward declarations for HT functions
-static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* config, cudaStream_t stream);
+static ncclResult_t
+init_hybridep_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* config, cudaStream_t stream);
 static ncclResult_t destroy_hybridep_intranode(ncclEpGroup_t ep_group);
-static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* config, cudaStream_t stream);
+static ncclResult_t
+init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* config, cudaStream_t stream);
 static ncclResult_t destroy_hybridep_internode(ncclEpGroup_t ep_group);
 
 // Forward declaration for LL helper (defined alongside ll_init_handle).
@@ -55,14 +57,14 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
 
 // Define NCCL_CHECK_RESULT macro for NCCL error checking
 #ifndef NCCL_CHECK_RESULT
-#define NCCL_CHECK_RESULT(cmd) do {                 \
-  ncclResult_t res = cmd;                           \
-  if (res != ncclSuccess) {                         \
-    fprintf(stderr, "NCCL error %d at %s:%d\n",     \
-            res, __FILE__, __LINE__);               \
-    exit(EXIT_FAILURE);                             \
-  }                                                 \
-} while(0)
+#define NCCL_CHECK_RESULT(cmd) \
+    do { \
+        ncclResult_t res = cmd; \
+        if (res != ncclSuccess) { \
+            fprintf(stderr, "NCCL error %d at %s:%d\n", res, __FILE__, __LINE__); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
 #endif
 
 // Size-based ABI versioning: every cross-boundary struct starts with a `size`
@@ -72,20 +74,26 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
 // relaxation (all-zero-trailing-bytes escape hatch).
 // Immediately after `size` there is a `magic` field pre-filled by NCCL_EP_*_INIT
 // to catch unininitialized structures.
-#define EP_REQUIRE_STRUCT(ptr) do { \
-    assert((ptr) != nullptr && (ptr)->size == sizeof(*(ptr)) && \
-           "ABI struct size mismatch — caller and libnccl_ep.so must be from the same release"); \
-    assert((ptr)->magic == NCCL_EP_MAGIC && \
-           "struct magic mismatch — pointer is uninitialised or not an NCCL EP struct " \
-           "(initialise with the corresponding NCCL_EP_*_INIT macro)"); \
-} while (0)
-#define EP_OPTIONAL_STRUCT(ptr) do { \
-    assert(((ptr) == nullptr || (ptr)->size == sizeof(*(ptr))) && \
-           "ABI struct size mismatch -- caller and libnccl_ep.so must be from the same release"); \
-    assert(((ptr) == nullptr || (ptr)->magic == NCCL_EP_MAGIC) && \
-           "struct magic mismatch -- pointer is uninitialised or not an NCCL EP struct " \
-           "(initialise with the corresponding NCCL_EP_*_INIT macro)"); \
-} while (0)
+#define EP_REQUIRE_STRUCT(ptr) \
+    do { \
+        assert( \
+            (ptr) != nullptr && (ptr)->size == sizeof(*(ptr)) && \
+            "ABI struct size mismatch — caller and libnccl_ep.so must be from the same release"); \
+        assert( \
+            (ptr)->magic == NCCL_EP_MAGIC && \
+            "struct magic mismatch — pointer is uninitialised or not an NCCL EP struct " \
+            "(initialise with the corresponding NCCL_EP_*_INIT macro)"); \
+    } while (0)
+#define EP_OPTIONAL_STRUCT(ptr) \
+    do { \
+        assert( \
+            ((ptr) == nullptr || (ptr)->size == sizeof(*(ptr))) && \
+            "ABI struct size mismatch -- caller and libnccl_ep.so must be from the same release"); \
+        assert( \
+            ((ptr) == nullptr || (ptr)->magic == NCCL_EP_MAGIC) && \
+            "struct magic mismatch -- pointer is uninitialised or not an NCCL EP struct " \
+            "(initialise with the corresponding NCCL_EP_*_INIT macro)"); \
+    } while (0)
 
 // Minimum FP8 EXTERN scale block size supported by the pre-allocated output scale buffer.
 // Buffer is sized at group create assuming this value; callers must use scale_block_size >= this.
@@ -100,33 +108,37 @@ static constexpr int kFP8ExternScaleBlockSize = 128;
 // document the corresponding legacy size below.
 static constexpr size_t kNcclEpLayoutInfoMinSize =
     offsetof(ncclEpLayoutInfo_t, recv_topk_idx_kind); // last legacy field end
-#define EP_OPTIONAL_LAYOUT_INFO(ptr) do { \
-    if ((ptr) != nullptr) { \
-        if ((ptr)->size < kNcclEpLayoutInfoMinSize || \
-            (ptr)->size > sizeof(*(ptr))) { \
-            fprintf(stderr, \
+#define EP_OPTIONAL_LAYOUT_INFO(ptr) \
+    do { \
+        if ((ptr) != nullptr) { \
+            if ((ptr)->size < kNcclEpLayoutInfoMinSize || (ptr)->size > sizeof(*(ptr))) { \
+                fprintf( \
+                    stderr, \
                     "NCCL EP: ncclEpLayoutInfo_t size out of supported range: " \
                     "got %u, expected [%zu, %zu]\n", \
-                    (ptr)->size, kNcclEpLayoutInfoMinSize, sizeof(*(ptr))); \
-            return ncclInvalidArgument; \
-        } \
-        if ((ptr)->magic != NCCL_EP_MAGIC) { \
-            fprintf(stderr, \
+                    (ptr)->size, \
+                    kNcclEpLayoutInfoMinSize, \
+                    sizeof(*(ptr))); \
+                return ncclInvalidArgument; \
+            } \
+            if ((ptr)->magic != NCCL_EP_MAGIC) { \
+                fprintf( \
+                    stderr, \
                     "NCCL EP: ncclEpLayoutInfo_t magic mismatch: got 0x%x, " \
                     "expected 0x%x (initialise with NCCL_EP_LAYOUT_INFO_INIT)\n", \
-                    (ptr)->magic, NCCL_EP_MAGIC); \
-            return ncclInvalidArgument; \
+                    (ptr)->magic, \
+                    NCCL_EP_MAGIC); \
+                return ncclInvalidArgument; \
+            } \
         } \
-    } \
-} while (0)
+    } while (0)
 
 // Safe field reader for ncclEpLayoutInfo_t::recv_topk_idx_kind. Returns AUTO
 // when the caller's struct (size) does not cover the field, preserving the
 // pre-flag default.
 static inline ncclEpExpertIdKind_t layoutInfoRecvTopkIdxKind(const ncclEpLayoutInfo_t* lip) {
     if (lip == nullptr) return NCCL_EP_EXPERT_ID_AUTO;
-    constexpr size_t field_end =
-        offsetof(ncclEpLayoutInfo_t, recv_topk_idx_kind) + sizeof(ncclEpExpertIdKind_t);
+    constexpr size_t field_end = offsetof(ncclEpLayoutInfo_t, recv_topk_idx_kind) + sizeof(ncclEpExpertIdKind_t);
     if (lip->size < field_end) return NCCL_EP_EXPERT_ID_AUTO;
     return lip->recv_topk_idx_kind;
 }
@@ -141,43 +153,53 @@ static inline ncclEpExpertIdKind_t resolveRecvTopkIdxKind(ncclEpExpertIdKind_t k
 // Helper function to convert ncclDataType_t to cudaDataType_t
 static cudaDataType_t ncclDataTypeToCudaDataType(ncclDataType_t nccl_type) {
     switch (nccl_type) {
-        case ncclFloat16:    return CUDA_R_16F;
-        case ncclFloat32:    return CUDA_R_32F;
-        case ncclFloat64:    return CUDA_R_64F;
-        case ncclBfloat16:   return CUDA_R_16BF;
-        case ncclInt8:       return CUDA_R_8I;
-        case ncclInt32:      return CUDA_R_32I;
-        case ncclInt64:      return CUDA_R_64I;
-        case ncclUint8:      return CUDA_R_8U;
-        case ncclUint32:     return CUDA_R_32U;
-        case ncclUint64:     return CUDA_R_64U;
-        default:
-            assert(false && "Unsupported ncclDataType_t for conversion to cudaDataType_t");
-            return CUDA_R_16BF; // Default fallback
+    case ncclFloat16:
+        return CUDA_R_16F;
+    case ncclFloat32:
+        return CUDA_R_32F;
+    case ncclFloat64:
+        return CUDA_R_64F;
+    case ncclBfloat16:
+        return CUDA_R_16BF;
+    case ncclInt8:
+        return CUDA_R_8I;
+    case ncclInt32:
+        return CUDA_R_32I;
+    case ncclInt64:
+        return CUDA_R_64I;
+    case ncclUint8:
+        return CUDA_R_8U;
+    case ncclUint32:
+        return CUDA_R_32U;
+    case ncclUint64:
+        return CUDA_R_64U;
+    default:
+        assert(false && "Unsupported ncclDataType_t for conversion to cudaDataType_t");
+        return CUDA_R_16BF; // Default fallback
     }
 }
 
 static size_t ncclTypeSize(ncclDataType_t nccl_type) {
     switch (nccl_type) {
-        case ncclInt8:
-        case ncclUint8:
-        case ncclFloat8e4m3:
-        case ncclFloat8e5m2:
-            return 1;
-        case ncclFloat16:
-        case ncclBfloat16:
-            return 2;
-        case ncclInt32:
-        case ncclUint32:
-        case ncclFloat32:
-            return 4;
-        case ncclInt64:
-        case ncclUint64:
-        case ncclFloat64:
-            return 8;
-        default:
-            assert(false && "Unsupported ncclDataType_t for size query");
-            return 0;
+    case ncclInt8:
+    case ncclUint8:
+    case ncclFloat8e4m3:
+    case ncclFloat8e5m2:
+        return 1;
+    case ncclFloat16:
+    case ncclBfloat16:
+        return 2;
+    case ncclInt32:
+    case ncclUint32:
+    case ncclFloat32:
+        return 4;
+    case ncclInt64:
+    case ncclUint64:
+    case ncclFloat64:
+        return 8;
+    default:
+        assert(false && "Unsupported ncclDataType_t for size query");
+        return 0;
     }
 }
 
@@ -198,13 +220,11 @@ static bool validate_fp8_dtype(ncclDataType_t dt) {
 // Internal magic cookie for tensors returned by ncclEpTensorAlloc. Kept out
 // of the public header so callers can only spell the STATIC cookie
 // (NCCL_EP_TENSOR_MAGIC) via NCCL_EP_TENSOR_INIT.
-#define NCCL_EP_TENSOR_ALLOC_STATIC  NCCL_EP_TENSOR_MAGIC
+#define NCCL_EP_TENSOR_ALLOC_STATIC NCCL_EP_TENSOR_MAGIC
 #define NCCL_EP_TENSOR_ALLOC_DYNAMIC 0xBEEFBEEF
 
 #define NCCL_EP_TENSOR_INIT_DYNAMIC \
-    ((ncclEpTensor_t){ \
-        .size  = (unsigned int)sizeof(ncclEpTensor_t), \
-        .magic = NCCL_EP_TENSOR_ALLOC_DYNAMIC })
+    ((ncclEpTensor_t){.size = (unsigned int)sizeof(ncclEpTensor_t), .magic = NCCL_EP_TENSOR_ALLOC_DYNAMIC})
 
 typedef struct ncclEpTensorInternal_s {
     // Shadow of pub.sizes captured by ncclEpTensorAlloc; lets the library
@@ -266,10 +286,10 @@ static inline bool tensorHasBinding(const ncclEpTensor_t* t) {
 // num_tokens == 0 as a no-op on the sender side and still participate in the
 // collective on the receiver side.
 static inline void tensorAssertValid(const ncclEpTensor_t* t) {
-    assert(tensorIsInitialised(t) &&
-           "ncclEpTensor_t not initialised — use NCCL_EP_TENSOR_INIT or ncclEpTensorAlloc");
-    assert((tensorIsEmpty(t) || tensorHasBinding(t)) &&
-           "ncclEpTensor_t has no storage binding — set `.data` or (`.win_hdl` [+ `.win_offset`])");
+    assert(tensorIsInitialised(t) && "ncclEpTensor_t not initialised — use NCCL_EP_TENSOR_INIT or ncclEpTensorAlloc");
+    assert(
+        (tensorIsEmpty(t) || tensorHasBinding(t)) &&
+        "ncclEpTensor_t has no storage binding — set `.data` or (`.win_hdl` [+ `.win_offset`])");
 }
 
 // Validate that a non-null tensor pointer points at an initialised descriptor.
@@ -332,8 +352,7 @@ ncclResult_t ncclEpTensorAlloc(
     unsigned int ndim,
     ncclDataType_t datatype,
     const size_t* sizes,
-    const ncclEpTensorAllocConfig_t* config)
-{
+    const ncclEpTensorAllocConfig_t* config) {
     EP_OPTIONAL_STRUCT(config);
     if (tensor == nullptr || sizes == nullptr || ndim == 0) {
         return ncclInvalidArgument;
@@ -357,8 +376,7 @@ ncclResult_t ncclEpTensorDestroy(ncclEpTensor_t* tensor) {
     if (tensor == nullptr) {
         return ncclSuccess;
     }
-    if (!tensorIsInitialised(tensor) ||
-        tensor->magic != NCCL_EP_TENSOR_ALLOC_DYNAMIC) {
+    if (!tensorIsInitialised(tensor) || tensor->magic != NCCL_EP_TENSOR_ALLOC_DYNAMIC) {
         return ncclInvalidArgument;
     }
     ncclEpTensorInternal_t* internal = _getInternalTensor(tensor);
@@ -371,24 +389,24 @@ ncclResult_t ncclEpTensorDestroy(ncclEpTensor_t* tensor) {
 // This operates on a single in-place host buffer, unlike batchAllGatherIpcHandles
 // which batches multiple IPC handles via a packed device buffer.
 // Each rank contributes element_size bytes at offset rank * element_size.
-static void ncclAllGatherHost(
-    void* host_buffer,
-    size_t element_size,
-    int rank,
-    int nRanks,
-    ncclComm_t comm,
-    cudaStream_t stream
-) {
+static void
+ncclAllGatherHost(void* host_buffer, size_t element_size, int rank, int nRanks, ncclComm_t comm, cudaStream_t stream) {
     const size_t total_size = element_size * nRanks;
     void* d_buffer;
     CUDA_CHECK(cudaMalloc(&d_buffer, total_size));
     CUDA_CHECK(cudaMemcpyAsync(
         static_cast<uint8_t*>(d_buffer) + rank * element_size,
         static_cast<uint8_t*>(host_buffer) + rank * element_size,
-        element_size, cudaMemcpyHostToDevice, stream));
+        element_size,
+        cudaMemcpyHostToDevice,
+        stream));
     NCCL_CHECK_RESULT(ncclAllGather(
         static_cast<uint8_t*>(d_buffer) + rank * element_size,
-        d_buffer, element_size, ncclUint8, comm, stream));
+        d_buffer,
+        element_size,
+        ncclUint8,
+        comm,
+        stream));
     CUDA_CHECK(cudaMemcpyAsync(host_buffer, d_buffer, total_size, cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(d_buffer));
@@ -398,7 +416,7 @@ static void ncclAllGatherHost(
 // If workspace is provided, it is used directly (must be at least sizeof(int) device bytes).
 // Otherwise a temporary cudaMalloc/cudaFree pair is used as fallback.
 static ncclResult_t ncclBarrier(ncclComm_t comm, cudaStream_t stream, void* workspace = nullptr) {
-    int *nccl_barrier_var = nullptr;
+    int* nccl_barrier_var = nullptr;
     bool owns_memory = false;
     if (workspace) {
         nccl_barrier_var = static_cast<int*>(workspace);
@@ -506,29 +524,30 @@ struct ncclEpGroup {
     unsigned int device_sm_count;   // Number of SMs on the device
     unsigned int comm_num_sms;      // Resolved SM count for EP kernels (from config.max_num_sms)
     unsigned int prolog_epilog_sms; // Resolved SM count for the prolog/epilog kernels (local_dup, local_reduce).
-    unsigned int preprocess_num_sms;         // Resolved SM count for the preprocessing scan kernels (NCCL_EP_PREPROCESS_NUM_SMS).
+    unsigned int
+        preprocess_num_sms; // Resolved SM count for the preprocessing scan kernels (NCCL_EP_PREPROCESS_NUM_SMS).
 
-    // HT EM dispatch/combine code path. Resolved once at ncclEpCreateGroup.
+  // HT EM dispatch/combine code path. Resolved once at ncclEpCreateGroup.
     enum class HtEmMode : uint8_t {
-        kLocalPermute = 0,  // FLAT-dispatch + local_permute kernels
-        kLocalDup     = 1,  // dispatch dedup + local_dup/local_reduce
-        kNvlinkDup    = 2,  // in-kernel Expert-major scatter (sender duplicates over NVLink)
+        kLocalPermute = 0, // FLAT-dispatch + local_permute kernels
+        kLocalDup = 1, // dispatch dedup + local_dup/local_reduce
+        kNvlinkDup = 2, // in-kernel Expert-major scatter (sender duplicates over NVLink)
     };
     HtEmMode ht_em_mode;
 
     ncclEpAllocConfig_t alloc;
 
-    // Active-mask buffer for FT support (LL only)
-    int* mask_buffer = nullptr;        // Device: int[nRanks], null if !enable_mask
-    int* async_error_flag = nullptr;   // Host-pinned: 0 = ok, 1 = timeout occurred
+  // Active-mask buffer for FT support (LL only)
+    int* mask_buffer = nullptr; // Device: int[nRanks], null if !enable_mask
+    int* async_error_flag = nullptr; // Host-pinned: 0 = ok, 1 = timeout occurred
     uint64_t timeout_cycles = NUM_TIMEOUT_CYCLES; // GPU clock cycles for wait-loop timeout
 
-    // Physical node properties (CUDA device assignment, IPC between co-located GPUs)
-    int gpus_per_node;    // Physical GPUs per node (nRanks / nNodes)
-    int rank_in_node;     // Per-node CUDA device ordinal (= cuda_device_id)
-    int node_id;          // Physical node index (rank / gpus_per_node)
+  // Physical node properties (CUDA device assignment, IPC between co-located GPUs)
+    int gpus_per_node; // Physical GPUs per node (nRanks / nNodes)
+    int rank_in_node; // Per-node CUDA device ordinal (= cuda_device_id)
+    int node_id; // Physical node index (rank / gpus_per_node)
 
-    // NCCL device API
+  // NCCL device API
     size_t num_nccl_comms;
     std::vector<ncclComm_t> nccl_comms;
     ncclDevComm_t* nccl_dev_comms;
@@ -536,71 +555,71 @@ struct ncclEpGroup {
     int num_dispatch_signals;
     unsigned clean_barrier_signal_base;
 
-    // Cross-rank sync region used by clean_low_latency_buffer.
-    void*         sync_buffer = nullptr;   // device buffer, int[nRanks] aligned
-    ncclWindow_t* sync_window = nullptr;   // device ptr to the registered window handle
+  // Cross-rank sync region used by clean_low_latency_buffer.
+    void* sync_buffer = nullptr; // device buffer, int[nRanks] aligned
+    ncclWindow_t* sync_window = nullptr; // device ptr to the registered window handle
 
-    // HT buffers for intranode communication
+  // HT buffers for intranode communication
     struct {
-        // IPC-mapped buffer pointer arrays (fixed-size, indexed by local NVL rank)
-        // Host arrays for population and cleanup
-        void **dispatch_expert_output_token_buffer_ptrs;
-        float **dispatch_expert_output_prob_buffer_ptrs;
-        float **dispatch_expert_output_scaling_factor_buffer_ptrs;
-        uint16_t **combine_expert_input_token_buffer_ptrs;
-        float **combine_expert_input_prob_buffer_ptrs;
+    // IPC-mapped buffer pointer arrays (fixed-size, indexed by local NVL rank)
+    // Host arrays for population and cleanup
+        void** dispatch_expert_output_token_buffer_ptrs;
+        float** dispatch_expert_output_prob_buffer_ptrs;
+        float** dispatch_expert_output_scaling_factor_buffer_ptrs;
+        uint16_t** combine_expert_input_token_buffer_ptrs;
+        float** combine_expert_input_prob_buffer_ptrs;
 
-        // Local buffers (owned by this rank)
-        void *expert_output_token;
-        float *expert_output_prob;
-        float *expert_output_scaling_factor;
-        uint16_t *expert_input_token;
-        float *expert_input_prob;
+    // Local buffers (owned by this rank)
+        void* expert_output_token;
+        float* expert_output_prob;
+        float* expert_output_scaling_factor;
+        uint16_t* expert_input_token;
+        float* expert_input_prob;
 
-        // Slot capacity of expert_output_token / expert_input_token.
+    // Slot capacity of expert_output_token / expert_input_token.
         size_t token_staging_slots;
 
-        // Sync flags (rank 0 allocates, others IPC-map)
-        uint32_t *intra_node_write_completion_flags;
-        uint32_t *combine_intra_node_write_completion_flags;
-        // Single device-resident counter block (one alloc, one free) backing
-        // the grid-barrier counters and the per-kernel expected-flag counters.
-        // The expected counters are initialized at bootstrap and bumped in the
-        // dispatch/combine kernel tails, so the bump is captured into any
-        // enclosing CUDA graph and replays correctly.
-        void     *dev_counter_block = nullptr;
-        uint32_t *dispatch_grid_barrier_counter = nullptr;
-        uint32_t *combine_grid_barrier_counter = nullptr;
-        uint64_t *dev_dispatch_expected_rdma = nullptr;
-        uint32_t *dev_dispatch_expected_intra = nullptr;
-        uint64_t *dev_combine_expected_rdma = nullptr;
-        uint32_t *dev_combine_expected_intra = nullptr;
+    // Sync flags (rank 0 allocates, others IPC-map)
+        uint32_t* intra_node_write_completion_flags;
+        uint32_t* combine_intra_node_write_completion_flags;
+    // Single device-resident counter block (one alloc, one free) backing
+    // the grid-barrier counters and the per-kernel expected-flag counters.
+    // The expected counters are initialized at bootstrap and bumped in the
+    // dispatch/combine kernel tails, so the bump is captured into any
+    // enclosing CUDA graph and replays correctly.
+        void* dev_counter_block = nullptr;
+        uint32_t* dispatch_grid_barrier_counter = nullptr;
+        uint32_t* combine_grid_barrier_counter = nullptr;
+        uint64_t* dev_dispatch_expected_rdma = nullptr;
+        uint32_t* dev_dispatch_expected_intra = nullptr;
+        uint64_t* dev_combine_expected_rdma = nullptr;
+        uint32_t* dev_combine_expected_intra = nullptr;
 
-        // RDMA buffers (multi-node only)
-        uint64_t *rdma_inter_node_group_flags;
-        uint16_t *rdma_intra_node_red_token;
-        float *rdma_intra_node_red_prob;
-        uint16_t *combine_rdma_inter_node_group_token;
-        float *combine_rdma_inter_node_group_prob;
-        uint64_t *combine_rdma_inter_node_group_flags;
+    // RDMA buffers (multi-node only)
+        uint64_t* rdma_inter_node_group_flags;
+        uint16_t* rdma_intra_node_red_token;
+        float* rdma_intra_node_red_prob;
+        uint16_t* combine_rdma_inter_node_group_token;
+        float* combine_rdma_inter_node_group_prob;
+        uint64_t* combine_rdma_inter_node_group_flags;
 
-        // Pre-registered dispatch buffers (group-level, allocated during Group Create)
-        // These are pre-registered with GIN to avoid ~60ms registration overhead during dispatch
-        void *token_staging_buffer;          // Pre-registered staging buffer for user tokens
-        float *dense_prob_buffer;            // Pre-registered buffer for sparse→dense prob conversion
-        float *scaling_factor_staging_buffer; // Pre-registered staging buffer for FP8 scaling factors
+    // Pre-registered dispatch buffers (group-level, allocated during Group Create)
+    // These are pre-registered with GIN to avoid ~60ms registration overhead during dispatch
+        void* token_staging_buffer; // Pre-registered staging buffer for user tokens
+        float* dense_prob_buffer; // Pre-registered buffer for sparse→dense prob conversion
+        float* scaling_factor_staging_buffer; // Pre-registered staging buffer for FP8 scaling factors
 
-        // Group-scoped routing bitmap; shared by all handles on this group.
-        uint8_t *global_routing_map = nullptr;
-        size_t   global_routing_map_size = 0;
+    // Group-scoped routing bitmap; shared by all handles on this group.
+        uint8_t* global_routing_map = nullptr;
+        size_t global_routing_map_size = 0;
 
-        // Merged IPC buffer (single cudaMalloc for all IPC-shared buffers)
+    // Merged IPC buffer (single cudaMalloc for all IPC-shared buffers)
         void* ipc_mega_buffer = nullptr;
         size_t ipc_mega_buffer_size = 0;
         ncclWindow_t intranode_mega_window = {};
         size_t ipc_dispatch_token_offset = 0;
         size_t ipc_dispatch_prob_offset = 0;
-        size_t ipc_dispatch_scaling_factor_offset = 0;  // FP8 EXTERN: per-block output scales region in the mega buffer
+        size_t ipc_dispatch_scaling_factor_offset = 0; // FP8 EXTERN: per-block output scales region in the mega buffer
         size_t ipc_combine_token_offset = 0;
         size_t ipc_combine_prob_offset = 0;
 
@@ -608,7 +627,7 @@ struct ncclEpGroup {
         uint32_t* completion_flags_base = nullptr;
         ncclWindow_t completion_flags_window = {};
 
-        void* host_ptr_block = nullptr;        // Single cudaHostAlloc for all pointer arrays
+        void* host_ptr_block = nullptr; // Single cudaHostAlloc for all pointer arrays
 
         // Config
         bool initialized;
@@ -616,47 +635,20 @@ struct ncclEpGroup {
     } ht_buffers;
 
     // Constructor to properly initialize all members
-    ncclEpGroup() :
-        comm(nullptr),
-        nRanks(0),
-        rank(0),
-        nNodes(0),
-        ep_workspace(nullptr),
-        cuda_device_id(0),
-        lsa_team_size(0),
-        lsa_rank(0),
-        rdma_team_size(0),
-        rdma_rank(0),
-        rdma_buffer(nullptr),
-        rdma_buffer_size_alloc(0),
-        config{},
-        num_local_experts(0),
-        max_recv_tokens(0),
-        device_sm_count(0),
-        comm_num_sms(0),
-        prolog_epilog_sms(0),
-        preprocess_num_sms(0),
-        ht_em_mode(HtEmMode::kLocalPermute),
-        alloc{},
-        gpus_per_node(0),
-        rank_in_node(0),
-        node_id(0),
-        num_nccl_comms(0),
-        nccl_comms{},
-        nccl_dev_comms(nullptr),
-        nccl_wins(nullptr),
-        num_dispatch_signals(0),
-        clean_barrier_signal_base(0),
-        ht_buffers{} {}
+    ncclEpGroup()
+        : comm(nullptr), nRanks(0), rank(0), nNodes(0), ep_workspace(nullptr), cuda_device_id(0), lsa_team_size(0),
+          lsa_rank(0), rdma_team_size(0), rdma_rank(0), rdma_buffer(nullptr), rdma_buffer_size_alloc(0), config{},
+          num_local_experts(0), max_recv_tokens(0), device_sm_count(0), comm_num_sms(0), prolog_epilog_sms(0),
+          preprocess_num_sms(0), ht_em_mode(HtEmMode::kLocalPermute), alloc{}, gpus_per_node(0), rank_in_node(0),
+          node_id(0), num_nccl_comms(0), nccl_comms{}, nccl_dev_comms(nullptr), nccl_wins(nullptr),
+          num_dispatch_signals(0), clean_barrier_signal_base(0), ht_buffers{} {}
 };
 
 // For tensors w/o external window, lazily bind the internal GIN window and offset.
 // Tensors created from a user window already carry their own window; resolve
 // their local data pointer here once a group/comm is available.
-static ncclResult_t resolveTensorWindowBinding(
-    const ncclEpGroup_t ep_group,
-    ncclEpTensor_t* tensor,
-    uint64_t default_offset) {
+static ncclResult_t
+resolveTensorWindowBinding(const ncclEpGroup_t ep_group, ncclEpTensor_t* tensor, uint64_t default_offset) {
     if (tensor == nullptr) {
         return ncclInvalidArgument;
     }
@@ -704,10 +696,9 @@ static ncclResult_t resolveTensorWindowBinding(
     const ncclEpTensor_t* tensor,
     ncclEpTensor_t* local_storage,
     uint64_t default_offset,
-    const ncclEpTensor_t** out
-) {
+    const ncclEpTensor_t** out) {
     const bool internode_initialized = ep_group->ht_buffers.internode_initialized;
-    const bool needs_win  = internode_initialized && tensor->win_hdl == ncclWindow_t{};
+    const bool needs_win = internode_initialized && tensor->win_hdl == ncclWindow_t{};
     const bool needs_data = tensor->data == nullptr;
     if (!needs_win && !needs_data) {
         *out = tensor;
@@ -721,9 +712,7 @@ static ncclResult_t resolveTensorWindowBinding(
 
 // A tensor is on the zero-copy path when its window is user-provided,
 // not the group-owned internal GIN window.
-static bool tensorUsesExternalWindow(
-    const ncclEpGroup_t ep_group,
-    const ncclEpTensor_t* tensor) {
+static bool tensorUsesExternalWindow(const ncclEpGroup_t ep_group, const ncclEpTensor_t* tensor) {
     // No window yet means a regular tensor - it may be lazily bound to the
     // internal window later, so do not classify it as external.
     if (tensor->win_hdl == ncclWindow_t{}) {
@@ -737,10 +726,8 @@ static bool tensorUsesExternalWindow(
 // directly to same-node peer buffers. The local pointer comes from tensor->data;
 // peer pointers are resolved from the NCCL window plus the stored offset.
 template <typename T>
-static ncclResult_t buildIntranodePtrArray(
-    const ncclEpGroup_t group,
-    const ncclEpTensor_t* tensor,
-    std::vector<T*>& out_ptrs) {
+static ncclResult_t
+buildIntranodePtrArray(const ncclEpGroup_t group, const ncclEpTensor_t* tensor, std::vector<T*>& out_ptrs) {
     if (tensor == nullptr || tensor->win_hdl == ncclWindow_t{}) {
         return ncclInvalidUsage;
     }
@@ -757,8 +744,7 @@ static ncclResult_t buildIntranodePtrArray(
 
         int peer_global = ncclTeamRankToWorld(group->comm, lsa_team, i);
         void* peer_ptr = nullptr;
-        NCCL_CHECK_RESULT(ncclGetPeerDevicePointer(
-            resolved->win_hdl, resolved->win_offset, peer_global, &peer_ptr));
+        NCCL_CHECK_RESULT(ncclGetPeerDevicePointer(resolved->win_hdl, resolved->win_offset, peer_global, &peer_ptr));
 
         out_ptrs[i] = static_cast<T*>(peer_ptr);
     }
@@ -771,10 +757,8 @@ static ncclResult_t buildIntranodePtrArray(
 static bool em_staging_indexed_by_em_slot(ncclEpGroup_t group);
 
 // HT Intranode Initialization (adapted for public NCCL APIs)
-static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
-                                    const ncclEpGroupConfig_t* in_config,
-                                    cudaStream_t stream)
-{
+static ncclResult_t
+init_hybridep_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, cudaStream_t stream) {
     ncclComm_t comm = ep_group->comm;
     // HT topology uses NCCL team semantics (rail/lsa)
     int lsa_ranks = ep_group->lsa_team_size;
@@ -798,11 +782,8 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
     size_t max_output_slots = static_cast<size_t>(max_recv_tokens);
     // Token staging slots per direction; zero_copy elides both regions.
     // kLocalPermute uses rank-major writes, kLocalDup and kNvlinkDup use em_slot.
-    const size_t flat_slots = static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank)
-                            * ep_group->nRanks;
-    size_t token_staging_slots = em_staging_indexed_by_em_slot(ep_group)
-        ? max_output_slots
-        : flat_slots;
+    const size_t flat_slots = static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * ep_group->nRanks;
+    size_t token_staging_slots = em_staging_indexed_by_em_slot(ep_group) ? max_output_slots : flat_slots;
     ep_group->ht_buffers.token_staging_slots = token_staging_slots;
     size_t expert_output_token_sz = token_staging_slots * max_token_bytes;
     size_t expert_output_prob_sz = max_output_slots * num_local_experts * lsa_ranks * sizeof(float);
@@ -818,13 +799,13 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
     // zero_copy elides both token regions (windowed tensors required).
     const bool zero_copy = ep_group->config.zero_copy == NCCL_EP_ZERO_COPY_ON;
     size_t dispatch_token_aligned = zero_copy ? 0 : align_ipc(expert_output_token_sz);
-    size_t dispatch_prob_aligned  = align_ipc(expert_output_prob_sz);
-    size_t dispatch_sf_aligned    = align_ipc(expert_output_scaling_factor_sz);
-    size_t combine_token_aligned  = zero_copy ? 0 : align_ipc(expert_input_token_sz);
-    size_t combine_prob_aligned   = align_ipc(expert_input_prob_sz);
+    size_t dispatch_prob_aligned = align_ipc(expert_output_prob_sz);
+    size_t dispatch_sf_aligned = align_ipc(expert_output_scaling_factor_sz);
+    size_t combine_token_aligned = zero_copy ? 0 : align_ipc(expert_input_token_sz);
+    size_t combine_prob_aligned = align_ipc(expert_input_prob_sz);
 
-    size_t mega_sz = dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned
-                   + combine_token_aligned + combine_prob_aligned;
+    size_t mega_sz = dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned + combine_token_aligned +
+                     combine_prob_aligned;
     NCCL_CHECK_RESULT(ncclMemAlloc(&ep_group->ht_buffers.ipc_mega_buffer, mega_sz));
     ep_group->ht_buffers.ipc_mega_buffer_size = mega_sz;
 
@@ -837,24 +818,25 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
 
     // FP8 EXTERN output scales region (after token+prob; shifts the combine offsets by dispatch_sf_aligned).
     ep_group->ht_buffers.ipc_dispatch_scaling_factor_offset = dispatch_token_aligned + dispatch_prob_aligned;
-    ep_group->ht_buffers.expert_output_scaling_factor = reinterpret_cast<float*>(
-        mega_base + dispatch_token_aligned + dispatch_prob_aligned);
+    ep_group->ht_buffers.expert_output_scaling_factor =
+        reinterpret_cast<float*>(mega_base + dispatch_token_aligned + dispatch_prob_aligned);
 
-    ep_group->ht_buffers.ipc_combine_token_offset = dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned;
-    ep_group->ht_buffers.expert_input_token = zero_copy
-        ? nullptr
-        : reinterpret_cast<uint16_t*>(mega_base + dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned);
+    ep_group->ht_buffers.ipc_combine_token_offset =
+        dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned;
+    ep_group->ht_buffers.expert_input_token =
+        zero_copy ? nullptr :
+                    reinterpret_cast<uint16_t*>(
+                        mega_base + dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned);
 
-    ep_group->ht_buffers.ipc_combine_prob_offset = dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned + combine_token_aligned;
+    ep_group->ht_buffers.ipc_combine_prob_offset =
+        dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned + combine_token_aligned;
     ep_group->ht_buffers.expert_input_prob = reinterpret_cast<float*>(
         mega_base + dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned + combine_token_aligned);
 
     // Host pointer arrays indexed by HT local rank within LSA team.
-    size_t host_block_sz = sizeof(void*) * lsa_ranks
-                         + sizeof(float*) * lsa_ranks      // dispatch prob
-                         + sizeof(float*) * lsa_ranks      // dispatch FP8 scales
-                         + sizeof(uint16_t*) * lsa_ranks
-                         + sizeof(float*) * lsa_ranks;
+    size_t host_block_sz = sizeof(void*) * lsa_ranks + sizeof(float*) * lsa_ranks // dispatch prob
+                           + sizeof(float*) * lsa_ranks // dispatch FP8 scales
+                           + sizeof(uint16_t*) * lsa_ranks + sizeof(float*) * lsa_ranks;
     CUDA_CHECK(cudaHostAlloc(&ep_group->ht_buffers.host_ptr_block, host_block_sz, cudaHostAllocMapped));
 
     uint8_t* hptr = static_cast<uint8_t*>(ep_group->ht_buffers.host_ptr_block);
@@ -869,7 +851,8 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
     ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs = reinterpret_cast<float**>(hptr);
 
     // Merged completion flags: allocate on all ranks as we will window register is collective
-    NCCL_CHECK_RESULT(ncclMemAlloc(reinterpret_cast<void**>(&ep_group->ht_buffers.completion_flags_base), 2 * sizeof(uint32_t)));
+    NCCL_CHECK_RESULT(
+        ncclMemAlloc(reinterpret_cast<void**>(&ep_group->ht_buffers.completion_flags_base), 2 * sizeof(uint32_t)));
     CUDA_CHECK(cudaMemsetAsync(ep_group->ht_buffers.completion_flags_base, 0, 2 * sizeof(uint32_t), stream));
     ep_group->ht_buffers.intra_node_write_completion_flags = ep_group->ht_buffers.completion_flags_base;
     ep_group->ht_buffers.combine_intra_node_write_completion_flags = ep_group->ht_buffers.completion_flags_base + 1;
@@ -887,12 +870,12 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
         CUDA_CHECK(ep_group->alloc.alloc_fn(&block, kCounterBlockBytes, ep_group->alloc.context));
         ep_group->ht_buffers.dev_counter_block = block;
         auto* base = reinterpret_cast<uint8_t*>(block);
-        ep_group->ht_buffers.dev_dispatch_expected_rdma    = reinterpret_cast<uint64_t*>(base +  0);
-        ep_group->ht_buffers.dev_combine_expected_rdma     = reinterpret_cast<uint64_t*>(base +  8);
-        ep_group->ht_buffers.dev_dispatch_expected_intra   = reinterpret_cast<uint32_t*>(base + 16);
-        ep_group->ht_buffers.dev_combine_expected_intra    = reinterpret_cast<uint32_t*>(base + 20);
+        ep_group->ht_buffers.dev_dispatch_expected_rdma = reinterpret_cast<uint64_t*>(base + 0);
+        ep_group->ht_buffers.dev_combine_expected_rdma = reinterpret_cast<uint64_t*>(base + 8);
+        ep_group->ht_buffers.dev_dispatch_expected_intra = reinterpret_cast<uint32_t*>(base + 16);
+        ep_group->ht_buffers.dev_combine_expected_intra = reinterpret_cast<uint32_t*>(base + 20);
         ep_group->ht_buffers.dispatch_grid_barrier_counter = reinterpret_cast<uint32_t*>(base + 24);
-        ep_group->ht_buffers.combine_grid_barrier_counter  = reinterpret_cast<uint32_t*>(base + 28);
+        ep_group->ht_buffers.combine_grid_barrier_counter = reinterpret_cast<uint32_t*>(base + 28);
 
         // Initialize the expected counters to the first-invocation value
         // (grid-barrier counters stay at 0). Bootstrap is outside any user
@@ -901,12 +884,11 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
         const uint64_t init_rdma = is_single_node ? 0ull : 1ull;
         const uint32_t init_intra = static_cast<uint32_t>(ep_group->lsa_team_size);
         uint8_t host_init[kCounterBlockBytes] = {0};
-        std::memcpy(host_init +  0, &init_rdma,  sizeof(init_rdma));
-        std::memcpy(host_init +  8, &init_rdma,  sizeof(init_rdma));
+        std::memcpy(host_init + 0, &init_rdma, sizeof(init_rdma));
+        std::memcpy(host_init + 8, &init_rdma, sizeof(init_rdma));
         std::memcpy(host_init + 16, &init_intra, sizeof(init_intra));
         std::memcpy(host_init + 20, &init_intra, sizeof(init_intra));
-        CUDA_CHECK(cudaMemcpyAsync(block, host_init, kCounterBlockBytes,
-                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(block, host_init, kCounterBlockBytes, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
@@ -937,32 +919,26 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
 
     for (int i = 0; i < lsa_ranks; i++) {
         if (i == lsa_rank) {
-            ep_group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[i] =
-                ep_group->ht_buffers.expert_output_token;
-            ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[i] =
-                ep_group->ht_buffers.expert_output_prob;
+            ep_group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[i] = ep_group->ht_buffers.expert_output_token;
+            ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[i] = ep_group->ht_buffers.expert_output_prob;
             ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[i] =
                 ep_group->ht_buffers.expert_output_scaling_factor;
-            ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i] =
-                ep_group->ht_buffers.expert_input_token;
-            ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs[i] =
-                ep_group->ht_buffers.expert_input_prob;
+            ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i] = ep_group->ht_buffers.expert_input_token;
+            ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs[i] = ep_group->ht_buffers.expert_input_prob;
         } else {
             int peer_global = ncclTeamRankToWorld(comm, lsa_team, i);
             void* peer_base = nullptr;
-            NCCL_CHECK_RESULT(ncclGetPeerDevicePointer(
-                ep_group->ht_buffers.intranode_mega_window, 0, peer_global, &peer_base));
+            NCCL_CHECK_RESULT(
+                ncclGetPeerDevicePointer(ep_group->ht_buffers.intranode_mega_window, 0, peer_global, &peer_base));
             uint8_t* pb = static_cast<uint8_t*>(peer_base);
-            ep_group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[i] = zero_copy
-                ? nullptr
-                : pb + ep_group->ht_buffers.ipc_dispatch_token_offset;
+            ep_group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[i] =
+                zero_copy ? nullptr : pb + ep_group->ht_buffers.ipc_dispatch_token_offset;
             ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[i] =
                 reinterpret_cast<float*>(pb + ep_group->ht_buffers.ipc_dispatch_prob_offset);
             ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[i] =
                 reinterpret_cast<float*>(pb + ep_group->ht_buffers.ipc_dispatch_scaling_factor_offset);
-            ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i] = zero_copy
-                ? nullptr
-                : reinterpret_cast<uint16_t*>(pb + ep_group->ht_buffers.ipc_combine_token_offset);
+            ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i] =
+                zero_copy ? nullptr : reinterpret_cast<uint16_t*>(pb + ep_group->ht_buffers.ipc_combine_token_offset);
             ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs[i] =
                 reinterpret_cast<float*>(pb + ep_group->ht_buffers.ipc_combine_prob_offset);
         }
@@ -972,8 +948,8 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
     if (lsa_rank != 0) {
         int node_rank0_global = ncclTeamRankToWorld(comm, lsa_team, 0);
         void* ptr = nullptr;
-        NCCL_CHECK_RESULT(ncclGetPeerDevicePointer(
-            ep_group->ht_buffers.completion_flags_window, 0, node_rank0_global, &ptr));
+        NCCL_CHECK_RESULT(
+            ncclGetPeerDevicePointer(ep_group->ht_buffers.completion_flags_window, 0, node_rank0_global, &ptr));
         ep_group->ht_buffers.intra_node_write_completion_flags = static_cast<uint32_t*>(ptr);
         ep_group->ht_buffers.combine_intra_node_write_completion_flags = static_cast<uint32_t*>(ptr) + 1;
     }
@@ -1040,14 +1016,14 @@ static ncclResult_t destroy_hybridep_intranode(ncclEpGroup_t ep_group) {
 
 // CUDACHECK_RET macro for CUDA calls in functions returning ncclResult_t
 #ifndef CUDACHECK_RET
-#define CUDACHECK_RET(cmd) do {                             \
-    cudaError_t err = cmd;                                  \
-    if (err != cudaSuccess) {                               \
-        fprintf(stderr, "CUDA error %s:%d '%s'\n",          \
-                __FILE__, __LINE__, cudaGetErrorString(err));\
-        return ncclInternalError;                            \
-    }                                                        \
-} while(0)
+#define CUDACHECK_RET(cmd) \
+    do { \
+        cudaError_t err = cmd; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error %s:%d '%s'\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            return ncclInternalError; \
+        } \
+    } while (0)
 #endif
 
 // Constants for GIN configuration
@@ -1055,10 +1031,8 @@ static constexpr int HYBRIDEP_GIN_MAX_CONTEXTS = 32;
 static constexpr int HYBRIDEP_GIN_CTXS_PER_COMM = 4;
 static constexpr int MAX_BARRIER_SESSIONS = 32;
 
-static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
-    const ncclEpGroupConfig_t* in_config,
-    cudaStream_t stream)
-{
+static ncclResult_t
+init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, cudaStream_t stream) {
     // Initialize using public NCCL APIs
     if (!in_config || !ep_group) {
         fprintf(stderr, "init_hybridep_internode: null config or ep_group\n");
@@ -1075,12 +1049,16 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
         ep_group->gin_config.num_dcomms = 1;
         ep_group->gin_config.dcomms = new ncclDevComm_t[1];
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-        reqs.lsaBarrierCount = HYBRIDEP_DISPATCH_NUM_OF_BLOCKS + 1;  // dispatch per-block [0,NB) + elected combine [NB]
+        reqs.lsaBarrierCount = HYBRIDEP_DISPATCH_NUM_OF_BLOCKS + 1; // dispatch per-block [0,NB) + elected combine [NB]
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
-        CUDACHECK_RET(cudaMalloc(reinterpret_cast<void**>(&ep_group->gin_config.d_dcomms),
-                                 sizeof(ncclDevComm_t) * ep_group->gin_config.num_dcomms));
-        CUDACHECK_RET(cudaMemcpy(ep_group->gin_config.d_dcomms, ep_group->gin_config.dcomms,
-                                 sizeof(ncclDevComm_t) * ep_group->gin_config.num_dcomms, cudaMemcpyHostToDevice));
+        CUDACHECK_RET(cudaMalloc(
+            reinterpret_cast<void**>(&ep_group->gin_config.d_dcomms),
+            sizeof(ncclDevComm_t) * ep_group->gin_config.num_dcomms));
+        CUDACHECK_RET(cudaMemcpy(
+            ep_group->gin_config.d_dcomms,
+            ep_group->gin_config.dcomms,
+            sizeof(ncclDevComm_t) * ep_group->gin_config.num_dcomms,
+            cudaMemcpyHostToDevice));
         return ncclSuccess;
     }
 
@@ -1091,29 +1069,37 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
     // =========================================================================
 
     constexpr size_t GIN_ALIGNMENT = 4096;
-    auto align_size = [](size_t sz, size_t alignment) {
-        return (sz + alignment - 1) & ~(alignment - 1);
-    };
+    auto align_size = [](size_t sz, size_t alignment) { return (sz + alignment - 1) & ~(alignment - 1); };
 
     // Chunk-aligned stride for the inter-node RDMA buffers, resolved once at group
     // creation (ep_group->ht_aligned_max_tokens / ht_tokens_per_chunk); the
     // dispatch/combine kernels must use the same stride and chunk size.
     const int ht_max_tokens = ep_group->ht_aligned_max_tokens;
     const int ht_tokens_per_chunk = ep_group->ht_tokens_per_chunk;
-    size_t rdma_intra_node_red_token_sz = align_size(static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * ep_group->config.max_token_bytes, GIN_ALIGNMENT);
+    size_t rdma_intra_node_red_token_sz = align_size(
+        static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * ep_group->config.max_token_bytes,
+        GIN_ALIGNMENT);
     size_t combine_rdma_inter_node_group_token_sz = rdma_intra_node_red_token_sz;
-    size_t rdma_intra_node_red_prob_sz = align_size(static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * (ep_group->num_local_experts * lsa_team_size) * sizeof(float), GIN_ALIGNMENT);
+    size_t rdma_intra_node_red_prob_sz = align_size(
+        static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * (ep_group->num_local_experts * lsa_team_size) *
+            sizeof(float),
+        GIN_ALIGNMENT);
     size_t combine_rdma_inter_node_group_prob_sz = rdma_intra_node_red_prob_sz;
 
     int max_chunks_per_rank = (ht_max_tokens + ht_tokens_per_chunk - 1) / ht_tokens_per_chunk;
-    size_t flags_sz = align_size(
-        static_cast<size_t>(rdma_team_size - 1) * max_chunks_per_rank * sizeof(uint64_t),
-        GIN_ALIGNMENT);
+    size_t flags_sz =
+        align_size(static_cast<size_t>(rdma_team_size - 1) * max_chunks_per_rank * sizeof(uint64_t), GIN_ALIGNMENT);
     // RDMA sync-guard: NUM_LSA_TEAMS uint64 internal-buffer readiness slots per direction.
     size_t guard_sz = align_size(static_cast<size_t>(rdma_team_size) * sizeof(uint64_t), GIN_ALIGNMENT);
-    size_t token_staging_sz = align_size(static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * ep_group->config.max_token_bytes, GIN_ALIGNMENT);
-    size_t dense_prob_sz = align_size(static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * ep_group->config.num_experts * sizeof(float), GIN_ALIGNMENT);
-    size_t scaling_factor_staging_sz = align_size(static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * sizeof(float), GIN_ALIGNMENT);
+    size_t token_staging_sz = align_size(
+        static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * ep_group->config.max_token_bytes,
+        GIN_ALIGNMENT);
+    size_t dense_prob_sz = align_size(
+        static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * ep_group->config.num_experts *
+            sizeof(float),
+        GIN_ALIGNMENT);
+    size_t scaling_factor_staging_sz =
+        align_size(static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * sizeof(float), GIN_ALIGNMENT);
 
     size_t bytes_per_token_entry = ep_group->config.max_token_bytes;
     size_t bytes_per_prob_entry = (ep_group->num_local_experts * lsa_team_size) * sizeof(float);
@@ -1121,8 +1107,12 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
     // (max_token_bytes / sizeof(bf16) / 128 = max_token_bytes / 256 floats).
     size_t bytes_per_sf_entry = (ep_group->config.max_token_bytes / 256) * sizeof(float);
     size_t bytes_per_entry = bytes_per_token_entry + bytes_per_prob_entry + bytes_per_sf_entry;
-    size_t rdma_send_staging_sz = align_size(static_cast<size_t>(rdma_team_size - 1) * ep_group->config.max_dispatch_tokens_per_rank * bytes_per_entry, GIN_ALIGNMENT);
-    size_t rdma_recv_packed_sz = align_size(static_cast<size_t>(rdma_team_size - 1) * ep_group->config.max_dispatch_tokens_per_rank * bytes_per_entry, GIN_ALIGNMENT);
+    size_t rdma_send_staging_sz = align_size(
+        static_cast<size_t>(rdma_team_size - 1) * ep_group->config.max_dispatch_tokens_per_rank * bytes_per_entry,
+        GIN_ALIGNMENT);
+    size_t rdma_recv_packed_sz = align_size(
+        static_cast<size_t>(rdma_team_size - 1) * ep_group->config.max_dispatch_tokens_per_rank * bytes_per_entry,
+        GIN_ALIGNMENT);
 
     size_t total_gin_buffer_size = 0;
     total_gin_buffer_size += rdma_intra_node_red_token_sz;
@@ -1222,9 +1212,11 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
     // Verify that configured HT node count matches NCCL rail team size.
     ncclTeam rail_team = ncclTeamRail(ep_group->comm);
     if (rail_team.nRanks != rdma_team_size) {
-        fprintf(stderr,
-                "[HT GIN] Error: rail team size (%d) must equal number of LSA domains (%d)\n",
-                rail_team.nRanks, rdma_team_size);
+        fprintf(
+            stderr,
+            "[HT GIN] Error: rail team size (%d) must equal number of LSA domains (%d)\n",
+            rail_team.nRanks,
+            rdma_team_size);
         return ncclInvalidUsage;
     }
 
@@ -1232,8 +1224,11 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
     int min_required_ctx = ep_group->comm_num_sms * HYBRIDEP_DISPATCH_N2N_WARPS;
     if (qps_per_rank == 0) qps_per_rank = min_required_ctx;
     if (qps_per_rank < min_required_ctx) {
-        fprintf(stderr, "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d for dedicated N2N warp contexts\n",
-                qps_per_rank, min_required_ctx);
+        fprintf(
+            stderr,
+            "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d for dedicated N2N warp contexts\n",
+            qps_per_rank,
+            min_required_ctx);
         return ncclInvalidUsage;
     }
     ep_group->gin_config.qps_per_rank = qps_per_rank;
@@ -1244,8 +1239,8 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
     int combine_signals = lsa_team_size * rdma_team_size * max_chunks_per_rank;
     int streaming_tail_signals = rdma_team_size * rdma_team_size * lsa_team_size * max_chunks_per_rank;
     int streaming_head_signals = rdma_team_size * rdma_team_size * lsa_team_size;
-    ep_group->gin_config.num_total_signals = dispatch_signals + combine_signals +
-                                               streaming_tail_signals + streaming_head_signals + MAX_BARRIER_SESSIONS;
+    ep_group->gin_config.num_total_signals =
+        dispatch_signals + combine_signals + streaming_tail_signals + streaming_head_signals + MAX_BARRIER_SESSIONS;
     ep_group->gin_config.signals_base = 0;
     ep_group->gin_config.combine_signal_offset = dispatch_signals;
     ep_group->gin_config.signals_tail_base = dispatch_signals + combine_signals;
@@ -1256,7 +1251,7 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
     ep_group->gin_config.num_dcomms = 1;
     ep_group->gin_config.dcomms = new ncclDevComm_t[1];
 
-   {
+    {
         ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
         NCCL_CHECK_RESULT(ncclCommQueryProperties(ep_group->comm, &props));
         if (props.railedGinType == NCCL_GIN_TYPE_NONE) {
@@ -1273,26 +1268,32 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
         reqs.ginQueueDepth = 3 * ht_tokens_per_chunk + 1;
         // LSA barriers for the HT sync-guard: per-block dispatch [0, NUM_OF_BLOCKS) + one
         // for the elected combine-tail block [NUM_OF_BLOCKS]. NUM_OF_BLOCKS <= HYBRIDEP_DISPATCH_NUM_OF_BLOCKS.
-        reqs.lsaBarrierCount = HYBRIDEP_DISPATCH_NUM_OF_BLOCKS + 1;  // dispatch per-block [0,NB) + elected combine [NB]
+        reqs.lsaBarrierCount = HYBRIDEP_DISPATCH_NUM_OF_BLOCKS + 1; // dispatch per-block [0,NB) + elected combine [NB]
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
     }
 
-    CUDACHECK_RET(cudaMalloc(reinterpret_cast<void**>(&ep_group->gin_config.d_dcomms),
-                          sizeof(ncclDevComm_t) * ep_group->gin_config.num_dcomms));
-    CUDACHECK_RET(cudaMemcpy(ep_group->gin_config.d_dcomms, ep_group->gin_config.dcomms,
-                          sizeof(ncclDevComm_t) * ep_group->gin_config.num_dcomms, cudaMemcpyHostToDevice));
+    CUDACHECK_RET(cudaMalloc(
+        reinterpret_cast<void**>(&ep_group->gin_config.d_dcomms),
+        sizeof(ncclDevComm_t) * ep_group->gin_config.num_dcomms));
+    CUDACHECK_RET(cudaMemcpy(
+        ep_group->gin_config.d_dcomms,
+        ep_group->gin_config.dcomms,
+        sizeof(ncclDevComm_t) * ep_group->gin_config.num_dcomms,
+        cudaMemcpyHostToDevice));
 
     // WindowRegister
-    NCCLCHECK(ncclCommWindowRegister(ep_group->comm,
+    NCCLCHECK(ncclCommWindowRegister(
+        ep_group->comm,
         ep_group->gin_config.gin_base_ptr,
         total_gin_buffer_size,
-        &ep_group->gin_config.nccl_window, 0));
+        &ep_group->gin_config.nccl_window,
+        0));
 
     ep_group->ht_buffers.internode_initialized = true;
     return ncclSuccess;
 }
 
-static ncclResult_t destroy_hybridep_internode(ncclEpGroup_t ep_group){
+static ncclResult_t destroy_hybridep_internode(ncclEpGroup_t ep_group) {
     if (!ep_group->ht_buffers.internode_initialized) return ncclSuccess;
 
     // =========================================================================
@@ -1303,8 +1304,7 @@ static ncclResult_t destroy_hybridep_internode(ncclEpGroup_t ep_group){
     if (ep_group->gin_config.dcomms != nullptr) {
         ncclResult_t res = ncclDevCommDestroy(ep_group->comm, &ep_group->gin_config.dcomms[0]);
         if (res != ncclSuccess) {
-            fprintf(stderr, "[HT GIN] Warning: Failed to destroy device comm: %s\n",
-                    ncclGetErrorString(res));
+            fprintf(stderr, "[HT GIN] Warning: Failed to destroy device comm: %s\n", ncclGetErrorString(res));
         }
         delete[] ep_group->gin_config.dcomms;
         ep_group->gin_config.dcomms = nullptr;
@@ -1325,8 +1325,7 @@ static ncclResult_t destroy_hybridep_internode(ncclEpGroup_t ep_group){
     if (ep_group->gin_config.gin_base_ptr != nullptr) {
         ncclResult_t res = ncclMemFree(ep_group->gin_config.gin_base_ptr);
         if (res != ncclSuccess) {
-            fprintf(stderr, "[HT GIN] Warning: Failed to free GIN memory: %s\n",
-                    ncclGetErrorString(res));
+            fprintf(stderr, "[HT GIN] Warning: Failed to free GIN memory: %s\n", ncclGetErrorString(res));
         }
         ep_group->gin_config.gin_base_ptr = nullptr;
 
@@ -1367,8 +1366,8 @@ ncclResult_t ncclEpGetVersion(int* version) {
 #define NCCL_EP_STR2(v) #v
 #define NCCL_EP_STR(v) NCCL_EP_STR2(v)
 #define NCCL_EP_VERSION_STRING \
-    "NCCL EP version " NCCL_EP_STR(NCCL_EP_MAJOR) "." NCCL_EP_STR(NCCL_EP_MINOR) "." NCCL_EP_STR(NCCL_EP_PATCH) \
-    "+cuda" NCCL_EP_STR(CUDA_MAJOR) "." NCCL_EP_STR(CUDA_MINOR)
+    "NCCL EP version " NCCL_EP_STR(NCCL_EP_MAJOR) "." NCCL_EP_STR(NCCL_EP_MINOR) "." NCCL_EP_STR( \
+        NCCL_EP_PATCH) "+cuda" NCCL_EP_STR(CUDA_MAJOR) "." NCCL_EP_STR(CUDA_MINOR)
 
 static void showVersion() {
     static std::once_flag once;
@@ -1389,36 +1388,36 @@ __attribute__((constructor)) static void nccl_ep_lib_init() {
     showVersion();
 }
 
-ncclResult_t ncclEpCreateGroup(
-    ncclEpGroup_t* out_ep_group,
-    ncclComm_t comm,
-    const ncclEpGroupConfig_t* in_config
-) {
+ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, const ncclEpGroupConfig_t* in_config) {
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     // Parameter validation
     assert(out_ep_group != nullptr);
     int nRanks;
     assert(comm != nullptr && ncclCommCount(comm, &nRanks) == ncclSuccess && nRanks > 0);
-    EP_REQUIRE_STRUCT(in_config);  // null-checks and size-validates in_config
+    EP_REQUIRE_STRUCT(in_config); // null-checks and size-validates in_config
     if (in_config->version != NCCL_EP_API_VERSION) {
-        fprintf(stderr,
-                "NCCL EP WARN: ncclEpGroupConfig_t.version=%u, library API_VERSION=%u; "
-                "behavior may differ across versions.\n",
-                in_config->version, (unsigned)NCCL_EP_API_VERSION);
+        fprintf(
+            stderr,
+            "NCCL EP WARN: ncclEpGroupConfig_t.version=%u, library API_VERSION=%u; "
+            "behavior may differ across versions.\n",
+            in_config->version,
+            (unsigned)NCCL_EP_API_VERSION);
     }
-    assert((in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY ||
-            in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) &&
-           "ncclEpCreateGroup: invalid algorithm, supported: low_latency, high_throughput");
+    assert(
+        (in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY || in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) &&
+        "ncclEpCreateGroup: invalid algorithm, supported: low_latency, high_throughput");
 
     bool low_latency_mode = (in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY);
     bool hybridep_mode = (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT);
     assert(in_config->num_experts > 0 && "ncclEpCreateGroup: num_experts must be greater than 0");
     assert(in_config->max_token_bytes > 0 && "ncclEpCreateGroup: max_token_bytes must be greater than 0");
-    assert(!(in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY && in_config->max_dispatch_tokens_per_rank == 0) &&
-            "ncclEpCreateGroup: max_dispatch_tokens_per_rank must be greater than 0 for low latency mode");
-    assert(!(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && in_config->max_dispatch_tokens_per_rank == 0) &&
-             "ncclEpCreateGroup: max_dispatch_tokens_per_rank must be set for HT backend");
+    assert(
+        !(in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY && in_config->max_dispatch_tokens_per_rank == 0) &&
+        "ncclEpCreateGroup: max_dispatch_tokens_per_rank must be greater than 0 for low latency mode");
+    assert(
+        !(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && in_config->max_dispatch_tokens_per_rank == 0) &&
+        "ncclEpCreateGroup: max_dispatch_tokens_per_rank must be set for HT backend");
     // HT max_dispatch_tokens_per_rank need not be a chunk multiple; the inter-node
     // stride is chunk-aligned internally (ep_group->ht_aligned_max_tokens).
     // Create teams: LSA and Rail
@@ -1439,27 +1438,26 @@ ncclResult_t ncclEpCreateGroup(
     nccl_ep_env_init(&ep_group->env);
 
     ep_group->alloc.alloc_fn = default_alloc_fn;
-    ep_group->alloc.free_fn  = default_free_fn;
+    ep_group->alloc.free_fn = default_free_fn;
     if (in_config->alloc.alloc_fn || in_config->alloc.free_fn) {
         if (!(in_config->alloc.alloc_fn && in_config->alloc.free_fn)) {
             fprintf(stderr, "NCCL EP: Failed to create group: Both alloc and free callbacks must be provided\n");
             return ncclInvalidUsage;
         }
         ep_group->alloc.alloc_fn = in_config->alloc.alloc_fn;
-        ep_group->alloc.free_fn  = in_config->alloc.free_fn;
-        ep_group->alloc.context  = in_config->alloc.context;
+        ep_group->alloc.free_fn = in_config->alloc.free_fn;
+        ep_group->alloc.context = in_config->alloc.context;
     }
 
     NCCL_CHECK_RESULT(ncclCommCount(comm, &ep_group->nRanks));
     NCCL_CHECK_RESULT(ncclCommUserRank(comm, &ep_group->rank));
     NCCL_CHECK_RESULT(ncclCommCuDevice(comm, &ep_group->cuda_device_id));
 
-    // Stamp this process's rank into the env config 
+    // Stamp this process's rank into the env config
     nccl_ep_env_set_rank(&ep_group->env, ep_group->rank);
 
     // Dump the resolved environment configuration once if requested
-    if (nccl_ep_env_verbose(ep_group->env))
-        nccl_ep_env_print(ep_group->env);
+    if (nccl_ep_env_verbose(ep_group->env)) nccl_ep_env_print(ep_group->env);
 
     CUDA_CHECK(cudaSetDevice(ep_group->cuda_device_id));
     cudaDeviceProp device_prop = {};
@@ -1487,7 +1485,10 @@ ncclResult_t ncclEpCreateGroup(
             const int numWarpGroups = (in_config->num_experts + (in_config->max_num_sms - 1)) / in_config->max_num_sms;
             if (numWarpGroups > llMaxWarpGroupsLimit) {
                 const int required_sms = (in_config->num_experts + (llMaxWarpGroupsLimit - 1)) / llMaxWarpGroupsLimit;
-                fprintf(stderr, "Error: insufficient 'max_num_sms'. In Low-Latency mode, NCCL EP requires at least %d SMs\n", required_sms);
+                fprintf(
+                    stderr,
+                    "Error: insufficient 'max_num_sms'. In Low-Latency mode, NCCL EP requires at least %d SMs\n",
+                    required_sms);
                 return ncclInvalidUsage;
             }
         }
@@ -1499,15 +1500,18 @@ ncclResult_t ncclEpCreateGroup(
     // Apply an env-provided SM-count override, validated against [1, device_sm_count].
     // Out-of-range values are warned about and the resolved default is kept.
     const unsigned int dev_sms = ep_group->device_sm_count;
-    auto apply_sms_override = [dev_sms, &env = ep_group->env](const ncclEpEnvVar& var,
-                                                              unsigned int& target) {
+    auto apply_sms_override = [dev_sms, &env = ep_group->env](const ncclEpEnvVar& var, unsigned int& target) {
         if (!var.is_set) return;
         if (var.value.ul >= 1 && var.value.ul <= dev_sms) {
             target = static_cast<unsigned int>(var.value.ul);
         } else {
-            fprintf(stderr,
-                    "[nccl_ep] %s=%lu out of range (must be in [1, %u]); using %u\n",
-                    var.name, var.value.ul, dev_sms, target);
+            fprintf(
+                stderr,
+                "[nccl_ep] %s=%lu out of range (must be in [1, %u]); using %u\n",
+                var.name,
+                var.value.ul,
+                dev_sms,
+                target);
             // Dump the full env configuration to help diagnose the misconfig.
             nccl_ep_env_print(env);
         }
@@ -1529,16 +1533,16 @@ ncclResult_t ncclEpCreateGroup(
 
     ep_group->num_local_experts = ep_group->config.num_experts / ep_group->nRanks;
     // HT: caller must provide a slot budget >= max_dispatch_tokens_per_rank (NCCL_EP_AUTO==0).
-    EP_HOST_ASSERT(!(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
-                     ep_group->config.max_recv_tokens_per_rank == 0) &&
-                   "ncclEpCreateGroup: HT mode requires max_recv_tokens_per_rank > 0");
-    EP_HOST_ASSERT(!(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
-                     ep_group->config.max_recv_tokens_per_rank < ep_group->config.max_dispatch_tokens_per_rank) &&
-                   "ncclEpCreateGroup: HT mode requires max_recv_tokens_per_rank >= max_dispatch_tokens_per_rank");
+    EP_HOST_ASSERT(
+        !(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ep_group->config.max_recv_tokens_per_rank == 0) &&
+        "ncclEpCreateGroup: HT mode requires max_recv_tokens_per_rank > 0");
+    EP_HOST_ASSERT(
+        !(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
+          ep_group->config.max_recv_tokens_per_rank < ep_group->config.max_dispatch_tokens_per_rank) &&
+        "ncclEpCreateGroup: HT mode requires max_recv_tokens_per_rank >= max_dispatch_tokens_per_rank");
     // LL auto-budget (nRanks * max_dispatch_tokens_per_rank, layout-agnostic).
     if (ep_group->config.max_recv_tokens_per_rank == 0) {
-        ep_group->config.max_recv_tokens_per_rank =
-            ep_group->nRanks * ep_group->config.max_dispatch_tokens_per_rank;
+        ep_group->config.max_recv_tokens_per_rank = ep_group->nRanks * ep_group->config.max_dispatch_tokens_per_rank;
     }
     ep_group->max_recv_tokens = static_cast<int>(ep_group->config.max_recv_tokens_per_rank);
 
@@ -1546,20 +1550,18 @@ ncclResult_t ncclEpCreateGroup(
     {
         std::vector<unsigned int> all_budgets(ep_group->nRanks, 0);
         all_budgets[ep_group->rank] = ep_group->config.max_recv_tokens_per_rank;
-        ncclAllGatherHost(all_budgets.data(), sizeof(unsigned int),
-                          ep_group->rank, ep_group->nRanks, comm, stream);
+        ncclAllGatherHost(all_budgets.data(), sizeof(unsigned int), ep_group->rank, ep_group->nRanks, comm, stream);
         for (int r = 1; r < ep_group->nRanks; ++r) {
-            EP_HOST_ASSERT(all_budgets[r] == all_budgets[0] &&
-                           "ncclEpCreateGroup: max_recv_tokens_per_rank must be identical across ranks");
+            EP_HOST_ASSERT(
+                all_budgets[r] == all_budgets[0] &&
+                "ncclEpCreateGroup: max_recv_tokens_per_rank must be identical across ranks");
         }
     }
-
 
     // Apply default values for auto-configured fields (when set to NCCL_EP_AUTO)
     if (ep_group->config.num_channels == NCCL_EP_AUTO) {
         ep_group->config.num_channels = 10;
     }
-
 
     if (ep_group->config.num_qp_per_rank == NCCL_EP_AUTO) {
         ep_group->config.num_qp_per_rank = ep_group->comm_num_sms * HYBRIDEP_DISPATCH_N2N_WARPS;
@@ -1583,11 +1585,13 @@ ncclResult_t ncclEpCreateGroup(
             resolved = clock_khz * 1000ULL * env_ms / 1000ULL;
             source = "NCCL_EP_TIMEOUT_MS env var";
             if (ep_group->config.timeout_ns != 0 && ep_group->rank == 0)
-                fprintf(stderr, "NCCL EP: NCCL_EP_TIMEOUT_MS=%lu overrides config.timeout_ns=%lu\n",
-                        (unsigned long)env_ms, (unsigned long)ep_group->config.timeout_ns);
+                fprintf(
+                    stderr,
+                    "NCCL EP: NCCL_EP_TIMEOUT_MS=%lu overrides config.timeout_ns=%lu\n",
+                    (unsigned long)env_ms,
+                    (unsigned long)ep_group->config.timeout_ns);
         } else if (ep_group->config.timeout_ns != 0) {
-            resolved = clock_khz * 1000ULL *
-                       (ep_group->config.timeout_ns / 1000000ULL) / 1000ULL;
+            resolved = clock_khz * 1000ULL * (ep_group->config.timeout_ns / 1000000ULL) / 1000ULL;
             source = "config.timeout_ns";
         }
 
@@ -1595,15 +1599,15 @@ ncclResult_t ncclEpCreateGroup(
         if (ep_group->rank == 0) {
             uint64_t timeout_ms = resolved / (clock_khz * 1000ULL / 1000ULL);
             char env_str[32];
-            if (have_env_ms)
-                snprintf(env_str, sizeof(env_str), "%llu", (unsigned long long)env_ms);
-            else
-                snprintf(env_str, sizeof(env_str), "unset");
-            fprintf(stderr, "NCCL EP: using timeout=%llums (env=%s, config.timeout_ns=%llu, source=%s)\n",
-                    (unsigned long long)timeout_ms,
-                    env_str,
-                    (unsigned long long)ep_group->config.timeout_ns,
-                    source);
+            if (have_env_ms) snprintf(env_str, sizeof(env_str), "%llu", (unsigned long long)env_ms);
+            else snprintf(env_str, sizeof(env_str), "unset");
+            fprintf(
+                stderr,
+                "NCCL EP: using timeout=%llums (env=%s, config.timeout_ns=%llu, source=%s)\n",
+                (unsigned long long)timeout_ms,
+                env_str,
+                (unsigned long long)ep_group->config.timeout_ns,
+                source);
         }
     }
 
@@ -1613,8 +1617,8 @@ ncclResult_t ncclEpCreateGroup(
     // invariant when multiple EP comms colocate on one physical node (e.g.
     // DP × EP mesh where ranks 4..7 form a second EP group on the same box).
     ep_group->gpus_per_node = ep_group->nRanks / ep_group->nNodes;
-    ep_group->rank_in_node  = ep_group->rank % ep_group->gpus_per_node;
-    ep_group->node_id       = ep_group->rank / ep_group->gpus_per_node;
+    ep_group->rank_in_node = ep_group->rank % ep_group->gpus_per_node;
+    ep_group->node_id = ep_group->rank / ep_group->gpus_per_node;
     ep_group->lsa_team_size = lsa_team.nRanks;
     ep_group->lsa_rank = lsa_team.rank;
     if (hybridep_mode) {
@@ -1628,10 +1632,12 @@ ncclResult_t ncclEpCreateGroup(
         ep_group->rdma_rank = ep_group->rank;
     }
     if (hybridep_mode) {
-        assert(ep_group->rdma_team_size > 0 && ep_group->lsa_team_size > 0 &&
-               "ncclEpCreateGroup: invalid HT team cardinalities");
-        assert(ep_group->rdma_team_size * ep_group->lsa_team_size == ep_group->nRanks &&
-               "ncclEpCreateGroup: HT requires rdma_team_size * lsa_team_size == nRanks");
+        assert(
+            ep_group->rdma_team_size > 0 && ep_group->lsa_team_size > 0 &&
+            "ncclEpCreateGroup: invalid HT team cardinalities");
+        assert(
+            ep_group->rdma_team_size * ep_group->lsa_team_size == ep_group->nRanks &&
+            "ncclEpCreateGroup: HT requires rdma_team_size * lsa_team_size == nRanks");
     }
 
     // HT EM mode: env override wins, else auto-pick from (zero_copy, lsa_team_size).
@@ -1639,11 +1645,10 @@ ncclResult_t ncclEpCreateGroup(
     //   zero_copy, lsa > 1      -> kNvlinkDup    (sender duplicates per-expert over NVLink)
     //   zero_copy, lsa == 1     -> kLocalDup     (receiver-side fan-out via local_dup)
     {
-        const bool want_local_dup  = nccl_ep_env_flag_on(ep_group->env.ht_em_local_dup);
+        const bool want_local_dup = nccl_ep_env_flag_on(ep_group->env.ht_em_local_dup);
         const bool want_nvlink_dup = nccl_ep_env_flag_on(ep_group->env.ht_em_nvlink_dup);
         if (want_local_dup && want_nvlink_dup) {
-            fprintf(stderr,
-                    "NCCL EP: NCCL_EP_HT_EM_LOCAL_DUP and NCCL_EP_HT_EM_NVLINK_DUP are mutually exclusive\n");
+            fprintf(stderr, "NCCL EP: NCCL_EP_HT_EM_LOCAL_DUP and NCCL_EP_HT_EM_NVLINK_DUP are mutually exclusive\n");
             return ncclInvalidUsage;
         }
         if (want_nvlink_dup) {
@@ -1651,15 +1656,14 @@ ncclResult_t ncclEpCreateGroup(
         } else if (want_local_dup) {
             ep_group->ht_em_mode = ncclEpGroup::HtEmMode::kLocalDup;
         } else if (in_config->zero_copy == NCCL_EP_ZERO_COPY_ON) {
-            ep_group->ht_em_mode = (ep_group->lsa_team_size > 1)
-                ? ncclEpGroup::HtEmMode::kNvlinkDup
-                : ncclEpGroup::HtEmMode::kLocalDup;
+            ep_group->ht_em_mode =
+                (ep_group->lsa_team_size > 1) ? ncclEpGroup::HtEmMode::kNvlinkDup : ncclEpGroup::HtEmMode::kLocalDup;
         } else {
             ep_group->ht_em_mode = ncclEpGroup::HtEmMode::kLocalPermute;
         }
     }
 
-    ep_group->rdma_buffer    = nullptr;
+    ep_group->rdma_buffer = nullptr;
 
     CUDA_CHECK(ep_group->alloc.alloc_fn(&ep_group->ep_workspace, NUM_WORKSPACE_BYTES, ep_group->alloc.context));
     CUDA_CHECK(cudaMemsetAsync(ep_group->ep_workspace, 0, NUM_WORKSPACE_BYTES, stream));
@@ -1681,42 +1685,44 @@ ncclResult_t ncclEpCreateGroup(
         // also covers the uint4 routing-map-load and token-group granularities), so
         // non-conforming values are rounded up with a warning.
         auto round_up_32 = [](int v) { return (v + 31) & ~31; };
-        int chunk = (ep_group->rdma_team_size > 1)
-            ? HT_TOKENS_PER_CHUNK_RDMA_DEFAULT
-            : round_up_32(HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP *
-                          static_cast<int>(ep_group->comm_num_sms));
-        if (ep_group->env.tokens_per_chunk.is_set &&
-            ep_group->env.tokens_per_chunk.value.ul > 0) {
+        int chunk =
+            (ep_group->rdma_team_size > 1) ?
+                HT_TOKENS_PER_CHUNK_RDMA_DEFAULT :
+                round_up_32(HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP * static_cast<int>(ep_group->comm_num_sms));
+        if (ep_group->env.tokens_per_chunk.is_set && ep_group->env.tokens_per_chunk.value.ul > 0) {
             const int requested = static_cast<int>(ep_group->env.tokens_per_chunk.value.ul);
             chunk = round_up_32(requested);
             if (chunk != requested) {
-                fprintf(stderr,
-                        "[nccl_ep] %s=%d rounded up to %d (must be a multiple of 32)\n",
-                        ep_group->env.tokens_per_chunk.name, requested, chunk);
+                fprintf(
+                    stderr,
+                    "[nccl_ep] %s=%d rounded up to %d (must be a multiple of 32)\n",
+                    ep_group->env.tokens_per_chunk.name,
+                    requested,
+                    chunk);
             }
         }
         ep_group->ht_tokens_per_chunk = chunk;
         // Chunk-aligned inter-node RDMA stride; also the max-tokens template arg for
         // the dispatch/combine kernels (guarantees MAX_NUM_OF_TOKENS_PER_RANK % chunk == 0).
-        ep_group->ht_aligned_max_tokens =
-            ((ep_group->config.max_dispatch_tokens_per_rank + chunk - 1) / chunk) * chunk;
+        ep_group->ht_aligned_max_tokens = ((ep_group->config.max_dispatch_tokens_per_rank + chunk - 1) / chunk) * chunk;
 
         NCCL_CHECK_RESULT(init_hybridep_intranode(ep_group, in_config, stream));
         NCCL_CHECK_RESULT(init_hybridep_internode(ep_group, in_config, stream));
 
         // Group-scoped routing bitmap shared by all handles on this group.
-        const size_t routing_bytes = static_cast<size_t>(ep_group->nRanks)
-                                   * ep_group->config.max_dispatch_tokens_per_rank
-                                   * ((ep_group->config.num_experts + 7) / 8);
+        const size_t routing_bytes = static_cast<size_t>(ep_group->nRanks) *
+                                     ep_group->config.max_dispatch_tokens_per_rank *
+                                     ((ep_group->config.num_experts + 7) / 8);
         CUDA_CHECK(ep_group->alloc.alloc_fn(
             reinterpret_cast<void**>(&ep_group->ht_buffers.global_routing_map),
-            routing_bytes, ep_group->alloc.context));
+            routing_bytes,
+            ep_group->alloc.context));
         ep_group->ht_buffers.global_routing_map_size = routing_bytes;
         // No init memset: AllGather in preprocessing overwrites every byte the kernel reads.
     }
 
     if (low_latency_mode) {
-        ep_group->num_nccl_comms = 0;  // no split comms created
+        ep_group->num_nccl_comms = 0; // no split comms created
 
         // Cleaning up any pending CUDA error
         CUDA_CHECK(cudaGetLastError());
@@ -1739,7 +1745,7 @@ ncclResult_t ncclEpCreateGroup(
 
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
         if (props.nLsaTeams > 1) {
-            reqs.ginContextCount = ep_group->config.num_qp_per_rank;  // all contexts in single comm
+            reqs.ginContextCount = ep_group->config.num_qp_per_rank; // all contexts in single comm
             // Signal layout: combine [0, N), dispatch [N, 2N), clean barrier [2N]
             reqs.ginSignalCount = 2 * num_total_signals + 1;
             reqs.ginForceEnable = true;
@@ -1748,10 +1754,9 @@ ncclResult_t ncclEpCreateGroup(
         }
         NCCL_CHECK_RESULT(ncclDevCommCreate(ep_group->comm, &reqs, &nccl_dev_comms_host[0]));
 
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->nccl_dev_comms),
-                                sizeof(ncclDevComm_t)));
-        CUDA_CHECK(cudaMemcpy(ep_group->nccl_dev_comms, nccl_dev_comms_host,
-                                sizeof(ncclDevComm_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->nccl_dev_comms), sizeof(ncclDevComm_t)));
+        CUDA_CHECK(
+            cudaMemcpy(ep_group->nccl_dev_comms, nccl_dev_comms_host, sizeof(ncclDevComm_t), cudaMemcpyHostToDevice));
 
         delete[] nccl_dev_comms_host;
         nccl_dev_comms_host = nullptr;
@@ -1763,17 +1768,14 @@ ncclResult_t ncclEpCreateGroup(
             // Keeping it out of rdma_buffer means lazy/grow reallocation of
             // rdma_buffer doesn't have to touch it, and ncclEpMaskClean can run
             // even before any LL handle has been created.
-            const size_t sync_buffer_bytes =
-                ((static_cast<size_t>(ep_group->nRanks) * sizeof(int) + 127) / 128) * 128;
+            const size_t sync_buffer_bytes = ((static_cast<size_t>(ep_group->nRanks) * sizeof(int) + 127) / 128) * 128;
             NCCL_CHECK_RESULT(ncclMemAlloc(&ep_group->sync_buffer, sync_buffer_bytes));
             CUDA_CHECK(cudaMemset(ep_group->sync_buffer, 0, sync_buffer_bytes));
             ncclWindow_t sync_win_host;
-            NCCL_CHECK_RESULT(ncclCommWindowRegister(ep_group->comm, ep_group->sync_buffer,
-                                                    sync_buffer_bytes, &sync_win_host, 0));
-            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->sync_window),
-                                    sizeof(ncclWindow_t)));
-            CUDA_CHECK(cudaMemcpy(ep_group->sync_window, &sync_win_host,
-                                    sizeof(ncclWindow_t), cudaMemcpyHostToDevice));
+            NCCL_CHECK_RESULT(
+                ncclCommWindowRegister(ep_group->comm, ep_group->sync_buffer, sync_buffer_bytes, &sync_win_host, 0));
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->sync_window), sizeof(ncclWindow_t)));
+            CUDA_CHECK(cudaMemcpy(ep_group->sync_window, &sync_win_host, sizeof(ncclWindow_t), cudaMemcpyHostToDevice));
         }
 
         // If the user passed an explicit rdma_buffer_size (anything other than
@@ -1792,10 +1794,10 @@ ncclResult_t ncclEpCreateGroup(
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->mask_buffer), mask_bytes));
         // Initialize all ranks as active (1 = active, 0 = masked/failed)
         std::vector<int> all_active(ep_group->nRanks, 1);
-        CUDA_CHECK(cudaMemcpyAsync(ep_group->mask_buffer, all_active.data(),
-                                   mask_bytes, cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&ep_group->async_error_flag),
-                                 sizeof(int), cudaHostAllocMapped));
+        CUDA_CHECK(
+            cudaMemcpyAsync(ep_group->mask_buffer, all_active.data(), mask_bytes, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(
+            cudaHostAlloc(reinterpret_cast<void**>(&ep_group->async_error_flag), sizeof(int), cudaHostAllocMapped));
         *ep_group->async_error_flag = 0;
     }
 
@@ -1804,9 +1806,7 @@ ncclResult_t ncclEpCreateGroup(
     return ncclSuccess;
 }
 
-ncclResult_t ncclEpGroupDestroy(
-    ncclEpGroup_t ep_group
-) {
+ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group) {
     if (ep_group == nullptr) {
         return ncclSuccess;
     }
@@ -1814,13 +1814,11 @@ ncclResult_t ncclEpGroupDestroy(
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Clean up HT intranode resources
-    if (ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
-        ep_group->ht_buffers.initialized) {
+    if (ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ep_group->ht_buffers.initialized) {
         destroy_hybridep_intranode(ep_group);
     }
     // Clean up HT internode resources (GIN deregistration must happen before ncclCommDestroy)
-    if (ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
-        ep_group->ht_buffers.internode_initialized) {
+    if (ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ep_group->ht_buffers.internode_initialized) {
         destroy_hybridep_internode(ep_group);
     }
     // Clean up mask buffer and async error flag
@@ -1859,8 +1857,7 @@ ncclResult_t ncclEpGroupDestroy(
         // handle still has nccl_wins == nullptr here.
         if (ep_group->nccl_wins != nullptr) {
             ncclWindow_t win_host;
-            CUDA_CHECK(cudaMemcpy(&win_host, ep_group->nccl_wins,
-                                    sizeof(ncclWindow_t), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(&win_host, ep_group->nccl_wins, sizeof(ncclWindow_t), cudaMemcpyDeviceToHost));
             NCCL_CHECK_RESULT(ncclCommWindowDeregister(ep_group->comm, win_host));
             CUDA_CHECK(cudaFree(ep_group->nccl_wins));
             ep_group->nccl_wins = nullptr;
@@ -1875,8 +1872,7 @@ ncclResult_t ncclEpGroupDestroy(
         // Tear down the standalone sync buffer + its window.
         if (ep_group->sync_window != nullptr) {
             ncclWindow_t sync_win_host;
-            CUDA_CHECK(cudaMemcpy(&sync_win_host, ep_group->sync_window,
-                                    sizeof(ncclWindow_t), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(&sync_win_host, ep_group->sync_window, sizeof(ncclWindow_t), cudaMemcpyDeviceToHost));
             NCCL_CHECK_RESULT(ncclCommWindowDeregister(ep_group->comm, sync_win_host));
             CUDA_CHECK(cudaFree(ep_group->sync_window));
             ep_group->sync_window = nullptr;
@@ -1888,8 +1884,7 @@ ncclResult_t ncclEpGroupDestroy(
 
         // Destroy single NCCL device communicator (copy back from device, destroy on ep_group->comm)
         ncclDevComm_t dc_host;
-        CUDA_CHECK(cudaMemcpy(&dc_host, ep_group->nccl_dev_comms,
-                                sizeof(ncclDevComm_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&dc_host, ep_group->nccl_dev_comms, sizeof(ncclDevComm_t), cudaMemcpyDeviceToHost));
         NCCL_CHECK_RESULT(ncclDevCommDestroy(ep_group->comm, &dc_host));
         CUDA_CHECK(cudaFree(ep_group->nccl_dev_comms));
         ep_group->nccl_dev_comms = nullptr;
@@ -1946,47 +1941,47 @@ struct ncclEpHandle {
             nccl_ep::LowLatencyLayout layout;
         } ll;
         struct {
-             // Global routing map lives on ep_group->ht_buffers (group-scoped).
+            // Global routing map lives on ep_group->ht_buffers (group-scoped).
 
-             // =================================================================================
-             // PREPROCESSING OUTPUTS - Computed once per iteration, used by dispatch & combine
-             // =================================================================================
+            // =================================================================================
+            // PREPROCESSING OUTPUTS - Computed once per iteration, used by dispatch & combine
+            // =================================================================================
 
-             // Sparse-to-dense map: maps each (token, source_rank) pair to its position in
-             // the destination rank's expert buffer. Used by NVLink (intra-node) warps.
-             // Value of -1 indicates token is not routed to that rank.
-             // dtype: int32_t
-             // layout: [num_nodes * max_dispatch_tokens_per_rank, num_ranks_per_node]
-             // usage: dispatch S2G warp group, combine G2S warp group
-             // lifetime: valid after metadata_preprocessing, constant within iteration
-             // vs NCCL HT: no direct equivalent.
-             //   - HT: uses is_token_in_rank (local tokens only) + atomics to compute positions
-             //   - HT: precomputes positions for ALL nodes' tokens, -1 sentinel for not routed
+            // Sparse-to-dense map: maps each (token, source_rank) pair to its position in
+            // the destination rank's expert buffer. Used by NVLink (intra-node) warps.
+            // Value of -1 indicates token is not routed to that rank.
+            // dtype: int32_t
+            // layout: [num_nodes * max_dispatch_tokens_per_rank, num_ranks_per_node]
+            // usage: dispatch S2G warp group, combine G2S warp group
+            // lifetime: valid after metadata_preprocessing, constant within iteration
+            // vs NCCL HT: no direct equivalent.
+            //   - HT: uses is_token_in_rank (local tokens only) + atomics to compute positions
+            //   - HT: precomputes positions for ALL nodes' tokens, -1 sentinel for not routed
             int32_t* sparse_to_dense_map;
 
-             // RDMA-to-attention map: boolean mask indicating which tokens this node needs
-             // to RECEIVE from RDMA (inter-node). Indexed by [node_id, token_id].
-             // Primarily used during combine to know which remote tokens to wait for.
-             // dtype: bool
-             // layout: [num_nodes, max_dispatch_tokens_per_rank_padded_to_16]
-             //        (padding to 16 required for TMA alignment)
-             // usage: dispatch G2S warp (polling), combine inter-node G2S/reduction warps
-             // lifetime: valid after metadata_preprocessing, constant within iteration
-             // vs NCCL HT: inverse perspective of is_token_in_rank.
-             //   - is_token_in_rank: outbound - "where do MY tokens go?" [my_token, dest_rank]
-             //   - rdma_to_attn_map: inbound - "which remote tokens do I receive?" [src_node, token]
+            // RDMA-to-attention map: boolean mask indicating which tokens this node needs
+            // to RECEIVE from RDMA (inter-node). Indexed by [node_id, token_id].
+            // Primarily used during combine to know which remote tokens to wait for.
+            // dtype: bool
+            // layout: [num_nodes, max_dispatch_tokens_per_rank_padded_to_16]
+            //        (padding to 16 required for TMA alignment)
+            // usage: dispatch G2S warp (polling), combine inter-node G2S/reduction warps
+            // lifetime: valid after metadata_preprocessing, constant within iteration
+            // vs NCCL HT: inverse perspective of is_token_in_rank.
+            //   - is_token_in_rank: outbound - "where do MY tokens go?" [my_token, dest_rank]
+            //   - rdma_to_attn_map: inbound - "which remote tokens do I receive?" [src_node, token]
             bool* rdma_to_attn_map;
 
-             // Attention-to-RDMA map: boolean mask indicating which local tokens need to be
-             // SENT via RDMA (inter-node) to each remote node.
-             // Only allocated when num_nodes > 1.
-             // dtype: bool
-             // layout: [max_dispatch_tokens_per_rank, num_nodes - 1]
-             // usage: dispatch N2N (RDMA) warp group
-             // lifetime: valid after metadata_preprocessing, constant within iteration
-             // vs NCCL HT: closest equivalent to is_token_in_rank for inter-node RDMA.
-             //   - is_token_in_rank: per-rank granularity [num_tokens, num_ranks]
-             //   - attn_to_rdma_map: per-node granularity [num_tokens, num_nodes-1] (RDMA only)
+            // Attention-to-RDMA map: boolean mask indicating which local tokens need to be
+            // SENT via RDMA (inter-node) to each remote node.
+            // Only allocated when num_nodes > 1.
+            // dtype: bool
+            // layout: [max_dispatch_tokens_per_rank, num_nodes - 1]
+            // usage: dispatch N2N (RDMA) warp group
+            // lifetime: valid after metadata_preprocessing, constant within iteration
+            // vs NCCL HT: closest equivalent to is_token_in_rank for inter-node RDMA.
+            //   - is_token_in_rank: per-rank granularity [num_tokens, num_ranks]
+            //   - attn_to_rdma_map: per-node granularity [num_tokens, num_nodes-1] (RDMA only)
             bool* attn_to_rdma_map;
 
             // Per-token per-rank bitmask cache produced during preprocessing.
@@ -1994,36 +1989,36 @@ struct ncclEpHandle {
             // layout: [num_nodes * max_send_tokens_per_rank * ranks_per_node]
             void* token_rank_mask;
 
-             // Local expert routing map: per-expert routing for tokens in this rank's buffer.
-             // Used by subsequent expert MLP layers to route tokens to correct experts.
-             // dtype: bool
-             // layout: [max_recv_tokens, experts_per_rank]
-             //        where max_recv_tokens = num_ranks * max_dispatch_tokens_per_rank
-             // usage: passed to expert computation layers (not used by dispatch/combine directly)
-             // lifetime: valid after metadata_preprocessing, constant within iteration
-             // vs NCCL HT: similar purpose to num_tokens_per_expert but more detailed
+            // Local expert routing map: per-expert routing for tokens in this rank's buffer.
+            // Used by subsequent expert MLP layers to route tokens to correct experts.
+            // dtype: bool
+            // layout: [max_recv_tokens, experts_per_rank]
+            //        where max_recv_tokens = num_ranks * max_dispatch_tokens_per_rank
+            // usage: passed to expert computation layers (not used by dispatch/combine directly)
+            // lifetime: valid after metadata_preprocessing, constant within iteration
+            // vs NCCL HT: similar purpose to num_tokens_per_expert but more detailed
             bool* local_expert_routing_map;
 
-             // Number of tokens routed to local experts (total across all local experts).
-             // Each token counted once even if routed to multiple local experts.
-             // dtype: int32_t
-             // layout: [1]
-             // usage: buffer sizing, iteration control
-             // lifetime: valid after metadata_preprocessing
+            // Number of tokens routed to local experts (total across all local experts).
+            // Each token counted once even if routed to multiple local experts.
+            // dtype: int32_t
+            // layout: [1]
+            // usage: buffer sizing, iteration control
+            // lifetime: valid after metadata_preprocessing
             int32_t* num_tokens_for_experts;
 
-             // =================================================================================
-             // CONVERSION BUFFERS - Pre-allocated to avoid dispatch/combine-time malloc
-             // =================================================================================
+            // =================================================================================
+            // CONVERSION BUFFERS - Pre-allocated to avoid dispatch/combine-time malloc
+            // =================================================================================
 
-             // Dense prob buffer: shared scratch for sparse↔dense conversions
-             // dtype: float
-             // layout: [max_dispatch_tokens_per_rank, num_experts]
-             // usage:
-             //   - dispatch forward: sparse→dense input topk_weights conversion
-             //   - combine backward: dense→sparse output prob conversion
-             // lifetime: allocated at handle creation, freed at handle destroy
-             // note: dispatch and combine are sequential, so one buffer suffices
+            // Dense prob buffer: shared scratch for sparse↔dense conversions
+            // dtype: float
+            // layout: [max_dispatch_tokens_per_rank, num_experts]
+            // usage:
+            //   - dispatch forward: sparse→dense input topk_weights conversion
+            //   - combine backward: dense→sparse output prob conversion
+            // lifetime: allocated at handle creation, freed at handle destroy
+            // note: dispatch and combine are sequential, so one buffer suffices
             // For multi-node: points to group-level pre-registered buffer
             // For single-node: handle-owned buffer
             float* dense_prob_buffer;
@@ -2034,7 +2029,7 @@ struct ncclEpHandle {
             // layout: [max_dispatch_tokens_per_rank, hidden]
             // usage: copy user tokens → use for inter-node RDMA
             // lifetime: group-owned (allocated in Group Create, freed in Group Destroy)
-            void* token_staging_buffer;  // Pointer to group-level buffer (not handle-owned)
+            void* token_staging_buffer; // Pointer to group-level buffer (not handle-owned)
 
             // Scaling factor staging buffer: pre-registered buffer for FP8 scaling factors
             // User scaling factors are copied here during dispatch, then this buffer is used for RDMA
@@ -2042,7 +2037,7 @@ struct ncclEpHandle {
             // layout: [max_dispatch_tokens_per_rank]
             // usage: copy user scaling factors → use for inter-node RDMA
             // lifetime: group-owned (allocated in Group Create, freed in Group Destroy)
-            float* scaling_factor_staging_buffer;  // Pointer to group-level buffer (not handle-owned)
+            float* scaling_factor_staging_buffer; // Pointer to group-level buffer (not handle-owned)
 
             // RDMA inter-node group flags: atomic completion flags for each remote node.
             // Remote ranks increment via RDMA atomic fetch-add to signal chunk completion.
@@ -2051,30 +2046,30 @@ struct ncclEpHandle {
             // layout: [num_nodes - 1]
             // usage: dispatch N2N warp (signaling), dispatch G2S warp (polling)
             // lifetime: reset to 0 at init, incremented by remote RDMA atomics
-            //uint64_t* rdma_inter_node_group_flags;
+            // uint64_t* rdma_inter_node_group_flags;
 
             // Per-handle preprocessing block (single allocation for all preprocessing buffers)
             void* preprocessing_block;
-            bool  owns_handle_mem; // false = caller-owned (user path); destroy skips free
+            bool owns_handle_mem; // false = caller-owned (user path); destroy skips free
             size_t preprocessing_zero_region_size;
             size_t preprocessing_s2d_size;
             void* preprocessing_scan_tmp;
 
             // Expert-major fields (alignment set in InitHandle; offsets/counts set in UpdateHandle)
-            size_t                    dispatch_output_per_expert_alignment;
-            int64_t*                  expert_token_offsets;       // [experts_per_rank] written by remap kernel
-            int32_t*                  per_expert_counts_active;   // alias to authoritative counts buffer
+            size_t dispatch_output_per_expert_alignment;
+            int64_t* expert_token_offsets; // [experts_per_rank] written by remap kernel
+            int32_t* per_expert_counts_active; // alias to authoritative counts buffer
 
             // EM local-fanout dup-groups (allocated iff mode == kLocalDup). Written by EM
             // scan; consumed by local_dup (post-dispatch) and local_reduce (pre-combine).
-            int32_t*                  emuf_group_buf;
-            int32_t*                  emuf_group_count;
-            int                       emuf_group_stride;
-            int                       emuf_max_groups;
+            int32_t* emuf_group_buf;
+            int32_t* emuf_group_count;
+            int emuf_group_stride;
+            int emuf_max_groups;
 
             // Cached user topk_idx; persists across dispatch/combine.
             // Native width matches handle->topk_idx.datatype (int32 or int64).
-            void*                     topk_idx;
+            void* topk_idx;
 
             // FLAT-dispatch + local-permute scratch (EM-permute path only).
             // flat2em_slot_map, recv_topk_weights_flat and token_to_recv_slot
@@ -2086,36 +2081,27 @@ struct ncclEpHandle {
             // slot in the output tensor. Shape [max_recv_tokens, top_k]
             // (invalid positions are -1). Written by em_scan_kernel during
             // UpdateHandle, read by the local-permute kernels.
-            int32_t*                  flat2em_slot_map;
+            int32_t* flat2em_slot_map;
             // Per-FLAT-slot topk weights; populated by dense_to_sparse_prob.
-            float*                    recv_topk_weights_flat;
+            float* recv_topk_weights_flat;
             // [num_total_attn_tokens] FLAT recv slot per global attention
             // token; -1 when the token has no local-rank hit. Populated by
             // scan_impl_flat in em-permute mode; consumed by em_scan_kernel
             // to populate the recv-indexed em_slot table.
-            int32_t*                  token_to_recv_slot;
+            int32_t* token_to_recv_slot;
 
         } hybridep;
     };
 
     ncclEpHandle()
-        : group(nullptr),
-          layout(NCCL_EP_LAYOUT_UNSET),
-          topk_idx(NCCL_EP_TENSOR_INIT),
-          num_tokens(0),
-          num_topk(0),
-          num_tokens_set(false),
-          cached_mode(false),
-          num_scales(0),
-          hidden_int4(0) {
+        : group(nullptr), layout(NCCL_EP_LAYOUT_UNSET), topk_idx(NCCL_EP_TENSOR_INIT), num_tokens(0), num_topk(0),
+          num_tokens_set(false), cached_mode(false), num_scales(0), hidden_int4(0) {
         constexpr size_t union_size = std::max(sizeof(ll), sizeof(hybridep));
         memset(static_cast<void*>(&ll), 0, union_size);
     }
 
-    ~ncclEpHandle() {
-    }
+    ~ncclEpHandle() {}
 };
-
 
 static bool is_internode_available(ncclEpGroup_t ep_group) {
     // True when there are multiple HT outer-domain nodes
@@ -2125,8 +2111,7 @@ static bool is_internode_available(ncclEpGroup_t ep_group) {
 // EM + mode == kLocalPermute. HT-only by design; zero_copy == OFF is enforced
 // by the HtEmMode resolver (mode == kLocalPermute => zero_copy != ON).
 static bool em_local_permute_enabled(ncclEpGroup_t group, ncclEpLayout_t layout) {
-    return layout == NCCL_EP_LAYOUT_EXPERT_MAJOR
-        && group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalPermute;
+    return layout == NCCL_EP_LAYOUT_EXPERT_MAJOR && group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalPermute;
 }
 static inline bool em_local_permute_enabled(ncclEpGroup_t group, ncclEpHandle_t handle) {
     return em_local_permute_enabled(group, handle->layout);
@@ -2134,26 +2119,24 @@ static inline bool em_local_permute_enabled(ncclEpGroup_t group, ncclEpHandle_t 
 
 // EM + mode == kLocalDup. HT-only by design.
 static bool em_local_dup_active(ncclEpGroup_t group, ncclEpLayout_t layout) {
-    return layout == NCCL_EP_LAYOUT_EXPERT_MAJOR
-        && group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalDup;
+    return layout == NCCL_EP_LAYOUT_EXPERT_MAJOR && group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalDup;
 }
 
 static bool em_staging_indexed_by_em_slot(ncclEpGroup_t group) {
-    return group->ht_em_mode == ncclEpGroup::HtEmMode::kNvlinkDup
-        || group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalDup;
+    return group->ht_em_mode == ncclEpGroup::HtEmMode::kNvlinkDup ||
+           group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalDup;
 }
-
 
 // Returns the total buffer size (in bytes) for a LL handle_mem block.
 // Used by ncclEpHandleMemSize (public) and ncclEpInitHandle (internal).
 static size_t ll_handle_mem_size(ncclEpGroup_t ep_group, int num_topk) {
     auto align256 = [](size_t s) -> size_t { return (s + 255) & ~size_t(255); };
     const size_t local_experts = static_cast<size_t>(ep_group->num_local_experts);
-    const size_t nRanks        = static_cast<size_t>(ep_group->nRanks);
-    const size_t max_tokens    = static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank);
+    const size_t nRanks = static_cast<size_t>(ep_group->nRanks);
+    const size_t max_tokens = static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank);
     // Layout: nRanks per-rank counts + nRanks * max_tokens * (num_topk+1) token entries
-    size_t sz_recv_src  = align256(nRanks * (1 + static_cast<size_t>(num_topk + 1) * max_tokens) * sizeof(int32_t));
-    size_t sz_dispatch  = align256(local_experts * nRanks * sizeof(int64_t));
+    size_t sz_recv_src = align256(nRanks * (1 + static_cast<size_t>(num_topk + 1) * max_tokens) * sizeof(int32_t));
+    size_t sz_dispatch = align256(local_experts * nRanks * sizeof(int64_t));
     return sz_recv_src + sz_dispatch;
 }
 
@@ -2163,13 +2146,13 @@ struct HtBlockLayout {
     // global_routing_map is group-scoped (ep_group->ht_buffers); not part of this block.
     size_t sz_r2a, sz_a2r, sz_ler, sz_ntfe;
     size_t sz_s2d, sz_rank_mask, sz_scan_tmp, sz_prob;
-    size_t sz_topk_idx;       // cached topk_idx
-    size_t sz_pec_active;     // EM only
-    size_t sz_eto;            // EM only
+    size_t sz_topk_idx; // cached topk_idx
+    size_t sz_pec_active; // EM only
+    size_t sz_eto; // EM only
     // Local-dup local-fanout scratch.
     size_t sz_emuf_group_buf, sz_emuf_group_count;
-    int    emuf_group_stride;   // row width actually allocated; <= experts_per_rank
-    int    emuf_max_groups;     // capacity in rows; kernel must not exceed
+    int emuf_group_stride; // row width actually allocated; <= experts_per_rank
+    int emuf_max_groups; // capacity in rows; kernel must not exceed
     // EM-permute scratch (handle mem).
     size_t sz_flat2em_slot_map;
     size_t sz_recv_topk_weights_flat;
@@ -2178,70 +2161,71 @@ struct HtBlockLayout {
 
     static HtBlockLayout compute(ncclEpGroup_t ep_group, ncclEpLayout_t layout, int num_topk = 0) {
         auto align256 = [](size_t s) -> size_t { return (s + 255) & ~size_t(255); };
-        const int num_experts      = ep_group->config.num_experts;
-        const int max_tokens       = ep_group->config.max_dispatch_tokens_per_rank;
-        const int lsa_team_size    = ep_group->lsa_team_size;
-        const int rdma_team_size   = ep_group->rdma_team_size;
+        const int num_experts = ep_group->config.num_experts;
+        const int max_tokens = ep_group->config.max_dispatch_tokens_per_rank;
+        const int lsa_team_size = ep_group->lsa_team_size;
+        const int rdma_team_size = ep_group->rdma_team_size;
         const int experts_per_rank = ep_group->num_local_experts;
-        const int max_recv_tokens  = ep_group->max_recv_tokens;
-        const int padded_max_tokens  = ((max_tokens + 15) / 16) * 16;
+        const int max_recv_tokens = ep_group->max_recv_tokens;
+        const int padded_max_tokens = ((max_tokens + 15) / 16) * 16;
         const bool has_expert_major = (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
-        const bool em_permute       = em_local_permute_enabled(ep_group, layout);
+        const bool em_permute = em_local_permute_enabled(ep_group, layout);
 
         HtBlockLayout L = {};
-        L.sz_r2a       = align256(static_cast<size_t>(rdma_team_size) * padded_max_tokens * sizeof(bool));
-        L.sz_a2r       = (rdma_team_size > 1) ? align256(static_cast<size_t>(max_tokens) * (rdma_team_size - 1) * sizeof(bool)) : 0;
-        L.sz_ler       = align256(static_cast<size_t>(ep_group->max_recv_tokens) * experts_per_rank * sizeof(bool));
-        L.sz_ntfe      = align256(sizeof(int32_t));
+        L.sz_r2a = align256(static_cast<size_t>(rdma_team_size) * padded_max_tokens * sizeof(bool));
+        L.sz_a2r =
+            (rdma_team_size > 1) ? align256(static_cast<size_t>(max_tokens) * (rdma_team_size - 1) * sizeof(bool)) : 0;
+        L.sz_ler = align256(static_cast<size_t>(ep_group->max_recv_tokens) * experts_per_rank * sizeof(bool));
+        L.sz_ntfe = align256(sizeof(int32_t));
         // S2D inner_dim: num_topk for nvlink_dup/local_dup EM (packed rank/slot); lsa_team_size
         // for FLAT and for EM-permute (unified FLAT-shape s2d — em_scan_kernel's
         // EM-shape writes are suppressed in em-permute mode).
         const int s2d_inner_dim = (has_expert_major && !em_permute) ? num_topk : lsa_team_size;
-        L.sz_s2d       = align256(static_cast<size_t>(rdma_team_size) * max_tokens * s2d_inner_dim * sizeof(int32_t));
-        L.sz_rank_mask = align256(static_cast<size_t>(rdma_team_size) * max_tokens * lsa_team_size * nccl_ep::hybridep::get_rank_mask_elem_size(lsa_team_size));
+        L.sz_s2d = align256(static_cast<size_t>(rdma_team_size) * max_tokens * s2d_inner_dim * sizeof(int32_t));
+        L.sz_rank_mask = align256(
+            static_cast<size_t>(rdma_team_size) * max_tokens * lsa_team_size *
+            nccl_ep::hybridep::get_rank_mask_elem_size(lsa_team_size));
         // Size for device_sm_count blocks: the upper bound on the preprocessing
         // scan's block count (ep_group->preprocess_num_sms, incl. any
         // NCCL_EP_PREPROCESS_NUM_SMS override) so the buffer always fits.
-        L.sz_scan_tmp  = align256(nccl_ep::hybridep::get_preprocessing_scan_tmp_size(
-                             static_cast<int>(ep_group->device_sm_count), lsa_team_size));
-        L.sz_prob      = !is_internode_available(ep_group) ?
-                             align256(static_cast<size_t>(max_tokens) * num_experts * sizeof(float)) : 0;
-        L.sz_topk_idx  = (num_topk > 0)
-            ? align256(static_cast<size_t>(max_tokens) * num_topk * sizeof(int64_t)) : 0;
+        L.sz_scan_tmp = align256(
+            nccl_ep::hybridep::get_preprocessing_scan_tmp_size(
+                static_cast<int>(ep_group->device_sm_count),
+                lsa_team_size));
+        L.sz_prob = !is_internode_available(ep_group) ?
+                        align256(static_cast<size_t>(max_tokens) * num_experts * sizeof(float)) :
+                        0;
+        L.sz_topk_idx = (num_topk > 0) ? align256(static_cast<size_t>(max_tokens) * num_topk * sizeof(int64_t)) : 0;
         L.sz_pec_active = has_expert_major ? align256(static_cast<size_t>(experts_per_rank) * sizeof(int32_t)) : 0;
         // [experts_per_rank + 1]: em_scan_kernel publishes the EM-padded total at `experts_per_rank` index.
-        L.sz_eto        = has_expert_major ? align256(static_cast<size_t>(experts_per_rank + 1) * sizeof(int64_t)) : 0;
+        L.sz_eto = has_expert_major ? align256(static_cast<size_t>(experts_per_rank + 1) * sizeof(int64_t)) : 0;
         // EM local-fanout dup-groups. Bounds: num_groups <= max_recv_tokens / 2
         // (each multi-hit group occupies >= 2 em_slots); row width <= min(num_topk, experts_per_rank).
-        const bool emuf_enabled = has_expert_major
-            && ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalDup;
-        const int emuf_row_width = (num_topk > 0)
-            ? std::min(num_topk, experts_per_rank) : experts_per_rank;
+        const bool emuf_enabled = has_expert_major && ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalDup;
+        const int emuf_row_width = (num_topk > 0) ? std::min(num_topk, experts_per_rank) : experts_per_rank;
         const size_t emuf_max_groups = static_cast<size_t>(ep_group->max_recv_tokens) / 2;
-        const size_t emuf_group_entries = emuf_enabled
-            ? emuf_max_groups * static_cast<size_t>(emuf_row_width)
-            : 0;
-        L.emuf_group_stride   = emuf_enabled ? emuf_row_width : 0;
-        L.emuf_max_groups     = emuf_enabled ? static_cast<int>(emuf_max_groups) : 0;
-        L.sz_emuf_group_buf   = align256(emuf_group_entries * sizeof(int32_t));
+        const size_t emuf_group_entries = emuf_enabled ? emuf_max_groups * static_cast<size_t>(emuf_row_width) : 0;
+        L.emuf_group_stride = emuf_enabled ? emuf_row_width : 0;
+        L.emuf_max_groups = emuf_enabled ? static_cast<int>(emuf_max_groups) : 0;
+        L.sz_emuf_group_buf = align256(emuf_group_entries * sizeof(int32_t));
         L.sz_emuf_group_count = emuf_enabled ? align256(sizeof(int32_t)) : 0;
         // EM-permute scratch: only when EM + !zero_copy_on (env-var flip handled at call time).
-        L.sz_flat2em_slot_map     = (em_permute && num_topk > 0)
-            ? align256(static_cast<size_t>(max_recv_tokens) * num_topk * sizeof(int32_t)) : 0;
-        L.sz_recv_topk_weights_flat = (em_permute && num_topk > 0)
-            ? align256(static_cast<size_t>(max_recv_tokens) * num_topk * sizeof(float)) : 0;
+        L.sz_flat2em_slot_map = (em_permute && num_topk > 0) ?
+                                    align256(static_cast<size_t>(max_recv_tokens) * num_topk * sizeof(int32_t)) :
+                                    0;
+        L.sz_recv_topk_weights_flat = (em_permute && num_topk > 0) ?
+                                          align256(static_cast<size_t>(max_recv_tokens) * num_topk * sizeof(float)) :
+                                          0;
         // EM-shape LERM mirrors sz_ler size; needs to be zero-initialised so
         // em_scan_kernel can write only the local-rank's em_slot rows.
         // num_total_attn_tokens = max_tokens * lsa_team_size * rdma_team_size.
-        L.sz_token_to_recv_slot          = em_permute
-            ? align256(static_cast<size_t>(max_tokens) * lsa_team_size * rdma_team_size * sizeof(int32_t))
-            : 0;
-        L.zero_region      = L.sz_r2a + L.sz_a2r + L.sz_ler + L.sz_ntfe;
-        L.no_memset_region = L.sz_rank_mask + L.sz_scan_tmp + L.sz_prob + L.sz_topk_idx
-                           + L.sz_pec_active + L.sz_eto
-                           + L.sz_emuf_group_buf + L.sz_emuf_group_count
-                           + L.sz_flat2em_slot_map
-                           + L.sz_recv_topk_weights_flat + L.sz_token_to_recv_slot;
+        L.sz_token_to_recv_slot =
+            em_permute ? align256(static_cast<size_t>(max_tokens) * lsa_team_size * rdma_team_size * sizeof(int32_t)) :
+                         0;
+        L.zero_region = L.sz_r2a + L.sz_a2r + L.sz_ler + L.sz_ntfe;
+        L.no_memset_region = L.sz_rank_mask + L.sz_scan_tmp + L.sz_prob + L.sz_topk_idx + L.sz_pec_active + L.sz_eto +
+                             L.sz_emuf_group_buf + L.sz_emuf_group_count + L.sz_flat2em_slot_map +
+                             L.sz_recv_topk_weights_flat + L.sz_token_to_recv_slot;
         L.total = L.zero_region + L.sz_s2d + L.no_memset_region;
         return L;
     }
@@ -2252,16 +2236,14 @@ static size_t ht_handle_mem_size(ncclEpGroup_t ep_group, ncclEpLayout_t layout, 
 }
 
 ncclResult_t ncclEpHandleMemSize(
-    ncclEpGroup_t               ep_group,
-    ncclEpLayout_t              layout,
+    ncclEpGroup_t ep_group,
+    ncclEpLayout_t layout,
     const ncclEpHandleConfig_t* config,
-    size_t*                     size_out,
-    int                         num_topk
-) {
+    size_t* size_out,
+    int num_topk) {
     assert(ep_group != nullptr && size_out != nullptr);
     EP_OPTIONAL_STRUCT(config);
-    EP_HOST_ASSERT(layout != NCCL_EP_LAYOUT_UNSET &&
-                   "ncclEpHandleMemSize: layout must be set explicitly");
+    EP_HOST_ASSERT(layout != NCCL_EP_LAYOUT_UNSET && "ncclEpHandleMemSize: layout must be set explicitly");
     if (ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
         assert(num_topk > 0 && "HT mode requires num_topk > 0 for ncclEpHandleMemSize");
         *size_out = ht_handle_mem_size(ep_group, layout, num_topk);
@@ -2287,8 +2269,7 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
     // imposes no cap. With a user-specified value, the caller (ll_init_handle)
     // rejects layouts that don't fit before reaching here, and the group-time
     // path passes exactly config.rdma_buffer_size.
-    EP_HOST_ASSERT(ep_group->config.rdma_buffer_size == NCCL_EP_AUTO ||
-                   new_size <= ep_group->config.rdma_buffer_size);
+    EP_HOST_ASSERT(ep_group->config.rdma_buffer_size == NCCL_EP_AUTO || new_size <= ep_group->config.rdma_buffer_size);
 
     const bool first_alloc = (ep_group->rdma_buffer == nullptr);
 
@@ -2317,8 +2298,7 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
     ep_group->rdma_buffer_size_alloc = new_size;
 
     ncclWindow_t win_host;
-    NCCL_CHECK_RESULT(ncclCommWindowRegister(ep_group->comm, ep_group->rdma_buffer,
-                                              new_size, &win_host, 0));
+    NCCL_CHECK_RESULT(ncclCommWindowRegister(ep_group->comm, ep_group->rdma_buffer, new_size, &win_host, 0));
     if (first_alloc) {
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->nccl_wins), sizeof(ncclWindow_t)));
     }
@@ -2327,15 +2307,20 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
     return ncclSuccess;
 }
 
-static ncclResult_t ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor_t* handle_mem, int num_topk) {
+static ncclResult_t
+ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor_t* handle_mem, int num_topk) {
     assert(num_topk > 0 && "LL mode requires num_topk > 0 (pass top_k to ncclEpInitHandle)");
-    assert((ep_group->config.max_dispatch_tokens_per_rank * ep_group->num_local_experts) % 4 == 0
-           && "TMA requires the number of tokens to be multiple of 4");
+    assert(
+        (ep_group->config.max_dispatch_tokens_per_rank * ep_group->num_local_experts) % 4 == 0 &&
+        "TMA requires the number of tokens to be multiple of 4");
 
     auto layout = nccl_ep::LowLatencyLayout(
         ep_group->config.max_dispatch_tokens_per_rank,
-        ep_group->config.max_token_bytes, ep_group->nRanks,
-        ep_group->config.num_experts, num_topk, handle->layout);
+        ep_group->config.max_token_bytes,
+        ep_group->nRanks,
+        ep_group->config.num_experts,
+        num_topk,
+        handle->layout);
 
     // Ensure rdma_buffer is large enough for this handle's actual layout.
     // - NCCL_EP_AUTO: lazily allocate (first handle) or grow (later handle
@@ -2346,43 +2331,48 @@ static ncclResult_t ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group
     //   value at group create. Reject the handle if it doesn't fit.
     if (layout.total_bytes > ep_group->rdma_buffer_size_alloc) {
         if (ep_group->config.rdma_buffer_size != NCCL_EP_AUTO) {
-            fprintf(stderr,
-                    "ncclEpInitHandle: requested layout needs %zu bytes but user-specified "
-                    "rdma_buffer_size is %zu bytes; either increase rdma_buffer_size or use "
-                    "NCCL_EP_AUTO to allow lazy sizing\n",
-                    layout.total_bytes,
-                    static_cast<size_t>(ep_group->config.rdma_buffer_size));
+            fprintf(
+                stderr,
+                "ncclEpInitHandle: requested layout needs %zu bytes but user-specified "
+                "rdma_buffer_size is %zu bytes; either increase rdma_buffer_size or use "
+                "NCCL_EP_AUTO to allow lazy sizing\n",
+                layout.total_bytes,
+                static_cast<size_t>(ep_group->config.rdma_buffer_size));
             return ncclInvalidUsage;
         }
-        const size_t new_size = ((layout.total_bytes + NUM_BUFFER_ALIGNMENT_BYTES - 1)
-                                 / NUM_BUFFER_ALIGNMENT_BYTES)
-                                * NUM_BUFFER_ALIGNMENT_BYTES;
+        const size_t new_size = ((layout.total_bytes + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES) *
+                                NUM_BUFFER_ALIGNMENT_BYTES;
         NCCLCHECK(ll_resize_rdma_buffer(ep_group, new_size));
     }
     assert(layout.total_bytes <= ep_group->rdma_buffer_size_alloc);
 
     if (handle_mem != nullptr) {
         assert(handle_mem->ndim == 1 && handle_mem->datatype == ncclUint8);
-        assert(handle_mem->sizes[0] >= ll_handle_mem_size(ep_group, num_topk) &&
-               "handle_mem too small; use ncclEpHandleMemSize to query required size");
+        assert(
+            handle_mem->sizes[0] >= ll_handle_mem_size(ep_group, num_topk) &&
+            "handle_mem too small; use ncclEpHandleMemSize to query required size");
         handle->ll.handle_mem = handle_mem->data;
         handle->ll.owns_handle_mem = false;
     } else {
-        CUDA_CHECK(ep_group->alloc.alloc_fn(&handle->ll.handle_mem, ll_handle_mem_size(ep_group, num_topk), ep_group->alloc.context));
+        CUDA_CHECK(ep_group->alloc.alloc_fn(
+            &handle->ll.handle_mem,
+            ll_handle_mem_size(ep_group, num_topk),
+            ep_group->alloc.context));
         handle->ll.owns_handle_mem = true;
     }
     char* base = static_cast<char*>(handle->ll.handle_mem);
 
-    const size_t recv_src_count = static_cast<size_t>(ep_group->nRanks) *
+    const size_t recv_src_count =
+        static_cast<size_t>(ep_group->nRanks) *
         (1 + static_cast<size_t>(num_topk + 1) * ep_group->config.max_dispatch_tokens_per_rank);
     {
         handle->ll.expert_recv_source_indices_sizes[0] = recv_src_count;
         handle->ll.expert_recv_source_indices = (ncclEpTensor_t){
             NCCL_EP_TENSOR_INIT_INLINE,
-            .ndim     = 1,
+            .ndim = 1,
             .datatype = ncclInt32,
-            .data     = base,
-            .sizes    = handle->ll.expert_recv_source_indices_sizes,
+            .data = base,
+            .sizes = handle->ll.expert_recv_source_indices_sizes,
         };
     }
 
@@ -2393,10 +2383,10 @@ static ncclResult_t ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group
         handle->ll.expert_dispatch_layout_sizes[1] = static_cast<size_t>(ep_group->nRanks);
         handle->ll.expert_dispatch_layout = (ncclEpTensor_t){
             NCCL_EP_TENSOR_INIT_INLINE,
-            .ndim     = 2,
+            .ndim = 2,
             .datatype = ncclInt64,
-            .data     = base + recv_src_bytes,
-            .sizes    = handle->ll.expert_dispatch_layout_sizes,
+            .data = base + recv_src_bytes,
+            .sizes = handle->ll.expert_dispatch_layout_sizes,
         };
     }
     handle->num_topk = num_topk;
@@ -2404,28 +2394,28 @@ static ncclResult_t ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group
     return ncclSuccess;
 }
 
-static ncclResult_t ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor_t* handle_mem, int num_topk) {
+static ncclResult_t
+ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor_t* handle_mem, int num_topk) {
     assert(ep_group->config.max_dispatch_tokens_per_rank > 0 && "HT requires max_dispatch_tokens_per_rank > 0");
     assert(num_topk > 0 && "HT mode requires num_topk > 0 (pass top_k to ncclEpInitHandle)");
     // kNvlinkDup/kLocalDup write the staging buffer in the same per-expert
     // expanded shape as the dispatch output (each token can occupy up to
     // num_topk slots), so max_recv_tokens must cover the worst case
     // nRanks * max_dispatch_tokens_per_rank * num_topk.
-    if (em_staging_indexed_by_em_slot(ep_group)
-        && ep_group->config.zero_copy != NCCL_EP_ZERO_COPY_ON) {
-        const size_t needed = static_cast<size_t>(ep_group->nRanks)
-                            * ep_group->config.max_dispatch_tokens_per_rank
-                            * num_topk;
-        EP_HOST_ASSERT(static_cast<size_t>(ep_group->max_recv_tokens) >= needed &&
-                       "ncclEpInitHandle: max_recv_tokens too small for em_slot staging");
+    if (em_staging_indexed_by_em_slot(ep_group) && ep_group->config.zero_copy != NCCL_EP_ZERO_COPY_ON) {
+        const size_t needed =
+            static_cast<size_t>(ep_group->nRanks) * ep_group->config.max_dispatch_tokens_per_rank * num_topk;
+        EP_HOST_ASSERT(
+            static_cast<size_t>(ep_group->max_recv_tokens) >= needed &&
+            "ncclEpInitHandle: max_recv_tokens too small for em_slot staging");
     }
     handle->num_topk = num_topk;
     const auto L = HtBlockLayout::compute(ep_group, handle->layout, num_topk);
 
     if (handle_mem != nullptr) {
         assert(handle_mem->ndim == 1 && handle_mem->datatype == ncclUint8);
-        assert(handle_mem->sizes[0] >= L.total &&
-               "handle_mem too small; use ncclEpHandleMemSize to query required size");
+        assert(
+            handle_mem->sizes[0] >= L.total && "handle_mem too small; use ncclEpHandleMemSize to query required size");
         ncclEpTensor_t handle_mem_local;
         const ncclEpTensor_t* resolved_handle_mem;
         NCCLCHECK(resolveTensorWindowBinding(ep_group, handle_mem, &handle_mem_local, 0, &resolved_handle_mem));
@@ -2442,60 +2432,66 @@ static ncclResult_t ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group
     size_t offset = 0;
 
     // global_routing_map: read directly from ep_group->ht_buffers (not duplicated on the handle).
-    handle->hybridep.rdma_to_attn_map          = reinterpret_cast<bool*>(ptr + offset);    offset += L.sz_r2a;
-    handle->hybridep.attn_to_rdma_map          = (ep_group->nNodes > 1) ?
-                                                     reinterpret_cast<bool*>(ptr + offset) : nullptr;
-                                                                                             offset += L.sz_a2r;
-    handle->hybridep.local_expert_routing_map  = reinterpret_cast<bool*>(ptr + offset);    offset += L.sz_ler;
-    handle->hybridep.num_tokens_for_experts    = reinterpret_cast<int32_t*>(ptr + offset); offset += L.sz_ntfe;
+    handle->hybridep.rdma_to_attn_map = reinterpret_cast<bool*>(ptr + offset);
+    offset += L.sz_r2a;
+    handle->hybridep.attn_to_rdma_map = (ep_group->nNodes > 1) ? reinterpret_cast<bool*>(ptr + offset) : nullptr;
+    offset += L.sz_a2r;
+    handle->hybridep.local_expert_routing_map = reinterpret_cast<bool*>(ptr + offset);
+    offset += L.sz_ler;
+    handle->hybridep.num_tokens_for_experts = reinterpret_cast<int32_t*>(ptr + offset);
+    offset += L.sz_ntfe;
     // --- end of zero_region (memset 0x00) ---
-    handle->hybridep.sparse_to_dense_map       = reinterpret_cast<int32_t*>(ptr + offset); offset += L.sz_s2d;
+    handle->hybridep.sparse_to_dense_map = reinterpret_cast<int32_t*>(ptr + offset);
+    offset += L.sz_s2d;
     // --- end of s2d region (memset 0xFF) ---
-    handle->hybridep.token_rank_mask           = ptr + offset;                              offset += L.sz_rank_mask;
-    handle->hybridep.preprocessing_scan_tmp   = reinterpret_cast<void*>(ptr + offset);    offset += L.sz_scan_tmp;
+    handle->hybridep.token_rank_mask = ptr + offset;
+    offset += L.sz_rank_mask;
+    handle->hybridep.preprocessing_scan_tmp = reinterpret_cast<void*>(ptr + offset);
+    offset += L.sz_scan_tmp;
     if (!is_internode_available(ep_group)) {
-        handle->hybridep.dense_prob_buffer     = reinterpret_cast<float*>(ptr + offset);   offset += L.sz_prob;
+        handle->hybridep.dense_prob_buffer = reinterpret_cast<float*>(ptr + offset);
+        offset += L.sz_prob;
     } else {
-        handle->hybridep.dense_prob_buffer     = nullptr;
+        handle->hybridep.dense_prob_buffer = nullptr;
     }
-    handle->hybridep.topk_idx                  = (L.sz_topk_idx > 0)
-        ? reinterpret_cast<void*>(ptr + offset) : nullptr;
+    handle->hybridep.topk_idx = (L.sz_topk_idx > 0) ? reinterpret_cast<void*>(ptr + offset) : nullptr;
     offset += L.sz_topk_idx;
     // EM remap counts/offsets live in handle_mem (EM only; FLAT must not read them).
-    handle->hybridep.per_expert_counts_active  = (L.sz_pec_active > 0)
-        ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
+    handle->hybridep.per_expert_counts_active =
+        (L.sz_pec_active > 0) ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
     offset += L.sz_pec_active;
-    handle->hybridep.expert_token_offsets      = (L.sz_eto > 0)
-        ? reinterpret_cast<int64_t*>(ptr + offset) : nullptr;
+    handle->hybridep.expert_token_offsets = (L.sz_eto > 0) ? reinterpret_cast<int64_t*>(ptr + offset) : nullptr;
     offset += L.sz_eto;
     if (L.sz_emuf_group_buf > 0) {
-        handle->hybridep.emuf_group_buf    = reinterpret_cast<int32_t*>(ptr + offset); offset += L.sz_emuf_group_buf;
-        handle->hybridep.emuf_group_count  = reinterpret_cast<int32_t*>(ptr + offset); offset += L.sz_emuf_group_count;
+        handle->hybridep.emuf_group_buf = reinterpret_cast<int32_t*>(ptr + offset);
+        offset += L.sz_emuf_group_buf;
+        handle->hybridep.emuf_group_count = reinterpret_cast<int32_t*>(ptr + offset);
+        offset += L.sz_emuf_group_count;
         handle->hybridep.emuf_group_stride = L.emuf_group_stride;
-        handle->hybridep.emuf_max_groups   = L.emuf_max_groups;
+        handle->hybridep.emuf_max_groups = L.emuf_max_groups;
     } else {
-        handle->hybridep.emuf_group_buf    = nullptr;
-        handle->hybridep.emuf_group_count  = nullptr;
+        handle->hybridep.emuf_group_buf = nullptr;
+        handle->hybridep.emuf_group_count = nullptr;
         handle->hybridep.emuf_group_stride = 0;
-        handle->hybridep.emuf_max_groups   = 0;
+        handle->hybridep.emuf_max_groups = 0;
     }
-    handle->hybridep.flat2em_slot_map         = (L.sz_flat2em_slot_map > 0)
-        ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
+    handle->hybridep.flat2em_slot_map =
+        (L.sz_flat2em_slot_map > 0) ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
     offset += L.sz_flat2em_slot_map;
-    handle->hybridep.recv_topk_weights_flat    = (L.sz_recv_topk_weights_flat > 0)
-        ? reinterpret_cast<float*>(ptr + offset) : nullptr;
+    handle->hybridep.recv_topk_weights_flat =
+        (L.sz_recv_topk_weights_flat > 0) ? reinterpret_cast<float*>(ptr + offset) : nullptr;
     offset += L.sz_recv_topk_weights_flat;
-    handle->hybridep.token_to_recv_slot        = (L.sz_token_to_recv_slot > 0)
-        ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
+    handle->hybridep.token_to_recv_slot =
+        (L.sz_token_to_recv_slot > 0) ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
     offset += L.sz_token_to_recv_slot;
     handle->hybridep.dispatch_output_per_expert_alignment = 0;
 
     if (is_internode_available(ep_group)) {
-        handle->hybridep.dense_prob_buffer             = ep_group->ht_buffers.dense_prob_buffer;
-        handle->hybridep.token_staging_buffer          = ep_group->ht_buffers.token_staging_buffer;
+        handle->hybridep.dense_prob_buffer = ep_group->ht_buffers.dense_prob_buffer;
+        handle->hybridep.token_staging_buffer = ep_group->ht_buffers.token_staging_buffer;
         handle->hybridep.scaling_factor_staging_buffer = ep_group->ht_buffers.scaling_factor_staging_buffer;
     } else {
-        handle->hybridep.token_staging_buffer          = nullptr;
+        handle->hybridep.token_staging_buffer = nullptr;
         handle->hybridep.scaling_factor_staging_buffer = nullptr;
     }
     return ncclSuccess;
@@ -2505,35 +2501,34 @@ static ncclResult_t ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group
 // handle_mem == nullptr → alloc_fn owns the block; freed on destroy.
 // handle_mem != nullptr → wraps caller buffer; destroy frees only the struct.
 ncclResult_t ncclEpInitHandle(
-    ncclEpHandle_t*             out_handle,
-    ncclEpGroup_t               ep_group,
-    ncclEpLayout_t              layout,
+    ncclEpHandle_t* out_handle,
+    ncclEpGroup_t ep_group,
+    ncclEpLayout_t layout,
     const ncclEpHandleConfig_t* config,
-    int                         num_topk,
-    const ncclEpTensor_t*       handle_mem
-) {
+    int num_topk,
+    const ncclEpTensor_t* handle_mem) {
     assert(ep_group != nullptr && out_handle != nullptr);
     assert(ep_group->comm != nullptr);
     EP_OPTIONAL_STRUCT(config);
-    handle_mem = tensor_ptr(handle_mem);  // NULL passthrough; otherwise validates magic
-    EP_HOST_ASSERT(layout != NCCL_EP_LAYOUT_UNSET &&
-                   "ncclEpInitHandle: layout must be set explicitly");
-    EP_HOST_ASSERT(!(ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
-                     layout != NCCL_EP_LAYOUT_FLAT &&
-                     layout != NCCL_EP_LAYOUT_EXPERT_MAJOR) &&
-                   "ncclEpInitHandle: HT mode supports flat and expert-major layouts");
-    EP_HOST_ASSERT(!(ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY &&
-                     layout != NCCL_EP_LAYOUT_EXPERT_MAJOR &&
-                     layout != NCCL_EP_LAYOUT_RANK_MAJOR) &&
-                   "ncclEpInitHandle: LL mode supports only expert-major and rank-major layouts");
+    handle_mem = tensor_ptr(handle_mem); // NULL passthrough; otherwise validates magic
+    EP_HOST_ASSERT(layout != NCCL_EP_LAYOUT_UNSET && "ncclEpInitHandle: layout must be set explicitly");
+    EP_HOST_ASSERT(
+        !(ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && layout != NCCL_EP_LAYOUT_FLAT &&
+          layout != NCCL_EP_LAYOUT_EXPERT_MAJOR) &&
+        "ncclEpInitHandle: HT mode supports flat and expert-major layouts");
+    EP_HOST_ASSERT(
+        !(ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY && layout != NCCL_EP_LAYOUT_EXPERT_MAJOR &&
+          layout != NCCL_EP_LAYOUT_RANK_MAJOR) &&
+        "ncclEpInitHandle: LL mode supports only expert-major and rank-major layouts");
     assert(ep_group->config.num_experts > 0);
     assert(ep_group->config.num_experts % ep_group->nRanks == 0);
 
     // Validate EM padding alignment up-front (pow2 required) before any allocation.
-    const bool is_ht_em = ep_group->config.algorithm != NCCL_EP_ALGO_LOW_LATENCY &&
-                          layout == NCCL_EP_LAYOUT_EXPERT_MAJOR;
-    const size_t em_align = (is_ht_em && config && config->dispatch_output_per_expert_alignment > 1)
-                            ? config->dispatch_output_per_expert_alignment : 1;
+    const bool is_ht_em =
+        ep_group->config.algorithm != NCCL_EP_ALGO_LOW_LATENCY && layout == NCCL_EP_LAYOUT_EXPERT_MAJOR;
+    const size_t em_align = (is_ht_em && config && config->dispatch_output_per_expert_alignment > 1) ?
+                                config->dispatch_output_per_expert_alignment :
+                                1;
     assert((em_align & (em_align - 1)) == 0 && "dispatch_output_per_expert_alignment must be a power of two");
 
     *out_handle = new ncclEpHandle();
@@ -2554,13 +2549,11 @@ ncclResult_t ncclEpInitHandle(
     return res;
 }
 
-
 ncclResult_t ncclEpUpdateHandle(
     ncclEpHandle_t handle,
     const ncclEpTensor_t* topk_idx,
     const ncclEpLayoutInfo_t* layout_info,
-    cudaStream_t stream)
-{
+    cudaStream_t stream) {
     assert(handle != nullptr);
     topk_idx = tensor_required(topk_idx);
     EP_OPTIONAL_LAYOUT_INFO(layout_info);
@@ -2571,8 +2564,9 @@ ncclResult_t ncclEpUpdateHandle(
 
     // LL and HT both accept ncclInt32 or ncclInt64; the cached idx keeps the
     // caller's native width.
-    assert((topk_idx->datatype == ncclInt32 || topk_idx->datatype == ncclInt64)
-           && "topk_idx must be ncclInt32 or ncclInt64");
+    assert(
+        (topk_idx->datatype == ncclInt32 || topk_idx->datatype == ncclInt64) &&
+        "topk_idx must be ncclInt32 or ncclInt64");
 
     // Take ownership of the descriptor with a library-owned tensor to
     // ensure no dependency on the caller's descriptor.
@@ -2582,8 +2576,9 @@ ncclResult_t ncclEpUpdateHandle(
     handle->num_tokens_set = true;
 
     if (ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        assert(static_cast<int>(topk_idx->sizes[1]) == handle->num_topk &&
-               "LL: num_topk mismatch between ncclEpInitHandle and ncclEpUpdateHandle");
+        assert(
+            static_cast<int>(topk_idx->sizes[1]) == handle->num_topk &&
+            "LL: num_topk mismatch between ncclEpInitHandle and ncclEpUpdateHandle");
         assert(layout_info == nullptr && "LL mode does not accept local tensors in ncclEpUpdateHandle");
         return ncclSuccess;
     }
@@ -2592,10 +2587,15 @@ ncclResult_t ncclEpUpdateHandle(
     }
 
     int num_topk = static_cast<int>(topk_idx->sizes[1]);
-    if (handle->num_topk > 0) assert(handle->num_topk == num_topk && "Given topk_idx has unmatched num_topk that ncclEpHandle was created with!");
+    if (handle->num_topk > 0)
+        assert(
+            handle->num_topk == num_topk &&
+            "Given topk_idx has unmatched num_topk that ncclEpHandle was created with!");
     else handle->num_topk = num_topk;
 
-    assert(handle->num_tokens <= static_cast<int>(ep_group->config.max_dispatch_tokens_per_rank) && "Token count exceeds HT buffer capacity");
+    assert(
+        handle->num_tokens <= static_cast<int>(ep_group->config.max_dispatch_tokens_per_rank) &&
+        "Token count exceeds HT buffer capacity");
 
     const ncclEpTensor_t* recv_expert_counter = layout_info ? tensor_ptr(layout_info->expert_counters) : nullptr;
 
@@ -2610,18 +2610,21 @@ ncclResult_t ncclEpUpdateHandle(
     // Buffers are allocated at max_tokens capacity, so this clears beyond the active num_tokens
     // region — safe because allgather/preprocessing will overwrite the relevant portions.
     CUDA_CHECK(cudaMemsetAsync(
-        handle->hybridep.preprocessing_block, 0,
-        handle->hybridep.preprocessing_zero_region_size, stream));
+        handle->hybridep.preprocessing_block,
+        0,
+        handle->hybridep.preprocessing_zero_region_size,
+        stream));
     // sparse_to_dense_map (unified S2D) uses 0xFF sentinel (not zero)
     if (handle->hybridep.preprocessing_s2d_size > 0) {
         CUDA_CHECK(cudaMemsetAsync(
-            handle->hybridep.sparse_to_dense_map, 0xFF,
-            handle->hybridep.preprocessing_s2d_size, stream));
+            handle->hybridep.sparse_to_dense_map,
+            0xFF,
+            handle->hybridep.preprocessing_s2d_size,
+            stream));
     }
 
     uint8_t* global_routing_map = ep_group->ht_buffers.global_routing_map;
-    uint8_t* local_routing_send_ptr =
-        global_routing_map + (max_tokens * num_experts_packed) * ep_group->rank;
+    uint8_t* local_routing_send_ptr = global_routing_map + (max_tokens * num_experts_packed) * ep_group->rank;
 
     // ===== Step 1: Convert sparse topk_idx to bitmap routing map =====
     // Pass max_tokens so the kernel zeroes the tail rows in the local send slot;
@@ -2668,8 +2671,9 @@ ncclResult_t ncclEpUpdateHandle(
     auto check_int32_or_int64 = [&](const ncclEpTensor_t* t, const char* name) {
         assert(t->ndim == 1 && "tensor must be 1D");
         assert((t->datatype == ncclInt32 || t->datatype == ncclInt64) && "tensor must be ncclInt32 or ncclInt64");
-        assert(t->sizes[0] >= static_cast<size_t>(ep_group->num_local_experts) &&
-               "tensor size must be >= num_local_experts");
+        assert(
+            t->sizes[0] >= static_cast<size_t>(ep_group->num_local_experts) &&
+            "tensor size must be >= num_local_experts");
         assert(t->data != nullptr && "tensor data must not be null");
         (void)name;
     };
@@ -2678,8 +2682,10 @@ ncclResult_t ncclEpUpdateHandle(
     bool out_dtype_set = false;
     auto track_out_dtype = [&](const ncclEpTensor_t* t) {
         const bool is64 = (t->datatype == ncclInt64);
-        if (!out_dtype_set) { out_is_int64 = is64; out_dtype_set = true; }
-        else assert(is64 == out_is_int64 && "all preprocessing int output tensors must share dtype");
+        if (!out_dtype_set) {
+            out_is_int64 = is64;
+            out_dtype_set = true;
+        } else assert(is64 == out_is_int64 && "all preprocessing int output tensors must share dtype");
     };
     void* padded_out_counts = nullptr;
     if (expert_major && recv_expert_counter != nullptr) {
@@ -2702,11 +2708,17 @@ ncclResult_t ncclEpUpdateHandle(
     } else if (recv_expert_counter != nullptr) {
         assert(recv_expert_counter->ndim == 1 && "recv_expert_counter must be 1D");
         assert(recv_expert_counter->datatype == ncclInt32 && "HT flat: recv_expert_counter must be ncclInt32");
-        assert(recv_expert_counter->sizes[0] >= static_cast<unsigned int>(ep_group->num_local_experts) &&
+        assert(
+            recv_expert_counter->sizes[0] >= static_cast<unsigned int>(ep_group->num_local_experts) &&
             "recv_expert_counter size must be >= num_local_experts");
         ncclEpTensor_t recv_expert_counter_local;
         const ncclEpTensor_t* resolved_recv_expert_counter;
-        NCCLCHECK(resolveTensorWindowBinding(ep_group, recv_expert_counter, &recv_expert_counter_local, 0, &resolved_recv_expert_counter));
+        NCCLCHECK(resolveTensorWindowBinding(
+            ep_group,
+            recv_expert_counter,
+            &recv_expert_counter_local,
+            0,
+            &resolved_recv_expert_counter));
         assert(resolved_recv_expert_counter->data != nullptr && "recv_expert_counter data must not be null");
         per_expert_counts_device = static_cast<int32_t*>(resolved_recv_expert_counter->data);
     }
@@ -2715,12 +2727,13 @@ ncclResult_t ncclEpUpdateHandle(
     // layout_info->recv_total_counter: scalar total recv tokens (size 1, int32/64), written by metadata.
     void* recv_total_counter = nullptr;
     {
-        const ncclEpTensor_t* recv_total_counter_tensor = layout_info ? tensor_ptr(layout_info->recv_total_counter) : nullptr;
+        const ncclEpTensor_t* recv_total_counter_tensor =
+            layout_info ? tensor_ptr(layout_info->recv_total_counter) : nullptr;
         if (recv_total_counter_tensor != nullptr) {
             assert(recv_total_counter_tensor->ndim == 1);
             assert(recv_total_counter_tensor->sizes[0] >= 1);
-            assert(recv_total_counter_tensor->datatype == ncclInt32 ||
-                   recv_total_counter_tensor->datatype == ncclInt64);
+            assert(
+                recv_total_counter_tensor->datatype == ncclInt32 || recv_total_counter_tensor->datatype == ncclInt64);
             assert(recv_total_counter_tensor->data != nullptr);
             recv_total_counter = recv_total_counter_tensor->data;
             track_out_dtype(recv_total_counter_tensor);
@@ -2734,53 +2747,52 @@ ncclResult_t ncclEpUpdateHandle(
 
     const bool em_permute_active = em_local_permute_enabled(ep_group, handle);
 
-    NCCLCHECK(nccl_ep::hybridep::call_metadata_preprocessing(
-        global_routing_map,
-        handle->hybridep.sparse_to_dense_map,
-        handle->hybridep.rdma_to_attn_map,
-        handle->hybridep.attn_to_rdma_map,
-        handle->hybridep.token_rank_mask,
-        handle->hybridep.num_tokens_for_experts,
-        handle->hybridep.local_expert_routing_map,
-        per_expert_counts_device,
-        handle->hybridep.preprocessing_scan_tmp,
-        ep_group->rdma_rank,
-        ep_group->lsa_rank,
-        max_tokens,
-        nNodes,
-        n_ranks_per_node,
-        experts_per_rank,
-        expert_major,
-        expert_major ? handle->hybridep.expert_token_offsets : nullptr,
-        padded_out_counts,
-        out_offsets,
-        expert_major
-            ? handle->hybridep.dispatch_output_per_expert_alignment
-            : size_t(0),
-        // Remap kernel writes authoritative per-expert counts (scan overcounts secondary hits).
-        expert_major ? per_expert_counts_device : nullptr,
-        expert_major ? handle->num_topk : 0,
-        recv_total_counter,
-        out_is_int64,
-        static_cast<int>(ep_group->config.max_recv_tokens_per_rank),
-        handle->hybridep.emuf_group_buf,
-        handle->hybridep.emuf_group_count,
-        handle->hybridep.emuf_group_stride,
-        handle->hybridep.emuf_max_groups,
-        ep_group->preprocess_num_sms,
-        // EM cooperative scan scratch carved from ep_workspace.
-        expert_major ? ep_group->ep_workspace : nullptr,
-        // EM-permute mode: FLAT scan replaces scan_em and writes the unified
-        // sparse_to_dense_map (now FLAT-shaped) + FLAT-shape LERM; em_scan_kernel
-        // runs only for EM-only offsets / counts / alignment.
-        em_permute_active,
-        // EM-permute bridge: scan_impl_flat fills token_to_recv_slot with the FLAT
-        // recv slot per global token, and em_scan_kernel consumes it to
-        // populate the recv-indexed em_slot table.
-        em_permute_active ? handle->hybridep.token_to_recv_slot : nullptr,
-        em_permute_active ? handle->hybridep.flat2em_slot_map : nullptr,
-        em_permute_active ? handle->num_topk : 0,
-        stream));
+    NCCLCHECK(
+        nccl_ep::hybridep::call_metadata_preprocessing(
+            global_routing_map,
+            handle->hybridep.sparse_to_dense_map,
+            handle->hybridep.rdma_to_attn_map,
+            handle->hybridep.attn_to_rdma_map,
+            handle->hybridep.token_rank_mask,
+            handle->hybridep.num_tokens_for_experts,
+            handle->hybridep.local_expert_routing_map,
+            per_expert_counts_device,
+            handle->hybridep.preprocessing_scan_tmp,
+            ep_group->rdma_rank,
+            ep_group->lsa_rank,
+            max_tokens,
+            nNodes,
+            n_ranks_per_node,
+            experts_per_rank,
+            expert_major,
+            expert_major ? handle->hybridep.expert_token_offsets : nullptr,
+            padded_out_counts,
+            out_offsets,
+            expert_major ? handle->hybridep.dispatch_output_per_expert_alignment : size_t(0),
+            // Remap kernel writes authoritative per-expert counts (scan overcounts secondary hits).
+            expert_major ? per_expert_counts_device : nullptr,
+            expert_major ? handle->num_topk : 0,
+            recv_total_counter,
+            out_is_int64,
+            static_cast<int>(ep_group->config.max_recv_tokens_per_rank),
+            handle->hybridep.emuf_group_buf,
+            handle->hybridep.emuf_group_count,
+            handle->hybridep.emuf_group_stride,
+            handle->hybridep.emuf_max_groups,
+            ep_group->preprocess_num_sms,
+            // EM cooperative scan scratch carved from ep_workspace.
+            expert_major ? ep_group->ep_workspace : nullptr,
+            // EM-permute mode: FLAT scan replaces scan_em and writes the unified
+            // sparse_to_dense_map (now FLAT-shaped) + FLAT-shape LERM; em_scan_kernel
+            // runs only for EM-only offsets / counts / alignment.
+            em_permute_active,
+            // EM-permute bridge: scan_impl_flat fills token_to_recv_slot with the FLAT
+            // recv slot per global token, and em_scan_kernel consumes it to
+            // populate the recv-indexed em_slot table.
+            em_permute_active ? handle->hybridep.token_to_recv_slot : nullptr,
+            em_permute_active ? handle->hybridep.flat2em_slot_map : nullptr,
+            em_permute_active ? handle->num_topk : 0,
+            stream));
 
     return ncclSuccess;
 }
@@ -2792,21 +2804,21 @@ ncclResult_t ncclEpCreateHandle(
     const ncclEpTensor_t* topk_idx,
     const ncclEpLayoutInfo_t* layout_info,
     const ncclEpHandleConfig_t* config,
-    cudaStream_t stream
-) {
+    cudaStream_t stream) {
     topk_idx = tensor_required(topk_idx);
     assert(out_handle != nullptr);
-    NCCL_CHECK_RESULT(ncclEpInitHandle(out_handle, ep_group, layout, config,
-                                       static_cast<int>(topk_idx->sizes[1]),
-                                       /*handle_mem=*/nullptr));
+    NCCL_CHECK_RESULT(ncclEpInitHandle(
+        out_handle,
+        ep_group,
+        layout,
+        config,
+        static_cast<int>(topk_idx->sizes[1]),
+        /*handle_mem=*/nullptr));
     return ncclEpUpdateHandle(*out_handle, topk_idx, layout_info, stream);
 }
 
-ncclResult_t ncclEpHandleDestroy(
-    ncclEpHandle_t handle
-) {
-    if (!handle)
-        return ncclSuccess;
+ncclResult_t ncclEpHandleDestroy(ncclEpHandle_t handle) {
+    if (!handle) return ncclSuccess;
 
     if (handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         if (handle->ll.owns_handle_mem && handle->ll.handle_mem) {
@@ -2827,7 +2839,7 @@ ncclResult_t ncclEpHandleDestroy(
     return ncclSuccess;
 }
 
-    // EP Operations
+// EP Operations
 
 ncclResult_t ncclEpDispatch(
     ncclEpHandle_t handle,
@@ -2835,21 +2847,21 @@ ncclResult_t ncclEpDispatch(
     const ncclEpDispatchOutputs_t* outputs,
     const ncclEpLayoutInfo_t* layout_info,
     const ncclEpDispatchConfig_t* config,
-    cudaStream_t stream
-) {
+    cudaStream_t stream) {
     EP_REQUIRE_STRUCT(inputs);
     EP_REQUIRE_STRUCT(outputs);
     EP_OPTIONAL_LAYOUT_INFO(layout_info);
     EP_OPTIONAL_STRUCT(config);
     const unsigned int send_only = config ? config->send_only : 0;
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
-    if (pass_direction != NCCL_EP_FWD_PASS &&
-        handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        fprintf(stderr, "ncclEpDispatch: backward pass (pass_direction=%d) is not supported in LL mode\n",
-                (int)pass_direction);
+    if (pass_direction != NCCL_EP_FWD_PASS && handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
+        fprintf(
+            stderr,
+            "ncclEpDispatch: backward pass (pass_direction=%d) is not supported in LL mode\n",
+            (int)pass_direction);
         return ncclInvalidUsage;
     }
-        ncclEpGroup_t group = handle->group;
+    ncclEpGroup_t group = handle->group;
 
     // Lazy num_tokens for callers that skip UpdateHandle (e.g. backward reusing forward's handle_mem).
     // Guard on `num_tokens_set` -- a real zero-token configuration is valid
@@ -2868,8 +2880,7 @@ ncclResult_t ncclEpDispatch(
     {
         const ncclEpTensor_t* xt = tensor_required(inputs->tokens);
         if (!validate_dtype(xt->datatype) && !validate_fp8_dtype(xt->datatype)) {
-            fprintf(stderr, "NCCL EP: dispatch unsupported token dtype %d\n",
-                    static_cast<int>(xt->datatype));
+            fprintf(stderr, "NCCL EP: dispatch unsupported token dtype %d\n", static_cast<int>(xt->datatype));
             return ncclInvalidArgument;
         }
     }
@@ -2900,52 +2911,53 @@ ncclResult_t ncclEpDispatch(
 
         // Read rank-major-specific tensors unconditionally so we can assert
         // their presence (rank-major) or absence (expert-major) in the switch below.
-        const ncclEpTensor_t* topk_weights_in   = tensor_ptr(inputs->topk_weights);
+        const ncclEpTensor_t* topk_weights_in = tensor_ptr(inputs->topk_weights);
         const ncclEpTensor_t* recv_topk_weights = tensor_ptr(outputs->topk_weights);
-        const ncclEpTensor_t* recv_topk_idx     = tensor_ptr(outputs->topk_idx);
+        const ncclEpTensor_t* recv_topk_idx = tensor_ptr(outputs->topk_idx);
         const ncclEpTensor_t* src_rank_counter = layout_info ? tensor_ptr(layout_info->src_rank_counters) : nullptr;
 
-        const unsigned num_recv_tokens = static_cast<unsigned>(group->nRanks) * group->config.max_dispatch_tokens_per_rank;
+        const unsigned num_recv_tokens =
+            static_cast<unsigned>(group->nRanks) * group->config.max_dispatch_tokens_per_rank;
         switch (handle->layout) {
-            case NCCL_EP_LAYOUT_RANK_MAJOR:
-                // Rank-major output is 3D so the per-rank, per-slot structure is
-                // explicit in the descriptor — the caller must acknowledge it.
-                assert(recv_x->ndim == 3);
-                assert(recv_x->sizes[0] == static_cast<unsigned>(group->nRanks));
-                assert(recv_x->sizes[1] == group->config.max_dispatch_tokens_per_rank);
-                assert(recv_x->sizes[2] == static_cast<unsigned>(hidden));
-                assert(topk_weights_in   != nullptr);
-                assert(recv_topk_weights != nullptr);
-                assert(recv_topk_idx     != nullptr);
-                assert(topk_weights_in->ndim == 2);
-                assert(topk_weights_in->datatype == ncclFloat32);
-                assert(topk_weights_in->sizes[0] == static_cast<unsigned>(handle->num_tokens));
-                assert(topk_weights_in->sizes[1] == static_cast<unsigned>(handle->num_topk));
-                assert(recv_topk_weights->ndim == 3);
-                assert(recv_topk_weights->datatype == ncclFloat32);
-                assert(recv_topk_weights->sizes[0] == static_cast<unsigned>(group->nRanks));
-                assert(recv_topk_weights->sizes[1] == group->config.max_dispatch_tokens_per_rank);
-                assert(recv_topk_weights->sizes[2] == static_cast<unsigned>(handle->num_topk));
-                assert(recv_topk_idx->ndim == 3);
-                assert(recv_topk_idx->datatype == ncclInt32);
-                assert(recv_topk_idx->sizes[0] == static_cast<unsigned>(group->nRanks));
-                assert(recv_topk_idx->sizes[1] == group->config.max_dispatch_tokens_per_rank);
-                assert(recv_topk_idx->sizes[2] == static_cast<unsigned>(handle->num_topk));
-                assert(src_rank_counter != nullptr);
-                assert(src_rank_counter->ndim == 1);
-                assert(src_rank_counter->datatype == ncclInt32);
-                assert(src_rank_counter->sizes[0] == static_cast<unsigned>(group->nRanks));
-                break;
-            default:
-                assert(recv_x->ndim == 3);
-                assert(recv_x->sizes[0] == group->num_local_experts);
-                assert(recv_x->sizes[1] == num_recv_tokens);
-                assert(recv_x->sizes[2] == static_cast<unsigned>(hidden));
-                assert(topk_weights_in   == nullptr);
-                assert(recv_topk_weights == nullptr);
-                assert(recv_topk_idx     == nullptr);
-                assert(src_rank_counter == nullptr);
-                break;
+        case NCCL_EP_LAYOUT_RANK_MAJOR:
+            // Rank-major output is 3D so the per-rank, per-slot structure is
+            // explicit in the descriptor — the caller must acknowledge it.
+            assert(recv_x->ndim == 3);
+            assert(recv_x->sizes[0] == static_cast<unsigned>(group->nRanks));
+            assert(recv_x->sizes[1] == group->config.max_dispatch_tokens_per_rank);
+            assert(recv_x->sizes[2] == static_cast<unsigned>(hidden));
+            assert(topk_weights_in != nullptr);
+            assert(recv_topk_weights != nullptr);
+            assert(recv_topk_idx != nullptr);
+            assert(topk_weights_in->ndim == 2);
+            assert(topk_weights_in->datatype == ncclFloat32);
+            assert(topk_weights_in->sizes[0] == static_cast<unsigned>(handle->num_tokens));
+            assert(topk_weights_in->sizes[1] == static_cast<unsigned>(handle->num_topk));
+            assert(recv_topk_weights->ndim == 3);
+            assert(recv_topk_weights->datatype == ncclFloat32);
+            assert(recv_topk_weights->sizes[0] == static_cast<unsigned>(group->nRanks));
+            assert(recv_topk_weights->sizes[1] == group->config.max_dispatch_tokens_per_rank);
+            assert(recv_topk_weights->sizes[2] == static_cast<unsigned>(handle->num_topk));
+            assert(recv_topk_idx->ndim == 3);
+            assert(recv_topk_idx->datatype == ncclInt32);
+            assert(recv_topk_idx->sizes[0] == static_cast<unsigned>(group->nRanks));
+            assert(recv_topk_idx->sizes[1] == group->config.max_dispatch_tokens_per_rank);
+            assert(recv_topk_idx->sizes[2] == static_cast<unsigned>(handle->num_topk));
+            assert(src_rank_counter != nullptr);
+            assert(src_rank_counter->ndim == 1);
+            assert(src_rank_counter->datatype == ncclInt32);
+            assert(src_rank_counter->sizes[0] == static_cast<unsigned>(group->nRanks));
+            break;
+        default:
+            assert(recv_x->ndim == 3);
+            assert(recv_x->sizes[0] == group->num_local_experts);
+            assert(recv_x->sizes[1] == num_recv_tokens);
+            assert(recv_x->sizes[2] == static_cast<unsigned>(hidden));
+            assert(topk_weights_in == nullptr);
+            assert(recv_topk_weights == nullptr);
+            assert(recv_topk_idx == nullptr);
+            assert(src_rank_counter == nullptr);
+            break;
         }
 
         if (scales != nullptr) {
@@ -2953,15 +2965,16 @@ ncclResult_t ncclEpDispatch(
             assert(scales->datatype == ncclFloat32);
             assert(scales->sizes[0] == group->num_local_experts);
             assert(scales->sizes[1] == group->config.max_dispatch_tokens_per_rank * group->nRanks);
-            EP_HOST_ASSERT(scales->sizes[2] > 0 && hidden % static_cast<int>(scales->sizes[2]) == 0 &&
-                           "LL FP8 output scales: sizes[2] must be a non-zero divisor of hidden");
+            EP_HOST_ASSERT(
+                scales->sizes[2] > 0 && hidden % static_cast<int>(scales->sizes[2]) == 0 &&
+                "LL FP8 output scales: sizes[2] must be a non-zero divisor of hidden");
             // Infer scale block size from the caller-supplied output scales tensor.
             const int scale_block_size = hidden / static_cast<int>(scales->sizes[2]);
             assert(hidden % 512 == 0);
             const size_t fp8_payload_bytes =
                 static_cast<size_t>(hidden) + static_cast<size_t>(scales->sizes[2]) * sizeof(float);
-            EP_HOST_ASSERT(fp8_payload_bytes <= group->config.max_token_bytes &&
-                           "FP8 dispatch bytes exceed max_token_bytes");
+            EP_HOST_ASSERT(
+                fp8_payload_bytes <= group->config.max_token_bytes && "FP8 dispatch bytes exceed max_token_bytes");
             (void)scale_block_size; // used below when threading to kernel
         }
 
@@ -2974,8 +2987,9 @@ ncclResult_t ncclEpDispatch(
             assert(in_scales_outer->ndim == 2);
             assert(in_scales_outer->datatype == ncclFloat32 || in_scales_outer->datatype == ncclUint8);
             assert(in_scales_outer->sizes[0] == handle->num_tokens);
-            EP_HOST_ASSERT(in_scales_outer->sizes[1] > 0 && hidden % static_cast<int>(in_scales_outer->sizes[1]) == 0 &&
-                           "LL FP8 input scales: sizes[1] must be a non-zero divisor of hidden");
+            EP_HOST_ASSERT(
+                in_scales_outer->sizes[1] > 0 && hidden % static_cast<int>(in_scales_outer->sizes[1]) == 0 &&
+                "LL FP8 input scales: sizes[1] must be a non-zero divisor of hidden");
             // scale_block_size inferred: hidden / numScales; any divisor of hidden is valid.
         } else {
             assert(in_scales_outer == nullptr && "inputs->scales must be null for BF16 LL dispatch");
@@ -3004,11 +3018,8 @@ ncclResult_t ncclEpDispatch(
         // (via P2P peer pointer) and the receiver skips the staging→recv_x copy.
         const bool nvlink_only = (group->lsa_team_size == group->nRanks);
         const bool use_fp8_outer = (scales != nullptr) || extern_fp8_outer;
-        const bool zero_copy_recv_x =
-            nvlink_only &&
-            handle->layout == NCCL_EP_LAYOUT_RANK_MAJOR &&
-            !use_fp8_outer &&
-            recv_x->win_hdl != ncclWindow_t{};
+        const bool zero_copy_recv_x = nvlink_only && handle->layout == NCCL_EP_LAYOUT_RANK_MAJOR && !use_fp8_outer &&
+                                      recv_x->win_hdl != ncclWindow_t{};
         // Strict zero_copy=ON contract: all opportunistic conditions must
         // hold, else the call is misconfigured. AUTO/OFF stay opportunistic
         // (matches pre-enum behavior; missing windows just stage through
@@ -3017,21 +3028,19 @@ ncclResult_t ncclEpDispatch(
             const char* reason =
                 !nvlink_only ? "requires nvlink-only topology (lsa_team_size == nRanks)" :
                 handle->layout != NCCL_EP_LAYOUT_RANK_MAJOR ? "requires NCCL_EP_LAYOUT_RANK_MAJOR" :
-                use_fp8_outer ? "is not supported with FP8 outputs" :
-                "requires outputs->tokens to be backed by an NCCL window (ncclCommWindowRegister)";
+                use_fp8_outer                               ? "is not supported with FP8 outputs" :
+                                "requires outputs->tokens to be backed by an NCCL window (ncclCommWindowRegister)";
             fprintf(stderr, "NCCL EP: zero_copy=ON on LL dispatch %s\n", reason);
             return ncclInvalidArgument;
         }
-        const ncclWindow_t recv_data_window =
-            zero_copy_recv_x ? recv_x->win_hdl : ncclWindow_t{};
-        const size_t recv_data_offset =
-            zero_copy_recv_x ? static_cast<size_t>(recv_x->win_offset) : 0;
+        const ncclWindow_t recv_data_window = zero_copy_recv_x ? recv_x->win_hdl : ncclWindow_t{};
+        const size_t recv_data_offset = zero_copy_recv_x ? static_cast<size_t>(recv_x->win_offset) : 0;
         auto dispatch_fn = [=](int phases) {
             char* rdma_base = static_cast<char*>(group->rdma_buffer);
             void* dispatch_send_ptr = rdma_base + buffer.dispatch_rdma_send_buffer_offset;
             void* dispatch_recv_ptr = rdma_base + buffer.dispatch_rdma_recv_data_buffer_offset;
-            int*  dispatch_count_ptr = reinterpret_cast<int*>(rdma_base + buffer.dispatch_rdma_recv_count_buffer_offset);
-            int*  next_clean_ptr = reinterpret_cast<int*>(rdma_base + next_clean_meta.first);
+            int* dispatch_count_ptr = reinterpret_cast<int*>(rdma_base + buffer.dispatch_rdma_recv_count_buffer_offset);
+            int* next_clean_ptr = reinterpret_cast<int*>(rdma_base + next_clean_meta.first);
             // Prepare data pointers
             auto* recv_x_data = recv_x->data;
             auto* scales_data = scales ? scales->data : nullptr;
@@ -3059,15 +3068,13 @@ ncclResult_t ncclEpDispatch(
             // kernel specialization (TopkIdxT). The lambda packs the shared
             // DispatchParams and threads extern-FP8 + zero-copy through.
             auto launch_dispatch = [&](auto* topk_idx_data, bool topk_is_int64) {
-                auto* in_scales_data = extern_fp8
-                    ? static_cast<const uint8_t*>(in_scales_outer->data) : nullptr;
+                auto* in_scales_data = extern_fp8 ? static_cast<const uint8_t*>(in_scales_outer->data) : nullptr;
                 nccl_ep::internode_ll::DispatchParams params{};
                 params.inData = x_data;
                 params.inScalesBuf = in_scales_data;
                 params.inTopkIdx = topk_idx_data;
                 params.topkIdxIsInt64 = topk_is_int64;
-                params.scalesPerToken = extern_fp8
-                    ? static_cast<int>(in_scales_outer->sizes[1]) : (hidden / 128);
+                params.scalesPerToken = extern_fp8 ? static_cast<int>(in_scales_outer->sizes[1]) : (hidden / 128);
                 params.inTopkWeights = topk_weights_in_data;
                 params.outDataBuf = recv_x_data;
                 params.outScalesBuf = scales_data;
@@ -3115,21 +3122,20 @@ ncclResult_t ncclEpDispatch(
                 nccl_ep::internode_ll::call_dispatch(params, use_fp8, stream);
             };
             switch (handle->topk_idx.datatype) {
-                case ncclInt32:
-                    launch_dispatch(static_cast<const int32_t*>(handle->topk_idx.data), /*topk_is_int64=*/false);
-                    break;
-                case ncclInt64:
-                    launch_dispatch(static_cast<const int64_t*>(handle->topk_idx.data), /*topk_is_int64=*/true);
-                    break;
-                default:
-                    assert(false && "LL topk_idx must be ncclInt32 or ncclInt64");
+            case ncclInt32:
+                launch_dispatch(static_cast<const int32_t*>(handle->topk_idx.data), /*topk_is_int64=*/false);
+                break;
+            case ncclInt64:
+                launch_dispatch(static_cast<const int64_t*>(handle->topk_idx.data), /*topk_is_int64=*/true);
+                break;
+            default:
+                assert(false && "LL topk_idx must be ncclInt32 or ncclInt64");
             }
         };
 
         // Execute dispatch with appropriate phase flags
-        const int dispatch_phases = send_only ?
-            LOW_LATENCY_SEND_PHASE :
-            (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
+        const int dispatch_phases =
+            send_only ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
         dispatch_fn(dispatch_phases);
 
         if (send_only) {
@@ -3154,22 +3160,31 @@ ncclResult_t ncclEpDispatch(
         assert(x->ndim == 2);
         assert(x->sizes[0] == handle->num_tokens);
         assert(x->sizes[0] <= group->config.max_dispatch_tokens_per_rank);
-        assert(x->sizes[1] * ncclTypeSize(x->datatype) <= group->config.max_token_bytes &&
-               "HT dispatch token bytes must not exceed group's max_token_bytes");
+        assert(
+            x->sizes[1] * ncclTypeSize(x->datatype) <= group->config.max_token_bytes &&
+            "HT dispatch token bytes must not exceed group's max_token_bytes");
         const int hidden = static_cast<int>(x->sizes[1]);
         NCCLCHECK(resolveTensorWindowBinding(
-            group, x, &x_local, static_cast<uint64_t>(group->gin_config.token_staging_offset), &x));
+            group,
+            x,
+            &x_local,
+            static_cast<uint64_t>(group->gin_config.token_staging_offset),
+            &x));
 
         // For multi-node: copy user buffers to pre-registered staging buffers
         // The staging buffers were allocated and GIN-registered during Group Create
         // This avoids ~60ms GIN registration overhead on the dispatch hot path
-        void* token_ptr = x->data;  // Default: use user buffer directly
+        void* token_ptr = x->data; // Default: use user buffer directly
         const bool x_uses_external_window = tensorUsesExternalWindow(group, x);
-        if (!is_single_node && handle->hybridep.token_staging_buffer != nullptr &&
-            !x_uses_external_window) {
+        if (!is_single_node && handle->hybridep.token_staging_buffer != nullptr && !x_uses_external_window) {
             // Copy user tokens to pre-registered staging buffer (D2D copy is ~0.1ms vs ~30ms GIN registration)
             size_t token_size = x->sizes[0] * x->sizes[1] * ncclTypeSize(x->datatype);
-            CUDA_CHECK(cudaMemcpyAsync(handle->hybridep.token_staging_buffer, x->data, token_size, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                handle->hybridep.token_staging_buffer,
+                x->data,
+                token_size,
+                cudaMemcpyDeviceToDevice,
+                stream));
             token_ptr = handle->hybridep.token_staging_buffer;
         }
         // EXTERN quantization is requested by the presence of input scales (per Phuong):
@@ -3177,7 +3192,7 @@ ncclResult_t ncclEpDispatch(
         // scales to the experts unchanged (block size is irrelevant here — pure transport).
         bool use_fp8 = (scales != nullptr);
         if (use_fp8 && x->datatype != ncclFloat8e4m3 && x->datatype != ncclFloat8e5m2) {
-            return ncclInvalidArgument;  // scales given => tokens must be an FP8 type
+            return ncclInvalidArgument; // scales given => tokens must be an FP8 type
         }
         // local_dup / local_reduce JIT hard-codes uint16_t token type; FP8 is unsupported.
         if (use_fp8 && em_local_dup_active(group, handle->layout)) {
@@ -3189,9 +3204,10 @@ ncclResult_t ncclEpDispatch(
         // dense_to_sparse_prob consumer). Hard-reject early before any kernel
         // runs; the user can set NCCL_EP_HT_EM_NVLINK_DUP=1 to take that path.
         if (use_fp8 && em_local_permute_enabled(group, handle)) {
-            fprintf(stderr,
-                    "NCCL EP: HT EM with fp8 is not supported on the local-permute path; "
-                    "set NCCL_EP_HT_EM_NVLINK_DUP=1 to use the nvlink_dup path.\n");
+            fprintf(
+                stderr,
+                "NCCL EP: HT EM with fp8 is not supported on the local-permute path; "
+                "set NCCL_EP_HT_EM_NVLINK_DUP=1 to use the nvlink_dup path.\n");
             return ncclInvalidArgument;
         }
         // Derive scale element size from the dtype in the caller-supplied scales tensor.
@@ -3199,17 +3215,26 @@ ncclResult_t ncclEpDispatch(
         const int scale_elem_bytes = (use_fp8 && scales->datatype == ncclUint8) ? 1 : static_cast<int>(sizeof(float));
         if (use_fp8) {
             NCCLCHECK(resolveTensorWindowBinding(
-                group, scales, &scales_local, static_cast<uint64_t>(group->gin_config.scaling_factor_staging_offset), &scales));
+                group,
+                scales,
+                &scales_local,
+                static_cast<uint64_t>(group->gin_config.scaling_factor_staging_offset),
+                &scales));
         }
 
         // For FP8: copy user scaling factors to pre-registered staging buffer
-        void* scales_ptr = use_fp8 ? scales->data : nullptr;  // Default: use user buffer directly
+        void* scales_ptr = use_fp8 ? scales->data : nullptr; // Default: use user buffer directly
         const bool scales_uses_external_window = use_fp8 && tensorUsesExternalWindow(group, scales);
         if (use_fp8 && !is_single_node && handle->hybridep.scaling_factor_staging_buffer != nullptr &&
             !scales_uses_external_window) {
             // Copy user scaling factors to pre-registered staging buffer (D2D copy is ~0.1ms vs ~30ms GIN registration)
             size_t scales_size = scales->sizes[0] * scales->sizes[1] * ncclTypeSize(scales->datatype);
-            CUDA_CHECK(cudaMemcpyAsync(handle->hybridep.scaling_factor_staging_buffer, scales->data, scales_size, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                handle->hybridep.scaling_factor_staging_buffer,
+                scales->data,
+                scales_size,
+                cudaMemcpyDeviceToDevice,
+                stream));
             scales_ptr = handle->hybridep.scaling_factor_staging_buffer;
         }
         if (use_fp8) {
@@ -3220,26 +3245,30 @@ ncclResult_t ncclEpDispatch(
         // HT dispatch kernel uses TMA for token/prob/scaling-factor payloads.
         // Keep these constraints at API-entry to fail fast on unsupported shapes.
         const int experts_per_node = group->num_local_experts * group->lsa_team_size;
-        assert((experts_per_node * static_cast<int>(sizeof(float))) % 16 == 0 &&
-               "HT dispatch requires experts_per_node to be multiple of 4 (16B prob TMA alignment)");
+        assert(
+            (experts_per_node * static_cast<int>(sizeof(float))) % 16 == 0 &&
+            "HT dispatch requires experts_per_node to be multiple of 4 (16B prob TMA alignment)");
 
-        const size_t token_bytes_per_token =
-            static_cast<size_t>(hidden) * ncclTypeSize(x->datatype);
-        assert((token_bytes_per_token % 16) == 0 &&
-               "HT dispatch requires token bytes per token to be 16B aligned for TMA");
+        const size_t token_bytes_per_token = static_cast<size_t>(hidden) * ncclTypeSize(x->datatype);
+        assert(
+            (token_bytes_per_token % 16) == 0 &&
+            "HT dispatch requires token bytes per token to be 16B aligned for TMA");
 
         // Infer FP8 scale block size from the caller's input scales tensor.
         // Buffer was pre-allocated for scale_block_size >= kFP8ExternScaleBlockSize (see group create).
         const int num_scales_per_token = use_fp8 ? static_cast<int>(scales->sizes[1]) : 0;
         if (use_fp8) {
-            EP_HOST_ASSERT(num_scales_per_token > 0 && hidden % num_scales_per_token == 0 &&
-                           "HT dispatch FP8: scales->sizes[1] must be a non-zero divisor of hidden");
+            EP_HOST_ASSERT(
+                num_scales_per_token > 0 && hidden % num_scales_per_token == 0 &&
+                "HT dispatch FP8: scales->sizes[1] must be a non-zero divisor of hidden");
             const int scale_block_size = hidden / num_scales_per_token;
-            EP_HOST_ASSERT(scale_block_size >= kFP8ExternScaleBlockSize &&
-                           "HT dispatch FP8: scale_block_size < kFP8ExternScaleBlockSize; "
-                           "pre-allocated output scale buffer too small (future: set max_scale_bytes_per_token in config)");
-            assert(((num_scales_per_token * scale_elem_bytes) % 16) == 0 &&
-                   "HT dispatch FP8 requires scaling-factor bytes per token to be 16B aligned");
+            EP_HOST_ASSERT(
+                scale_block_size >= kFP8ExternScaleBlockSize &&
+                "HT dispatch FP8: scale_block_size < kFP8ExternScaleBlockSize; "
+                "pre-allocated output scale buffer too small (future: set max_scale_bytes_per_token in config)");
+            assert(
+                ((num_scales_per_token * scale_elem_bytes) % 16) == 0 &&
+                "HT dispatch FP8 requires scaling-factor bytes per token to be 16B aligned");
         }
 
         // Output tensors
@@ -3271,7 +3300,11 @@ ncclResult_t ncclEpDispatch(
             assert(topk_weights->sizes[0] == handle->num_tokens);
             assert(topk_weights->sizes[1] == handle->num_topk);
             NCCLCHECK(resolveTensorWindowBinding(
-                group, topk_weights, &topk_weights_local, static_cast<uint64_t>(group->gin_config.dense_prob_offset), &topk_weights));
+                group,
+                topk_weights,
+                &topk_weights_local,
+                static_cast<uint64_t>(group->gin_config.dense_prob_offset),
+                &topk_weights));
         } else {
             if (topk_weights != nullptr || recv_topk_weights != nullptr || recv_topk_idx != nullptr) {
                 return ncclInvalidArgument;
@@ -3281,9 +3314,11 @@ ncclResult_t ncclEpDispatch(
         // FWD only: rebuild dense prob from cached topk_idx + caller topk_weights.
         float* dense_prob = handle->hybridep.dense_prob_buffer;
         if (forward_dispatch) {
-            assert(handle->hybridep.topk_idx != nullptr &&
-                   "HT FWD dispatch: hybridep.topk_idx missing (ncclEpUpdateHandle not called?)");
-            size_t dense_prob_size = static_cast<size_t>(handle->num_tokens) * group->config.num_experts * sizeof(float);
+            assert(
+                handle->hybridep.topk_idx != nullptr &&
+                "HT FWD dispatch: hybridep.topk_idx missing (ncclEpUpdateHandle not called?)");
+            size_t dense_prob_size =
+                static_cast<size_t>(handle->num_tokens) * group->config.num_experts * sizeof(float);
             CUDA_CHECK(cudaMemsetAsync(dense_prob, 0, dense_prob_size, stream));
 
             if (handle->topk_idx.datatype == ncclInt32) {
@@ -3327,9 +3362,10 @@ ncclResult_t ncclEpDispatch(
         std::vector<void*> dispatch_output_token_ptrs;
         const bool recv_x_uses_external_window = tensorUsesExternalWindow(group, recv_x);
         if (group->config.zero_copy == NCCL_EP_ZERO_COPY_ON && !recv_x_uses_external_window) {
-            fprintf(stderr,
-                    "NCCL EP: zero_copy requires ncclEpDispatch outputs->tokens to be backed by a "
-                    "user-registered NCCL window (ncclCommWindowRegister)\n");
+            fprintf(
+                stderr,
+                "NCCL EP: zero_copy requires ncclEpDispatch outputs->tokens to be backed by a "
+                "user-registered NCCL window (ncclCommWindowRegister)\n");
             return ncclInvalidArgument;
         }
         // em_permute always writes to staging (the permute kernel below copies
@@ -3337,10 +3373,7 @@ ncclResult_t ncclEpDispatch(
         // since the permute kernel just dereferences recv_x->data.
         const bool em_permute_active = em_local_permute_enabled(group, handle);
         if (recv_x_uses_external_window && !em_permute_active) {
-            NCCLCHECK(buildIntranodePtrArray<void>(
-                group,
-                recv_x,
-                dispatch_output_token_ptrs));
+            NCCLCHECK(buildIntranodePtrArray<void>(group, recv_x, dispatch_output_token_ptrs));
             params.expert_output_token_ptrs = dispatch_output_token_ptrs.data();
         } else {
             params.expert_output_token_ptrs = group->ht_buffers.dispatch_expert_output_token_buffer_ptrs;
@@ -3349,15 +3382,13 @@ ncclResult_t ncclEpDispatch(
         std::vector<uint8_t*> dispatch_output_sf_ptrs;
         const bool recv_scales_uses_external_window = use_fp8 && tensorUsesExternalWindow(group, recv_scales);
         if (recv_scales_uses_external_window) {
-            NCCLCHECK(buildIntranodePtrArray<uint8_t>(
-                group,
-                recv_scales,
-                dispatch_output_sf_ptrs));
+            NCCLCHECK(buildIntranodePtrArray<uint8_t>(group, recv_scales, dispatch_output_sf_ptrs));
             params.expert_output_scaling_factor_ptrs = dispatch_output_sf_ptrs.data();
         } else {
-            params.expert_output_scaling_factor_ptrs = use_fp8
-                ? reinterpret_cast<uint8_t* const*>(group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs)
-                : nullptr;
+            params.expert_output_scaling_factor_ptrs =
+                use_fp8 ? reinterpret_cast<uint8_t* const*>(
+                              group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs) :
+                          nullptr;
         }
         // EM-permute path runs the dispatch kernel in FLAT layout and reshuffles
         // FLAT staging into EM zones via the local permute kernel below. BWD
@@ -3366,20 +3397,19 @@ ncclResult_t ncclEpDispatch(
         params.rdma_to_attn_map = handle->hybridep.rdma_to_attn_map;
         params.attn_to_rdma_map = handle->hybridep.attn_to_rdma_map;
         params.sparse_to_dense_map = handle->hybridep.sparse_to_dense_map;
-        params.s2d_inner_dim = (expert_major && !em_permute_active)
-            ? handle->num_topk : group->lsa_team_size;
+        params.s2d_inner_dim = (expert_major && !em_permute_active) ? handle->num_topk : group->lsa_team_size;
         params.layout = em_permute_active ? NCCL_EP_LAYOUT_RANK_MAJOR : handle->layout;
         // s2d_inner_dim must pair with layout (mismatch → OOB in combine reduction).
-        assert((params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR)
-                   ? (params.s2d_inner_dim == handle->num_topk)
-                   : (params.s2d_inner_dim == group->lsa_team_size));
+        assert(
+            (params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? (params.s2d_inner_dim == handle->num_topk) :
+                                                             (params.s2d_inner_dim == group->lsa_team_size));
         // Expert-major zero-padding inputs for the in-kernel PAD warp; suppressed
         // in EM-permute mode (permute kernel writes pads after dispatch).
         const bool fused_em_pad = expert_major && !em_permute_active;
         params.pad_actual_counts = fused_em_pad ? handle->hybridep.per_expert_counts_active : nullptr;
         params.pad_expert_token_offsets = fused_em_pad ? handle->hybridep.expert_token_offsets : nullptr;
-        params.pad_alignment = fused_em_pad
-            ? static_cast<int>(handle->hybridep.dispatch_output_per_expert_alignment) : 0;
+        params.pad_alignment =
+            fused_em_pad ? static_cast<int>(handle->hybridep.dispatch_output_per_expert_alignment) : 0;
         // Always pass a valid device pointer — the kernel unconditionally
         // dereferences this even in single-node mode (the value is just unused).
         params.expected_rdma_flag_value = group->ht_buffers.dev_dispatch_expected_rdma;
@@ -3391,7 +3421,7 @@ ncclResult_t ncclEpDispatch(
         // Pass device communicators and windows
         // Always pass a valid devComm (single-node too): the HT LSA sync-guard uses the NCCL LSA
         // barrier (needs comm.lsaBarrier). GIN/RDMA paths stay if-constexpr-gated (out single-node).
-        //TODO: remove multiple gin comm notion from group
+        // TODO: remove multiple gin comm notion from group
         params.dcomm = group->gin_config.dcomms[0];
         params.nccl_token_window = x->win_hdl;
         params.nccl_prob_window = forward_dispatch ? group->gin_config.nccl_window : ncclWindow_t{};
@@ -3402,9 +3432,10 @@ ncclResult_t ncclEpDispatch(
         // Use offsets relative to gin_base_ptr
         // All buffers are part of one large registered window
         // Calculate bytes_per_entry for batched staging
-        size_t bytes_per_token_entry = group->config.max_token_bytes;  // token data
-        size_t bytes_per_prob_entry = (group->num_local_experts * group->lsa_team_size) * sizeof(float);  // prob data
-        size_t bytes_per_sf_entry = use_fp8 ? static_cast<size_t>(num_scales_per_token) * scale_elem_bytes : 0;  // FP8 scaling factor
+        size_t bytes_per_token_entry = group->config.max_token_bytes; // token data
+        size_t bytes_per_prob_entry = (group->num_local_experts * group->lsa_team_size) * sizeof(float); // prob data
+        size_t bytes_per_sf_entry =
+            use_fp8 ? static_cast<size_t>(num_scales_per_token) * scale_elem_bytes : 0; // FP8 scaling factor
         size_t bytes_per_entry = bytes_per_token_entry + bytes_per_prob_entry + bytes_per_sf_entry;
 
         params.mr_info = {
@@ -3413,7 +3444,8 @@ ncclResult_t ncclEpDispatch(
             .attn_input_scaling_factor_offset = (is_single_node || !use_fp8) ? 0 : scales->win_offset,
             // Batched staging parameters (packed layout)
             .rdma_send_staging_offset = is_single_node ? 0 : group->gin_config.rdma_send_staging_offset,
-            .rdma_inter_node_group_packed_offset = is_single_node ? 0 : group->gin_config.rdma_inter_node_group_packed_offset,
+            .rdma_inter_node_group_packed_offset =
+                is_single_node ? 0 : group->gin_config.rdma_inter_node_group_packed_offset,
             .guard_offset = is_single_node ? 0 : group->gin_config.dispatch_guard_offset,
             .bytes_per_entry = bytes_per_entry,
             .max_tokens_per_dest = static_cast<size_t>(group->config.max_dispatch_tokens_per_rank),
@@ -3426,24 +3458,23 @@ ncclResult_t ncclEpDispatch(
         params.num_tokens_per_rank = group->config.max_dispatch_tokens_per_rank;
         // EM local-fanout: dispatch dedups S2G; receiver local_dup fills secondaries.
         const bool em_unfused_active = em_local_dup_active(group, handle->layout);
-        params.local_dup_num_sms = em_unfused_active
-                                   ? static_cast<int>(group->prolog_epilog_sms) : 0;
+        params.local_dup_num_sms = em_unfused_active ? static_cast<int>(group->prolog_epilog_sms) : 0;
 
         // Call dispatch kernel
         const int sf_bytes_per_token = use_fp8 ? num_scales_per_token * scale_elem_bytes : 0;
-        NCCLCHECK(nccl_ep::hybridep::call_dispatch(
-            params,
-            group->ht_aligned_max_tokens,
-            group->ht_tokens_per_chunk,
-            group->rdma_team_size,
-            use_fp8,
-            forward_dispatch,
-            static_cast<int>(group->comm_num_sms),
-            sf_bytes_per_token,
-            &group->env,
-            stream,
-            x->datatype
-        ));
+        NCCLCHECK(
+            nccl_ep::hybridep::call_dispatch(
+                params,
+                group->ht_aligned_max_tokens,
+                group->ht_tokens_per_chunk,
+                group->rdma_team_size,
+                use_fp8,
+                forward_dispatch,
+                static_cast<int>(group->comm_num_sms),
+                sf_bytes_per_token,
+                &group->env,
+                stream,
+                x->datatype));
 
         // Fan primaries out to secondary em_slots in this rank's recv buffer.
         if (em_unfused_active) {
@@ -3451,9 +3482,7 @@ ncclResult_t ncclEpDispatch(
                 /*expert_output_token=*/
                 group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->lsa_rank],
                 /*expert_output_prob=*/
-                forward_dispatch
-                    ? group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank]
-                    : nullptr,
+                forward_dispatch ? group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank] : nullptr,
                 handle->hybridep.emuf_group_buf,
                 handle->hybridep.emuf_group_count,
                 handle->hybridep.emuf_group_stride,
@@ -3486,10 +3515,12 @@ ncclResult_t ncclEpDispatch(
         // FP8-scales D2D; the em-permute path reads num_tokens_for_experts on
         // device, so skip the sync entirely when it fires.
         if (!is_capturing && !em_permute_active) {
-            CUDA_CHECK(cudaMemcpyAsync(&actual_recv_tokens,
-                                       handle->hybridep.num_tokens_for_experts,
-                                       sizeof(actual_recv_tokens),
-                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                &actual_recv_tokens,
+                handle->hybridep.num_tokens_for_experts,
+                sizeof(actual_recv_tokens),
+                cudaMemcpyDeviceToHost,
+                stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
             assert(actual_recv_tokens <= max_recv_tokens);
         }
@@ -3507,12 +3538,11 @@ ncclResult_t ncclEpDispatch(
                 return ncclInvalidArgument;
             }
             // Clamp to staging capacity (see token_staging_slots).
-            const unsigned int clamped_rows = static_cast<unsigned int>(
-                std::min<size_t>(recv_copy_rows, group->ht_buffers.token_staging_slots));
+            const unsigned int clamped_rows =
+                static_cast<unsigned int>(std::min<size_t>(recv_copy_rows, group->ht_buffers.token_staging_slots));
             size_t copy_size = static_cast<size_t>(clamped_rows) * recv_x->sizes[1] * ncclTypeSize(recv_x->datatype);
             void* src = group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->lsa_rank];
-            CUDA_CHECK(cudaMemcpyAsync(recv_x->data, src, copy_size,
-                cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(recv_x->data, src, copy_size, cudaMemcpyDeviceToDevice, stream));
         }
 
         /* ===== Convert dense output → sparse format ===== */
@@ -3523,7 +3553,8 @@ ncclResult_t ncclEpDispatch(
             if (recv_topk_weights == nullptr) {
                 return ncclInvalidArgument;
             }
-            NCCLCHECK(resolveTensorWindowBinding(group, recv_topk_weights, &recv_topk_weights_local, 0, &recv_topk_weights));
+            NCCLCHECK(
+                resolveTensorWindowBinding(group, recv_topk_weights, &recv_topk_weights_local, 0, &recv_topk_weights));
             const bool em = (handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
             if (em) {
                 if (recv_topk_idx != nullptr) {
@@ -3537,18 +3568,15 @@ ncclResult_t ncclEpDispatch(
             }
             assert(recv_topk_weights->datatype == ncclFloat32);
             if (em) {
-                assert(recv_topk_weights->ndim == 1 &&
-                       "HT EM recv_topk_weights must be 1D [num_recv_tokens]");
+                assert(recv_topk_weights->ndim == 1 && "HT EM recv_topk_weights must be 1D [num_recv_tokens]");
                 if (recv_topk_weights->sizes[0] < max_recv_tokens) {
                     return ncclInvalidArgument;
                 }
             } else {
-                assert(recv_topk_weights->ndim == 2 &&
-                       "HT FLAT recv_topk_weights must be 2D [num_recv_tokens, top_k]");
+                assert(recv_topk_weights->ndim == 2 && "HT FLAT recv_topk_weights must be 2D [num_recv_tokens, top_k]");
                 assert(recv_topk_idx->ndim == 2);
                 assert(recv_topk_idx->datatype == ncclInt64);
-                if (recv_topk_weights->sizes[0] < max_recv_tokens ||
-                    recv_topk_idx->sizes[0] < max_recv_tokens ||
+                if (recv_topk_weights->sizes[0] < max_recv_tokens || recv_topk_idx->sizes[0] < max_recv_tokens ||
                     recv_topk_weights->sizes[0] != recv_topk_idx->sizes[0]) {
                     return ncclInvalidArgument;
                 }
@@ -3569,12 +3597,10 @@ ncclResult_t ncclEpDispatch(
             // published by em_scan_kernel. The local permute kernel below
             // reshuffles FLAT scratch into the caller's EM recv buffer.
             const bool dsp_em = em && !em_permute_active;
-            float*   dsp_topk_weights = em_permute_active
-                ? handle->hybridep.recv_topk_weights_flat
-                : static_cast<float*>(recv_topk_weights->data);
-            int64_t* dsp_topk_idx = em_permute_active
-                ? nullptr
-                : (recv_topk_idx ? static_cast<int64_t*>(recv_topk_idx->data) : nullptr);
+            float* dsp_topk_weights = em_permute_active ? handle->hybridep.recv_topk_weights_flat :
+                                                          static_cast<float*>(recv_topk_weights->data);
+            int64_t* dsp_topk_idx =
+                em_permute_active ? nullptr : (recv_topk_idx ? static_cast<int64_t*>(recv_topk_idx->data) : nullptr);
 
             nccl_ep::hybridep::dense_to_sparse_prob(
                 group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank],
@@ -3610,7 +3636,7 @@ ncclResult_t ncclEpDispatch(
             }
             const int row_bytes = static_cast<int>(recv_x->sizes[1]) * ncclTypeSize(recv_x->datatype);
             if (row_bytes <= 0 || (row_bytes % 16) != 0) {
-                return ncclInvalidArgument;  // int4-vectorized row copy requires 16B-aligned row
+                return ncclInvalidArgument; // int4-vectorized row copy requires 16B-aligned row
             }
             nccl_ep::hybridep::launch_dispatch_permute(
                 recv_x->data,
@@ -3636,8 +3662,10 @@ ncclResult_t ncclEpDispatch(
                 if (recv_scales->sizes[0] < recv_copy_rows) {
                     return ncclInvalidArgument;
                 }
-                size_t copy_size = static_cast<size_t>(recv_copy_rows) * recv_scales->sizes[1] * ncclTypeSize(recv_scales->datatype);
-                CUDA_CHECK(cudaMemcpyAsync(recv_scales->data,
+                size_t copy_size =
+                    static_cast<size_t>(recv_copy_rows) * recv_scales->sizes[1] * ncclTypeSize(recv_scales->datatype);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    recv_scales->data,
                     group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[group->lsa_rank],
                     copy_size,
                     cudaMemcpyDeviceToDevice,
@@ -3653,17 +3681,17 @@ ncclResult_t ncclEpCombine(
     const ncclEpCombineInputs_t* inputs,
     const ncclEpCombineOutputs_t* outputs,
     const ncclEpCombineConfig_t* config,
-    cudaStream_t stream
-) {
+    cudaStream_t stream) {
     EP_REQUIRE_STRUCT(inputs);
     EP_REQUIRE_STRUCT(outputs);
     EP_OPTIONAL_STRUCT(config);
     const unsigned int send_only = config ? config->send_only : 0;
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
-    if (pass_direction != NCCL_EP_FWD_PASS &&
-        handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        fprintf(stderr, "ncclEpCombine: backward pass (pass_direction=%d) is not supported in LL mode\n",
-                (int)pass_direction);
+    if (pass_direction != NCCL_EP_FWD_PASS && handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
+        fprintf(
+            stderr,
+            "ncclEpCombine: backward pass (pass_direction=%d) is not supported in LL mode\n",
+            (int)pass_direction);
         return ncclInvalidUsage;
     }
 
@@ -3684,8 +3712,7 @@ ncclResult_t ncclEpCombine(
     {
         const ncclEpTensor_t* xt = tensor_required(inputs->tokens);
         if (!validate_dtype(xt->datatype)) {
-            fprintf(stderr, "NCCL EP: combine unsupported token dtype %d\n",
-                    static_cast<int>(xt->datatype));
+            fprintf(stderr, "NCCL EP: combine unsupported token dtype %d\n", static_cast<int>(xt->datatype));
             return ncclInvalidArgument;
         }
     }
@@ -3706,8 +3733,7 @@ ncclResult_t ncclEpCombine(
             topk_weights = nullptr;
         } else {
             topk_weights = tensor_ptr(outputs->topk_weights);
-            EP_HOST_ASSERT(topk_weights != nullptr &&
-                           "expert-major combine requires topk_weights in outputs");
+            EP_HOST_ASSERT(topk_weights != nullptr && "expert-major combine requires topk_weights in outputs");
         }
 
         // Extract configuration values
@@ -3718,33 +3744,34 @@ ncclResult_t ncclEpCombine(
         // Extract hidden dimension (index differs by layout).
         int hidden;
         switch (handle->layout) {
-            case NCCL_EP_LAYOUT_RANK_MAJOR:
-                // Rank-major input is 3D so the per-rank, per-slot structure is
-                // explicit in the descriptor — the caller must acknowledge it.
-                assert(x->ndim == 3);
-                assert(x->sizes[0] == static_cast<unsigned>(num_ranks));
-                assert(x->sizes[1] == static_cast<unsigned>(num_max_dispatch_tokens_per_rank));
-                assert(x->sizes[2] % sizeof(int4) == 0);
-                assert(x->sizes[2] % 128 == 0);
-                hidden = static_cast<int>(x->sizes[2]);
-                break;
-            default:
-                assert(x->ndim == 3);
-                assert(x->sizes[0] == num_experts / num_ranks);
-                assert(x->sizes[1] == static_cast<unsigned>(num_ranks) * num_max_dispatch_tokens_per_rank);
-                assert(x->sizes[2] % sizeof(int4) == 0);
-                assert(x->sizes[2] % 128 == 0);
-                hidden = static_cast<int>(x->sizes[2]);
-                break;
+        case NCCL_EP_LAYOUT_RANK_MAJOR:
+            // Rank-major input is 3D so the per-rank, per-slot structure is
+            // explicit in the descriptor — the caller must acknowledge it.
+            assert(x->ndim == 3);
+            assert(x->sizes[0] == static_cast<unsigned>(num_ranks));
+            assert(x->sizes[1] == static_cast<unsigned>(num_max_dispatch_tokens_per_rank));
+            assert(x->sizes[2] % sizeof(int4) == 0);
+            assert(x->sizes[2] % 128 == 0);
+            hidden = static_cast<int>(x->sizes[2]);
+            break;
+        default:
+            assert(x->ndim == 3);
+            assert(x->sizes[0] == num_experts / num_ranks);
+            assert(x->sizes[1] == static_cast<unsigned>(num_ranks) * num_max_dispatch_tokens_per_rank);
+            assert(x->sizes[2] % sizeof(int4) == 0);
+            assert(x->sizes[2] % 128 == 0);
+            hidden = static_cast<int>(x->sizes[2]);
+            break;
         }
 
-            // Validate topk_idx tensor (LL: int32 or int64; dtype must
-            // match what ncclEpUpdateHandle saw).
+        // Validate topk_idx tensor (LL: int32 or int64; dtype must
+        // match what ncclEpUpdateHandle saw).
         assert(topk_idx->ndim == 2);
-        assert((topk_idx->datatype == ncclInt32 || topk_idx->datatype == ncclInt64)
-               && "LL topk_idx must be ncclInt32 or ncclInt64");
+        assert(
+            (topk_idx->datatype == ncclInt32 || topk_idx->datatype == ncclInt64) &&
+            "LL topk_idx must be ncclInt32 or ncclInt64");
 
-            // Validate src_info tensor
+        // Validate src_info tensor
         assert(src_info->ndim == 1);
         assert(src_info->datatype == ncclInt32);
 
@@ -3784,8 +3811,8 @@ ncclResult_t ncclEpCombine(
             char* rdma_base = static_cast<char*>(handle->group->rdma_buffer);
             void* combine_send_ptr = rdma_base + buffer.combine_rdma_send_buffer_offset;
             void* combine_recv_ptr = rdma_base + buffer.combine_rdma_recv_data_buffer_offset;
-            int*  combine_flag_ptr = reinterpret_cast<int*>(rdma_base + buffer.combine_rdma_recv_flag_buffer_offset);
-            int*  next_clean_ptr = reinterpret_cast<int*>(rdma_base + next_clean_meta.first);
+            int* combine_flag_ptr = reinterpret_cast<int*>(rdma_base + buffer.combine_rdma_recv_flag_buffer_offset);
+            int* next_clean_ptr = reinterpret_cast<int*>(rdma_base + next_clean_meta.first);
             // Prepare data pointers
             auto* out_data = out->data;
             auto* x_data = x->data;
@@ -3840,25 +3867,25 @@ ncclResult_t ncclEpCombine(
                 nccl_ep::internode_ll::call_combine(params, stream);
             };
             switch (topk_idx->datatype) {
-                case ncclInt32:
-                    launch_combine(static_cast<const int32_t*>(topk_idx->data), /*topk_is_int64=*/false);
-                    break;
-                case ncclInt64:
-                    launch_combine(static_cast<const int64_t*>(topk_idx->data), /*topk_is_int64=*/true);
-                    break;
-                default:
-                    assert(false && "LL topk_idx must be ncclInt32 or ncclInt64");
+            case ncclInt32:
+                launch_combine(static_cast<const int32_t*>(topk_idx->data), /*topk_is_int64=*/false);
+                break;
+            case ncclInt64:
+                launch_combine(static_cast<const int64_t*>(topk_idx->data), /*topk_is_int64=*/true);
+                break;
+            default:
+                assert(false && "LL topk_idx must be ncclInt32 or ncclInt64");
             }
         };
 
         // Execute combine with appropriate phase flags
-        const int combine_phases = send_only ?
-            LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
+        const int combine_phases =
+            send_only ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
         combine_fn(combine_phases);
 
         if (send_only) {
-                handle->ll.continue_fn = combine_fn;
-            }
+            handle->ll.continue_fn = combine_fn;
+        }
     } else if (handle->group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
         // ===== HT mode =====
         // Combine: gather expert outputs back to original token positions
@@ -3866,7 +3893,7 @@ ncclResult_t ncclEpCombine(
         // Backward combine: tokens + gradients (training, topk_weights provided)
         ncclEpGroup_t group = handle->group;
         bool is_single_node = !is_internode_available(group);
-             //assert(is_single_node && "HT mode only supports single-node");
+        // assert(is_single_node && "HT mode only supports single-node");
 
         /* ===== Inputs validation ===== */
         const ncclEpTensor_t* x = tensor_required(inputs->tokens);
@@ -3877,7 +3904,11 @@ ncclResult_t ncclEpCombine(
         // Local copies for tensors that need window resolution; only populated when used.
         ncclEpTensor_t x_local, topk_weights_local, combined_topk_weights_local, combined_x_local;
         NCCLCHECK(resolveTensorWindowBinding(
-            group, x, &x_local, static_cast<uint64_t>(group->gin_config.rdma_intra_node_red_token_offset), &x));
+            group,
+            x,
+            &x_local,
+            static_cast<uint64_t>(group->gin_config.rdma_intra_node_red_token_offset),
+            &x));
 
         // Get dimensions from input tensor
         auto num_tokens = static_cast<int>(x->sizes[0]);
@@ -3922,19 +3953,29 @@ ncclResult_t ncclEpCombine(
             // Input shape validation by layout — must match FWD recv_topk_weights.
             assert(topk_weights->datatype == ncclFloat32);
             if (expert_major_in) {
-                assert(topk_weights->ndim == 1 &&
-                       "HT EM BWD combine: input topk_weights must be 1D [num_recv_tokens]");
+                assert(topk_weights->ndim == 1 && "HT EM BWD combine: input topk_weights must be 1D [num_recv_tokens]");
                 input_topk_stride = 1;
             } else {
-                assert(topk_weights->ndim == 2 &&
-                       "HT FLAT/RM BWD combine: input topk_weights must be 2D [num_recv, top_k]");
-                assert(static_cast<int>(topk_weights->sizes[1]) == num_topk &&
-                       "HT FLAT/RM BWD combine: input top_k must equal output top_k");
+                assert(
+                    topk_weights->ndim == 2 &&
+                    "HT FLAT/RM BWD combine: input topk_weights must be 2D [num_recv, top_k]");
+                assert(
+                    static_cast<int>(topk_weights->sizes[1]) == num_topk &&
+                    "HT FLAT/RM BWD combine: input top_k must equal output top_k");
                 input_topk_stride = num_topk;
             }
             NCCLCHECK(resolveTensorWindowBinding(
-                group, topk_weights, &topk_weights_local, static_cast<uint64_t>(group->gin_config.rdma_intra_node_red_prob_offset), &topk_weights));
-            NCCLCHECK(resolveTensorWindowBinding(group, combined_topk_weights, &combined_topk_weights_local, 0, &combined_topk_weights));
+                group,
+                topk_weights,
+                &topk_weights_local,
+                static_cast<uint64_t>(group->gin_config.rdma_intra_node_red_prob_offset),
+                &topk_weights));
+            NCCLCHECK(resolveTensorWindowBinding(
+                group,
+                combined_topk_weights,
+                &combined_topk_weights_local,
+                0,
+                &combined_topk_weights));
         } else {
             // FWD combine: input topk_weights forbidden. outputs->topk_weights is unused
             // by the kernel here and left to caller bookkeeping (not validated).
@@ -3950,25 +3991,24 @@ ncclResult_t ncclEpCombine(
         }
         assert(combined_x->ndim == 2);
         assert(combined_x->sizes[0] == num_combined_tokens); // Output should match original token count
-        assert(combined_x->sizes[1] == hidden);              // Should match input hidden dimension
+        assert(combined_x->sizes[1] == hidden); // Should match input hidden dimension
         NCCLCHECK(resolveTensorWindowBinding(group, combined_x, &combined_x_local, 0, &combined_x));
 
         /* ===== Copy input to IPC staging buffers ===== */
         // Expert MLP output needs to be in IPC buffer so other ranks can read it
         const bool combine_x_uses_external_window = tensorUsesExternalWindow(group, x);
         if (group->config.zero_copy == NCCL_EP_ZERO_COPY_ON && !combine_x_uses_external_window) {
-            fprintf(stderr,
-                    "NCCL EP: zero_copy requires ncclEpCombine inputs->tokens to be backed by a "
-                    "user-registered NCCL window (ncclCommWindowRegister)\n");
+            fprintf(
+                stderr,
+                "NCCL EP: zero_copy requires ncclEpCombine inputs->tokens to be backed by a "
+                "user-registered NCCL window (ncclCommWindowRegister)\n");
             return ncclInvalidArgument;
         }
         // em-permute path: gather caller EM x into FLAT staging via
         // local_permute_reduce so combine can run with FLAT layout. The kernel
         // also fuses a 1D EM to [num_flat, top_k] FLAT weight gather on BWD.
-        const bool em_permute_combine =
-            em_local_permute_enabled(group, handle);
-        const bool em_permute_bwd_weights =
-            em_permute_combine && backward_combine && expert_major_in;
+        const bool em_permute_combine = em_local_permute_enabled(group, handle);
+        const bool em_permute_bwd_weights = em_permute_combine && backward_combine && expert_major_in;
         // em-permute combine always runs the local_permute_reduce gather
         // (caller EM x -> FLAT staging), regardless of external-window — x->data
         // is the resolved device pointer either way.
@@ -3977,17 +4017,15 @@ ncclResult_t ncclEpCombine(
             // local_permute_reduce handles bf16/fp16/fp32.
             const int row_bytes = hidden * ncclTypeSize(x->datatype);
             if (row_bytes <= 0 || (row_bytes % 16) != 0) {
-                return ncclInvalidArgument;  // int4-vectorized row copy requires 16B-aligned row
+                return ncclInvalidArgument; // int4-vectorized row copy requires 16B-aligned row
             }
             nccl_ep::hybridep::launch_combine_reduce(
                 group->ht_buffers.expert_input_token,
                 x->data,
                 handle->hybridep.flat2em_slot_map,
                 handle->hybridep.num_tokens_for_experts,
-                em_permute_bwd_weights
-                    ? static_cast<const float*>(topk_weights->data) : nullptr,
-                em_permute_bwd_weights
-                    ? handle->hybridep.recv_topk_weights_flat : nullptr,
+                em_permute_bwd_weights ? static_cast<const float*>(topk_weights->data) : nullptr,
+                em_permute_bwd_weights ? handle->hybridep.recv_topk_weights_flat : nullptr,
                 handle->num_topk,
                 row_bytes,
                 static_cast<int>(group->device_sm_count),
@@ -4016,16 +4054,18 @@ ncclResult_t ncclEpCombine(
             // Zero-initialize the dense prob buffer before scattering
             CUDA_CHECK(cudaMemsetAsync(
                 group->ht_buffers.combine_expert_input_prob_buffer_ptrs[group->lsa_rank],
-                0, dense_prob_size, stream));
+                0,
+                dense_prob_size,
+                stream));
 
             // Scatter sparse weights into dense prob [num_recv, experts_per_node].
             // em-permute uses FLAT inputs (gathered above for EM, or passed
             // through for FLAT) keyed by the FLAT main LERM; nvlink_dup/local_dup EM keeps
             // the 1D EM input keyed by the EM-shape LERM scratch.
             const bool use_flat_inputs = em_permute_combine;
-            const float* prob_input = (use_flat_inputs && expert_major_in)
-                ? handle->hybridep.recv_topk_weights_flat
-                : static_cast<const float*>(topk_weights->data);
+            const float* prob_input = (use_flat_inputs && expert_major_in) ?
+                                          handle->hybridep.recv_topk_weights_flat :
+                                          static_cast<const float*>(topk_weights->data);
             const int prob_stride = use_flat_inputs ? num_topk : input_topk_stride;
             const bool* lerm_for_combine = handle->hybridep.local_expert_routing_map;
             nccl_ep::hybridep::sparse_to_dense_prob_combine(
@@ -4043,7 +4083,8 @@ ncclResult_t ncclEpCombine(
         // Use pre-allocated dense prob buffer for backward combine
         float* dense_output_prob = handle->hybridep.dense_prob_buffer;
         if (backward_combine) {
-            size_t dense_output_prob_size = static_cast<size_t>(num_combined_tokens) * group->config.num_experts * sizeof(float);
+            size_t dense_output_prob_size =
+                static_cast<size_t>(num_combined_tokens) * group->config.num_experts * sizeof(float);
             CUDA_CHECK(cudaMemsetAsync(dense_output_prob, 0, dense_output_prob_size, stream));
         }
 
@@ -4061,37 +4102,38 @@ ncclResult_t ncclEpCombine(
         // Use HOST pointer arrays - these get copied into the kernel param struct for fast __grid_constant__ access
         std::vector<uint16_t*> combine_input_token_ptrs;
         if (combine_x_uses_external_window) {
-            NCCLCHECK(buildIntranodePtrArray<uint16_t>(
-                group,
-                x,
-                combine_input_token_ptrs));
+            NCCLCHECK(buildIntranodePtrArray<uint16_t>(group, x, combine_input_token_ptrs));
             params.expert_input_token_ptrs = combine_input_token_ptrs.data();
         } else {
             params.expert_input_token_ptrs = group->ht_buffers.combine_expert_input_token_buffer_ptrs;
         }
-        params.expert_input_prob_ptrs = backward_combine ? group->ht_buffers.combine_expert_input_prob_buffer_ptrs : nullptr;
+        params.expert_input_prob_ptrs =
+            backward_combine ? group->ht_buffers.combine_expert_input_prob_buffer_ptrs : nullptr;
         params.attn_output_token = combined_x->data;
         params.attn_output_prob = backward_combine ? dense_output_prob : nullptr;
         params.rdma_intra_node_red_token = is_single_node ? nullptr : group->ht_buffers.rdma_intra_node_red_token;
-        params.rdma_intra_node_red_prob = (!is_single_node && backward_combine) ? group->ht_buffers.rdma_intra_node_red_prob : nullptr;
-        params.combine_rdma_inter_node_group_token = is_single_node ? nullptr : group->ht_buffers.combine_rdma_inter_node_group_token;
-        params.combine_rdma_inter_node_group_prob = (!is_single_node && backward_combine) ? group->ht_buffers.combine_rdma_inter_node_group_prob : nullptr;
+        params.rdma_intra_node_red_prob =
+            (!is_single_node && backward_combine) ? group->ht_buffers.rdma_intra_node_red_prob : nullptr;
+        params.combine_rdma_inter_node_group_token =
+            is_single_node ? nullptr : group->ht_buffers.combine_rdma_inter_node_group_token;
+        params.combine_rdma_inter_node_group_prob =
+            (!is_single_node && backward_combine) ? group->ht_buffers.combine_rdma_inter_node_group_prob : nullptr;
         // Unified s2d: FLAT-shape for FLAT layout and EM em-permute mode;
         // EM-shape (packed rank/slot) only for EM kNvlinkDup / kLocalDup modes.
         params.sparse_to_dense_map = handle->hybridep.sparse_to_dense_map;
         const bool expert_major = (handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
-        params.s2d_inner_dim = (expert_major && !em_permute_combine)
-            ? handle->num_topk : group->lsa_team_size;
+        params.s2d_inner_dim = (expert_major && !em_permute_combine) ? handle->num_topk : group->lsa_team_size;
         params.layout = em_permute_combine ? NCCL_EP_LAYOUT_RANK_MAJOR : handle->layout;
-        assert((params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR)
-                   ? (params.s2d_inner_dim == handle->num_topk)
-                   : (params.s2d_inner_dim == group->lsa_team_size));
+        assert(
+            (params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? (params.s2d_inner_dim == handle->num_topk) :
+                                                             (params.s2d_inner_dim == group->lsa_team_size));
         params.rdma_to_attn_map = handle->hybridep.rdma_to_attn_map;
         params.attn_to_rdma_map = handle->hybridep.attn_to_rdma_map;
         params.local_expert_routing_map = handle->hybridep.local_expert_routing_map;
         // Always pass a valid device pointer — see dispatch path comment.
         params.combine_expected_rdma_flag_value = group->ht_buffers.dev_combine_expected_rdma;
-        params.combine_rdma_inter_node_group_flags = is_single_node ? nullptr : group->ht_buffers.combine_rdma_inter_node_group_flags;
+        params.combine_rdma_inter_node_group_flags =
+            is_single_node ? nullptr : group->ht_buffers.combine_rdma_inter_node_group_flags;
         params.combine_expected_intra_node_flag_value = group->ht_buffers.dev_combine_expected_intra;
         params.combine_grid_barrier_counter = group->ht_buffers.combine_grid_barrier_counter;
         params.combine_intra_node_write_completion_flags = group->ht_buffers.combine_intra_node_write_completion_flags;
@@ -4100,8 +4142,8 @@ ncclResult_t ncclEpCombine(
             !combine_x_uses_external_window ? x->win_hdl : group->gin_config.nccl_window;
         const size_t combine_token_offset =
             is_single_node ? 0 :
-            (!combine_x_uses_external_window ? static_cast<size_t>(x->win_offset)
-                                             : group->gin_config.rdma_intra_node_red_token_offset);
+                             (!combine_x_uses_external_window ? static_cast<size_t>(x->win_offset) :
+                                                                group->gin_config.rdma_intra_node_red_token_offset);
         // Pass device communicators and windows
         // Always pass the devComm (single-node too): the HT LSA sync-guard now uses the
         // NCCL LSA barrier (needs comm.lsaBarrier). RDMA paths stay if-constexpr-gated.
@@ -4117,23 +4159,25 @@ ncclResult_t ncclEpCombine(
         // Use offsets relative to gin_base_ptr
         params.mr_info = {
             .rdma_intra_node_red_token_offset = combine_token_offset,
-            .combine_rdma_inter_node_group_token_offset = is_single_node ? 0 : group->gin_config.combine_rdma_inter_node_group_token_offset,
+            .combine_rdma_inter_node_group_token_offset =
+                is_single_node ? 0 : group->gin_config.combine_rdma_inter_node_group_token_offset,
             .rdma_intra_node_red_prob_offset = is_single_node ? 0 : group->gin_config.rdma_intra_node_red_prob_offset,
-            .combine_rdma_inter_node_group_prob_offset = is_single_node ? 0 : group->gin_config.combine_rdma_inter_node_group_prob_offset,
+            .combine_rdma_inter_node_group_prob_offset =
+                is_single_node ? 0 : group->gin_config.combine_rdma_inter_node_group_prob_offset,
             .guard_offset = is_single_node ? 0 : group->gin_config.combine_guard_offset,
         };
         params.local_rank = group->lsa_rank;
         params.node_rank = group->rdma_rank;
         params.num_tokens_per_rank = group->config.max_dispatch_tokens_per_rank;
-        params.num_real_tokens     = num_combined_tokens;
+        params.num_real_tokens = num_combined_tokens;
         params.num_recv_tokens = num_tokens;
         params.combine_local_reduce_enabled = em_local_dup_active(group, handle->layout);
 
         // Pre-sum secondary em_slots into primaries before combine reads them.
         if (params.combine_local_reduce_enabled) {
-            assert(handle->hybridep.emuf_group_buf != nullptr &&
-                   handle->hybridep.emuf_group_count != nullptr &&
-                   "unfused combine requires emuf dup-group buf from dispatch scan");
+            assert(
+                handle->hybridep.emuf_group_buf != nullptr && handle->hybridep.emuf_group_count != nullptr &&
+                "unfused combine requires emuf dup-group buf from dispatch scan");
             nccl_ep::hybridep::call_local_reduce(
                 /*expert_input_token=*/
                 params.expert_input_token_ptrs[group->lsa_rank],
@@ -4156,18 +4200,18 @@ ncclResult_t ncclEpCombine(
         nccl_ep::hybridep::call_combine(
             params,
             group->ht_aligned_max_tokens, // chunk-aligned stride
-            group->ht_tokens_per_chunk,   // tokens per dispatch/combine chunk
+            group->ht_tokens_per_chunk, // tokens per dispatch/combine chunk
             group->rdma_team_size, // num_nodes (RDMA domain size)
             backward_combine, // backward mode flag
             static_cast<int>(group->comm_num_sms),
             &group->env,
-            stream
-        );
+            stream);
 
         // BWD combine: scatter dense output back to FWD k-slot ordering via hybridep.topk_idx.
         if (backward_combine) {
-            assert(handle->hybridep.topk_idx != nullptr &&
-                   "HT BWD combine: hybridep.topk_idx missing (ncclEpUpdateHandle not called?)");
+            assert(
+                handle->hybridep.topk_idx != nullptr &&
+                "HT BWD combine: hybridep.topk_idx missing (ncclEpUpdateHandle not called?)");
             if (handle->topk_idx.datatype == ncclInt32) {
                 nccl_ep::hybridep::dense_to_sparse_prob_combine(
                     dense_output_prob,
@@ -4195,16 +4239,12 @@ ncclResult_t ncclEpCombine(
     return ncclSuccess;
 }
 
-ncclResult_t ncclEpComplete(
-    ncclEpHandle_t handle,
-    const ncclEpCompleteConfig_t* config,
-    cudaStream_t stream
-) {
+ncclResult_t ncclEpComplete(ncclEpHandle_t handle, const ncclEpCompleteConfig_t* config, cudaStream_t stream) {
     EP_OPTIONAL_STRUCT(config);
     if (handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         if (handle->ll.continue_fn) {
-                handle->ll.continue_fn(LOW_LATENCY_RECV_PHASE);
-                handle->ll.continue_fn = nullptr;
+            handle->ll.continue_fn(LOW_LATENCY_RECV_PHASE);
+            handle->ll.continue_fn = nullptr;
         }
     } else if (handle->group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
         // HT mode - no continue needed (synchronous)
@@ -4212,44 +4252,35 @@ ncclResult_t ncclEpComplete(
     return ncclSuccess;
 }
 
-ncclResult_t ncclEpMaskQuery(
-    ncclEpGroup_t ep_group,
-    int* mask_status,
-    cudaStream_t stream
-) {
+ncclResult_t ncclEpMaskQuery(ncclEpGroup_t ep_group, int* mask_status, cudaStream_t stream) {
     EP_HOST_ASSERT(ep_group != nullptr);
     if (!ep_group->config.enable_mask) {
         return ncclInvalidUsage;
     }
     EP_HOST_ASSERT(ep_group->mask_buffer != nullptr && "ncclEpMaskQuery: enable_mask must be true");
     EP_HOST_ASSERT(mask_status != nullptr);
-    CUDA_CHECK(cudaMemcpyAsync(mask_status, ep_group->mask_buffer,
-                               ep_group->nRanks * sizeof(int),
-                               cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        mask_status,
+        ep_group->mask_buffer,
+        ep_group->nRanks * sizeof(int),
+        cudaMemcpyDeviceToDevice,
+        stream));
     return ncclSuccess;
 }
 
-ncclResult_t ncclEpMaskUpdate(
-    ncclEpGroup_t ep_group,
-    const int* mask,
-    cudaStream_t stream
-) {
+ncclResult_t ncclEpMaskUpdate(ncclEpGroup_t ep_group, const int* mask, cudaStream_t stream) {
     EP_HOST_ASSERT(ep_group != nullptr);
     if (!ep_group->config.enable_mask) {
         return ncclInvalidUsage;
     }
     EP_HOST_ASSERT(ep_group->mask_buffer != nullptr && "ncclEpMaskUpdate: enable_mask must be true");
     EP_HOST_ASSERT(mask != nullptr);
-    CUDA_CHECK(cudaMemcpyAsync(ep_group->mask_buffer, mask,
-                               ep_group->nRanks * sizeof(int),
-                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(ep_group->mask_buffer, mask, ep_group->nRanks * sizeof(int), cudaMemcpyHostToDevice, stream));
     return ncclSuccess;
 }
 
-ncclResult_t ncclEpMaskClean(
-    ncclEpGroup_t ep_group,
-    cudaStream_t stream
-) {
+ncclResult_t ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) {
     EP_HOST_ASSERT(ep_group != nullptr);
 
     if (!ep_group->config.enable_mask) {
@@ -4257,19 +4288,21 @@ ncclResult_t ncclEpMaskClean(
     }
     EP_HOST_ASSERT(ep_group->mask_buffer != nullptr && "ncclEpMaskClean: enable_mask must be true");
     EP_HOST_ASSERT(ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY);
-    EP_HOST_ASSERT(ep_group->rdma_buffer != nullptr &&
-                   "ncclEpMaskClean: rdma_buffer not yet allocated; create at least one LL handle first");
+    EP_HOST_ASSERT(
+        ep_group->rdma_buffer != nullptr &&
+        "ncclEpMaskClean: rdma_buffer not yet allocated; create at least one LL handle first");
     EP_HOST_ASSERT(ep_group->sync_buffer != nullptr && ep_group->sync_window != nullptr);
 
     // Reset internal RDMA recv-count/flag counters for both double-buffer slots
     // via a GPU kernel that includes a cross-rank barrier, then clear the mask.
     // Query the layout to read the clean_meta_offset values.
-    nccl_ep::LowLatencyLayout layout(ep_group->config.max_dispatch_tokens_per_rank,
-                                      ep_group->config.max_token_bytes,
-                                      ep_group->nRanks,
-                                      ep_group->config.num_experts,
-                                      MAX_NUM_TOPK,
-                                      NCCL_EP_LAYOUT_RANK_MAJOR);
+    nccl_ep::LowLatencyLayout layout(
+        ep_group->config.max_dispatch_tokens_per_rank,
+        ep_group->config.max_token_bytes,
+        ep_group->nRanks,
+        ep_group->config.num_experts,
+        MAX_NUM_TOPK,
+        NCCL_EP_LAYOUT_RANK_MAJOR);
     char* rdma_base = static_cast<char*>(ep_group->rdma_buffer);
     auto clean_0 = layout.buffers[0].clean_meta_offset();
     auto clean_1 = layout.buffers[1].clean_meta_offset();
@@ -4293,18 +4326,18 @@ ncclResult_t ncclEpMaskClean(
     // Reset all ranks to active (1 = active).
     // Sync the stream before returning so all_active outlives the async copy.
     std::vector<int> all_active(ep_group->nRanks, 1);
-    CUDA_CHECK(cudaMemcpyAsync(ep_group->mask_buffer, all_active.data(),
-                               ep_group->nRanks * sizeof(int),
-                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        ep_group->mask_buffer,
+        all_active.data(),
+        ep_group->nRanks * sizeof(int),
+        cudaMemcpyHostToDevice,
+        stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     return ncclSuccess;
 }
 
-ncclResult_t ncclEpGetAsyncError(
-    ncclEpGroup_t ep_group,
-    int* error_out
-) {
+ncclResult_t ncclEpGetAsyncError(ncclEpGroup_t ep_group, int* error_out) {
     EP_HOST_ASSERT(ep_group != nullptr);
     if (!ep_group->config.enable_mask) {
         return ncclInvalidUsage;
@@ -4315,9 +4348,7 @@ ncclResult_t ncclEpGetAsyncError(
     return ncclSuccess;
 }
 
-ncclResult_t ncclEpErrorClear(
-    ncclEpGroup_t ep_group
-) {
+ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group) {
     EP_HOST_ASSERT(ep_group != nullptr);
     if (!ep_group->config.enable_mask) {
         return ncclInvalidUsage;
@@ -4350,10 +4381,7 @@ int ncclEpHandle_test_getExpertsPerRank(ncclEpHandle_t handle) {
     return handle->group->num_local_experts;
 }
 
-ncclResult_t ncclEpHandle_test_getNumRecvTokens(
-    ncclEpHandle_t handle,
-    unsigned int* num_recv_tokens
-) {
+ncclResult_t ncclEpHandle_test_getNumRecvTokens(ncclEpHandle_t handle, unsigned int* num_recv_tokens) {
     if (handle->group->config.algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT) {
         return ncclInvalidUsage;
     }

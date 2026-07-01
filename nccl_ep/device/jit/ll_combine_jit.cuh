@@ -27,7 +27,9 @@ constexpr const char* kLlCombineJitEntryName = "nccl_ep_jit_ll_combine_kernel";
 constexpr int kLlCombineMaxTopk = 9;
 constexpr int kLlCombineMaxUnrolls = 4;
 
-inline const char* ll_combine_bool_literal(bool value) { return value ? "true" : "false"; }
+inline const char* ll_combine_bool_literal(bool value) {
+    return value ? "true" : "false";
+}
 
 inline std::string ll_combine_jit_source(
     bool useLogFmt,
@@ -36,15 +38,12 @@ inline std::string ll_combine_jit_source(
     bool topkIdxIsInt64,
     ncclDataType_t tokenDtype) {
     const char* layout_literal =
-        (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR)
-            ? "NCCL_EP_LAYOUT_EXPERT_MAJOR"
-            : "NCCL_EP_LAYOUT_RANK_MAJOR";
+        (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? "NCCL_EP_LAYOUT_EXPERT_MAJOR" : "NCCL_EP_LAYOUT_RANK_MAJOR";
     const char* topk_type = topkIdxIsInt64 ? "int64_t" : "int32_t";
     const char* token_dtype_literal = ll_token_dtype_template_literal(tokenDtype);
 
     std::ostringstream src;
-    src
-        << "#include \"device/ll_ep.cuh\"\n"
+    src << "#include \"device/ll_ep.cuh\"\n"
         << "#include \"device/ll_ep_adapter.cuh\"\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(1024, 1)\n"
@@ -90,13 +89,10 @@ inline void launch_ll_combine(
     static const int variant_identity = 0;
     const std::string variant_name = [&] {
         std::ostringstream name;
-        name
-            << "ll_combine"
-            << "_hdim" << hidden
-            << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_rm")
-            << (useLogFmt ? "_logfmt" : "_bf16")
-            << (topkIdxIsInt64 ? "_topk64" : "_topk32")
-            << ll_token_dtype_name_tag(tokenDtype);
+        name << "ll_combine"
+             << "_hdim" << hidden << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_rm")
+             << (useLogFmt ? "_logfmt" : "_bf16") << (topkIdxIsInt64 ? "_topk64" : "_topk32")
+             << ll_token_dtype_name_tag(tokenDtype);
         return name.str();
     }();
     const std::string source = ll_combine_jit_source(useLogFmt, hidden, layout, topkIdxIsInt64, tokenDtype);

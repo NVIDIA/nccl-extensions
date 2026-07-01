@@ -28,10 +28,7 @@ using ::nccl_ep::ceil_div;
 //   - hands off to launch_ll_dispatch(), which JIT-compiles the kernel
 //     specialised for (useFp8, useUe8m0, hidden, layout, nvlinkOnly)
 // ============================================================================
-void call_dispatch(
-    const DispatchParams& params,
-    bool useFp8,
-    cudaStream_t stream) {
+void call_dispatch(const DispatchParams& params, bool useFp8, cudaStream_t stream) {
     constexpr int kNumMaxTopK = 9;
     const int numWarpGroups = ceil_div(params.numExperts, params.numDeviceSms);
     const int numWarpsPerGroup = 32 / numWarpGroups;
@@ -47,8 +44,7 @@ void call_dispatch(
     auto rankDone = rankCountersBase + 2 * params.numRanks;
     EP_HOST_ASSERT((2 * params.numRanks + params.numExperts) * sizeof(int) <= NUM_WORKSPACE_BYTES);
 
-    if (params.useUe8m0)
-        EP_HOST_ASSERT(params.roundScale and "UE8M0 SF requires `round_scale=True`");
+    if (params.useUe8m0) EP_HOST_ASSERT(params.roundScale and "UE8M0 SF requires `round_scale=True`");
 
     dispatch_kernel_args_t args{};
     args.inData = params.inData;
@@ -105,13 +101,21 @@ void call_dispatch(
     // input gets the distinct 4-byte kernel. Mirrors the legacy host launch
     // selection exactly (see ll_ep.cuh dispatch DISPATCH_LAUNCH_CASE_IMPL).
     const ncclDataType_t kernelTokenDtype =
-        (!useFp8 && !useExternQuant && params.tokenDtype == ncclFloat32)
-            ? ncclFloat32 : ncclBfloat16;
+        (!useFp8 && !useExternQuant && params.tokenDtype == ncclFloat32) ? ncclFloat32 : ncclBfloat16;
 
     jit::launch_ll_dispatch(
-        useFp8, params.useUe8m0, useExternQuant, params.hidden, params.layout,
-        params.nvlinkOnly, params.topkIdxIsInt64, kernelTokenDtype,
-        numSms, numWarps, args, stream);
+        useFp8,
+        params.useUe8m0,
+        useExternQuant,
+        params.hidden,
+        params.layout,
+        params.nvlinkOnly,
+        params.topkIdxIsInt64,
+        kernelTokenDtype,
+        numSms,
+        numWarps,
+        args,
+        stream);
 }
 
 // ============================================================================
@@ -120,9 +124,7 @@ void call_dispatch(
 // Resolves (numSms, numWarps), computes the dynamic SMEM budget, packs args,
 // and hands off to launch_ll_combine() for JIT compile + launch.
 // ============================================================================
-void call_combine(
-    const CombineParams& params,
-    cudaStream_t stream) {
+void call_combine(const CombineParams& params, cudaStream_t stream) {
     const int numWarpGroups = ceil_div(params.numExperts, params.numDeviceSms);
     const int numWarpsPerGroup = 32 / numWarpGroups;
     const int numRecvPerSm = ceil_div(params.numCombinedTokens, params.numDeviceSms);
@@ -138,7 +140,7 @@ void call_combine(
     EP_HOST_ASSERT(params.numTopk <= jit::kLlCombineMaxTopk);
 
     // Online cast (LogFMT) is incompatible with zero-copy.
-    EP_HOST_ASSERT(not (params.zeroCopy and params.useLogFmt));
+    EP_HOST_ASSERT(not(params.zeroCopy and params.useLogFmt));
 
     // Per-block SMEM = max(send-side TMA staging, recv-side TMA staging).
     // Send side: numWarps × kNumStages TMA buffers + per-warp LogFMT metadata.
@@ -156,8 +158,8 @@ void call_combine(
     const int numSendTmaBytes = 32 * static_cast<int>(sizeof(int4)) * jit::kLlCombineMaxUnrolls + 16;
     const int smemSendSize = numWarps * (kNumStages * numSendTmaBytes + numMetaBytes);
     const int numRecvTmaBytes = 16 + hidden * elemBytes;
-    const int smemRecvSize = kMaxNumGroups *
-        (kNumStages * numRecvTmaBytes + hidden * elemBytes + kNumStages * numMetaBytes * 3);
+    const int smemRecvSize =
+        kMaxNumGroups * (kNumStages * numRecvTmaBytes + hidden * elemBytes + kNumStages * numMetaBytes * 3);
     const int smem_size = std::max(smemSendSize, smemRecvSize);
 
     combine_kernel_args_t args{};
@@ -197,16 +199,22 @@ void call_combine(
     args.timeoutCycles = params.timeoutCycles;
 
     jit::launch_ll_combine(
-        params.useLogFmt, hidden, params.layout, params.topkIdxIsInt64,
-        params.tokenDtype, numSms, numWarps, smem_size, args, stream);
+        params.useLogFmt,
+        hidden,
+        params.layout,
+        params.topkIdxIsInt64,
+        params.tokenDtype,
+        numSms,
+        numWarps,
+        smem_size,
+        args,
+        stream);
 }
 
 // ============================================================================
 // LL buffer-clean wrapper
 // ============================================================================
-void call_clean_low_latency_buffer(
-    const CleanLowLatencyBufferParams& params,
-    cudaStream_t stream) {
+void call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStream_t stream) {
     clean_low_latency_buffer_kernel_args_t args{};
     args.clean_0 = params.clean_0;
     args.num_clean_int_0 = params.num_clean_int_0;

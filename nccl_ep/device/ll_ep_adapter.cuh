@@ -22,16 +22,22 @@ namespace internode_ll {
 // folded into the variant_name so distinct wire dtypes get distinct cache keys.
 inline const char* ll_token_dtype_template_literal(ncclDataType_t dt) {
     switch (dt) {
-        case ncclFloat32: return "ncclFloat32";
-        case ncclFloat16: return "ncclFloat16";
-        default:          return "ncclBfloat16";
+    case ncclFloat32:
+        return "ncclFloat32";
+    case ncclFloat16:
+        return "ncclFloat16";
+    default:
+        return "ncclBfloat16";
     }
 }
 inline const char* ll_token_dtype_name_tag(ncclDataType_t dt) {
     switch (dt) {
-        case ncclFloat32: return "_tfp32";
-        case ncclFloat16: return "_tfp16";
-        default:          return "_tbf16";
+    case ncclFloat32:
+        return "_tfp32";
+    case ncclFloat16:
+        return "_tfp16";
+    default:
+        return "_tbf16";
     }
 }
 
@@ -217,20 +223,20 @@ struct DispatchParams {
     // Runtime workspace + error tracking
     void* workspace;
     int numDeviceSms;
-    int* rankMask           = nullptr;
-    int* asyncErrorFlag     = nullptr;
-    uint64_t timeoutCycles  = NUM_TIMEOUT_CYCLES;
+    int* rankMask = nullptr;
+    int* asyncErrorFlag = nullptr;
+    uint64_t timeoutCycles = NUM_TIMEOUT_CYCLES;
 
     // Per-call behavior toggles that select the JIT kernel specialization.
     // useFp8 stays outside the struct so callers see, at the call site,
     // which token-data-type variant is being launched.
-    bool useUe8m0   = false;
+    bool useUe8m0 = false;
     bool roundScale = false;
     bool nvlinkOnly = false;
     // recv_topk_idx numbering; the host wrapper resolves AUTO -> LOCAL before
     // launch, so the kernel only ever sees LOCAL or GLOBAL.
     ncclEpExpertIdKind_t recvTopkIdxKind = NCCL_EP_EXPERT_ID_LOCAL;
-    int  phases     = 0;
+    int phases = 0;
 
     // Zero-copy dispatch output (rank-major + nvlinkOnly + bf16). When
     // recvDataWindow != {}, the sender writes payload directly into the peer's
@@ -286,14 +292,14 @@ struct CombineParams {
     // Runtime workspace + error tracking
     void* workspace;
     int numDeviceSms;
-    int* rankMask           = nullptr;
-    int* asyncErrorFlag     = nullptr;
-    uint64_t timeoutCycles  = NUM_TIMEOUT_CYCLES;
+    int* rankMask = nullptr;
+    int* asyncErrorFlag = nullptr;
+    uint64_t timeoutCycles = NUM_TIMEOUT_CYCLES;
 
     // Per-call behavior toggles that select the JIT kernel specialization.
     bool useLogFmt = false;
-    bool zeroCopy  = false;
-    int  phases    = 0;
+    bool zeroCopy = false;
+    int phases = 0;
 
     // Token wire dtype (unquantized payload width). Combine decodes + reduces,
     // so BF16/FP16/FP32 are three distinct kernel specializations (FP32 also
@@ -322,18 +328,11 @@ struct CleanLowLatencyBufferParams {
 // JIT-compiled kernel.
 // ============================================================================
 
-void call_dispatch(
-    const DispatchParams& params,
-    bool useFp8,
-    cudaStream_t stream = 0);
+void call_dispatch(const DispatchParams& params, bool useFp8, cudaStream_t stream = 0);
 
-void call_combine(
-    const CombineParams& params,
-    cudaStream_t stream = 0);
+void call_combine(const CombineParams& params, cudaStream_t stream = 0);
 
-void call_clean_low_latency_buffer(
-    const CleanLowLatencyBufferParams& params,
-    cudaStream_t stream = 0);
+void call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStream_t stream = 0);
 
 } // namespace internode_ll
 } // namespace nccl_ep

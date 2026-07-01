@@ -27,7 +27,6 @@
 // Larger batches reduce NIC doorbell overhead but may delay first-byte latency.
 #define HYBRIDEP_DISPATCH_RDMA_BATCH_SIZE 4
 
-
 // ============================================================================
 // Combine configuration constants
 // ============================================================================
@@ -65,5 +64,6 @@
 
 // local_reduce uses __shfl_sync over lanes 0..PIPE_DEPTH-1 for the cooperative
 // G2S source-list broadcast, so PIPE_DEPTH must fit in a warp.
-static_assert(NCCLEP_LOCAL_REDUCE_PIPE_DEPTH <= 32,
-              "NCCLEP_LOCAL_REDUCE_PIPE_DEPTH must be <= 32 (warp shuffle width)");
+static_assert(
+    NCCLEP_LOCAL_REDUCE_PIPE_DEPTH <= 32,
+    "NCCLEP_LOCAL_REDUCE_PIPE_DEPTH must be <= 32 (warp shuffle width)");

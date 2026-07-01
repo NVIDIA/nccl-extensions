@@ -64,7 +64,7 @@ typedef enum {
      *   * In HT mode, the user is expected to apply topk weights before passing the post-expert
      *     activations to ncclEpCombine.
      *   * In LL mode, the Combine kernel is applying the weights on the fly.
-     * For all modes, the Combine kernel performs accumulation of up to num_topk 
+     * For all modes, the Combine kernel performs accumulation of up to num_topk
      * expert contributions, returning a single output token per input slot.
      */
     NCCL_EP_LAYOUT_EXPERT_MAJOR,
@@ -180,7 +180,7 @@ typedef enum {
  * info struct.
  */
 typedef enum {
-    NCCL_EP_EXPERT_ID_AUTO   = NCCL_EP_AUTO,
-    NCCL_EP_EXPERT_ID_LOCAL  = 1,
+    NCCL_EP_EXPERT_ID_AUTO = NCCL_EP_AUTO,
+    NCCL_EP_EXPERT_ID_LOCAL = 1,
     NCCL_EP_EXPERT_ID_GLOBAL = 2,
 } ncclEpExpertIdKind_t;

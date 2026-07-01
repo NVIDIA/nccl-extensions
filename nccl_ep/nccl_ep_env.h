@@ -37,27 +37,27 @@ enum class ncclEpEnvType {
 // check `is_set` before reading it. The union lets more representations
 // (double, string, ...) be added later without churn.
 struct ncclEpEnvVar {
-    const char*   name;
+    const char* name;
     ncclEpEnvType type;
-    bool          is_set = false;
+    bool is_set = false;
     union {
         unsigned long ul = 0;
-        bool          flag;
+        bool flag;
     } value;
 };
 
 struct ncclEpEnvConfig {
     int rank = 0;
-    ncclEpEnvVar verbose            {"NCCL_EP_ENV_VERBOSE",        ncclEpEnvType::flag};
-    ncclEpEnvVar debug              {"NCCL_EP_DEBUG",              ncclEpEnvType::flag};
-    ncclEpEnvVar ht_em_local_dup    {"NCCL_EP_HT_EM_LOCAL_DUP",    ncclEpEnvType::flag};
-    ncclEpEnvVar ht_em_nvlink_dup   {"NCCL_EP_HT_EM_NVLINK_DUP",   ncclEpEnvType::flag};
-    ncclEpEnvVar disable_guard      {"NCCL_EP_DISABLE_GUARD",      ncclEpEnvType::flag};
-    ncclEpEnvVar timeout_ms         {"NCCL_EP_TIMEOUT_MS",         ncclEpEnvType::ulong};
-    ncclEpEnvVar comm_num_sms       {"NCCL_EP_COMM_SMS",           ncclEpEnvType::ulong};
-    ncclEpEnvVar prolog_epilog_sms  {"NCCL_EP_PROLOG_EPILOG_SMS",  ncclEpEnvType::ulong};
-    ncclEpEnvVar preprocess_num_sms {"NCCL_EP_PREPROCESS_NUM_SMS", ncclEpEnvType::ulong};
-    ncclEpEnvVar tokens_per_chunk   {"NCCL_EP_TOKENS_PER_CHUNK",   ncclEpEnvType::ulong};
+    ncclEpEnvVar verbose{"NCCL_EP_ENV_VERBOSE", ncclEpEnvType::flag};
+    ncclEpEnvVar debug{"NCCL_EP_DEBUG", ncclEpEnvType::flag};
+    ncclEpEnvVar ht_em_local_dup{"NCCL_EP_HT_EM_LOCAL_DUP", ncclEpEnvType::flag};
+    ncclEpEnvVar ht_em_nvlink_dup{"NCCL_EP_HT_EM_NVLINK_DUP", ncclEpEnvType::flag};
+    ncclEpEnvVar disable_guard{"NCCL_EP_DISABLE_GUARD", ncclEpEnvType::flag};
+    ncclEpEnvVar timeout_ms{"NCCL_EP_TIMEOUT_MS", ncclEpEnvType::ulong};
+    ncclEpEnvVar comm_num_sms{"NCCL_EP_COMM_SMS", ncclEpEnvType::ulong};
+    ncclEpEnvVar prolog_epilog_sms{"NCCL_EP_PROLOG_EPILOG_SMS", ncclEpEnvType::ulong};
+    ncclEpEnvVar preprocess_num_sms{"NCCL_EP_PREPROCESS_NUM_SMS", ncclEpEnvType::ulong};
+    ncclEpEnvVar tokens_per_chunk{"NCCL_EP_TOKENS_PER_CHUNK", ncclEpEnvType::ulong};
 };
 
 // True iff a flag variable was explicitly set to an "on" value (1/on/true).
@@ -73,8 +73,7 @@ inline bool nccl_ep_env_verbose(const ncclEpEnvConfig& cfg) {
 
 // Stamp this process's rank into *cfg.
 inline void nccl_ep_env_set_rank(ncclEpEnvConfig* cfg, int rank) {
-    if (cfg != nullptr)
-        cfg->rank = rank;
+    if (cfg != nullptr) cfg->rank = rank;
 }
 
 // Read every NCCL EP environment variable into *cfg (resetting it first).

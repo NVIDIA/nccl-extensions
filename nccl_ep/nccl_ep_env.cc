@@ -19,18 +19,14 @@ namespace {
 void parse_flag(ncclEpEnvVar& var) {
     const char* v = std::getenv(var.name);
     if (v == nullptr || v[0] == '\0') return;  // unset -> is_set stays false
-    if (strcasecmp(v, "1") == 0 || strcasecmp(v, "on") == 0 ||
-        strcasecmp(v, "true") == 0) {
+    if (strcasecmp(v, "1") == 0 || strcasecmp(v, "on") == 0 || strcasecmp(v, "true") == 0) {
         var.is_set = true;
         var.value.flag = true;
-    } else if (strcasecmp(v, "0") == 0 || strcasecmp(v, "off") == 0 ||
-               strcasecmp(v, "false") == 0) {
+    } else if (strcasecmp(v, "0") == 0 || strcasecmp(v, "off") == 0 || strcasecmp(v, "false") == 0) {
         var.is_set = true;
         var.value.flag = false;
     } else {
-        std::fprintf(stderr,
-                     "[nccl_ep] %s=%s ignored (expected 1/on/true or 0/off/false)\n",
-                     var.name, v);
+        std::fprintf(stderr, "[nccl_ep] %s=%s ignored (expected 1/on/true or 0/off/false)\n", var.name, v);
     }
 }
 
@@ -70,9 +66,16 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
     // Every variable, so the user can see exactly what was provided. Adding a
     // field to ncclEpEnvConfig only requires adding it to this list.
     const ncclEpEnvVar* vars[] = {
-        &cfg.verbose, &cfg.debug, &cfg.ht_em_local_dup, &cfg.ht_em_nvlink_dup, &cfg.disable_guard,
-        &cfg.timeout_ms, &cfg.comm_num_sms, &cfg.prolog_epilog_sms,
-        &cfg.preprocess_num_sms, &cfg.tokens_per_chunk,
+        &cfg.verbose,
+        &cfg.debug,
+        &cfg.ht_em_local_dup,
+        &cfg.ht_em_nvlink_dup,
+        &cfg.disable_guard,
+        &cfg.timeout_ms,
+        &cfg.comm_num_sms,
+        &cfg.prolog_epilog_sms,
+        &cfg.preprocess_num_sms,
+        &cfg.tokens_per_chunk,
     };
 
     std::fprintf(stderr, "[nccl_ep][env] NCCL EP environment configuration:\n");
@@ -83,8 +86,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         }
         switch (v->type) {
         case ncclEpEnvType::flag:
-            std::fprintf(stderr, "[nccl_ep][env]   %-28s = %s\n", v->name,
-                         v->value.flag ? "enabled" : "disabled");
+            std::fprintf(stderr, "[nccl_ep][env]   %-28s = %s\n", v->name, v->value.flag ? "enabled" : "disabled");
             break;
         case ncclEpEnvType::ulong:
             std::fprintf(stderr, "[nccl_ep][env]   %-28s = %lu\n", v->name, v->value.ul);

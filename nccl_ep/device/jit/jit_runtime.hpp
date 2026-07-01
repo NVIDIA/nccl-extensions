@@ -53,11 +53,8 @@ JitKernelStatus launch_jit_kernel(
     cudaStream_t stream,
     std::string* error);
 
-JitKernelStatus launch_jit_kernel(
-    const JitKernelVariant& variant,
-    void* kernel_param,
-    cudaStream_t stream,
-    std::string* error);
+JitKernelStatus
+launch_jit_kernel(const JitKernelVariant& variant, void* kernel_param, cudaStream_t stream, std::string* error);
 
 const char* jit_kernel_status_name(JitKernelStatus status);
 

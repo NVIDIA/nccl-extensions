@@ -27,45 +27,47 @@
 // Exception Handling
 //==============================================================================
 
-class EPException: public std::exception {
+class EPException : public std::exception {
 private:
     std::string message = {};
 
 public:
-    explicit EPException(const char *name, const char* file, const int line, const std::string& error) {
+    explicit EPException(const char* name, const char* file, const int line, const std::string& error) {
         message = std::string("Failed: ") + name + " error " + file + ":" + std::to_string(line) + " '" + error + "'";
     }
 
-    const char *what() const noexcept override { return message.c_str(); }
+    const char* what() const noexcept override {
+        return message.c_str();
+    }
 };
 
 #ifndef CUDA_CHECK
 #define CUDA_CHECK(cmd) \
-do { \
-    cudaError_t e = (cmd); \
-    if (e != cudaSuccess) { \
-        throw EPException("CUDA", __FILE__, __LINE__, cudaGetErrorString(e)); \
-    } \
-} while (0)
+    do { \
+        cudaError_t e = (cmd); \
+        if (e != cudaSuccess) { \
+            throw EPException("CUDA", __FILE__, __LINE__, cudaGetErrorString(e)); \
+        } \
+    } while (0)
 #endif
 
 #ifndef EP_HOST_ASSERT
 #define EP_HOST_ASSERT(cond) \
-do { \
-    if (not (cond)) { \
-        throw EPException("Assertion", __FILE__, __LINE__, #cond); \
-    } \
-} while (0)
+    do { \
+        if (not(cond)) { \
+            throw EPException("Assertion", __FILE__, __LINE__, #cond); \
+        } \
+    } while (0)
 #endif
 
 #ifndef EP_DEVICE_ASSERT
 #define EP_DEVICE_ASSERT(cond) \
-do { \
-    if (not (cond)) { \
-        printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond); \
-        asm("trap;"); \
-    } \
-} while (0)
+    do { \
+        if (not(cond)) { \
+            printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond); \
+            asm("trap;"); \
+        } \
+    } while (0)
 #endif
 
 //==============================================================================
@@ -98,14 +100,14 @@ do { \
 #define LAUNCH_KERNEL(config, kernel, ...) CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ##__VA_ARGS__))
 #else
 #define LAUNCH_KERNEL(config, kernel, ...) \
-do { \
-    kernel<<<__num_sms, __num_threads, 0, __stream>>>(__VA_ARGS__); \
-    cudaError_t e = cudaGetLastError(); \
-    if (e != cudaSuccess) { \
-        EPException cuda_exception("CUDA", __FILE__, __LINE__, cudaGetErrorString(e)); \
-        fprintf(stderr, "%s\n", cuda_exception.what()); \
-        throw cuda_exception; \
-    } \
-} while (0)
+    do { \
+        kernel<<<__num_sms, __num_threads, 0, __stream>>>(__VA_ARGS__); \
+        cudaError_t e = cudaGetLastError(); \
+        if (e != cudaSuccess) { \
+            EPException cuda_exception("CUDA", __FILE__, __LINE__, cudaGetErrorString(e)); \
+            fprintf(stderr, "%s\n", cuda_exception.what()); \
+            throw cuda_exception; \
+        } \
+    } while (0)
 #endif
 #endif

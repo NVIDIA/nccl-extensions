@@ -21,9 +21,11 @@ namespace hybridep {
 namespace jit {
 
 constexpr const char* kScanFlatJitEntryName = "nccl_ep_jit_ht_scan_flat_kernel";
-constexpr const char* kScanEmJitEntryName   = "nccl_ep_jit_ht_scan_em_kernel";
+constexpr const char* kScanEmJitEntryName = "nccl_ep_jit_ht_scan_em_kernel";
 
-inline const char* scan_bool_literal(bool value) { return value ? "true" : "false"; }
+inline const char* scan_bool_literal(bool value) {
+    return value ? "true" : "false";
+}
 
 inline std::string scan_flat_jit_source(
     int num_threads_per_block,
@@ -34,8 +36,7 @@ inline std::string scan_flat_jit_source(
     constexpr int rank_mask_word_bits = CHAR_BIT * static_cast<int>(sizeof(uint64_t));
     const int rank_mask_words = (lsa_team_size + rank_mask_word_bits - 1) / rank_mask_word_bits;
     std::ostringstream src;
-    src
-        << "#include \"device/hybrid_ep.cuh\"\n"
+    src << "#include \"device/hybrid_ep.cuh\"\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(" << num_threads_per_block << ", 1)\n"
         << "__global__ void " << kScanFlatJitEntryName << "(\n"
@@ -57,16 +58,12 @@ inline std::string scan_flat_jit_source(
     return src.str();
 }
 
-inline std::string scan_em_jit_source(
-    int num_threads_per_block,
-    int num_of_blocks,
-    int num_lsa_teams,
-    int lsa_team_size) {
+inline std::string
+scan_em_jit_source(int num_threads_per_block, int num_of_blocks, int num_lsa_teams, int lsa_team_size) {
     constexpr int rank_mask_word_bits = CHAR_BIT * static_cast<int>(sizeof(uint64_t));
     const int rank_mask_words = (lsa_team_size + rank_mask_word_bits - 1) / rank_mask_word_bits;
     std::ostringstream src;
-    src
-        << "#include \"device/hybrid_ep.cuh\"\n"
+    src << "#include \"device/hybrid_ep.cuh\"\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(" << num_threads_per_block << ", 1)\n"
         << "__global__ void " << kScanEmJitEntryName << "(\n"
@@ -95,17 +92,17 @@ inline void launch_scan_flat(
     static const int variant_identity = 0;
     const std::string variant_name = [&] {
         std::ostringstream name;
-        name
-            << "scan_flat"
-            << "_nodes" << num_lsa_teams
-            << "_lsa" << lsa_team_size
-            << "_threads" << num_threads_per_block
-            << "_blocks" << num_of_blocks
-            << (enable_per_expert_counts ? "_pec" : "_nopec");
+        name << "scan_flat"
+             << "_nodes" << num_lsa_teams << "_lsa" << lsa_team_size << "_threads" << num_threads_per_block << "_blocks"
+             << num_of_blocks << (enable_per_expert_counts ? "_pec" : "_nopec");
         return name.str();
     }();
     const std::string source = scan_flat_jit_source(
-        num_threads_per_block, num_of_blocks, num_lsa_teams, lsa_team_size, enable_per_expert_counts);
+        num_threads_per_block,
+        num_of_blocks,
+        num_lsa_teams,
+        lsa_team_size,
+        enable_per_expert_counts);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_scan_flat";
@@ -119,8 +116,7 @@ inline void launch_scan_flat(
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
 
     std::string error;
-    const ::nccl_ep::jit::JitKernelStatus status =
-        ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
+    const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
         std::fprintf(
@@ -144,16 +140,12 @@ inline void launch_scan_em(
     static const int variant_identity = 0;
     const std::string variant_name = [&] {
         std::ostringstream name;
-        name
-            << "scan_em"
-            << "_nodes" << num_lsa_teams
-            << "_lsa" << lsa_team_size
-            << "_threads" << num_threads_per_block
-            << "_blocks" << num_of_blocks;
+        name << "scan_em"
+             << "_nodes" << num_lsa_teams << "_lsa" << lsa_team_size << "_threads" << num_threads_per_block << "_blocks"
+             << num_of_blocks;
         return name.str();
     }();
-    const std::string source = scan_em_jit_source(
-        num_threads_per_block, num_of_blocks, num_lsa_teams, lsa_team_size);
+    const std::string source = scan_em_jit_source(num_threads_per_block, num_of_blocks, num_lsa_teams, lsa_team_size);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_scan_em";
@@ -167,8 +159,7 @@ inline void launch_scan_em(
     variant.dynamic_smem_bytes = 0;
 
     std::string error;
-    const ::nccl_ep::jit::JitKernelStatus status =
-        ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
+    const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
         std::fprintf(

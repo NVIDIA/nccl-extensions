@@ -22,7 +22,9 @@ namespace jit {
 
 constexpr const char* kLlDispatchJitEntryName = "nccl_ep_jit_ll_dispatch_kernel";
 
-inline const char* ll_dispatch_bool_literal(bool value) { return value ? "true" : "false"; }
+inline const char* ll_dispatch_bool_literal(bool value) {
+    return value ? "true" : "false";
+}
 
 inline std::string ll_dispatch_jit_source(
     bool useFp8,
@@ -34,9 +36,7 @@ inline std::string ll_dispatch_jit_source(
     bool topkIdxIsInt64,
     ncclDataType_t tokenDtype) {
     const char* layout_literal =
-        (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR)
-            ? "NCCL_EP_LAYOUT_EXPERT_MAJOR"
-            : "NCCL_EP_LAYOUT_RANK_MAJOR";
+        (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? "NCCL_EP_LAYOUT_EXPERT_MAJOR" : "NCCL_EP_LAYOUT_RANK_MAJOR";
     const char* topk_type = topkIdxIsInt64 ? "int64_t" : "int32_t";
     const char* token_dtype_literal = ll_token_dtype_template_literal(tokenDtype);
 
@@ -44,8 +44,7 @@ inline std::string ll_dispatch_jit_source(
     // host packs. Including device/ll_ep_adapter.cuh keeps the layout in sync;
     // ll_ep.cuh pulls in all kernel templates and helpers.
     std::ostringstream src;
-    src
-        << "#include \"device/ll_ep.cuh\"\n"
+    src << "#include \"device/ll_ep.cuh\"\n"
         << "#include \"device/ll_ep_adapter.cuh\"\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(1024, 1)\n"
@@ -97,20 +96,22 @@ inline void launch_ll_dispatch(
     static const int variant_identity = 0;
     const std::string variant_name = [&] {
         std::ostringstream name;
-        name
-            << "ll_dispatch"
-            << "_hdim" << hidden
-            << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_rm")
-            << (useFp8 ? "_fp8" : "_bf16")
-            << (useUe8m0 ? "_ue8m0" : "")
-            << (useExternQuant ? "_extern" : "")
-            << (nvlinkOnly ? "_nvlinkonly" : "")
-            << (topkIdxIsInt64 ? "_topk64" : "_topk32")
-            << ll_token_dtype_name_tag(tokenDtype);
+        name << "ll_dispatch"
+             << "_hdim" << hidden << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_rm")
+             << (useFp8 ? "_fp8" : "_bf16") << (useUe8m0 ? "_ue8m0" : "") << (useExternQuant ? "_extern" : "")
+             << (nvlinkOnly ? "_nvlinkonly" : "") << (topkIdxIsInt64 ? "_topk64" : "_topk32")
+             << ll_token_dtype_name_tag(tokenDtype);
         return name.str();
     }();
     const std::string source = ll_dispatch_jit_source(
-        useFp8, useUe8m0, useExternQuant, hidden, layout, nvlinkOnly, topkIdxIsInt64, tokenDtype);
+        useFp8,
+        useUe8m0,
+        useExternQuant,
+        hidden,
+        layout,
+        nvlinkOnly,
+        topkIdxIsInt64,
+        tokenDtype);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ll_dispatch";

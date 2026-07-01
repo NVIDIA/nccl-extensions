@@ -33,11 +33,7 @@ std::string env_value(const char* name) {
 bool env_flag_enabled(const char* name, bool default_value) {
     std::string value = env_value(name);
     if (value.empty()) return default_value;
-    return value[0] != '0' &&
-           value != "false" &&
-           value != "FALSE" &&
-           value != "off" &&
-           value != "OFF";
+    return value[0] != '0' && value != "false" && value != "FALSE" && value != "off" && value != "OFF";
 }
 
 bool announce_once(const std::string& key) {
@@ -132,12 +128,24 @@ std::string json_escape(std::string_view text) {
     std::ostringstream out;
     for (char c : text) {
         switch (c) {
-        case '\\': out << "\\\\"; break;
-        case '"': out << "\\\""; break;
-        case '\n': out << "\\n"; break;
-        case '\r': out << "\\r"; break;
-        case '\t': out << "\\t"; break;
-        default: out << c; break;
+        case '\\':
+            out << "\\\\";
+            break;
+        case '"':
+            out << "\\\"";
+            break;
+        case '\n':
+            out << "\\n";
+            break;
+        case '\r':
+            out << "\\r";
+            break;
+        case '\t':
+            out << "\\t";
+            break;
+        default:
+            out << c;
+            break;
         }
     }
     return out.str();
@@ -158,9 +166,8 @@ bool write_file_atomic(const std::filesystem::path& path, const std::string& dat
     }
 
     std::ostringstream tmp_name;
-    tmp_name << path.string()
-             << ".tmp." << static_cast<long>(getpid())
-             << "." << std::hash<std::thread::id>{}(std::this_thread::get_id());
+    tmp_name << path.string() << ".tmp." << static_cast<long>(getpid()) << "."
+             << std::hash<std::thread::id>{}(std::this_thread::get_id());
     const std::filesystem::path tmp_path = tmp_name.str();
     const auto mode = binary ? (std::ios::binary | std::ios::trunc) : std::ios::trunc;
     {

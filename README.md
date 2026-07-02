@@ -1,13 +1,22 @@
 # NCCL Extensions
 
-This repository is a collection of directories that extend NCCL with new
-capabilities or higher-level APIs.  The content here is under constant
-development and subject to change.
+NCCL Extensions is a repository of communication patterns for AI use cases,
+built on top of NCCL device and host APIs. It speeds up tensor communication
+for workloads like MoE token shuffling and reinforcement learning weight
+rollout.
+
+This is an evolving space, and the content here is under constant development
+and subject to change. We will continue exploring it and welcome your
+contributions.
 
 ## Current Collection
 
-| Directory | Description |
-|-----------|-------------|
-| [`nccl_ep/`](nccl_ep/) | Expert Parallel (EP) APIs for MoE communication |
-| [`nccl_m2n/`](nccl_m2n/) | Cross-mesh transfer APIs for RL communication |
+### [`nccl_ep/`](nccl_ep/) — Expert Parallelism (EP)
+Optimized dispatch and combine primitives for Mixture-of-Experts (MoE) token
+routing, built on NCCL's Device API (LSA and GIN operations).
+
+### [`nccl_m2n/`](nccl_m2n/) — Mesh-to-Mesh (M2N)
+Experimental library for resharding a tensor between two disjoint groups of
+GPU processes (e.g. trainer and inference ranks) in a single, zero-copy call,
+built on NCCL's window API.
 

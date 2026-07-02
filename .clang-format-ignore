@@ -1,0 +1,9 @@
+# ignore codes from external projects
+nccl_m2n/third_party**
+
+# ignore generated codes
+build/**
+
+# ignore all these directories to avoid divergence during migration
+nccl_ep/**
+nccl_m2n/**

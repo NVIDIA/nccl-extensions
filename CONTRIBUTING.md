@@ -139,6 +139,11 @@ Caveats          | memory, but since it is a part of a struct, it is easier
                  | for now to keep the code simple.
 ```
 
+### License
+By submitting a contribution, you agree that it will be licensed under the
+Apache License, Version 2.0 (Apache-2.0). We only accept contributions under
+this license.
+
 ### Signed Commits
 All commits must be signed off to certify you have the right to submit the code:
 ```bash

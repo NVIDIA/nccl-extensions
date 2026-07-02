@@ -187,9 +187,14 @@ typedef struct {
     // REQUIRED for both LL and HT modes (must be > 0).
     unsigned int max_dispatch_tokens_per_rank;
     // Maximum number of tokens any single rank will receive.
-    //   HT: required, must be >= max_dispatch_tokens_per_rank. If you use the
-    //   Expert-Major layout, this size must account for the possibility of
+    //   HT: explicit value must be >= max_dispatch_tokens_per_rank. If you use
+    //   the Expert-Major layout, this size must account for the possibility of
     //   duplicating a token to multiple local experts.
+    //   HT AUTO/0 enables eager mode: the library derives its internal bound
+    //   and the caller sizes dispatch recv buffers to the actual recv count of
+    //   the current routing (see ncclEpLayoutInfo_t::recv_total_counter). Eager
+    //   mode does not support NCCL_EP_OVERFLOW_DROP or CUDA Graph capture of
+    //   ncclEpDispatch.
     //   LL: AUTO/0 → nRanks * max_dispatch_tokens_per_rank.
     unsigned int max_recv_tokens_per_rank;
     // Upper bound on per-token bytes, covering both dispatch and combine.
@@ -235,6 +240,11 @@ typedef struct {
     // Policy on recv overflow (HT only). Zero-init default = NCCL_EP_OVERFLOW_AUTO
     // (resolves to TRAP). NCCL_EP_OVERFLOW_DROP drops overflowing tokens and continues.
     ncclEpOverflowPolicy_t overflow_policy;
+    // Upper bound on per-token top-k across all handles of this group. Optional
+    // (0 = unset); required only for HT eager mode with the Expert-Major layout,
+    // where it sizes internal buffers. When set, ncclEpInitHandle validates the
+    // handle's num_topk against it.
+    unsigned int num_topk;
 } ncclEpGroupConfig_t;
 
 #define NCCL_EP_GROUP_CONFIG_INIT \

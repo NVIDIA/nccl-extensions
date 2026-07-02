@@ -866,6 +866,10 @@ struct dispatch_kernel_param_base_t {
     // Cross-round WAR sync-guards: LSA (intra-node staging) uses the NCCL LSA barrier; RDMA
     // (inter-node staging) is hand-rolled. Only the enable flags are needed on the device now.
     bool guard_enabled; // cross-round WAR guard (LSA + RDMA share one enable)
+    // Backstop bound for recv slot indices; the scan never publishes slots at or
+    // above it (DROP masks the rest), so the S2G assert only fires on corrupted
+    // or stale routing maps.
+    int max_recv_tokens_per_rank;
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
     dispatch_warp_timing_entry_t* warp_timing;
 #endif
@@ -1315,11 +1319,15 @@ __forceinline__ __device__ void dispatch_s2g_issue_token(
     const int pipeline_rank,
     const int stage,
     const int HIDDEN_DIM,
-    const int sf_bytes_per_token) {
+    const int sf_bytes_per_token,
+    const int max_recv_tokens_per_rank) {
     const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE));
     const uint32_t sf_bytes = (uint32_t)sf_bytes_per_token;
 
     // Remote fan-out: each field has its own output array, indexed [rank]+slot*stride.
+    // The scan never publishes slots at or above the bound, so this catches
+    // corrupted or stale routing maps before they overrun a recv buffer.
+    EP_DEVICE_ASSERT(dst.output_buffer_index < max_recv_tokens_per_rank);
     const void* token_dst = remote_expert_output_token[dst.remote_rank_id] + (dst.output_buffer_index * HIDDEN_DIM);
     const void* sf_dst = nullptr;
     if constexpr (HAS_SF) {
@@ -1555,6 +1563,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
     const bool local_dup_enabled,
+    const int max_recv_tokens_per_rank,
     SMEM_TYPE* smem_buffer_ptr) {
     constexpr int STAGES_PER_PIPELINE = NUM_OF_STAGES / NUM_PIPELINES;
     static_assert(
@@ -1664,7 +1673,8 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                                         pipeline_rank,
                                         stage,
                                         HIDDEN_DIM,
-                                        sf_bytes_per_token);
+                                        sf_bytes_per_token,
+                                        max_recv_tokens_per_rank);
                                 }
                                 // prob via cooperative (coalesced) SM stores (off the TMA path), GMEM source -> remote.
                                 if constexpr (FORWARD_DISPATCH) {
@@ -3931,6 +3941,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             HIDDEN_DIM,
             SF_BYTES_PER_TOKEN,
             param.local_dup_enabled,
+            param.max_recv_tokens_per_rank,
             smem_buffer_ptr);
     } else if (
         PAD_GROUP::size() > 0 && threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() +
@@ -4884,6 +4895,7 @@ struct local_permute_dup_param_t {
     int top_k;
     int experts_per_rank;
     int row_bytes;
+    int caller_num_recv_tokens;   // caller recv buffer row capacity
 };
 
 template <int HiddenInt4, int HiddenVec>
@@ -4898,7 +4910,8 @@ __device__ __forceinline__ void local_permute_dup(
     const int32_t* __restrict__ per_expert_counts_active,
     int top_k,
     int experts_per_rank,
-    int /*row_bytes*/) {
+    int /*row_bytes*/,
+    int caller_num_recv_tokens) {
     constexpr int kThreadsPerSlot = kLocalPermuteThreadsPerSlot;
     constexpr int kHiddenVec = HiddenVec;
     constexpr int kPermuteWarps = kLocalPermutePermuteWarps;
@@ -4912,6 +4925,10 @@ __device__ __forceinline__ void local_permute_dup(
     const int pad_idx = warp_id - kPermuteWarps;
 
     const int num_recv = *num_recv_tokens_dev;
+    // Caller recv buffers must hold the full padded EM total. Host checks
+    // enforce this per mode (budget or actual rows); this is the backstop.
+    const int64_t em_padded_total = expert_token_offsets[experts_per_rank];
+    EP_DEVICE_ASSERT(caller_num_recv_tokens >= em_padded_total);
     constexpr int row_int4 = HiddenInt4;
     constexpr int row_bytes = HiddenInt4 * 16;
 

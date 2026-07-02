@@ -436,7 +436,8 @@ inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec,
         << "      p.per_expert_counts_active,\n"
         << "      p.top_k,\n"
         << "      p.experts_per_rank,\n"
-        << "      p.row_bytes);\n"
+        << "      p.row_bytes,\n"
+        << "      p.caller_num_recv_tokens);\n"
         << "}\n";
     return src.str();
 }

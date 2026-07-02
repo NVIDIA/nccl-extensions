@@ -249,6 +249,7 @@ void launch_dispatch_permute(
     int row_bytes,
     int sm_count,
     unsigned int prolog_epilog_sms,
+    int caller_num_recv_tokens,
     cudaStream_t stream);
 
 // Inverse of launch_dispatch_permute: gather caller EM combine input into
@@ -361,6 +362,9 @@ struct DispatchParams {
     int local_dup_num_sms = 0;
 
     bool guard_enabled = false; // RDMA + LSA buffer guard on/off
+
+    // Backstop bound for recv slot indices (see dispatch_kernel_param_base_t).
+    int max_recv_tokens_per_rank = 0;
 };
 
 // Call dispatch kernel with runtime template parameter resolution.

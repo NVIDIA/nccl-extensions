@@ -785,6 +785,7 @@ template <typename TOKEN_DATA_TYPE>
     kp.num_of_tokens_per_rank = params.num_tokens_per_rank;
     kp.local_dup_enabled = (params.local_dup_num_sms > 0);
     kp.guard_enabled = params.guard_enabled;
+    kp.max_recv_tokens_per_rank = params.max_recv_tokens_per_rank;
 
     // Pass device communicators and windows
     kp.dcomm = params.dcomm;
@@ -1299,6 +1300,7 @@ void launch_dispatch_permute(
     int row_bytes,
     int sm_count,
     unsigned int prolog_epilog_sms,
+    int caller_num_recv_tokens,
     cudaStream_t stream) {
     assert(experts_per_rank > 0 && experts_per_rank <= ::hybrid_ep::kLocalPermuteMaxExpertsPerRank);
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
@@ -1320,6 +1322,7 @@ void launch_dispatch_permute(
     p.top_k = top_k;
     p.experts_per_rank = experts_per_rank;
     p.row_bytes = row_bytes;
+    p.caller_num_recv_tokens = caller_num_recv_tokens;
 
     ::nccl_ep::hybridep::jit::launch_local_permute_dup(static_cast<int>(grid), p, stream);
 }

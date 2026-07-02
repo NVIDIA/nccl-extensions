@@ -501,6 +501,106 @@ TEST_F(OutputLayoutTest, TotalCounterDeviceFLAT) {
     NCCL_ASSERT(ncclEpHandleDestroy(h));
 }
 
+// Eager mode (max_recv_tokens_per_rank = NCCL_EP_AUTO): dispatch succeeds with
+// recv buffers sized to the actual recv count for both FLAT and EM layouts, and
+// rejects undersized recv buffers before any kernel writes caller memory.
+
+TEST_F(OutputLayoutTest, EagerRecvSize) {
+    ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
+    gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+    gcfg.num_experts = kNumExperts;
+    gcfg.max_dispatch_tokens_per_rank = kNumTokens;
+    gcfg.max_token_bytes = kHidden * sizeof(nv_bfloat16);
+    gcfg.rdma_buffer_size = NCCL_EP_AUTO;
+    gcfg.num_qp_per_rank = NCCL_EP_AUTO;
+    gcfg.num_channels = NCCL_EP_AUTO;
+    gcfg.max_recv_tokens_per_rank = NCCL_EP_AUTO; // eager mode
+    gcfg.num_topk = kTopK;
+    ncclEpGroup_t eager_group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&eager_group, g_comm, &gcfg));
+
+    auto run = [&](bool em, const ncclEpHandleConfig_t* hcfg = nullptr) {
+        ncclEpHandle_t h = nullptr;
+        NCCL_ASSERT(ncclEpCreateHandle(
+            &h,
+            eager_group,
+            em ? NCCL_EP_LAYOUT_EXPERT_MAJOR : NCCL_EP_LAYOUT_FLAT,
+            em ? topk_idx_em_ : topk_idx_,
+            nullptr,
+            hcfg,
+            g_stream));
+        ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+        unsigned int num_recv = 0;
+        NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+        ASSERT_GT(num_recv, 1u);
+
+        nv_bfloat16 *d_tok, *d_recv;
+        float *d_weights, *d_recv_w;
+        int64_t* d_recv_idx = nullptr;
+        CUDA_ASSERT(cudaMalloc(&d_tok, kNumTokens * kHidden * sizeof(nv_bfloat16)));
+        CUDA_ASSERT(cudaMalloc(&d_recv, num_recv * kHidden * sizeof(nv_bfloat16)));
+        CUDA_ASSERT(cudaMalloc(&d_weights, kNumTokens * kTopK * sizeof(float)));
+        CUDA_ASSERT(cudaMalloc(&d_recv_w, num_recv * (em ? 1 : kTopK) * sizeof(float)));
+        if (!em) CUDA_ASSERT(cudaMalloc(&d_recv_idx, num_recv * kTopK * sizeof(int64_t)));
+
+        std::vector<float> h_w(kNumTokens * kTopK, 1.0f);
+        CUDA_ASSERT(cudaMemcpy(d_weights, h_w.data(), kNumTokens * kTopK * sizeof(float), cudaMemcpyHostToDevice));
+
+        ncclEpTensor_t *t_tok, *t_recv, *t_w, *t_recv_w, *t_recv_idx = nullptr;
+        NCCL_ASSERT(epTensorCreate(&t_tok, 2, ncclBfloat16, d_tok, kNumTokens, kHidden));
+        NCCL_ASSERT(epTensorCreate(&t_recv, 2, ncclBfloat16, d_recv, num_recv, kHidden));
+        NCCL_ASSERT(epTensorCreate(&t_w, 2, ncclFloat32, d_weights, kNumTokens, kTopK));
+        if (em) {
+            NCCL_ASSERT(epTensorCreate(&t_recv_w, 1, ncclFloat32, d_recv_w, num_recv));
+        } else {
+            NCCL_ASSERT(epTensorCreate(&t_recv_w, 2, ncclFloat32, d_recv_w, num_recv, kTopK));
+            NCCL_ASSERT(epTensorCreate(&t_recv_idx, 2, ncclInt64, d_recv_idx, num_recv, kTopK));
+        }
+
+        ncclEpDispatchInputs_t d_in_s = NCCL_EP_DISPATCH_INPUTS_INIT;
+        ncclEpDispatchOutputs_t d_out_s = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+        d_in_s.tokens = t_tok;
+        d_in_s.topk_weights = t_w;
+        d_out_s.tokens = t_recv;
+        d_out_s.topk_weights = t_recv_w;
+        d_out_s.topk_idx = t_recv_idx;
+        ncclEpDispatchConfig_t dcfg = NCCL_EP_DISPATCH_CONFIG_INIT;
+        EXPECT_EQ(ncclEpDispatch(h, &d_in_s, &d_out_s, nullptr, &dcfg, g_stream), ncclSuccess);
+        EXPECT_EQ(ncclEpComplete(h, nullptr, g_stream), ncclSuccess);
+        EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+
+        // Undersized recv buffer: rejected on host before any kernel launch.
+        ncclEpTensor_t* t_recv_small = nullptr;
+        NCCL_ASSERT(epTensorCreate(&t_recv_small, 2, ncclBfloat16, d_recv, num_recv - 1, kHidden));
+        d_out_s.tokens = t_recv_small;
+        EXPECT_EQ(ncclEpDispatch(h, &d_in_s, &d_out_s, nullptr, &dcfg, g_stream), ncclInvalidArgument);
+        ncclEpTensorDestroy(t_recv_small);
+
+        ncclEpTensorDestroy(t_tok);
+        ncclEpTensorDestroy(t_recv);
+        ncclEpTensorDestroy(t_w);
+        ncclEpTensorDestroy(t_recv_w);
+        if (t_recv_idx) ncclEpTensorDestroy(t_recv_idx);
+        cudaFree(d_tok);
+        cudaFree(d_recv);
+        cudaFree(d_weights);
+        cudaFree(d_recv_w);
+        if (d_recv_idx) cudaFree(d_recv_idx);
+        NCCL_ASSERT(ncclEpHandleDestroy(h));
+    };
+
+    run(/*em=*/false);
+    run(/*em=*/true);
+
+    // EM zone padding: the queried recv total includes padding, so eager
+    // sizing covers alignment (padded total fits the eager bound here).
+    ncclEpHandleConfig_t hcfg = NCCL_EP_HANDLE_CONFIG_INIT;
+    hcfg.dispatch_output_per_expert_alignment = 8;
+    run(/*em=*/true, &hcfg);
+
+    NCCL_ASSERT(ncclEpGroupDestroy(eager_group));
+}
+
 // ── TopK2MixedRoutingTest fixture ─────────────────────────────────────────────
 // top-k=2 with a fixed routing mixing same-rank pairs (T0/T1) and cross-rank
 // pairs (T2/T3):

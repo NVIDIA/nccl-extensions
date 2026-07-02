@@ -54,7 +54,8 @@ $(GTEST_OBJDIR)/gtest_main.a: $(GTEST_OBJDIR)/gtest-all.o $(GTEST_OBJDIR)/gtest_
 $(DST_DIR):
 	@mkdir -p $@
 
-INTERNAL_HEADERS := $(abspath ../nccl_ep_test_internal.h) test_common.h
+INTERNAL_HEADERS := $(abspath ../nccl_ep_test_internal.h) test_common.h \
+                    $(wildcard $(NCCL_EP_INCDIR)/nccl_ep*.h $(NCCL_EP_INCDIR)/ep_*.h)
 
 $(DST_DIR)/%.o: %.cu $(INTERNAL_HEADERS) | $(DST_DIR)
 	@printf "Compiling  %-45s > %s\n" $< $@

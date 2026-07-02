@@ -634,6 +634,11 @@ struct ncclEpGroup {
         bool internode_initialized;
     } ht_buffers;
 
+    // HT eager recv sizing (config.max_recv_tokens_per_rank == NCCL_EP_AUTO):
+    // max_recv_tokens holds the derived internal bound; the caller sizes
+    // dispatch recv buffers to the actual recv count of the current routing.
+    bool eager_mode;
+
     // Constructor to properly initialize all members
     ncclEpGroup()
         : comm(nullptr), nRanks(0), rank(0), nNodes(0), ep_workspace(nullptr), cuda_device_id(0), lsa_team_size(0),
@@ -641,7 +646,7 @@ struct ncclEpGroup {
           num_local_experts(0), max_recv_tokens(0), device_sm_count(0), comm_num_sms(0), prolog_epilog_sms(0),
           preprocess_num_sms(0), ht_em_mode(HtEmMode::kLocalPermute), alloc{}, gpus_per_node(0), rank_in_node(0),
           node_id(0), num_nccl_comms(0), nccl_comms{}, nccl_dev_comms(nullptr), nccl_wins(nullptr),
-          num_dispatch_signals(0), clean_barrier_signal_base(0), ht_buffers{} {}
+          num_dispatch_signals(0), clean_barrier_signal_base(0), ht_buffers{}, eager_mode(false) {}
 };
 
 // For tensors w/o external window, lazily bind the internal GIN window and offset.
@@ -755,6 +760,7 @@ buildIntranodePtrArray(const ncclEpGroup_t group, const ncclEpTensor_t* tensor, 
 // Only kLocalDup/kNvlinkDup with non-zero-copy; reachable via env override since
 // auto selection pairs these modes with zero_copy=ON (no staging allocated).
 static bool em_staging_indexed_by_em_slot(ncclEpGroup_t group);
+static ncclResult_t ht_query_num_recv_tokens(ncclEpHandle_t handle, cudaStream_t stream, unsigned int* num_recv_tokens);
 
 // HT Intranode Initialization (adapted for public NCCL APIs)
 static ncclResult_t
@@ -782,6 +788,9 @@ init_hybridep_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
     size_t max_output_slots = static_cast<size_t>(max_recv_tokens);
     // Token staging slots per direction; zero_copy elides both regions.
     // kLocalPermute uses rank-major writes, kLocalDup and kNvlinkDup use em_slot.
+    // Eager mode: max_output_slots covers the raw worst case but no per-expert
+    // pad slack (alignment is per-handle, unknown here). A dup-mode routing whose
+    // padded total exceeds it traps at the scan instead of overrunning staging.
     const size_t flat_slots = static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * ep_group->nRanks;
     size_t token_staging_slots = em_staging_indexed_by_em_slot(ep_group) ? max_output_slots : flat_slots;
     ep_group->ht_buffers.token_staging_slots = token_staging_slots;
@@ -1520,16 +1529,32 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     ep_group->nNodes = static_cast<int>(unique_hosts.size());
 
     ep_group->num_local_experts = ep_group->config.num_experts / ep_group->nRanks;
-    // HT: caller must provide a slot budget >= max_dispatch_tokens_per_rank (NCCL_EP_AUTO==0).
     EP_HOST_ASSERT(
-        !(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ep_group->config.max_recv_tokens_per_rank == 0) &&
-        "ncclEpCreateGroup: HT mode requires max_recv_tokens_per_rank > 0");
-    EP_HOST_ASSERT(
-        !(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
+        !(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ep_group->config.max_recv_tokens_per_rank != 0 &&
           ep_group->config.max_recv_tokens_per_rank < ep_group->config.max_dispatch_tokens_per_rank) &&
         "ncclEpCreateGroup: HT mode requires max_recv_tokens_per_rank >= max_dispatch_tokens_per_rank");
-    // LL auto-budget (nRanks * max_dispatch_tokens_per_rank, layout-agnostic).
-    if (ep_group->config.max_recv_tokens_per_rank == 0) {
+    EP_HOST_ASSERT(
+        !(in_config->num_topk != 0 && in_config->num_topk > in_config->num_experts) &&
+        "ncclEpCreateGroup: num_topk must be <= num_experts");
+
+    // Resolve the per-rank recv slot budget.
+    //   HT explicit value: fixed budget; callers size recv buffers to it.
+    //   HT AUTO/0: eager mode; the bound only sizes internal buffers and callers
+    //   size recv buffers to the actual recv count per routing. Expert-Major
+    //   expands each token to up to num_topk slots, hence the config.num_topk
+    //   factor. Eager relies on TRAP semantics, so DROP requires a fixed budget.
+    //   LL AUTO/0: nRanks * max_dispatch_tokens_per_rank (layout-agnostic).
+    ep_group->eager_mode = hybridep_mode && (ep_group->config.max_recv_tokens_per_rank == 0);
+    if (ep_group->eager_mode) {
+        EP_HOST_ASSERT(
+            ep_group->config.overflow_policy != NCCL_EP_OVERFLOW_DROP &&
+            "ncclEpCreateGroup: eager mode (max_recv_tokens_per_rank = NCCL_EP_AUTO) "
+            "does not support NCCL_EP_OVERFLOW_DROP");
+        const size_t bound = static_cast<size_t>(ep_group->nRanks) * ep_group->config.max_dispatch_tokens_per_rank *
+                             (ep_group->config.num_topk > 0 ? ep_group->config.num_topk : 1);
+        EP_HOST_ASSERT(bound <= UINT_MAX && "ncclEpCreateGroup: eager recv bound overflows unsigned int");
+        ep_group->config.max_recv_tokens_per_rank = static_cast<unsigned int>(bound);
+    } else if (ep_group->config.max_recv_tokens_per_rank == 0) {
         ep_group->config.max_recv_tokens_per_rank = ep_group->nRanks * ep_group->config.max_dispatch_tokens_per_rank;
     }
     ep_group->max_recv_tokens = static_cast<int>(ep_group->config.max_recv_tokens_per_rank);
@@ -2374,6 +2399,20 @@ static ncclResult_t
 ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor_t* handle_mem, int num_topk) {
     assert(ep_group->config.max_dispatch_tokens_per_rank > 0 && "HT requires max_dispatch_tokens_per_rank > 0");
     assert(num_topk > 0 && "HT mode requires num_topk > 0 (pass top_k to ncclEpInitHandle)");
+    // Eager groups size internal buffers from config.num_topk; enforce it as the
+    // per-handle upper bound, and require it for Expert-Major (per-expert slot
+    // expansion is unbounded without it).
+    if (ep_group->config.num_topk > 0) {
+        EP_HOST_ASSERT(
+            static_cast<unsigned int>(num_topk) <= ep_group->config.num_topk &&
+            "ncclEpInitHandle: num_topk exceeds ncclEpGroupConfig_t::num_topk");
+    } else if (ep_group->eager_mode && handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+        fprintf(
+            stderr,
+            "NCCL EP: eager mode (max_recv_tokens_per_rank = NCCL_EP_AUTO) requires "
+            "ncclEpGroupConfig_t::num_topk for the Expert-Major layout\n");
+        return ncclInvalidUsage;
+    }
     // kNvlinkDup/kLocalDup write the staging buffer in the same per-expert
     // expanded shape as the dispatch output (each token can occupy up to
     // num_topk slots), so max_recv_tokens must cover the worst case
@@ -2750,7 +2789,17 @@ ncclResult_t ncclEpUpdateHandle(
             expert_major ? handle->num_topk : 0,
             recv_total_counter,
             out_is_int64,
-            static_cast<int>(ep_group->config.max_recv_tokens_per_rank),
+            // Eager local-permute: padded zones live only in the caller buffer
+            // (checked at dispatch), so extend the zone-overflow budget by the
+            // worst-case padding. Dup modes stage by padded em_slot in
+            // bound-sized buffers, so they keep the strict budget.
+            static_cast<int>(
+                ep_group->config.max_recv_tokens_per_rank +
+                ((ep_group->eager_mode && em_permute_active &&
+                  handle->hybridep.dispatch_output_per_expert_alignment > 1)
+                     ? static_cast<unsigned int>(experts_per_rank) *
+                           (static_cast<unsigned int>(handle->hybridep.dispatch_output_per_expert_alignment) - 1)
+                     : 0)),
             handle->hybridep.emuf_group_buf,
             handle->hybridep.emuf_group_count,
             handle->hybridep.emuf_group_stride,
@@ -2784,7 +2833,9 @@ ncclResult_t ncclEpCreateHandle(
     cudaStream_t stream) {
     topk_idx = tensor_required(topk_idx);
     assert(out_handle != nullptr);
-    NCCL_CHECK_RESULT(ncclEpInitHandle(
+    // Propagate validation errors (e.g. unsupported eager-mode combinations)
+    // instead of exiting the process.
+    NCCLCHECK(ncclEpInitHandle(
         out_handle,
         ep_group,
         layout,
@@ -3255,9 +3306,25 @@ ncclResult_t ncclEpDispatch(
             return ncclInvalidArgument;
         }
         NCCLCHECK(resolveTensorWindowBinding(group, recv_x, &recv_x_local, 0, &recv_x));
-        // HT dispatch indexes recv slots up to max_recv_tokens; recv_x must be large enough.
-        if (recv_x->ndim < 2 ||
-            recv_x->sizes[0] < static_cast<unsigned>(group->max_recv_tokens)) {
+        if (recv_x->ndim < 2) {
+            return ncclInvalidArgument;
+        }
+        // Eager mode sizes recv buffers per routing, which requires the actual
+        // recv count on host and is unavailable during CUDA Graph capture.
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+        const bool is_capturing = (capture_status == cudaStreamCaptureStatusActive);
+        if (group->eager_mode && is_capturing) {
+            fprintf(
+                stderr,
+                "NCCL EP: eager mode (max_recv_tokens_per_rank = NCCL_EP_AUTO) does not support "
+                "CUDA Graph capture of ncclEpDispatch; use a fixed max_recv_tokens_per_rank\n");
+            return ncclInvalidUsage;
+        }
+        // Fixed budget: dispatch indexes recv slots up to max_recv_tokens; recv_x
+        // must cover it in full. Eager mode is checked against the actual recv
+        // count below, before any kernel writes caller memory.
+        if (!group->eager_mode && recv_x->sizes[0] < static_cast<unsigned>(group->max_recv_tokens)) {
             return ncclInvalidArgument;
         }
         if (use_fp8) {
@@ -3352,6 +3419,23 @@ ncclResult_t ncclEpDispatch(
         // staging -> recv_x->data); external-window vs. plain recv_x is irrelevant
         // since the permute kernel just dereferences recv_x->data.
         const bool em_permute_active = em_local_permute_enabled(group, handle);
+        // Required caller recv capacity: the full budget in fixed mode (recv_x
+        // checked above), the routing's actual recv count in eager mode. Eager
+        // validates before any kernel writes caller memory; the counts were
+        // published by the handle's scan, so they are final here.
+        unsigned int num_recv_tokens_required = static_cast<unsigned int>(group->max_recv_tokens);
+        if (group->eager_mode) {
+            NCCLCHECK(ht_query_num_recv_tokens(handle, stream, &num_recv_tokens_required));
+            if (recv_x->sizes[0] < num_recv_tokens_required) {
+                fprintf(
+                    stderr,
+                    "NCCL EP: eager dispatch recv buffer too small: %u tokens < %u required "
+                    "(size from ncclEpLayoutInfo_t::recv_total_counter)\n",
+                    static_cast<unsigned>(recv_x->sizes[0]),
+                    num_recv_tokens_required);
+                return ncclInvalidArgument;
+            }
+        }
         if (recv_x_uses_external_window && !em_permute_active) {
             NCCLCHECK(buildIntranodePtrArray<void>(group, recv_x, dispatch_output_token_ptrs));
             params.expert_output_token_ptrs = dispatch_output_token_ptrs.data();
@@ -3439,6 +3523,10 @@ ncclResult_t ncclEpDispatch(
         // EM local-fanout: dispatch dedups S2G; receiver local_dup fills secondaries.
         const bool em_unfused_active = em_local_dup_active(group, handle->layout);
         params.local_dup_num_sms = em_unfused_active ? static_cast<int>(group->prolog_epilog_sms) : 0;
+        // Device-side backstop bound for recv slot indices: the fixed budget or
+        // the derived eager bound. The scan produces slots below it (DROP masks
+        // the rest), so the S2G assert only fires on corrupted or stale routing maps.
+        params.max_recv_tokens_per_rank = group->max_recv_tokens;
 
         // Call dispatch kernel
         const int sf_bytes_per_token = use_fp8 ? num_scales_per_token * scale_elem_bytes : 0;
@@ -3488,9 +3576,6 @@ ncclResult_t ncclEpDispatch(
         //   - Not capturing: blocking D2H readback of the actual recv-token
         //     total and copy only that many rows, keeping bandwidth cost
         //     proportional to real traffic.
-        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
-        const bool is_capturing = (capture_status == cudaStreamCaptureStatusActive);
         unsigned int actual_recv_tokens = 0;
         // D2H readback sizes the byte_copy and FP8-scales D2D; skip when
         // external-window outputs or em-permute make both copies unnecessary.
@@ -3516,6 +3601,7 @@ ncclResult_t ncclEpDispatch(
         // after dense_to_sparse_prob has populated recv_topk_idx_flat, since the
         // permute kernel uses that table to map FLAT slots to EM zones.
         assert(recv_x->ndim == 2);
+        const int caller_num_recv_tokens = static_cast<int>(recv_x->sizes[0]);
         if (!recv_x_uses_external_window && !em_permute_active) {
             if (recv_x->sizes[0] < recv_copy_rows) {
                 return ncclInvalidArgument;
@@ -3552,20 +3638,24 @@ ncclResult_t ncclEpDispatch(
             assert(recv_topk_weights->datatype == ncclFloat32);
             if (em) {
                 assert(recv_topk_weights->ndim == 1 && "HT EM recv_topk_weights must be 1D [num_recv_tokens]");
-                if (recv_topk_weights->sizes[0] < max_recv_tokens) {
-                    return ncclInvalidArgument;
-                }
             } else {
                 assert(recv_topk_weights->ndim == 2 && "HT FLAT recv_topk_weights must be 2D [num_recv_tokens, top_k]");
                 assert(recv_topk_idx->ndim == 2);
+                // dense_to_sparse_prob writes recv_topk_idx as int64, so the caller buffer must be int64.
                 assert(recv_topk_idx->datatype == ncclInt64);
-                if (recv_topk_weights->sizes[0] < max_recv_tokens || recv_topk_idx->sizes[0] < max_recv_tokens ||
-                    recv_topk_weights->sizes[0] != recv_topk_idx->sizes[0]) {
+                if (recv_topk_weights->sizes[0] != recv_topk_idx->sizes[0]) {
                     return ncclInvalidArgument;
                 }
             }
+            if (recv_topk_weights->sizes[0] < num_recv_tokens_required) {
+                return ncclInvalidArgument;
+            }
 
-            int num_recv_tokens = static_cast<int>(max_recv_tokens);
+            // Non-permute paths write the caller buffer, so bound the row count to
+            // recv_copy_rows. The em-permute path writes internal scratch here and
+            // the caller buffer later in launch_dispatch_permute.
+            int num_recv_tokens = em_permute_active ? static_cast<int>(max_recv_tokens)
+                                                    : static_cast<int>(recv_copy_rows);
             int experts_per_node = group->num_local_experts * group->lsa_team_size;
             // recv_topk_idx numbering selector (matches LL rank-major path):
             // version-safe read of layout_info, resolve AUTO -> LOCAL, pass the
@@ -3613,10 +3703,6 @@ ncclResult_t ncclEpDispatch(
                 // wire dtype (bf16/fp16/fp32) works; FP8 is not supported here.
                 return ncclInvalidArgument;
             }
-            // local_permute_dup writes recv_x by em_slot up to max_recv_tokens.
-            if (recv_x->sizes[0] < max_recv_tokens) {
-                return ncclInvalidArgument;
-            }
             const int row_bytes = static_cast<int>(recv_x->sizes[1]) * ncclTypeSize(recv_x->datatype);
             if (row_bytes <= 0 || (row_bytes % 16) != 0) {
                 return ncclInvalidArgument; // int4-vectorized row copy requires 16B-aligned row
@@ -3635,6 +3721,7 @@ ncclResult_t ncclEpDispatch(
                 row_bytes,
                 static_cast<int>(group->device_sm_count),
                 group->prolog_epilog_sms,
+                caller_num_recv_tokens,
                 stream);
         }
 
@@ -4363,7 +4450,10 @@ int ncclEpHandle_test_getExpertsPerRank(ncclEpHandle_t handle) {
     return handle->group->num_local_experts;
 }
 
-ncclResult_t ncclEpHandle_test_getNumRecvTokens(ncclEpHandle_t handle, unsigned int* num_recv_tokens) {
+// Stream-ordered variant: the readback runs after prior work on `stream`
+// (e.g. the ncclEpUpdateHandle scan), so callers on the same stream need no
+// separate synchronization.
+static ncclResult_t ht_query_num_recv_tokens(ncclEpHandle_t handle, cudaStream_t stream, unsigned int* num_recv_tokens) {
     if (handle->group->config.algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT) {
         return ncclInvalidUsage;
     }
@@ -4372,24 +4462,33 @@ ncclResult_t ncclEpHandle_test_getNumRecvTokens(ncclEpHandle_t handle, unsigned 
     // FLAT mode: num_tokens_for_experts holds the raw recv count.
     if (handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
         int64_t em_padded_total;
-        CUDA_CHECK(cudaMemcpy(
+        CUDA_CHECK(cudaMemcpyAsync(
             &em_padded_total,
             handle->hybridep.expert_token_offsets + handle->group->num_local_experts,
             sizeof(em_padded_total),
-            cudaMemcpyDeviceToHost));
+            cudaMemcpyDeviceToHost,
+            stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         assert(em_padded_total >= 0);
         *num_recv_tokens = static_cast<unsigned int>(em_padded_total);
         return ncclSuccess;
     }
     int32_t actual_recv_tokens;
-    CUDA_CHECK(cudaMemcpy(
+    CUDA_CHECK(cudaMemcpyAsync(
         &actual_recv_tokens,
         handle->hybridep.num_tokens_for_experts,
         sizeof(actual_recv_tokens),
-        cudaMemcpyDeviceToHost));
+        cudaMemcpyDeviceToHost,
+        stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     assert(actual_recv_tokens >= 0);
     *num_recv_tokens = static_cast<unsigned int>(actual_recv_tokens);
     return ncclSuccess;
+}
+
+
+ncclResult_t ncclEpHandle_test_getNumRecvTokens(ncclEpHandle_t handle, unsigned int* num_recv_tokens) {
+    return ht_query_num_recv_tokens(handle, /*stream=*/nullptr, num_recv_tokens);
 }
 
 void ncclEpHandle_test_clearTopkIdx(ncclEpHandle_t handle) {

@@ -2235,106 +2235,97 @@ __forceinline__ __device__ void issue_local_g2s_row(
     global_offset += total_valid_count;
 }
 
-// Device function for intra-node G2S warp for combine kernel. There can be only 1 such warp per CUDA block!
+// Decode a block's flat chunk index into its destination node, per-node chunk id, and token
+// count. Emit order (chunk c for node+1..node-1, then c+1) matches the RDMA consume order.
+// Shared by the combine warp groups.
+struct combine_chunk_coord_t {
+    int node_id;
+    int chunk_id;
+    int chunk_size;
+};
+
+template <int NUM_LSA_TEAMS, int NUM_OF_TOKENS_PER_CHUNK>
+__forceinline__ __device__ combine_chunk_coord_t
+combine_chunk_schedule(int chunk_idx, int node_rank, int chunks_per_rank, int remainder_chunk_size) {
+    combine_chunk_coord_t c;
+    c.node_id = (chunk_idx % (NUM_LSA_TEAMS - 1) + (node_rank + 1)) % NUM_LSA_TEAMS;
+    c.chunk_id = chunk_idx / (NUM_LSA_TEAMS - 1);
+    c.chunk_size = (remainder_chunk_size != 0 && c.chunk_id == chunks_per_rank - 1) ? remainder_chunk_size
+                                                                                    : NUM_OF_TOKENS_PER_CHUNK;
+    return c;
+}
+
+// Intra-node G2S warp for the combine kernel. Exactly one such warp per block.
 template <
     typename SMEM_TYPE,
     int NUM_OF_STAGES_G2S,
     int NUM_OF_TOKENS_PER_CHUNK,
     int NUM_LSA_TEAMS,
+    int LSA_TEAM_SIZE,
     int NUM_OF_BLOCKS,
     bool BACKWARD_COMBINE,
     int HIDDEN_DIM,
     ncclEpLayout_t kLayout,
     ncclDataType_t kTokenDtype>
-__forceinline__ __device__ void combine_warps_G2S_intra(
-    const int node_rank,
-    const int num_of_tokens_per_rank,
-    const int num_of_ranks_per_node,
+__forceinline__ __device__ void combine_G2S_intra_warp(
+    // INPUT
     const bool* rdma_to_attn_map,
     const int32_t* sparse_to_dense_map,
     uint16_t* const* remote_expert_input_token,
     float* const* remote_expert_input_prob,
-    SMEM_TYPE* smem_buffer_ptr,
+    // CONFIG
+    const int node_rank,
+    const int num_of_tokens_per_rank,
     const int experts_per_rank,
-    const bool combine_local_reduce_enabled) {
+    const bool combine_local_reduce_enabled,
+    SMEM_TYPE* smem_buffer_ptr) {
     static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
 
-    // The intra node reduction warp group of each CUDA block produce a chunk at a time.
-    // The chunk order is: first produce the same chunk id for all other nodes id, then produce following chunk id.
-    // (i.e. chunk 0 for node + 1, node + 2, ... node - 1, then chunk 1 for node + 1, node + 2, ... node - 1)
-    // The RDMA warp group of a CUDA block will consume the chunk by the same order. So each CUDA block will produce and consume the same set of chunks id.
-    // The reason to distribute chunk in this order is that the inter-node reduction will need the same chunk id from all other nodes, so we need to produce and send chunks in this order.
-
     const int remainder_chunk_size = num_of_tokens_per_rank % NUM_OF_TOKENS_PER_CHUNK;
-    // How many chunks per rank. Including full chunks and the remainder chunk.
-    const int num_of_chunks_per_rank = ((num_of_tokens_per_rank - 1) / NUM_OF_TOKENS_PER_CHUNK) + 1;
-    // Total number of chunks to produce for RDMA warps to consume.
-    const int total_num_of_chunks = (NUM_LSA_TEAMS - 1) * num_of_chunks_per_rank;
-    // The rdma_to_attn_map need to be paded to multiple of rdma_to_attn_map_load_t per node.
-    // The largest size of rdma_to_attn_map_load_t allowed in all Hybrid-EP kernels are 16B(16 bools), so need to be paded to 16B per node.
-    // That means the size of rdma_to_attn_map should be rdma_to_attn_map_size_per_node * NUM_LSA_TEAMS.
-    const int rdma_to_attn_map_size_per_node = (((num_of_tokens_per_rank - 1) / 16) + 1) * 16;
-    // Warp-cooperative G2S: all lanes participate in parallel TMA.
-    // Lanes load sparse_to_dense_map in parallel (up to 32 ranks per warp pass),
-    // then valid lanes issue TMA to different stages simultaneously.
-    // RED processes stages sequentially.
-    //
-    // Parity protocol: G2S tracks a "global_offset" counting total stages filled.
-    // For a lane with global rank R among valid entries, its stage and parity are:
-    //   stage_idx = (global_offset + R) % ring_len
-    //   parity    = 1 ^ ((global_offset + R) / ring_len) & 1
-    // This matches RED's sequential consumption exactly.
+    const int chunks_per_rank = nccl_ep::ceil_div(num_of_tokens_per_rank, NUM_OF_TOKENS_PER_CHUNK);
+    const int total_chunks = (NUM_LSA_TEAMS - 1) * chunks_per_rank;
+    // rdma_to_attn_map is padded to 16B (16 bools) per node.
+    const int rdma_map_size_per_node = nccl_ep::align(num_of_tokens_per_rank, 16);
+
+    // Warp-cooperative G2S: lanes scan sparse_to_dense_map in parallel and issue TMA to distinct
+    // stages; global_offset counts total stages filled so RED consumes them in lockstep.
     constexpr int WARP_SIZE = 32;
     const int lane_id = (int)(threadIdx.x & (WARP_SIZE - 1));
     constexpr int ring_len = NUM_OF_STAGES_G2S;
     // Wire token width: 2 B for BF16/FP16 (default), 4 B for FP32 NONE.
     const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>()));
-    const uint32_t prob_bytes = (uint32_t)((experts_per_rank * num_of_ranks_per_node) * sizeof(float));
+    const uint32_t prob_bytes = (uint32_t)((experts_per_rank * LSA_TEAM_SIZE) * sizeof(float));
 
     // EM unfused-combine dedup uses __shfl_up_sync(1); requires s2d_inner_dim <= WARP_SIZE.
     if (combine_local_reduce_enabled && lane_id == 0 && smem_buffer_ptr->s2d_inner_dim > WARP_SIZE) {
         __trap();
     }
 
-    // Track total stages filled across all tokens.
     int global_offset = 0;
 
-    // Iterate through all chunks assigned to this block.
-    for (int i = blockIdx.x; i < total_num_of_chunks; i += NUM_OF_BLOCKS) {
-        // Which node this chunk will be sent to.
-        int node_id = (i % (NUM_LSA_TEAMS - 1) + (node_rank + 1)) % NUM_LSA_TEAMS;
-        // What is the chunk id of this chunk for the node it will be sent to.
-        int chunk_id = i / (NUM_LSA_TEAMS - 1);
-        // How many token for this chunk.
-        int current_chunk_size;
-        if (remainder_chunk_size != 0 && chunk_id == num_of_chunks_per_rank - 1) {
-            current_chunk_size = remainder_chunk_size;
-        } else {
-            current_chunk_size = NUM_OF_TOKENS_PER_CHUNK;
-        }
+    for (int chunk_idx = blockIdx.x; chunk_idx < total_chunks; chunk_idx += NUM_OF_BLOCKS) {
+        const combine_chunk_coord_t coord = combine_chunk_schedule<NUM_LSA_TEAMS, NUM_OF_TOKENS_PER_CHUNK>(
+            chunk_idx, node_rank, chunks_per_rank, remainder_chunk_size);
 
-        const bool* rdma_to_attn_map_load_base_addr =
-            rdma_to_attn_map + (node_id * rdma_to_attn_map_size_per_node + chunk_id * NUM_OF_TOKENS_PER_CHUNK);
+        const bool* rdma_row_base =
+            rdma_to_attn_map + (coord.node_id * rdma_map_size_per_node + coord.chunk_id * NUM_OF_TOKENS_PER_CHUNK);
 
         // S2D inner dim: mode-dependent, carried by SMEM layout struct.
         const int s2d_entries_g2s = smem_buffer_ptr->s2d_inner_dim;
-        const int32_t* sparse_to_dense_map_load_base_addr =
+        const int32_t* s2d_row_base =
             sparse_to_dense_map +
-            (node_id * num_of_tokens_per_rank + chunk_id * NUM_OF_TOKENS_PER_CHUNK) * s2d_entries_g2s;
+            (coord.node_id * num_of_tokens_per_rank + coord.chunk_id * NUM_OF_TOKENS_PER_CHUNK) * s2d_entries_g2s;
 
-        // Iterate through all dst tokens within this chunk.
-        for (int current_token_id = 0; current_token_id < current_chunk_size; current_token_id++) {
-            // Check whether this dst token is needed by this node. If not needed, just skip.
-            bool token_needed_by_this_node = rdma_to_attn_map_load_base_addr[current_token_id];
-            if (!token_needed_by_this_node) {
+        for (int current_token_id = 0; current_token_id < coord.chunk_size; current_token_id++) {
+            // Skip dst tokens this node doesn't need.
+            if (!rdma_row_base[current_token_id]) {
                 continue;
             }
 
-            const int32_t* sparse_to_dense_row =
-                sparse_to_dense_map_load_base_addr + current_token_id * s2d_entries_g2s;
+            const int32_t* sparse_to_dense_row = s2d_row_base + current_token_id * s2d_entries_g2s;
 
-            // Warp-cooperative s2d-row scan with inline broadcast-issue; advances
-            // global_offset by the number of entries issued. See issue_local_g2s_row.
+            // Warp-cooperative s2d-row scan with inline broadcast-issue; advances global_offset
+            // by the number of entries issued. See issue_local_g2s_row.
             issue_local_g2s_row</*INTER_NODE=*/false, BACKWARD_COMBINE, kLayout, HIDDEN_DIM, kTokenDtype>(
                 smem_buffer_ptr,
                 sparse_to_dense_row,
@@ -2348,7 +2339,7 @@ __forceinline__ __device__ void combine_warps_G2S_intra(
                 token_bytes,
                 prob_bytes,
                 experts_per_rank,
-                num_of_ranks_per_node,
+                LSA_TEAM_SIZE,
                 combine_local_reduce_enabled);
         }
     }
@@ -4347,6 +4338,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             NUM_OF_STAGES_G2S,
             NUM_OF_STAGES_S2G,
             NUM_OF_TOKENS_PER_CHUNK,
+                // OUTPUT
             NUM_LSA_TEAMS,
             NUM_OF_BLOCKS,
             NUM_OF_TOKENS_PER_GROUP,
@@ -4368,26 +4360,26 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
         threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size()) {
         // Intra-node G2S warp group.
         if constexpr (NUM_LSA_TEAMS != 1) {
-            combine_warps_G2S_intra<
+            combine_G2S_intra_warp<
                 cur_smem_t,
                 NUM_OF_STAGES_G2S,
                 NUM_OF_TOKENS_PER_CHUNK,
                 NUM_LSA_TEAMS,
+                LSA_TEAM_SIZE,
                 NUM_OF_BLOCKS,
                 BACKWARD_COMBINE,
                 HIDDEN_DIM,
                 kLayout,
                 kTokenDtype>(
-                param.node_rank,
-                param.num_of_tokens_per_rank,
-                param.num_of_ranks_per_node,
                 param.rdma_to_attn_map,
                 param.sparse_to_dense_map,
                 param.expert_input_token,
                 param.expert_input_prob,
-                smem_buffer_ptr,
+                param.node_rank,
+                param.num_of_tokens_per_rank,
                 param.experts_per_rank,
-                param.combine_local_reduce_enabled);
+                param.combine_local_reduce_enabled,
+                smem_buffer_ptr);
         }
     } else if (
         threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() +

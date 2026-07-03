@@ -3343,7 +3343,197 @@ __forceinline__ __device__ void combine_warps_G2S_inter(
     }
 }
 
-// Device function for inter-node reduction warp group for combine kernel.
+// Consume one inter-node G2S stage into the FP32 accumulators: token is accumulated; prob is written
+// into node slot `prob_slot` (accumulated for the local phase, assigned for remote phases). Advances
+// this pipeline's G2S cursor/parity. Returns the producer's last-src flag when READ_LAST_FLAG.
+template <
+    int NUM_OF_THREADS_PER_PIPELINE,
+    bool BACKWARD_COMBINE,
+    int HIDDEN_DIM,
+    bool READ_LAST_FLAG,
+    bool ACCUMULATE_PROB,
+    ncclDataType_t kTokenDtype,
+    typename SMEM_TYPE,
+    int NUM_ACC>
+__forceinline__ __device__ bool combine_inter_consume_src(
+    SMEM_TYPE* smem_buffer_ptr,
+    int& token_stage,
+    uint32_t& token_producer_parity,
+    int starting_G2S_index,
+    int ending_G2S_index,
+    int warp_rank_within_pipeline,
+    int thread_rank_within_pipeline,
+    int pipeline_rank,
+    float2 (&acc_token_fp32)[NUM_ACC],
+    float* acc_prob_ptr,
+    int prob_slot,
+    int prob_vec_per_thread,
+    int prob_dim) {
+    constexpr int NUM_OF_BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
+
+    __nv_bfloat162* load_token_base_ptr =
+        reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_inter_node_token_G2S(token_stage));
+    float* load_prob_base_ptr;
+    if constexpr (BACKWARD_COMBINE) {
+        load_prob_base_ptr = smem_buffer_ptr->get_inter_node_prob_G2S(token_stage);
+    }
+
+    // Wait until this src token is staged in SMEM, then let the whole pipeline read it.
+    if (warp_rank_within_pipeline == 0) {
+        if (cuda::ptx::elect_sync(~0)) {
+            while (!cuda::ptx::mbarrier_try_wait_parity(
+                smem_buffer_ptr->get_inter_node_mbarrier_G2S_producer(token_stage), token_producer_parity)) {
+            }
+        }
+    }
+    arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank);
+
+#pragma unroll
+    for (int n = 0; n < NUM_ACC; n++) {
+        int element_id = (n * NUM_OF_THREADS_PER_PIPELINE) + thread_rank_within_pipeline;
+        if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
+            float2 src_data_fp32 = nccl_ep::ld_token_pair<kTokenDtype>(load_token_base_ptr, element_id);
+            acc_token_fp32[n].x += src_data_fp32.x;
+            acc_token_fp32[n].y += src_data_fp32.y;
+        }
+    }
+    if constexpr (BACKWARD_COMBINE) {
+#pragma unroll
+        for (int pv = 0; pv < prob_vec_per_thread; pv++) {
+            int element_id = thread_rank_within_pipeline + pv * NUM_OF_THREADS_PER_PIPELINE;
+            if (element_id < prob_dim) {
+                float src_data = load_prob_base_ptr[element_id];
+                if constexpr (ACCUMULATE_PROB) {
+                    acc_prob_ptr[prob_slot * prob_vec_per_thread + pv] += src_data;
+                } else {
+                    acc_prob_ptr[prob_slot * prob_vec_per_thread + pv] = src_data;
+                }
+            }
+        }
+    }
+
+    bool last_src_token = false;
+    if constexpr (READ_LAST_FLAG) {
+        last_src_token = smem_buffer_ptr->inter_node_flag_G2S_buffer[token_stage];
+    }
+
+    // All pipeline threads finish reading before the producer reuses this stage.
+    arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank);
+    if (warp_rank_within_pipeline == 0) {
+        if (cuda::ptx::elect_sync(~0)) {
+            cuda::ptx::mbarrier_arrive(smem_buffer_ptr->get_inter_node_mbarrier_G2S_consumer(token_stage));
+        }
+    }
+
+    token_stage += 1;
+    if (token_stage == ending_G2S_index) {
+        token_stage = starting_G2S_index;
+        token_producer_parity ^= 1;
+    }
+    return last_src_token;
+}
+
+// Store one reduced dst token (+per-node prob) from FP32 registers into an S2G SMEM stage and TMA-copy
+// it to the attn output. Advances this pipeline's S2G cursor.
+template <
+    int NUM_OF_THREADS_PER_PIPELINE,
+    int NUM_OF_STAGES_S2G_PER_PIPELINE,
+    int NUM_LSA_TEAMS,
+    bool BACKWARD_COMBINE,
+    int HIDDEN_DIM,
+    ncclDataType_t kTokenDtype,
+    typename SMEM_TYPE,
+    int NUM_ACC>
+__forceinline__ __device__ void combine_inter_store_token(
+    SMEM_TYPE* smem_buffer_ptr,
+    int& dst_token_stage,
+    int starting_S2G_index,
+    int ending_S2G_index,
+    int warp_rank_within_pipeline,
+    int thread_rank_within_pipeline,
+    int pipeline_rank,
+    const float2 (&acc_token_fp32)[NUM_ACC],
+    const float* acc_prob_ptr,
+    int prob_vec_per_thread,
+    int prob_dim,
+    int node_rank,
+    uint16_t* attn_output_token_base,
+    float* attn_output_prob_base,
+    size_t out_token_stride_u16,
+    int token_in_chunk,
+    int absolute_token_id,
+    int num_real_tokens) {
+    constexpr int NUM_OF_BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
+
+    __nv_bfloat162* store_token_base_ptr =
+        reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_inter_node_token_S2G(dst_token_stage));
+
+    // Wait for prior TMA reads of this S2G stage to finish before overwriting it.
+    if (warp_rank_within_pipeline == 0) {
+        if (cuda::ptx::elect_sync(~0)) {
+            cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<NUM_OF_STAGES_S2G_PER_PIPELINE - 1>{});
+        }
+    }
+    arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank);
+
+#pragma unroll
+    for (int n = 0; n < NUM_ACC; n++) {
+        int element_id = (n * NUM_OF_THREADS_PER_PIPELINE) + thread_rank_within_pipeline;
+        if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
+            nccl_ep::st_token_pair<kTokenDtype>(store_token_base_ptr, element_id, acc_token_fp32[n]);
+        }
+    }
+    if constexpr (BACKWARD_COMBINE) {
+        float* store_prob_base_ptr = smem_buffer_ptr->get_inter_node_prob_S2G(dst_token_stage);
+        // Gather per-source-node prob into output node order (node_rank, node_rank-1, ...).
+#pragma unroll
+        for (int n = 0; n < NUM_LSA_TEAMS; n++) {
+            int attn_prob_output_node_id = (node_rank - n) >= 0 ? node_rank - n : node_rank + NUM_LSA_TEAMS - n;
+            int element_base_id = attn_prob_output_node_id * prob_dim;
+#pragma unroll
+            for (int m = 0; m < prob_vec_per_thread; m++) {
+                int element_id = thread_rank_within_pipeline + m * NUM_OF_THREADS_PER_PIPELINE;
+                if (element_id < prob_dim) {
+                    store_prob_base_ptr[element_base_id + element_id] = acc_prob_ptr[n * prob_vec_per_thread + m];
+                }
+            }
+        }
+    }
+
+    // Publish SMEM writes to the async proxy, then sync the pipeline before the TMA launch.
+    cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+    arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank);
+
+    if (warp_rank_within_pipeline == 0) {
+        if (cuda::ptx::elect_sync(~0) && absolute_token_id < num_real_tokens) {
+            uint16_t* current_token_addr = attn_output_token_base + (size_t)token_in_chunk * out_token_stride_u16;
+            cuda::ptx::cp_async_bulk(
+                cuda::ptx::space_global,
+                cuda::ptx::space_shared,
+                reinterpret_cast<void*>(current_token_addr),
+                reinterpret_cast<const void*>(smem_buffer_ptr->get_inter_node_token_S2G(dst_token_stage)),
+                (uint32_t)(HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>())));
+
+            if constexpr (BACKWARD_COMBINE) {
+                float* current_prob_addr = attn_output_prob_base + token_in_chunk * (prob_dim * NUM_LSA_TEAMS);
+                cuda::ptx::cp_async_bulk(
+                    cuda::ptx::space_global,
+                    cuda::ptx::space_shared,
+                    reinterpret_cast<void*>(current_prob_addr),
+                    reinterpret_cast<const void*>(smem_buffer_ptr->get_inter_node_prob_S2G(dst_token_stage)),
+                    (uint32_t)((prob_dim * NUM_LSA_TEAMS) * sizeof(float)));
+            }
+            cuda::ptx::cp_async_bulk_commit_group();
+        }
+    }
+
+    dst_token_stage += 1;
+    if (dst_token_stage == ending_S2G_index) {
+        dst_token_stage = starting_S2G_index;
+    }
+}
+
+// Inter-node reduction warp group for the combine kernel.
 template <
     typename SMEM_TYPE,
     typename INTER_NODE_RED_GROUP,
@@ -3358,140 +3548,106 @@ template <
     int HIDDEN_DIM,
     int LSA_TEAM_SIZE,
     ncclDataType_t kTokenDtype>
-__forceinline__ __device__ void inter_node_red_warp_group_device_function(
+__forceinline__ __device__ void combine_RED_inter_warp(
+    // INPUT
+    const bool* rdma_to_attn_map,
+    const bool* attn_to_rdma_map,
+    // OUTPUT
+    uint16_t* attn_output_token,
+    float* attn_output_prob,
+    // CONFIG
     const int node_rank,
     const int num_of_tokens_per_rank,
     const int num_real_tokens,
-    const int num_of_ranks_per_node,
-    const bool* rdma_to_attn_map,
-    const bool* attn_to_rdma_map,
-    uint16_t* attn_output_token,
-    float* attn_output_prob,
-    SMEM_TYPE* smem_buffer_ptr,
-    const int experts_per_rank) {
-    // The warps from inter-node red warp group will be divided into multiple independent pipeline. Each pipeline has INTER_NODE_RED_GROUP::warp_size() / NUM_OF_DATA_PIPELINE_PER_BLOCK warps.
-    // Number of pipeline should match inter-node G2S warp group, so they can coupled into multiple independent data pipeline within a CUDA block.
+    const int experts_per_rank,
+    SMEM_TYPE* smem_buffer_ptr) {
+    // The warp group is split into NUM_OF_DATA_PIPELINE_PER_BLOCK independent pipelines (matching the
+    // inter-node G2S group); each pipeline owns an equal slice of the G2S/S2G FIFOs.
     static_assert(
         INTER_NODE_RED_GROUP::warp_size() % NUM_OF_DATA_PIPELINE_PER_BLOCK == 0,
-        "The warp count of inter-node red warp group must be multiple of NUM_OF_DATA_PIPELINE_PER_BLOCK.");
+        "Inter-node red warp count must be a multiple of NUM_OF_DATA_PIPELINE_PER_BLOCK.");
     constexpr int WARP_SIZE = 32;
     constexpr int NUM_OF_THREADS_PER_PIPELINE =
         (INTER_NODE_RED_GROUP::warp_size() / NUM_OF_DATA_PIPELINE_PER_BLOCK) * WARP_SIZE;
-    // Evenly distribute the inter-node G2S FIFO to every pipeline within the inter-node red warp group.
-    // When NUM_OF_DATA_PIPELINE_PER_BLOCK = 1 and INTER_NODE_RED_GROUP::warp_size() = 4, then the algorith is the same as old version(1 pipeline w/ 4 warps per CUDA block).
     static_assert(
         NUM_OF_STAGES_G2S % NUM_OF_DATA_PIPELINE_PER_BLOCK == 0,
-        "NUM_OF_STAGES_G2S must be multiple of data pipeline per CUDA block.");
+        "NUM_OF_STAGES_G2S must be a multiple of NUM_OF_DATA_PIPELINE_PER_BLOCK.");
     constexpr int NUM_OF_STAGES_G2S_PER_PIPELINE = NUM_OF_STAGES_G2S / NUM_OF_DATA_PIPELINE_PER_BLOCK;
-    // Evenly distribute the inter-node S2G FIFO to every pipeline within the inter-node red warp group.
     static_assert(
         NUM_OF_STAGES_S2G % NUM_OF_DATA_PIPELINE_PER_BLOCK == 0,
-        "NUM_OF_STAGES_S2G must be multiple of data pipeline per CUDA block.");
+        "NUM_OF_STAGES_S2G must be a multiple of NUM_OF_DATA_PIPELINE_PER_BLOCK.");
     constexpr int NUM_OF_STAGES_S2G_PER_PIPELINE = NUM_OF_STAGES_S2G / NUM_OF_DATA_PIPELINE_PER_BLOCK;
-    // All chunks in output buffer(attn buffer) will be divided into token groups and assigned to different CUDA blocks.
-    // This is different than other functions where chunks are assigned to different CUDA blocks.
+    // Output chunks are split into token groups striped across blocks (unlike the chunk-per-block stages).
     static_assert(
         NUM_OF_TOKENS_PER_CHUNK % NUM_OF_TOKENS_PER_GROUP == 0,
-        "NUM_OF_TOKENS_PER_CHUNK must be multiple of NUM_OF_TOKENS_PER_GROUP.");
+        "NUM_OF_TOKENS_PER_CHUNK must be a multiple of NUM_OF_TOKENS_PER_GROUP.");
     constexpr int NUM_OF_TOKEN_GROUPS_PER_CHUNK = NUM_OF_TOKENS_PER_CHUNK / NUM_OF_TOKENS_PER_GROUP;
-
     static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
 
-    // Processing token using BF16x2 intruction, HIDDEN_DIM must be multiple of 2.
+    // Tokens reduced as BF16x2 in FP32 (HIDDEN_DIM even); prob stays in float.
     constexpr int NUM_OF_BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
     constexpr int NUM_OF_ACC_ELEMENTS_PER_THREAD =
-        ((NUM_OF_BF16X2_ELEMENTS_PER_TOKEN - 1) / NUM_OF_THREADS_PER_PIPELINE) + 1;
-
-    // Processing prob using fp32.
-    const int NUM_OF_PROB_VEC_ELEMENT_PER_THREAD =
-        ((experts_per_rank * num_of_ranks_per_node - 1) / NUM_OF_THREADS_PER_PIPELINE) + 1;
-
+        nccl_ep::ceil_div(NUM_OF_BF16X2_ELEMENTS_PER_TOKEN, NUM_OF_THREADS_PER_PIPELINE);
+    const int prob_dim = experts_per_rank * LSA_TEAM_SIZE;
+    const int prob_vec_per_thread = nccl_ep::ceil_div(prob_dim, NUM_OF_THREADS_PER_PIPELINE);
     // Compile-time upper bound sized exactly to this instantiation's LSA team.
     constexpr int MAX_NUM_OF_PROB_VEC_ELEMENT_PER_THREAD =
-        ((NUM_MAX_LOCAL_EXPERTS * LSA_TEAM_SIZE - 1) / NUM_OF_THREADS_PER_PIPELINE) + 1;
+        nccl_ep::ceil_div(NUM_MAX_LOCAL_EXPERTS * LSA_TEAM_SIZE, NUM_OF_THREADS_PER_PIPELINE);
 
-    // The inter node reduction warp group of each CUDA block produce a token group of a chunk at a time. Token groups of each chunk assigned to each CUDA block in interleave pattern.
-    // The chunk order is: i.e. chunk 0, then chunk 1, ... the last chunk of attn output buffer.
-    // The RDMA network for current rank will produce the same chunk id from node - 1, node - 2 ... node + 1.
-    // So inter node reduction warp group will consume the src chunk in the same order.
-
+    // Each block produces token groups of the local rank's output chunks in order; the RDMA network feeds
+    // matching chunk IDs from node-1, node-2, ..., node+1, so src chunks arrive in the same order.
     const int remainder_chunk_size = num_of_tokens_per_rank % NUM_OF_TOKENS_PER_CHUNK;
-    // How many chunks per rank. Including full chunks and the remainder chunk.
-    const int num_of_chunks_per_rank = ((num_of_tokens_per_rank - 1) / NUM_OF_TOKENS_PER_CHUNK) + 1;
-    // Total number of chunks to process in the output buffer(attn buffer). output buffer(attn buffer) will only have 1 rank's tokens.
-    const int total_num_of_chunks = num_of_chunks_per_rank;
-    // The rdma_to_attn_map need to be paded to multiple of rdma_to_attn_map_load_t per node.
-    // The largest size of rdma_to_attn_map_load_t allowed in all Hybrid-EP kernels are 16B(16 bools), so need to be paded to 16B per node.
-    // That means the size of rdma_to_attn_map should be rdma_to_attn_map_size_per_node * NUM_LSA_TEAMS.
-    const int rdma_to_attn_map_size_per_node = (((num_of_tokens_per_rank - 1) / 16) + 1) * 16;
-    // Pipeline rank and thread/warp rank within the pipeline for this thread.
+    const int chunks_per_rank = nccl_ep::ceil_div(num_of_tokens_per_rank, NUM_OF_TOKENS_PER_CHUNK);
+    const int total_chunks = chunks_per_rank;
+    // rdma_to_attn_map is padded to 16B (16 bools) per node.
+    const int rdma_map_size_per_node = nccl_ep::align(num_of_tokens_per_rank, 16);
+    // Dtype-aware per-token output stride in uint16_t units.
+    const size_t out_token_stride_u16 = (size_t)HIDDEN_DIM * nccl_ep::size_u8<kTokenDtype>() / sizeof(uint16_t);
+
+    // This thread's pipeline placement and G2S/S2G FIFO sub-range.
     const int pipeline_rank = INTER_NODE_RED_GROUP::thread_rank() / NUM_OF_THREADS_PER_PIPELINE;
     const int thread_rank_within_pipeline = INTER_NODE_RED_GROUP::thread_rank() % NUM_OF_THREADS_PER_PIPELINE;
     const int warp_rank_within_pipeline = thread_rank_within_pipeline / WARP_SIZE;
-    // Starting and ending index within G2S FIFO for this pipeline.
     const int starting_G2S_index = NUM_OF_STAGES_G2S_PER_PIPELINE * pipeline_rank;
     const int ending_G2S_index = NUM_OF_STAGES_G2S_PER_PIPELINE * (pipeline_rank + 1);
-    // Src token stage id and phase.
     int token_stage = starting_G2S_index;
     uint32_t token_producer_parity = 0;
-
-    // Starting and ending index within S2G FIFO for this pipeline.
     const int starting_S2G_index = NUM_OF_STAGES_S2G_PER_PIPELINE * pipeline_rank;
     const int ending_S2G_index = NUM_OF_STAGES_S2G_PER_PIPELINE * (pipeline_rank + 1);
-    // Dst token stage id.
     int dst_token_stage = starting_S2G_index;
 
-    // Iterate through all chunks. All chunks will assign to all CUDA block.
-    for (int i = 0; i < total_num_of_chunks; i++) {
-        // How many rdma_to_attn load iter(a.k.a token group) for this chunk.
-        int num_of_token_groups_for_current_chunk;
-        // How many token for this chunk.
-        int current_chunk_size;
-        if (remainder_chunk_size != 0 && i == num_of_chunks_per_rank - 1) { // tail processing
-            num_of_token_groups_for_current_chunk = ((remainder_chunk_size - 1) / NUM_OF_TOKENS_PER_GROUP) + 1;
-            current_chunk_size = remainder_chunk_size;
-        } else {
-            num_of_token_groups_for_current_chunk = NUM_OF_TOKEN_GROUPS_PER_CHUNK;
-            current_chunk_size = NUM_OF_TOKENS_PER_CHUNK;
+    for (int chunk_idx = 0; chunk_idx < total_chunks; chunk_idx++) {
+        const bool is_tail = (remainder_chunk_size != 0 && chunk_idx == chunks_per_rank - 1);
+        const int current_chunk_size = is_tail ? remainder_chunk_size : NUM_OF_TOKENS_PER_CHUNK;
+        const int token_groups_for_chunk =
+            is_tail ? nccl_ep::ceil_div(remainder_chunk_size, NUM_OF_TOKENS_PER_GROUP) : NUM_OF_TOKEN_GROUPS_PER_CHUNK;
+
+        const bool* rdma_to_attn_map_base =
+            rdma_to_attn_map + (node_rank * rdma_map_size_per_node + chunk_idx * NUM_OF_TOKENS_PER_CHUNK);
+        const bool* attn_to_rdma_map_base = nullptr;
+        if constexpr (NUM_LSA_TEAMS > 1) {
+            attn_to_rdma_map_base = attn_to_rdma_map + (chunk_idx * NUM_OF_TOKENS_PER_CHUNK) * (NUM_LSA_TEAMS - 1);
+        }
+        uint16_t* attn_output_token_base =
+            attn_output_token + (size_t)(chunk_idx * NUM_OF_TOKENS_PER_CHUNK) * out_token_stride_u16;
+        float* attn_output_prob_base = nullptr;
+        if constexpr (BACKWARD_COMBINE) {
+            attn_output_prob_base =
+                attn_output_prob + (chunk_idx * NUM_OF_TOKENS_PER_CHUNK) * (prob_dim * NUM_LSA_TEAMS);
         }
 
-        const bool* rdma_to_attn_map_load_base_addr =
-            rdma_to_attn_map + (node_rank * rdma_to_attn_map_size_per_node + i * NUM_OF_TOKENS_PER_CHUNK);
-        const bool* attn_to_rdma_map_load_base_addr = nullptr;
-        if constexpr (NUM_LSA_TEAMS > 1) {
-            attn_to_rdma_map_load_base_addr = attn_to_rdma_map + (i * NUM_OF_TOKENS_PER_CHUNK) * (NUM_LSA_TEAMS - 1);
-        }
-        // Per-token stride: HIDDEN_DIM uint16_t units (BF16/FP16) or HIDDEN_DIM*2 (FP32).
-        // out_token_stride_u16 is the dtype-aware stride captured here.
-        const size_t elem_bytes = nccl_ep::size_u8<kTokenDtype>();
-        const size_t out_token_stride_u16 = (size_t)HIDDEN_DIM * elem_bytes / sizeof(uint16_t);
-        uint16_t* attn_output_token_base_ptr =
-            attn_output_token + (size_t)(i * NUM_OF_TOKENS_PER_CHUNK) * out_token_stride_u16;
-        float* attn_output_prob_base_ptr;
-        if constexpr (BACKWARD_COMBINE) {
-            attn_output_prob_base_ptr =
-                attn_output_prob +
-                (i * NUM_OF_TOKENS_PER_CHUNK) * (experts_per_rank * num_of_ranks_per_node * NUM_LSA_TEAMS);
-        }
-        // Iterate through all token groups within this chunk which assign to this CUDA block.
-        for (int j = blockIdx.x; j < num_of_token_groups_for_current_chunk; j += NUM_OF_BLOCKS) {
-            // Iterate through all dst(output) tokens within this token group.
-            // Assign each dst token to each pipeline using a round-robin fasion.
-            for (int k = pipeline_rank; k < NUM_OF_TOKENS_PER_GROUP; k += NUM_OF_DATA_PIPELINE_PER_BLOCK) {
-                int current_token_id = j * NUM_OF_TOKENS_PER_GROUP + k;
-                // If the current token is out-of-bound, then just end this load iter.
+        // Token groups are striped across blocks; each pipeline handles a round-robin slice of dst tokens.
+        for (int group_idx = blockIdx.x; group_idx < token_groups_for_chunk; group_idx += NUM_OF_BLOCKS) {
+            for (int token_in_group = pipeline_rank; token_in_group < NUM_OF_TOKENS_PER_GROUP;
+                 token_in_group += NUM_OF_DATA_PIPELINE_PER_BLOCK) {
+                int current_token_id = group_idx * NUM_OF_TOKENS_PER_GROUP + token_in_group;
                 if (current_token_id >= current_chunk_size) {
                     break;
                 }
-                // Each dst token need to accumulate src tokens from local node's ranks(this part is the same as intra-node reduction), and src tokens from rdma inter-node buffers.
-                // Accumulate local tokens first, then rdma tokens.
-                // Accumulator for this dst token. Token must be accumulated in FP32.
+
+                // Each dst token accumulates local-node src tokens (like intra reduction) then remote-node
+                // RDMA src tokens. Prob is gathered per source node: slot 0 = local, 1..LSA-1 = remote.
                 float2 acc_token_fp32[NUM_OF_ACC_ELEMENTS_PER_THREAD];
-                // Optional Accumulator for this dst token prob.
-                // Different node's prob need to be gathered together to output.
-                // 0 used for local node's prob, [1, NUM_LSA_TEAMS - 1] used for remote node's prob.
-                // Flattened array: acc_prob_ptr[n * NUM_OF_PROB_VEC_ELEMENT_PER_THREAD + m] for 2D access
-                // Use MAX size for compile-time array allocation, actual size determined by runtime experts_per_rank
                 using acc_prob_storage_type =
                     acc_prob_storage_t<BACKWARD_COMBINE, NUM_LSA_TEAMS * MAX_NUM_OF_PROB_VEC_ELEMENT_PER_THREAD>;
                 [[maybe_unused]] acc_prob_storage_type acc_prob_storage;
@@ -3499,7 +3655,6 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(
                 if constexpr (BACKWARD_COMBINE) {
                     acc_prob_ptr = acc_prob_storage.data;
                 }
-// Init accumulator.
 #pragma unroll
                 for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD; n++) {
                     acc_token_fp32[n].x = 0.0f;
@@ -3508,265 +3663,103 @@ __forceinline__ __device__ void inter_node_red_warp_group_device_function(
                 if constexpr (BACKWARD_COMBINE) {
 #pragma unroll
                     for (int n = 0; n < NUM_LSA_TEAMS; n++) {
-                        for (int m = 0; m < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; m++) {
-                            acc_prob_ptr[n * NUM_OF_PROB_VEC_ELEMENT_PER_THREAD + m] = 0.0f;
+                        for (int m = 0; m < prob_vec_per_thread; m++) {
+                            acc_prob_ptr[n * prob_vec_per_thread + m] = 0.0f;
                         }
                     }
                 }
-                // Check whether this dst token is needed by this(local) node. If not needed, just skip local accumulation.
-                bool token_needed_by_this_node = rdma_to_attn_map_load_base_addr[current_token_id];
-                // If this dst token is needed by this node, load the local src token from shared memory and accumulate them.
-                if (token_needed_by_this_node) {
-                    // End reduction group flag.
-                    bool last_local_node_src_token = false;
-                    // Continue loading local src token for this dst token and reduce them to accumulator until all local src token for this dst token have been accumulated.
+
+                // Local-node accumulation: consume staged src tokens until the producer marks the last one.
+                if (rdma_to_attn_map_base[current_token_id]) {
+                    bool last_local_src = false;
                     do {
-                        // Base address for current token and prob(optional) in shared memory.
-                        __nv_bfloat162* load_token_base_ptr =
-                            reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_inter_node_token_G2S(token_stage));
-                        float* load_prob_base_ptr;
-                        if constexpr (BACKWARD_COMBINE) {
-                            load_prob_base_ptr = smem_buffer_ptr->get_inter_node_prob_G2S(token_stage);
-                        }
-
-                        // Wait until current src token ready in shared memory.
-                        if (warp_rank_within_pipeline == 0) {
-                            if (cuda::ptx::elect_sync(~0)) {
-                                while (!cuda::ptx::mbarrier_try_wait_parity(
-                                    smem_buffer_ptr->get_inter_node_mbarrier_G2S_producer(token_stage),
-                                    token_producer_parity)) {
-                                }
-                            }
-                        }
-                        // named barrier: we wait for number of threads(all threads in the pipline) that must arrive before any can proceed
-                        arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank);
-
-// Accumulate token and prob(optional). NONE-FP16: reinterpret as __half2;
-// NONE-FP32: read float2 directly (8 SMEM bytes per slot).
-#pragma unroll
-                        for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD; n++) {
-                            int element_id = (n * NUM_OF_THREADS_PER_PIPELINE) + thread_rank_within_pipeline;
-                            if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
-                                float2 src_data_fp32 =
-                                    nccl_ep::ld_token_pair<kTokenDtype>(load_token_base_ptr, element_id);
-                                acc_token_fp32[n].x += src_data_fp32.x;
-                                acc_token_fp32[n].y += src_data_fp32.y;
-                            }
-                        }
-                        if constexpr (BACKWARD_COMBINE) {
-#pragma unroll
-                            for (int n = 0; n < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; n++) {
-                                int element_id = thread_rank_within_pipeline + n * NUM_OF_THREADS_PER_PIPELINE;
-                                if (element_id < experts_per_rank * num_of_ranks_per_node) {
-                                    float src_data = load_prob_base_ptr[element_id];
-                                    acc_prob_ptr[0 * NUM_OF_PROB_VEC_ELEMENT_PER_THREAD + n] += src_data;
-                                }
-                            }
-                        }
-
-                        // Check flag for last src token.
-                        last_local_node_src_token = smem_buffer_ptr->inter_node_flag_G2S_buffer[token_stage];
-
-                        // Make sure all threads within the pipeline have finished loading the token entry and accumulate it to the register accumulator.
-                        // Then notify the producer warp to load next token entry to the shared memory as the shared memory can be reused.
-                        arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank);
-                        if (warp_rank_within_pipeline == 0) {
-                            if (cuda::ptx::elect_sync(~0)) {
-                                cuda::ptx::mbarrier_arrive(
-                                    smem_buffer_ptr->get_inter_node_mbarrier_G2S_consumer(token_stage));
-                            }
-                        }
-
-                        // Goto next src token entry.
-                        token_stage += 1;
-                        if (token_stage == ending_G2S_index) {
-                            token_stage = starting_G2S_index;
-                            token_producer_parity ^= 1;
-                        }
-
-                    } while (!last_local_node_src_token);
+                        last_local_src = combine_inter_consume_src<
+                            NUM_OF_THREADS_PER_PIPELINE,
+                            BACKWARD_COMBINE,
+                            HIDDEN_DIM,
+                            /*READ_LAST_FLAG=*/true,
+                            /*ACCUMULATE_PROB=*/true,
+                            kTokenDtype>(
+                            smem_buffer_ptr,
+                            token_stage,
+                            token_producer_parity,
+                            starting_G2S_index,
+                            ending_G2S_index,
+                            warp_rank_within_pipeline,
+                            thread_rank_within_pipeline,
+                            pipeline_rank,
+                            acc_token_fp32,
+                            acc_prob_ptr,
+                            /*prob_slot=*/0,
+                            prob_vec_per_thread,
+                            prob_dim);
+                    } while (!last_local_src);
                 }
 
+                // Remote-node accumulation: at most one src token per remote node (node-1, node-2, ..., node+1).
                 if constexpr (NUM_LSA_TEAMS > 1) {
-                    // Then accumulate from rdma inter-node buffers. There are total NUM_LSA_TEAMS - 1 (possible) src tokens from rdma buffer to reduce.
-                    const bool* attn_to_rdma_map_load_addr =
-                        attn_to_rdma_map_load_base_addr + (j * NUM_OF_TOKENS_PER_GROUP + k) * (NUM_LSA_TEAMS - 1);
+                    const bool* attn_to_rdma_addr = attn_to_rdma_map_base + current_token_id * (NUM_LSA_TEAMS - 1);
 #pragma unroll
                     for (int n = 1; n < NUM_LSA_TEAMS; n++) {
-                        // The current node been processed. For each chunk id, node_id order is
-                        // (no local_node itself, which is already been accumulated above) local_node - 1, local_node - 2, ......, local_node + 1 and will wrap around.
                         int node_id = node_rank >= n ? node_rank - n : node_rank + NUM_LSA_TEAMS - n;
-                        // The tile id within the rdma buffers(include attn_to_rdma map) for the current node id. Because these rdma buffers only have NUM_LSA_TEAMS - 1 tile or element.
                         int rdma_buffer_tile_id = node_id > node_rank ? node_id - 1 : node_id;
-                        // Check wether current dst token need src token from this (remote) node.
-                        if (attn_to_rdma_map_load_addr[rdma_buffer_tile_id]) {
-                            // Base address for current token and prob(optional) in shared memory.
-                            __nv_bfloat162* load_token_base_ptr = reinterpret_cast<__nv_bfloat162*>(
-                                smem_buffer_ptr->get_inter_node_token_G2S(token_stage));
-                            float* load_prob_base_ptr;
-                            if constexpr (BACKWARD_COMBINE) {
-                                load_prob_base_ptr = smem_buffer_ptr->get_inter_node_prob_G2S(token_stage);
-                            }
-                            // Wait until current src token ready in shared memory.
-                            if (warp_rank_within_pipeline ==
-                                0) { // this means that only wrap 0 in the pipeline participates
-                                if (cuda::ptx::elect_sync(~0)) {
-                                    while (!cuda::ptx::mbarrier_try_wait_parity(
-                                        smem_buffer_ptr->get_inter_node_mbarrier_G2S_producer(token_stage),
-                                        token_producer_parity)) {
-                                    }
-                                }
-                            }
-                            arrive_and_wait(
+                        if (attn_to_rdma_addr[rdma_buffer_tile_id]) {
+                            combine_inter_consume_src<
                                 NUM_OF_THREADS_PER_PIPELINE,
-                                2 + pipeline_rank); // named barrier, we wait for number of threads that must arrive before any can proceed
-
-// Accumulate token and prob(optional). NONE-FP16: reinterpret as __half2;
-// NONE-FP32: read float2 directly (8 SMEM bytes per slot).
-#pragma unroll
-                            for (int m = 0; m < NUM_OF_ACC_ELEMENTS_PER_THREAD; m++) {
-                                int element_id = (m * NUM_OF_THREADS_PER_PIPELINE) + thread_rank_within_pipeline;
-                                if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
-                                    float2 src_data_fp32 =
-                                        nccl_ep::ld_token_pair<kTokenDtype>(load_token_base_ptr, element_id);
-                                    acc_token_fp32[m].x += src_data_fp32.x;
-                                    acc_token_fp32[m].y += src_data_fp32.y;
-                                }
-                            }
-                            if constexpr (BACKWARD_COMBINE) {
-#pragma unroll
-                                for (int m = 0; m < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; m++) {
-                                    int element_id = thread_rank_within_pipeline + m * NUM_OF_THREADS_PER_PIPELINE;
-                                    if (element_id < experts_per_rank * num_of_ranks_per_node) {
-                                        acc_prob_ptr[n * NUM_OF_PROB_VEC_ELEMENT_PER_THREAD + m] =
-                                            load_prob_base_ptr[element_id];
-                                    }
-                                }
-                            }
-
-                            // Make sure all threads within the pipeline have finished loading the token entry and accumulate it to the register accumulator.
-                            // Then notify the producer warp to load next token entry to the shared memory as the shared memory can be reused.
-                            arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank);
-                            if (warp_rank_within_pipeline == 0) {
-                                if (cuda::ptx::elect_sync(~0)) {
-                                    cuda::ptx::mbarrier_arrive(
-                                        smem_buffer_ptr->get_inter_node_mbarrier_G2S_consumer(token_stage));
-                                }
-                            }
-
-                            // Goto next src token entry.
-                            token_stage += 1;
-                            if (token_stage == ending_G2S_index) {
-                                token_stage = starting_G2S_index;
-                                token_producer_parity ^= 1;
-                            }
+                                BACKWARD_COMBINE,
+                                HIDDEN_DIM,
+                                /*READ_LAST_FLAG=*/false,
+                                /*ACCUMULATE_PROB=*/false,
+                                kTokenDtype>(
+                                smem_buffer_ptr,
+                                token_stage,
+                                token_producer_parity,
+                                starting_G2S_index,
+                                ending_G2S_index,
+                                warp_rank_within_pipeline,
+                                thread_rank_within_pipeline,
+                                pipeline_rank,
+                                acc_token_fp32,
+                                acc_prob_ptr,
+                                /*prob_slot=*/n,
+                                prob_vec_per_thread,
+                                prob_dim);
                         }
                     }
                 }
 
-                // Store the dst token back to share memory.
-                // Because each attn token must have go to TOPK rank in dispatch, so it must have been reduced in combine. So each attn dst token must be written back.
-                // Base address for current dst token and prob(optional) in shared memory.
-                __nv_bfloat162* store_token_base_ptr =
-                    reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_inter_node_token_S2G(dst_token_stage));
-                float* store_prob_base_ptr;
-                if constexpr (BACKWARD_COMBINE) {
-                    store_prob_base_ptr = smem_buffer_ptr->get_inter_node_prob_S2G(dst_token_stage);
-                }
-
-                // Select the TMA thread within the pipeline to wait for previously issued TMA S2G operations finish reading this entry.
-                if (warp_rank_within_pipeline == 0) {
-                    if (cuda::ptx::elect_sync(~0)) {
-                        cuda::ptx::cp_async_bulk_wait_group_read(
-                            cuda::ptx::n32_t<NUM_OF_STAGES_S2G_PER_PIPELINE - 1>{});
-                    }
-                }
-                // Make sure all threads within the pipeline have wait for previously issued TMA S2G operations finish reading this entry before storing new data to this entry.
-                arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank);
-
-// Store the token.
-//   NONE-FP16: pack via __float22half2_rn into the same 4 SMEM bytes.
-//   NONE-FP32: write float2 verbatim (8 SMEM bytes per slot).
-// TMA later copies bytes verbatim to global so the wire dtype matches the kernel pack.
-#pragma unroll
-                for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD; n++) {
-                    int element_id = (n * NUM_OF_THREADS_PER_PIPELINE) + thread_rank_within_pipeline;
-                    if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
-                        nccl_ep::st_token_pair<kTokenDtype>(store_token_base_ptr, element_id, acc_token_fp32[n]);
-                    }
-                }
-                // Store the prob(optional).
-                if constexpr (BACKWARD_COMBINE) {
-#pragma unroll
-                    for (int n = 0; n < NUM_LSA_TEAMS; n++) {
-                        int attn_prob_output_node_id =
-                            (node_rank - n) >= 0 ? node_rank - n : node_rank + NUM_LSA_TEAMS - n;
-                        int element_base_id = attn_prob_output_node_id * (experts_per_rank * num_of_ranks_per_node);
-#pragma unroll
-                        for (int m = 0; m < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; m++) {
-                            int element_id = thread_rank_within_pipeline + m * NUM_OF_THREADS_PER_PIPELINE;
-                            if (element_id < experts_per_rank * num_of_ranks_per_node) {
-                                store_prob_base_ptr[element_base_id + element_id] =
-                                    acc_prob_ptr[n * NUM_OF_PROB_VEC_ELEMENT_PER_THREAD + m];
-                            }
-                        }
-                    }
-                }
-
-                // Make sure the shared memory stored by current thread is visible by async proxy.
-                cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
-
-                // Make sure all threads within the pipeline have finished storing the current token entry and making it visible to async proxy.
-                arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank);
-
-                // Select the TMA thread within the pipeline to issue S2G TMA operations for current token entry.
-                if (warp_rank_within_pipeline == 0) {
-                    int absolute_token_id = i * NUM_OF_TOKENS_PER_CHUNK + j * NUM_OF_TOKENS_PER_GROUP + k;
-                    if (cuda::ptx::elect_sync(~0) && absolute_token_id < num_real_tokens) {
-                        // Per-token stride: HIDDEN_DIM uint16_t units (BF16/FP16) or HIDDEN_DIM*2 (FP32).
-                        // out_token_stride_u16 is the dtype-aware stride captured above.
-                        uint16_t* current_token_addr = attn_output_token_base_ptr +
-                                                       (size_t)(j * NUM_OF_TOKENS_PER_GROUP + k) * out_token_stride_u16;
-                        // Store the token from shared to global output. Bytes scale with elem width.
-                        cuda::ptx::cp_async_bulk(
-                            cuda::ptx::space_global,
-                            cuda::ptx::space_shared,
-                            reinterpret_cast<void*>(current_token_addr),
-                            reinterpret_cast<const void*>(smem_buffer_ptr->get_inter_node_token_S2G(dst_token_stage)),
-                            (uint32_t)(HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>())));
-
-                        // Store the prob from shared to global output.
-                        if constexpr (BACKWARD_COMBINE) {
-                            float* current_prob_addr = attn_output_prob_base_ptr +
-                                                       (j * NUM_OF_TOKENS_PER_GROUP + k) *
-                                                           (experts_per_rank * num_of_ranks_per_node * NUM_LSA_TEAMS);
-                            cuda::ptx::cp_async_bulk(
-                                cuda::ptx::space_global,
-                                cuda::ptx::space_shared,
-                                reinterpret_cast<void*>(current_prob_addr),
-                                reinterpret_cast<const void*>(
-                                    smem_buffer_ptr->get_inter_node_prob_S2G(dst_token_stage)),
-                                (uint32_t)((experts_per_rank * num_of_ranks_per_node * NUM_LSA_TEAMS) * sizeof(float)));
-                        }
-                        // Commit S2G TMA operations for this dst token into a bulk async copy group.
-                        cuda::ptx::cp_async_bulk_commit_group();
-                    }
-                }
-
-                // Goto next dst token entry.
-                dst_token_stage += 1;
-                if (dst_token_stage == ending_S2G_index) {
-                    dst_token_stage = starting_S2G_index;
-                }
+                // Every attn dst token was routed in dispatch, so it is always written back.
+                combine_inter_store_token<
+                    NUM_OF_THREADS_PER_PIPELINE,
+                    NUM_OF_STAGES_S2G_PER_PIPELINE,
+                    NUM_LSA_TEAMS,
+                    BACKWARD_COMBINE,
+                    HIDDEN_DIM,
+                    kTokenDtype>(
+                    smem_buffer_ptr,
+                    dst_token_stage,
+                    starting_S2G_index,
+                    ending_S2G_index,
+                    warp_rank_within_pipeline,
+                    thread_rank_within_pipeline,
+                    pipeline_rank,
+                    acc_token_fp32,
+                    acc_prob_ptr,
+                    prob_vec_per_thread,
+                    prob_dim,
+                    node_rank,
+                    attn_output_token_base,
+                    attn_output_prob_base,
+                    out_token_stride_u16,
+                    /*token_in_chunk=*/group_idx * NUM_OF_TOKENS_PER_GROUP + token_in_group,
+                    /*absolute_token_id=*/chunk_idx * NUM_OF_TOKENS_PER_CHUNK +
+                        group_idx * NUM_OF_TOKENS_PER_GROUP + token_in_group,
+                    num_real_tokens);
             }
         }
     }
-    // Because the attn output buffers will only be produced by local combine kernel, not by the combine kernels on other ranks,
-    // so we only need to wait for local combine kernel to finish writing all token data back to output buffer before we can exit.
-    // Also, a kernel will be considered completed from CUDA stream's perspective if and only if all the threads are exit and all memory operations(including TMA operations)
-    // issued by all threads have been completed and made visible to sys scope.
-    // So the CUDA stream's kernel boundary implicit synchronization should be enough to sync with all TMA operations issued in the combine kernel.
-    // So we can directly exit w/o any explicit synchronization with TMA operations.
+    // Attn output buffers are produced only by the local combine kernel, so the CUDA stream's
+    // kernel-boundary sync flushes all outstanding TMA S2G writes; no explicit drain is needed here.
 }
 
 // __launch_bounds__(1, 1)
@@ -4347,7 +4340,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
         }
     } else if (threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size()) {
         // Inter-node reduction warp group.
-        inter_node_red_warp_group_device_function<
+        combine_RED_inter_warp<
             cur_smem_t,
             INTER_NODE_RED_GROUP,
             NUM_OF_DATA_PIPELINE_PER_BLOCK,
@@ -4361,16 +4354,18 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             HIDDEN_DIM,
             LSA_TEAM_SIZE,
             kTokenDtype>(
+            // INPUT
+            param.rdma_to_attn_map,
+            param.attn_to_rdma_map,
+            // OUTPUT
+            param.attn_output_token,
+            param.attn_output_prob,
+            // CONFIG
             param.node_rank,
             param.num_of_tokens_per_rank,
             param.num_real_tokens,
-            param.num_of_ranks_per_node,
-            param.rdma_to_attn_map,
-            param.attn_to_rdma_map,
-            param.attn_output_token,
-            param.attn_output_prob,
-            smem_buffer_ptr,
-            param.experts_per_rank);
+            param.experts_per_rank,
+            smem_buffer_ptr);
     } else if (
         threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size()) {
         // Intra-node G2S warp group.

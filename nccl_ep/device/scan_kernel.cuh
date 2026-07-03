@@ -7,6 +7,7 @@
 #pragma once
 #include "common.hpp"
 #include "device_primitives.cuh"
+#include <cooperative_groups.h>
 
 namespace hybrid_ep {
 
@@ -709,5 +710,288 @@ struct scan_em_kernel_param_t {
     int num_of_ranks_per_node;
     int experts_per_rank;
 };
+
+struct build_em_tables_param_t {
+    const uint8_t* input_routing_map;
+    const uint64_t* token_rank_mask_words;
+    int num_mask_words;
+    int num_total_attn_tokens;
+    int num_tokens_per_rank;
+    int num_ranks_per_node;
+    int experts_per_rank;
+    int num_lsa_teams;
+    int node_rank;
+    int local_rank;
+    int s2d_inner_dim;
+    int max_recv_tokens_per_rank;
+    int em_alignment;
+    int32_t* sparse_to_dense_map;
+    bool*    local_expert_routing_map;
+    int32_t* num_tokens_for_experts;
+    int64_t* em_internal_offsets;
+    int32_t* em_padded_out_counts_i32;
+    int64_t* em_padded_out_counts_i64;
+    int32_t* em_out_offsets_i32;
+    int64_t* em_out_offsets_i64;
+    int32_t* em_actual_counts_out;
+    int32_t* recv_total_counter_i32;
+    int64_t* recv_total_counter_i64;
+    bool     out_is_int64;
+    int32_t* emuf_group_buf;
+    int32_t* emuf_group_count;
+    int      emuf_group_stride;
+    int      emuf_max_groups;
+    int32_t* gscratch;
+    const int32_t* token_to_recv_slot;
+    int32_t* flat2em_slot_map;
+    int      em_top_k;
+};
+
+template<int MAX_EXPERTS_PER_RANK>
+__device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
+    namespace cg = cooperative_groups;
+    extern __shared__ int32_t s_smem[];
+
+    const int epr   = p.experts_per_rank;
+    const int nrpn  = p.num_ranks_per_node;
+    const int n_dle = nrpn * epr;
+    const int packed_row_bytes =
+        ((p.num_lsa_teams * nrpn * epr) + 7) / 8;
+
+    int32_t* g_block_count = p.gscratch;
+
+    const int local_per_node_bytes = ((nrpn * epr) + 7) / 8;
+    const int tid       = threadIdx.x;
+    const int lane      = tid & 31;
+    const int warp      = tid >> 5;
+    const int num_warps = blockDim.x >> 5;
+    const int B         = blockIdx.x;
+    const int N         = gridDim.x;
+    const int s_warp_stride = n_dle;
+    int32_t* s_warp_state = s_smem;
+    int32_t* s_offsets    = s_smem + num_warps * n_dle;
+
+    auto grid = cg::this_grid();
+
+    const int tpb = (p.num_total_attn_tokens + N - 1) / N;
+    const int bs  = B * tpb;
+    const int be  = min(bs + tpb, p.num_total_attn_tokens);
+    const int tpw = (be - bs + num_warps - 1) / num_warps;
+    const int ws  = bs + warp * tpw;
+    const int we  = min(ws + tpw, be);
+
+    for (int i = tid; i < num_warps * n_dle; i += blockDim.x) s_warp_state[i] = 0;
+    __syncthreads();
+
+    const int n_local_bits_ph1  = nrpn * epr;
+    const int n_local_words_ph1 = (n_local_bits_ph1 + 63) / 64;
+    for (int tok = ws + lane; tok < we; tok += 32) {
+        const uint64_t* mw = p.token_rank_mask_words + (size_t)tok * p.num_mask_words;
+        const uint64_t mw0 = mw[0];
+        const uint64_t mw1 = (p.num_mask_words >= 2) ? mw[1] : 0;
+        if (mw0 == 0 && mw1 == 0) continue;
+        const uint8_t* row = p.input_routing_map + (size_t)tok * packed_row_bytes
+                           + (size_t)p.node_rank * local_per_node_bytes;
+        for (int wi = 0; wi < n_local_words_ph1; wi++) {
+            const int word_bit_base = wi * 64;
+            const int remaining = n_local_bits_ph1 - word_bit_base;
+            const int word_bits = remaining >= 64 ? 64 : remaining;
+            uint64_t s = nccl_ep::em_ld64(row, wi * 8);
+            if (word_bits < 64) s &= (uint64_t{1} << word_bits) - 1;
+            while (s) {
+                const int b = __ffsll(static_cast<long long>(s)) - 1;
+                atomicAdd(&s_warp_state[warp * s_warp_stride + word_bit_base + b], 1);
+                s &= s - 1;
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int dle = tid; dle < n_dle; dle += blockDim.x) {
+        int sum = 0;
+        for (int w = 0; w < num_warps; w++) sum += s_warp_state[w * s_warp_stride + dle];
+        g_block_count[(size_t)B * n_dle + dle] = sum;
+    }
+
+    grid.sync();
+
+    for (int dle = tid; dle < n_dle; dle += blockDim.x) {
+        int my_prefix = 0;
+        int total = 0;
+        for (int b = 0; b < N; b++) {
+            const int c = g_block_count[(size_t)b * n_dle + dle];
+            if (b < B) my_prefix += c;
+            total += c;
+        }
+        s_offsets[dle] = total;
+        int cum = my_prefix;
+        for (int w = 0; w < num_warps; w++) {
+            const int c = s_warp_state[w * s_warp_stride + dle];
+            s_warp_state[w * s_warp_stride + dle] = cum;
+            cum += c;
+        }
+    }
+    __syncthreads();
+
+    {
+        const int align = (p.em_alignment > 1) ? p.em_alignment : 1;
+        for (int d = warp; d < nrpn; d += num_warps) {
+            if (lane == 0) {
+                const bool write_em = (B == 0 && d == p.local_rank);
+                int cum = 0;
+                for (int k = 0; k < epr; k++) {
+                    const int c = s_offsets[d * epr + k];
+                    const int padded = (align > 1 && c > 0) ? ((c + align - 1) / align) * align : c;
+                    s_offsets[d * epr + k] = cum;
+                    if (write_em) {
+                        if (p.em_internal_offsets) p.em_internal_offsets[k] = cum;
+                        if (p.em_actual_counts_out) p.em_actual_counts_out[k] = c;
+                        if (p.out_is_int64) {
+                            if (p.em_padded_out_counts_i64) p.em_padded_out_counts_i64[k] = (int64_t)padded;
+                            if (p.em_out_offsets_i64) p.em_out_offsets_i64[k] = (int64_t)cum;
+                        } else {
+                            if (p.em_padded_out_counts_i32) p.em_padded_out_counts_i32[k] = (int32_t)padded;
+                            if (p.em_out_offsets_i32) p.em_out_offsets_i32[k] = (int32_t)cum;
+                        }
+                    }
+                    cum += padded;
+                }
+                if (cum > p.max_recv_tokens_per_rank) {
+                    printf("build_em_tables: dest %d padded slots %d > max_recv_tokens_per_rank %d\n",
+                           d, cum, p.max_recv_tokens_per_rank);
+                    __trap();
+                }
+                if (write_em) {
+                    if (p.em_internal_offsets) p.em_internal_offsets[epr] = (int64_t)cum;
+                    if (p.num_tokens_for_experts) *p.num_tokens_for_experts = (int32_t)cum;
+                    if (p.out_is_int64) {
+                        if (p.recv_total_counter_i64) *p.recv_total_counter_i64 = (int64_t)cum;
+                    } else {
+                        if (p.recv_total_counter_i32) *p.recv_total_counter_i32 = (int32_t)cum;
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    const int n_local_bits  = nrpn * epr;
+    const int n_local_words = (n_local_bits + 63) / 64;
+    const int num_tiles     = (we - ws + 31) / 32;
+    const int epr_l2        = __ffs(epr) - 1;
+    const int epr_mask      = epr - 1;
+    for (int tile = 0; tile < num_tiles; tile++) {
+        const int tok = ws + tile * 32 + lane;
+        const bool valid = (tok < we);
+        bool any_hit = false;
+        if (valid) {
+            const uint64_t* mw = p.token_rank_mask_words + (size_t)tok * p.num_mask_words;
+            const uint64_t mw0 = mw[0];
+            const uint64_t mw1 = (p.num_mask_words >= 2) ? mw[1] : 0;
+            any_hit = (mw0 != 0) || (mw1 != 0);
+        }
+
+        const uint8_t* row_local = nullptr;
+        int send_idx = 0;
+        bool is_our_send = false;
+        if (any_hit) {
+            row_local = p.input_routing_map + (size_t)tok * packed_row_bytes
+                      + (size_t)p.node_rank * local_per_node_bytes;
+            const int sgr = tok / p.num_tokens_per_rank;
+            const int sn  = sgr / nrpn;
+            const int slr = sgr % nrpn;
+            const int lti = tok % p.num_tokens_per_rank;
+            send_idx = sn * p.num_tokens_per_rank + lti;
+            is_our_send = (slr == p.local_rank);
+        }
+
+        int my_packed_idx = 0;
+        int primary_em_slot = -1;
+        int n_local_sec = 0;
+        int local_secondaries[MAX_EXPERTS_PER_RANK];
+
+        int my_local_packed_idx = 0;
+        int my_recv_s = -1;
+        if (p.flat2em_slot_map && any_hit) {
+            my_recv_s = p.token_to_recv_slot[tok];
+        }
+
+        for (int wi = 0; wi < n_local_words; wi++) {
+            const int word_bit_base = wi * 64;
+            const int remaining = n_local_bits - word_bit_base;
+            const int word_bits = remaining >= 64 ? 64 : remaining;
+            uint64_t my_slice = 0;
+            if (any_hit) {
+                my_slice = nccl_ep::em_ld64(row_local, wi * 8);
+                if (word_bits < 64) my_slice &= (uint64_t{1} << word_bits) - 1;
+            }
+            const uint32_t any_lo = __reduce_or_sync(0xffffffff, (uint32_t)my_slice);
+            const uint32_t any_hi = (word_bits > 32)
+                ? __reduce_or_sync(0xffffffff, (uint32_t)(my_slice >> 32)) : 0u;
+            uint64_t union_slice = ((uint64_t)any_hi << 32) | (uint64_t)any_lo;
+
+            while (union_slice) {
+                const int b = __ffsll(static_cast<long long>(union_slice)) - 1;
+                const int dle = word_bit_base + b;
+                const int d = dle >> epr_l2;
+                const int le = dle & epr_mask;
+                const bool my_hit = (my_slice >> b) & 1ull;
+                const uint32_t mask = __ballot_sync(0xffffffff, my_hit);
+                if (my_hit) {
+                    const int within = __popc(mask & ((1u << lane) - 1u));
+                    const int em_slot = s_offsets[dle] + s_warp_state[warp * s_warp_stride + dle] + within;
+                    if (d == p.local_rank) {
+                        if (p.local_expert_routing_map) {
+                            p.local_expert_routing_map[em_slot * epr + le] = true;
+                        }
+                        if (p.emuf_group_buf != nullptr) {
+                            if (primary_em_slot < 0) {
+                                primary_em_slot = em_slot;
+                            } else {
+                                local_secondaries[n_local_sec++] = em_slot;
+                            }
+                        }
+                        if (p.flat2em_slot_map && my_recv_s >= 0 &&
+                            my_local_packed_idx < p.em_top_k) {
+                            p.flat2em_slot_map[(size_t)my_recv_s * p.em_top_k + my_local_packed_idx] =
+                                em_slot;
+                            my_local_packed_idx++;
+                        }
+                    }
+                    if (is_our_send) {
+                        if (p.sparse_to_dense_map) {
+                            p.sparse_to_dense_map[(size_t)send_idx * p.s2d_inner_dim + my_packed_idx] =
+                                em_s2d_pack(d, em_slot);
+                        }
+                        my_packed_idx++;
+                    }
+                }
+                if (lane == 0) {
+                    s_warp_state[warp * s_warp_stride + dle] += __popc(mask);
+                }
+                union_slice &= union_slice - 1;
+            }
+        }
+
+        if (p.flat2em_slot_map && my_recv_s >= 0) {
+            for (int k = my_local_packed_idx; k < p.em_top_k; k++) {
+                p.flat2em_slot_map[(size_t)my_recv_s * p.em_top_k + k] = -1;
+            }
+        }
+
+        if (p.emuf_group_buf != nullptr && n_local_sec > 0) {
+            const int grp = atomicAdd(p.emuf_group_count, 1);
+            if (grp >= p.emuf_max_groups) {
+                __trap();
+            }
+            int32_t* row = p.emuf_group_buf + (size_t)grp * p.emuf_group_stride;
+            row[0] = primary_em_slot;
+            for (int s = 0; s < n_local_sec; s++) row[1 + s] = local_secondaries[s];
+            if (1 + n_local_sec < p.emuf_group_stride) {
+                row[1 + n_local_sec] = -1;
+            }
+        }
+    }
+}
 
 } // namespace hybrid_ep

@@ -336,6 +336,13 @@ __device__ __forceinline__ int64_t ld_volatile_global(const uint64_t* ptr) {
     return ret;
 }
 
+// Load 64 bits at a byte offset; memcpy folds to LDG.E.64 (or split if unaligned).
+__device__ __forceinline__ uint64_t em_ld64(const uint8_t* row, int byte_off) {
+    uint64_t v;
+    memcpy(&v, row + byte_off, sizeof(v));
+    return v;
+}
+
 //==============================================================================
 // Load Operations - Relaxed (system scope)
 //==============================================================================

@@ -165,6 +165,64 @@ inline void launch_scan_em(
     }
 }
 
+constexpr const char* kBuildEmTablesJitEntryName = "nccl_ep_jit_build_em_tables_kernel";
+constexpr int kBuildEmTablesBlockDim = 1024;
+
+inline std::string build_em_tables_jit_source(int experts_per_rank) {
+    std::ostringstream src;
+    src
+        << "#include \"device/hybrid_ep.cuh\"\n"
+        << "\n"
+        << "extern \"C\" __launch_bounds__(" << kBuildEmTablesBlockDim << ", 1)\n"
+        << "__global__ void " << kBuildEmTablesJitEntryName << "(\n"
+        << "    const __grid_constant__ hybrid_ep::build_em_tables_param_t p) {\n"
+        << "  hybrid_ep::build_em_tables_impl<" << experts_per_rank << ">(p);\n"
+        << "}\n";
+    return src.str();
+}
+
+inline void launch_build_em_tables_jit(
+    int experts_per_rank,
+    ::hybrid_ep::build_em_tables_param_t& param,
+    int dynamic_smem_bytes,
+    int num_blocks,
+    cudaStream_t stream) {
+    static const int variant_identity = 0;
+    const std::string variant_name = [&] {
+        std::ostringstream name;
+        name << "build_em_tables_epr" << experts_per_rank;
+        return name.str();
+    }();
+    const std::string source = build_em_tables_jit_source(experts_per_rank);
+
+    ::nccl_ep::jit::JitKernelVariant variant;
+    variant.kernel_family = "ht_build_em_tables";
+    variant.variant_name = variant_name;
+    variant.source = source;
+    variant.entry_name = kBuildEmTablesJitEntryName;
+    variant.identity = &variant_identity;
+    variant.runtime_key = static_cast<std::uint64_t>(experts_per_rank);
+    variant.num_blocks = num_blocks;
+    variant.block_dim = kBuildEmTablesBlockDim;
+    variant.dynamic_smem_bytes = dynamic_smem_bytes;
+    variant.cooperative = true;
+
+    std::string error;
+    const ::nccl_ep::jit::JitKernelStatus status =
+        ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
+
+    if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
+        std::fprintf(
+            stderr,
+            "[nccl_ep jit] fatal build-em-tables JIT launch failure for %s: %s%s%s\n",
+            variant_name.c_str(),
+            ::nccl_ep::jit::jit_kernel_status_name(status),
+            error.empty() ? "" : ": ",
+            error.empty() ? "" : error.c_str());
+        std::abort();
+    }
+}
+
 } // namespace jit
 } // namespace hybridep
 } // namespace nccl_ep

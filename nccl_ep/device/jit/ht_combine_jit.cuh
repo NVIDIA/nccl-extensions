@@ -332,8 +332,11 @@ constexpr const char* kLocalReduceJitEntryName = "nccl_ep_jit_ht_local_reduce_ke
 
 constexpr int kLocalReduceBlockDim = 128;
 
-inline std::string
-local_reduce_jit_source(int hidden_dim, bool backward_combine, ncclDataType_t token_dtype = ncclBfloat16) {
+inline std::string local_reduce_jit_source(
+    int hidden_dim,
+    bool backward_combine,
+    int experts_per_rank,
+    ncclDataType_t token_dtype = ncclBfloat16) {
     // Param/sizeof type collapses FP16->uint16_t (layout-identical); the decode
     // template arg keeps the real dtype so the reduce math is correct.
     const char* token_type_literal = (token_dtype == ncclFloat32) ? "uint32_t" : "uint16_t";
@@ -353,7 +356,8 @@ local_reduce_jit_source(int hidden_dim, bool backward_combine, ncclDataType_t to
         << "      " << hidden_dim << ",\n"
         << "      " << kLocalReduceBlockDim << ",\n"
         << "      " << bool_literal(backward_combine) << ",\n"
-        << "      " << token_dtype_literal << ">(p);\n"
+        << "      " << token_dtype_literal << ",\n"
+        << "      " << experts_per_rank << ">(p);\n"
         << "}\n";
     return src.str();
 }
@@ -362,6 +366,7 @@ template <typename T>
 inline void launch_local_reduce(
     int hidden_dim,
     bool backward_combine,
+    int experts_per_rank,
     int num_blocks,
     ::hybrid_ep::local_reduce_kernel_param_t<T>& param,
     cudaStream_t stream,
@@ -370,13 +375,11 @@ inline void launch_local_reduce(
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "local_reduce"
-             << "_hdim" << hidden_dim << (backward_combine ? "_bwd" : "_fwd")
-             << (token_dtype == ncclFloat32 ? "_fp32" :
-                 token_dtype == ncclFloat16 ? "_fp16" :
-                                              "_bf16");
+             << "_hdim" << hidden_dim << "_epr" << experts_per_rank << (backward_combine ? "_bwd" : "_fwd")
+             << (token_dtype == ncclFloat32 ? "_fp32" : token_dtype == ncclFloat16 ? "_fp16" : "_bf16");
         return name.str();
     }();
-    const std::string source = local_reduce_jit_source(hidden_dim, backward_combine, token_dtype);
+    const std::string source = local_reduce_jit_source(hidden_dim, backward_combine, experts_per_rank, token_dtype);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_local_reduce";
@@ -385,8 +388,9 @@ inline void launch_local_reduce(
     variant.entry_name = kLocalReduceJitEntryName;
     variant.identity = &variant_identity;
     variant.runtime_key = (static_cast<std::uint64_t>(hidden_dim) & 0xFFFFFFu) |
-                          (static_cast<std::uint64_t>(backward_combine ? 1u : 0u) << 24) |
-                          (static_cast<std::uint64_t>(token_dtype) << 32);
+                          (static_cast<std::uint64_t>(experts_per_rank & 0xFFu) << 24) |
+                          (static_cast<std::uint64_t>(backward_combine ? 1u : 0u) << 32) |
+                          (static_cast<std::uint64_t>(token_dtype) << 33);
     variant.num_blocks = num_blocks;
     variant.block_dim = kLocalReduceBlockDim;
     variant.dynamic_smem_bytes = ::hybrid_ep::local_reduce_dynamic_smem_bytes(hidden_dim, static_cast<int>(sizeof(T)));

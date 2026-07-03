@@ -4712,7 +4712,7 @@ inline int local_reduce_dynamic_smem_bytes(int hidden_dim, int token_elem_bytes)
            2 * kPipeDepth * static_cast<int>(sizeof(uint64_t)) + 8;
 }
 
-template <typename T, int HIDDEN_DIM, int BLOCK_DIM, bool BACKWARD_COMBINE, ncclDataType_t kTokenDtype = ncclBfloat16>
+template <typename T, int HIDDEN_DIM, int BLOCK_DIM, bool BACKWARD_COMBINE, ncclDataType_t kTokenDtype, int MAX_EXPERTS_PER_RANK>
 __device__ __forceinline__ void local_reduce_kernel_impl(const local_reduce_kernel_param_t<T>& p) {
     static_assert(HIDDEN_DIM % 8 == 0, "HIDDEN_DIM must be a multiple of 8 (uint4 = 8 elems @2 B / 4 @4 B per vector)");
     static_assert(BLOCK_DIM % 32 == 0 && BLOCK_DIM >= 64, "BLOCK_DIM must be a multiple of 32 and at least 2 warps");
@@ -4839,7 +4839,7 @@ __device__ __forceinline__ void local_reduce_kernel_impl(const local_reduce_kern
             const int32_t* row = p.emuf_group_buf + static_cast<size_t>(i) * stride;
             const int primary = row[0];
             int n_sec = 0;
-            int secondaries[HYBRIDEP_MAX_LOCAL_EXPERTS_PER_RANK];
+            int secondaries[MAX_EXPERTS_PER_RANK];
 #pragma unroll 1
             for (int s = 1; s < stride; s++) {
                 int v = row[s];

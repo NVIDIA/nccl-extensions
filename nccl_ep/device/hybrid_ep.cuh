@@ -2345,7 +2345,211 @@ __forceinline__ __device__ void combine_G2S_intra_warp(
     }
 }
 
-// Device function for intra-node reduction warp group for combine kernel.
+// Reduce all G2S source-token contributions for one destination token into FP32 registers
+// (+prob into SMEM for backward). Advances the G2S stage cursor/parity to the next dst token.
+template <
+    typename INTRA_NODE_RED_GROUP,
+    int NUM_OF_STAGES_G2S,
+    bool BACKWARD_COMBINE,
+    int HIDDEN_DIM,
+    ncclDataType_t kTokenDtype,
+    typename SMEM_TYPE,
+    int NUM_ACC>
+__forceinline__ __device__ void combine_reduce_dst_token(
+    SMEM_TYPE* smem_buffer_ptr,
+    int& token_stage,
+    uint32_t& token_producer_parity,
+    float2 (&acc_token_fp32)[NUM_ACC],
+    float* acc_prob_ptr,
+    int prob_vec_per_thread,
+    int prob_dim) {
+    constexpr int NUM_OF_BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
+
+#pragma unroll
+    for (int n = 0; n < NUM_ACC; n++) {
+        acc_token_fp32[n].x = 0.0f;
+        acc_token_fp32[n].y = 0.0f;
+    }
+    if constexpr (BACKWARD_COMBINE) {
+#pragma unroll
+        for (int n = 0; n < prob_vec_per_thread; n++) {
+            acc_prob_ptr[n] = 0.0f;
+        }
+    }
+
+    // Consume source tokens for this dst token until the producer marks the last one.
+    bool last_src_token = false;
+    do {
+        __nv_bfloat162* load_token_base_ptr =
+            reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_intra_node_token_G2S(token_stage));
+        float* load_prob_base_ptr;
+        if constexpr (BACKWARD_COMBINE) {
+            load_prob_base_ptr = smem_buffer_ptr->get_intra_node_prob_G2S(token_stage);
+        }
+
+        // Warp 0 waits for the producer; then the whole reduction group reads this stage.
+        if (INTRA_NODE_RED_GROUP::warp_rank() == 0) {
+            if (cuda::ptx::elect_sync(~0)) {
+                while (!cuda::ptx::mbarrier_try_wait_parity(
+                    smem_buffer_ptr->get_intra_node_mbarrier_G2S_producer(token_stage), token_producer_parity)) {
+                }
+            }
+        }
+        arrive_and_wait(INTRA_NODE_RED_GROUP::size(), 1);
+
+// Accumulate the register-resident token. NONE-FP16 reads __half2, NONE-FP32 reads float2 and
+// skips precision conversion; predicates are launch-uniform so branching is free.
+#pragma unroll
+        for (int n = 0; n < NUM_ACC; n++) {
+            int element_id = (n * INTRA_NODE_RED_GROUP::size()) + INTRA_NODE_RED_GROUP::thread_rank();
+            if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
+                float2 src_data_fp32 = nccl_ep::ld_token_pair<kTokenDtype>(load_token_base_ptr, element_id);
+                acc_token_fp32[n].x += src_data_fp32.x;
+                acc_token_fp32[n].y += src_data_fp32.y;
+            }
+        }
+        if constexpr (BACKWARD_COMBINE) {
+#pragma unroll
+            for (int n = 0; n < prob_vec_per_thread; n++) {
+                int prob_element_id = INTRA_NODE_RED_GROUP::thread_rank() + n * INTRA_NODE_RED_GROUP::size();
+                if (prob_element_id < prob_dim) {
+                    acc_prob_ptr[n] += load_prob_base_ptr[prob_element_id];
+                }
+            }
+        }
+
+        last_src_token = smem_buffer_ptr->intra_node_flag_G2S_buffer[token_stage];
+
+        // All reduction threads must finish reading before the producer reuses this stage.
+        arrive_and_wait(INTRA_NODE_RED_GROUP::size(), 1);
+        if (INTRA_NODE_RED_GROUP::warp_rank() == 0) {
+            if (cuda::ptx::elect_sync(~0)) {
+                cuda::ptx::mbarrier_arrive(smem_buffer_ptr->get_intra_node_mbarrier_G2S_consumer(token_stage));
+            }
+        }
+
+        token_stage += 1;
+        if (token_stage == NUM_OF_STAGES_G2S) {
+            token_stage = 0;
+            token_producer_parity ^= 1;
+        }
+    } while (!last_src_token);
+}
+
+// Store one reduced destination token (+prob) from FP32 registers into an S2G SMEM stage and
+// TMA-copy it to the per-destination intra-node red buffer. Advances the S2G stage cursor.
+template <
+    typename INTRA_NODE_RED_GROUP,
+    int NUM_OF_STAGES_S2G,
+    bool BACKWARD_COMBINE,
+    int HIDDEN_DIM,
+    ncclDataType_t kTokenDtype,
+    typename SMEM_TYPE,
+    int NUM_ACC>
+__forceinline__ __device__ void combine_store_reduced_token(
+    SMEM_TYPE* smem_buffer_ptr,
+    int& dst_token_stage,
+    const float2 (&acc_token_fp32)[NUM_ACC],
+    const float* acc_prob_ptr,
+    int prob_vec_per_thread,
+    int prob_dim,
+    uint16_t* red_token_base,
+    float* red_prob_base,
+    int current_token_id) {
+    constexpr int NUM_OF_BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
+
+    __nv_bfloat162* store_token_base_ptr =
+        reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_intra_node_token_S2G(dst_token_stage));
+
+    // Ensure any earlier TMA read from this S2G stage has completed before we overwrite it.
+    if (INTRA_NODE_RED_GROUP::warp_rank() == 0) {
+        if (cuda::ptx::elect_sync(~0)) {
+            cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<NUM_OF_STAGES_S2G - 1>{});
+        }
+    }
+    arrive_and_wait(INTRA_NODE_RED_GROUP::size(), 1);
+
+// Store the register-resident token (NONE-FP16 packs __half2, NONE-FP32 writes float2 verbatim).
+#pragma unroll
+    for (int n = 0; n < NUM_ACC; n++) {
+        int element_id = (n * INTRA_NODE_RED_GROUP::size()) + INTRA_NODE_RED_GROUP::thread_rank();
+        if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
+            nccl_ep::st_token_pair<kTokenDtype>(store_token_base_ptr, element_id, acc_token_fp32[n]);
+        }
+    }
+    if constexpr (BACKWARD_COMBINE) {
+        float* store_prob_base_ptr = smem_buffer_ptr->get_intra_node_prob_S2G(dst_token_stage);
+#pragma unroll
+        for (int n = 0; n < prob_vec_per_thread; n++) {
+            int prob_element_id = INTRA_NODE_RED_GROUP::thread_rank() + n * INTRA_NODE_RED_GROUP::size();
+            if (prob_element_id < prob_dim) {
+                store_prob_base_ptr[prob_element_id] = acc_prob_ptr[n];
+            }
+        }
+    }
+
+    // Publish SMEM writes to the async copy engine, then sync before the TMA launch.
+    cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+    arrive_and_wait(INTRA_NODE_RED_GROUP::size(), 1);
+
+    if (INTRA_NODE_RED_GROUP::warp_rank() == 0) {
+        if (cuda::ptx::elect_sync(~0)) {
+            // Wire token width scaled into uint16_t units (4 B FP32, 2 B BF16/FP16).
+            const size_t red_token_bytes = HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>());
+            uint16_t* current_token_addr = red_token_base + current_token_id * red_token_bytes / sizeof(uint16_t);
+            cuda::ptx::cp_async_bulk(
+                cuda::ptx::space_global,
+                cuda::ptx::space_shared,
+                reinterpret_cast<void*>(current_token_addr),
+                reinterpret_cast<const void*>(smem_buffer_ptr->get_intra_node_token_S2G(dst_token_stage)),
+                (uint32_t)(red_token_bytes));
+
+            if constexpr (BACKWARD_COMBINE) {
+                float* current_prob_addr = red_prob_base + current_token_id * prob_dim;
+                cuda::ptx::cp_async_bulk(
+                    cuda::ptx::space_global,
+                    cuda::ptx::space_shared,
+                    reinterpret_cast<void*>(current_prob_addr),
+                    reinterpret_cast<const void*>(smem_buffer_ptr->get_intra_node_prob_S2G(dst_token_stage)),
+                    (uint32_t)(prob_dim * sizeof(float)));
+            }
+            cuda::ptx::cp_async_bulk_commit_group();
+        }
+    }
+
+    dst_token_stage += 1;
+    if (dst_token_stage == NUM_OF_STAGES_S2G) {
+        dst_token_stage = 0;
+    }
+}
+
+// Drain outstanding TMA S2G writes and publish the cumulative streaming counter to the RDMA warp.
+// CHUNK_END uses a device-scope fence (GDR/NIC visibility); mid-batch uses a block-scope fence.
+template <typename INTRA_NODE_RED_GROUP, int STREAMING_BATCH, bool CHUNK_END>
+__forceinline__ __device__ void combine_streaming_drain(
+    int& streaming_pending,
+    int& additional_in_flight_s2g,
+    uint32_t& cumulative_produced,
+    volatile uint32_t* rdma_streaming_counter) {
+    if (INTRA_NODE_RED_GROUP::warp_rank() == 0) {
+        if (cuda::ptx::elect_sync(~0)) {
+            cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+            if constexpr (STREAMING_BATCH > 0) {
+                cumulative_produced += streaming_pending;
+                if constexpr (CHUNK_END) {
+                    __threadfence(); // device scope: flush L2->VRAM for NIC visibility (GDR)
+                } else {
+                    __threadfence_block(); // same block; sm_90 SMEM is not cached
+                }
+                *rdma_streaming_counter = cumulative_produced;
+            }
+        }
+    }
+    additional_in_flight_s2g = 0;
+    streaming_pending = 0;
+}
+
+// Intra-node reduction warp group for the combine kernel.
 template <
     typename INTRA_NODE_RED_GROUP,
     typename SMEM_TYPE,
@@ -2360,357 +2564,167 @@ template <
     int HIDDEN_DIM,
     int LSA_TEAM_SIZE,
     ncclDataType_t kTokenDtype>
-__forceinline__ __device__ void intra_node_red_warp_group_device_function(
-    const int node_rank,
-    const int num_of_tokens_per_rank,
-    const int num_of_ranks_per_node,
+__forceinline__ __device__ void combine_RED_intra_warp(
+    // INPUT
     const bool* rdma_to_attn_map,
+    // OUTPUT
     uint16_t* rdma_intra_node_red_token,
     float* rdma_intra_node_red_prob,
-    SMEM_TYPE* smem_buffer_ptr,
-    const int experts_per_rank) {
-    // Vectorized loads from rdma_to_attn_map. Each destination token contributes one bool.
-    using rdma_to_attn_map_load_t = uint4;
+    // CONFIG
+    const int node_rank,
+    const int num_of_tokens_per_rank,
+    const int experts_per_rank,
+    SMEM_TYPE* smem_buffer_ptr) {
+    // Routing map is read as vectorized 16B loads; each dst token contributes one bool.
+    using routing_loads_t = uint4;
     static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
     static_assert(
-        NUM_OF_TOKENS_PER_CHUNK % sizeof(rdma_to_attn_map_load_t) == 0,
-        "NUM_OF_TOKENS_PER_CHUNK must be multiple of rdma_to_attn_map_load_t.");
-    constexpr int NUM_OF_RDMA_TO_ATTN_LOAD_ITER_PER_CHUNK = NUM_OF_TOKENS_PER_CHUNK / sizeof(rdma_to_attn_map_load_t);
-    constexpr int NUM_OF_TOKENS_PER_RDMA_TO_ATTN_LOAD_ITER = sizeof(rdma_to_attn_map_load_t) / sizeof(bool);
+        NUM_OF_TOKENS_PER_CHUNK % sizeof(routing_loads_t) == 0,
+        "NUM_OF_TOKENS_PER_CHUNK must be multiple of routing_loads_t.");
+    constexpr int ROUTING_LOADS_PER_CHUNK = NUM_OF_TOKENS_PER_CHUNK / sizeof(routing_loads_t);
+    constexpr int TOKENS_PER_ROUTING_LOAD = sizeof(routing_loads_t) / sizeof(bool);
 
-    // Token values are processed as BF16x2 and accumulated in FP32. HIDDEN_DIM must be even.
-
+    // Tokens reduced as BF16x2 in FP32; HIDDEN_DIM must be even.
     constexpr int NUM_OF_BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
     constexpr int MAX_NUM_OF_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
     constexpr int NUM_OF_ACC_ELEMENTS_PER_THREAD_INTRA =
-        ((NUM_OF_BF16X2_ELEMENTS_PER_TOKEN - 1) / INTRA_NODE_RED_GROUP::size()) + 1;
-    // Backward-combine probability vectors stay in float (no BF16 packing).
-    const int NUM_OF_PROB_VEC_ELEMENT_PER_THREAD =
-        ((experts_per_rank * num_of_ranks_per_node - 1) / INTRA_NODE_RED_GROUP::size()) + 1;
+        nccl_ep::ceil_div(NUM_OF_BF16X2_ELEMENTS_PER_TOKEN, (int)INTRA_NODE_RED_GROUP::size());
+    // Backward-combine prob vectors stay in float (no BF16 packing).
+    const int prob_dim = experts_per_rank * LSA_TEAM_SIZE;
+    const int prob_vec_per_thread = nccl_ep::ceil_div(prob_dim, (int)INTRA_NODE_RED_GROUP::size());
     // Compile-time upper bound sized exactly to this instantiation's LSA team.
     constexpr int MAX_NUM_OF_PROB_VEC_ELEMENT_PER_THREAD =
-        ((NUM_MAX_LOCAL_EXPERTS * LSA_TEAM_SIZE - 1) / INTRA_NODE_RED_GROUP::size()) + 1;
-
-    // This warp group emits chunks in the same per-destination order consumed by the RDMA warp group:
-    // chunk 0 for node + 1, node + 2, ... node - 1, then chunk 1 for node + 1, ...
-    // That ordering lets the downstream inter-node stage observe matching chunk IDs across peers.
+        nccl_ep::ceil_div(NUM_MAX_LOCAL_EXPERTS * LSA_TEAM_SIZE, (int)INTRA_NODE_RED_GROUP::size());
 
     const int remainder_chunk_size = num_of_tokens_per_rank % NUM_OF_TOKENS_PER_CHUNK;
-    // Number of chunks for one rank, including the tail chunk if present.
-    const int num_of_chunks_per_rank = ((num_of_tokens_per_rank - 1) / NUM_OF_TOKENS_PER_CHUNK) + 1;
-    // Total chunks emitted by this node across all remote destinations.
-    const int total_num_of_chunks = (NUM_LSA_TEAMS - 1) * num_of_chunks_per_rank;
-    // Pad each node's rdma_to_attn_map slice to one vector-load granularity (16 bytes / 16 bools).
-    const int rdma_to_attn_map_size_per_node = (((num_of_tokens_per_rank - 1) / 16) + 1) * 16;
-    // G2S FIFO cursor and producer parity for source-token consumption.
+    const int chunks_per_rank = nccl_ep::ceil_div(num_of_tokens_per_rank, NUM_OF_TOKENS_PER_CHUNK);
+    const int total_chunks = (NUM_LSA_TEAMS - 1) * chunks_per_rank;
+    // rdma_to_attn_map is padded to 16B (16 bools) per node.
+    const int rdma_map_size_per_node = nccl_ep::align(num_of_tokens_per_rank, 16);
+
+    // G2S FIFO cursor + producer parity (source tokens); S2G FIFO cursor (reduced dst tokens).
     int token_stage = 0;
     uint32_t token_producer_parity = 0;
-
-    // S2G FIFO cursor for reduced destination tokens.
     int dst_token_stage = 0;
 
-    // Streaming overlap: drain + signal every STREAMING_BATCH dst tokens.
-    // The counter is CUMULATIVE across all chunks (never reset), avoiding inter-chunk races.
+    // Streaming overlap: drain + signal every STREAMING_BATCH dst tokens. The counter is cumulative
+    // across chunks (never reset), so the consumer never races a reset.
     constexpr int STREAMING_BATCH = HYBRIDEP_COMBINE_RDMA_STREAMING_BATCH;
-    int streaming_pending = 0; // tokens TMA-committed but not yet signaled to counter
-    uint32_t cumulative_produced = 0; // total active tokens whose TMA S2G is complete (across all chunks)
+    int streaming_pending = 0;
+    uint32_t cumulative_produced = 0;
 
-    // Iterate through all chunks assigned to this block.
-    for (int i = blockIdx.x; i < total_num_of_chunks; i += NUM_OF_BLOCKS) {
-        // Destination node for this emitted chunk.
-        int node_id = (i % (NUM_LSA_TEAMS - 1) + (node_rank + 1)) % NUM_LSA_TEAMS;
-        // Chunk index within that destination node's stream.
-        int chunk_id = i / (NUM_LSA_TEAMS - 1);
-        // Compact destination-slot index in the RDMA reduction buffers.
-        int rdma_remote_node_id = node_id > node_rank ? node_id - 1 : node_id;
-        // Token offset of this chunk inside the per-destination reduction buffer.
-        int rdma_intra_node_red_id =
-            rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK + chunk_id * NUM_OF_TOKENS_PER_CHUNK;
-        // Number of vector loads needed for the routing flags of this chunk.
-        int num_of_routing_info_load_iter_for_current_chunk;
-        // Number of valid tokens in this chunk.
-        int current_chunk_size;
-        if (remainder_chunk_size != 0 && chunk_id == num_of_chunks_per_rank - 1) {
-            num_of_routing_info_load_iter_for_current_chunk =
-                ((remainder_chunk_size - 1) / sizeof(rdma_to_attn_map_load_t)) + 1;
-            current_chunk_size = remainder_chunk_size;
-        } else {
-            num_of_routing_info_load_iter_for_current_chunk = NUM_OF_RDMA_TO_ATTN_LOAD_ITER_PER_CHUNK;
-            current_chunk_size = NUM_OF_TOKENS_PER_CHUNK;
-        }
+    for (int chunk_idx = blockIdx.x; chunk_idx < total_chunks; chunk_idx += NUM_OF_BLOCKS) {
+        const combine_chunk_coord_t coord = combine_chunk_schedule<NUM_LSA_TEAMS, NUM_OF_TOKENS_PER_CHUNK>(
+            chunk_idx, node_rank, chunks_per_rank, remainder_chunk_size);
+        // Compact destination-slot index + token offset in the RDMA reduction buffers.
+        const int rdma_remote_node_id = coord.node_id > node_rank ? coord.node_id - 1 : coord.node_id;
+        const int rdma_intra_node_red_id =
+            rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK + coord.chunk_id * NUM_OF_TOKENS_PER_CHUNK;
+        // Vector loads covering this chunk's routing flags (tail chunk is shorter).
+        const int routing_loads_for_chunk = (remainder_chunk_size != 0 && coord.chunk_id == chunks_per_rank - 1)
+                                                 ? nccl_ep::ceil_div(remainder_chunk_size, (int)sizeof(routing_loads_t))
+                                                 : ROUTING_LOADS_PER_CHUNK;
 
-        const rdma_to_attn_map_load_t* rdma_to_attn_map_load_base_addr =
-            reinterpret_cast<const rdma_to_attn_map_load_t*>(
-                rdma_to_attn_map + (node_id * rdma_to_attn_map_size_per_node + chunk_id * NUM_OF_TOKENS_PER_CHUNK));
+        const routing_loads_t* rdma_map_base = reinterpret_cast<const routing_loads_t*>(
+            rdma_to_attn_map + (coord.node_id * rdma_map_size_per_node + coord.chunk_id * NUM_OF_TOKENS_PER_CHUNK));
 
-        // Per-token stride in uint16_t units: HIDDEN_DIM for BF16/FP16, 2*HIDDEN_DIM for FP32.
-        uint16_t* rdma_intra_node_red_token_base_ptr =
+        // Per-token stride scaled into uint16_t units (HIDDEN_DIM for BF16/FP16, 2*HIDDEN_DIM for FP32).
+        uint16_t* red_token_base =
             rdma_intra_node_red_token + rdma_intra_node_red_id * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
-        float* rdma_intra_node_red_prob_base_ptr;
+        float* red_prob_base = nullptr;
         if constexpr (BACKWARD_COMBINE) {
-            const int experts_per_node = experts_per_rank * num_of_ranks_per_node;
-            rdma_intra_node_red_prob_base_ptr = rdma_intra_node_red_prob + rdma_intra_node_red_id * experts_per_node;
+            red_prob_base = rdma_intra_node_red_prob + rdma_intra_node_red_id * prob_dim;
         }
 
-        // Cumulative counter: no handshake or reset needed between chunks.
-        // The counter monotonically increases across all chunks, so the consumer
-        // always sees a valid threshold and never races with a reset.
         streaming_pending = 0;
-
-        // Number of destination-token S2G copies committed for this chunk.
         int additional_in_flight_s2g = 0;
-        // Iterate through all destination tokens within this chunk.
-        for (int j = 0; j < num_of_routing_info_load_iter_for_current_chunk; j++) {
-            rdma_to_attn_map_load_t rdma_to_attn_map_data = rdma_to_attn_map_load_base_addr[j];
+        for (int load_idx = 0; load_idx < routing_loads_for_chunk; load_idx++) {
+            routing_loads_t routing_data = rdma_map_base[load_idx];
 #pragma unroll
-            for (int k = 0; k < NUM_OF_TOKENS_PER_RDMA_TO_ATTN_LOAD_ITER; k++) {
-                int current_token_id = j * NUM_OF_TOKENS_PER_RDMA_TO_ATTN_LOAD_ITER + k;
-                // Tail chunk: stop once we step past the real token count.
-                if (current_token_id >= current_chunk_size) {
+            for (int token_in_load = 0; token_in_load < TOKENS_PER_ROUTING_LOAD; token_in_load++) {
+                int current_token_id = load_idx * TOKENS_PER_ROUTING_LOAD + token_in_load;
+                // Tail chunk: stop once past the real token count.
+                if (current_token_id >= coord.chunk_size) {
                     break;
                 }
-                // Check whether the destination node for this chunk needs this token.
-                bool token_needed_by_this_node = *(reinterpret_cast<bool*>(&rdma_to_attn_map_data) + k);
-                // If so, one or more contributing source tokens are already being staged through G2S.
-                if (token_needed_by_this_node) {
-                    // FP32 accumulator for the register-resident token.
-                    float2 acc_token_fp32[NUM_OF_ACC_ELEMENTS_PER_THREAD_INTRA];
-                    // Optional FP32 accumulator for probability data in backward combine.
-                    // This storage is instantiated only in backward specializations.
-                    using acc_prob_storage_type =
-                        acc_prob_storage_t<BACKWARD_COMBINE, MAX_NUM_OF_PROB_VEC_ELEMENT_PER_THREAD>;
-                    [[maybe_unused]] acc_prob_storage_type acc_prob_storage;
-                    [[maybe_unused]] float* acc_prob_ptr = nullptr;
-                    if constexpr (BACKWARD_COMBINE) {
-                        acc_prob_ptr = acc_prob_storage.data;
-                    }
-                    // Producer marks the final contributor for this destination token with this flag.
-                    bool last_src_token = false;
-#pragma unroll
-                    for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD_INTRA; n++) {
-                        acc_token_fp32[n].x = 0.0f;
-                        acc_token_fp32[n].y = 0.0f;
-                    }
-                    if constexpr (BACKWARD_COMBINE) {
-#pragma unroll
-                        for (int n = 0; n < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; n++) {
-                            acc_prob_ptr[n] = 0.0f;
-                        }
-                    }
-                    // Consume source tokens for this destination token until the producer marks the last one.
-                    do {
-                        // Current source token / optional prob slice in the G2S FIFO stage.
-                        __nv_bfloat162* load_token_base_ptr =
-                            reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_intra_node_token_G2S(token_stage));
-                        float* load_prob_base_ptr;
-                        if constexpr (BACKWARD_COMBINE) {
-                            load_prob_base_ptr = smem_buffer_ptr->get_intra_node_prob_G2S(token_stage);
-                        }
+                // Skip dst tokens this node doesn't need.
+                if (!*(reinterpret_cast<bool*>(&routing_data) + token_in_load)) {
+                    continue;
+                }
 
-                        // Warp 0 waits for the producer; then the whole reduction group can read this stage.
-                        if (INTRA_NODE_RED_GROUP::warp_rank() == 0) {
-                            if (cuda::ptx::elect_sync(~0)) {
-                                while (!cuda::ptx::mbarrier_try_wait_parity(
-                                    smem_buffer_ptr->get_intra_node_mbarrier_G2S_producer(token_stage),
-                                    token_producer_parity)) {
-                                }
-                            }
-                        }
-                        arrive_and_wait(INTRA_NODE_RED_GROUP::size(), 1);
+                float2 acc_token_fp32[NUM_OF_ACC_ELEMENTS_PER_THREAD_INTRA];
+                // acc_prob storage instantiated only in backward specializations.
+                using acc_prob_storage_type =
+                    acc_prob_storage_t<BACKWARD_COMBINE, MAX_NUM_OF_PROB_VEC_ELEMENT_PER_THREAD>;
+                [[maybe_unused]] acc_prob_storage_type acc_prob_storage;
+                [[maybe_unused]] float* acc_prob_ptr = nullptr;
+                if constexpr (BACKWARD_COMBINE) {
+                    acc_prob_ptr = acc_prob_storage.data;
+                }
 
-// Accumulate the register-resident token. NONE-FP16 reinterprets the same 4
-// SMEM bytes as __half2 instead of __nv_bfloat162. NONE-FP32 reads a float2
-// (8 SMEM bytes per slot) and skips precision conversion. Predicates are
-// launch-uniform so branching costs nothing per warp.
-#pragma unroll
-                        for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD_INTRA; n++) {
-                            int element_id = (n * INTRA_NODE_RED_GROUP::size()) + INTRA_NODE_RED_GROUP::thread_rank();
-                            if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
-                                float2 src_data_fp32 =
-                                    nccl_ep::ld_token_pair<kTokenDtype>(load_token_base_ptr, element_id);
-                                acc_token_fp32[n].x += src_data_fp32.x;
-                                acc_token_fp32[n].y += src_data_fp32.y;
-                            }
-                        }
-                        // Accumulate the token tail in shared memory to cap register usage for large hidden dims.
-                        if constexpr (BACKWARD_COMBINE) {
-#pragma unroll
-                            for (int n = 0; n < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; n++) {
-                                int prob_element_id =
-                                    INTRA_NODE_RED_GROUP::thread_rank() + n * INTRA_NODE_RED_GROUP::size();
-                                if (prob_element_id < experts_per_rank * num_of_ranks_per_node) {
-                                    float src_data = load_prob_base_ptr[prob_element_id];
-                                    acc_prob_ptr[n] += src_data;
-                                }
-                            }
-                        }
+                combine_reduce_dst_token<
+                    INTRA_NODE_RED_GROUP,
+                    NUM_OF_STAGES_G2S,
+                    BACKWARD_COMBINE,
+                    HIDDEN_DIM,
+                    kTokenDtype>(
+                    smem_buffer_ptr,
+                    token_stage,
+                    token_producer_parity,
+                    acc_token_fp32,
+                    acc_prob_ptr,
+                    prob_vec_per_thread,
+                    prob_dim);
 
-                        // Producer sets this on the last source token for the current destination token.
-                        last_src_token = smem_buffer_ptr->intra_node_flag_G2S_buffer[token_stage];
+                combine_store_reduced_token<
+                    INTRA_NODE_RED_GROUP,
+                    NUM_OF_STAGES_S2G,
+                    BACKWARD_COMBINE,
+                    HIDDEN_DIM,
+                    kTokenDtype>(
+                    smem_buffer_ptr,
+                    dst_token_stage,
+                    acc_token_fp32,
+                    acc_prob_ptr,
+                    prob_vec_per_thread,
+                    prob_dim,
+                    red_token_base,
+                    red_prob_base,
+                    current_token_id);
 
-                        // All reduction threads must finish consuming this G2S stage before the producer reuses it.
-                        arrive_and_wait(INTRA_NODE_RED_GROUP::size(), 1);
-                        if (INTRA_NODE_RED_GROUP::warp_rank() == 0) {
-                            if (cuda::ptx::elect_sync(~0)) {
-                                cuda::ptx::mbarrier_arrive(
-                                    smem_buffer_ptr->get_intra_node_mbarrier_G2S_consumer(token_stage));
-                            }
-                        }
-
-                        // Advance to the next G2S stage, toggling parity on wraparound.
-                        token_stage += 1;
-                        if (token_stage == NUM_OF_STAGES_G2S) {
-                            token_stage = 0;
-                            token_producer_parity ^= 1;
-                        }
-
-                    } while (!last_src_token);
-
-                    // Current reduced destination token / optional prob slice in the S2G FIFO stage.
-                    __nv_bfloat162* store_token_base_ptr =
-                        reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_intra_node_token_S2G(dst_token_stage));
-                    float* store_prob_base_ptr;
-                    if constexpr (BACKWARD_COMBINE) {
-                        store_prob_base_ptr = smem_buffer_ptr->get_intra_node_prob_S2G(dst_token_stage);
-                    }
-
-                    // Ensure any earlier TMA read from this S2G stage has completed before we overwrite it.
-                    if (INTRA_NODE_RED_GROUP::warp_rank() == 0) {
-                        if (cuda::ptx::elect_sync(~0)) {
-                            cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<NUM_OF_STAGES_S2G - 1>{});
-                        }
-                    }
-                    // All reduction threads wait here before storing new data into this stage.
-                    arrive_and_wait(INTRA_NODE_RED_GROUP::size(), 1);
-
-// Store the register-resident token.
-//   NONE-FP16: pack via __float22half2_rn into the same 4 SMEM bytes.
-//   NONE-FP32: write float2 verbatim (8 SMEM bytes per slot) — no precision
-//   conversion. TMA later copies bytes verbatim to global.
-#pragma unroll
-                    for (int n = 0; n < NUM_OF_ACC_ELEMENTS_PER_THREAD_INTRA; n++) {
-                        int element_id = (n * INTRA_NODE_RED_GROUP::size()) + INTRA_NODE_RED_GROUP::thread_rank();
-                        if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
-                            nccl_ep::st_token_pair<kTokenDtype>(store_token_base_ptr, element_id, acc_token_fp32[n]);
-                        }
-                    }
-                    // Store the token tail from the SMEM accumulator, or zeros if no tail element was touched.
-                    // Store the prob(optional).
-                    if constexpr (BACKWARD_COMBINE) {
-#pragma unroll
-                        for (int n = 0; n < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; n++) {
-                            int prob_element_id =
-                                INTRA_NODE_RED_GROUP::thread_rank() + n * INTRA_NODE_RED_GROUP::size();
-                            if (prob_element_id < experts_per_rank * num_of_ranks_per_node) {
-                                store_prob_base_ptr[prob_element_id] = acc_prob_ptr[n];
-                            }
-                        }
-                    }
-
-                    // Publish these shared-memory writes to the async copy engine.
-                    cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
-
-                    // All threads must finish populating this S2G stage before the TMA thread launches the copy.
-                    arrive_and_wait(INTRA_NODE_RED_GROUP::size(), 1);
-
-                    // Warp 0 issues the S2G copies for this reduced destination token.
-                    if (INTRA_NODE_RED_GROUP::warp_rank() == 0) {
-                        if (cuda::ptx::elect_sync(~0)) {
-                            // Wire token width: 4 B for FP32, 2 B for BF16/FP16. The global buffer base is
-                            // uint16_t*, so the per-token stride is scaled into uint16_t units.
-                            const size_t red_token_bytes = HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>());
-                            uint16_t* current_token_addr =
-                                rdma_intra_node_red_token_base_ptr +
-                                (j * NUM_OF_TOKENS_PER_RDMA_TO_ATTN_LOAD_ITER + k) * red_token_bytes / sizeof(uint16_t);
-                            // Copy the reduced token from the S2G shared stage to the per-destination global buffer.
-                            cuda::ptx::cp_async_bulk(
-                                cuda::ptx::space_global,
-                                cuda::ptx::space_shared,
-                                reinterpret_cast<void*>(current_token_addr),
-                                reinterpret_cast<const void*>(
-                                    smem_buffer_ptr->get_intra_node_token_S2G(dst_token_stage)),
-                                (uint32_t)(red_token_bytes));
-
-                            // Store the prob from shared to global(Optional).
-                            if constexpr (BACKWARD_COMBINE) {
-                                float* current_prob_addr = rdma_intra_node_red_prob_base_ptr +
-                                                           (j * NUM_OF_TOKENS_PER_RDMA_TO_ATTN_LOAD_ITER + k) *
-                                                               (experts_per_rank * num_of_ranks_per_node);
-                                cuda::ptx::cp_async_bulk(
-                                    cuda::ptx::space_global,
-                                    cuda::ptx::space_shared,
-                                    reinterpret_cast<void*>(current_prob_addr),
-                                    reinterpret_cast<const void*>(
-                                        smem_buffer_ptr->get_intra_node_prob_S2G(dst_token_stage)),
-                                    (uint32_t)((experts_per_rank * num_of_ranks_per_node) * sizeof(float)));
-                            }
-                            // Group the token/prob copies for this destination token into one async-copy commit.
-                            cuda::ptx::cp_async_bulk_commit_group();
-                        }
-                    }
-
-                    // Advance to the next S2G stage.
-                    dst_token_stage += 1;
-                    if (dst_token_stage == NUM_OF_STAGES_S2G) {
-                        dst_token_stage = 0;
-                    }
-
-                    // Another token entry's S2G in-flight.
-                    additional_in_flight_s2g += 1;
-
-                    // Streaming: periodic drain + counter update
-                    streaming_pending++;
-                    if constexpr (STREAMING_BATCH > 0) {
-                        if (streaming_pending >= STREAMING_BATCH) {
-                            if (INTRA_NODE_RED_GROUP::warp_rank() == 0) {
-                                if (cuda::ptx::elect_sync(~0)) {
-                                    // Drain ALL outstanding TMA S2G writes
-                                    cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
-                                    // Signal tokens ready to RDMA warp (cumulative, never reset).
-                                    // Volatile store instead of atomicExch: same block, shared memory
-                                    // is not cached on sm_90. __threadfence_block() ensures TMA S2G
-                                    // writes are visible before the counter update.
-                                    cumulative_produced += streaming_pending;
-                                    __threadfence_block();
-                                    *((volatile uint32_t*)smem_buffer_ptr->rdma_streaming_counter) =
-                                        cumulative_produced;
-                                }
-                            }
-                            additional_in_flight_s2g = 0;
-                            streaming_pending = 0;
-                        }
+                additional_in_flight_s2g += 1;
+                streaming_pending++;
+                if constexpr (STREAMING_BATCH > 0) {
+                    if (streaming_pending >= STREAMING_BATCH) {
+                        combine_streaming_drain<INTRA_NODE_RED_GROUP, STREAMING_BATCH, /*CHUNK_END=*/false>(
+                            streaming_pending,
+                            additional_in_flight_s2g,
+                            cumulative_produced,
+                            (volatile uint32_t*)smem_buffer_ptr->rdma_streaming_counter);
                     }
                 }
             }
         }
-        // End of chunk: drain remaining TMA writes + signal streaming counter
+
+        // End of chunk: drain remaining TMA writes + signal the streaming counter.
         if (streaming_pending > 0 || additional_in_flight_s2g > 0) {
-            if (INTRA_NODE_RED_GROUP::warp_rank() == 0) {
-                if (cuda::ptx::elect_sync(~0)) {
-                    cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
-                    if constexpr (STREAMING_BATCH > 0) {
-                        cumulative_produced += streaming_pending;
-                        __threadfence(); // device scope: flush L2→VRAM for NIC visibility (GDR)
-                        *((volatile uint32_t*)smem_buffer_ptr->rdma_streaming_counter) = cumulative_produced;
-                    }
-                }
-            }
-            streaming_pending = 0;
-            additional_in_flight_s2g = 0;
+            combine_streaming_drain<INTRA_NODE_RED_GROUP, STREAMING_BATCH, /*CHUNK_END=*/true>(
+                streaming_pending,
+                additional_in_flight_s2g,
+                cumulative_produced,
+                (volatile uint32_t*)smem_buffer_ptr->rdma_streaming_counter);
         }
 
-        // Signal chunk-complete mbarrier unconditionally (for parity tracking)
+        // Chunk-complete mbarrier (parity tracking).
         if constexpr (NUM_LSA_TEAMS != 1) {
             if (INTRA_NODE_RED_GROUP::warp_rank() == 0) {
                 if (cuda::ptx::elect_sync(~0)) {
                     cuda::ptx::mbarrier_arrive(&smem_buffer_ptr->intra_node_to_rdma_mbarrier_buffer
-                                                    [rdma_remote_node_id * MAX_NUM_OF_CHUNKS_PER_RANK + chunk_id]);
+                                                    [rdma_remote_node_id * MAX_NUM_OF_CHUNKS_PER_RANK + coord.chunk_id]);
                 }
             }
         }
     }
-
-    // No post-loop cleanup needed: every chunk is fully drained and signaled at chunk end.
 }
 
 // Device function for inter-node node2node(RDMA) warp for combine kernel. There can be only 1 inter-node warp per CUDA block!
@@ -4306,7 +4320,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     if (threadIdx_x_int < INTRA_NODE_RED_GROUP::size()) {
         if constexpr (NUM_LSA_TEAMS != 1) {
             // Intra-node reduction warp group.
-            intra_node_red_warp_group_device_function<
+            combine_RED_intra_warp<
                 INTRA_NODE_RED_GROUP,
                 cur_smem_t,
                 NUM_OF_STAGES_G2S,
@@ -4320,14 +4334,16 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 HIDDEN_DIM,
                 LSA_TEAM_SIZE,
                 kTokenDtype>(
-                param.node_rank,
-                param.num_of_tokens_per_rank,
-                param.num_of_ranks_per_node,
+                // INPUT
                 param.rdma_to_attn_map,
+                // OUTPUT
                 param.rdma_intra_node_red_token,
                 param.rdma_intra_node_red_prob,
-                smem_buffer_ptr,
-                param.experts_per_rank);
+                // CONFIG
+                param.node_rank,
+                param.num_of_tokens_per_rank,
+                param.experts_per_rank,
+                smem_buffer_ptr);
         }
     } else if (threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size()) {
         // Inter-node reduction warp group.
@@ -4338,7 +4354,6 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             NUM_OF_STAGES_G2S,
             NUM_OF_STAGES_S2G,
             NUM_OF_TOKENS_PER_CHUNK,
-                // OUTPUT
             NUM_LSA_TEAMS,
             NUM_OF_BLOCKS,
             NUM_OF_TOKENS_PER_GROUP,

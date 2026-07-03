@@ -377,7 +377,7 @@ ncclResult_t call_metadata_preprocessing(
     int32_t* num_tokens_for_experts,
     bool* local_expert_routing_map,
     int32_t* per_expert_token_counts,
-    void* scan_tmp,
+    void* ranks_scan_tmp,
     int node_rank,
     int local_rank,
     int num_tokens_per_rank,
@@ -419,32 +419,45 @@ ncclResult_t call_metadata_preprocessing(
     constexpr int NUM_OF_WARPS_PER_BLOCK_SCAN = NUM_THREADS_PER_BLOCK / 32;
 
     if (expert_major) {
+        // The EM scan's gscratch is the shared ep_workspace (NUM_WORKSPACE_BYTES).
+        // Verify the selected path's requirement fits before using it.
+        const size_t gscratch_needed =
+            get_em_scan_gscratch_size(num_ranks_per_node, experts_per_rank, NUM_OF_BLOCKS, em_permute);
+        if (gscratch_needed > NUM_WORKSPACE_BYTES) {
+            std::fprintf(stderr,
+                         "[nccl_ep] EM scan gscratch (%zu B) exceeds ep_workspace (%zu B) for "
+                         "num_ranks_per_node=%d experts_per_rank=%d num_sms=%d local_permute=%d\n",
+                         gscratch_needed, static_cast<size_t>(NUM_WORKSPACE_BYTES), num_ranks_per_node,
+                         experts_per_rank, NUM_OF_BLOCKS, static_cast<int>(em_permute));
+            return ncclInvalidUsage;
+        }
+
         if (em_permute) {
-            // EM-permute path: run the FLAT scan to populate the unified
-            // (FLAT-shape) s2d + LERM (FLAT-shape) + token_rank_mask + RDMA/attn
-            // maps in one pass. em_scan_kernel still runs below but only for
-            // EM-only offsets / counts / alignment; its s2d and LERM writes are
-            // suppressed by passing null pointers.
             const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * num_ranks_per_node * sizeof(::hybrid_ep::tmp_state_t);
-            CUDA_CHECK(cudaMemsetAsync(scan_tmp, 0, preprocessing_tmp_sz, stream));
+            CUDA_CHECK(cudaMemsetAsync(ranks_scan_tmp, 0, preprocessing_tmp_sz, stream));
 
-            const size_t scan_smem_size = (2 * NUM_OF_WARPS_PER_BLOCK_SCAN * num_ranks_per_node * sizeof(int32_t)) +
-                                          (num_ranks_per_node * sizeof(int32_t));
-            const int dynamic_smem_bytes = static_cast<int>(scan_smem_size);
+            // The shared gscratch (ep_workspace, fit-checked above) doubles as the
+            // fused scan's per-expert decoupled-scan state; gscratch_needed is its
+            // exact byte size on the local-permute path.
+            auto* expert_scan_tmp = reinterpret_cast<::hybrid_ep::tmp_state_t*>(scan_gscratch);
+            CUDA_CHECK(cudaMemsetAsync(expert_scan_tmp, 0, gscratch_needed, stream));
 
-            ::hybrid_ep::scan_flat_kernel_param_t sp;
+            // FLAT scan smem (no expert_counts region) + EM-permute smem region.
+            const size_t flat_ints = static_cast<size_t>(num_ranks_per_node) * (2 * NUM_OF_WARPS_PER_BLOCK_SCAN + 1);
+            const size_t em_ints = static_cast<size_t>(experts_per_rank) * (2 * NUM_OF_WARPS_PER_BLOCK_SCAN + 3);
+            const int dynamic_smem_bytes = static_cast<int>((flat_ints + em_ints) * sizeof(int32_t));
+
+            ::hybrid_ep::scan_flat_kernel_param_t sp{};
             sp.input_routing_map = global_routing_map;
-            sp.tmp = reinterpret_cast<::hybrid_ep::tmp_state_t*>(scan_tmp);
+            sp.tmp = reinterpret_cast<::hybrid_ep::tmp_state_t*>(ranks_scan_tmp);
             sp.sparse_to_dense_map = sparse_to_dense_map;
             sp.rdma_to_attn_map = rdma_to_attn_map;
             sp.attn_to_rdma_map = attn_to_rdma_map;
             sp.token_rank_mask = token_rank_mask;
-            // FLAT scan publishes raw recv count here; em_scan_kernel leaves
-            // it untouched in em-permute mode. EM-padded total lives in
-            // expert_token_offsets[experts_per_rank].
+            // Initialize Flat parameters
             sp.num_of_tokens_for_experts = num_tokens_for_experts;
             sp.local_expert_routing_map = local_expert_routing_map;
-            sp.per_expert_token_counts = nullptr; // em_scan_kernel writes authoritative per-expert counts
+            sp.per_expert_token_counts = nullptr; // unused for Expert-major path
             sp.node_rank = node_rank;
             sp.local_rank = local_rank;
             sp.num_of_tokens_per_rank = num_tokens_per_rank;
@@ -453,17 +466,38 @@ ncclResult_t call_metadata_preprocessing(
             sp.recv_total_counter = recv_total_counter;
             sp.out_is_int64 = out_is_int64;
             sp.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
-            sp.token_to_recv_slot = token_to_recv_slot;
+            sp.token_to_recv_slot = nullptr;  // not needed: recv slot known at emit
+            // EM-permute outputs.
+            sp.expert_scan_tmp = expert_scan_tmp;
+            sp.flat2em_slot_map = flat2em_slot_map;
+            sp.em_top_k = em_top_k;
+            sp.em_alignment = static_cast<int>(alignment);
+            sp.em_internal_offsets = internal_offsets;
+            sp.em_padded_out_counts_i32 = out_is_int64 ? nullptr : static_cast<int32_t*>(padded_out_counts);
+            sp.em_padded_out_counts_i64 = out_is_int64 ? static_cast<int64_t*>(padded_out_counts) : nullptr;
+            sp.em_out_offsets_i32 = out_is_int64 ? nullptr : static_cast<int32_t*>(out_offsets);
+            sp.em_out_offsets_i64 = out_is_int64 ? static_cast<int64_t*>(out_offsets) : nullptr;
+            sp.em_actual_counts_out = actual_counts_out;
 
             jit::launch_scan_flat(
                 NUM_THREADS_PER_BLOCK,
                 NUM_OF_BLOCKS,
                 num_nodes,
                 num_ranks_per_node,
-                /*per_expert_counts=*/false,
+                experts_per_rank,
+                /*enable_per_expert_counts=*/false,
+                /*enable_em_permute=*/true,
                 sp,
                 dynamic_smem_bytes,
                 stream);
+
+            (void)s2d_inner_dim;
+            (void)emuf_group_buf;
+            (void)emuf_group_count;
+            (void)emuf_group_stride;
+            (void)emuf_max_groups;
+            (void)token_to_recv_slot;
+            return ncclSuccess;
         } else {
             // nvlink_dup / local_dup EM path: produce only the per-token rank mask + RDMA/attn
             // maps in the scan, then let em_scan_kernel build S2D / LERM / em offsets.
@@ -530,7 +564,7 @@ ncclResult_t call_metadata_preprocessing(
     }
 
     const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * num_ranks_per_node * sizeof(::hybrid_ep::tmp_state_t);
-    CUDA_CHECK(cudaMemsetAsync(scan_tmp, 0, preprocessing_tmp_sz, stream));
+    CUDA_CHECK(cudaMemsetAsync(ranks_scan_tmp, 0, preprocessing_tmp_sz, stream));
 
     const size_t scan_smem_size = (2 * NUM_OF_WARPS_PER_BLOCK_SCAN * num_ranks_per_node * sizeof(int32_t)) +
                                   (num_ranks_per_node * sizeof(int32_t)) +
@@ -539,7 +573,7 @@ ncclResult_t call_metadata_preprocessing(
 
     ::hybrid_ep::scan_flat_kernel_param_t sp;
     sp.input_routing_map = global_routing_map;
-    sp.tmp = reinterpret_cast<::hybrid_ep::tmp_state_t*>(scan_tmp);
+    sp.tmp = reinterpret_cast<::hybrid_ep::tmp_state_t*>(ranks_scan_tmp);
     sp.sparse_to_dense_map = sparse_to_dense_map;
     sp.rdma_to_attn_map = rdma_to_attn_map;
     sp.attn_to_rdma_map = attn_to_rdma_map;
@@ -562,7 +596,9 @@ ncclResult_t call_metadata_preprocessing(
         NUM_OF_BLOCKS,
         num_nodes,
         num_ranks_per_node,
+        experts_per_rank,
         per_expert_token_counts != nullptr,
+        /*enable_em_permute=*/false,
         sp,
         dynamic_smem_bytes,
         stream);
@@ -668,8 +704,14 @@ void launch_build_em_tables(
                                     num_sms, stream);
 }
 
-size_t get_scan_gscratch_size(int num_ranks_per_node, int experts_per_rank, int num_sms) {
+size_t get_em_scan_gscratch_size(int num_ranks_per_node, int experts_per_rank, int num_sms, bool is_local_permute) {
     assert(num_sms > 0);
+    if (is_local_permute) {
+        // Fused em-permute scan: per-expert decoupled-scan state
+        // expert_scan_tmp[num_sms * experts_per_rank] tmp_state_t (independent of nrpn).
+        return static_cast<size_t>(num_sms) * experts_per_rank * sizeof(::hybrid_ep::tmp_state_t);
+    }
+    // em_scan_kernel (kLocalDup / nvlink_dup path): block_count[num_sms][nrpn*epr] int32.
     return static_cast<size_t>(num_sms) * num_ranks_per_node * experts_per_rank * sizeof(int32_t);
 }
 

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <sstream>
 #include <string>
 
@@ -32,7 +33,9 @@ inline std::string scan_flat_jit_source(
     int num_of_blocks,
     int num_lsa_teams,
     int lsa_team_size,
-    bool enable_per_expert_counts) {
+    int experts_per_rank,
+    bool enable_per_expert_counts,
+    bool enable_em_permute) {
     constexpr int rank_mask_word_bits = CHAR_BIT * static_cast<int>(sizeof(uint64_t));
     const int rank_mask_words = (lsa_team_size + rank_mask_word_bits - 1) / rank_mask_word_bits;
     std::ostringstream src;
@@ -47,13 +50,22 @@ inline std::string scan_flat_jit_source(
         << "      " << num_of_blocks << ",\n"
         << "      " << num_lsa_teams << ",\n"
         << "      " << lsa_team_size << ",\n"
-        << "      " << scan_bool_literal(enable_per_expert_counts) << ">(\n"
+        << "      " << scan_bool_literal(enable_per_expert_counts) << ",\n"
+        << "      " << scan_bool_literal(enable_em_permute) << ",\n"
+        << "      " << (enable_em_permute ? experts_per_rank : 0) << ">(\n"
         << "      p.input_routing_map, p.tmp, p.sparse_to_dense_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"
         << "      reinterpret_cast<hybrid_ep::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
         << "      p.num_of_tokens_for_experts, p.local_expert_routing_map, p.per_expert_token_counts,\n"
         << "      p.node_rank, p.local_rank, p.num_of_tokens_per_rank, p.num_of_ranks_per_node, p.experts_per_rank,\n"
         << "      p.recv_total_counter, p.out_is_int64, p.max_recv_tokens_per_rank,\n"
-        << "      p.token_to_recv_slot, smem_bytes);\n"
+        << "      p.token_to_recv_slot, smem_bytes";
+    if (enable_em_permute) {
+        src << ",\n"
+            << "      p.expert_scan_tmp, p.flat2em_slot_map, p.em_top_k, p.em_alignment, p.em_internal_offsets,\n"
+            << "      p.em_padded_out_counts_i32, p.em_padded_out_counts_i64,\n"
+            << "      p.em_out_offsets_i32, p.em_out_offsets_i64, p.em_actual_counts_out";
+    }
+    src << ");\n"
         << "}\n";
     return src.str();
 }
@@ -85,7 +97,9 @@ inline void launch_scan_flat(
     int num_of_blocks,
     int num_lsa_teams,
     int lsa_team_size,
+    int experts_per_rank,
     bool enable_per_expert_counts,
+    bool enable_em_permute,
     ::hybrid_ep::scan_flat_kernel_param_t& param,
     int dynamic_smem_bytes,
     cudaStream_t stream) {
@@ -94,7 +108,8 @@ inline void launch_scan_flat(
         std::ostringstream name;
         name << "scan_flat"
              << "_nodes" << num_lsa_teams << "_lsa" << lsa_team_size << "_threads" << num_threads_per_block << "_blocks"
-             << num_of_blocks << (enable_per_expert_counts ? "_pec" : "_nopec");
+             << num_of_blocks << (enable_per_expert_counts ? "_pec" : "_nopec") << (enable_em_permute ? "_em" : "_noem");
+        if (enable_em_permute) name << "_epr" << experts_per_rank;
         return name.str();
     }();
     const std::string source = scan_flat_jit_source(
@@ -102,7 +117,9 @@ inline void launch_scan_flat(
         num_of_blocks,
         num_lsa_teams,
         lsa_team_size,
-        enable_per_expert_counts);
+        experts_per_rank,
+        enable_per_expert_counts,
+        enable_em_permute);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_scan_flat";
@@ -110,7 +127,10 @@ inline void launch_scan_flat(
     variant.source = source;
     variant.entry_name = kScanFlatJitEntryName;
     variant.identity = &variant_identity;
-    variant.runtime_key = 0;
+    // The FLAT (nopec/pec) and EM-permute instantiations share this launcher's
+    // single variant_identity; key the fast in-process cache on the variant name
+    // so they don't alias (an EM handle must not reuse the cached FLAT kernel).
+    variant.runtime_key = static_cast<std::uint64_t>(std::hash<std::string>{}(variant_name));
     variant.num_blocks = num_of_blocks;
     variant.block_dim = num_threads_per_block;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
@@ -149,7 +169,8 @@ inline void launch_scan_em(
     variant.source = source;
     variant.entry_name = kScanEmJitEntryName;
     variant.identity = &variant_identity;
-    variant.runtime_key = 0;
+    // Distinct geometries (lsa/threads/blocks) must not alias in the fast cache.
+    variant.runtime_key = static_cast<std::uint64_t>(std::hash<std::string>{}(variant_name));
     variant.num_blocks = num_of_blocks;
     variant.block_dim = num_threads_per_block;
     variant.dynamic_smem_bytes = 0;

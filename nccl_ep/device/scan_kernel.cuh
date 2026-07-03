@@ -221,7 +221,7 @@ __device__ __forceinline__ int32_t warp_excl_scan(bool participates, int lane_id
     return (lane_id >= 1) ? exclusive_scan : 0;
 }
 
-template <bool ENABLE_PER_EXPERT_COUNTS>
+template <bool ENABLE_PER_EXPERT_COUNTS, bool ENABLE_EM_PERMUTE = false>
 __device__ __forceinline__ void write_local_routing(
     const uint8_t* input_routing_map,
     bool* local_expert_routing_map,
@@ -236,7 +236,13 @@ __device__ __forceinline__ void write_local_routing(
     int local_rank,
     int experts_per_rank,
     int lane_id,
-    bool expert_major) {
+    bool expert_major,
+    // EM-permute related params
+    int32_t* flat2em_slot_map = nullptr,
+    const int32_t* expert_base = nullptr,
+    int32_t* warp_expert_prefix = nullptr,
+    int em_top_k = 0,
+    int warp_id = 0) {
     bool lane_participates = (token_out_of_bound == 0) && token_needed_by_local_rank;
     const uint8_t* local_rank_bitmap_row = nullptr;
     bool* local_expert_routing_map_store_base_addr = nullptr;
@@ -249,6 +255,7 @@ __device__ __forceinline__ void write_local_routing(
         }
     }
 
+    int em_k = 0;  // number of local-expert hits emitted for this lane's token
     const int local_expert_bit_base = local_rank * experts_per_rank;
     for (int k = 0; k < experts_per_rank; k++) {
         int expert_bit = local_expert_bit_base + k;
@@ -260,7 +267,25 @@ __device__ __forceinline__ void write_local_routing(
             }
         }
 
-        if constexpr (ENABLE_PER_EXPERT_COUNTS) {
+        if constexpr (ENABLE_EM_PERMUTE) {
+            // Tile-wide exclusive scan of hits for expert k, offset by the
+            // per-warp running prefix and the expert's padded zone base.
+            const unsigned expert_mask = __ballot_sync(~0u, routed_to_expert);
+            const int pref_k = warp_expert_prefix[warp_id * experts_per_rank + k];  // read before update
+            if (routed_to_expert) {
+                const int within = __popc(expert_mask & ((1u << lane_id) - 1u));
+                const int em_slot = expert_base[k] + pref_k + within;
+                if (em_k < em_top_k) {
+                    flat2em_slot_map[static_cast<size_t>(local_rank_slot) * em_top_k + em_k] = em_slot;
+                }
+                em_k++;
+            }
+            __syncwarp();  // all lanes read pref_k before lane 0 overwrites it
+            if (lane_id == 0) {
+                warp_expert_prefix[warp_id * experts_per_rank + k] = pref_k + __popc(expert_mask);
+            }
+            __syncwarp();  // publish update before the next tile re-reads this slot
+        } else if constexpr (ENABLE_PER_EXPERT_COUNTS) {
             unsigned expert_mask = __ballot_sync(~0u, routed_to_expert);
             if (lane_id == 0) {
                 int warp_expert_count = __popc(expert_mask);
@@ -270,9 +295,19 @@ __device__ __forceinline__ void write_local_routing(
             }
         }
     }
+
+    // Pad trailing flat2em slots with -1 so the copy kernel skips them.
+    if constexpr (ENABLE_EM_PERMUTE) {
+        if (lane_participates) {
+            for (int k = em_k; k < em_top_k; k++) {
+                flat2em_slot_map[static_cast<size_t>(local_rank_slot) * em_top_k + k] = -1;
+            }
+        }
+    }
 }
 
-template <int NUM_RANK_TILES, int LSA_TEAM_SIZE, int NUM_MASK_WORDS, bool ENABLE_PER_EXPERT_COUNTS>
+template <int NUM_RANK_TILES, int LSA_TEAM_SIZE, int NUM_MASK_WORDS, bool ENABLE_PER_EXPERT_COUNTS,
+          bool ENABLE_EM_PERMUTE = false>
 __device__ __forceinline__ void assign_recv_slots(
     const uint8_t* input_routing_map,
     int32_t* sparse_to_dense_map,
@@ -297,7 +332,12 @@ __device__ __forceinline__ void assign_recv_slots(
     bool expert_major,
     bool out_is_int64,
     int max_recv_tokens_per_rank,
-    int32_t* token_to_recv_slot = nullptr) {
+    int32_t* token_to_recv_slot = nullptr,
+    // EM-permute outputs (ENABLE_EM_PERMUTE only)
+    int32_t* flat2em_slot_map = nullptr,
+    const int32_t* expert_base = nullptr,
+    int32_t* warp_expert_prefix = nullptr,
+    int em_top_k = 0) {
     for (int i = 0; i < num_of_tokens_per_thread; i++) {
         int current_token_id = thread_starting_token + i * WARP_SIZE;
         int token_out_of_bound = 0;
@@ -362,7 +402,7 @@ __device__ __forceinline__ void assign_recv_slots(
             __syncwarp();
         }
 
-        write_local_routing<ENABLE_PER_EXPERT_COUNTS>(
+        write_local_routing<ENABLE_PER_EXPERT_COUNTS, ENABLE_EM_PERMUTE>(
             input_routing_map,
             local_expert_routing_map,
             block_expert_token_counts,
@@ -376,7 +416,15 @@ __device__ __forceinline__ void assign_recv_slots(
             local_rank,
             experts_per_rank,
             lane_id,
-            expert_major);
+            expert_major,
+            flat2em_slot_map,
+            expert_base,
+            warp_expert_prefix,
+            em_top_k,
+            warp_id);
+        // EM-permute updates warp_expert_prefix in smem; keep the warp converged
+        // before the next tile re-reads it.
+        if constexpr (ENABLE_EM_PERMUTE) __syncwarp();
 
     // em-permute: persist per-global-token recv slot (-1 = no local-rank hit).
         if (token_to_recv_slot != nullptr && token_out_of_bound == 0) {
@@ -396,11 +444,16 @@ __device__ __forceinline__ void assign_recv_slots(
                 __trap();
             }
             *num_of_tokens_for_experts = local_rank_prefix_after_scan;
-            if (recv_total_counter) {
-                if (out_is_int64) {
-                    *static_cast<int64_t*>(recv_total_counter) = static_cast<int64_t>(local_rank_prefix_after_scan);
-                } else {
-                    *static_cast<int32_t*>(recv_total_counter) = local_rank_prefix_after_scan;
+            // EM-permute reports the padded total via recv_total_counter (written
+            // in scan_impl_flat's EM block); don't clobber it with the unpadded
+            // FLAT count here.
+            if constexpr (!ENABLE_EM_PERMUTE) {
+                if (recv_total_counter) {
+                    if (out_is_int64) {
+                        *static_cast<int64_t*>(recv_total_counter) = static_cast<int64_t>(local_rank_prefix_after_scan);
+                    } else {
+                        *static_cast<int32_t*>(recv_total_counter) = local_rank_prefix_after_scan;
+                    }
                 }
             }
         }
@@ -485,14 +538,113 @@ compute_scan_geometry(int num_of_tokens_per_rank, int num_of_ranks_per_node, int
     return g;
 }
 
-// FLAT-layout scan: produces token_rank_mask, rdma/attn maps, sparse_to_dense
-// (rank-major), recv-slot prefixes, and (optionally) per-expert token counts.
+// ---------------------------------------------------------------------------
+// EM-permute fusion helpers: extra phases that let scan_impl_flat also produce the
+// em-permute outputs (flat2em_slot_map + per-expert padded zone geometry) that
+// em_scan_kernel used to build, so the second cooperative scan can be dropped.
+// Gated at the scan_impl_flat call sites by `if constexpr (ENABLE_EM_PERMUTE)`.
+// ---------------------------------------------------------------------------
+
+// Per-local-expert tally over all global attn tokens (mirror of tally_ranks but
+// counting how many tokens set each local-rank expert bit). Writes per-warp
+// sums to smem. Counts the exact set that lands in the EM buffer: tokens whose
+// (local_rank, k) bit is set (which implies routing to the local rank).
+template <int MAX_LOCAL_EXPERTS>
+__device__ __forceinline__ void tally_local_experts(
+    const uint8_t* input_routing_map,
+    int32_t* warp_expert_sums,
+    int thread_starting_token,
+    int num_of_tokens_per_thread,
+    int num_of_total_attn_tokens,
+    int packed_row_bytes,
+    int experts_per_node_packed,
+    int node_rank,
+    int local_rank,
+    int experts_per_rank,
+    int warp_id,
+    int lane_id) {
+    int32_t counts[MAX_LOCAL_EXPERTS];
+#pragma unroll
+    for (int k = 0; k < MAX_LOCAL_EXPERTS; k++) counts[k] = 0;
+
+    const int local_expert_bit_base = local_rank * experts_per_rank;
+    for (int i = 0; i < num_of_tokens_per_thread; i++) {
+        const int tok = thread_starting_token + i * WARP_SIZE;
+        if (tok >= num_of_total_attn_tokens) break;
+        const uint8_t* row =
+            input_routing_map + static_cast<size_t>(tok) * packed_row_bytes + node_rank * experts_per_node_packed;
+#pragma unroll
+        for (int k = 0; k < MAX_LOCAL_EXPERTS; k++) {
+            const int bit = local_expert_bit_base + k;
+            if ((row[bit >> 3] >> (bit & 7)) & 1u) counts[k]++;
+        }
+    }
+    // All lanes converge here (loop exit); reduce lane counts per expert.
+#pragma unroll
+    for (int k = 0; k < MAX_LOCAL_EXPERTS; k++) {
+        const int32_t s = __reduce_add_sync(~0u, counts[k]);
+        if (lane_id == 0) warp_expert_sums[warp_id * experts_per_rank + k] = s;
+    }
+}
+
+// Publish per-expert block sums, then derive (a) predecessor prefix for this
+// block and (b) the grand total across ALL blocks (needed for padded zone
+// bases). Uses the same decoupled tmp_state_t polling as the rank scan, so no
+// cooperative launch is required -- every block waits for every block to post.
+template <int NUM_THREADS_PER_BLOCK, int NUM_OF_WARPS_PER_BLOCK, int NUM_OF_BLOCKS>
+__device__ __forceinline__ void em_expert_cross_block(
+    const int32_t* warp_expert_sums,
+    int32_t* expert_block_prefix,
+    int32_t* expert_total,
+    tmp_state_t* expert_scan_tmp,
+    int experts_per_rank,
+    int block_id) {
+    for (int e = threadIdx.x; e < experts_per_rank; e += NUM_THREADS_PER_BLOCK) {
+        int32_t acc = 0;
+#pragma unroll
+        for (int w = 0; w < NUM_OF_WARPS_PER_BLOCK; w++) acc += warp_expert_sums[w * experts_per_rank + e];
+        tmp_state_t data{PRIV_SUM, acc};
+        uint64_t bits = *reinterpret_cast<uint64_t*>(&data);
+        nccl_ep::st_relaxed_gpu_global(
+            reinterpret_cast<uint64_t*>(&expert_scan_tmp[block_id * experts_per_rank + e]), bits);
+    }
+
+    for (int e = threadIdx.x; e < experts_per_rank; e += NUM_THREADS_PER_BLOCK) {
+        int32_t prefix = 0;
+        int32_t total = 0;
+        for (int b = 0; b < NUM_OF_BLOCKS; b++) {
+            tmp_state_t data{EMPTY, 0};
+            tmp_state_t* src = &expert_scan_tmp[b * experts_per_rank + e];
+            do {
+                uint64_t bits = nccl_ep::ld_relaxed_gpu_global(reinterpret_cast<const uint64_t*>(src));
+                data = *reinterpret_cast<tmp_state_t*>(&bits);
+            } while (data.state != PRIV_SUM);
+            if (b < block_id) prefix += data.value;
+            total += data.value;
+        }
+        expert_block_prefix[e] = prefix;
+        expert_total[e] = total;
+    }
+}
+
+// FLAT-layout scan, optionally fused with EM-permute. Always produces
+// token_rank_mask, rdma/attn maps, sparse_to_dense (rank-major), and recv-slot
+// prefixes. Two mutually-exclusive add-ons, selected at compile time:
+//   ENABLE_PER_EXPERT_COUNTS -> FLAT per-expert token counts.
+//   ENABLE_EM_PERMUTE           -> em-permute outputs: flat2em_slot_map and the
+//                               [experts_per_rank(+1)] padded zone geometry
+//                               (replaces the standalone em_scan_kernel).
+// The EM add-on requires expert_scan_tmp + the em_* outputs + MAX_LOCAL_EXPERTS and
+// its smem region carved past the FLAT region; all are ignored when disabled, so
+// the FLAT instantiation is byte-identical and pays no register/smem cost.
 template <
     int NUM_THREADS_PER_BLOCK,
     int NUM_OF_BLOCKS,
     int NUM_LSA_TEAMS,
     int LSA_TEAM_SIZE,
-    bool ENABLE_PER_EXPERT_COUNTS>
+    bool ENABLE_PER_EXPERT_COUNTS,
+    bool ENABLE_EM_PERMUTE = false,
+    int MAX_LOCAL_EXPERTS = 0>
 __device__ __forceinline__ void scan_impl_flat(
     const uint8_t* input_routing_map,
     tmp_state_t* tmp,
@@ -512,13 +664,27 @@ __device__ __forceinline__ void scan_impl_flat(
     bool out_is_int64,
     int max_recv_tokens_per_rank,
     int32_t* token_to_recv_slot,
-    uint8_t* smem_bytes) {
+    uint8_t* smem_bytes,
+    // EM-permute inputs/outputs; ignored unless ENABLE_EM_PERMUTE.
+    tmp_state_t* expert_scan_tmp = nullptr,
+    int32_t* flat2em_slot_map = nullptr,
+    int em_top_k = 0,
+    int em_alignment = 1,
+    int64_t* em_internal_offsets = nullptr,
+    int32_t* em_padded_out_counts_i32 = nullptr,
+    int64_t* em_padded_out_counts_i64 = nullptr,
+    int32_t* em_out_offsets_i32 = nullptr,
+    int64_t* em_out_offsets_i64 = nullptr,
+    int32_t* em_actual_counts_out = nullptr) {
     static_assert(
         LSA_TEAM_SIZE <= EM_S2D_MAX_RANKS,
         "em_s2d_pack rank field is 10 bits; LSA team size must fit in 1024");
     static_assert(
         LSA_TEAM_SIZE <= NUM_THREADS_PER_BLOCK,
         "scan_impl_flat requires one block thread per LSA rank to initialize warp prefixes");
+    static_assert(
+        !(ENABLE_PER_EXPERT_COUNTS && ENABLE_EM_PERMUTE),
+        "per-expert-counts and EM-permute both drive the expert ballot; enable at most one");
 
     constexpr int NUM_OF_WARPS_PER_BLOCK = NUM_THREADS_PER_BLOCK / WARP_SIZE;
     constexpr int NUM_MASK_WORDS = (LSA_TEAM_SIZE + 63) / 64;
@@ -532,6 +698,22 @@ __device__ __forceinline__ void scan_impl_flat(
     scan_smem_t smem =
         scan_smem_t::from_raw(smem_bytes, NUM_OF_WARPS_PER_BLOCK, num_of_ranks_per_node, ENABLE_PER_EXPERT_COUNTS);
 
+    // EM-permute smem region carved past the FLAT scan region (only when enabled).
+    int32_t* expert_warp_sums = nullptr;
+    int32_t* expert_block_prefix = nullptr;
+    int32_t* expert_total = nullptr;
+    int32_t* expert_base = nullptr;
+    int32_t* warp_expert_prefix = nullptr;
+    if constexpr (ENABLE_EM_PERMUTE) {
+        int32_t* em = reinterpret_cast<int32_t*>(smem_bytes) +
+                      static_cast<size_t>(num_of_ranks_per_node) * (2 * NUM_OF_WARPS_PER_BLOCK + 1);
+        expert_warp_sums = em;
+        expert_block_prefix = expert_warp_sums + NUM_OF_WARPS_PER_BLOCK * experts_per_rank;
+        expert_total = expert_block_prefix + experts_per_rank;
+        expert_base = expert_total + experts_per_rank;
+        warp_expert_prefix = expert_base + experts_per_rank;
+    }
+
     if constexpr (ENABLE_PER_EXPERT_COUNTS) {
         for (int e = threadIdx.x; e < experts_per_rank; e += NUM_THREADS_PER_BLOCK) {
             smem.expert_counts[e] = 0;
@@ -539,6 +721,7 @@ __device__ __forceinline__ void scan_impl_flat(
         __syncthreads();
     }
 
+    // Phase 1: rank tally (+ per-local-expert tally when EM-permute is enabled).
     int32_t token_routing_map_sum[LSA_TEAM_SIZE];
     tally_ranks<LSA_TEAM_SIZE, NUM_MASK_WORDS>(
         input_routing_map,
@@ -557,20 +740,91 @@ __device__ __forceinline__ void scan_impl_flat(
         local_rank,
         g.rdma_to_attn_map_size_per_node);
 
+    if constexpr (ENABLE_EM_PERMUTE) {
+        tally_local_experts<MAX_LOCAL_EXPERTS>(
+            input_routing_map, expert_warp_sums, g.thread_starting_token, g.num_of_tokens_per_thread,
+            g.num_of_total_attn_tokens, g.packed_row_bytes, g.experts_per_node_packed, node_rank,
+            local_rank, experts_per_rank, g.warp_id, g.lane_id);
+    }
+
     reduce_warp_tally<LSA_TEAM_SIZE>(token_routing_map_sum, smem, num_of_ranks_per_node, g.warp_id, g.lane_id);
     __syncthreads();
 
+    // Cross-block prefixes: ranks (predecessor-only) + experts (predecessor +
+    // grand total for padded bases, EM-permute only).
     cross_block_prefix_scan<NUM_THREADS_PER_BLOCK, NUM_OF_WARPS_PER_BLOCK>(
         smem,
         tmp,
         num_of_ranks_per_node,
         blockIdx.x);
+    if constexpr (ENABLE_EM_PERMUTE) {
+        em_expert_cross_block<NUM_THREADS_PER_BLOCK, NUM_OF_WARPS_PER_BLOCK, NUM_OF_BLOCKS>(
+            expert_warp_sums, expert_block_prefix, expert_total, expert_scan_tmp, experts_per_rank, blockIdx.x);
+    }
     __syncthreads();
 
     init_warp_rank_prefixes<NUM_OF_WARPS_PER_BLOCK>(smem, num_of_ranks_per_node);
+
+    if constexpr (ENABLE_EM_PERMUTE) {
+        // Padded per-expert zone bases from grand totals; block 0 publishes the
+        // global EM offset arrays. Every block computes expert_base locally.
+        if (threadIdx.x == 0) {
+            const int align = (em_alignment > 1) ? em_alignment : 1;
+            int cum = 0;
+            for (int k = 0; k < experts_per_rank; k++) {
+                const int c = expert_total[k];
+                expert_base[k] = cum;
+                const int padded = (align > 1 && c > 0) ? ((c + align - 1) / align) * align : c;
+                if (blockIdx.x == 0) {
+                    if (em_internal_offsets) em_internal_offsets[k] = cum;
+                    if (em_actual_counts_out) em_actual_counts_out[k] = c;
+                    if (out_is_int64) {
+                        if (em_padded_out_counts_i64) em_padded_out_counts_i64[k] = static_cast<int64_t>(padded);
+                        if (em_out_offsets_i64) em_out_offsets_i64[k] = static_cast<int64_t>(cum);
+                    } else {
+                        if (em_padded_out_counts_i32) em_padded_out_counts_i32[k] = padded;
+                        if (em_out_offsets_i32) em_out_offsets_i32[k] = cum;
+                    }
+                }
+                cum += padded;
+            }
+            if (blockIdx.x == 0) {
+                if (em_internal_offsets) em_internal_offsets[experts_per_rank] = cum;
+                // EM user-visible recv-token count is the padded total (matches
+                // getNumRecvTokens). num_of_tokens_for_experts stays the unpadded
+                // FLAT count (the permute/dispatch path relies on it); only the
+                // optional user recv_total_counter reports the padded total, and
+                // the FLAT branch of assign_recv_slots is suppressed for it.
+                if (recv_total_counter) {
+                    if (out_is_int64) {
+                        *static_cast<int64_t*>(recv_total_counter) = static_cast<int64_t>(cum);
+                    } else {
+                        *static_cast<int32_t*>(recv_total_counter) = cum;
+                    }
+                }
+            }
+            if (cum > max_recv_tokens_per_rank) {
+                printf("scan_impl_flat(em): padded EM slots %d > max_recv_tokens_per_rank %d\n", cum,
+                       max_recv_tokens_per_rank);
+                __trap();
+            }
+        }
+
+        // Seed per-warp expert prefixes: block predecessor prefix + earlier warps.
+        if (threadIdx.x < experts_per_rank) {
+            const int e = threadIdx.x;
+            int32_t prefix = expert_block_prefix[e];
+#pragma unroll
+            for (int w = 0; w < NUM_OF_WARPS_PER_BLOCK; w++) {
+                warp_expert_prefix[w * experts_per_rank + e] = prefix;
+                prefix += expert_warp_sums[w * experts_per_rank + e];
+            }
+        }
+    }
     __syncthreads();
 
-    assign_recv_slots<NUM_RANK_TILES, LSA_TEAM_SIZE, NUM_MASK_WORDS, ENABLE_PER_EXPERT_COUNTS>(
+    // Phase 2: single token pass -> FLAT recv slots + FLAT LERM (+ EM slots).
+    assign_recv_slots<NUM_RANK_TILES, LSA_TEAM_SIZE, NUM_MASK_WORDS, ENABLE_PER_EXPERT_COUNTS, ENABLE_EM_PERMUTE>(
         input_routing_map,
         sparse_to_dense_map,
         token_rank_mask,
@@ -594,7 +848,11 @@ __device__ __forceinline__ void scan_impl_flat(
         /*expert_major=*/false,
         out_is_int64,
         max_recv_tokens_per_rank,
-        token_to_recv_slot);
+        token_to_recv_slot,
+        flat2em_slot_map,
+        expert_base,
+        warp_expert_prefix,
+        em_top_k);
 
     if constexpr (ENABLE_PER_EXPERT_COUNTS) {
         __syncthreads();
@@ -697,6 +955,20 @@ struct scan_flat_kernel_param_t {
     bool out_is_int64;
     int max_recv_tokens_per_rank;
     int32_t* token_to_recv_slot;  // em-permute scratch; null otherwise.
+
+    // ---- EM-permute fusion outputs (scan_impl_flat<ENABLE_EM_PERMUTE=true> only; null on FLAT path) ----
+    // When these are wired, scan_flat also produces what em_scan_kernel used to
+    // build on the em-permute path, so em_scan_kernel can be skipped entirely.
+    tmp_state_t* expert_scan_tmp;        // [num_of_blocks * experts_per_rank] decoupled-scan state
+    int32_t* flat2em_slot_map;       // [num_recv, em_top_k] FLAT recv slot -> EM slot(s)
+    int em_top_k;                    // width of flat2em_slot_map inner dim
+    int em_alignment;                // per-expert zone padding multiple (>=1)
+    int64_t* em_internal_offsets;    // [experts_per_rank + 1] padded zone base + total
+    int32_t* em_padded_out_counts_i32;
+    int64_t* em_padded_out_counts_i64;
+    int32_t* em_out_offsets_i32;
+    int64_t* em_out_offsets_i64;
+    int32_t* em_actual_counts_out;   // [experts_per_rank] unpadded per-expert counts
 };
 
 struct scan_em_kernel_param_t {

@@ -139,7 +139,7 @@ ncclResult_t call_metadata_preprocessing(
     int32_t* num_tokens_for_experts, // Output: total tokens for local experts
     bool* local_expert_routing_map, // Output: per-expert routing for local tokens
     int32_t* per_expert_token_counts, // Optional output: per-expert counts (nullptr to skip)
-    void* scan_tmp, // Pre-allocated temp buffer (from get_preprocessing_scan_tmp_size)
+    void* ranks_scan_tmp, // Pre-allocated per-rank scan state (from get_preprocessing_scan_tmp_size)
     int node_rank, // This node's rank (0 to num_nodes-1)
     int local_rank, // Rank within node (0 to num_ranks_per_node-1)
     int num_tokens_per_rank, // Actual tokens per rank this iteration (runtime)
@@ -223,8 +223,9 @@ void launch_build_em_tables(
     int em_top_k,
     cudaStream_t stream);
 
-// Returns required size (bytes) for the gscratch buffer used by launch_build_em_tables.
-size_t get_scan_gscratch_size(int num_ranks_per_node, int experts_per_rank, int num_sms);
+// The size of gscratch (ep_workspace) consumed by the EM scan
+size_t get_em_scan_gscratch_size(int num_ranks_per_node, int experts_per_rank, 
+                                 int num_sms, bool is_local_permute);
 
 // Scatter FLAT staging rows into EM zones using flat2em_slot_map (written by
 // em_scan_kernel during UpdateHandle); zero-fill per-expert pad rows.

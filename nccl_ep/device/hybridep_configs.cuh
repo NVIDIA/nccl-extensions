@@ -51,9 +51,6 @@
 // ============================================================================
 #define HYBRIDEP_NUM_THREADS_PER_BLOCK_PREPROCESSING 512
 
-// Max local experts per rank for expert-major remap kernel register arrays (runtime-asserted).
-#define HYBRIDEP_MAX_LOCAL_EXPERTS_PER_RANK 64
-
 // ============================================================================
 // EM local-fanout kernels (local_dup, local_reduce).
 // Used only when NCCL_EP_HT_EM_LOCAL_DUP=1.

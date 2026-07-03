@@ -86,6 +86,7 @@ inline std::string dispatch_jit_source(
     bool use_fp8,
     int hidden_dim,
     int sf_bytes_per_token,
+    int experts_per_rank,
     ncclDataType_t token_dtype = ncclBfloat16) {
     const char* layout_literal =
         (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? "NCCL_EP_LAYOUT_EXPERT_MAJOR" : "NCCL_EP_LAYOUT_FLAT";
@@ -132,7 +133,8 @@ inline std::string dispatch_jit_source(
         << "      " << lsa_team_size << ",\n"
         << "      " << layout_literal << ",\n"
         << "      " << hidden_dim << ",\n"
-        << "      kSfBytesPerToken>(param, smem_bytes);\n"
+        << "      kSfBytesPerToken,\n"
+        << "      " << experts_per_rank << ">(param, smem_bytes);\n"
         << "}\n";
     return src.str();
 }
@@ -150,6 +152,7 @@ inline void launch_dispatch(
     bool use_fp8,
     int hidden_dim,
     int sf_bytes_per_token,
+    int experts_per_rank,
     const ncclEpEnvConfig* env,  // for rank-0-gated verbose param dump; may be null
     void* param,
     size_t param_size,
@@ -173,7 +176,7 @@ inline void launch_dispatch(
              << (use_fp8                    ? "_fp8" :
                  token_dtype == ncclFloat32 ? "_fp32" :
                                               "_16b")
-             << "_sf" << sf_bytes_per_token;
+             << "_sf" << sf_bytes_per_token << "_epr" << experts_per_rank;
         return name.str();
     }();
     const std::string source = dispatch_jit_source(
@@ -198,6 +201,7 @@ inline void launch_dispatch(
         use_fp8,
         hidden_dim,
         sf_bytes_per_token,
+        experts_per_rank,
         token_dtype);
 
     ::nccl_ep::jit::JitKernelVariant variant;
@@ -220,7 +224,7 @@ inline void launch_dispatch(
             "[nccl_ep][env]   nodes(lsa_teams)=%d lsa_team_size=%d hidden_dim=%d\n"
             "[nccl_ep][env]   stages=%d in_flight_s2g=%d pipelines=%d tokens_per_chunk=%d max_tokens_per_rank=%d\n"
             "[nccl_ep][env]   num_blocks=%d block_dim=%d dynamic_smem_bytes=%d\n"
-            "[nccl_ep][env]   forward=%s layout=%s dtype=%s use_fp8=%s sf_bytes_per_token=%d\n",
+            "[nccl_ep][env]   forward=%s layout=%s dtype=%s use_fp8=%s sf_bytes_per_token=%d experts_per_rank=%d\n",
             variant_name.c_str(),
             num_lsa_teams,
             lsa_team_size,
@@ -239,7 +243,8 @@ inline void launch_dispatch(
              token_dtype == ncclFloat32 ? "fp32" :
                                           "16b"),
             dispatch_bool_literal(use_fp8),
-            sf_bytes_per_token);
+            sf_bytes_per_token,
+            experts_per_rank);
     }
 
     std::string error;

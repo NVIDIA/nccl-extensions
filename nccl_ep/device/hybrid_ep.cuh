@@ -2727,6 +2727,121 @@ __forceinline__ __device__ void combine_RED_intra_warp(
     }
 }
 
+// RDMA-put the active tokens (per rdma_to_attn_map) of one chunk to the remote node, coalescing
+// contiguous runs into batches of at most MAX_BATCH (token + optional prob). Under STREAMING each flush
+// first waits for the intra-node reduction warp to publish enough produced tokens (streaming_counter)
+// and advances cumulative_sent; otherwise the whole chunk is assumed reduced. Lane 0 only.
+template <
+    bool STREAMING,
+    bool BACKWARD_COMBINE,
+    int MAX_BATCH,
+    int MAX_NUM_OF_TOKENS_PER_RANK,
+    size_t TOKEN_BYTES>
+__forceinline__ __device__ void combine_n2n_put_active_tokens(
+    ncclGin& net,
+    ncclTeam rail,
+    int node_id,
+    ncclWindow_t nccl_token_window,
+    ncclWindow_t nccl_prob_window,
+    ncclWindow_t nccl_internal_window,
+    const struct combine_memory_region_info_t* smem_mr_info_ptr,
+    const bool* rdma_to_attn_map,
+    int chunk_base_token_idx,
+    int chunk_first_token,
+    int token_range,
+    int rdma_remote_node_id,
+    int rank_in_remote,
+    int prob_dim,
+    volatile uint32_t* streaming_counter,
+    uint32_t& cumulative_sent) {
+    int batch_start_in_chunk = -1;
+    int batch_count = 0;
+    for (int token_idx_in_chunk = 0; token_idx_in_chunk < token_range; ++token_idx_in_chunk) {
+        bool need_write = rdma_to_attn_map[token_idx_in_chunk + chunk_base_token_idx];
+        bool is_last = (token_idx_in_chunk == token_range - 1);
+        if (need_write) {
+            if (batch_count == 0) batch_start_in_chunk = token_idx_in_chunk;
+            batch_count++;
+        }
+        bool should_flush = batch_count > 0 && (!need_write || is_last || batch_count >= MAX_BATCH);
+        if (should_flush) {
+            if constexpr (STREAMING) {
+                while (*streaming_counter < (cumulative_sent + batch_count)) {
+                }
+            }
+            int batch_start_token = batch_start_in_chunk + chunk_first_token;
+            size_t token_src_offset =
+                smem_mr_info_ptr->rdma_intra_node_red_token_offset +
+                (rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * TOKEN_BYTES;
+            size_t token_dst_offset =
+                smem_mr_info_ptr->combine_rdma_inter_node_group_token_offset +
+                (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * TOKEN_BYTES;
+            net.put(
+                rail,
+                node_id,
+                nccl_internal_window,
+                token_dst_offset,
+                nccl_token_window,
+                token_src_offset,
+                batch_count * TOKEN_BYTES,
+                ncclGin_None{},
+                ncclGin_None{},
+                ncclCoopThread());
+
+            if constexpr (BACKWARD_COMBINE) {
+                size_t prob_src_offset =
+                    smem_mr_info_ptr->rdma_intra_node_red_prob_offset +
+                    (rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * prob_dim * sizeof(float);
+                size_t prob_dst_offset =
+                    smem_mr_info_ptr->combine_rdma_inter_node_group_prob_offset +
+                    (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * prob_dim * sizeof(float);
+                net.put(
+                    rail,
+                    node_id,
+                    nccl_internal_window,
+                    prob_dst_offset,
+                    nccl_prob_window,
+                    prob_src_offset,
+                    batch_count * prob_dim * sizeof(float),
+                    ncclGin_None{},
+                    ncclGin_None{},
+                    ncclCoopThread());
+            }
+
+            if constexpr (STREAMING) {
+                cumulative_sent += batch_count;
+            }
+            batch_count = 0;
+            batch_start_in_chunk = -1;
+        }
+    }
+}
+
+// Signal the remote node (via ncclGin) that this chunk has been delivered. Lane 0 only.
+template <int MAX_NUM_OF_TOKENS_PER_RANK, int NUM_OF_TOKENS_PER_CHUNK, int NUM_LSA_TEAMS>
+__forceinline__ __device__ void combine_n2n_signal_remote(
+    ncclGin& net,
+    ncclTeam rail,
+    int node_id,
+    int local_rank,
+    int node_rank,
+    int chunk_id,
+    unsigned signals_base,
+    unsigned combine_signal_offset) {
+    constexpr int MAX_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
+    unsigned signal_id = signals_base + combine_signal_offset +
+                         local_rank * (NUM_LSA_TEAMS * MAX_CHUNKS_PER_RANK) + node_rank * MAX_CHUNKS_PER_RANK +
+                         chunk_id;
+    net.signal(
+        rail,
+        node_id,
+        ncclGin_SignalAdd{signal_id, 1},
+        ncclCoopThread(),
+        ncclGin_None{},
+        cuda::thread_scope_thread,
+        cuda::thread_scope_thread);
+}
+
 // Inter-node N2N (RDMA) warp group for the combine kernel. Exactly one such warp per block;
 // uses the ncclGin API (net.put / net.signal).
 template <
@@ -2765,7 +2880,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     // Token RDMA offsets/sizes below scale by size_u8 (4 B for FP32, 2 B for BF16/FP16);
     // prob is always float and is unaffected.
     // Load rdma_to_attn_map using LDG.128. Each token will need 1 bool from this map.
-    using rdma_to_attn_map_load_t = uint4;
+    using routing_loads_t = uint4;
     static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
     static_assert(INTER_NODE_RDMA_GROUP::size() == 32, "INTER_NODE_RDMA_GROUP should be 1 warp.");
     static_assert(INTER_NODE_RDMA_GROUP::size() >= NUM_LSA_TEAMS - 1, "mr_info should be loaded at once.");
@@ -2773,11 +2888,9 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
         NUM_OF_TOKENS_PER_CHUNK % INTER_NODE_RDMA_GROUP::size() == 0,
         "NUM_OF_TOKENS_PER_CHUNK must be multiple of 32.");
     static_assert(
-        NUM_OF_TOKENS_PER_CHUNK % sizeof(rdma_to_attn_map_load_t) == 0,
-        "NUM_OF_TOKENS_PER_CHUNK must be multiple of sizeof(rdma_to_attn_map_load_t).");
-    // The (NUM_LSA_TEAMS - 1) queue pairs of one block were arranged together.
-    // int block_offset = blockIdx.x * (NUM_LSA_TEAMS - 1);
-    // Mr_infos and rdma_mbarrier_buffer in shared memory.
+        NUM_OF_TOKENS_PER_CHUNK % sizeof(routing_loads_t) == 0,
+        "NUM_OF_TOKENS_PER_CHUNK must be multiple of sizeof(routing_loads_t).");
+    // mr_info and the intra-node -> rdma mbarrier buffer are staged in shared memory.
     struct combine_memory_region_info_t* smem_mr_info_ptr = nullptr;
     uint64_t* intra_node_to_rdma_mbarrier_buffer_ptr = nullptr;
     constexpr int MAX_NUM_OF_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
@@ -2791,6 +2904,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     __syncwarp();
 
     // Chunks this rank produces for the RDMA warps to consume; residue slots pad up to the max.
+    const int remainder_chunk_size = num_of_tokens_per_rank % NUM_OF_TOKENS_PER_CHUNK;
     const int chunks_per_rank = nccl_ep::ceil_div(num_of_tokens_per_rank, NUM_OF_TOKENS_PER_CHUNK);
     const int total_chunks = (NUM_LSA_TEAMS - 1) * MAX_NUM_OF_CHUNKS_PER_RANK;
     // rdma_to_attn_map is padded to 16B (16 bools) per node.
@@ -2798,13 +2912,14 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     uint32_t token_consumer_parity = 0;
     uint32_t cumulative_sent = 0; // Cumulative active tokens RDMA-put across all chunks (never reset).
     for (int chunk_idx = blockIdx.x; chunk_idx < total_chunks; chunk_idx += NUM_OF_BLOCKS) {
-        // Destination node and its per-node chunk id (both sender and G2S receiver use this formula
-        // so signals match).
-        int node_id = (chunk_idx % (NUM_LSA_TEAMS - 1) + (node_rank + 1)) % NUM_LSA_TEAMS;
+        // Node/chunk mapping shared with the G2S receiver so signals match.
+        const combine_chunk_coord_t coord = combine_chunk_schedule<NUM_LSA_TEAMS, NUM_OF_TOKENS_PER_CHUNK>(
+            chunk_idx, node_rank, chunks_per_rank, remainder_chunk_size);
+        const int node_id = coord.node_id;
+        const int chunk_id = coord.chunk_id;
         // With rail-scoped GIN comms, node index maps to rail-team rank.
-        int rank_in_remote = node_id < node_rank ? node_rank - 1 : node_rank;
-        int chunk_id = chunk_idx / (NUM_LSA_TEAMS - 1);
-        bool is_residue = (chunk_id >= chunks_per_rank);
+        const int rank_in_remote = node_id < node_rank ? node_rank - 1 : node_rank;
+        const bool is_residue = (chunk_id >= chunks_per_rank);
 
         // Distribute chunks across comms/contexts for parallelism.
         int total_channels = num_gin_comms * num_ctx_per_comm;
@@ -2815,13 +2930,8 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
         ncclTeam rail = ncclTeamRail(dcomms[comm_idx]);
         int rdma_remote_node_id = node_id > node_rank ? node_id - 1 : node_id;
         int chunk_base_token_idx = node_id * rdma_map_size_per_node + chunk_id * NUM_OF_TOKENS_PER_CHUNK;
-        int token_range = 0;
-        if (!is_residue) {
-            token_range = NUM_OF_TOKENS_PER_CHUNK;
-            if (chunk_id * NUM_OF_TOKENS_PER_CHUNK + token_range > num_of_tokens_per_rank) {
-                token_range = num_of_tokens_per_rank - chunk_id * NUM_OF_TOKENS_PER_CHUNK;
-            }
-        }
+        // Residue chunks carry no tokens; real chunks use the scheduled size (tail = remainder).
+        const int token_range = is_residue ? 0 : coord.chunk_size;
         constexpr int STREAMING_BATCH = HYBRIDEP_COMBINE_RDMA_STREAMING_BATCH;
         // Per-token wire bytes (compile-time): hidden x element width.
         constexpr size_t token_bytes = static_cast<size_t>(HIDDEN_DIM) * nccl_ep::size_u8<kTokenDtype>();
@@ -2830,70 +2940,12 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
             // cumulative_sent tracks total active tokens across all chunks (no reset).
 
             if (INTER_NODE_RDMA_GROUP::thread_rank() == 0) {
-                int batch_start_in_chunk = -1;
-                int batch_count = 0;
-
-                for (int token_idx_in_chunk = 0; token_idx_in_chunk < token_range; ++token_idx_in_chunk) {
-                    bool need_write = rdma_to_attn_map[token_idx_in_chunk + chunk_base_token_idx];
-                    bool is_last = (token_idx_in_chunk == token_range - 1);
-
-                    if (need_write) {
-                        if (batch_count == 0) batch_start_in_chunk = token_idx_in_chunk;
-                        batch_count++;
-                    }
-
-                    bool should_flush = batch_count > 0 && (!need_write || is_last || batch_count >= STREAMING_BATCH);
-
-                    if (should_flush) {
-                        while (*((volatile uint32_t*)smem_buffer_ptr->rdma_streaming_counter) <
-                               (cumulative_sent + batch_count)) {
-                        }
-
-                        int batch_start_token = batch_start_in_chunk + chunk_id * NUM_OF_TOKENS_PER_CHUNK;
-                        size_t token_src_offset =
-                            smem_mr_info_ptr->rdma_intra_node_red_token_offset +
-                            (rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * token_bytes;
-                        size_t token_dst_offset =
-                            smem_mr_info_ptr->combine_rdma_inter_node_group_token_offset +
-                            (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * token_bytes;
-                        net.put(
-                            rail,
-                            node_id,
-                            nccl_internal_window,
-                            token_dst_offset,
-                            nccl_token_window,
-                            token_src_offset,
-                            batch_count * token_bytes,
-                            ncclGin_None{},
-                            ncclGin_None{},
-                            ncclCoopThread());
-
-                        if constexpr (BACKWARD_COMBINE) {
-                            size_t prob_src_offset =
-                                smem_mr_info_ptr->rdma_intra_node_red_prob_offset +
-                                (rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) *
-                                    (experts_per_rank * LSA_TEAM_SIZE) * sizeof(float);
-                            size_t prob_dst_offset = smem_mr_info_ptr->combine_rdma_inter_node_group_prob_offset +
-                                                     (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) *
-                                                         (experts_per_rank * LSA_TEAM_SIZE) * sizeof(float);
-                            net.put(
-                                rail,
-                                node_id,
-                                nccl_internal_window,
-                                prob_dst_offset,
-                                nccl_prob_window,
-                                prob_src_offset,
-                                batch_count * (experts_per_rank * LSA_TEAM_SIZE) * sizeof(float),
-                                ncclGin_None{},
-                                ncclGin_None{},
-                                ncclCoopThread());
-                        }
-
-                        cumulative_sent += batch_count;
-                        batch_count = 0;
-                        batch_start_in_chunk = -1;
-                    }
-                }
+                combine_n2n_put_active_tokens</*STREAMING=*/true, BACKWARD_COMBINE, STREAMING_BATCH,
+                                              MAX_NUM_OF_TOKENS_PER_RANK, token_bytes>(
+                    net, rail, node_id, nccl_token_window, nccl_prob_window, nccl_internal_window, smem_mr_info_ptr,
+                    rdma_to_attn_map, chunk_base_token_idx, chunk_id * NUM_OF_TOKENS_PER_CHUNK, token_range,
+                    rdma_remote_node_id, rank_in_remote, experts_per_rank * LSA_TEAM_SIZE,
+                    (volatile uint32_t*)smem_buffer_ptr->rdma_streaming_counter, cumulative_sent);
             }
 
             // Wait for mbarrier (parity tracking -- reduction warp always arrives)
@@ -2908,25 +2960,15 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
             // Signal remote
             __syncwarp();
             if (INTER_NODE_RDMA_GROUP::thread_rank() == 0) {
-                constexpr int MAX_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
-                unsigned signal_id = signals_base + combine_signal_offset +
-                                     local_rank * (NUM_LSA_TEAMS * MAX_CHUNKS_PER_RANK) +
-                                     node_rank * MAX_CHUNKS_PER_RANK + chunk_id;
-                net.signal(
-                    rail,
-                    node_id,
-                    ncclGin_SignalAdd{signal_id, 1},
-                    ncclCoopThread(),
-                    ncclGin_None{},
-                    cuda::thread_scope_thread,
-                    cuda::thread_scope_thread);
+                combine_n2n_signal_remote<MAX_NUM_OF_TOKENS_PER_RANK, NUM_OF_TOKENS_PER_CHUNK, NUM_LSA_TEAMS>(
+                    net, rail, node_id, local_rank, node_rank, chunk_id, signals_base, combine_signal_offset);
             }
             __syncwarp();
 
             // No consumed handshake needed: cumulative counter never resets.
 
         } else {
-            // ---- FALLBACK PATH (STREAMING_BATCH == 0): original mbarrier-first ----
+            // ---- FALLBACK PATH (STREAMING_BATCH == 0): mbarrier-first, then put ----
             if (!is_residue) {
                 while (!cuda::ptx::mbarrier_try_wait_parity(
                     &intra_node_to_rdma_mbarrier_buffer_ptr
@@ -2937,82 +2979,19 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
 
             if (!is_residue && INTER_NODE_RDMA_GROUP::thread_rank() == 0) {
                 constexpr int max_batch = HYBRIDEP_DISPATCH_RDMA_BATCH_SIZE;
-                int batch_start_in_chunk = -1;
-                int batch_count = 0;
-
-                for (int token_idx_in_chunk = 0; token_idx_in_chunk < token_range; ++token_idx_in_chunk) {
-                    bool need_write = rdma_to_attn_map[token_idx_in_chunk + chunk_base_token_idx];
-                    bool is_last = (token_idx_in_chunk == token_range - 1);
-
-                    if (need_write) {
-                        if (batch_count == 0) batch_start_in_chunk = token_idx_in_chunk;
-                        batch_count++;
-                    }
-
-                    bool should_flush = batch_count > 0 && (!need_write || is_last || batch_count >= max_batch);
-
-                    if (should_flush) {
-                        int batch_start_token = batch_start_in_chunk + chunk_id * NUM_OF_TOKENS_PER_CHUNK;
-                        size_t token_src_offset =
-                            smem_mr_info_ptr->rdma_intra_node_red_token_offset +
-                            (rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * token_bytes;
-                        size_t token_dst_offset =
-                            smem_mr_info_ptr->combine_rdma_inter_node_group_token_offset +
-                            (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * token_bytes;
-                        net.put(
-                            rail,
-                            node_id,
-                            nccl_internal_window,
-                            token_dst_offset,
-                            nccl_token_window,
-                            token_src_offset,
-                            batch_count * token_bytes,
-                            ncclGin_None{},
-                            ncclGin_None{},
-                            ncclCoopThread());
-
-                        if constexpr (BACKWARD_COMBINE) {
-                            size_t prob_src_offset =
-                                smem_mr_info_ptr->rdma_intra_node_red_prob_offset +
-                                (rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) *
-                                    (experts_per_rank * LSA_TEAM_SIZE) * sizeof(float);
-                            size_t prob_dst_offset = smem_mr_info_ptr->combine_rdma_inter_node_group_prob_offset +
-                                                     (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) *
-                                                         (experts_per_rank * LSA_TEAM_SIZE) * sizeof(float);
-                            net.put(
-                                rail,
-                                node_id,
-                                nccl_internal_window,
-                                prob_dst_offset,
-                                nccl_prob_window,
-                                prob_src_offset,
-                                batch_count * (experts_per_rank * LSA_TEAM_SIZE) * sizeof(float),
-                                ncclGin_None{},
-                                ncclGin_None{},
-                                ncclCoopThread());
-                        }
-
-                        batch_count = 0;
-                        batch_start_in_chunk = -1;
-                    }
-                }
+                combine_n2n_put_active_tokens</*STREAMING=*/false, BACKWARD_COMBINE, max_batch,
+                                              MAX_NUM_OF_TOKENS_PER_RANK, token_bytes>(
+                    net, rail, node_id, nccl_token_window, nccl_prob_window, nccl_internal_window, smem_mr_info_ptr,
+                    rdma_to_attn_map, chunk_base_token_idx, chunk_id * NUM_OF_TOKENS_PER_CHUNK, token_range,
+                    rdma_remote_node_id, rank_in_remote, experts_per_rank * LSA_TEAM_SIZE,
+                    nullptr, cumulative_sent);
             }
 
             // Signal remote
             __syncwarp();
             if (INTER_NODE_RDMA_GROUP::thread_rank() == 0) {
-                constexpr int MAX_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
-                unsigned signal_id = signals_base + combine_signal_offset +
-                                     local_rank * (NUM_LSA_TEAMS * MAX_CHUNKS_PER_RANK) +
-                                     node_rank * MAX_CHUNKS_PER_RANK + chunk_id;
-                net.signal(
-                    rail,
-                    node_id,
-                    ncclGin_SignalAdd{signal_id, 1},
-                    ncclCoopThread(),
-                    ncclGin_None{},
-                    cuda::thread_scope_thread,
-                    cuda::thread_scope_thread);
+                combine_n2n_signal_remote<MAX_NUM_OF_TOKENS_PER_RANK, NUM_OF_TOKENS_PER_CHUNK, NUM_LSA_TEAMS>(
+                    net, rail, node_id, local_rank, node_rank, chunk_id, signals_base, combine_signal_offset);
             }
             __syncwarp();
         }

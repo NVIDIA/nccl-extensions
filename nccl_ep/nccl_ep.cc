@@ -1927,7 +1927,7 @@ struct ncclEpHandle {
             // the destination rank's expert buffer. Used by NVLink (intra-node) warps.
             // Value of -1 indicates token is not routed to that rank.
             // dtype: int32_t
-            // layout: [num_nodes * max_dispatch_tokens_per_rank, num_ranks_per_node]
+            // layout: [num_nodes * max_dispatch_tokens_per_rank, lsa_team_size]
             // usage: dispatch S2G warp group, combine G2S warp group
             // lifetime: valid after metadata_preprocessing, constant within iteration
             // vs NCCL HT: no direct equivalent.
@@ -3326,7 +3326,7 @@ ncclResult_t ncclEpDispatch(
         nccl_ep::hybridep::DispatchParams params;
         params.hidden_dim = hidden;
         params.experts_per_rank = group->num_local_experts;
-        params.num_ranks_per_node = group->lsa_team_size;
+        params.lsa_team_size = group->lsa_team_size;
         params.attn_input_token = token_ptr;
         params.attn_input_prob = forward_dispatch ? dense_prob : nullptr;
         params.attn_input_scaling_factor = use_fp8 ? static_cast<const uint8_t*>(scales_ptr) : nullptr;
@@ -3465,7 +3465,7 @@ ncclResult_t ncclEpDispatch(
                 /*grid_barrier_counter=*/params.dispatch_grid_barrier_counter,
                 params.hidden_dim,
                 params.experts_per_rank,
-                params.num_ranks_per_node,
+                params.lsa_team_size,
                 forward_dispatch,
                 params.local_dup_num_sms,
                 stream,
@@ -4070,7 +4070,7 @@ ncclResult_t ncclEpCombine(
         nccl_ep::hybridep::CombineParams params;
         params.hidden_dim = hidden;
         params.experts_per_rank = group->num_local_experts;
-        params.num_ranks_per_node = group->lsa_team_size;
+        params.lsa_team_size = group->lsa_team_size;
         // Use HOST pointer arrays - these get copied into the kernel param struct for fast __grid_constant__ access
         std::vector<uint16_t*> combine_input_token_ptrs;
         if (combine_x_uses_external_window) {
@@ -4160,7 +4160,7 @@ ncclResult_t ncclEpCombine(
                 handle->hybridep.emuf_group_stride,
                 params.hidden_dim,
                 params.experts_per_rank,
-                params.num_ranks_per_node,
+                params.lsa_team_size,
                 backward_combine,
                 static_cast<int>(group->prolog_epilog_sms),
                 stream,

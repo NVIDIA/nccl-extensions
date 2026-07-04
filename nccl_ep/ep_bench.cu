@@ -2591,13 +2591,13 @@ HighThroughputBytes calculateHighThroughputBytes(
     int myRank,
     int nRanks,
     bool use_fp8,
-    int num_ranks_per_node,
+    int lsa_team_size,
     ncclDataType_t token_dtype) {
     HighThroughputBytes bytes = {0, 0, 0, 0, 0, 0, 0, 0};
 
-    int num_nodes = (nRanks + num_ranks_per_node - 1) / num_ranks_per_node;
+    int num_nodes = (nRanks + lsa_team_size - 1) / lsa_team_size;
     unsigned int num_experts_per_node = static_cast<unsigned int>(num_experts / num_nodes);
-    int local_node = myRank / num_ranks_per_node;
+    int local_node = myRank / lsa_team_size;
     unsigned int num_experts_per_rank = num_experts / static_cast<unsigned int>(nRanks);
 
     // Send side: count unique (token, node) pairs from this rank's topk_idx
@@ -2623,7 +2623,7 @@ HighThroughputBytes calculateHighThroughputBytes(
     // Each (src_rank, token) pair is counted once regardless of how many experts on myRank it targets.
     std::vector<int64_t> src_perm(num_experts);
     for (int src_rank = 0; src_rank < nRanks; src_rank++) {
-        int src_node = src_rank / num_ranks_per_node;
+        int src_node = src_rank / lsa_team_size;
         bool is_rdma = (src_node != local_node);
         unsigned int src_tokens = num_tokens_per_rank[src_rank];
 

@@ -60,7 +60,7 @@ inline std::string scan_flat_jit_source(
         << "      p.input_routing_map, p.tmp, p.sparse_to_dense_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"
         << "      reinterpret_cast<hybrid_ep::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
         << "      p.num_of_tokens_for_experts, p.local_expert_routing_map, p.per_expert_token_counts,\n"
-        << "      p.node_rank, p.local_rank, p.num_of_tokens_per_rank, p.num_of_ranks_per_node, p.experts_per_rank,\n"
+        << "      p.node_rank, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank,\n"
         << "      p.recv_total_counter, p.out_is_int64, p.max_recv_tokens_per_rank,\n"
         << "      p.token_to_recv_slot, smem_bytes";
     if (enable_em_permute) {
@@ -91,7 +91,7 @@ scan_em_jit_source(int num_threads_per_block, int num_of_blocks, int num_lsa_tea
         << "      " << lsa_team_size << ">(\n"
         << "      p.input_routing_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"
         << "      reinterpret_cast<hybrid_ep::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
-        << "      p.node_rank, p.local_rank, p.num_of_tokens_per_rank, p.num_of_ranks_per_node, p.experts_per_rank);\n"
+        << "      p.node_rank, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank);\n"
         << "}\n";
     return src.str();
 }
@@ -196,7 +196,7 @@ inline void launch_scan_em(
 constexpr const char* kBuildEmTablesJitEntryName = "nccl_ep_jit_build_em_tables_kernel";
 constexpr int kBuildEmTablesBlockDim = 1024;
 
-inline std::string build_em_tables_jit_source(int experts_per_rank) {
+inline std::string build_em_tables_jit_source(int experts_per_rank, int lsa_team_size) {
     std::ostringstream src;
     src
         << "#include \"device/hybrid_ep.cuh\"\n"
@@ -204,13 +204,14 @@ inline std::string build_em_tables_jit_source(int experts_per_rank) {
         << "extern \"C\" __launch_bounds__(" << kBuildEmTablesBlockDim << ", 1)\n"
         << "__global__ void " << kBuildEmTablesJitEntryName << "(\n"
         << "    const __grid_constant__ hybrid_ep::build_em_tables_param_t p) {\n"
-        << "  hybrid_ep::build_em_tables_impl<" << experts_per_rank << ">(p);\n"
+        << "  hybrid_ep::build_em_tables_impl<" << experts_per_rank << ", " << lsa_team_size << ">(p);\n"
         << "}\n";
     return src.str();
 }
 
 inline void launch_build_em_tables_jit(
     int experts_per_rank,
+    int lsa_team_size,
     ::hybrid_ep::build_em_tables_param_t& param,
     int dynamic_smem_bytes,
     int num_blocks,
@@ -218,10 +219,10 @@ inline void launch_build_em_tables_jit(
     static const int variant_identity = 0;
     const std::string variant_name = [&] {
         std::ostringstream name;
-        name << "build_em_tables_epr" << experts_per_rank;
+        name << "build_em_tables_epr" << experts_per_rank << "_lsa" << lsa_team_size;
         return name.str();
     }();
-    const std::string source = build_em_tables_jit_source(experts_per_rank);
+    const std::string source = build_em_tables_jit_source(experts_per_rank, lsa_team_size);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_build_em_tables";
@@ -229,7 +230,9 @@ inline void launch_build_em_tables_jit(
     variant.source = source;
     variant.entry_name = kBuildEmTablesJitEntryName;
     variant.identity = &variant_identity;
-    variant.runtime_key = static_cast<std::uint64_t>(experts_per_rank);
+    // Variant now depends on both epr and lsa_team_size; key the fast cache on both.
+    variant.runtime_key =
+        (static_cast<std::uint64_t>(experts_per_rank) << 32) | static_cast<std::uint64_t>(lsa_team_size);
     variant.num_blocks = num_blocks;
     variant.block_dim = kBuildEmTablesBlockDim;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;

@@ -382,7 +382,7 @@ ncclResult_t call_metadata_preprocessing(
     int local_rank,
     int num_tokens_per_rank,
     int num_nodes,
-    int num_ranks_per_node,
+    int lsa_team_size,
     int experts_per_rank,
     bool expert_major,
     int64_t* internal_offsets,
@@ -422,18 +422,18 @@ ncclResult_t call_metadata_preprocessing(
         // The EM scan's gscratch is the shared ep_workspace (NUM_WORKSPACE_BYTES).
         // Verify the selected path's requirement fits before using it.
         const size_t gscratch_needed =
-            get_em_scan_gscratch_size(num_ranks_per_node, experts_per_rank, NUM_OF_BLOCKS, em_permute);
+            get_em_scan_gscratch_size(lsa_team_size, experts_per_rank, NUM_OF_BLOCKS, em_permute);
         if (gscratch_needed > NUM_WORKSPACE_BYTES) {
             std::fprintf(stderr,
                          "[nccl_ep] EM scan gscratch (%zu B) exceeds ep_workspace (%zu B) for "
-                         "num_ranks_per_node=%d experts_per_rank=%d num_sms=%d local_permute=%d\n",
-                         gscratch_needed, static_cast<size_t>(NUM_WORKSPACE_BYTES), num_ranks_per_node,
+                         "lsa_team_size=%d experts_per_rank=%d num_sms=%d local_permute=%d\n",
+                         gscratch_needed, static_cast<size_t>(NUM_WORKSPACE_BYTES), lsa_team_size,
                          experts_per_rank, NUM_OF_BLOCKS, static_cast<int>(em_permute));
             return ncclInvalidUsage;
         }
 
         if (em_permute) {
-            const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * num_ranks_per_node * sizeof(::hybrid_ep::tmp_state_t);
+            const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * lsa_team_size * sizeof(::hybrid_ep::tmp_state_t);
             CUDA_CHECK(cudaMemsetAsync(ranks_scan_tmp, 0, preprocessing_tmp_sz, stream));
 
             // The shared gscratch (ep_workspace, fit-checked above) doubles as the
@@ -443,7 +443,7 @@ ncclResult_t call_metadata_preprocessing(
             CUDA_CHECK(cudaMemsetAsync(expert_scan_tmp, 0, gscratch_needed, stream));
 
             // FLAT scan smem (no expert_counts region) + EM-permute smem region.
-            const size_t flat_ints = static_cast<size_t>(num_ranks_per_node) * (2 * NUM_OF_WARPS_PER_BLOCK_SCAN + 1);
+            const size_t flat_ints = static_cast<size_t>(lsa_team_size) * (2 * NUM_OF_WARPS_PER_BLOCK_SCAN + 1);
             const size_t em_ints = static_cast<size_t>(experts_per_rank) * (2 * NUM_OF_WARPS_PER_BLOCK_SCAN + 3);
             const int dynamic_smem_bytes = static_cast<int>((flat_ints + em_ints) * sizeof(int32_t));
 
@@ -461,7 +461,6 @@ ncclResult_t call_metadata_preprocessing(
             sp.node_rank = node_rank;
             sp.local_rank = local_rank;
             sp.num_of_tokens_per_rank = num_tokens_per_rank;
-            sp.num_of_ranks_per_node = num_ranks_per_node;
             sp.experts_per_rank = experts_per_rank;
             sp.recv_total_counter = recv_total_counter;
             sp.out_is_int64 = out_is_int64;
@@ -482,7 +481,7 @@ ncclResult_t call_metadata_preprocessing(
                 NUM_THREADS_PER_BLOCK,
                 NUM_OF_BLOCKS,
                 num_nodes,
-                num_ranks_per_node,
+                lsa_team_size,
                 experts_per_rank,
                 /*enable_per_expert_counts=*/false,
                 /*enable_em_permute=*/true,
@@ -509,21 +508,20 @@ ncclResult_t call_metadata_preprocessing(
             sp.node_rank = node_rank;
             sp.local_rank = local_rank;
             sp.num_of_tokens_per_rank = num_tokens_per_rank;
-            sp.num_of_ranks_per_node = num_ranks_per_node;
             sp.experts_per_rank = experts_per_rank;
 
-            jit::launch_scan_em(NUM_THREADS_PER_BLOCK, NUM_OF_BLOCKS, num_nodes, num_ranks_per_node, sp, stream);
+            jit::launch_scan_em(NUM_THREADS_PER_BLOCK, NUM_OF_BLOCKS, num_nodes, lsa_team_size, sp, stream);
         }
 
-        const int num_mask_words = (num_ranks_per_node + 63) / 64;
-        const int num_total_attn_tokens = num_tokens_per_rank * num_ranks_per_node * num_nodes;
+        const int num_mask_words = (lsa_team_size + 63) / 64;
+        const int num_total_attn_tokens = num_tokens_per_rank * lsa_team_size * num_nodes;
         launch_build_em_tables(
             global_routing_map,
             token_rank_mask,
             num_mask_words,
             num_total_attn_tokens,
             num_tokens_per_rank,
-            num_ranks_per_node,
+            lsa_team_size,
             experts_per_rank,
             num_nodes,
             node_rank,
@@ -563,11 +561,11 @@ ncclResult_t call_metadata_preprocessing(
         CUDA_CHECK(cudaMemsetAsync(per_expert_token_counts, 0, experts_per_rank * sizeof(int32_t), stream));
     }
 
-    const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * num_ranks_per_node * sizeof(::hybrid_ep::tmp_state_t);
+    const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * lsa_team_size * sizeof(::hybrid_ep::tmp_state_t);
     CUDA_CHECK(cudaMemsetAsync(ranks_scan_tmp, 0, preprocessing_tmp_sz, stream));
 
-    const size_t scan_smem_size = (2 * NUM_OF_WARPS_PER_BLOCK_SCAN * num_ranks_per_node * sizeof(int32_t)) +
-                                  (num_ranks_per_node * sizeof(int32_t)) +
+    const size_t scan_smem_size = (2 * NUM_OF_WARPS_PER_BLOCK_SCAN * lsa_team_size * sizeof(int32_t)) +
+                                  (lsa_team_size * sizeof(int32_t)) +
                                   (per_expert_token_counts != nullptr ? experts_per_rank * sizeof(int32_t) : 0);
     const int dynamic_smem_bytes = static_cast<int>(scan_smem_size);
 
@@ -584,7 +582,6 @@ ncclResult_t call_metadata_preprocessing(
     sp.node_rank = node_rank;
     sp.local_rank = local_rank;
     sp.num_of_tokens_per_rank = num_tokens_per_rank;
-    sp.num_of_ranks_per_node = num_ranks_per_node;
     sp.experts_per_rank = experts_per_rank;
     sp.recv_total_counter = recv_total_counter;
     sp.out_is_int64 = out_is_int64;
@@ -595,7 +592,7 @@ ncclResult_t call_metadata_preprocessing(
         NUM_THREADS_PER_BLOCK,
         NUM_OF_BLOCKS,
         num_nodes,
-        num_ranks_per_node,
+        lsa_team_size,
         experts_per_rank,
         per_expert_token_counts != nullptr,
         /*enable_em_permute=*/false,
@@ -615,8 +612,8 @@ ncclResult_t call_metadata_preprocessing(
     return ncclSuccess;
 }
 
-size_t get_preprocessing_scan_tmp_size(int num_blocks, int num_ranks_per_node) {
-    return static_cast<size_t>(num_blocks) * num_ranks_per_node * sizeof(::hybrid_ep::tmp_state_t);
+size_t get_preprocessing_scan_tmp_size(int num_blocks, int lsa_team_size) {
+    return static_cast<size_t>(num_blocks) * lsa_team_size * sizeof(::hybrid_ep::tmp_state_t);
 }
 
 size_t get_rank_mask_elem_size(int lsa_team_size) {
@@ -630,7 +627,7 @@ void launch_build_em_tables(
     int num_mask_words,
     int num_total_attn_tokens,
     int num_tokens_per_rank,
-    int num_ranks_per_node,
+    int lsa_team_size,
     int experts_per_rank,
     int num_lsa_teams,
     int node_rank,
@@ -657,11 +654,11 @@ void launch_build_em_tables(
     int32_t* flat2em_slot_map,
     int em_top_k,
     cudaStream_t stream) {
-    if (num_total_attn_tokens <= 0 || num_ranks_per_node <= 0 || experts_per_rank <= 0) return;
+    if (num_total_attn_tokens <= 0 || lsa_team_size <= 0 || experts_per_rank <= 0) return;
     assert((experts_per_rank & (experts_per_rank - 1)) == 0 && "experts_per_rank must be a power of two");
     assert(num_mask_words >= 1 && num_mask_words <= 2 && "lsa_team_size must be <= 128");
     assert(num_sms > 0 && "launch_build_em_tables requires num_sms > 0");
-    const int n_dle = num_ranks_per_node * experts_per_rank;
+    const int n_dle = lsa_team_size * experts_per_rank;
 
     constexpr int kNumWarps = jit::kBuildEmTablesBlockDim / 32;
     const size_t smem_bytes = static_cast<size_t>(kNumWarps + 1) * n_dle * sizeof(int32_t);
@@ -672,8 +669,6 @@ void launch_build_em_tables(
     p.num_mask_words           = num_mask_words;
     p.num_total_attn_tokens    = num_total_attn_tokens;
     p.num_tokens_per_rank      = num_tokens_per_rank;
-    p.num_ranks_per_node       = num_ranks_per_node;
-    p.experts_per_rank         = experts_per_rank;
     p.num_lsa_teams            = num_lsa_teams;
     p.node_rank                = node_rank;
     p.local_rank               = local_rank;
@@ -701,11 +696,11 @@ void launch_build_em_tables(
     p.flat2em_slot_map         = flat2em_slot_map;
     p.em_top_k                 = em_top_k;
 
-    jit::launch_build_em_tables_jit(experts_per_rank, p, static_cast<int>(smem_bytes),
+    jit::launch_build_em_tables_jit(experts_per_rank, lsa_team_size, p, static_cast<int>(smem_bytes),
                                     num_sms, stream);
 }
 
-size_t get_em_scan_gscratch_size(int num_ranks_per_node, int experts_per_rank, int num_sms, bool is_local_permute) {
+size_t get_em_scan_gscratch_size(int lsa_team_size, int experts_per_rank, int num_sms, bool is_local_permute) {
     assert(num_sms > 0);
     if (is_local_permute) {
         // Fused em-permute scan: per-expert decoupled-scan state
@@ -713,7 +708,7 @@ size_t get_em_scan_gscratch_size(int num_ranks_per_node, int experts_per_rank, i
         return static_cast<size_t>(num_sms) * experts_per_rank * sizeof(::hybrid_ep::tmp_state_t);
     }
     // em_scan_kernel (kLocalDup / nvlink_dup path): block_count[num_sms][nrpn*epr] int32.
-    return static_cast<size_t>(num_sms) * num_ranks_per_node * experts_per_rank * sizeof(int32_t);
+    return static_cast<size_t>(num_sms) * lsa_team_size * experts_per_rank * sizeof(int32_t);
 }
 
 int get_device_max_dynamic_smem() {
@@ -750,7 +745,7 @@ template <typename TOKEN_DATA_TYPE>
     // Model configuration
     kp.hidden_dim = params.hidden_dim;
     kp.experts_per_rank = params.experts_per_rank;
-    kp.num_of_ranks_per_node = params.num_ranks_per_node;
+    kp.num_of_ranks_per_node = params.lsa_team_size;
     // User input buffers
     kp.attn_input_token = reinterpret_cast<const TOKEN_DATA_TYPE*>(params.attn_input_token);
     kp.attn_input_prob = params.attn_input_prob;
@@ -813,9 +808,9 @@ std::vector<uint8_t> build_dispatch_arg_buffer(
 
     const size_t base_size = sizeof(ParamBase);
     const size_t token_offset = base_size;
-    const size_t prob_offset = token_offset + params.num_ranks_per_node * sizeof(TOKEN_DATA_TYPE*);
-    const size_t sf_offset = prob_offset + params.num_ranks_per_node * sizeof(float*);
-    const size_t total_size = sf_offset + params.num_ranks_per_node * sizeof(float*);
+    const size_t prob_offset = token_offset + params.lsa_team_size * sizeof(TOKEN_DATA_TYPE*);
+    const size_t sf_offset = prob_offset + params.lsa_team_size * sizeof(float*);
+    const size_t total_size = sf_offset + params.lsa_team_size * sizeof(float*);
 
     std::vector<uint8_t> arg(total_size);
     std::memcpy(arg.data(), &kp, sizeof(kp));
@@ -823,7 +818,7 @@ std::vector<uint8_t> build_dispatch_arg_buffer(
     auto* token_ptrs = reinterpret_cast<TOKEN_DATA_TYPE**>(arg.data() + token_offset);
     auto* prob_ptrs = reinterpret_cast<float**>(arg.data() + prob_offset);
     auto* sf_ptrs = reinterpret_cast<uint8_t**>(arg.data() + sf_offset);
-    for (int i = 0; i < params.num_ranks_per_node; i++) {
+    for (int i = 0; i < params.lsa_team_size; i++) {
         token_ptrs[i] = reinterpret_cast<TOKEN_DATA_TYPE*>(params.expert_output_token_ptrs[i]);
         prob_ptrs[i] = params.expert_output_prob_ptrs ? params.expert_output_prob_ptrs[i] : nullptr;
         sf_ptrs[i] = params.expert_output_scaling_factor_ptrs ? params.expert_output_scaling_factor_ptrs[i] : nullptr;
@@ -853,7 +848,7 @@ ncclResult_t dispatch_impl(
         using TOKEN_DATA_TYPE = uint16_t;
         // TMA requires prob buffer (experts_per_node * sizeof(float)) to be 16B aligned
         // Check alignment at runtime now that experts_per_rank is dynamic
-        const int experts_per_node = params.experts_per_rank * params.num_ranks_per_node;
+        const int experts_per_node = params.experts_per_rank * params.lsa_team_size;
         assert(
             (experts_per_node * sizeof(float)) % 16 == 0 && "experts_per_node must be multiple of 4 for TMA alignment");
         // 16B cp.async.bulk alignment for the S2D map fetch; matters when s2d_inner_dim < 4.
@@ -915,7 +910,7 @@ ncclResult_t dispatch_impl(
             num_blocks,
             FORWARD_DISPATCH,
             num_nodes,
-            params.num_ranks_per_node,
+            params.lsa_team_size,
             params.layout,
             use_fp8,
             kp.hidden_dim,
@@ -984,7 +979,7 @@ ncclResult_t call_dispatch(
     // Model configuration
     kp.hidden_dim = params.hidden_dim;
     kp.experts_per_rank = params.experts_per_rank;
-    kp.num_of_ranks_per_node = params.num_ranks_per_node;
+    kp.num_of_ranks_per_node = params.lsa_team_size;
     // User output buffers
     kp.attn_output_token = reinterpret_cast<uint16_t*>(params.attn_output_token);
     kp.attn_output_prob = params.attn_output_prob;
@@ -1046,15 +1041,15 @@ std::vector<uint8_t> build_combine_arg_buffer(
 
     const size_t base_size = sizeof(ParamBase);
     const size_t token_offset = base_size;
-    const size_t prob_offset = token_offset + params.num_ranks_per_node * sizeof(uint16_t*);
-    const size_t total_size = prob_offset + params.num_ranks_per_node * sizeof(float*);
+    const size_t prob_offset = token_offset + params.lsa_team_size * sizeof(uint16_t*);
+    const size_t total_size = prob_offset + params.lsa_team_size * sizeof(float*);
 
     std::vector<uint8_t> arg(total_size);
     std::memcpy(arg.data(), &kp, sizeof(kp));
 
     auto* token_ptrs = reinterpret_cast<uint16_t**>(arg.data() + token_offset);
     auto* prob_ptrs = reinterpret_cast<float**>(arg.data() + prob_offset);
-    for (int i = 0; i < params.num_ranks_per_node; i++) {
+    for (int i = 0; i < params.lsa_team_size; i++) {
         token_ptrs[i] = params.expert_input_token_ptrs[i];
         prob_ptrs[i] = params.expert_input_prob_ptrs ? params.expert_input_prob_ptrs[i] : nullptr;
     }
@@ -1073,7 +1068,7 @@ void combine_impl(
     const ncclEpEnvConfig* env,
     cudaStream_t stream) {
     // TMA requires prob buffer (experts_per_node * sizeof(float)) to be 16B aligned
-    const int experts_per_node = params.experts_per_rank * params.num_ranks_per_node;
+    const int experts_per_node = params.experts_per_rank * params.lsa_team_size;
     assert((experts_per_node * sizeof(float)) % 16 == 0 && "experts_per_node must be multiple of 4 for TMA alignment");
 
     auto kp = build_combine_param_base(params);
@@ -1135,7 +1130,7 @@ void combine_impl(
         HYBRIDEP_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
         BACKWARD_COMBINE,
         num_nodes,
-        params.num_ranks_per_node,
+        params.lsa_team_size,
         params.layout,
         kp.hidden_dim,
         env,

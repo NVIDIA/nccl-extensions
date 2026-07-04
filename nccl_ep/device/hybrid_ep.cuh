@@ -158,7 +158,7 @@ struct dispatch_config_t {
     int num_of_blocks;
     bool forward_dispatch;
     bool device_side_sync;
-    int s2d_inner_dim; // flat: num_ranks_per_node, expert-major: num_topk
+    int s2d_inner_dim; // flat: lsa_team_size, expert-major: num_topk
     int num_pipelines;
     int stages_per_pipeline;
     int sf_bytes_per_token; // total scale bytes per token (pre-computed on host)
@@ -355,7 +355,7 @@ struct dispatch_smem_layout_t {
     int sf_buffer_stage_stride; // bytes
     int s2d_map_stage_stride; // bytes (flat: tokens * ranks, expert-major: tokens * topk)
     int pad_tma_slot_bytes; // bytes (= padded hidden_dim * sizeof(token))
-    int s2d_inner_dim; // flat: num_ranks_per_node, expert-major: num_topk
+    int s2d_inner_dim; // flat: lsa_team_size, expert-major: num_topk
     int num_pipelines;
     int stages_per_pipeline;
     dispatch_memory_region_info_t* dispatch_memory_region_info;
@@ -449,7 +449,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     offset += config.num_of_stages * layout.token_buffer_stage_stride;
 
     // Sparse to dense map buffer: S2D_MAP_RING_STAGES ping-pong stages PER PIPELINE (128B aligned)
-    // Inner dim is mode-dependent: flat = num_ranks_per_node, expert-major = num_topk.
+    // Inner dim is mode-dependent: flat = lsa_team_size, expert-major = num_topk.
     layout.s2d_inner_dim = config.s2d_inner_dim;
     layout.s2d_map_stage_stride = config.num_of_tokens_per_chunk * config.s2d_inner_dim * sizeof(int32_t);
     layout.s2d_map_stage_stride = (layout.s2d_map_stage_stride + 127) & ~127;
@@ -537,7 +537,7 @@ static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& confi
     total_size += config.num_of_stages * token_buffer_stage_stride;
 
     // Sparse to dense map buffer: S2D_MAP_RING_STAGES ping-pong stages PER PIPELINE (128B aligned)
-    // Inner dim is mode-dependent: flat = num_ranks_per_node, expert-major = num_topk.
+    // Inner dim is mode-dependent: flat = lsa_team_size, expert-major = num_topk.
     int s2d_map_stage_stride = config.num_of_tokens_per_chunk * config.s2d_inner_dim * sizeof(int32_t);
     s2d_map_stage_stride = (s2d_map_stage_stride + 127) & ~127;
     total_size += S2D_MAP_RING_STAGES * num_pipelines * s2d_map_stage_stride;
@@ -866,7 +866,7 @@ struct dispatch_kernel_param_base_t {
     const bool* rdma_to_attn_map;
     const bool* attn_to_rdma_map;
     const int32_t* sparse_to_dense_map;
-    int s2d_inner_dim; // flat: num_ranks_per_node, expert-major: num_topk
+    int s2d_inner_dim; // flat: lsa_team_size, expert-major: num_topk
     // Expert-major zero-padding inputs for the PAD warp.
     // PAD warp is a no-op when pad_alignment <= 1; pointers may be null then.
     const int32_t* pad_actual_counts; // [experts_per_rank] unpadded token counts
@@ -938,7 +938,7 @@ struct combine_kernel_param_base_t {
     const bool* rdma_to_attn_map;
     const bool* attn_to_rdma_map;
     const int32_t* sparse_to_dense_map;
-    int s2d_inner_dim; // flat: num_ranks_per_node, expert-major: num_topk
+    int s2d_inner_dim; // flat: lsa_team_size, expert-major: num_topk
     // Device-resident expected counters. Initialized at bootstrap; bumped in
     // this kernel's tail so CUDA-graph capture+replay self-sequences.
     uint64_t* expected_rdma_flag_value;

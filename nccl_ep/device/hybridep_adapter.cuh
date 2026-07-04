@@ -141,10 +141,10 @@ ncclResult_t call_metadata_preprocessing(
     int32_t* per_expert_token_counts, // Optional output: per-expert counts (nullptr to skip)
     void* ranks_scan_tmp, // Pre-allocated per-rank scan state (from get_preprocessing_scan_tmp_size)
     int node_rank, // This node's rank (0 to num_nodes-1)
-    int local_rank, // Rank within node (0 to num_ranks_per_node-1)
+    int local_rank, // Rank within node (0 to lsa_team_size-1)
     int num_tokens_per_rank, // Actual tokens per rank this iteration (runtime)
     int num_nodes, // Number of nodes (RDMA domain size)
-    int num_ranks_per_node, // Ranks per node (NVLink domain size)
+    int lsa_team_size, // Ranks per LSA (NVLink) team
     int experts_per_rank, // Experts per GPU
     bool expert_major = false, // true = expert-major layout (gates fused remap)
     int64_t* internal_offsets = nullptr, // Expert-major: per-expert zone offsets consumed by dispatch
@@ -178,7 +178,7 @@ ncclResult_t call_metadata_preprocessing(
 // num_blocks must be >= the block count the scan is launched with (see the
 // preprocessing SM count resolved in ncclEpCreateGroup); size with the device
 // SM count to cover any NCCL_EP_PREPROCESS_NUM_SMS override.
-size_t get_preprocessing_scan_tmp_size(int num_blocks, int num_ranks_per_node);
+size_t get_preprocessing_scan_tmp_size(int num_blocks, int lsa_team_size);
 
 // Returns sizeof(rank_mask_t<ceil(lsa_team_size/64)>) for the given lsa_team_size.
 // Formula: ceil(lsa_team_size / 64) * sizeof(uint64_t).
@@ -194,7 +194,7 @@ void launch_build_em_tables(
     int num_mask_words,
     int num_total_attn_tokens,
     int num_tokens_per_rank,
-    int num_ranks_per_node,
+    int lsa_team_size,
     int experts_per_rank,
     int num_lsa_teams,
     int node_rank,
@@ -224,7 +224,7 @@ void launch_build_em_tables(
     cudaStream_t stream);
 
 // The size of gscratch (ep_workspace) consumed by the EM scan
-size_t get_em_scan_gscratch_size(int num_ranks_per_node, int experts_per_rank, 
+size_t get_em_scan_gscratch_size(int lsa_team_size, int experts_per_rank,
                                  int num_sms, bool is_local_permute);
 
 // Scatter FLAT staging rows into EM zones using flat2em_slot_map (written by
@@ -305,14 +305,14 @@ struct DispatchParams {
     // User inputs
     int hidden_dim; // Model hidden dimension
     int experts_per_rank; // Experts per GPU
-    int num_ranks_per_node; // Ranks per node (NVLink domain size)
+    int lsa_team_size; // Ranks per LSA (NVLink) team
     const void* attn_input_token;
     const float* attn_input_prob; // Forward dispatch only
     const uint8_t* attn_input_scaling_factor; // FP8 only (float* for FP32, uint8_t* for UE8M0)
 
     // IPC-mapped output buffers (from ep_group)
     // Pointer tables are expected to be device-resident (d_* arrays).
-    void* const* expert_output_token_ptrs; // Array[num_ranks_per_node]
+    void* const* expert_output_token_ptrs; // Array[lsa_team_size]
     float* const* expert_output_prob_ptrs; // Forward only
     uint8_t* const* expert_output_scaling_factor_ptrs; // FP8 only
 
@@ -384,8 +384,8 @@ struct CombineParams {
     // These pointers are copied into the kernel param struct for fast __grid_constant__ access.
     int hidden_dim; // Model hidden dimension
     int experts_per_rank; // Experts per GPU
-    int num_ranks_per_node; // Ranks per node (NVLink domain size)
-    uint16_t* const* expert_input_token_ptrs; // HOST array[num_ranks_per_node], BF16 only
+    int lsa_team_size; // Ranks per LSA (NVLink) team
+    uint16_t* const* expert_input_token_ptrs; // HOST array[lsa_team_size], BF16 only
     float* const* expert_input_prob_ptrs; // HOST array, backward only
 
     // User output buffers

@@ -473,10 +473,9 @@ ncclResult_t call_metadata_preprocessing(
             sp.em_top_k = em_top_k;
             sp.em_alignment = static_cast<int>(alignment);
             sp.em_internal_offsets = internal_offsets;
-            sp.em_padded_out_counts_i32 = out_is_int64 ? nullptr : static_cast<int32_t*>(padded_out_counts);
-            sp.em_padded_out_counts_i64 = out_is_int64 ? static_cast<int64_t*>(padded_out_counts) : nullptr;
-            sp.em_out_offsets_i32 = out_is_int64 ? nullptr : static_cast<int32_t*>(out_offsets);
-            sp.em_out_offsets_i64 = out_is_int64 ? static_cast<int64_t*>(out_offsets) : nullptr;
+            // dtype (int32/int64) is a template parameter
+            sp.em_padded_out_counts = padded_out_counts;
+            sp.em_out_offsets = out_offsets;
             sp.em_actual_counts_out = actual_counts_out;
 
             jit::launch_scan_flat(
@@ -487,6 +486,7 @@ ncclResult_t call_metadata_preprocessing(
                 experts_per_rank,
                 /*enable_per_expert_counts=*/false,
                 /*enable_em_permute=*/true,
+                out_is_int64,
                 sp,
                 dynamic_smem_bytes,
                 stream);
@@ -599,6 +599,7 @@ ncclResult_t call_metadata_preprocessing(
         experts_per_rank,
         per_expert_token_counts != nullptr,
         /*enable_em_permute=*/false,
+        out_is_int64,
         sp,
         dynamic_smem_bytes,
         stream);

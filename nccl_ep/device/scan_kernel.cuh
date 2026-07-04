@@ -644,7 +644,8 @@ template <
     int LSA_TEAM_SIZE,
     bool ENABLE_PER_EXPERT_COUNTS,
     bool ENABLE_EM_PERMUTE = false,
-    int MAX_LOCAL_EXPERTS = 0>
+    int MAX_LOCAL_EXPERTS = 0,
+    typename EM_OUT_T = int32_t>  // dtype of em_padded_out_counts / em_out_offsets
 __device__ __forceinline__ void scan_impl_flat(
     const uint8_t* input_routing_map,
     tmp_state_t* tmp,
@@ -671,10 +672,8 @@ __device__ __forceinline__ void scan_impl_flat(
     int em_top_k = 0,
     int em_alignment = 1,
     int64_t* em_internal_offsets = nullptr,
-    int32_t* em_padded_out_counts_i32 = nullptr,
-    int64_t* em_padded_out_counts_i64 = nullptr,
-    int32_t* em_out_offsets_i32 = nullptr,
-    int64_t* em_out_offsets_i64 = nullptr,
+    EM_OUT_T* em_padded_out_counts = nullptr,
+    EM_OUT_T* em_out_offsets = nullptr,
     int32_t* em_actual_counts_out = nullptr) {
     static_assert(
         LSA_TEAM_SIZE <= EM_S2D_MAX_RANKS,
@@ -778,13 +777,8 @@ __device__ __forceinline__ void scan_impl_flat(
                 if (blockIdx.x == 0) {
                     if (em_internal_offsets) em_internal_offsets[k] = cum;
                     if (em_actual_counts_out) em_actual_counts_out[k] = c;
-                    if (out_is_int64) {
-                        if (em_padded_out_counts_i64) em_padded_out_counts_i64[k] = static_cast<int64_t>(padded);
-                        if (em_out_offsets_i64) em_out_offsets_i64[k] = static_cast<int64_t>(cum);
-                    } else {
-                        if (em_padded_out_counts_i32) em_padded_out_counts_i32[k] = padded;
-                        if (em_out_offsets_i32) em_out_offsets_i32[k] = cum;
-                    }
+                    if (em_padded_out_counts) em_padded_out_counts[k] = static_cast<EM_OUT_T>(padded);
+                    if (em_out_offsets) em_out_offsets[k] = static_cast<EM_OUT_T>(cum);
                 }
                 cum += padded;
             }
@@ -964,10 +958,9 @@ struct scan_flat_kernel_param_t {
     int em_top_k;                    // width of flat2em_slot_map inner dim
     int em_alignment;                // per-expert zone padding multiple (>=1)
     int64_t* em_internal_offsets;    // [experts_per_rank + 1] padded zone base + total
-    int32_t* em_padded_out_counts_i32;
-    int64_t* em_padded_out_counts_i64;
-    int32_t* em_out_offsets_i32;
-    int64_t* em_out_offsets_i64;
+    // count and offset datatypes are templated
+    void* em_padded_out_counts;
+    void* em_out_offsets;
     int32_t* em_actual_counts_out;   // [experts_per_rank] unpadded per-expert counts
 };
 

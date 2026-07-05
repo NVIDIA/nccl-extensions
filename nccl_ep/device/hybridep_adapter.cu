@@ -442,10 +442,10 @@ ncclResult_t call_metadata_preprocessing(
             auto* expert_scan_tmp = reinterpret_cast<::hybrid_ep::tmp_state_t*>(scan_gscratch);
             CUDA_CHECK(cudaMemsetAsync(expert_scan_tmp, 0, gscratch_needed, stream));
 
-            // FLAT scan smem (no expert_counts region) + EM-permute smem region.
-            const size_t flat_ints = static_cast<size_t>(lsa_team_size) * (2 * NUM_OF_WARPS_PER_BLOCK_SCAN + 1);
-            const size_t em_ints = static_cast<size_t>(experts_per_rank) * (2 * NUM_OF_WARPS_PER_BLOCK_SCAN + 3);
-            const int dynamic_smem_bytes = static_cast<int>((flat_ints + em_ints) * sizeof(int32_t));
+            // Rank region + EM-permute region; sized by the single scan_flat_smem_t layout.
+            const int dynamic_smem_bytes = static_cast<int>(::hybrid_ep::scan_flat_smem_t::byte_size(
+                NUM_OF_WARPS_PER_BLOCK_SCAN, lsa_team_size, experts_per_rank,
+                /*has_expert_counts=*/false, /*has_em_permute=*/true));
 
             ::hybrid_ep::scan_flat_kernel_param_t sp{};
             sp.input_routing_map = global_routing_map;
@@ -564,10 +564,10 @@ ncclResult_t call_metadata_preprocessing(
     const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * lsa_team_size * sizeof(::hybrid_ep::tmp_state_t);
     CUDA_CHECK(cudaMemsetAsync(ranks_scan_tmp, 0, preprocessing_tmp_sz, stream));
 
-    const size_t scan_smem_size = (2 * NUM_OF_WARPS_PER_BLOCK_SCAN * lsa_team_size * sizeof(int32_t)) +
-                                  (lsa_team_size * sizeof(int32_t)) +
-                                  (per_expert_token_counts != nullptr ? experts_per_rank * sizeof(int32_t) : 0);
-    const int dynamic_smem_bytes = static_cast<int>(scan_smem_size);
+    // Rank region (+ optional per-expert counts); sized by the single scan_flat_smem_t layout.
+    const int dynamic_smem_bytes = static_cast<int>(::hybrid_ep::scan_flat_smem_t::byte_size(
+        NUM_OF_WARPS_PER_BLOCK_SCAN, lsa_team_size, experts_per_rank,
+        /*has_expert_counts=*/per_expert_token_counts != nullptr, /*has_em_permute=*/false));
 
     ::hybrid_ep::scan_flat_kernel_param_t sp;
     sp.input_routing_map = global_routing_map;

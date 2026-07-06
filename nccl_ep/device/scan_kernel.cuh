@@ -155,55 +155,65 @@ bitmap_row_to_rank_mask(const uint8_t* bitmap_row, int experts_per_rank) {
     return rank_mask;
 }
 
+// Scans the range of assigned tokens (defined by the scan geometry)
+// * Typically each thread gets at most one token (512 threads/block x 16 blocks is 8K threads)
+// Logic for each token:
+// * Calculate `token_rank_mask` indicating which rank from local LSA team receives this token
+// * Mark all tokens that are sent from ranks having the same local rank as the caller
+//   * This is required to understand what to expect from RDMA rail-partners
+// * Accumulate `rank_sums` for each local rank in LSA team (rank-scan prefix sum)
+// * When `smem` is provided (FLAT rank-scan path), perform warp-reduce of the
+//   per-thread rank_sums
 template <int LSA_TEAM_SIZE, int NUM_MASK_WORDS>
-__device__ __forceinline__ void tally_ranks(
+__device__ __forceinline__ void extract_lsa_ranks_meta(
     const uint8_t* input_routing_map,
     rank_mask_t<NUM_MASK_WORDS>* token_rank_mask,
     bool* rdma_to_attn_map,
-    int32_t* rank_sums,
     const scan_geometry_t& g,
-    int num_of_tokens_per_rank,
+    int tokens_per_rank,
     int experts_per_rank,
-    int node_rank,
-    int local_rank) {
+    int lsa_team_id,
+    int local_rank,
+    scan_flat_smem_t* smem = nullptr) {
+    int32_t rank_sums[LSA_TEAM_SIZE];
 #pragma unroll
     for (int i = 0; i < LSA_TEAM_SIZE; i++) rank_sums[i] = 0;
 
     for (int i = 0; i < g.num_of_tokens_per_thread; i++) {
-        int current_token_id = g.thread_starting_token + i * WARP_SIZE;
-        if (current_token_id >= g.num_of_total_attn_tokens) break;
+        int token_id = g.thread_starting_token + i * WARP_SIZE;
+        if (token_id >= g.num_of_total_attn_tokens) break;
 
-        int current_token_node_rank = current_token_id / (num_of_tokens_per_rank * LSA_TEAM_SIZE);
-        int current_token_local_rank =
-            (current_token_id % (num_of_tokens_per_rank * LSA_TEAM_SIZE)) / num_of_tokens_per_rank;
-        int current_token_local_id = current_token_id % num_of_tokens_per_rank;
-        int rdma_map_id = current_token_node_rank * g.rdma_to_attn_map_size_per_node + current_token_local_id;
+        const int TOKENS_PER_LSA_TEAM = tokens_per_rank * LSA_TEAM_SIZE;
+        int src_lsa_team = token_id / TOKENS_PER_LSA_TEAM;
+        int src_local_rank = (token_id % TOKENS_PER_LSA_TEAM) / tokens_per_rank;
+        int src_token_id = token_id % tokens_per_rank;
+        int rdma_map_id = src_lsa_team * g.rdma_to_attn_map_size_per_node + src_token_id;
 
         const uint8_t* bitmap_row =
-            input_routing_map + current_token_id * g.packed_row_bytes + node_rank * g.experts_per_node_packed;
+            input_routing_map + token_id * g.packed_row_bytes + lsa_team_id * g.experts_per_node_packed;
         rank_mask_t<NUM_MASK_WORDS> rank_mask =
             bitmap_row_to_rank_mask<NUM_MASK_WORDS, LSA_TEAM_SIZE>(bitmap_row, experts_per_rank);
 
+        // Accumulate unconditionally; discarded by callers that pass no smem.
 #pragma unroll
         for (int j = 0; j < LSA_TEAM_SIZE; j++) {
             rank_sums[j] += rank_mask.test(j);
         }
-        token_rank_mask[current_token_id] = rank_mask;
+        token_rank_mask[token_id] = rank_mask;
 
-        if (current_token_local_rank == local_rank) {
+        if (src_local_rank == local_rank) {
             rdma_to_attn_map[rdma_map_id] = rank_mask.any();
         }
     }
-}
 
-template <int LSA_TEAM_SIZE>
-__device__ __forceinline__ void
-reduce_warp_tally(const int32_t* rank_sums, scan_flat_smem_t& smem, int warp_id, int lane_id) {
+    // Reduce the per-thread local rank counts to warp-level sums (FLAT path only).
+    if (smem != nullptr) {
 #pragma unroll
-    for (int rank = 0; rank < LSA_TEAM_SIZE; rank++) {
-        int32_t rank_sum = __reduce_add_sync(~0u, rank_sums[rank]);
-        if (lane_id == 0) {
-            smem.warp_rank_sums[warp_id * LSA_TEAM_SIZE + rank] = rank_sum;
+        for (int rank = 0; rank < LSA_TEAM_SIZE; rank++) {
+            int32_t rank_sum = __reduce_add_sync(~0u, rank_sums[rank]);
+            if (g.lane_id == 0) {
+                smem->warp_rank_sums[g.warp_id * LSA_TEAM_SIZE + rank] = rank_sum;
+            }
         }
     }
 }
@@ -562,37 +572,39 @@ compute_scan_geometry(int num_of_tokens_per_rank, int experts_per_rank) {
 // Gated at the scan_impl_flat call sites by `if constexpr (ENABLE_EM_PERMUTE)`.
 // ---------------------------------------------------------------------------
 
-// Per-local-expert tally over all global attn tokens (mirror of tally_ranks but
-// counting how many tokens set each local-rank expert bit). Writes per-warp
-// sums to smem. Counts the exact set that lands in the EM buffer: tokens whose
-// (local_rank, k) bit is set (which implies routing to the local rank).
+// Scans the range of assigned tokens (defined by the scan geometry)
+// * Typically each thread gets at most one token (512 threads/block x 16 blocks is 8K threads)
+// Logic for each token:
+// * Calculate per-local-expert `expert_sums` indicating how many tokens each local expert receives
+// * Warp-reduces `expert_sums` into `smem.expert_warp_sums`
 template <int EXPERTS_PER_RANK>
-__device__ __forceinline__ void tally_local_experts(
+__device__ __forceinline__ void extract_local_experts_meta(
     const uint8_t* input_routing_map,
     scan_flat_smem_t& smem,
     const scan_geometry_t& g,
-    int node_rank,
+    int lsa_team_id,
     int local_rank) {
-    int32_t counts[EXPERTS_PER_RANK];
+    int32_t expert_sums[EXPERTS_PER_RANK];
 #pragma unroll
-    for (int k = 0; k < EXPERTS_PER_RANK; k++) counts[k] = 0;
+    for (int k = 0; k < EXPERTS_PER_RANK; k++) expert_sums[k] = 0;
 
     const int local_expert_bit_base = local_rank * EXPERTS_PER_RANK;
     for (int i = 0; i < g.num_of_tokens_per_thread; i++) {
         const int tok = g.thread_starting_token + i * WARP_SIZE;
         if (tok >= g.num_of_total_attn_tokens) break;
         const uint8_t* row =
-            input_routing_map + static_cast<size_t>(tok) * g.packed_row_bytes + node_rank * g.experts_per_node_packed;
+            input_routing_map + static_cast<size_t>(tok) * g.packed_row_bytes +
+            lsa_team_id * g.experts_per_node_packed;
 #pragma unroll
         for (int k = 0; k < EXPERTS_PER_RANK; k++) {
             const int bit = local_expert_bit_base + k;
-            if ((row[bit >> 3] >> (bit & 7)) & 1u) counts[k]++;
+            if ((row[bit >> 3] >> (bit & 7)) & 1u) expert_sums[k]++;
         }
     }
-    // All lanes converge here (loop exit); reduce lane counts per expert.
+    // All lanes converge here (loop exit); reduce per-lane sums per expert.
 #pragma unroll
     for (int k = 0; k < EXPERTS_PER_RANK; k++) {
-        const int32_t s = __reduce_add_sync(~0u, counts[k]);
+        const int32_t s = __reduce_add_sync(~0u, expert_sums[k]);
         if (g.lane_id == 0) smem.expert_warp_sums[g.warp_id * EXPERTS_PER_RANK + k] = s;
     }
 }
@@ -716,23 +728,22 @@ __device__ __forceinline__ void scan_impl_flat(
     }
 
     // Phase 1: rank tally (+ per-local-expert tally when EM-permute is enabled).
-    int32_t token_routing_map_sum[LSA_TEAM_SIZE];
-    tally_ranks<LSA_TEAM_SIZE, NUM_MASK_WORDS>(
+    // Passing &smem drives the warp-reduce of rank counts into smem.warp_rank_sums.
+    extract_lsa_ranks_meta<LSA_TEAM_SIZE, NUM_MASK_WORDS>(
         input_routing_map,
         token_rank_mask,
         rdma_to_attn_map,
-        token_routing_map_sum,
         g,
         num_of_tokens_per_rank,
         experts_per_rank,
         node_rank,
-        local_rank);
+        local_rank,
+        &smem);
 
     if constexpr (ENABLE_EM_PERMUTE) {
-        tally_local_experts<EXPERTS_PER_RANK>(input_routing_map, smem, g, node_rank, local_rank);
+        extract_local_experts_meta<EXPERTS_PER_RANK>(input_routing_map, smem, g, node_rank, local_rank);
     }
 
-    reduce_warp_tally<LSA_TEAM_SIZE>(token_routing_map_sum, smem, g.warp_id, g.lane_id);
     __syncthreads();
 
     // Cross-block prefixes: ranks (predecessor-only) + experts (predecessor +
@@ -843,7 +854,7 @@ __device__ __forceinline__ void scan_impl_flat(
 
 // EM-layout pre-scan: produces only what em_scan_kernel (see hybridep_adapter.cu)
 // and the rest of the EM pipeline still need from the global routing bitmap --
-// the per-token rank mask, rdma_to_attn_map (filled by tally_ranks), and
+// the per-token rank mask, rdma_to_attn_map (filled by extract_lsa_ranks_meta), and
 // attn_to_rdma_map. The FLAT-only prefix scan / sparse_to_dense / per-expert
 // counts are skipped entirely.
 template <int NUM_THREADS_PER_BLOCK, int NUM_OF_BLOCKS, int NUM_LSA_TEAMS, int LSA_TEAM_SIZE>
@@ -868,18 +879,17 @@ __device__ __forceinline__ void scan_impl_em(
         num_of_tokens_per_rank,
         experts_per_rank);
 
-    int32_t token_routing_map_sum[LSA_TEAM_SIZE];
-    tally_ranks<LSA_TEAM_SIZE, NUM_MASK_WORDS>(
+    // EM pre-pass: no smem argument -> rank sums are skipped; only token_rank_mask
+    // and rdma_to_attn_map are produced.
+    extract_lsa_ranks_meta<LSA_TEAM_SIZE, NUM_MASK_WORDS>(
         input_routing_map,
         token_rank_mask,
         rdma_to_attn_map,
-        token_routing_map_sum,
         g,
         num_of_tokens_per_rank,
         experts_per_rank,
         node_rank,
         local_rank);
-    (void)token_routing_map_sum;
 
     fill_attn_to_rdma<NUM_LSA_TEAMS, NUM_THREADS_PER_BLOCK, NUM_OF_BLOCKS, LSA_TEAM_SIZE>(
         input_routing_map,

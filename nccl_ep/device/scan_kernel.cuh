@@ -286,31 +286,26 @@ template <bool ENABLE_PER_EXPERT_COUNTS, bool ENABLE_EM_PERMUTE = false>
 __device__ __forceinline__ void write_local_routing(
     const uint8_t* input_routing_map,
     bool* local_expert_routing_map,
-    int32_t* block_expert_token_counts,
+    scan_flat_smem_t& smem,
+    const scan_geometry_t& g,
     int current_token_id,
     int token_out_of_bound,
     bool token_needed_by_local_rank,
     int32_t local_rank_slot,
-    int packed_row_bytes,
-    int experts_per_node_packed,
     int node_rank,
     int local_rank,
     int experts_per_rank,
-    int lane_id,
     bool expert_major,
     // EM-permute related params
     int32_t* flat2em_slot_map = nullptr,
-    const int32_t* expert_base = nullptr,
-    int32_t* warp_expert_prefix = nullptr,
-    int em_top_k = 0,
-    int warp_id = 0) {
+    int em_top_k = 0) {
     bool lane_participates = (token_out_of_bound == 0) && token_needed_by_local_rank;
     const uint8_t* local_rank_bitmap_row = nullptr;
     bool* local_expert_routing_map_store_base_addr = nullptr;
 
     if (lane_participates) {
         local_rank_bitmap_row =
-            input_routing_map + current_token_id * packed_row_bytes + node_rank * experts_per_node_packed;
+            input_routing_map + current_token_id * g.packed_row_bytes + node_rank * g.experts_per_node_packed;
         if (!expert_major) {
             local_expert_routing_map_store_base_addr = local_expert_routing_map + local_rank_slot * experts_per_rank;
         }
@@ -329,29 +324,35 @@ __device__ __forceinline__ void write_local_routing(
         }
 
         if constexpr (ENABLE_EM_PERMUTE) {
-            // Tile-wide exclusive scan of hits for expert k, offset by the
-            // per-warp running prefix and the expert's padded zone base.
+            // Each thread is processing a unique token (assigned to it by the scan geometry)
+            // 1. If thread's current token is routed to the local expert k, 
+            //    the ballot_sync establishes its sequential number across all warp threads
+            //    routing their tokens to the same local expert
+            // 2. `em_k` is used to track the number of local-expert hits emitted for this lane's token
+            // 3. `pref_k` is initialized by `init_warp_expert_prefixes()` to it's initial offset
+            //    and is advanced every iteration by the number of local-expert hits observed
+            //    cumulatively by all warp's lanes: `__popc(expert_mask)`
             const unsigned expert_mask = __ballot_sync(~0u, routed_to_expert);
-            const int pref_k = warp_expert_prefix[warp_id * experts_per_rank + k];  // read before update
+            const int pref_k = smem.warp_expert_prefix[g.warp_id * experts_per_rank + k];  // read before update
             if (routed_to_expert) {
-                const int within = __popc(expert_mask & ((1u << lane_id) - 1u));
-                const int em_slot = expert_base[k] + pref_k + within;
+                const int within = __popc(expert_mask & ((1u << g.lane_id) - 1u));
+                const int em_slot = smem.expert_base[k] + pref_k + within;
                 if (em_k < em_top_k) {
                     flat2em_slot_map[static_cast<size_t>(local_rank_slot) * em_top_k + em_k] = em_slot;
                 }
                 em_k++;
             }
             __syncwarp();  // all lanes read pref_k before lane 0 overwrites it
-            if (lane_id == 0) {
-                warp_expert_prefix[warp_id * experts_per_rank + k] = pref_k + __popc(expert_mask);
+            if (g.lane_id == 0) {
+                smem.warp_expert_prefix[g.warp_id * experts_per_rank + k] = pref_k + __popc(expert_mask);
             }
             __syncwarp();  // publish update before the next tile re-reads this slot
         } else if constexpr (ENABLE_PER_EXPERT_COUNTS) {
             unsigned expert_mask = __ballot_sync(~0u, routed_to_expert);
-            if (lane_id == 0) {
+            if (g.lane_id == 0) {
                 int warp_expert_count = __popc(expert_mask);
                 if (warp_expert_count > 0) {
-                    atomicAdd(block_expert_token_counts + k, warp_expert_count);
+                    atomicAdd(smem.expert_counts + k, warp_expert_count);
                 }
             }
         }
@@ -378,7 +379,7 @@ __device__ __forceinline__ void assign_recv_slots(
     void* recv_total_counter,
     scan_flat_smem_t& smem,
     const scan_geometry_t& g,
-    int num_of_tokens_per_rank,
+    int tokens_per_rank,
     int experts_per_rank,
     int node_rank,
     int local_rank,
@@ -397,14 +398,15 @@ __device__ __forceinline__ void assign_recv_slots(
         if (current_token_id >= g.num_of_total_attn_tokens) token_out_of_bound = 1;
         if (__all_sync(~0u, token_out_of_bound) != 0) break;
 
-        int current_token_node_rank = current_token_id / (num_of_tokens_per_rank * LSA_TEAM_SIZE);
-        int current_token_local_rank =
-            (current_token_id % (num_of_tokens_per_rank * LSA_TEAM_SIZE)) / num_of_tokens_per_rank;
-        int current_token_local_id = current_token_id % num_of_tokens_per_rank;
+        const int TOKENS_PER_LSA_TEAM = tokens_per_rank * LSA_TEAM_SIZE;
+        int src_lsa_team = current_token_id / TOKENS_PER_LSA_TEAM;
+        int src_local_rank = (current_token_id % TOKENS_PER_LSA_TEAM) / tokens_per_rank;
+        int src_token_id = current_token_id % tokens_per_rank;
 
         rank_mask_t<NUM_MASK_WORDS> rank_mask;
         rank_mask.clear();
-        if (token_out_of_bound == 0) rank_mask = token_rank_mask[current_token_id];
+        if (token_out_of_bound == 0)
+            rank_mask = token_rank_mask[current_token_id];
 
         bool token_needed_by_local_rank = false;
         int32_t local_rank_slot = -1;
@@ -431,10 +433,10 @@ __device__ __forceinline__ void assign_recv_slots(
                 int32_t final_ex_scan = token_needed_by_this_rank ? previous_token_sum[j] + temp_scan : -1;
                 previous_token_sum[j] += temp_sum;
 
-                if (!expert_major && token_out_of_bound == 0 && current_token_local_rank == local_rank &&
+                if (!expert_major && token_out_of_bound == 0 && src_local_rank == local_rank &&
                     rank < LSA_TEAM_SIZE) {
                     sparse_to_dense_map
-                        [(current_token_node_rank * num_of_tokens_per_rank + current_token_local_id) *
+                        [(src_lsa_team * tokens_per_rank + src_token_id) *
                              LSA_TEAM_SIZE +
                          rank] = final_ex_scan;
                 }
@@ -458,28 +460,25 @@ __device__ __forceinline__ void assign_recv_slots(
         write_local_routing<ENABLE_PER_EXPERT_COUNTS, ENABLE_EM_PERMUTE>(
             input_routing_map,
             local_expert_routing_map,
-            smem.expert_counts,
+            smem,
+            g,
             current_token_id,
             token_out_of_bound,
             token_needed_by_local_rank,
             local_rank_slot,
-            g.packed_row_bytes,
-            g.experts_per_node_packed,
             node_rank,
             local_rank,
             experts_per_rank,
-            g.lane_id,
             expert_major,
             flat2em_slot_map,
-            smem.expert_base,
-            smem.warp_expert_prefix,
-            em_top_k,
-            g.warp_id);
+            em_top_k);
+
         // EM-permute updates warp_expert_prefix in smem; keep the warp converged
         // before the next tile re-reads it.
-        if constexpr (ENABLE_EM_PERMUTE) __syncwarp();
+        if constexpr (ENABLE_EM_PERMUTE)
+            __syncwarp();
 
-    // em-permute: persist per-global-token recv slot (-1 = no local-rank hit).
+        // em-permute: persist per-global-token recv slot (-1 = no local-rank hit).
         if (token_to_recv_slot != nullptr && token_out_of_bound == 0) {
             token_to_recv_slot[current_token_id] = token_needed_by_local_rank ? local_rank_slot : -1;
         }

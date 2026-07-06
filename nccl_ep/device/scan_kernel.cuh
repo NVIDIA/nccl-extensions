@@ -218,9 +218,13 @@ __device__ __forceinline__ void extract_lsa_ranks_meta(
     }
 }
 
+
+// Inter-block prefix scan for ranks
 template <int NUM_THREADS_PER_BLOCK, int NUM_OF_WARPS_PER_BLOCK, int LSA_TEAM_SIZE>
 __device__ __forceinline__ void
-cross_block_prefix_scan(scan_flat_smem_t& smem, tmp_state_t* tmp, int block_id) {
+cross_block_prefix_scan_ranks(scan_flat_smem_t& smem, tmp_state_t* tmp, int block_id) {
+
+    // Publish per-rank block sums using `PRIV_SUM` as an atomic signal for other blocks
     for (int i = threadIdx.x; i < LSA_TEAM_SIZE; i += NUM_THREADS_PER_BLOCK) {
         int32_t rank_acc = 0;
 #pragma unroll
@@ -233,6 +237,10 @@ cross_block_prefix_scan(scan_flat_smem_t& smem, tmp_state_t* tmp, int block_id) 
         nccl_ep::st_relaxed_gpu_global(reinterpret_cast<uint64_t*>(&tmp[block_id * LSA_TEAM_SIZE + i]), data);
     }
 
+    // Traverse LSA team ranks (assigned to threads). For each rank, scan through all blocks
+    // and accumulate the per-rank block sums.
+    //   * wait on the `PRIV_SUM` signal to ensure block arrival
+    //   * Calculate the per-rank block prefix by adding the accumulated block sums
     for (int i = threadIdx.x; i < LSA_TEAM_SIZE; i += NUM_THREADS_PER_BLOCK) {
         int32_t previous_block_sum_for_current_rank = 0;
         for (int j = 0; j < block_id; j++) {
@@ -381,6 +389,8 @@ __device__ __forceinline__ void assign_recv_slots(
     // EM-permute outputs (ENABLE_EM_PERMUTE only)
     int32_t* flat2em_slot_map = nullptr,
     int em_top_k = 0) {
+
+    // Scan the range of assigned tokens (defined by the scan geometry)
     for (int i = 0; i < g.num_of_tokens_per_thread; i++) {
         int current_token_id = g.thread_starting_token + i * WARP_SIZE;
         int token_out_of_bound = 0;
@@ -609,16 +619,14 @@ __device__ __forceinline__ void extract_local_experts_meta(
     }
 }
 
-// Publish per-expert block sums, then derive (a) predecessor prefix for this
-// block and (b) the grand total across ALL blocks (needed for padded zone
-// bases). Uses the same decoupled tmp_state_t polling as the rank scan, so no
-// cooperative launch is required -- every block waits for every block to post.
 template <int NUM_THREADS_PER_BLOCK, int NUM_OF_WARPS_PER_BLOCK, int NUM_OF_BLOCKS>
-__device__ __forceinline__ void em_expert_cross_block(
+__device__ __forceinline__ void cross_block_prefix_scan_experts(
     scan_flat_smem_t& smem,
     tmp_state_t* expert_scan_tmp,
     int experts_per_rank,
     int block_id) {
+
+    // Publish per-expert block sums using `PRIV_SUM` as an atomic signal for other blocks
     for (int e = threadIdx.x; e < experts_per_rank; e += NUM_THREADS_PER_BLOCK) {
         int32_t acc = 0;
 #pragma unroll
@@ -629,6 +637,11 @@ __device__ __forceinline__ void em_expert_cross_block(
             reinterpret_cast<uint64_t*>(&expert_scan_tmp[block_id * experts_per_rank + e]), bits);
     }
 
+    // Traverse local rank's experts (assigned to threads). For each local expert, scan through all blocks
+    // and accumulate the per-expert block sums.
+    //   * wait on the `PRIV_SUM` signal to ensure block arrival
+    //   * Calculate the per-expert block prefix by adding the accumulated block sums
+    //   * Calculate the grand total across ALL blocks by summing the accumulated block sums
     for (int e = threadIdx.x; e < experts_per_rank; e += NUM_THREADS_PER_BLOCK) {
         int32_t prefix = 0;
         int32_t total = 0;
@@ -644,6 +657,76 @@ __device__ __forceinline__ void em_expert_cross_block(
         }
         smem.expert_block_prefix[e] = prefix;
         smem.expert_total[e] = total;
+    }
+}
+
+// Thread 0 turns the per-expert cross-block grand totals (smem.expert_total)
+// into padded per-expert zone bases (smem.expert_base, computed by every block),
+// and block 0 additionally publishes the global EM count/offset tensors
+// (internal offsets, padded/actual counts, out offsets, and the optional padded
+// recv_total_counter). Traps if the padded EM total exceeds the recv budget.
+template <typename EM_OUT_T>
+__device__ __forceinline__ void em_populate_cnt_tensors(
+    scan_flat_smem_t& smem,
+    int experts_per_rank,
+    int em_alignment,
+    int64_t* em_internal_offsets,
+    EM_OUT_T* em_padded_out_counts,
+    EM_OUT_T* em_out_offsets,
+    int32_t* em_actual_counts_out,
+    void* recv_total_counter,
+    bool out_is_int64,
+    int max_recv_tokens_per_rank) {
+    if (threadIdx.x == 0) {
+        const int align = (em_alignment > 1) ? em_alignment : 1;
+        int cum = 0;
+        for (int k = 0; k < experts_per_rank; k++) {
+            const int c = smem.expert_total[k];
+            smem.expert_base[k] = cum;
+            const int padded = (align > 1 && c > 0) ? ((c + align - 1) / align) * align : c;
+            if (blockIdx.x == 0) {
+                if (em_internal_offsets) em_internal_offsets[k] = cum;
+                if (em_actual_counts_out) em_actual_counts_out[k] = c;
+                if (em_padded_out_counts) em_padded_out_counts[k] = static_cast<EM_OUT_T>(padded);
+                if (em_out_offsets) em_out_offsets[k] = static_cast<EM_OUT_T>(cum);
+            }
+            cum += padded;
+        }
+        if (blockIdx.x == 0) {
+            if (em_internal_offsets) em_internal_offsets[experts_per_rank] = cum;
+            // EM user-visible recv-token count is the padded total (matches
+            // getNumRecvTokens). num_of_tokens_for_experts stays the unpadded
+            // FLAT count (the permute/dispatch path relies on it); only the
+            // optional user recv_total_counter reports the padded total, and
+            // the FLAT branch of assign_recv_slots is suppressed for it.
+            if (recv_total_counter) {
+                if (out_is_int64) {
+                    *static_cast<int64_t*>(recv_total_counter) = static_cast<int64_t>(cum);
+                } else {
+                    *static_cast<int32_t*>(recv_total_counter) = cum;
+                }
+            }
+        }
+        if (cum > max_recv_tokens_per_rank) {
+            printf("scan_impl_flat(em): padded EM slots %d > max_recv_tokens_per_rank %d\n", cum,
+                   max_recv_tokens_per_rank);
+            __trap();
+        }
+    }
+}
+
+// EM-permute counterpart of init_warp_rank_prefixes: seed each warp's per-expert
+// prefix with the block predecessor prefix plus the sums of earlier warps.
+template <int NUM_OF_WARPS_PER_BLOCK>
+__device__ __forceinline__ void init_warp_expert_prefixes(scan_flat_smem_t& smem, int experts_per_rank) {
+    if (threadIdx.x < experts_per_rank) {
+        const int e = threadIdx.x;
+        int32_t prefix = smem.expert_block_prefix[e];
+#pragma unroll
+        for (int w = 0; w < NUM_OF_WARPS_PER_BLOCK; w++) {
+            smem.warp_expert_prefix[w * experts_per_rank + e] = prefix;
+            prefix += smem.expert_warp_sums[w * experts_per_rank + e];
+        }
     }
 }
 
@@ -748,12 +831,12 @@ __device__ __forceinline__ void scan_impl_flat(
 
     // Cross-block prefixes: ranks (predecessor-only) + experts (predecessor +
     // grand total for padded bases, EM-permute only).
-    cross_block_prefix_scan<NUM_THREADS_PER_BLOCK, NUM_OF_WARPS_PER_BLOCK, LSA_TEAM_SIZE>(
+    cross_block_prefix_scan_ranks<NUM_THREADS_PER_BLOCK, NUM_OF_WARPS_PER_BLOCK, LSA_TEAM_SIZE>(
         smem,
         tmp,
         blockIdx.x);
     if constexpr (ENABLE_EM_PERMUTE) {
-        em_expert_cross_block<NUM_THREADS_PER_BLOCK, NUM_OF_WARPS_PER_BLOCK, NUM_OF_BLOCKS>(
+        cross_block_prefix_scan_experts<NUM_THREADS_PER_BLOCK, NUM_OF_WARPS_PER_BLOCK, NUM_OF_BLOCKS>(
             smem, expert_scan_tmp, experts_per_rank, blockIdx.x);
     }
     __syncthreads();
@@ -763,53 +846,20 @@ __device__ __forceinline__ void scan_impl_flat(
     if constexpr (ENABLE_EM_PERMUTE) {
         // Padded per-expert zone bases from grand totals; block 0 publishes the
         // global EM offset arrays. Every block computes expert_base locally.
-        if (threadIdx.x == 0) {
-            const int align = (em_alignment > 1) ? em_alignment : 1;
-            int cum = 0;
-            for (int k = 0; k < experts_per_rank; k++) {
-                const int c = smem.expert_total[k];
-                smem.expert_base[k] = cum;
-                const int padded = (align > 1 && c > 0) ? ((c + align - 1) / align) * align : c;
-                if (blockIdx.x == 0) {
-                    if (em_internal_offsets) em_internal_offsets[k] = cum;
-                    if (em_actual_counts_out) em_actual_counts_out[k] = c;
-                    if (em_padded_out_counts) em_padded_out_counts[k] = static_cast<EM_OUT_T>(padded);
-                    if (em_out_offsets) em_out_offsets[k] = static_cast<EM_OUT_T>(cum);
-                }
-                cum += padded;
-            }
-            if (blockIdx.x == 0) {
-                if (em_internal_offsets) em_internal_offsets[experts_per_rank] = cum;
-                // EM user-visible recv-token count is the padded total (matches
-                // getNumRecvTokens). num_of_tokens_for_experts stays the unpadded
-                // FLAT count (the permute/dispatch path relies on it); only the
-                // optional user recv_total_counter reports the padded total, and
-                // the FLAT branch of assign_recv_slots is suppressed for it.
-                if (recv_total_counter) {
-                    if (out_is_int64) {
-                        *static_cast<int64_t*>(recv_total_counter) = static_cast<int64_t>(cum);
-                    } else {
-                        *static_cast<int32_t*>(recv_total_counter) = cum;
-                    }
-                }
-            }
-            if (cum > max_recv_tokens_per_rank) {
-                printf("scan_impl_flat(em): padded EM slots %d > max_recv_tokens_per_rank %d\n", cum,
-                       max_recv_tokens_per_rank);
-                __trap();
-            }
-        }
+        em_populate_cnt_tensors<EM_OUT_T>(
+            smem,
+            experts_per_rank,
+            em_alignment,
+            em_internal_offsets,
+            em_padded_out_counts,
+            em_out_offsets,
+            em_actual_counts_out,
+            recv_total_counter,
+            out_is_int64,
+            max_recv_tokens_per_rank);
 
         // Seed per-warp expert prefixes: block predecessor prefix + earlier warps.
-        if (threadIdx.x < experts_per_rank) {
-            const int e = threadIdx.x;
-            int32_t prefix = smem.expert_block_prefix[e];
-#pragma unroll
-            for (int w = 0; w < NUM_OF_WARPS_PER_BLOCK; w++) {
-                smem.warp_expert_prefix[w * experts_per_rank + e] = prefix;
-                prefix += smem.expert_warp_sums[w * experts_per_rank + e];
-            }
-        }
+        init_warp_expert_prefixes<NUM_OF_WARPS_PER_BLOCK>(smem, experts_per_rank);
     }
     __syncthreads();
 

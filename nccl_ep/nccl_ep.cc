@@ -3492,10 +3492,12 @@ ncclResult_t ncclEpDispatch(
         CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
         const bool is_capturing = (capture_status == cudaStreamCaptureStatusActive);
         unsigned int actual_recv_tokens = 0;
-        // The D2H readback exists only to size the legacy byte_copy and the
-        // FP8-scales D2D; the em-permute path reads num_tokens_for_experts on
-        // device, so skip the sync entirely when it fires.
-        if (!is_capturing && !em_permute_active) {
+        // D2H readback sizes the byte_copy and FP8-scales D2D; skip when
+        // external-window outputs or em-permute make both copies unnecessary.
+        const bool need_recv_count_readback =
+            !em_permute_active &&
+            (!recv_x_uses_external_window || (use_fp8 && !recv_scales_uses_external_window));
+        if (!is_capturing && need_recv_count_readback) {
             CUDA_CHECK(cudaMemcpyAsync(
                 &actual_recv_tokens,
                 handle->hybridep.num_tokens_for_experts,

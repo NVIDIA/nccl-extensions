@@ -1620,10 +1620,10 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             "ncclEpCreateGroup: HT requires rdma_team_size * lsa_team_size == nRanks");
     }
 
-    // HT EM mode: env override wins, else auto-pick from (zero_copy, lsa_team_size).
-    //   non zero_copy           -> kLocalPermute (FLAT dispatch + permute kernels)
-    //   zero_copy, lsa > 1      -> kNvlinkDup    (sender duplicates per-expert over NVLink)
-    //   zero_copy, lsa == 1     -> kLocalDup     (receiver-side fan-out via local_dup)
+    // HT EM mode: env override wins, else auto-pick from (zero_copy, number of LSA teams).
+    //   non zero_copy               -> kLocalPermute (FLAT dispatch + permute kernels)
+    //   zero_copy, multiple teams   -> kNvlinkDup    (sender duplicates per-expert over NVLink)
+    //   zero_copy, single team      -> kLocalDup     (receiver-side fan-out via local_dup)
     {
         const bool want_local_dup = nccl_ep_env_flag_on(ep_group->env.ht_em_local_dup);
         const bool want_nvlink_dup = nccl_ep_env_flag_on(ep_group->env.ht_em_nvlink_dup);
@@ -1637,7 +1637,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             ep_group->ht_em_mode = ncclEpGroup::HtEmMode::kLocalDup;
         } else if (in_config->zero_copy == NCCL_EP_ZERO_COPY_ON) {
             ep_group->ht_em_mode =
-                (ep_group->lsa_team_size > 1) ? ncclEpGroup::HtEmMode::kNvlinkDup : ncclEpGroup::HtEmMode::kLocalDup;
+                (ep_group->rdma_team_size > 1) ? ncclEpGroup::HtEmMode::kNvlinkDup : ncclEpGroup::HtEmMode::kLocalDup;
         } else {
             ep_group->ht_em_mode = ncclEpGroup::HtEmMode::kLocalPermute;
         }
@@ -4080,7 +4080,8 @@ ncclResult_t ncclEpCombine(
         params.lsa_team_size = group->lsa_team_size;
         // Use HOST pointer arrays - these get copied into the kernel param struct for fast __grid_constant__ access
         std::vector<uint16_t*> combine_input_token_ptrs;
-        if (combine_x_uses_external_window) {
+        // em-permute combine always reads the FLAT staging, not the caller tensor.
+        if (combine_x_uses_external_window && !em_permute_combine) {
             NCCLCHECK(buildIntranodePtrArray<uint16_t>(group, x, combine_input_token_ptrs));
             params.expert_input_token_ptrs = combine_input_token_ptrs.data();
         } else {

@@ -220,35 +220,39 @@ compute_cap
 
 ### Set the environment
 
-The following paths are required for building and running the
-
 ```
 export COMPUTE_CAP=<discovered compute_cap>
 export CUDA_HOME=/path/to/cuda
 export MPI_HOME=/path/to/openmpi
-export NCCL_HOME=/path/to/nccl/build # The desired NCCL build
-export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:$LD_LIBRARY_PATH"
-export PATH="${CUDA_HOME}/bin:${NCCL_HOME}/bin:${MPI_HOME}/bin:$PATH"
+export PATH="${CUDA_HOME}/bin:${MPI_HOME}/bin:$PATH"
 ```
 
 ## Building
 
-### Step 1: Build NCCL with Device API Support
+### Step 1: Get NCCL
+
+This repo vendors a compatible NCCL build via git submodule at
+`third_party/nccl`. Build it once:
 
 ```bash
-cd /path/to/nccl-source
-make -j src.build BUILDDIR=${NCCL_HOME}
+git submodule update --init third_party/nccl
+make -C nccl_ep nccl-submodule   # -> third_party/nccl/build/{include,lib}
 ```
 
-This creates the NCCL build artifacts in `BUILDDIR` (`./build` by default):
-- `${NCCL_HOME}/lib/libnccl.so` - NCCL library with EP support
-- `${NCCL_HOME}/include/` - Header files
+`NCCL_HOME` defaults to `third_party/nccl/build` automatically — no export
+needed. To use your own NCCL build instead (e.g. a different version, or one
+with custom patches), set `NCCL_HOME` to override the default:
+
+```bash
+export NCCL_HOME=/path/to/your/nccl/build
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:$LD_LIBRARY_PATH"
+export PATH="${CUDA_HOME}/bin:${NCCL_HOME}/bin:${MPI_HOME}/bin:$PATH"
+```
 
 ### Step 2: Build NCCL EP Library and Test
 
-
 ```bash
-make -C contrib/nccl_ep MPI=1 BUILDDIR=${NCCL_HOME} \
+make -C nccl_ep MPI=1 \
        NVCC_GENCODE="-gencode=arch=compute_${COMPUTE_CAP},code=sm_${COMPUTE_CAP}"
 ```
 

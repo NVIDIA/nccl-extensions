@@ -23,11 +23,11 @@
 #   make tests-clean  - Delegate to tests/Makefile (clean test binaries)
 #   make help         - Show all targets and options
 #
-# Required environment variables:
-#   NCCL_HOME         - Path to NCCL build directory (must contain internal
-#                       headers like nccl_device.h)
-#
 # Optional environment variables:
+#   NCCL_HOME         - Path to NCCL build directory (must contain internal
+#                       headers like nccl_device.h). Defaults to the vendored
+#                       NCCL submodule's build output (../third_party/nccl/build)
+#                       if unset — see `make nccl-submodule`.
 #   CUDA_HOME         - Path to CUDA installation (default: /usr/local/cuda)
 #   MPI_HOME          - Path to MPI installation (for benchmarks only)
 #   PREFIX            - Install prefix (default: /usr/local)
@@ -43,9 +43,19 @@ include Makefile.common
 BENCH_PICK_NAMES := reshard reshard_batch_user_window reshard_model
 
 .PHONY: all lib bench bench-clean tests basic_api_test_mpi basic_api_test_local \
-        clean tests-clean install help $(BENCH_PICK_NAMES)
+        clean tests-clean install help nccl-submodule $(BENCH_PICK_NAMES)
 
 all: lib
+
+# One-time: build the vendored NCCL submodule so the default NCCL_HOME
+# (third_party/nccl/build) has artifacts. Not a prerequisite of all/lib —
+# building NCCL is a deliberate, separate step.
+nccl-submodule:
+	@if [ ! -f $(NCCL_RESHARD_ROOT)/../third_party/nccl/makefiles/version.mk ]; then \
+		echo "error: $(NCCL_RESHARD_ROOT)/../third_party/nccl is empty. Run: git submodule update --init third_party/nccl" >&2; \
+		exit 1; \
+	fi
+	$(MAKE) -C $(NCCL_RESHARD_ROOT)/../third_party/nccl -j src.build
 
 # ============================================================================
 # Library

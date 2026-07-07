@@ -35,14 +35,31 @@ message(STATUS "NCCL EP version: ${NCCL_EP_MAJOR}.${NCCL_EP_MINOR}.${NCCL_EP_PAT
 # Build layout:
 #   NCCL_HOME          — input: NCCL core headers + libnccl.so
 #   NCCL_EP_BUILDDIR   — output: NCCL EP artifacts
-# Defaults preserve the legacy single-tree layout under CMAKE_BINARY_DIR.
+# Defaults to the vendored NCCL submodule's build output; override NCCL_HOME
+# via -DNCCL_HOME=... to point at your own from-source NCCL build.
 
-set(NCCL_HOME "${CMAKE_BINARY_DIR}" CACHE PATH "NCCL core build/install directory used by NCCL EP")
+set(NCCL_SUBMODULE_HOME "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/nccl" CACHE PATH "Vendored NCCL submodule checkout")
+set(NCCL_HOME "${NCCL_SUBMODULE_HOME}/build" CACHE PATH "NCCL core build/install directory used by NCCL EP")
 set(NCCL_EP_BUILDDIR "${CMAKE_BINARY_DIR}" CACHE PATH "NCCL EP build output directory")
 set(NCCL_INCDIR "${NCCL_HOME}/include")
 set(NCCL_LIBDIR "${NCCL_HOME}/lib")
 set(NCCL_EP_INCDIR "${NCCL_EP_BUILDDIR}/include")
 set(NCCL_EP_LIBDIR "${NCCL_EP_BUILDDIR}/lib")
+
+# One-time: build the vendored NCCL submodule so the default NCCL_HOME
+# (third_party/nccl/build) has artifacts. Mirrors the `nccl-submodule` Make
+# target; not a dependency of any build target — building NCCL is a
+# deliberate, separate step. Run with: cmake --build <builddir> --target nccl-submodule
+add_custom_target(nccl-submodule
+    COMMAND sh -c "if [ ! -f '${NCCL_SUBMODULE_HOME}/makefiles/version.mk' ]; then \
+        echo 'error: ${NCCL_SUBMODULE_HOME} is empty. Run: git submodule update --init third_party/nccl' 1>&2; \
+        exit 1; \
+    fi"
+    COMMAND make -C "${NCCL_SUBMODULE_HOME}" -j src.build
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMENT "Building vendored NCCL submodule"
+    VERBATIM
+)
 
 # Source files
 set(NCCL_EP_HOST_SRC

@@ -10,8 +10,9 @@
 # so all paths (sources, headers, build dir) resolve from the project root
 # regardless of where `make` was invoked.
 #
-# Required env: NCCL_HOME
-# Optional env: CUDA_HOME, MPI_HOME, NVCC_GENCODE, DEBUG, BUILDDIR
+# Optional env: NCCL_HOME, CUDA_HOME, MPI_HOME, NVCC_GENCODE, DEBUG, BUILDDIR
+# NCCL_HOME defaults to the vendored NCCL submodule's build output
+# (../third_party/nccl/build) if unset.
 # ============================================================================
 
 # Project root = directory containing this Makefile.common.
@@ -21,16 +22,20 @@ NCCL_RESHARD_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 
+# If the caller hasn't set NCCL_HOME, default to the vendored NCCL
+# submodule's build output. Callers pointing at their own from-source NCCL
+# build should still set NCCL_HOME explicitly; this ?= will not override it.
+NCCL_HOME ?= $(abspath $(NCCL_RESHARD_ROOT)/../third_party/nccl/build)
+
 # ── Required dependency checks (skipped for `clean` / `help`) ──────────────
-NO_DEPS_GOALS := clean help tests-clean
+# `nccl-submodule` is exempt too: it *builds* the NCCL that the check looks
+# for, so requiring nccl_device.h to already exist would be a chicken-and-egg.
+NO_DEPS_GOALS := clean help tests-clean nccl-submodule
 SKIP_DEP_CHECK := $(if $(MAKECMDGOALS),$(if $(filter-out $(NO_DEPS_GOALS),$(MAKECMDGOALS)),,1))
 
 ifeq ($(SKIP_DEP_CHECK),)
-ifndef NCCL_HOME
-$(error NCCL_HOME is not set. Set it to your NCCL build directory, e.g., /path/to/nccl/build)
-endif
 ifeq ($(wildcard $(NCCL_HOME)/include/nccl_device.h),)
-$(error NCCL_HOME=$(NCCL_HOME) does not contain include/nccl_device.h. NCCL must be built from source.)
+$(error NCCL_HOME=$(NCCL_HOME) does not contain include/nccl_device.h. NCCL must be built from source; if using the vendored submodule, run: git submodule update --init third_party/nccl && make -C third_party/nccl -j src.build)
 endif
 ifeq ($(wildcard $(NVCC)),)
 $(error NVCC not found at $(NVCC). Set CUDA_HOME correctly.)

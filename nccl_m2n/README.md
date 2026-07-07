@@ -75,8 +75,10 @@ buffer is the common case, but a matching non-zero offset is accepted.
 
 ## Quick Start
 
-Prerequisites: an NCCL build from source (with `nccl_device.h` exported), CUDA,
-and an MPI runtime for the benchmarks.
+Prerequisites: CUDA and an MPI runtime for the benchmarks. NCCL is vendored
+as a git submodule (`third_party/nccl`); `NCCL_HOME` defaults to its build
+output automatically. To use a different NCCL build instead, set
+`NCCL_HOME` explicitly (see below).
 
 Two build paths are shipped side-by-side — pick either; both produce the
 same artifacts under `build/lib/` and `build/bin/`.
@@ -85,8 +87,14 @@ same artifacts under `build/lib/` and `build/bin/`.
 git clone <repo-url> nccl-m2n
 cd nccl-m2n
 
-# 1. Point at your NCCL build
-export NCCL_HOME=/path/to/nccl/build
+# 0. One-time: build the vendored NCCL submodule (skip if you set NCCL_HOME
+#    below to point at your own build)
+git submodule update --init third_party/nccl
+make -C nccl_m2n nccl-submodule
+
+# 1. Optional: point at a different NCCL build (else defaults to the
+#    submodule's build output above)
+# export NCCL_HOME=/path/to/nccl/build
 ```
 
 ### Option A — Make
@@ -344,7 +352,7 @@ cmake --build build -j [--target <name>]
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `NCCL_HOME` | *(unset; required)* | Path to a from-source NCCL build (`$NCCL_HOME/include/nccl_device.h` must exist). Make reads the env var directly; pass `-DNCCL_HOME=...` to `cmake`. |
+| `NCCL_HOME` | `third_party/nccl/build` (vendored submodule) | Path to a from-source NCCL build (`$NCCL_HOME/include/nccl_device.h` must exist). Make reads the env var directly; pass `-DNCCL_HOME=...` to `cmake`. Override to point at your own build. |
 
 ### Optional environment / cache vars
 
@@ -744,7 +752,7 @@ prepare path for each call.
 |---|---|
 | `ncclInvalidArgument` from `ncclReshardWithWindow` | One of the preconditions failed: NULL comm/window/descriptor/mesh, mismatched `ndims`/dtype, `ndims` outside 1..3, or an unsupported dtype. |
 | Validation fails with destination still containing the pre-call bytes | The kernel did not write to dest. Re-run with `NCCL_RESHARD_LOG_LEVEL=DEBUG` to see the prepared plan, then file an issue with the `reshard_bench` command line that reproduces the failure. |
-| `nccl_device.h: No such file or directory` at compile time | `NCCL_HOME` points at a binary install rather than a from-source build. Build NCCL from source or point at one. |
+| `nccl_device.h: No such file or directory` at compile time | `NCCL_HOME` points at a binary install rather than a from-source build. Build NCCL from source or point at one, or build the vendored default: `git submodule update --init third_party/nccl && make -C third_party/nccl -j src.build`. |
 | Fast-but-wrong: `make` succeeds yet runtime crashes with "illegal instruction" | Often a downstream symptom of a kernel that completed with corrupt state on the previous reshard call. Re-run with `NCCL_RESHARD_LOG_LEVEL=DEBUG` to see the prepared plan. |
 
 ---

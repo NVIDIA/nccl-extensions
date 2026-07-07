@@ -3457,10 +3457,11 @@ ncclResult_t ncclEpDispatch(
                 x->datatype));
 
         // Fan primaries out to secondary em_slots in this rank's recv buffer.
+        // Use the resolved output array (user window under zero_copy, IPC staging otherwise).
         if (em_unfused_active) {
             nccl_ep::hybridep::call_local_dup(
                 /*expert_output_token=*/
-                group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->lsa_rank],
+                params.expert_output_token_ptrs[group->lsa_rank],
                 /*expert_output_prob=*/
                 forward_dispatch ? group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank] : nullptr,
                 handle->hybridep.emuf_group_buf,

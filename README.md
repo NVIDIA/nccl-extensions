@@ -20,6 +20,17 @@ Experimental library for resharding a tensor between two disjoint groups of
 GPU processes (e.g. trainer and inference ranks) in a single, zero-copy call,
 built on NCCL's window API.
 
+## Getting the Code
+
+This repo vendors NCCL as a git submodule. Clone with:
+
+```bash
+git clone --recursive <repo-url>
+```
+
+(or `git submodule update --init` after a normal clone). See each
+subproject's README for build instructions.
+
 ## Contributing
 
 We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) to get

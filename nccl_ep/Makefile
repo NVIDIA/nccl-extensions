@@ -1,11 +1,17 @@
 # NCCL_EP: Expert Parallelism extension for NCCL
 #
-# Build with: make -C contrib/nccl_ep
-# Requires NCCL to be built first: make src.build
+# Build with: make -C nccl_ep
+# Requires NCCL to be built first (see the vendored submodule at
+# ../third_party/nccl, or point NCCL_HOME at your own build).
+
+# NCCL_SUBMODULE_HOME points at the vendored NCCL checkout (see
+# third_party/nccl at the repo root), used both for NCCL's shared build
+# helpers (common.mk) and as the default NCCL_HOME below.
+NCCL_SUBMODULE_HOME := $(abspath ../third_party/nccl)
 
 # std::optional and other C++17 features used in nccl_moe.cc
 CXXSTD := -std=c++17
-include ../../makefiles/common.mk
+include $(NCCL_SUBMODULE_HOME)/makefiles/common.mk
 
 # NVCC_CXX_COMPILER: nvcc -ccbin; from CXX if one token, else g++
 ifeq ($(words $(CXX)),1)
@@ -36,14 +42,15 @@ ifeq ($(origin NVCC_GENCODE),file)
   endif
 endif
 
-.PHONY: all clean lib ep_test ep_bench
+.PHONY: all clean lib ep_test ep_bench nccl-submodule
 
 # Build layout:
 #   NCCL_HOME          — input: NCCL core headers + libnccl.so
 #   NCCL_EP_BUILDDIR   — output: NCCL EP artifacts
-# Defaults preserve the legacy single-tree layout: BUILDDIR controls both.
+# Defaults to the vendored NCCL submodule's build output; override NCCL_HOME
+# (and optionally BUILDDIR) to point at your own from-source NCCL build.
 
-BUILDDIR ?= $(abspath ../../build)
+BUILDDIR ?= $(NCCL_SUBMODULE_HOME)/build
 NCCL_HOME ?= $(BUILDDIR)
 NCCL_EP_BUILDDIR ?= $(BUILDDIR)
 
@@ -146,6 +153,16 @@ HEADERS := include/nccl_ep.h
 HEADER_TARGETS := $(HEADERS:include/%=$(INCDIR)/%)
 # Build targets
 all: lib ep_test ep_bench
+
+# One-time: build the vendored NCCL submodule so the default NCCL_HOME
+# (third_party/nccl/build) has artifacts. Not a prerequisite of all/lib —
+# building NCCL is a deliberate, separate step.
+nccl-submodule:
+	@if [ ! -f $(NCCL_SUBMODULE_HOME)/makefiles/version.mk ]; then \
+		echo "error: $(NCCL_SUBMODULE_HOME) is empty. Run: git submodule update --init third_party/nccl" >&2; \
+		exit 1; \
+	fi
+	$(MAKE) -C $(NCCL_SUBMODULE_HOME) -j src.build
 
 lib: $(LIBTARGET) $(SOLIBTARGET) $(SOLIBLINKS) $(HEADER_TARGETS) $(NCCL_EP_JIT_HEADER_TARGETS)
 

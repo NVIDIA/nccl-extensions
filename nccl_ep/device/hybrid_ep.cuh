@@ -220,6 +220,21 @@ __host__ __device__ __forceinline__ int em_s2d_unpack_slot(int32_t v) {
     return static_cast<int>(static_cast<uint32_t>(v) & EM_S2D_SLOT_MASK);
 }
 
+// NCCL_EP_OVERFLOW_DROP helpers: a recv slot at/above capacity would index past
+// the recv buffer, so the drop policy remaps it to the sentinel -1.
+__host__ __device__ __forceinline__ bool slot_overflows(int32_t slot, int capacity) {
+    return slot >= capacity;
+}
+__host__ __device__ __forceinline__ int32_t drop_overflow_slot(int32_t slot, bool drop, int capacity) {
+    return (drop && slot_overflows(slot, capacity)) ? -1 : slot;
+}
+
+// Combine kernels pad each node's rdma_to_attn_map row to a multiple of 16 bools;
+// producers of the map must use the same stride.
+__host__ __device__ __forceinline__ int rdma_to_attn_row_stride(int tokens_per_rank) {
+    return (((tokens_per_rank - 1) / 16) + 1) * 16;
+}
+
 // EM unfused-combine path: s2d entries are lex-sorted (dest_rank, k), so duplicates
 // within a row are adjacent. Returns true when this lane's entry has the same
 // dest_rank as the lane immediately upstream -- the peer rank's local_reduce_kernel

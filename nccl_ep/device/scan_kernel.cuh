@@ -388,7 +388,6 @@ __device__ __forceinline__ void assign_recv_slots(
     int max_recv_tokens_per_rank,
     bool allow_overflow_drop,
     bool* rdma_to_attn_map,
-    int rdma_to_attn_map_size_per_node,
     int32_t* token_to_recv_slot = nullptr,
     // EM-permute outputs (ENABLE_EM_PERMUTE only)
     int32_t* flat2em_slot_map = nullptr,
@@ -441,8 +440,7 @@ __device__ __forceinline__ void assign_recv_slots(
                 if (!expert_major && token_out_of_bound == 0 && src_local_rank == local_rank &&
                     rank < LSA_TEAM_SIZE) {
                     // Drop policy: slot at/above capacity OOBs the recv buffer; mark -1.
-                    int32_t slot = final_ex_scan;
-                    if (allow_overflow_drop && slot >= max_recv_tokens_per_rank) slot = -1;
+                    int32_t slot = drop_overflow_slot(final_ex_scan, allow_overflow_drop, max_recv_tokens_per_rank);
                     sparse_to_dense_map
                         [(src_lsa_team * tokens_per_rank + src_token_id) *
                              LSA_TEAM_SIZE +
@@ -469,7 +467,7 @@ __device__ __forceinline__ void assign_recv_slots(
         // Drop policy: clear combine gate for fully-dropped tokens to avoid combine deadlock.
         if (!expert_major && allow_overflow_drop && token_out_of_bound == 0 &&
             src_local_rank == local_rank && rank_mask.any() && !token_any_slot_kept) {
-            rdma_to_attn_map[src_lsa_team * rdma_to_attn_map_size_per_node +
+            rdma_to_attn_map[src_lsa_team * g.rdma_to_attn_map_size_per_node +
                              src_token_id] = false;
         }
 
@@ -496,8 +494,8 @@ __device__ __forceinline__ void assign_recv_slots(
 
         // em-permute: persist recv slot; -1 if no local hit or dropped.
         if (token_to_recv_slot != nullptr && token_out_of_bound == 0) {
-            int32_t slot = token_needed_by_local_rank ? local_rank_slot : -1;
-            if (allow_overflow_drop && slot >= max_recv_tokens_per_rank) slot = -1;
+            int32_t slot = drop_overflow_slot(token_needed_by_local_rank ? local_rank_slot : -1,
+                                              allow_overflow_drop, max_recv_tokens_per_rank);
             token_to_recv_slot[current_token_id] = slot;
         }
 
@@ -583,7 +581,7 @@ compute_scan_geometry(int num_of_tokens_per_rank, int experts_per_rank) {
     g.num_of_tokens_per_thread = ((g.num_of_total_attn_tokens - 1) / NUM_OF_TOTAL_THREADS) + 1;
     g.num_of_tokens_per_warp = g.num_of_tokens_per_thread * WARP_SIZE;
     g.num_of_tokens_per_block = g.num_of_tokens_per_warp * NUM_OF_WARPS_PER_BLOCK;
-    g.rdma_to_attn_map_size_per_node = (((num_of_tokens_per_rank - 1) / 16) + 1) * 16;
+    g.rdma_to_attn_map_size_per_node = rdma_to_attn_row_stride(num_of_tokens_per_rank);
 
     const int experts_per_node = experts_per_rank * LSA_TEAM_SIZE;
     g.experts_per_node_packed = (experts_per_node + 7) / 8;
@@ -905,7 +903,6 @@ __device__ __forceinline__ void scan_impl_flat(
         max_recv_tokens_per_rank,
         allow_overflow_drop,
         rdma_to_attn_map,
-        g.rdma_to_attn_map_size_per_node,
         token_to_recv_slot,
         flat2em_slot_map,
         em_top_k);
@@ -1081,7 +1078,7 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
 
     const int local_per_node_bytes = ((nrpn * epr) + 7) / 8;
     // Matches the combine kernels' rdma_to_attn_map row padding (16 bools/node).
-    const int rdma_to_attn_map_size_per_node = (((p.num_tokens_per_rank - 1) / 16) + 1) * 16;
+    const int rdma_to_attn_map_size_per_node = rdma_to_attn_row_stride(p.num_tokens_per_rank);
     const int tid       = threadIdx.x;
     const int lane      = tid & 31;
     const int warp      = tid >> 5;
@@ -1284,7 +1281,7 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
                     const int within = __popc(mask & ((1u << lane) - 1u));
                     const int em_slot = s_offsets[dle] + s_warp_state[warp * s_warp_stride + dle] + within;
                     // Drop policy: slot at/above capacity would OOB recv buffer; mark dropped.
-                    const bool dropped = p.allow_overflow_drop && (em_slot >= p.max_recv_tokens_per_rank);
+                    const bool dropped = p.allow_overflow_drop && slot_overflows(em_slot, p.max_recv_tokens_per_rank);
                     if (d == p.local_rank) {
                         if (p.local_expert_routing_map && !dropped) {
                             p.local_expert_routing_map[em_slot * epr + le] = true;

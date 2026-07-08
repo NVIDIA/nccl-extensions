@@ -295,7 +295,6 @@ __device__ __forceinline__ void write_local_routing(
     int node_rank,
     int local_rank,
     int experts_per_rank,
-    bool expert_major,
     // EM-permute related params
     int32_t* flat2em_slot_map = nullptr,
     int em_top_k = 0) {
@@ -306,9 +305,7 @@ __device__ __forceinline__ void write_local_routing(
     if (lane_participates) {
         local_rank_bitmap_row =
             input_routing_map + current_token_id * g.packed_row_bytes + node_rank * g.experts_per_node_packed;
-        if (!expert_major) {
-            local_expert_routing_map_store_base_addr = local_expert_routing_map + local_rank_slot * experts_per_rank;
-        }
+        local_expert_routing_map_store_base_addr = local_expert_routing_map + local_rank_slot * experts_per_rank;
     }
 
     int em_k = 0;  // number of local-expert hits emitted for this lane's token
@@ -318,9 +315,7 @@ __device__ __forceinline__ void write_local_routing(
         bool routed_to_expert = false;
         if (lane_participates) {
             routed_to_expert = ((local_rank_bitmap_row[expert_bit / 8] >> (expert_bit % 8)) & 1u) != 0;
-            if (!expert_major) {
-                local_expert_routing_map_store_base_addr[k] = routed_to_expert;
-            }
+            local_expert_routing_map_store_base_addr[k] = routed_to_expert;
         }
 
         if constexpr (ENABLE_EM_PERMUTE) {
@@ -383,7 +378,6 @@ __device__ __forceinline__ void assign_recv_slots(
     int experts_per_rank,
     int node_rank,
     int local_rank,
-    bool expert_major,
     bool out_is_int64,
     int max_recv_tokens_per_rank,
     bool allow_overflow_drop,
@@ -437,7 +431,7 @@ __device__ __forceinline__ void assign_recv_slots(
                 int32_t final_ex_scan = token_needed_by_this_rank ? previous_token_sum[j] + temp_scan : -1;
                 previous_token_sum[j] += temp_sum;
 
-                if (!expert_major && token_out_of_bound == 0 && src_local_rank == local_rank &&
+                if (token_out_of_bound == 0 && src_local_rank == local_rank &&
                     rank < LSA_TEAM_SIZE) {
                     // Drop policy: slot at/above capacity OOBs the recv buffer; mark -1.
                     int32_t slot = drop_overflow_slot(final_ex_scan, allow_overflow_drop, max_recv_tokens_per_rank);
@@ -465,7 +459,7 @@ __device__ __forceinline__ void assign_recv_slots(
         }
 
         // Drop policy: clear combine gate for fully-dropped tokens to avoid combine deadlock.
-        if (!expert_major && allow_overflow_drop && token_out_of_bound == 0 &&
+        if (allow_overflow_drop && token_out_of_bound == 0 &&
             src_local_rank == local_rank && rank_mask.any() && !token_any_slot_kept) {
             rdma_to_attn_map[src_lsa_team * g.rdma_to_attn_map_size_per_node +
                              src_token_id] = false;
@@ -483,7 +477,6 @@ __device__ __forceinline__ void assign_recv_slots(
             node_rank,
             local_rank,
             experts_per_rank,
-            expert_major,
             flat2em_slot_map,
             em_top_k);
 
@@ -499,7 +492,7 @@ __device__ __forceinline__ void assign_recv_slots(
             token_to_recv_slot[current_token_id] = slot;
         }
 
-        if (!expert_major && current_token_id == g.num_of_total_attn_tokens - 1) {
+        if (current_token_id == g.num_of_total_attn_tokens - 1) {
             const int32_t true_total = local_rank_prefix_after_scan;
             const bool overflow = true_total > max_recv_tokens_per_rank;
             if (overflow && !allow_overflow_drop) {
@@ -918,7 +911,6 @@ __device__ __forceinline__ void scan_impl_flat(
         experts_per_rank,
         node_rank,
         local_rank,
-        /*expert_major=*/false,
         out_is_int64,
         max_recv_tokens_per_rank,
         allow_overflow_drop,

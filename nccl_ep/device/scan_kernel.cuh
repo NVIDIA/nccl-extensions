@@ -684,7 +684,9 @@ __device__ __forceinline__ void cross_block_prefix_scan_experts(
 // into padded per-expert zone bases (smem.expert_base, computed by every block),
 // and block 0 additionally publishes the global EM count/offset tensors
 // (internal offsets, padded/actual counts, out offsets, and the optional padded
-// recv_total_counter). Traps if the padded EM total exceeds the recv budget.
+// recv_total_counter). If the padded EM total exceeds the recv budget it traps,
+// unless allow_overflow_drop is set, in which case reported counts are clamped to
+// the budget and recv_total_counter reports the true pre-drop total.
 template <typename EM_OUT_T>
 __device__ __forceinline__ void em_populate_cnt_tensors(
     scan_flat_smem_t& smem,
@@ -696,7 +698,8 @@ __device__ __forceinline__ void em_populate_cnt_tensors(
     int32_t* em_actual_counts_out,
     void* recv_total_counter,
     bool out_is_int64,
-    int max_recv_tokens_per_rank) {
+    int max_recv_tokens_per_rank,
+    bool allow_overflow_drop) {
     if (threadIdx.x == 0) {
         const int align = (em_alignment > 1) ? em_alignment : 1;
         int cum = 0;
@@ -705,15 +708,29 @@ __device__ __forceinline__ void em_populate_cnt_tensors(
             smem.expert_base[k] = cum;
             const int padded = (align > 1 && c > 0) ? ((c + align - 1) / align) * align : c;
             if (blockIdx.x == 0) {
+                // Drop policy: clamp reported counts to remaining budget; expert_base / cum
+                // (slot assignment) stay unchanged so emit-phase slots still match.
+                int rep_actual = c;
+                int rep_padded = padded;
+                if (allow_overflow_drop) {
+                    const int room = (cum < max_recv_tokens_per_rank) ? (max_recv_tokens_per_rank - cum) : 0;
+                    rep_actual = (c < room) ? c : room;
+                    rep_padded = (padded < room) ? padded : room;
+                }
                 if (em_internal_offsets) em_internal_offsets[k] = cum;
-                if (em_actual_counts_out) em_actual_counts_out[k] = c;
-                if (em_padded_out_counts) em_padded_out_counts[k] = static_cast<EM_OUT_T>(padded);
+                if (em_actual_counts_out) em_actual_counts_out[k] = rep_actual;
+                if (em_padded_out_counts) em_padded_out_counts[k] = static_cast<EM_OUT_T>(rep_padded);
                 if (em_out_offsets) em_out_offsets[k] = static_cast<EM_OUT_T>(cum);
             }
             cum += padded;
         }
+        const int true_total = cum;
+        const bool overflow = true_total > max_recv_tokens_per_rank;
         if (blockIdx.x == 0) {
-            if (em_internal_offsets) em_internal_offsets[experts_per_rank] = cum;
+            // Internal total drives recv processing, so clamp to capacity (slots above it
+            // were dropped); recv_total_counter still reports the true pre-drop padded total.
+            if (em_internal_offsets)
+                em_internal_offsets[experts_per_rank] = overflow ? max_recv_tokens_per_rank : true_total;
             // EM user-visible recv-token count is the padded total (matches
             // getNumRecvTokens). num_of_tokens_for_experts stays the unpadded
             // FLAT count (the permute/dispatch path relies on it); only the
@@ -721,15 +738,17 @@ __device__ __forceinline__ void em_populate_cnt_tensors(
             // the FLAT branch of assign_recv_slots is suppressed for it.
             if (recv_total_counter) {
                 if (out_is_int64) {
-                    *static_cast<int64_t*>(recv_total_counter) = static_cast<int64_t>(cum);
+                    *static_cast<int64_t*>(recv_total_counter) = static_cast<int64_t>(true_total);
                 } else {
-                    *static_cast<int32_t*>(recv_total_counter) = cum;
+                    *static_cast<int32_t*>(recv_total_counter) = true_total;
                 }
             }
         }
-        if (cum > max_recv_tokens_per_rank) {
-            printf("scan_impl_flat(em): padded EM slots %d > max_recv_tokens_per_rank %d\n", cum,
-                   max_recv_tokens_per_rank);
+        if (overflow && !allow_overflow_drop) {
+            printf("scan_impl_flat(em): padded EM slots %d > max_recv_tokens_per_rank %d; "
+                   "increase ncclEpGroupConfig_t::max_recv_tokens_per_rank "
+                   "or set overflow_policy = NCCL_EP_OVERFLOW_DROP\n",
+                   true_total, max_recv_tokens_per_rank);
             __trap();
         }
     }
@@ -877,7 +896,8 @@ __device__ __forceinline__ void scan_impl_flat(
             em_actual_counts_out,
             recv_total_counter,
             out_is_int64,
-            max_recv_tokens_per_rank);
+            max_recv_tokens_per_rank,
+            allow_overflow_drop);
 
         // Seed per-warp expert prefixes: block predecessor prefix + earlier warps.
         init_warp_expert_prefixes<NUM_OF_WARPS_PER_BLOCK>(smem, experts_per_rank);

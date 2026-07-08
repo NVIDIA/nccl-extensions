@@ -710,10 +710,15 @@ __device__ __forceinline__ void em_populate_cnt_tensors(
                     rep_actual = (c < room) ? c : room;
                     rep_padded = (padded < room) ? padded : room;
                 }
-                if (em_internal_offsets) em_internal_offsets[k] = cum;
+                // Published zone base: clamp to capacity so post-capacity experts (which
+                // carry clamped count 0) don't advertise offsets past the recv buffer. cum
+                // stays the true prefix, so kept-token slots and the true total are unaffected.
+                const int zone_base =
+                    (allow_overflow_drop && cum > max_recv_tokens_per_rank) ? max_recv_tokens_per_rank : cum;
+                if (em_internal_offsets) em_internal_offsets[k] = zone_base;
                 if (em_actual_counts_out) em_actual_counts_out[k] = rep_actual;
                 if (em_padded_out_counts) em_padded_out_counts[k] = static_cast<EM_OUT_T>(rep_padded);
-                if (em_out_offsets) em_out_offsets[k] = static_cast<EM_OUT_T>(cum);
+                if (em_out_offsets) em_out_offsets[k] = static_cast<EM_OUT_T>(zone_base);
             }
             cum += padded;
         }
@@ -1174,7 +1179,9 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
                     const int padded = (align > 1 && c > 0) ? ((c + align - 1) / align) * align : c;
                     s_offsets[d * epr + k] = cum;
                     if (write_em) {
-                        // Drop policy: clamp counts to budget; offsets unchanged so emit-phase slots still match.
+                        // Drop policy: clamp reported counts to remaining budget. The slot
+                        // geometry (s_offsets / cum, read by the emit phase) stays unchanged
+                        // so kept-token slots still match.
                         int rep_actual = c;
                         int rep_padded = padded;
                         if (p.allow_overflow_drop) {
@@ -1183,14 +1190,19 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
                             rep_actual = (c < room) ? c : room;
                             rep_padded = (padded < room) ? padded : room;
                         }
-                        if (p.em_internal_offsets) p.em_internal_offsets[k] = cum;
+                        // Published zone base: clamp to capacity so post-capacity experts (which
+                        // carry clamped count 0) don't advertise offsets past the recv buffer.
+                        // The emit phase reads s_offsets, not these outputs, so slots are unaffected.
+                        const int zone_base = (p.allow_overflow_drop && cum > p.max_recv_tokens_per_rank)
+                                                  ? p.max_recv_tokens_per_rank : cum;
+                        if (p.em_internal_offsets) p.em_internal_offsets[k] = zone_base;
                         if (p.em_actual_counts_out) p.em_actual_counts_out[k] = rep_actual;
                         if (p.out_is_int64) {
                             if (p.em_padded_out_counts_i64) p.em_padded_out_counts_i64[k] = (int64_t)rep_padded;
-                            if (p.em_out_offsets_i64) p.em_out_offsets_i64[k] = (int64_t)cum;
+                            if (p.em_out_offsets_i64) p.em_out_offsets_i64[k] = (int64_t)zone_base;
                         } else {
                             if (p.em_padded_out_counts_i32) p.em_padded_out_counts_i32[k] = (int32_t)rep_padded;
-                            if (p.em_out_offsets_i32) p.em_out_offsets_i32[k] = (int32_t)cum;
+                            if (p.em_out_offsets_i32) p.em_out_offsets_i32[k] = (int32_t)zone_base;
                         }
                     }
                     cum += padded;

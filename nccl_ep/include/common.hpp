@@ -90,6 +90,8 @@
 
 namespace nccl_ep {
 
+constexpr int kDsFp8E3M4ElementsPerScale = 128;
+
 // Internode low-latency kernels
 namespace internode_ll {
 
@@ -206,18 +208,11 @@ struct LowLatencyLayout {
         //  - 2 symmetric odd/even receive buffers
         //  - 2 symmetric odd/even signaling buffers
 
-        // Per-slot sizes for buffer allocation (datatype-agnostic at the API;
-        // max_token_bytes upper-bounds the per-token payload). The library's FP8
-        // path quantizes from bf16 internally, so its per-token footprint is
-        // bounded by max_token_bytes (which the caller sizes for the bf16 worst case).
-        // Combine reserves additional per-128-bf16-element scale-factor space
-        // (min/max as bf162) — an internal kernel contract of the FP8 quantizer.
-        //
-        // Per-call enforcement: ncclEpDispatch host-side asserts that the actual
-        // input tokens fit max_token_bytes (unquantized path), and that the
-        // FP8-quantized bytes fit max_token_bytes when the FP8 quantizer is engaged.
-        // So the formulas below safely upper-bound any per-call kernel stride.
-        const size_t num_scales = max_token_bytes / sizeof(nv_bfloat16) / 128;  // bf16 hidden / scale-tile size
+        // Per-slot sizes for buffer allocation are datatype-agnostic at the API;
+        // max_token_bytes upper-bounds the entire dispatch payload. Recipe
+        // validation ensures the selected token and scale payload fits that bound.
+        // Combine reserves its existing per-128-token-element metadata space.
+        const size_t num_scales = max_token_bytes / sizeof(nv_bfloat16) / 128;
         size_t scale_metadata_bytes = num_scales * sizeof(nv_bfloat162);
 
         size_t disp_hdr_sz = internode_ll::get_dispatch_hdr_sz(num_topk, layout);

@@ -322,8 +322,8 @@ typedef struct {
     ncclEpTensor_t* topk_weights; // optional; 2D [num_tokens, top_k], ncclFloat32
   //   LL rank-major: per-token routing weights
   //   HT forward: routing weights (topk_idx taken from handle)
-    ncclEpTensor_t* scales; // required when tokens->datatype is FP8 (HT or LL EXTERN);
-  // 2D [num_tokens, hidden/128], ncclFloat32 or ncclUint8 (UE8M0)
+    ncclEpTensor_t* scales;       // required by SCALES_FORWARD only;
+                                  // 2D [num_tokens, num_scales], ncclFloat32
 } ncclEpDispatchInputs_t;
 
 #define NCCL_EP_DISPATCH_INPUTS_INIT \
@@ -338,7 +338,7 @@ typedef struct {
     ncclEpTensor_t* tokens; // required; received tokens
     ncclEpTensor_t* topk_weights; // optional; LL rank-major or HT: received top-k weights
   //   LL rank-major: ncclFloat32 [num_ranks, max_dispatch_tokens_per_rank, top_k]
-    ncclEpTensor_t* scales; // optional; FP8 only; received per-token scaling factors
+    ncclEpTensor_t* scales;       // required by SCALES_FORWARD and DS_FP8E3M4; received per-token scales
     ncclEpTensor_t* topk_idx; // optional; LL rank-major or HT FLAT: received top-k expert indices
   // Per-slot values are either the local or global expert id, selected via
   // ncclEpLayoutInfo_t::recv_topk_idx_kind (AUTO/LOCAL/GLOBAL; AUTO resolves
@@ -577,6 +577,40 @@ ncclResult_t ncclEpUpdateHandle(
     const ncclEpLayoutInfo_t* layout_info, // NULL = none
     cudaStream_t stream);
 
+// Dispatch quantization recipes are explicit contracts between the caller and
+// EP. Their semantics are shared by high-throughput (HT) and low-latency (LL)
+// dispatch; only tensor layouts may differ by algorithm.
+//
+// NONE: the token tensor is transported in its declared dtype. Both scales
+// tensors must be absent.
+//
+// SCALES_FORWARD: the caller supplies already-encoded one-byte tokens
+// (ncclFloat8e4m3 or ncclFloat8e5m2) and FP32 per-token scales. Dispatch copies
+// both token bytes and scales unchanged; it performs no quantization or
+// dequantization, so config.round_scales must be zero. Both input and output
+// scales tensors are required.
+//
+// DS_FP8E3M4: LL-only internal quantization. The caller supplies BF16 tokens;
+// dispatch emits E4M3 token bytes and generated FP32 scales, one per 128 token
+// elements. The hidden dimension must be divisible by 512 so the quantized
+// payload is 16-byte aligned. inputs->scales must be absent and outputs->scales
+// is required.
+//
+// NONE is zero so a zero-initialized config preserves the unquantized path.
+// New recipes must document their HT and LL semantics here, including any
+// algorithm-specific support restrictions.
+typedef enum {
+    NCCL_EP_DISPATCH_QUANT_NONE = 0,
+    NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD = 1,
+    NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4 = 2,
+} ncclEpDispatchQuantizationRecipe_t;
+
+typedef enum {
+    // Combine currently supports only unquantized token transport. Future
+    // recipes must document their HT and LL semantics alongside dispatch.
+    NCCL_EP_COMBINE_QUANT_NONE = 0,
+} ncclEpCombineQuantizationRecipe_t;
+
 // EP dispatch configuration structure
 typedef struct {
     unsigned int size; // = sizeof(this struct); first field, never moves
@@ -584,6 +618,7 @@ typedef struct {
     unsigned int send_only; // if non-zero, only initiate transfers; requires ncclEpComplete() afterward
   //   supported for LL mode only; output tensors must still be preallocated
     unsigned int round_scales; // whether to round the scaling factors tensor into a power of 2
+    ncclEpDispatchQuantizationRecipe_t quantization_recipe; // NONE by default; selects the required scale tensors
     ncclEpPassDir_t pass_direction; // forward (default) or backward pass; HT-only.
   //   FWD requires inputs->topk_weights; BWD forbids it and forbids
   //   outputs->topk_weights / outputs->topk_idx.
@@ -670,6 +705,7 @@ typedef struct {
     unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
     unsigned int send_only; // if non-zero, only initiate transfers; requires ncclEpComplete() afterward
     //   supported for LL mode only; output tensors must still be preallocated
+    ncclEpCombineQuantizationRecipe_t quantization_recipe; // NONE by default; reserved recipes validate future combine support
     ncclEpPassDir_t pass_direction; // forward (default) or backward pass; HT-only.
     //   FWD forbids inputs->topk_weights; BWD requires inputs->topk_weights
     //   and outputs->topk_weights.

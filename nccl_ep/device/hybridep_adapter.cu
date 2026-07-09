@@ -842,20 +842,21 @@ std::vector<uint8_t> build_dispatch_arg_buffer(
     return arg;
 }
 
-// Template dispatch launcher for forward/backward and sync modes
-template <bool FORWARD_DISPATCH>
+// Host dispatch launcher. The JIT source owns all device-kernel specialization;
+// the host only asks hybrid_ep for the matching dynamic-SMEM size.
 ncclResult_t dispatch_impl(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank,
     int num_tokens_per_chunk,
     int num_nodes,
-    bool use_fp8,
+    ncclEpPassDir_t pass_direction,
     int num_blocks,
     int sf_bytes_per_token,
     const ncclEpEnvConfig* env,
     cudaStream_t stream,
-    ncclDataType_t token_dtype = ncclBfloat16) {
+    const DispatchKernelSpec& kernel_spec) {
     {
+        const bool forward_dispatch = (pass_direction == NCCL_EP_FWD_PASS);
         // The dispatch param/arg buffers are pointer-only (wire-width-invariant), so the
         // host packs with one fixed type; the JIT specializes the actual kernel by
         // token_dtype (dispatch_token_data_type_literal in launch_dispatch). No host-side
@@ -881,7 +882,7 @@ ncclResult_t dispatch_impl(
         d_config.num_of_in_flight_s2g = HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G;
         d_config.num_of_tokens_per_chunk = num_tokens_per_chunk;
         d_config.num_of_blocks = num_blocks;
-        d_config.forward_dispatch = FORWARD_DISPATCH;
+        d_config.forward_dispatch = forward_dispatch;
         d_config.sf_bytes_per_token = sf_bytes_per_token;
         d_config.num_pipelines = HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
         d_config.stages_per_pipeline = HYBRIDEP_DISPATCH_NUM_OF_STAGES / HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
@@ -892,19 +893,18 @@ ncclResult_t dispatch_impl(
         d_model.num_of_ranks_per_node = kp.num_of_ranks_per_node;
         d_model.num_of_nodes = num_nodes;
 
-        // Layout size depends only on the wire byte width; pick the canonical
-        // instantiation by dtype (FP8=1 B, FP32=4 B, BF16/FP16=2 B) -- mirrors
-        // dispatch_jit's kernel specialization so host and device agree.
-#define HYBRIDEP_DISP_SMEM(DT) \
-    ((params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? \
-         ::hybrid_ep::calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_EXPERT_MAJOR, DT>(d_config, d_model) : \
-         ::hybrid_ep::calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_FLAT, DT>(d_config, d_model))
-        const int smem_size = static_cast<int>(
-            use_fp8                    ? HYBRIDEP_DISP_SMEM(ncclFloat8e4m3) :
-            token_dtype == ncclFloat32 ? HYBRIDEP_DISP_SMEM(ncclFloat32) :
-                                         HYBRIDEP_DISP_SMEM(ncclBfloat16));
-#undef HYBRIDEP_DISP_SMEM
-        if (ncclResult_t r = check_dispatch_smem_limit(d_config, smem_size); r != ncclSuccess) return r;
+        const int smem_size = static_cast<int>(::hybrid_ep::calculate_dispatch_smem_layout_size(
+            params.layout, kernel_spec.payload_bytes, d_config, d_model));
+        if (smem_size == 0) {
+            std::fprintf(stderr, "NCCL EP warning: unsupported HT dispatch token size %u\n",
+                         kernel_spec.payload_bytes);
+            return ncclInvalidArgument;
+        }
+        if (ncclResult_t r = check_dispatch_smem_limit(d_config, smem_size); r != ncclSuccess) {
+            std::fprintf(stderr, "NCCL EP warning: dispatch shared-memory requirement %d is unsupported\n",
+                         smem_size);
+            return r;
+        }
 
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
         const jit::dispatch_warp_layout_t dispatch_layout = jit::compute_dispatch_warp_layout(num_nodes, params.layout);
@@ -917,17 +917,16 @@ ncclResult_t dispatch_impl(
 #endif
 
         std::vector<uint8_t> kernel_arg = build_dispatch_arg_buffer(kp, params);
-        jit::launch_dispatch(
+        if (ncclResult_t r = jit::launch_dispatch(
             HYBRIDEP_DISPATCH_NUM_OF_STAGES,
             HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
             num_tokens_per_chunk,
             max_dispatch_tokens_per_rank,
             num_blocks,
-            FORWARD_DISPATCH,
+            forward_dispatch,
             num_nodes,
             params.lsa_team_size,
             params.layout,
-            use_fp8,
             kp.hidden_dim,
             sf_bytes_per_token,
             kp.experts_per_rank,
@@ -936,7 +935,8 @@ ncclResult_t dispatch_impl(
             kernel_arg.size(),
             smem_size,
             stream,
-            token_dtype);
+            kernel_spec); r != ncclSuccess)
+            return r;
 
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
         jit::dispatch_dump_warp_timing(dispatch_layout, num_blocks, d_wt, stream);
@@ -951,38 +951,21 @@ ncclResult_t call_dispatch(
     int max_dispatch_tokens_per_rank,
     int num_tokens_per_chunk,
     int num_nodes,
-    bool use_fp8,
-    bool forward_dispatch,
+    ncclEpDispatchQuantizationRecipe_t quantization_recipe,
+    ncclEpPassDir_t pass_direction,
     int num_blocks,
     int sf_bytes_per_token,
     const ncclEpEnvConfig* env,
     cudaStream_t stream,
     ncclDataType_t token_dtype) {
-    if (forward_dispatch) {
-        return dispatch_impl<true>(
-            params,
-            max_dispatch_tokens_per_rank,
-            num_tokens_per_chunk,
-            num_nodes,
-            use_fp8,
-            num_blocks,
-            sf_bytes_per_token,
-            env,
-            stream,
-            token_dtype);
-    } else {
-        return dispatch_impl<false>(
-            params,
-            max_dispatch_tokens_per_rank,
-            num_tokens_per_chunk,
-            num_nodes,
-            use_fp8,
-            num_blocks,
-            sf_bytes_per_token,
-            env,
-            stream,
-            token_dtype);
+    DispatchKernelSpec kernel_spec;
+    if (ncclResult_t r = resolveDispatchKernelSpec(quantization_recipe, token_dtype, &kernel_spec);
+        r != ncclSuccess) {
+        return r;
     }
+    return dispatch_impl(
+        params, max_dispatch_tokens_per_rank, num_tokens_per_chunk, num_nodes,
+        pass_direction, num_blocks, sf_bytes_per_token, env, stream, kernel_spec);
 }
 
 // ============================================================================
@@ -1181,8 +1164,8 @@ void call_local_dup(
     ncclDataType_t token_dtype) {
     constexpr int kPipeDepth = NCCLEP_LOCAL_DUP_PIPE_DEPTH;
     // local_dup is a byte-relocation fan-out: the wire type only sets the
-    // per-token width (FP16/BF16 -> uint16_t, FP32 -> uint32_t). FP8 is rejected
-    // upstream on this path.
+    // per-token width (FP16/BF16 -> uint16_t, FP32 -> uint32_t). SCALES_FORWARD
+    // is rejected upstream on this path.
     auto run = [&](auto tag) {
         using TOKEN_DATA_TYPE = decltype(tag);
         const int smem_bytes = ::hybrid_ep::local_dup_dynamic_smem_bytes(

@@ -11,7 +11,7 @@ This release has the following limitations:
 | Limitation                       | Description |
 |----------------------------------|-------------|
 | **Limited QA coverage**          | This release is considered experimental and had limited Quality Assurance (QA) testing |
-| **No FP8 support**               | FP8 data types are not currently supported |
+| **No integrated quantization**   | The API currently forwards only the supported dispatch recipes; it does not quantize or dequantize token values |
 | **Fabric selection**             | Current version of API does not provide a way to force RDMA-only communication |
 | **Up to 8 nodes**                | Maximum of 64 GPUs (8 nodes × 8 GPUs) is supported |
 | **Up to 8 ranks per node**       | Only up to 8 GPUs per node is supported |

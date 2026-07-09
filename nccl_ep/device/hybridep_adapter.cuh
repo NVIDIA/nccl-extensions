@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "nccl_ep.h"
+#include "quantization_recipe.hpp"
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <nccl.h>
@@ -314,13 +316,13 @@ struct DispatchParams {
     int lsa_team_size; // Ranks per LSA (NVLink) team
     const void* attn_input_token;
     const float* attn_input_prob; // Forward dispatch only
-    const uint8_t* attn_input_scaling_factor; // FP8 only (float* for FP32, uint8_t* for UE8M0)
+    const uint8_t* attn_input_scaling_factor;  // SCALES_FORWARD input, addressed as bytes
 
     // IPC-mapped output buffers (from ep_group)
     // Pointer tables are expected to be device-resident (d_* arrays).
     void* const* expert_output_token_ptrs; // Array[lsa_team_size]
     float* const* expert_output_prob_ptrs; // Forward only
-    uint8_t* const* expert_output_scaling_factor_ptrs; // FP8 only
+    uint8_t* const* expert_output_scaling_factor_ptrs; // SCALES_FORWARD outputs, addressed as bytes
 
     // Metadata (from handle->hybridep preprocessing outputs)
     const bool* rdma_to_attn_map;
@@ -367,15 +369,16 @@ struct DispatchParams {
     int max_recv_tokens_per_rank = 0;
 };
 
-// Call dispatch kernel with runtime template parameter resolution.
+// Call dispatch kernel. Recipe and pass-direction enums remain explicit until
+// the JIT boundary selects its compile-time specialization.
 // Returns ncclInvalidArgument if the dispatch SMEM exceeds the device limit.
 ncclResult_t call_dispatch(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank, // Max tokens for buffer sizing (chunk-aligned)
     int num_tokens_per_chunk, // Dispatch/combine tokens per chunk (resolved per group)
     int num_nodes, // Number of nodes (RDMA domain size)
-    bool use_fp8, // true = FP8 (uint8_t); mutually exclusive with token_dtype != BF16
-    bool forward_dispatch, // True for forward, false for backward
+    ncclEpDispatchQuantizationRecipe_t quantization_recipe,
+    ncclEpPassDir_t pass_direction,
     int num_blocks, // Number of SMs/blocks for the kernel grid
     int sf_bytes_per_token, // Total scale bytes per token (pre-computed on host)
     const ncclEpEnvConfig* env, // Group env config; gates rank-0 verbose param dump (may be null)
@@ -446,7 +449,7 @@ struct CombineParams {
     // EM unfused-combine: combine skips secondary em_slots; primaries hold the
     // pre-reduced sum written by local_reduce.
     bool combine_local_reduce_enabled = false;
-    ncclDataType_t token_dtype = ncclBfloat16; // BF16/FP16/FP32 wire (NONE mode); ignored when use_fp8
+    ncclDataType_t token_dtype = ncclBfloat16;  // Actual token wire dtype
 
     bool guard_enabled = false; // RDMA + LSA buffer guard on/off
 };

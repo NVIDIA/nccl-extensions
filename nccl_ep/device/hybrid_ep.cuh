@@ -10,6 +10,8 @@
  */
 
 #pragma once
+
+#include "nccl_ep.h"
 #include "common.hpp"
 #include "device_primitives.cuh"
 #include "hybridep_configs.cuh"
@@ -415,20 +417,20 @@ struct dispatch_smem_layout_t {
     }
 };
 
-template <ncclEpLayout_t kLayout, ncclDataType_t kTokenDtype>
+template <ncclEpLayout_t kLayout, int kTokenSize>
 __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     dispatch_smem_layout_t& layout,
     void* smem_base,
     const dispatch_config_t& config,
     const model_config_t& model) {
+    static_assert(kTokenSize > 0, "token size must be positive");
     size_t offset = 0;
     const int num_pipelines = config.num_pipelines;
     layout.num_pipelines = num_pipelines;
     layout.stages_per_pipeline = config.stages_per_pipeline;
 
     // Token buffer (aligned to 128B for TMA) -- total stages unchanged
-    const int token_size = nccl_ep::size_u8<kTokenDtype>();
-    layout.token_buffer_stage_stride = model.hidden_dim * token_size;
+    layout.token_buffer_stage_stride = model.hidden_dim * kTokenSize;
     layout.token_buffer_stage_stride = (layout.token_buffer_stage_stride + 127) & ~127;
     layout.intra_node_token_buffer = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += config.num_of_stages * layout.token_buffer_stage_stride;
@@ -488,7 +490,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     // PAD warp TMA slot: one zeroed token row, broadcast to padding slots.
     // Only allocated for expert-major; flat leaves the pointer null.
     if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-        int pad_bytes = model.hidden_dim * nccl_ep::size_u8<kTokenDtype>();
+        int pad_bytes = model.hidden_dim * kTokenSize;
         layout.pad_tma_slot_bytes = (pad_bytes + 127) & ~127;
         offset = (offset + 127) & ~127;
         layout.pad_tma_buffer = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
@@ -500,14 +502,13 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
 
     return layout;
 }
-template <ncclEpLayout_t kLayout, ncclDataType_t kTokenDtype>
+template <ncclEpLayout_t kLayout, int kTokenSize>
 static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& config, const model_config_t& model) {
+    static_assert(kTokenSize > 0, "token size must be positive");
     size_t total_size = 0;
     const int num_pipelines = config.num_pipelines;
-    const int token_size = nccl_ep::size_u8<kTokenDtype>();
-
     // Token buffer (aligned to 128B for TMA) -- total stages unchanged
-    int token_buffer_stage_stride = model.hidden_dim * token_size;
+    int token_buffer_stage_stride = model.hidden_dim * kTokenSize;
     token_buffer_stage_stride = (token_buffer_stage_stride + 127) & ~127;
     total_size += config.num_of_stages * token_buffer_stage_stride;
 
@@ -543,7 +544,7 @@ static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& confi
     }
     // PAD warp TMA slot (expert-major only, 128B aligned)
     if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-        int pad_bytes = model.hidden_dim * nccl_ep::size_u8<kTokenDtype>();
+        int pad_bytes = model.hidden_dim * kTokenSize;
         pad_bytes = (pad_bytes + 127) & ~127;
         total_size = (total_size + 127) & ~127;
         total_size += pad_bytes;
@@ -553,9 +554,35 @@ static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& confi
     return total_size;
 }
 
-// kTokenDtype drives the per-stage token-buffer stride via the derived element width
-// (2 B for BF16/FP16, 4 B for FP32); everything else (prob, mbarriers, scales) is
-// element-width-invariant.
+// Host-side companion to the templated layout calculation above. The JIT
+// specializes the device kernel on TOKEN_DATA_TYPE; this wrapper uses that
+// same byte width for the launch-time dynamic-SMEM calculation, keeping the
+// only host template dispatch next to the template it selects.
+inline size_t calculate_dispatch_smem_layout_size(
+    ncclEpLayout_t layout,
+    unsigned int token_size,
+    const dispatch_config_t& config,
+    const model_config_t& model) {
+    if (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+        switch (token_size) {
+            case 1: return calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_EXPERT_MAJOR, 1>(config, model);
+            case 2: return calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_EXPERT_MAJOR, 2>(config, model);
+            case 4: return calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_EXPERT_MAJOR, 4>(config, model);
+            default: return 0;
+        }
+    }
+    // Preserve the pre-wrapper host mapping: every non-EM layout uses the
+    // flat dispatch SMEM layout. Layout validity is enforced at the API layer.
+    switch (token_size) {
+        case 1: return calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_FLAT, 1>(config, model);
+        case 2: return calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_FLAT, 2>(config, model);
+        case 4: return calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_FLAT, 4>(config, model);
+        default: return 0;
+    }
+}
+
+// kTokenSize drives the per-stage token-buffer stride; everything else
+// (probabilities, mbarriers, scales) is element-width-invariant.
 template <ncclDataType_t kTokenDtype = ncclBfloat16>
 __device__ combine_smem_layout_t create_combine_smem_layout(
     combine_smem_layout_t& layout,
@@ -882,7 +909,7 @@ struct dispatch_kernel_param_t : dispatch_kernel_param_base_t<TOKEN_DATA_TYPE> {
     // Keep embedded arrays here to avoid device-side pointer-table indirection.
     TOKEN_DATA_TYPE* expert_output_token[LSA_TEAM_SIZE];
     float* expert_output_prob[LSA_TEAM_SIZE]; // Only valid in forward dispatch.
-    uint8_t* expert_output_scaling_factor[LSA_TEAM_SIZE]; // Only valid for FP8 token type.
+    uint8_t* expert_output_scaling_factor[LSA_TEAM_SIZE]; // Only valid for SCALES_FORWARD.
 };
 
 // Fixed-size part of combine kernel parameters. Peer pointer arrays are appended
@@ -1367,7 +1394,7 @@ __forceinline__ __device__ void dispatch_s2g_store_prob(
         unsigned long long pd_bits = __shfl_sync(
             0xffffffffu, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(my_prob_dst)), src_lane);
         float4* dst_ptr4 = reinterpret_cast<float4*>(static_cast<uintptr_t>(pd_bits));
-        
+
         #pragma unroll
         for (int e = s2g_lane; e < prob_vec4; e += 32) {
             dst_ptr4[e] = prob_src4[e];
@@ -3747,7 +3774,8 @@ __device__ __forceinline__ bool elect_last_block(const int* counter, int num_blo
 }
 
 template <
-    ncclDataType_t kTokenDtype,
+    typename TOKEN_DATA_TYPE,
+    ncclEpDispatchQuantizationRecipe_t kQuantizationRecipe,
     typename INTER_NODE_GROUP,
     typename INTRA_NODE_G2S_GROUP,
     typename INTRA_NODE_S2G_GROUP,
@@ -3766,9 +3794,11 @@ template <
     int SF_BYTES_PER_TOKEN,
     int EXPERTS_PER_RANK>
 __device__ __forceinline__ void dispatch_kernel_impl(
-    const dispatch_kernel_param_t<nccl_ep::wire_t<kTokenDtype>, LSA_TEAM_SIZE>& param,
+    const dispatch_kernel_param_t<TOKEN_DATA_TYPE, LSA_TEAM_SIZE>& param,
     uint8_t* smem_bytes) {
-    using TOKEN_DATA_TYPE = nccl_ep::wire_t<kTokenDtype>;
+    static_assert(kQuantizationRecipe == NCCL_EP_DISPATCH_QUANT_NONE ||
+                      kQuantizationRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD,
+                  "unsupported dispatch quantization recipe");
     if constexpr (NUM_LSA_TEAMS != 1) {
         static_assert(
             INTER_NODE_GROUP::size() % 32 == 0 && INTER_NODE_GROUP::size() <= 64,
@@ -3796,7 +3826,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     d_model.num_of_experts_per_rank = param.experts_per_rank;
     d_model.num_of_ranks_per_node = param.num_of_ranks_per_node;
     d_model.num_of_nodes = NUM_LSA_TEAMS;
-    create_dispatch_smem_layout<kLayout, kTokenDtype>(smem_layout, smem_bytes, d_config, d_model);
+    create_dispatch_smem_layout<kLayout, sizeof(TOKEN_DATA_TYPE)>(smem_layout, smem_bytes, d_config, d_model);
     cur_smem_t* smem_buffer_ptr = &smem_layout;
 
     using head_init_warp = warp_group<1, 0>;
@@ -3851,7 +3881,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     long long _wt_start = 0;
     if (threadIdx.x % 32 == 0) _wt_start = clock64();
 #endif
-    constexpr bool HAS_SF = (SF_BYTES_PER_TOKEN > 0);
+    constexpr bool HAS_SF = (kQuantizationRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD);
     int threadIdx_x_int = (int)threadIdx.x;
     if (threadIdx_x_int < INTER_NODE_GROUP::size()) {
         if constexpr (NUM_LSA_TEAMS != 1) {

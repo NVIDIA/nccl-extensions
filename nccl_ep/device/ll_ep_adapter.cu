@@ -9,6 +9,7 @@
 #include "jit/ll_dispatch_jit.cuh"
 #include "jit/ll_combine_jit.cuh"
 #include "jit/ll_clean_jit.cuh"
+#include "quantization_recipe.hpp"
 
 #include <algorithm>
 
@@ -26,9 +27,12 @@ using ::nccl_ep::ceil_div;
 //   - chooses (numSms, numWarps) from the per-rank expert count
 //   - packs the params + per-call flags into dispatch_kernel_args_t
 //   - hands off to launch_ll_dispatch(), which JIT-compiles the kernel
-//     specialised for (useFp8, useUe8m0, hidden, layout, nvlinkOnly)
+//     specialised for (recipe, hidden, layout, nvlinkOnly)
 // ============================================================================
-void call_dispatch(const DispatchParams& params, bool useFp8, cudaStream_t stream) {
+ncclResult_t call_dispatch(
+    const DispatchParams& params,
+    ncclEpDispatchQuantizationRecipe_t quantization_recipe,
+    cudaStream_t stream) {
     constexpr int kNumMaxTopK = 9;
     const int numWarpGroups = ceil_div(params.numExperts, params.numDeviceSms);
     const int numWarpsPerGroup = 32 / numWarpGroups;
@@ -43,8 +47,6 @@ void call_dispatch(const DispatchParams& params, bool useFp8, cudaStream_t strea
     auto rankCountersBase = static_cast<int*>(params.workspace);
     auto rankDone = rankCountersBase + 2 * params.numRanks;
     EP_HOST_ASSERT((2 * params.numRanks + params.numExperts) * sizeof(int) <= NUM_WORKSPACE_BYTES);
-
-    if (params.useUe8m0) EP_HOST_ASSERT(params.roundScale and "UE8M0 SF requires `round_scale=True`");
 
     dispatch_kernel_args_t args{};
     args.inData = params.inData;
@@ -93,25 +95,20 @@ void call_dispatch(const DispatchParams& params, bool useFp8, cudaStream_t strea
     args.recvDataWindow = params.recvDataWindow;
     args.recvDataOffset = params.recvDataOffset;
 
-    // EXTERN FP8 (kExternQuant) is signalled by a non-null input scale buffer.
-    const bool useExternQuant = (params.inScalesBuf != nullptr);
+    DispatchKernelSpec kernel_spec;
+    ncclResult_t r = resolveDispatchKernelSpec(
+        quantization_recipe, params.tokenDtype, &kernel_spec);
+    if (r != ncclSuccess) {
+        return r;
+    }
 
-    // Dispatch is a byte-copy, so FP16 folds onto the BF16 kernel (no redundant
-    // FP16 instantiation) and any FP8 path always wires BF16. Only non-FP8 FP32
-    // input gets the distinct 4-byte kernel. Mirrors the legacy host launch
-    // selection exactly (see ll_ep.cuh dispatch DISPATCH_LAUNCH_CASE_IMPL).
-    const ncclDataType_t kernelTokenDtype =
-        (!useFp8 && !useExternQuant && params.tokenDtype == ncclFloat32) ? ncclFloat32 : ncclBfloat16;
-
-    jit::launch_ll_dispatch(
-        useFp8,
-        params.useUe8m0,
-        useExternQuant,
+    return jit::launch_ll_dispatch(
         params.hidden,
         params.layout,
         params.nvlinkOnly,
         params.topkIdxIsInt64,
-        kernelTokenDtype,
+        kernel_spec,
+        params.tokenDtype,
         numSms,
         numWarps,
         args,

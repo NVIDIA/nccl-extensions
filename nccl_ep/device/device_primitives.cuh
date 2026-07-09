@@ -90,7 +90,7 @@ __host__ __device__ constexpr int size_u8<ncclFloat8e5m2>() {
     return sizeof(uint8_t);
 }
 
-// Wire element width in uint16_t units (token buffers use a uint16_t* base; FP8 has no
+// Wire element width in uint16_t units (token buffers use a uint16_t* base; one-byte values have no
 // uint16_t-unit stride, so it is intentionally not specialized here).
 template <ncclDataType_t kDt>
 __host__ __device__ constexpr int size_u16();
@@ -110,7 +110,7 @@ __host__ __device__ constexpr int size_u16<ncclBfloat16>() {
 // Unsigned integer "wire type" of the same width as a token dtype, for the
 // byte-copy dispatch path (which moves tokens by raw width, never decoding
 // values). FP16 and BF16 collapse to uint16_t (identical byte transport);
-// FP32 -> uint32_t, FP8 -> uint8_t. Primary template is undefined so an
+// FP32 -> uint32_t, one-byte values -> uint8_t. Primary template is undefined so an
 // unsupported dtype is a compile error (mirrors size_u8).
 template <ncclDataType_t kDt>
 struct wire_type;

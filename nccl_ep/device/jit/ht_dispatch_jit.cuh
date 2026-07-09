@@ -7,6 +7,7 @@
 #pragma once
 
 #include "device/hybrid_ep.cuh"
+#include "device/hybridep_adapter.cuh"
 #include "device/jit/jit_runtime.hpp"
 #include "device/jit/jit_utils.hpp"
 #include "nccl_ep_env.h"
@@ -28,10 +29,6 @@ constexpr const char* kDispatchJitEntryName = "nccl_ep_jit_ht_dispatch_kernel";
 
 inline const char* dispatch_bool_literal(bool value) {
     return value ? "true" : "false";
-}
-
-inline const char* dispatch_token_data_type_literal(bool use_fp8, ncclDataType_t token_dtype = ncclBfloat16) {
-    return use_fp8 ? "uint8_t" : (token_dtype == ncclFloat32 ? "uint32_t" : "uint16_t");
 }
 
 struct dispatch_warp_layout_t {
@@ -83,24 +80,16 @@ inline std::string dispatch_jit_source(
     int num_pipelines,
     int lsa_team_size,
     ncclEpLayout_t layout,
-    bool use_fp8,
     int hidden_dim,
     int sf_bytes_per_token,
     int experts_per_rank,
-    ncclDataType_t token_dtype = ncclBfloat16) {
+    const DispatchKernelSpec& kernel_spec) {
     const char* layout_literal =
         (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? "NCCL_EP_LAYOUT_EXPERT_MAJOR" : "NCCL_EP_LAYOUT_FLAT";
-    const char* token_type_literal = dispatch_token_data_type_literal(use_fp8, token_dtype);
-    // Canonical wire-dtype enum for the kernel template arg: FP8 -> e4m3 (1 B),
-    // FP32 -> 4 B, everything else (BF16/FP16) -> BF16 (2 B). Mirrors
-    // token_type_literal so wire_t<kWireDtype> == TOKEN_DATA_TYPE. Dispatch is a
-    // byte copy, so FP16 and BF16 intentionally share one (2-byte) kernel.
-    const char* wire_dtype_literal =
-        use_fp8 ? "ncclFloat8e4m3" : (token_dtype == ncclFloat32 ? "ncclFloat32" : "ncclBfloat16");
     std::ostringstream src;
     src << "#include \"device/hybrid_ep.cuh\"\n"
         << "\n"
-        << "using TOKEN_DATA_TYPE = " << token_type_literal << ";\n"
+        << "using TOKEN_DATA_TYPE = " << kernel_spec.payload_type_literal << ";\n"
         << "static constexpr int kSfBytesPerToken = " << sf_bytes_per_token << ";\n"
         << "using INTER_NODE_GROUP     = hybrid_ep::warp_group<" << inter_node_group_warps << ", "
         << inter_node_group_start << ">;\n"
@@ -117,7 +106,8 @@ inline std::string dispatch_jit_source(
         << "> param) {\n"
         << "  extern __shared__ uint8_t smem_bytes[];\n"
         << "  hybrid_ep::dispatch_kernel_impl<\n"
-        << "      " << wire_dtype_literal << ",\n"
+        << "      TOKEN_DATA_TYPE,\n"
+        << "      " << kernel_spec.recipe_source_literal << ",\n"
         << "      INTER_NODE_GROUP,\n"
         << "      INTRA_NODE_G2S_GROUP,\n"
         << "      INTRA_NODE_S2G_GROUP,\n"
@@ -139,7 +129,7 @@ inline std::string dispatch_jit_source(
     return src.str();
 }
 
-inline void launch_dispatch(
+inline ncclResult_t launch_dispatch(
     int num_of_stages,
     int num_of_in_flight_s2g,
     int num_of_tokens_per_chunk,
@@ -149,7 +139,6 @@ inline void launch_dispatch(
     int num_lsa_teams,
     int lsa_team_size,
     ncclEpLayout_t layout,
-    bool use_fp8,
     int hidden_dim,
     int sf_bytes_per_token,
     int experts_per_rank,
@@ -158,7 +147,7 @@ inline void launch_dispatch(
     size_t param_size,
     int dynamic_smem_bytes,
     cudaStream_t stream,
-    ncclDataType_t token_dtype = ncclBfloat16) {
+    const DispatchKernelSpec& kernel_spec) {
     const dispatch_warp_layout_t L = compute_dispatch_warp_layout(num_lsa_teams, layout);
 
     static const int fwd_variant_identity = 0;
@@ -171,11 +160,8 @@ inline void launch_dispatch(
              << num_of_stages << "_inflt" << num_of_in_flight_s2g << "_chunk" << num_of_tokens_per_chunk << "_maxt"
              << max_tokens_per_rank << "_blocks" << num_of_blocks << (forward_dispatch ? "_fwd" : "_bwd")
              << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_fl")
-            // Dispatch is a pure byte-copy: FP16 and BF16 both map to a uint16_t kernel,
-            // so they share one cache entry ("_16b"); only the 32-bit width is distinct.
-             << (use_fp8                    ? "_fp8" :
-                 token_dtype == ncclFloat32 ? "_fp32" :
-                                              "_16b")
+             << "_recipe" << kernel_spec.recipe_cache_tag
+             << "_payload" << kernel_spec.payload_cache_tag
              << "_sf" << sf_bytes_per_token << "_epr" << experts_per_rank;
         return name.str();
     }();
@@ -198,11 +184,10 @@ inline void launch_dispatch(
         L.num_pipelines,
         lsa_team_size,
         layout,
-        use_fp8,
         hidden_dim,
         sf_bytes_per_token,
         experts_per_rank,
-        token_dtype);
+        kernel_spec);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_dispatch";
@@ -224,7 +209,7 @@ inline void launch_dispatch(
             "[nccl_ep][env]   nodes(lsa_teams)=%d lsa_team_size=%d hidden_dim=%d\n"
             "[nccl_ep][env]   stages=%d in_flight_s2g=%d pipelines=%d tokens_per_chunk=%d max_tokens_per_rank=%d\n"
             "[nccl_ep][env]   num_blocks=%d block_dim=%d dynamic_smem_bytes=%d\n"
-            "[nccl_ep][env]   forward=%s layout=%s dtype=%s use_fp8=%s sf_bytes_per_token=%d experts_per_rank=%d\n",
+            "[nccl_ep][env]   forward=%s layout=%s wire_dtype=%s dispatch_recipe=%s sf_bytes_per_token=%d experts_per_rank=%d\n",
             variant_name.c_str(),
             num_lsa_teams,
             lsa_team_size,
@@ -239,10 +224,8 @@ inline void launch_dispatch(
             dynamic_smem_bytes,
             dispatch_bool_literal(forward_dispatch),
             (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "EXPERT_MAJOR" : "FLAT"),
-            (use_fp8                    ? "fp8" :
-             token_dtype == ncclFloat32 ? "fp32" :
-                                          "16b"),
-            dispatch_bool_literal(use_fp8),
+            kernel_spec.wire_dtype_literal,
+            kernel_spec.recipe_source_literal,
             sf_bytes_per_token,
             experts_per_rank);
     }
@@ -255,8 +238,9 @@ inline void launch_dispatch(
         std::fprintf(stderr, "[nccl_ep jit] fatal dispatch JIT launch failure for %s: %s%s%s\n", variant_name.c_str(),
                      ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
                      error.empty() ? "" : error.c_str());
-        std::abort();
+        return ncclInternalError;
     }
+    return ncclSuccess;
 }
 
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING

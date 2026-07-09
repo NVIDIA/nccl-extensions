@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "nccl_ep.h"
+
 #include <filesystem>
 #include <string>
 #include <string_view>

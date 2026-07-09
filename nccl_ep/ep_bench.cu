@@ -441,7 +441,46 @@ static float bf16ToFloat(uint16_t bf16) {
 }
 
 static size_t tokenElemBytes(ncclDataType_t dtype) {
-    return (dtype == ncclFloat32) ? 4u : 2u;
+    switch (dtype) {
+        case ncclFloat8e4m3:
+        case ncclFloat8e5m2:
+            return 1u;
+        case ncclBfloat16:
+        case ncclFloat16:
+            return 2u;
+        case ncclFloat32:
+            return 4u;
+        default:
+            fprintf(stderr, "NCCL EP benchmark warning: unsupported token dtype %d\n",
+                    static_cast<int>(dtype));
+            return 0;
+    }
+}
+
+static ncclDataType_t dispatchTokenDtype(
+    ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
+    ncclDataType_t none_dtype) {
+    switch (dispatch_quantization) {
+        case NCCL_EP_DISPATCH_QUANT_NONE: return none_dtype;
+        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD: return ncclFloat8e4m3;
+        case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4: return ncclFloat8e4m3;
+        default:
+            fprintf(stderr, "NCCL EP benchmark warning: unsupported dispatch recipe %d\n",
+                    static_cast<int>(dispatch_quantization));
+            return none_dtype;
+    }
+}
+
+static const char* dispatchRecipeName(ncclEpDispatchQuantizationRecipe_t dispatch_quantization) {
+    switch (dispatch_quantization) {
+        case NCCL_EP_DISPATCH_QUANT_NONE: return "none";
+        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD: return "scales-forward";
+        case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4: return "ds-fp8e3m4";
+        default:
+            fprintf(stderr, "NCCL EP benchmark warning: unsupported dispatch recipe %d\n",
+                    static_cast<int>(dispatch_quantization));
+            return "invalid";
+    }
 }
 
 static float tokenElemToFloat(const void* data, size_t idx, ncclDataType_t dtype) {
@@ -822,17 +861,34 @@ static const int RANK_OFFSET = 128;
 // Matches DeepEP's approach: last 128 columns store token index
 static const int TOKEN_ID_COLS = 128;
 
-// FP8 scale tensor: one scale per 128 hidden elements.
-static const unsigned FP8_BLOCK_SIZE = 128;
+static const unsigned DS_FP8E3M4_ELEMENTS_PER_SCALE = 128;
+static const unsigned SCALES_FORWARD_BENCHMARK_SCALES_PER_TOKEN = 4;
 
-static inline uint8_t fp8TokenByte(int rank, unsigned int t, unsigned int h) {
+static unsigned int benchmarkScalesPerToken(
+    ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
+    unsigned int hidden) {
+    switch (dispatch_quantization) {
+        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
+            return SCALES_FORWARD_BENCHMARK_SCALES_PER_TOKEN;
+        case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
+            return hidden / DS_FP8E3M4_ELEMENTS_PER_SCALE;
+        case NCCL_EP_DISPATCH_QUANT_NONE:
+            return 0;
+        default:
+            fprintf(stderr, "NCCL EP benchmark warning: unsupported dispatch recipe %d\n",
+                    static_cast<int>(dispatch_quantization));
+            return 0;
+    }
+}
+
+static inline uint8_t scalesForwardTokenByte(int rank, unsigned int t, unsigned int h) {
     if (h == 0) return static_cast<uint8_t>(rank);
     if (h == 1) return static_cast<uint8_t>(t / 256u);
     if (h == 2) return static_cast<uint8_t>(t % 256u);
     return static_cast<uint8_t>((static_cast<unsigned>(rank) * 131u + t * 17u + h) & 0xFFu);
 }
 
-static inline float fp8ScaleValue(int rank, unsigned int t, unsigned int b) {
+static inline float scalesForwardScaleValue(int rank, unsigned int t, unsigned int b) {
     return static_cast<float>(rank * 1000 + static_cast<int>(t) * 10 + static_cast<int>(b));
 }
 
@@ -859,7 +915,7 @@ static double calc_diff(const double* x, const double* y, size_t n) {
 
 // Initialize dispatch input tensors with validation-friendly patterns.
 // When dispatch_inputs.tokens is BF16: fills with rank value + token ID in last TOKEN_ID_COLS cols.
-// When dispatch_inputs.tokens is FP8: fills with fp8TokenByte pattern; fills scales if present.
+// When dispatch_inputs.tokens is scales-forward: fills with scalesForwardTokenByte pattern; fills scales if present.
 // topk_weights are filled the same way for both.
 void initializeValidationData(
     const BenchmarkAllocState& alloc,
@@ -870,17 +926,15 @@ void initializeValidationData(
     unsigned int top_k,
     int myRank,
     bool is_ht_mode,
+    ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
     ncclDataType_t token_dtype = ncclBfloat16) {
-    const ncclDataType_t tok_dtype = dispatch_inputs.tokens ? dispatch_inputs.tokens->datatype : ncclBfloat16;
-    const bool is_fp8 = (tok_dtype == ncclFloat8e4m3 || tok_dtype == ncclFloat8e5m2);
-
-    if (is_fp8) {
-        // FP8 EXTERN dispatch: fill 1-byte token data with fp8TokenByte pattern.
+    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        // SCALES_FORWARD dispatch: fill one-byte token data with the validation pattern.
         size_t token_size = static_cast<size_t>(num_tokens) * hidden;
         uint8_t* token_data_host = new uint8_t[token_size];
         for (unsigned int t = 0; t < num_tokens; t++)
             for (unsigned int h = 0; h < hidden; h++)
-                token_data_host[static_cast<size_t>(t) * hidden + h] = fp8TokenByte(myRank, t, h);
+                token_data_host[static_cast<size_t>(t) * hidden + h] = scalesForwardTokenByte(myRank, t, h);
         {
             void* input0_data;
             NCCLCHECK(epGetTensorData(alloc, dispatch_inputs.tokens, &input0_data));
@@ -890,12 +944,12 @@ void initializeValidationData(
 
         // Fill input scales if present.
         if (dispatch_inputs.scales) {
-            const unsigned int numScales = hidden / FP8_BLOCK_SIZE;
+            const unsigned int numScales = static_cast<unsigned int>(dispatch_inputs.scales->sizes[1]);
             size_t scale_size = static_cast<size_t>(num_tokens) * numScales;
             float* scale_data_host = new float[scale_size];
             for (unsigned int t = 0; t < num_tokens; t++)
                 for (unsigned int b = 0; b < numScales; b++)
-                    scale_data_host[static_cast<size_t>(t) * numScales + b] = fp8ScaleValue(myRank, t, b);
+                    scale_data_host[static_cast<size_t>(t) * numScales + b] = scalesForwardScaleValue(myRank, t, b);
             {
                 void* scales_data;
                 NCCLCHECK(epGetTensorData(alloc, dispatch_inputs.scales, &scales_data));
@@ -904,7 +958,8 @@ void initializeValidationData(
             delete[] scale_data_host;
         }
     } else {
-        // NONE mode (BF16/FP16/FP32): fill with rank value; last TOKEN_ID_COLS columns carry token index.
+        // NONE and DS_FP8E3M4 inputs are BF16/FP16/FP32 tensors. Fill with a
+        // rank value and a token ID in the final TOKEN_ID_COLS columns.
         float rank_value = static_cast<float>(myRank - RANK_OFFSET);
         size_t token_size = num_tokens * hidden;
         size_t eb = tokenElemBytes(token_dtype);
@@ -928,7 +983,7 @@ void initializeValidationData(
         delete[] token_data_host;
     }
 
-    // topk_weights — shared by both NONE and FP8 paths.
+    // topk_weights — shared by both NONE and scales-forward paths.
     // Generate random positive topk_weights: abs(randn)
     // LL: weights applied during combine → affects combined output
     // HT: weights forwarded during dispatch → does NOT affect combined output
@@ -952,7 +1007,7 @@ void initializeValidationData(
     delete[] topk_weights_host;
 }  // initializeValidationData
 
-// FP8 EXTERN dispatch validation — simple byte-transport check.
+// SCALES_FORWARD dispatch validation — simple byte-transport check.
 // Token row: byte[0]=rank, byte[1]=t/256, byte[2]=t%256, rest=(rank*131+t*17+h)&0xFF.
 // Identity is read from bytes 0-2; scales are FP32 deterministic pattern.
 // Dispatch is pure byte transport — we just verify the bytes arrive unchanged.
@@ -1212,6 +1267,237 @@ static ValidationResult validateDispatchOutputLLExpertMaj(
         char buf[256];
         snprintf(buf, sizeof(buf), "LL-EM dispatch validation: %d errors", rep.errors);
         result.message = buf;
+    }
+    return result;
+}
+
+// ==================== LL expert-major SCALES_FORWARD validation ====================
+// Output tokens/scales are [local_expert, recv_slot, hidden/scales]. Verify
+// every populated expert slot carries the exact token bytes and FP32 scale row
+// from its routed source token.
+static ValidationResult validateDispatchOutputLLExpertMajScalesForward(
+    const BenchmarkAllocState&     alloc,
+    const ncclEpDispatchOutputs_t& dispatch_outputs,
+    const ncclEpLayoutInfo_t&      dispatch_layout_info,
+    unsigned int max_tokens_per_rank,
+    const unsigned int*            num_tokens_per_rank,
+    unsigned int hidden,
+    unsigned int top_k,
+    unsigned int num_experts,
+    unsigned int num_local_experts,
+    int myRank,
+    int nRanks
+) {
+    ValidationResult result = {true, 0, 0.0, ""};
+    ErrorReporter rep;
+    const unsigned int num_scales = static_cast<unsigned int>(dispatch_outputs.scales->sizes[2]);
+    const size_t* token_sizes = dispatch_outputs.tokens->sizes;
+    const unsigned int slots_per_expert = static_cast<unsigned int>(token_sizes[1]);
+    const size_t total_slots = static_cast<size_t>(num_local_experts) * slots_per_expert;
+
+    std::vector<uint8_t> recv_tokens(total_slots * hidden);
+    std::vector<float> recv_scales(total_slots * num_scales);
+    std::vector<int> received_per_expert(num_local_experts);
+    void* output_tokens = nullptr;
+    void* output_scales = nullptr;
+    void* expert_counters = nullptr;
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.tokens, &output_tokens));
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.scales, &output_scales));
+    NCCLCHECK(epGetTensorData(alloc, dispatch_layout_info.expert_counters, &expert_counters));
+    CUDACHECK(cudaMemcpy(recv_tokens.data(), output_tokens, recv_tokens.size(), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_scales.data(), output_scales,
+                         recv_scales.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(received_per_expert.data(), expert_counters,
+                         received_per_expert.size() * sizeof(int), cudaMemcpyDeviceToHost));
+
+    std::vector<std::set<std::pair<int, int>>> expected(num_local_experts);
+    std::vector<int64_t> source_topk(static_cast<size_t>(max_tokens_per_rank) * top_k);
+    for (int rank = 0; rank < nRanks; ++rank) {
+        generateRandomTopkIndicesLL(source_topk.data(), num_tokens_per_rank[rank],
+                                    num_experts, top_k, rank);
+        for (unsigned int token = 0; token < num_tokens_per_rank[rank]; ++token) {
+            for (unsigned int topk = 0; topk < top_k; ++topk) {
+                const int64_t expert = source_topk[token * top_k + topk];
+                if (expert >= 0 && expert / static_cast<int>(num_local_experts) == myRank) {
+                    expected[expert % static_cast<int>(num_local_experts)].insert(
+                        {rank, static_cast<int>(token)});
+                }
+            }
+        }
+    }
+
+    std::vector<uint8_t> expected_token(hidden);
+    std::vector<float> expected_scale(num_scales);
+    for (unsigned int expert = 0; expert < num_local_experts; ++expert) {
+        const int count = received_per_expert[expert];
+        if (count < 0 || count > static_cast<int>(slots_per_expert)) {
+            rep.error("[Rank %d] LL SCALES_FORWARD: expert %u has invalid count %d (max %u)\n",
+                      myRank, expert, count, slots_per_expert);
+            continue;
+        }
+        std::set<std::pair<int, int>> found;
+        for (int slot = 0; slot < count; ++slot) {
+            const size_t row = static_cast<size_t>(expert) * slots_per_expert + slot;
+            const uint8_t* token_row = recv_tokens.data() + row * hidden;
+            const float* scale_row = recv_scales.data() + row * num_scales;
+            const int source_rank = static_cast<int>(token_row[0]);
+            const int source_token = static_cast<int>(token_row[1]) * 256 + token_row[2];
+            if (source_rank < 0 || source_rank >= nRanks || source_token < 0 ||
+                source_token >= static_cast<int>(max_tokens_per_rank)) {
+                rep.error("[Rank %d] LL SCALES_FORWARD: expert %u slot %d has invalid identity (%d, %d)\n",
+                          myRank, expert, slot, source_rank, source_token);
+                continue;
+            }
+            const auto key = std::make_pair(source_rank, source_token);
+            if (expected[expert].find(key) == expected[expert].end()) {
+                rep.error("[Rank %d] LL SCALES_FORWARD: expert %u slot %d has unexpected token (%d, %d)\n",
+                          myRank, expert, slot, source_rank, source_token);
+            }
+            found.insert(key);
+            for (unsigned int h = 0; h < hidden; ++h)
+                expected_token[h] = scalesForwardTokenByte(source_rank, source_token, h);
+            if (memcmp(token_row, expected_token.data(), hidden) != 0) {
+                rep.error("[Rank %d] LL SCALES_FORWARD: expert %u slot %d token bytes differ\n",
+                          myRank, expert, slot);
+            }
+            for (unsigned int scale = 0; scale < num_scales; ++scale)
+                expected_scale[scale] = scalesForwardScaleValue(source_rank, source_token, scale);
+            if (memcmp(scale_row, expected_scale.data(), num_scales * sizeof(float)) != 0) {
+                rep.error("[Rank %d] LL SCALES_FORWARD: expert %u slot %d scale row differs\n",
+                          myRank, expert, slot);
+            }
+        }
+        for (const auto& key : expected[expert]) {
+            if (found.find(key) == found.end()) {
+                rep.error("[Rank %d] LL SCALES_FORWARD: expert %u is missing token (%d, %d)\n",
+                          myRank, expert, key.first, key.second);
+            }
+        }
+    }
+
+    result.errors = rep.errors;
+    result.passed = result.errors == 0;
+    if (!result.passed) {
+        char message[256];
+        snprintf(message, sizeof(message), "LL SCALES_FORWARD dispatch validation: %d errors", result.errors);
+        result.message = message;
+    }
+    return result;
+}
+
+static float dsFp8E3M4ScaleValue(
+    int source_rank,
+    unsigned int source_token,
+    unsigned int scale_idx,
+    unsigned int num_scales) {
+    float amax = 1e-4f;
+    if (scale_idx + 1 == num_scales) {
+        amax = std::max(amax, static_cast<float>(source_token / 256));
+        amax = std::max(amax, static_cast<float>(source_token % 256));
+    } else {
+        amax = std::max(amax, std::abs(static_cast<float>(source_rank - RANK_OFFSET)));
+    }
+    return amax / 448.0f;
+}
+
+static ValidationResult validateDispatchOutputLLExpertMajDsFp8E3M4(
+    const BenchmarkAllocState&     alloc,
+    const ncclEpDispatchOutputs_t& dispatch_outputs,
+    const ncclEpLayoutInfo_t&      dispatch_layout_info,
+    unsigned int max_tokens_per_rank,
+    const unsigned int*            num_tokens_per_rank,
+    unsigned int hidden,
+    unsigned int top_k,
+    unsigned int num_experts,
+    unsigned int num_local_experts,
+    int myRank,
+    int nRanks
+) {
+    ValidationResult result = {true, 0, 0.0, ""};
+    ErrorReporter rep;
+    const unsigned int num_scales = hidden / DS_FP8E3M4_ELEMENTS_PER_SCALE;
+    const unsigned int slots_per_expert =
+        static_cast<unsigned int>(dispatch_outputs.tokens->sizes[1]);
+    const size_t total_slots = static_cast<size_t>(num_local_experts) * slots_per_expert;
+
+    std::vector<uint8_t> recv_tokens(total_slots * hidden);
+    std::vector<float> recv_scales(total_slots * num_scales);
+    std::vector<int> received_per_expert(num_local_experts);
+    void* output_tokens = nullptr;
+    void* output_scales = nullptr;
+    void* expert_counters = nullptr;
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.tokens, &output_tokens));
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.scales, &output_scales));
+    NCCLCHECK(epGetTensorData(alloc, dispatch_layout_info.expert_counters, &expert_counters));
+    CUDACHECK(cudaMemcpy(recv_tokens.data(), output_tokens, recv_tokens.size(), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_scales.data(), output_scales,
+                         recv_scales.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(received_per_expert.data(), expert_counters,
+                         received_per_expert.size() * sizeof(int), cudaMemcpyDeviceToHost));
+
+    std::vector<std::set<std::pair<int, int>>> expected(num_local_experts);
+    std::vector<int64_t> source_topk(static_cast<size_t>(max_tokens_per_rank) * top_k);
+    for (int rank = 0; rank < nRanks; ++rank) {
+        generateRandomTopkIndicesLL(source_topk.data(), num_tokens_per_rank[rank],
+                                    num_experts, top_k, rank);
+        for (unsigned int token = 0; token < num_tokens_per_rank[rank]; ++token) {
+            for (unsigned int topk = 0; topk < top_k; ++topk) {
+                const int64_t expert = source_topk[token * top_k + topk];
+                if (expert >= 0 && expert / static_cast<int>(num_local_experts) == myRank) {
+                    expected[expert % static_cast<int>(num_local_experts)].insert(
+                        {rank, static_cast<int>(token)});
+                }
+            }
+        }
+    }
+
+    for (unsigned int expert = 0; expert < num_local_experts; ++expert) {
+        const int count = received_per_expert[expert];
+        if (count < 0 || count > static_cast<int>(slots_per_expert)) {
+            rep.error("[Rank %d] LL DS_FP8E3M4: expert %u has invalid count %d (max %u)\n",
+                      myRank, expert, count, slots_per_expert);
+            continue;
+        }
+        std::set<std::pair<int, int>> found;
+        for (int slot = 0; slot < count; ++slot) {
+            const size_t row = static_cast<size_t>(expert) * slots_per_expert + slot;
+            const uint8_t* token_row = recv_tokens.data() + row * hidden;
+            const float* scale_row = recv_scales.data() + row * num_scales;
+            const auto match = std::find_if(
+                expected[expert].begin(), expected[expert].end(), [&](const auto& source) {
+                    for (unsigned int scale = 0; scale < num_scales; ++scale) {
+                        if (std::abs(scale_row[scale] - dsFp8E3M4ScaleValue(
+                                source.first, source.second, scale, num_scales)) > 1e-6f) {
+                            return false;
+                        }
+                    }
+                    return true;
+                });
+            if (match == expected[expert].end()) {
+                rep.error("[Rank %d] LL DS_FP8E3M4: expert %u slot %d has an unexpected scale row\n",
+                          myRank, expert, slot);
+                continue;
+            }
+            if (std::all_of(token_row, token_row + hidden, [](uint8_t value) { return value == 0; })) {
+                rep.error("[Rank %d] LL DS_FP8E3M4: expert %u slot %d has an all-zero token row\n",
+                          myRank, expert, slot);
+            }
+            found.insert(*match);
+        }
+        for (const auto& source : expected[expert]) {
+            if (found.find(source) == found.end()) {
+                rep.error("[Rank %d] LL DS_FP8E3M4: expert %u is missing token (%d, %d)\n",
+                          myRank, expert, source.first, source.second);
+            }
+        }
+    }
+
+    result.errors = rep.errors;
+    result.passed = result.errors == 0;
+    if (!result.passed) {
+        char message[256];
+        snprintf(message, sizeof(message), "LL DS_FP8E3M4 dispatch validation: %d errors", result.errors);
+        result.message = message;
     }
     return result;
 }
@@ -1485,14 +1771,14 @@ static void preReduceRankMajor(
     delete[] recv_wgt;
 }
 
-// ==================== HT EXTERN FP8 dispatch byte-equality validation ====================
-// Output tokens: 2D [buf_rows, hidden] uint8 (FP8 bytes); output scales: 2D [buf_rows, numScales] f32.
-// Dispatch is a pure byte transport (it never decodes FP8). For each valid recv slot we recover the
-// source (rank, token) from the f32 scale blocks 0/1/2, then memcmp the full token byte row and the
-// full scale row against the deterministic recompute (fp8TokenByte / fp8ScaleValue). Routing replay
+// ==================== HT SCALES_FORWARD dispatch byte-equality validation ====================
+// Output tokens: 2D [buf_rows, hidden] one-byte values; output scales: 2D [buf_rows, numScales] f32.
+// Dispatch is a pure byte transport. For each valid recv slot we recover the
+// source (rank, token) from the first three token bytes, then memcmp the full token byte row and the
+// full scale row against the deterministic recompute (scalesForwardTokenByte / scalesForwardScaleValue). Routing replay
 // (generateTopkIndicesHT) gives the expected (rank, token) set for missing/unexpected accounting.
 // Mirrors validateDispatchOutputHTRankMaj's valid-slot scan via recv_topk_idx.
-static ValidationResult validateDispatchOutputHTExtern(
+static ValidationResult validateDispatchOutputHTScalesForward(
     const ncclEpDispatchOutputs_t& dispatch_outputs,
     unsigned int max_tokens_per_rank,
     const unsigned int* num_tokens_per_rank,
@@ -1505,7 +1791,7 @@ static ValidationResult validateDispatchOutputHTExtern(
     ValidationResult result = {true, 0, 0.0, ""};
     ErrorReporter rep;
 
-    const unsigned int numScales = hidden / FP8_BLOCK_SIZE;
+    const unsigned int numScales = static_cast<unsigned int>(dispatch_outputs.scales->sizes[1]);
 
     const size_t* out0_sizes = dispatch_outputs.tokens->sizes;
     unsigned int buf_rows = out0_sizes[0];
@@ -1582,7 +1868,7 @@ static ValidationResult validateDispatchOutputHTExtern(
 
         if (src_rank < 0 || src_rank >= nRanks || token_id < 0 || token_id >= static_cast<int>(max_tokens_per_rank)) {
             rep.error(
-                "[Rank %d] FP8 dispatch: slot %u: invalid identity (rank=%d, token=%d)\n",
+                "[Rank %d] SCALES_FORWARD dispatch: slot %u: invalid identity (rank=%d, token=%d)\n",
                 myRank,
                 j,
                 src_rank,
@@ -1593,7 +1879,7 @@ static ValidationResult validateDispatchOutputHTExtern(
         auto key = std::make_pair(src_rank, token_id);
         if (expected.find(key) == expected.end()) {
             rep.error(
-                "[Rank %d] FP8 dispatch: slot %u: unexpected token (rank=%d, token=%d)\n",
+                "[Rank %d] SCALES_FORWARD dispatch: slot %u: unexpected token (rank=%d, token=%d)\n",
                 myRank,
                 j,
                 src_rank,
@@ -1603,13 +1889,13 @@ static ValidationResult validateDispatchOutputHTExtern(
 
         // Recompute and byte-compare the full token row.
         for (unsigned int h = 0; h < hidden; h++)
-            exp_tok[h] = fp8TokenByte(src_rank, static_cast<unsigned>(token_id), h);
+            exp_tok[h] = scalesForwardTokenByte(src_rank, static_cast<unsigned>(token_id), h);
         if (memcmp(tok_row, exp_tok.data(), hidden) != 0) {
             unsigned int bad = 0;
             for (; bad < hidden; bad++)
                 if (tok_row[bad] != exp_tok[bad]) break;
             rep.error(
-                "[Rank %d] FP8 dispatch: slot %u (rank=%d, token=%d): token mismatch "
+                "[Rank %d] SCALES_FORWARD dispatch: slot %u (rank=%d, token=%d): token mismatch "
                 "at h=%u (got 0x%02x exp 0x%02x)\n",
                 myRank,
                 j,
@@ -1622,13 +1908,13 @@ static ValidationResult validateDispatchOutputHTExtern(
 
         // Recompute and compare the full scale row.
         for (unsigned int b = 0; b < numScales; b++)
-            exp_sf[b] = fp8ScaleValue(src_rank, static_cast<unsigned>(token_id), b);
+            exp_sf[b] = scalesForwardScaleValue(src_rank, static_cast<unsigned>(token_id), b);
         if (memcmp(sf_row, exp_sf.data(), numScales * sizeof(float)) != 0) {
             unsigned int bad = 0;
             for (; bad < numScales; bad++)
                 if (sf_row[bad] != exp_sf[bad]) break;
             rep.error(
-                "[Rank %d] FP8 dispatch: slot %u (rank=%d, token=%d): scale mismatch "
+                "[Rank %d] SCALES_FORWARD dispatch: slot %u (rank=%d, token=%d): scale mismatch "
                 "at block=%u (got %.9g exp %.9g)\n",
                 myRank,
                 j,
@@ -1642,7 +1928,8 @@ static ValidationResult validateDispatchOutputHTExtern(
 
     for (const auto& key : expected) {
         if (found.find(key) == found.end()) {
-            rep.error("[Rank %d] HT FP8 dispatch: missing token (rank=%d, token=%d)\n", myRank, key.first, key.second);
+            rep.error("[Rank %d] HT SCALES_FORWARD dispatch: missing token (rank=%d, token=%d)\n",
+                      myRank, key.first, key.second);
         }
     }
 
@@ -1654,7 +1941,7 @@ static ValidationResult validateDispatchOutputHTExtern(
     result.passed = (rep.errors == 0);
     if (!result.passed) {
         char buf[256];
-        snprintf(buf, sizeof(buf), "HT FP8 dispatch validation: %d errors", rep.errors);
+        snprintf(buf, sizeof(buf), "HT scales-forward dispatch validation: %d errors", rep.errors);
         result.message = buf;
     }
     return result;
@@ -2025,7 +2312,6 @@ static ValidationResult validateDispatchOutputHTExpertMaj(
 // Dispatcher: routes to the appropriate per-mode validation function.
 ValidationResult validateDispatchOutput(
     const BenchmarkAllocState& alloc,
-    const ncclEpDispatchInputs_t& dispatch_inputs,
     const ncclEpDispatchOutputs_t& dispatch_outputs,
     const ncclEpLayoutInfo_t& dispatch_layout_info,
     unsigned int max_tokens_per_rank,
@@ -2039,16 +2325,17 @@ ValidationResult validateDispatchOutput(
     bool is_ht_mode,
     bool is_expert_major,
     size_t expert_major_alignment,
+    ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
     const int64_t* meta_expert_counts_padded = nullptr,
     const int64_t* meta_expert_offsets = nullptr,
     ncclDataType_t token_dtype = ncclBfloat16) {
     (void)expert_major_alignment;
-    if (is_ht_mode) {
-        // EXTERN FP8 dispatch (input tokens are FP8 + scales forwarded): byte-equality validation.
-        const ncclDataType_t in_dt =
-            (dispatch_inputs.tokens != nullptr) ? dispatch_inputs.tokens->datatype : ncclBfloat16;
-        if (in_dt == ncclFloat8e4m3 || in_dt == ncclFloat8e5m2) {
-            return validateDispatchOutputHTExtern(
+    switch (dispatch_quantization) {
+        case NCCL_EP_DISPATCH_QUANT_NONE:
+            break;
+        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
+            if (is_ht_mode) {
+                return validateDispatchOutputHTScalesForward(
                 dispatch_outputs,
                 max_tokens_per_rank,
                 num_tokens_per_rank,
@@ -2058,7 +2345,31 @@ ValidationResult validateDispatchOutput(
                 num_local_experts,
                 myRank,
                 nRanks);
-        }
+            }
+            if (is_expert_major) {
+                return validateDispatchOutputLLExpertMajScalesForward(
+                    alloc, dispatch_outputs, dispatch_layout_info,
+                    max_tokens_per_rank, num_tokens_per_rank,
+                    hidden, top_k, num_experts, num_local_experts, myRank, nRanks);
+            }
+            fprintf(stderr,
+                    "NCCL EP benchmark warning: LL rank-major SCALES_FORWARD output validation is not implemented; "
+                    "the dispatch result is not byte-verified.\n");
+            return {true, 0, 0.0, "skipped (LL rank-major scales-forward dispatch validation not yet implemented)"};
+        case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
+            if (is_ht_mode || !is_expert_major) {
+                fprintf(stderr,
+                        "NCCL EP benchmark warning: DS_FP8E3M4 validation is implemented only for LL expert-major output.\n");
+                return {true, 0, 0.0, "skipped (DS_FP8E3M4 validation unavailable for this layout)"};
+            }
+            return validateDispatchOutputLLExpertMajDsFp8E3M4(
+                alloc, dispatch_outputs, dispatch_layout_info,
+                max_tokens_per_rank, num_tokens_per_rank,
+                hidden, top_k, num_experts, num_local_experts, myRank, nRanks);
+        default:
+            return {false, 1, 0.0, "unsupported dispatch quantization recipe"};
+    }
+    if (is_ht_mode) {
         // EM requires both meta arrays; fall back to RM scan if missing.
         if (is_expert_major && meta_expert_offsets != nullptr && meta_expert_counts_padded != nullptr) {
             return validateDispatchOutputHTExpertMaj(
@@ -2090,12 +2401,6 @@ ValidationResult validateDispatchOutput(
             nRanks,
             token_dtype);
     } else {
-        // LL FP8 EXTERN dispatch: byte-level validation not yet implemented for LL output layouts.
-        const ncclDataType_t in_dt =
-            (dispatch_inputs.tokens != nullptr) ? dispatch_inputs.tokens->datatype : ncclBfloat16;
-        if (in_dt == ncclFloat8e4m3 || in_dt == ncclFloat8e5m2) {
-            return {true, 0, 0.0, "skipped (LL FP8 dispatch validation not yet implemented)"};
-        }
         if (is_expert_major) {
             return validateDispatchOutputLLExpertMaj(
                 alloc,
@@ -2525,19 +2830,19 @@ PairedBenchResult runPairedBenchmark(
 // Structure to hold Low Latency byte calculation
 // Matches DeepEP test_low_latency.py methodology
 struct LowLatencyBytes {
-    size_t dispatch_bytes;  // FP8 or BF16 format per selection
+    size_t dispatch_bytes;  // scales-forward or BF16 format per selection
     size_t combine_bytes;   // NONE-mode format: hidden * elem_bytes per selection
     unsigned int num_valid_selections;
 };
 
 // Calculate bytes for Low Latency mode.
-// Dispatch can be FP8 or NONE-mode (bf16/fp16/fp32); combine is always the NONE-mode dtype.
+// Dispatch can be scales-forward or NONE-mode (bf16/fp16/fp32); combine is always the NONE-mode dtype.
 LowLatencyBytes calculateLowLatencyBytes(
     const int64_t* topk_idx_host,
     unsigned int num_tokens,
     unsigned int top_k,
     unsigned int hidden,
-    bool use_fp8,
+    ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
     ncclDataType_t token_dtype) {
     LowLatencyBytes bytes = {0, 0, 0};
 
@@ -2548,15 +2853,26 @@ LowLatencyBytes calculateLowLatencyBytes(
         }
     }
 
-    // FP8 bytes per selection: hidden + hidden/128*4 + 16 (scale factors + metadata)
-    const size_t fp8_bytes_per_selection = hidden + (hidden / 128) * 4 + 16;
+    const size_t quantized_bytes_per_selection = hidden +
+        benchmarkScalesPerToken(dispatch_quantization, hidden) * sizeof(float) + 16;
     // NONE-mode bytes per selection: hidden * elem_bytes (2 for bf16/fp16, 4 for fp32)
     const size_t none_bytes_per_selection = hidden * tokenElemBytes(token_dtype);
 
-    // Dispatch: FP8 or NONE-mode based on config
-    bytes.dispatch_bytes = static_cast<size_t>(bytes.num_valid_selections) *
-                           (use_fp8 ? fp8_bytes_per_selection : none_bytes_per_selection);
-    // Combine: always NONE-mode (no FP8 combine)
+    // Dispatch: scales-forward or NONE-mode based on config
+    switch (dispatch_quantization) {
+        case NCCL_EP_DISPATCH_QUANT_NONE:
+            bytes.dispatch_bytes = static_cast<size_t>(bytes.num_valid_selections) * none_bytes_per_selection;
+            break;
+        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
+        case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
+            bytes.dispatch_bytes = static_cast<size_t>(bytes.num_valid_selections) * quantized_bytes_per_selection;
+            break;
+        default:
+            fprintf(stderr, "NCCL EP benchmark warning: unsupported dispatch recipe %d\n",
+                    static_cast<int>(dispatch_quantization));
+            return bytes;
+    }
+    // Combine: always NONE-mode (no scales-forward combine)
     bytes.combine_bytes = static_cast<size_t>(bytes.num_valid_selections) * none_bytes_per_selection;
 
     return bytes;
@@ -2607,7 +2923,7 @@ HighThroughputBytes calculateHighThroughputBytes(
     unsigned int hidden,
     int myRank,
     int nRanks,
-    bool use_fp8,
+    ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
     int lsa_team_size,
     ncclDataType_t token_dtype) {
     HighThroughputBytes bytes = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -2661,9 +2977,20 @@ HighThroughputBytes calculateHighThroughputBytes(
 
     // NONE-mode token bytes: hidden * elem_bytes (2 for bf16/fp16, 4 for fp32).
     const size_t none_bytes_per_token = hidden * tokenElemBytes(token_dtype);
-    const double fp8_factor = (1.0 + 4.0 / 128.0) / 2.0;
-    const size_t bytes_per_token =
-        use_fp8 ? static_cast<size_t>(none_bytes_per_token * fp8_factor) : none_bytes_per_token;
+    size_t bytes_per_token = 0;
+    switch (dispatch_quantization) {
+        case NCCL_EP_DISPATCH_QUANT_NONE:
+            bytes_per_token = none_bytes_per_token;
+            break;
+        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
+            bytes_per_token = hidden +
+                benchmarkScalesPerToken(dispatch_quantization, hidden) * sizeof(float);
+            break;
+        default:
+            fprintf(stderr, "NCCL EP benchmark warning: unsupported dispatch recipe %d\n",
+                    static_cast<int>(dispatch_quantization));
+            return bytes;
+    }
 
     bytes.total_send_bytes = bytes.total_send_tokens * bytes_per_token;
     bytes.rdma_send_bytes = bytes.rdma_send_tokens * bytes_per_token;
@@ -2846,7 +3173,8 @@ void printHighThroughputResults(
     size_t global_rdma_send,
     size_t global_total_recv,
     size_t global_rdma_recv,
-    bool ht_em_local_dup) {
+    bool ht_em_local_dup,
+    ncclEpDispatchQuantizationRecipe_t dispatch_quantization) {
     double local_dispatch_avg = dispatch_result.avg_ms;
     double local_dispatch_min = dispatch_result.min_ms;
     double local_dispatch_max = dispatch_result.max_ms;
@@ -2920,7 +3248,8 @@ void printHighThroughputResults(
         double dk_total_s = global_dispatch_avg * 1e-3;  // avg total dispatch time in seconds
         double ck_total_s = global_combine_avg * 1e-3;
 
-        printf("\n=== Summary (High Throughput BF16, across %d ranks) ===\n", nRanks);
+        printf("\n=== Summary (High Throughput recipe %s, across %d ranks) ===\n",
+               dispatchRecipeName(dispatch_quantization), nRanks);
         printf("NOTE: total time = kernel time + memcpyD2D + misc\n");
 
         // --- BW based on total time ---
@@ -3181,10 +3510,7 @@ void printUsage(const char* programName, int myRank) {
             "kernel).\n");
         printf("  --mask-test             Simulate rank failures and test active-mask (LL only, implies --validate)\n");
         printf("  --topk-idx-int32        LL only: pass ncclInt32 topk_idx instead of ncclInt64\n");
-        printf(
-            "  --fp8-dispatch          Send FP8 (e4m3) tokens + FP32 scales through dispatch (HT or LL, "
-            "hidden%%128==0).\n");
-        printf("                          Use --validate to verify byte-exact forwarding; omit for BW measurement.\n");
+        printf("  --dispatch-quantization <recipe>  Dispatch quantization recipe: none|scales-forward|ds-fp8e3m4.\n");
         printf(
             "  --expert-id-kind <k>    Numbering for recv_topk_idx writes: auto|local|global (LL-RM/HT-FLAT only; "
             "default: auto)\n");
@@ -3225,7 +3551,7 @@ int main(int argc, char* argv[]) {
     bool include_non_uniform_tokens = false;
     bool topk_idx_int32 = false;  // LL only: pass ncclInt32 topk_idx instead of ncclInt64
     bool em_nvlink_dup = false;       // HT+EM only: force nvlink_dup path (sender duplicates per-expert over NVLink)
-    bool fp8_dispatch = false;    // EXTERN FP8 dispatch: pass FP8 tokens + scales; works with HT and LL
+    ncclEpDispatchQuantizationRecipe_t dispatch_quantization = NCCL_EP_DISPATCH_QUANT_NONE;
     // Numbering selector for recv_topk_idx writes (LL rank-major / HT FLAT only).
     // AUTO leaves the lib at its default (resolves to LOCAL today); LOCAL / GLOBAL pin
     // a stable contract end-to-end.
@@ -3263,7 +3589,7 @@ int main(int argc, char* argv[]) {
         {"dispatch-less-than-max-tokens", required_argument, 0, 'l'},
         {"non-uniform-tokens", no_argument, 0, 'N'},
         {"topk-idx-int32", no_argument, 0, 'I'},
-        {"fp8-dispatch", no_argument, 0, 0},
+        {"dispatch-quantization", required_argument, 0, 0},
         {"expert-id-kind", required_argument, 0, 1000},
         {"datatype", required_argument, 0, 0},
         {"help", no_argument, 0, 'h'},
@@ -3395,8 +3721,19 @@ int main(int argc, char* argv[]) {
             {
                 // Long-only options dispatched by name.
                 const char* name = long_options[option_index].name;
-                if (strcmp(name, "fp8-dispatch") == 0) {
-                    fp8_dispatch = true;
+                if (strcmp(name, "dispatch-quantization") == 0) {
+                    if (strcmp(optarg, "none") == 0) {
+                        dispatch_quantization = NCCL_EP_DISPATCH_QUANT_NONE;
+                    } else if (strcmp(optarg, "scales-forward") == 0) {
+                        dispatch_quantization = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+                    } else if (strcmp(optarg, "ds-fp8e3m4") == 0) {
+                        dispatch_quantization = NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4;
+                    } else {
+                        if (myRank == 0)
+                            printf("Error: --dispatch-quantization must be none, scales-forward, or ds-fp8e3m4, got '%s'\n", optarg);
+                        MPI_Finalize();
+                        return 1;
+                    }
                 } else if (strcmp(name, "datatype") == 0) {
                     if (strcmp(optarg, "bf16") == 0) token_dtype = ncclBfloat16;
                     else if (strcmp(optarg, "fp16") == 0) token_dtype = ncclFloat16;
@@ -3463,19 +3800,46 @@ int main(int argc, char* argv[]) {
         layout = (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) ? NCCL_EP_LAYOUT_FLAT : NCCL_EP_LAYOUT_EXPERT_MAJOR;
     }
 
-    // --fp8-dispatch: pass FP8 tokens + FP32 scales through dispatch (HT or LL).
-    // Use --validate to verify byte-exact forwarding. Use without --validate to measure
-    // physical BW (FP8 bytes on wire) vs BF16 baseline.
-    if (fp8_dispatch) {
-        if (hidden % FP8_BLOCK_SIZE != 0) {
-            if (myRank == 0)
-                printf("Error: --fp8-dispatch requires hidden %% %u == 0 (got hidden=%u)\n", FP8_BLOCK_SIZE, hidden);
+    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        if (!dispatch_only) {
+            if (myRank == 0) {
+                printf("Error: --dispatch-quantization scales-forward has no combine recipe; "
+                       "pass --dispatch-only.\n");
+            }
             MPI_Finalize();
             return 1;
         }
-        // Combine inputs would be FP8-typed tokens; the combine copy and validation assume
-        // BF16.  When the user requests validation, restrict to dispatch-only automatically.
-        if (validate_data) dispatch_only = true;
+    } else if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
+        if (algorithm != NCCL_EP_ALGO_LOW_LATENCY) {
+            if (myRank == 0) {
+                printf("Error: ds-fp8e3m4 is supported only in low-latency mode.\n");
+            }
+            MPI_Finalize();
+            return 1;
+        }
+        if (hidden % (4 * DS_FP8E3M4_ELEMENTS_PER_SCALE) != 0) {
+            if (myRank == 0) {
+                printf("Error: ds-fp8e3m4 requires hidden %% %u == 0 (got hidden=%u)\n",
+                       4 * DS_FP8E3M4_ELEMENTS_PER_SCALE, hidden);
+            }
+            MPI_Finalize();
+            return 1;
+        }
+        if (token_dtype != ncclBfloat16) {
+            if (myRank == 0) {
+                printf("Error: ds-fp8e3m4 requires --datatype bf16.\n");
+            }
+            MPI_Finalize();
+            return 1;
+        }
+        if (!dispatch_only) {
+            if (myRank == 0) {
+                printf("Error: --dispatch-quantization ds-fp8e3m4 has no combine recipe; "
+                       "pass --dispatch-only.\n");
+            }
+            MPI_Finalize();
+            return 1;
+        }
     }
 
     // Validate parameters
@@ -3592,10 +3956,11 @@ int main(int argc, char* argv[]) {
         printf("  Experts:         %u (local: %u)\n", num_experts, num_local_experts);
         printf("  Warmup iters:    %d\n", num_warmup);
         printf("  Benchmark iters: %d\n", num_iters);
+        printf("  Dispatch recipe: %s\n", dispatchRecipeName(dispatch_quantization));
         printf(
             "  Dispatch dtype:  %s\n",
-            fp8_dispatch ? "FP8" :
-                           (token_dtype == ncclFloat32 ? "FP32" : (token_dtype == ncclFloat16 ? "FP16" : "BF16")));
+            dispatch_quantization != NCCL_EP_DISPATCH_QUANT_NONE ? "1-byte wire" :
+            (token_dtype == ncclFloat32 ? "FP32" : (token_dtype == ncclFloat16 ? "FP16" : "BF16")));
         printf("  Profile mode:    %s\n", profile_mode ? "enabled" : "disabled");
         printf("  NVLink:          %s\n", disable_nvlink ? "disabled (force RDMA intranode, LL only)" : "enabled");
         printf("  Validate mode:   %s\n", validate_data ? "enabled" : "disabled");
@@ -3668,6 +4033,9 @@ int main(int argc, char* argv[]) {
     // max_dispatch_tokens_per_rank is the per-rank batch size (max tokens any single rank will send).
     config.max_dispatch_tokens_per_rank = dynamic_tokens ? NCCL_EP_AUTO : max_tokens_per_rank;
 
+    // Group staging for SCALES_FORWARD is sized from the normal token-byte
+    // budget, which must retain at least the two-byte baseline used by the
+    // library's scale staging layout.
     config.max_token_bytes = hidden * tokenElemBytes(token_dtype);
     // Use NCCL_EP_AUTO for buffer sizes (required for dynamic tokens with larger batches)
     // For LL mode with disable_nvlink: NCCL_P2P_DISABLE env var handles NCCL GIN P2P
@@ -3777,7 +4145,8 @@ int main(int argc, char* argv[]) {
     LowLatencyBytes ll_bytes = {};
     HighThroughputBytes ht_bytes = {};
     if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        ll_bytes = calculateLowLatencyBytes(topk_idx_host, num_tokens, top_k, hidden, fp8_dispatch, token_dtype);
+        ll_bytes = calculateLowLatencyBytes(topk_idx_host, num_tokens, top_k, hidden,
+                                            dispatch_quantization, token_dtype);
     } else {
         ht_bytes = calculateHighThroughputBytes(
             topk_idx_host,
@@ -3788,7 +4157,7 @@ int main(int argc, char* argv[]) {
             hidden,
             myRank,
             nRanks,
-            fp8_dispatch,
+            dispatch_quantization,
             ncclTeamLsa(comm).nRanks,
             token_dtype);
     }
@@ -3930,7 +4299,12 @@ int main(int argc, char* argv[]) {
         printf("[DEBUG] Setting up tensors...\n");
         fflush(stdout);
     }
-    const ncclDataType_t tok_dt = fp8_dispatch ? ncclFloat8e4m3 : token_dtype;
+    const ncclDataType_t dispatch_input_dtype =
+        dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4
+            ? ncclBfloat16
+            : dispatchTokenDtype(dispatch_quantization, token_dtype);
+    const ncclDataType_t dispatch_output_dtype =
+        dispatchTokenDtype(dispatch_quantization, token_dtype);
     if (is_ll_mode) {
         // LL rank-major zero-copy: window-back dispatch_outputs.tokens so the
         // kernel can write payload directly into peer recv_x via P2P.
@@ -3942,7 +4316,8 @@ int main(int argc, char* argv[]) {
         ll_zc_opts.nccl_mem_ptrs = &alloc.external_data_ptrs;
         ll_zc_opts.tensor_data_ptrs = &alloc.tensor_data_ptrs;
         const EpTensorAllocOptions* ll_dispatch_out_opts =
-            (zcopy && layout == NCCL_EP_LAYOUT_RANK_MAJOR) ? &ll_zc_opts : nullptr;
+            (zcopy && layout == NCCL_EP_LAYOUT_RANK_MAJOR &&
+             dispatch_quantization == NCCL_EP_DISPATCH_QUANT_NONE) ? &ll_zc_opts : nullptr;
         setupLowLatencyTensors(
             dispatch_inputs,
             dispatch_outputs,
@@ -3959,7 +4334,17 @@ int main(int argc, char* argv[]) {
             nRanks,
             layout,
             ll_dispatch_out_opts,
-            tok_dt);
+            dispatch_input_dtype);
+        if (dispatch_input_dtype != dispatch_output_dtype) {
+            const size_t output_sizes[3] = {
+                dispatch_outputs.tokens->sizes[0],
+                dispatch_outputs.tokens->sizes[1],
+                dispatch_outputs.tokens->sizes[2],
+            };
+            epFreeTensor(&dispatch_outputs.tokens, &alloc.external_data_ptrs, &alloc.tensor_data_ptrs);
+            NCCLCHECK(epMakeTensor(&dispatch_outputs.tokens, 3, dispatch_output_dtype,
+                                   output_sizes[0], output_sizes[1], output_sizes[2]));
+        }
     } else {
         setupHighThroughputTensors(
             comm,
@@ -3978,16 +4363,17 @@ int main(int argc, char* argv[]) {
             num_recv_tokens,
             layout,
             zcopy,
-            tok_dt);
+            dispatch_input_dtype);
     }
 
-    // --fp8-dispatch: allocate FP32 input/output scale tensors.
-    // Presence of inputs->scales selects EXTERN FP8 forwarding in the library (HT and LL).
-    // Input scales: 2D [num_tokens, numScales] for both HT and LL.
-    // Output scales: HT=2D [num_recv_tokens, numScales]; LL=3D [num_local_experts, nRanks*max_tokens_per_rank, numScales].
-    if (fp8_dispatch) {
-        const unsigned int numScales = hidden / FP8_BLOCK_SIZE;
-        NCCLCHECK(epMakeTensor(&dispatch_inputs.scales, 2, ncclFloat32, num_tokens, numScales));
+    // SCALES_FORWARD receives its input scales from the caller; DS_FP8E3M4
+    // generates output scales during LL dispatch.
+    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD ||
+        dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
+        const unsigned int numScales = benchmarkScalesPerToken(dispatch_quantization, hidden);
+        if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+            NCCLCHECK(epMakeTensor(&dispatch_inputs.scales, 2, ncclFloat32, num_tokens, numScales));
+        }
         if (is_ll_mode) {
             NCCLCHECK(epMakeTensor(
                 &dispatch_outputs.scales,
@@ -4041,7 +4427,8 @@ int main(int argc, char* argv[]) {
             top_k,
             myRank,
             !is_ll_mode,
-            token_dtype);
+            dispatch_quantization,
+            dispatch_input_dtype);
         if (myRank == 0) {
             printf("[DEBUG] Validation data initialized\n");
             fflush(stdout);
@@ -4050,6 +4437,7 @@ int main(int argc, char* argv[]) {
 
     ncclEpDispatchConfig_t dispatch_config = NCCL_EP_DISPATCH_CONFIG_INIT;
     dispatch_config.round_scales = 0;
+    dispatch_config.quantization_recipe = dispatch_quantization;
 
     // Synchronize before benchmarking
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
@@ -4106,10 +4494,15 @@ int main(int argc, char* argv[]) {
     KernelTimer ktimer;
 
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+    // A dispatch-only recipe test has no combine contract. Keep the paired
+    // timing harness, but make its combine phase a no-op rather than invoking
+    // ncclEpCombine with dispatch-format tensors.
+    std::function<void()> benchmark_combine_fn = combine_fn;
+    if (dispatch_only) benchmark_combine_fn = [] {};
     PairedBenchResult paired_result = runPairedBenchmark(
         update_fn,
         dispatch_fn,
-        combine_fn,
+        benchmark_combine_fn,
         actual_warmup,
         actual_iters,
         dispatch_data_bytes,
@@ -4151,7 +4544,7 @@ int main(int argc, char* argv[]) {
                 NCCLCHECK(ncclEpCreateHandle(&ep_handle, ep_group, layout, topk_idx, layout_info_ptr, cfg_ptr, stream));
             }
         };
-        runNvtxProfiling(myRank, actual_iters, dispatch_fn, combine_fn, handle_create_fn, stream);
+        runNvtxProfiling(myRank, actual_iters, dispatch_fn, benchmark_combine_fn, handle_create_fn, stream);
     }
 
     // ==================== CUPTI Kernel-Only Timing (reduce before print) ====================
@@ -4171,8 +4564,9 @@ int main(int argc, char* argv[]) {
     if (myRank == 0 && algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
         printf(
             "\n=== Summary (High Throughput %s, across %d ranks) ===\n",
-            fp8_dispatch ? "FP8" :
-                           (token_dtype == ncclFloat32 ? "FP32" : (token_dtype == ncclFloat16 ? "FP16" : "BF16")),
+            dispatch_quantization == NCCL_EP_DISPATCH_QUANT_NONE ?
+                (token_dtype == ncclFloat32 ? "FP32" : (token_dtype == ncclFloat16 ? "FP16" : "BF16")) :
+                dispatchRecipeName(dispatch_quantization),
             nRanks);
         printf("NOTE: total time = kernel time + memcpyD2D + misc\n");
     }
@@ -4229,7 +4623,8 @@ int main(int argc, char* argv[]) {
             global_rdma_send,
             global_total_recv,
             global_rdma_recv,
-            ht_em_local_dup);
+            ht_em_local_dup,
+            dispatch_quantization);
     }
 
     // Aggregate group/handle creation times across ranks
@@ -4292,7 +4687,8 @@ int main(int argc, char* argv[]) {
             top_k,
             myRank,
             !is_ll_mode,
-            token_dtype);
+            dispatch_quantization,
+            dispatch_input_dtype);
 
         // Run dispatch
         dispatch_fn();
@@ -4321,7 +4717,6 @@ int main(int argc, char* argv[]) {
 
         ValidationResult dispatch_valid = validateDispatchOutput(
             alloc,
-            dispatch_inputs,
             dispatch_outputs,
             dispatch_layout_info,
             max_tokens_per_rank,
@@ -4335,6 +4730,7 @@ int main(int argc, char* argv[]) {
             !is_ll_mode,
             layout == NCCL_EP_LAYOUT_EXPERT_MAJOR,
             expert_major_alignment,
+            dispatch_quantization,
             dispatch_meta_counts_host,
             dispatch_meta_offsets_host,
             token_dtype);
@@ -4460,7 +4856,8 @@ int main(int argc, char* argv[]) {
         const int combine_fail_rank = 3;
 
         // Re-initialize validation data
-        initializeValidationData(alloc, dispatch_inputs, topk_weights, num_tokens, hidden, top_k, myRank, !is_ll_mode);
+        initializeValidationData(alloc, dispatch_inputs, topk_weights, num_tokens, hidden, top_k, myRank,
+                                 !is_ll_mode, dispatch_quantization, dispatch_input_dtype);
 
         // --- Phase 1: Dispatch with rank 1 failing ---
         if (myRank == dispatch_fail_rank) {
@@ -4603,8 +5000,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Free FP8 scale tensors (cleanupBenchmarkTensors does not handle scales).
-    if (fp8_dispatch) {
+    // Free recipe scale tensors (cleanupBenchmarkTensors does not handle them).
+    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD ||
+        dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
         epFreeTensor(&dispatch_inputs.scales);
         epFreeTensor(&dispatch_outputs.scales);
     }

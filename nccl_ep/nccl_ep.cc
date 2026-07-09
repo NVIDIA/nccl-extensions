@@ -95,10 +95,11 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
             "(initialise with the corresponding NCCL_EP_*_INIT macro)"); \
     } while (0)
 
-// Minimum FP8 EXTERN scale block size supported by the pre-allocated output scale buffer.
-// Buffer is sized at group create assuming this value; callers must use scale_block_size >= this.
-// TODO: remove when ncclEpGroupConfig_t gains max_scale_bytes_per_token (future API update).
-static constexpr int kFP8ExternScaleBlockSize = 128;
+// SCALES_FORWARD does not assign meaning to a scale entry. Reserve enough
+// space for the largest FP32 scale row that can fit inside max_token_bytes.
+static inline size_t maxForwardedScalesPerToken(size_t max_token_bytes) {
+    return max_token_bytes / sizeof(float);
+}
 
 // Targeted forward-binary-compat for ncclEpLayoutInfo_t (only). The struct
 // grows by appending; older callers built against a pre-flag header report a
@@ -204,12 +205,12 @@ static size_t ncclTypeSize(ncclDataType_t nccl_type) {
 }
 
 // Supported token wire dtypes (runtime, since x->datatype comes from the descriptor).
-// NONE mode is BF16/FP16/FP32; FP8 (e4m3/e5m2) is a separate dispatch wire format.
+// NONE mode is BF16/FP16/FP32; SCALES_FORWARD uses a one-byte floating wire dtype.
 // Single source of truth for the accepted sets.
 static bool validate_dtype(ncclDataType_t dt) {
     return dt == ncclBfloat16 || dt == ncclFloat16 || dt == ncclFloat32;
 }
-static bool validate_fp8_dtype(ncclDataType_t dt) {
+static bool validate_scales_forward_token_dtype(ncclDataType_t dt) {
     return dt == ncclFloat8e4m3 || dt == ncclFloat8e5m2;
 }
 
@@ -318,6 +319,174 @@ static inline const ncclEpTensor_t* tensor_required(const ncclEpTensor_t* t) {
     assert(t != nullptr && "required tensor field is NULL");
     tensorAssertValid(t);
     return t;
+}
+
+struct DispatchRecipeLaunchContext {
+    ncclEpAlgorithm_t algorithm;
+    ncclEpLayout_t layout;
+    int hidden;
+    int num_local_experts;
+    int num_ranks;
+    int max_tokens_per_rank;
+    size_t max_token_bytes;
+};
+
+// Recipe validation is deliberately centralized. Algorithm branches may rely on
+// the selected recipe and never infer it from an optional tensor or dtype.
+static ncclResult_t validateDispatchRecipe(
+    const ncclEpDispatchInputs_t* inputs,
+    const ncclEpDispatchOutputs_t* outputs,
+    const ncclEpDispatchConfig_t* config,
+    const DispatchRecipeLaunchContext& launch) {
+    const auto recipe = config ? config->quantization_recipe : NCCL_EP_DISPATCH_QUANT_NONE;
+    const ncclEpTensor_t* tokens = tensor_required(inputs->tokens);
+    const ncclEpTensor_t* output_tokens = tensor_ptr(outputs->tokens);
+    const ncclEpTensor_t* input_scales = tensor_ptr(inputs->scales);
+    const ncclEpTensor_t* output_scales = tensor_ptr(outputs->scales);
+    auto fail = [&](const char* message) -> ncclResult_t {
+        fprintf(stderr, "NCCL EP warning: dispatch recipe %d: %s\n",
+                static_cast<int>(recipe), message);
+        return ncclInvalidArgument;
+    };
+    switch (recipe) {
+        case NCCL_EP_DISPATCH_QUANT_NONE:
+            if (!validate_dtype(tokens->datatype)) {
+                return fail("tokens has unsupported dtype");
+            }
+            if (output_tokens == nullptr) {
+                return fail("outputs->tokens is required");
+            }
+            if (output_tokens->datatype != tokens->datatype) {
+                return fail("outputs->tokens dtype must match inputs->tokens");
+            }
+            if (input_scales != nullptr) {
+                return fail("inputs->scales must be null for NONE");
+            }
+            if (output_scales != nullptr) {
+                return fail("outputs->scales must be null for NONE");
+            }
+            return ncclSuccess;
+        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD: {
+            if (config != nullptr && config->round_scales != 0) {
+                return fail("round_scales must be zero when scales are forwarded");
+            }
+            if (!validate_scales_forward_token_dtype(tokens->datatype)) {
+                return fail("tokens must use a one-byte floating dtype");
+            }
+            if (tokens->ndim != 2) {
+                return fail("tokens must be 2D [tokens, hidden]");
+            }
+            if (launch.algorithm == NCCL_EP_ALGO_LOW_LATENCY && launch.hidden % 256 != 0) {
+                return fail("LL SCALES_FORWARD requires hidden divisible by 256 for vectorized transport");
+            }
+            if (input_scales == nullptr) {
+                return fail("inputs->scales is required");
+            }
+            if (output_scales == nullptr) {
+                return fail("outputs->scales is required");
+            }
+            if (output_tokens == nullptr) {
+                return fail("outputs->tokens is required");
+            }
+            if (input_scales->ndim != 2 || input_scales->datatype != ncclFloat32) {
+                return fail("inputs->scales must be FP32 2D [tokens, scales]");
+            }
+            if (input_scales->sizes[0] != tokens->sizes[0]) {
+                return fail("inputs->scales dimension 0 must equal the token count");
+            }
+            if (input_scales->sizes[1] == 0) {
+                return fail("inputs->scales dimension 1 must be non-zero");
+            }
+            if (static_cast<size_t>(launch.hidden) + input_scales->sizes[1] * sizeof(float) > launch.max_token_bytes) {
+                return fail("token bytes plus scale bytes exceed the group token-byte limit");
+            }
+            const size_t scale_bytes = input_scales->sizes[1] * sizeof(float);
+            if (scale_bytes % 16 != 0) {
+                return fail("scale bytes per token must be 16-byte aligned");
+            }
+            if (output_tokens->datatype != tokens->datatype) {
+                return fail("outputs->tokens dtype must match inputs->tokens");
+            }
+            if (launch.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
+                const size_t expected_slots = static_cast<size_t>(launch.max_tokens_per_rank) * launch.num_ranks;
+                if (output_scales->ndim != 3 || output_scales->datatype != ncclFloat32) {
+                    return fail("LL outputs->scales must be FP32 3D [local_experts, recv_slots, scales]");
+                }
+                if (output_scales->sizes[0] != static_cast<size_t>(launch.num_local_experts) ||
+                    output_scales->sizes[1] != expected_slots ||
+                    output_scales->sizes[2] != input_scales->sizes[1]) {
+                    return fail("LL outputs->scales dimensions do not match local experts, recv slots, and input scales");
+                }
+            } else {
+                if (output_scales->ndim != 2 || output_scales->datatype != ncclFloat32) {
+                    return fail("HT outputs->scales must be FP32 2D [recv_tokens, scales]");
+                }
+                if (output_scales->sizes[0] == 0 || output_scales->sizes[1] != input_scales->sizes[1]) {
+                    return fail("HT outputs->scales must have non-zero rows and match input scale count");
+                }
+            }
+            return ncclSuccess;
+        }
+        case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4: {
+            if (launch.algorithm != NCCL_EP_ALGO_LOW_LATENCY) {
+                return fail("DS_FP8E3M4 is supported only in LL mode");
+            }
+            if (tokens->datatype != ncclBfloat16) {
+                return fail("DS_FP8E3M4 requires BF16 input tokens");
+            }
+            if (output_tokens == nullptr) {
+                return fail("DS_FP8E3M4 requires outputs->tokens");
+            }
+            if (output_tokens->datatype != ncclFloat8e4m3) {
+                return fail("DS_FP8E3M4 requires E4M3 output tokens");
+            }
+            if (tokens->ndim != 2 ||
+                tokens->sizes[1] % (4 * nccl_ep::kDsFp8E3M4ElementsPerScale) != 0) {
+                return fail("DS_FP8E3M4 tokens must be 2D with hidden divisible by 512");
+            }
+            if (input_scales != nullptr) {
+                return fail("DS_FP8E3M4 does not accept inputs->scales");
+            }
+            if (output_scales == nullptr) {
+                return fail("DS_FP8E3M4 requires outputs->scales");
+            }
+            const size_t expected_scales =
+                static_cast<size_t>(launch.hidden / nccl_ep::kDsFp8E3M4ElementsPerScale);
+            if (output_scales->ndim != 3 || output_scales->datatype != ncclFloat32 ||
+                output_scales->sizes[0] != static_cast<size_t>(launch.num_local_experts) ||
+                output_scales->sizes[1] !=
+                    static_cast<size_t>(launch.max_tokens_per_rank) * launch.num_ranks ||
+                output_scales->sizes[2] != expected_scales) {
+                return fail("DS_FP8E3M4 outputs->scales must be FP32 [local_experts, recv_slots, hidden / 128]");
+            }
+            if (static_cast<size_t>(launch.hidden) + expected_scales * sizeof(float) > launch.max_token_bytes) {
+                return fail("DS_FP8E3M4 token bytes plus scale bytes exceed the group token-byte limit");
+            }
+            return ncclSuccess;
+        }
+        default:
+            return fail("recipe is not implemented");
+    }
+}
+
+static ncclResult_t validateCombineRecipe(
+    const ncclEpCombineInputs_t* inputs,
+    const ncclEpCombineOutputs_t* outputs,
+    const ncclEpCombineConfig_t* config) {
+    (void)outputs;
+    const auto recipe = config ? config->quantization_recipe : NCCL_EP_COMBINE_QUANT_NONE;
+    auto fail = [&](const char* message) -> ncclResult_t {
+        fprintf(stderr, "NCCL EP warning: combine recipe %d: %s\n",
+                static_cast<int>(recipe), message);
+        return ncclInvalidArgument;
+    };
+    switch (recipe) {
+        case NCCL_EP_COMBINE_QUANT_NONE:
+            return validate_dtype(tensor_required(inputs->tokens)->datatype)
+                ? ncclSuccess : fail("tokens has unsupported dtype");
+        default:
+            return fail("recipe is not implemented");
+    }
 }
 
 // Make a temporary stack copy of `src` for short-lived library-internal use
@@ -619,7 +788,7 @@ struct ncclEpGroup {
         ncclWindow_t intranode_mega_window = {};
         size_t ipc_dispatch_token_offset = 0;
         size_t ipc_dispatch_prob_offset = 0;
-        size_t ipc_dispatch_scaling_factor_offset = 0; // FP8 EXTERN: per-block output scales region in the mega buffer
+        size_t ipc_dispatch_scaling_factor_offset = 0;  // SCALES_FORWARD per-block output-scales region in the mega buffer
         size_t ipc_combine_token_offset = 0;
         size_t ipc_combine_prob_offset = 0;
 
@@ -799,11 +968,10 @@ init_hybridep_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
     size_t expert_input_token_sz = token_staging_slots * max_token_bytes;
     size_t expert_input_prob_sz = max_output_slots * num_local_experts * lsa_ranks * sizeof(float);
 
-    // FP8 EXTERN per-block output scales (FP32). hidden = max_token_bytes / sizeof(bf16);
-    // FP8 EXTERN per-block output scales. Buffer sized assuming kFP8ExternScaleBlockSize (see
-    // file-scope constant); callers must use scale_block_size >= kFP8ExternScaleBlockSize.
+    // Output scales (FP32), sized for the largest SCALES_FORWARD row that the
+    // group's token-byte budget permits.
     size_t expert_output_scaling_factor_sz =
-        max_output_slots * ((max_token_bytes / sizeof(uint16_t)) / kFP8ExternScaleBlockSize) * sizeof(float);
+        max_output_slots * maxForwardedScalesPerToken(max_token_bytes) * sizeof(float);
 
     // zero_copy elides both token regions (windowed tensors required).
     const bool zero_copy = ep_group->config.zero_copy == NCCL_EP_ZERO_COPY_ON;
@@ -825,7 +993,7 @@ init_hybridep_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
     ep_group->ht_buffers.ipc_dispatch_prob_offset = dispatch_token_aligned;
     ep_group->ht_buffers.expert_output_prob = reinterpret_cast<float*>(mega_base + dispatch_token_aligned);
 
-    // FP8 EXTERN output scales region (after token+prob; shifts the combine offsets by dispatch_sf_aligned).
+    // SCALES_FORWARD output-scales region (after token+prob; shifts combine offsets by dispatch_sf_aligned).
     ep_group->ht_buffers.ipc_dispatch_scaling_factor_offset = dispatch_token_aligned + dispatch_prob_aligned;
     ep_group->ht_buffers.expert_output_scaling_factor =
         reinterpret_cast<float*>(mega_base + dispatch_token_aligned + dispatch_prob_aligned);
@@ -1107,14 +1275,15 @@ init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
         static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * ep_group->config.num_experts *
             sizeof(float),
         GIN_ALIGNMENT);
-    size_t scaling_factor_staging_sz =
-        align_size(static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * sizeof(float), GIN_ALIGNMENT);
+    const size_t max_scales_per_token = maxForwardedScalesPerToken(ep_group->config.max_token_bytes);
+    size_t scaling_factor_staging_sz = align_size(
+        static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * max_scales_per_token * sizeof(float),
+        GIN_ALIGNMENT);
 
     size_t bytes_per_token_entry = ep_group->config.max_token_bytes;
     size_t bytes_per_prob_entry = (ep_group->num_local_experts * lsa_team_size) * sizeof(float);
-    // FP8 scale-factor entry: per-128-bf16-element scale. Internal to the bf16->fp8 quantizer
-    // (max_token_bytes / sizeof(bf16) / 128 = max_token_bytes / 256 floats).
-    size_t bytes_per_sf_entry = (ep_group->config.max_token_bytes / 256) * sizeof(float);
+    // Forwarded scales reserve the maximum recipe-valid FP32 payload.
+    size_t bytes_per_sf_entry = max_scales_per_token * sizeof(float);
     size_t bytes_per_entry = bytes_per_token_entry + bytes_per_prob_entry + bytes_per_sf_entry;
     size_t rdma_send_staging_sz = align_size(
         static_cast<size_t>(rdma_team_size - 1) * ep_group->config.max_dispatch_tokens_per_rank * bytes_per_entry,
@@ -1938,7 +2107,7 @@ struct ncclEpHandle {
 
             int buffer_idx = 0;
 
-            std::function<void(unsigned int)> continue_fn;
+            std::function<ncclResult_t(unsigned int)> continue_fn;
             nccl_ep::LowLatencyLayout layout;
         } ll;
         struct {
@@ -2026,13 +2195,13 @@ struct ncclEpHandle {
 
             // Token staging buffer: pre-registered buffer to avoid GIN registration during dispatch
             // User tokens are copied here during dispatch, then this buffer is used for RDMA
-            // dtype: uint16_t (bf16) or uint8_t (fp8)
+            // dtype: uint16_t (two-byte transport) or uint8_t (one-byte transport)
             // layout: [max_dispatch_tokens_per_rank, hidden]
             // usage: copy user tokens → use for inter-node RDMA
             // lifetime: group-owned (allocated in Group Create, freed in Group Destroy)
             void* token_staging_buffer; // Pointer to group-level buffer (not handle-owned)
 
-            // Scaling factor staging buffer: pre-registered buffer for FP8 scaling factors
+            // Scaling factor staging buffer: pre-registered buffer for forwarded scales
             // User scaling factors are copied here during dispatch, then this buffer is used for RDMA
             // dtype: float
             // layout: [max_dispatch_tokens_per_rank]
@@ -2920,12 +3089,26 @@ ncclResult_t ncclEpDispatch(
     EP_OPTIONAL_STRUCT(config);
     const unsigned int send_only = config ? config->send_only : 0;
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
+    const ncclEpDispatchQuantizationRecipe_t quantization_recipe =
+        config ? config->quantization_recipe : NCCL_EP_DISPATCH_QUANT_NONE;
+    ncclEpGroup_t group = handle->group;
+    const ncclEpTensor_t* recipe_tokens = tensor_required(inputs->tokens);
+    if (recipe_tokens->ndim != 2) return ncclInvalidArgument;
+    const DispatchRecipeLaunchContext recipe_launch{
+        .algorithm = group->config.algorithm,
+        .layout = handle->layout,
+        .hidden = static_cast<int>(recipe_tokens->sizes[1]),
+        .num_local_experts = group->num_local_experts,
+        .num_ranks = group->nRanks,
+        .max_tokens_per_rank = static_cast<int>(group->config.max_dispatch_tokens_per_rank),
+        .max_token_bytes = group->config.max_token_bytes,
+    };
+    NCCLCHECK(validateDispatchRecipe(inputs, outputs, config, recipe_launch));
     if (pass_direction != NCCL_EP_FWD_PASS && handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         fprintf(stderr, "ncclEpDispatch: backward pass (pass_direction=%d) is not supported in LL mode\n",
                 (int)pass_direction);
         return ncclInvalidUsage;
     }
-    ncclEpGroup_t group = handle->group;
 
     // Lazy num_tokens for callers that skip UpdateHandle (e.g. backward reusing forward's handle_mem).
     // Guard on `num_tokens_set` -- a real zero-token configuration is valid
@@ -2938,24 +3121,12 @@ ncclResult_t ncclEpDispatch(
         handle->num_tokens_set = true;
     }
 
-    // Consolidated token-dtype gate for all dispatch paths (LL/HT): NONE-mode
-    // (bf16/fp16/fp32) or FP8 EXTERN (e4m3/e5m2). Checked once here so the
-    // per-mode branches below need not re-validate.
-    {
-        const ncclEpTensor_t* xt = tensor_required(inputs->tokens);
-        if (!validate_dtype(xt->datatype) && !validate_fp8_dtype(xt->datatype)) {
-            fprintf(stderr, "NCCL EP: dispatch unsupported token dtype %d\n", static_cast<int>(xt->datatype));
-            return ncclInvalidArgument;
-        }
-    }
-
     if (group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         const ncclEpTensor_t* x = tensor_required(inputs->tokens);
         assert(x->ndim == 2);
         assert(x->sizes[0] == handle->num_tokens);
         assert(x->sizes[0] <= group->config.max_dispatch_tokens_per_rank);
         assert(x->sizes[1] % sizeof(int4) == 0);
-        assert(x->sizes[1] % 128 == 0);
         assert(x->sizes[1] * ncclTypeSize(x->datatype) <= group->config.max_token_bytes);
         const int hidden = static_cast<int>(x->sizes[1]);
 
@@ -2964,14 +3135,6 @@ ncclResult_t ncclEpDispatch(
         const ncclEpTensor_t* scales = tensor_ptr(outputs->scales);
         assert(recv_x->ndim > 0);
 
-        // The FP8 wire path is selected by the presence of a scales tensor, not by
-        // x->datatype. An FP8 input dtype with no scales would otherwise fall through
-        // to the NONE path and be read at 2 B/elem instead of 1 B — out-of-bounds /
-        // corruption. Require scales for FP8 inputs (mirrors the HT dispatch guard).
-        if ((x->datatype == ncclFloat8e4m3 || x->datatype == ncclFloat8e5m2) && scales == nullptr) {
-            fprintf(stderr, "NCCL EP: LL dispatch with FP8 token dtype requires an outputs->scales tensor\n");
-            return ncclInvalidArgument;
-        }
 
         // Read rank-major-specific tensors unconditionally so we can assert
         // their presence (rank-major) or absence (expert-major) in the switch below.
@@ -3024,40 +3187,7 @@ ncclResult_t ncclEpDispatch(
             break;
         }
 
-        if (scales != nullptr) {
-            assert(scales->ndim == 3);
-            assert(scales->datatype == ncclFloat32);
-            assert(scales->sizes[0] == group->num_local_experts);
-            assert(scales->sizes[1] == group->config.max_dispatch_tokens_per_rank * group->nRanks);
-            EP_HOST_ASSERT(
-                scales->sizes[2] > 0 && hidden % static_cast<int>(scales->sizes[2]) == 0 &&
-                "LL FP8 output scales: sizes[2] must be a non-zero divisor of hidden");
-            // Infer scale block size from the caller-supplied output scales tensor.
-            const int scale_block_size = hidden / static_cast<int>(scales->sizes[2]);
-            assert(hidden % 512 == 0);
-            const size_t fp8_payload_bytes =
-                static_cast<size_t>(hidden) + static_cast<size_t>(scales->sizes[2]) * sizeof(float);
-            EP_HOST_ASSERT(
-                fp8_payload_bytes <= group->config.max_token_bytes && "FP8 dispatch bytes exceed max_token_bytes");
-            (void)scale_block_size; // used below when threading to kernel
-        }
-
-        // EXTERN FP8: token dtype is the signal. FP8 input → caller pre-quantized;
-        // inputs->scales is required and must supply one FP32 scale per block.
-        const bool extern_fp8_outer = (x->datatype == ncclFloat8e4m3 || x->datatype == ncclFloat8e5m2);
         const ncclEpTensor_t* in_scales_outer = tensor_ptr(inputs->scales);
-        if (extern_fp8_outer) {
-            EP_HOST_ASSERT(in_scales_outer != nullptr && "LL FP8 EXTERN requires inputs->scales");
-            assert(in_scales_outer->ndim == 2);
-            assert(in_scales_outer->datatype == ncclFloat32 || in_scales_outer->datatype == ncclUint8);
-            assert(in_scales_outer->sizes[0] == handle->num_tokens);
-            EP_HOST_ASSERT(
-                in_scales_outer->sizes[1] > 0 && hidden % static_cast<int>(in_scales_outer->sizes[1]) == 0 &&
-                "LL FP8 input scales: sizes[1] must be a non-zero divisor of hidden");
-            // scale_block_size inferred: hidden / numScales; any divisor of hidden is valid.
-        } else {
-            assert(in_scales_outer == nullptr && "inputs->scales must be null for BF16 LL dispatch");
-        }
 
         // RECV_EXPERT_COUNTER_DEVICE is required for expert-major (per-expert atomic slot allocator)
         // and must be absent for rank-major (outCnt is unused in the rank-major kernel path).
@@ -3081,9 +3211,11 @@ ncclResult_t ncclEpDispatch(
         // path, sender writes payload directly into the user's recv_x buffer
         // (via P2P peer pointer) and the receiver skips the staging→recv_x copy.
         const bool nvlink_only = (group->lsa_team_size == group->nRanks);
-        const bool use_fp8_outer = (scales != nullptr) || extern_fp8_outer;
-        const bool zero_copy_recv_x = nvlink_only && handle->layout == NCCL_EP_LAYOUT_RANK_MAJOR && !use_fp8_outer &&
-                                      recv_x->win_hdl != ncclWindow_t{};
+        const bool zero_copy_recv_x =
+            nvlink_only &&
+            handle->layout == NCCL_EP_LAYOUT_RANK_MAJOR &&
+            quantization_recipe == NCCL_EP_DISPATCH_QUANT_NONE &&
+            recv_x->win_hdl != ncclWindow_t{};
         // Strict zero_copy=ON contract: all opportunistic conditions must
         // hold, else the call is misconfigured. AUTO/OFF stay opportunistic
         // (matches pre-enum behavior; missing windows just stage through
@@ -3092,14 +3224,14 @@ ncclResult_t ncclEpDispatch(
             const char* reason =
                 !nvlink_only ? "requires nvlink-only topology (lsa_team_size == nRanks)" :
                 handle->layout != NCCL_EP_LAYOUT_RANK_MAJOR ? "requires NCCL_EP_LAYOUT_RANK_MAJOR" :
-                use_fp8_outer                               ? "is not supported with FP8 outputs" :
-                                "requires outputs->tokens to be backed by an NCCL window (ncclCommWindowRegister)";
+                quantization_recipe != NCCL_EP_DISPATCH_QUANT_NONE ? "is not supported with quantized outputs" :
+                "requires outputs->tokens to be backed by an NCCL window (ncclCommWindowRegister)";
             fprintf(stderr, "NCCL EP: zero_copy=ON on LL dispatch %s\n", reason);
             return ncclInvalidArgument;
         }
         const ncclWindow_t recv_data_window = zero_copy_recv_x ? recv_x->win_hdl : ncclWindow_t{};
         const size_t recv_data_offset = zero_copy_recv_x ? static_cast<size_t>(recv_x->win_offset) : 0;
-        auto dispatch_fn = [=](int phases) {
+        auto dispatch_fn = [=](int phases) -> ncclResult_t {
             char* rdma_base = static_cast<char*>(group->rdma_buffer);
             void* dispatch_send_ptr = rdma_base + buffer.dispatch_rdma_send_buffer_offset;
             void* dispatch_recv_ptr = rdma_base + buffer.dispatch_rdma_recv_data_buffer_offset;
@@ -3117,10 +3249,6 @@ ncclResult_t ncclEpDispatch(
             auto* recv_topk_weights_data = recv_topk_weights ? static_cast<float*>(recv_topk_weights->data) : nullptr;
             auto* recv_topk_idx_data = recv_topk_idx ? static_cast<int32_t*>(recv_topk_idx->data) : nullptr;
 
-            // INTERN FP8: x->datatype == ncclBfloat16 && outputs->scales != nullptr
-            // EXTERN FP8: x->datatype == ncclFloat8e4m3/e5m2 (inputs->scales validated above)
-            const bool extern_fp8 = (x->datatype == ncclFloat8e4m3 || x->datatype == ncclFloat8e5m2);
-            const bool use_fp8 = (scales != nullptr) || extern_fp8;
             const bool round_scale = config ? config->round_scales : false;
             // recv_topk_idx numbering selector. Read in a version-safe way
             // (older callers' smaller layout_info reports AUTO), then resolve
@@ -3130,15 +3258,20 @@ ncclResult_t ncclEpDispatch(
 
             // LL accepts int32 or int64 topk_idx; the cached dtype picks the JIT
             // kernel specialization (TopkIdxT). The lambda packs the shared
-            // DispatchParams and threads extern-FP8 + zero-copy through.
-            auto launch_dispatch = [&](auto* topk_idx_data, bool topk_is_int64) {
-                auto* in_scales_data = extern_fp8 ? static_cast<const uint8_t*>(in_scales_outer->data) : nullptr;
+            // DispatchParams and threads recipe-specific state through.
+            auto launch_dispatch = [&](auto* topk_idx_data, bool topk_is_int64) -> ncclResult_t {
+                auto* in_scales_data = (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)
+                    ? static_cast<const uint8_t*>(in_scales_outer->data) : nullptr;
                 nccl_ep::internode_ll::DispatchParams params{};
                 params.inData = x_data;
                 params.inScalesBuf = in_scales_data;
                 params.inTopkIdx = topk_idx_data;
                 params.topkIdxIsInt64 = topk_is_int64;
-                params.scalesPerToken = extern_fp8 ? static_cast<int>(in_scales_outer->sizes[1]) : (hidden / 128);
+                params.scalesPerToken = (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)
+                    ? static_cast<int>(in_scales_outer->sizes[1])
+                    : quantization_recipe == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4
+                        ? hidden / nccl_ep::kDsFp8E3M4ElementsPerScale
+                        : 0;
                 params.inTopkWeights = topk_weights_in_data;
                 params.outDataBuf = recv_x_data;
                 params.outScalesBuf = scales_data;
@@ -3175,7 +3308,6 @@ ncclResult_t ncclEpDispatch(
                 params.rankMask = group->mask_buffer;
                 params.asyncErrorFlag = group->async_error_flag;
                 params.timeoutCycles = group->timeout_cycles;
-                params.useUe8m0 = false;
                 params.roundScale = round_scale;
                 params.nvlinkOnly = nvlink_only;
                 params.recvDataWindow = recv_data_window;
@@ -3183,24 +3315,43 @@ ncclResult_t ncclEpDispatch(
                 params.recvTopkIdxKind = recv_topk_idx_kind;
                 params.phases = phases;
                 params.tokenDtype = x->datatype;
-                nccl_ep::internode_ll::call_dispatch(params, use_fp8, stream);
+                // Keep recipe dispatch explicit at the kernel launch boundary. The
+                // selected branch becomes the JIT kernel's quantization variant.
+                switch (quantization_recipe) {
+                    case NCCL_EP_DISPATCH_QUANT_NONE:
+                        return nccl_ep::internode_ll::call_dispatch(
+                            params, NCCL_EP_DISPATCH_QUANT_NONE, stream);
+                    case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
+                        return nccl_ep::internode_ll::call_dispatch(
+                            params, NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD, stream);
+                    case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
+                        return nccl_ep::internode_ll::call_dispatch(
+                            params, NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4, stream);
+                    default:
+                        std::fprintf(stderr,
+                                     "NCCL EP warning: unsupported LL dispatch recipe %d\n",
+                                     static_cast<int>(quantization_recipe));
+                        return ncclInvalidArgument;
+                }
             };
             switch (handle->topk_idx.datatype) {
             case ncclInt32:
-                launch_dispatch(static_cast<const int32_t*>(handle->topk_idx.data), /*topk_is_int64=*/false);
-                break;
+                    return launch_dispatch(
+                        static_cast<const int32_t*>(handle->topk_idx.data), /*topk_is_int64=*/false);
             case ncclInt64:
-                launch_dispatch(static_cast<const int64_t*>(handle->topk_idx.data), /*topk_is_int64=*/true);
-                break;
+                    return launch_dispatch(
+                        static_cast<const int64_t*>(handle->topk_idx.data), /*topk_is_int64=*/true);
             default:
-                assert(false && "LL topk_idx must be ncclInt32 or ncclInt64");
+                    std::fprintf(stderr, "NCCL EP warning: LL topk_idx has unsupported dtype %d\n",
+                                 static_cast<int>(handle->topk_idx.datatype));
+                    return ncclInvalidArgument;
             }
         };
 
         // Execute dispatch with appropriate phase flags
         const int dispatch_phases =
             send_only ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
-        dispatch_fn(dispatch_phases);
+        NCCLCHECK(dispatch_fn(dispatch_phases));
 
         if (send_only) {
             handle->ll.continue_fn = dispatch_fn;
@@ -3251,33 +3402,26 @@ ncclResult_t ncclEpDispatch(
                 stream));
             token_ptr = handle->hybridep.token_staging_buffer;
         }
-        // EXTERN quantization is requested by the presence of input scales (per Phuong):
-        // scales != NULL => the caller pre-quantized to FP8 and we forward the FP8 tokens +
-        // scales to the experts unchanged (block size is irrelevant here — pure transport).
-        bool use_fp8 = (scales != nullptr);
-        if (use_fp8 && x->datatype != ncclFloat8e4m3 && x->datatype != ncclFloat8e5m2) {
-            return ncclInvalidArgument; // scales given => tokens must be an FP8 type
-        }
-        // local_dup / local_reduce JIT hard-codes uint16_t token type; FP8 is unsupported.
-        if (use_fp8 && em_local_dup_active(group, handle->layout)) {
+        // The recipe selects external quantization; tensors only satisfy its contract.
+        // local_dup / local_reduce JIT hard-codes uint16_t token type; SCALES_FORWARD is unsupported.
+        if ((quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) && em_local_dup_active(group, handle->layout)) {
             return ncclInvalidArgument;
         }
-        // fp8 is incompatible with the FLAT-dispatch + local-permute path: the
+        // SCALES_FORWARD is incompatible with the FLAT-dispatch + local-permute path: the
         // permute kernel is bf16-only and UpdateHandle has already populated
         // the main LERM in FLAT shape (mismatched for the nvlink_dup
         // dense_to_sparse_prob consumer). Hard-reject early before any kernel
         // runs; the user can set NCCL_EP_HT_EM_NVLINK_DUP=1 to take that path.
-        if (use_fp8 && em_local_permute_enabled(group, handle)) {
+        if (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+            em_local_permute_enabled(group, handle)) {
             fprintf(
                 stderr,
-                "NCCL EP: HT EM with fp8 is not supported on the local-permute path; "
+                "NCCL EP: HT EM scales-forward is not supported on the local-permute path; "
                 "set NCCL_EP_HT_EM_NVLINK_DUP=1 to use the nvlink_dup path.\n");
             return ncclInvalidArgument;
         }
-        // Derive scale element size from the dtype in the caller-supplied scales tensor.
-        // FP32 (ncclFloat32) = 4 bytes/scale, UE8M0 (ncclUint8) = 1 byte/scale.
-        const int scale_elem_bytes = (use_fp8 && scales->datatype == ncclUint8) ? 1 : static_cast<int>(sizeof(float));
-        if (use_fp8) {
+        const int scale_elem_bytes = static_cast<int>(sizeof(float));
+        if ((quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)) {
             NCCLCHECK(resolveTensorWindowBinding(
                 group,
                 scales,
@@ -3286,10 +3430,10 @@ ncclResult_t ncclEpDispatch(
                 &scales));
         }
 
-        // For FP8: copy user scaling factors to pre-registered staging buffer
-        void* scales_ptr = use_fp8 ? scales->data : nullptr; // Default: use user buffer directly
-        const bool scales_uses_external_window = use_fp8 && tensorUsesExternalWindow(group, scales);
-        if (use_fp8 && !is_single_node && handle->hybridep.scaling_factor_staging_buffer != nullptr &&
+        // For SCALES_FORWARD: copy user scales to the pre-registered staging buffer.
+        void* scales_ptr = (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) ? scales->data : nullptr;  // Default: use user buffer directly
+        const bool scales_uses_external_window = (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) && tensorUsesExternalWindow(group, scales);
+        if ((quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) && !is_single_node && handle->hybridep.scaling_factor_staging_buffer != nullptr &&
             !scales_uses_external_window) {
             // Copy user scaling factors to pre-registered staging buffer (D2D copy is ~0.1ms vs ~30ms GIN registration)
             size_t scales_size = scales->sizes[0] * scales->sizes[1] * ncclTypeSize(scales->datatype);
@@ -3300,10 +3444,6 @@ ncclResult_t ncclEpDispatch(
                 cudaMemcpyDeviceToDevice,
                 stream));
             scales_ptr = handle->hybridep.scaling_factor_staging_buffer;
-        }
-        if (use_fp8) {
-            assert(scales->ndim == 2);
-            assert(scales->datatype == ncclFloat32 || scales->datatype == ncclUint8);
         }
 
         // HT dispatch kernel uses TMA for token/prob/scaling-factor payloads.
@@ -3318,22 +3458,10 @@ ncclResult_t ncclEpDispatch(
             (token_bytes_per_token % 16) == 0 &&
             "HT dispatch requires token bytes per token to be 16B aligned for TMA");
 
-        // Infer FP8 scale block size from the caller's input scales tensor.
-        // Buffer was pre-allocated for scale_block_size >= kFP8ExternScaleBlockSize (see group create).
-        const int num_scales_per_token = use_fp8 ? static_cast<int>(scales->sizes[1]) : 0;
-        if (use_fp8) {
-            EP_HOST_ASSERT(
-                num_scales_per_token > 0 && hidden % num_scales_per_token == 0 &&
-                "HT dispatch FP8: scales->sizes[1] must be a non-zero divisor of hidden");
-            const int scale_block_size = hidden / num_scales_per_token;
-            EP_HOST_ASSERT(
-                scale_block_size >= kFP8ExternScaleBlockSize &&
-                "HT dispatch FP8: scale_block_size < kFP8ExternScaleBlockSize; "
-                "pre-allocated output scale buffer too small (future: set max_scale_bytes_per_token in config)");
-            assert(
-                ((num_scales_per_token * scale_elem_bytes) % 16) == 0 &&
-                "HT dispatch FP8 requires scaling-factor bytes per token to be 16B aligned");
-        }
+        const int num_scales_per_token =
+            quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD
+                ? static_cast<int>(scales->sizes[1])
+                : 0;
 
         // Output tensors
         const ncclEpTensor_t* recv_x = tensor_required(outputs->tokens);
@@ -3365,7 +3493,7 @@ ncclResult_t ncclEpDispatch(
         if (!group->eager_mode && recv_x->sizes[0] < static_cast<unsigned>(group->max_recv_tokens)) {
             return ncclInvalidArgument;
         }
-        if (use_fp8) {
+        if (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
             recv_scales = tensor_ptr(outputs->scales);
             if (recv_scales == nullptr) {
                 return ncclInvalidArgument;
@@ -3440,7 +3568,7 @@ ncclResult_t ncclEpDispatch(
         params.lsa_team_size = group->lsa_team_size;
         params.attn_input_token = token_ptr;
         params.attn_input_prob = forward_dispatch ? dense_prob : nullptr;
-        params.attn_input_scaling_factor = use_fp8 ? static_cast<const uint8_t*>(scales_ptr) : nullptr;
+        params.attn_input_scaling_factor = (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) ? static_cast<const uint8_t*>(scales_ptr) : nullptr;
         // Use HOST pointer arrays - these get copied into the kernel param struct for fast __grid_constant__ access.
         // For external output tensors with windows, resolve full per-rank output pointers
         // (local + same-node peers) so all writers target user buffers directly.
@@ -3466,19 +3594,22 @@ ncclResult_t ncclEpDispatch(
         }
         params.expert_output_prob_ptrs = group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs;
         std::vector<uint8_t*> dispatch_output_sf_ptrs;
-        const bool rcv_scales_zcopy = use_fp8 && tensorUsesExternalWindow(group, recv_scales);
+        const bool rcv_scales_zcopy =
+            quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+            tensorUsesExternalWindow(group, recv_scales);
         if (rcv_scales_zcopy) {
             NCCLCHECK(buildIntranodePtrArray<uint8_t>(group, recv_scales, dispatch_output_sf_ptrs));
             params.expert_output_scaling_factor_ptrs = dispatch_output_sf_ptrs.data();
         } else {
             params.expert_output_scaling_factor_ptrs =
-                use_fp8 ? reinterpret_cast<uint8_t* const*>(
-                              group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs) :
-                          nullptr;
+                quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD
+                    ? reinterpret_cast<uint8_t* const*>(
+                          group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs)
+                    : nullptr;
         }
 
         bool zcopy_only = rcv_x_zcopy;
-        if (use_fp8) {
+        if (quantization_recipe != NCCL_EP_DISPATCH_QUANT_NONE) {
             zcopy_only = zcopy_only && rcv_scales_zcopy;
         }
         const bool need_recv_counts = !is_capturing && !em_permute_active && !zcopy_only;
@@ -3536,7 +3667,7 @@ ncclResult_t ncclEpDispatch(
         params.dcomm = group->gin_config.dcomms[0];
         params.nccl_token_window = x->win_hdl;
         params.nccl_prob_window = forward_dispatch ? group->gin_config.nccl_window : ncclWindow_t{};
-        params.nccl_sf_window = use_fp8 ? scales->win_hdl : ncclWindow_t{};
+        params.nccl_sf_window = (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) ? scales->win_hdl : ncclWindow_t{};
         params.nccl_internal_window = group->gin_config.nccl_window;
         params.num_ctx_per_comm = is_single_node ? 0 : group->gin_config.num_ctx_per_comm;
         params.gin_base_ptr = is_single_node ? nullptr : group->gin_config.gin_base_ptr;
@@ -3546,24 +3677,29 @@ ncclResult_t ncclEpDispatch(
         size_t bytes_per_token_entry = group->config.max_token_bytes; // token data
         size_t bytes_per_prob_entry = (group->num_local_experts * group->lsa_team_size) * sizeof(float); // prob data
         size_t bytes_per_sf_entry =
-            use_fp8 ? static_cast<size_t>(num_scales_per_token) * scale_elem_bytes : 0; // FP8 scaling factor
+            quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD
+                ? static_cast<size_t>(num_scales_per_token) * scale_elem_bytes
+                : 0;
         size_t bytes_per_entry = bytes_per_token_entry + bytes_per_prob_entry + bytes_per_sf_entry;
 
-        params.mr_info = {
-            .attn_input_token_offset = is_single_node ? 0 : x->win_offset,
-            .attn_input_prob_offset = (is_single_node || !forward_dispatch) ? 0 : group->gin_config.dense_prob_offset,
-            .attn_input_scaling_factor_offset = (is_single_node || !use_fp8) ? 0 : scales->win_offset,
-            // Batched staging parameters (packed layout)
-            .rdma_send_staging_offset = is_single_node ? 0 : group->gin_config.rdma_send_staging_offset,
-            .rdma_inter_node_group_packed_offset =
-                is_single_node ? 0 : group->gin_config.rdma_inter_node_group_packed_offset,
-            .guard_offset = is_single_node ? 0 : group->gin_config.dispatch_guard_offset,
-            .bytes_per_entry = bytes_per_entry,
-            .max_tokens_per_dest = static_cast<size_t>(group->config.max_dispatch_tokens_per_rank),
-            // Streaming signal parameters
-            .signals_tail_base = is_single_node ? 0 : static_cast<unsigned>(group->gin_config.signals_tail_base),
-            .num_max_rdma_chunked_send_tokens = is_single_node ? 0 : group->gin_config.num_max_rdma_chunked_send_tokens,
-        };
+        params.mr_info.attn_input_token_offset = is_single_node ? 0 : x->win_offset;
+        params.mr_info.attn_input_prob_offset =
+            (is_single_node || !forward_dispatch) ? 0 : group->gin_config.dense_prob_offset;
+        params.mr_info.attn_input_scaling_factor_offset =
+            (is_single_node || quantization_recipe != NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)
+                ? 0
+                : scales->win_offset;
+        params.mr_info.rdma_send_staging_offset =
+            is_single_node ? 0 : group->gin_config.rdma_send_staging_offset;
+        params.mr_info.rdma_inter_node_group_packed_offset =
+            is_single_node ? 0 : group->gin_config.rdma_inter_node_group_packed_offset;
+        params.mr_info.guard_offset = is_single_node ? 0 : group->gin_config.dispatch_guard_offset;
+        params.mr_info.bytes_per_entry = bytes_per_entry;
+        params.mr_info.max_tokens_per_dest = static_cast<size_t>(group->config.max_dispatch_tokens_per_rank);
+        params.mr_info.signals_tail_base =
+            is_single_node ? 0 : static_cast<unsigned>(group->gin_config.signals_tail_base);
+        params.mr_info.num_max_rdma_chunked_send_tokens =
+            is_single_node ? 0 : group->gin_config.num_max_rdma_chunked_send_tokens;
         params.local_rank = group->lsa_rank;
         params.node_rank = group->rdma_rank;
         params.num_tokens_per_rank = group->config.max_dispatch_tokens_per_rank;
@@ -3576,15 +3712,18 @@ ncclResult_t ncclEpDispatch(
         params.max_recv_tokens_per_rank = group->max_recv_tokens;
 
         // Call dispatch kernel
-        const int sf_bytes_per_token = use_fp8 ? num_scales_per_token * scale_elem_bytes : 0;
+        const int sf_bytes_per_token =
+            quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD
+                ? num_scales_per_token * scale_elem_bytes
+                : 0;
         NCCLCHECK(
             nccl_ep::hybridep::call_dispatch(
                 params,
                 group->ht_aligned_max_tokens,
                 group->ht_tokens_per_chunk,
                 group->rdma_team_size,
-                use_fp8,
-                forward_dispatch,
+                quantization_recipe,
+                pass_direction,
                 static_cast<int>(group->comm_num_sms),
                 sf_bytes_per_token,
                 &group->env,
@@ -3722,7 +3861,7 @@ ncclResult_t ncclEpDispatch(
             assert(forward_dispatch ? (recv_topk_weights != nullptr) : (recv_topk_weights == nullptr));
             if (!validate_dtype(recv_x->datatype)) {
                 // local_permute_dup is a byte-relocation kernel: any NONE-mode
-                // wire dtype (bf16/fp16/fp32) works; FP8 is not supported here.
+                // wire dtype (bf16/fp16/fp32) works; SCALES_FORWARD is not supported here.
                 return ncclInvalidArgument;
             }
             const int row_bytes = static_cast<int>(recv_x->sizes[1]) * ncclTypeSize(recv_x->datatype);
@@ -3747,8 +3886,8 @@ ncclResult_t ncclEpDispatch(
                 stream);
         }
 
-        // FP8 scales output (async D2D, sized by caller).
-        if (use_fp8) {
+        // SCALES_FORWARD output scales (async D2D, sized by caller).
+        if (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
             assert(recv_scales->ndim == 2);
             if (!rcv_scales_zcopy) {
                 if (recv_scales->sizes[0] < recv_copy_rows) {
@@ -3779,6 +3918,7 @@ ncclResult_t ncclEpCombine(
     EP_OPTIONAL_STRUCT(config);
     const unsigned int send_only = config ? config->send_only : 0;
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
+    NCCLCHECK(validateCombineRecipe(inputs, outputs, config));
     if (pass_direction != NCCL_EP_FWD_PASS && handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         fprintf(stderr, "ncclEpCombine: backward pass (pass_direction=%d) is not supported in LL mode\n",
                 (int)pass_direction);
@@ -3897,7 +4037,7 @@ ncclResult_t ncclEpCombine(
 
         // Define combine lambda
         unsigned signal_base = handle->ll.buffer_idx * (handle->group->num_dispatch_signals / 2);
-        auto combine_fn = [=](int phases) {
+        auto combine_fn = [=](int phases) -> ncclResult_t {
             char* rdma_base = static_cast<char*>(handle->group->rdma_buffer);
             void* combine_send_ptr = rdma_base + buffer.combine_rdma_send_buffer_offset;
             void* combine_recv_ptr = rdma_base + buffer.combine_rdma_recv_data_buffer_offset;
@@ -3959,12 +4099,14 @@ ncclResult_t ncclEpCombine(
             switch (topk_idx->datatype) {
             case ncclInt32:
                 launch_combine(static_cast<const int32_t*>(topk_idx->data), /*topk_is_int64=*/false);
-                break;
+                    return ncclSuccess;
             case ncclInt64:
                 launch_combine(static_cast<const int64_t*>(topk_idx->data), /*topk_is_int64=*/true);
-                break;
+                    return ncclSuccess;
             default:
-                assert(false && "LL topk_idx must be ncclInt32 or ncclInt64");
+                    std::fprintf(stderr, "NCCL EP warning: LL topk_idx has unsupported dtype %d\n",
+                                 static_cast<int>(topk_idx->datatype));
+                    return ncclInvalidArgument;
             }
         };
 
@@ -4334,7 +4476,7 @@ ncclResult_t ncclEpComplete(ncclEpHandle_t handle, const ncclEpCompleteConfig_t*
     EP_OPTIONAL_STRUCT(config);
     if (handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         if (handle->ll.continue_fn) {
-            handle->ll.continue_fn(LOW_LATENCY_RECV_PHASE);
+                NCCLCHECK(handle->ll.continue_fn(LOW_LATENCY_RECV_PHASE));
             handle->ll.continue_fn = nullptr;
         }
     } else if (handle->group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {

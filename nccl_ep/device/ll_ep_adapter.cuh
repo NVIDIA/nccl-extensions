@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "nccl_ep.h"
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -58,7 +59,7 @@ inline const char* ll_token_dtype_name_tag(ncclDataType_t dt) {
 struct dispatch_kernel_args_t {
     // INPUT
     const void* inData;
-    const uint8_t* inScalesBuf;   // non-null for EXTERN FP8 quant (kExternQuant)
+    const uint8_t* inScalesBuf;   // non-null for SCALES_FORWARD
     const void* inTopkIdx;        // cast to const TopkIdxT* by the JIT entry
     const float* inTopkWeights;
     int* rankMask;
@@ -87,7 +88,7 @@ struct dispatch_kernel_args_t {
     int64_t* waitStats;
     // CONFIG
     int numTokens;
-    int scalesPerToken;           // EXTERN FP8 input scale count per token
+    int scalesPerToken;           // SCALES_FORWARD input scale count per token
     int maxTokensPerRank;
     int numTopk;
     int numExperts;
@@ -176,10 +177,10 @@ struct clean_low_latency_buffer_kernel_args_t {
 struct DispatchParams {
     // User inputs
     const void* inData;
-    const uint8_t* inScalesBuf = nullptr;  // non-null for EXTERN FP8 quant
+    const uint8_t* inScalesBuf = nullptr;  // non-null for SCALES_FORWARD
     const void* inTopkIdx;                  // int32_t* or int64_t*; see topkIdxIsInt64
     bool topkIdxIsInt64 = true;             // selects the TopkIdxT kernel specialization
-    int scalesPerToken = 0;                 // EXTERN FP8 input scale count per token
+    int scalesPerToken = 0;                 // SCALES_FORWARD input scale count per token
     const float* inTopkWeights;
 
     // User / pre-allocated output buffers
@@ -227,10 +228,7 @@ struct DispatchParams {
     int* asyncErrorFlag = nullptr;
     uint64_t timeoutCycles = NUM_TIMEOUT_CYCLES;
 
-    // Per-call behavior toggles that select the JIT kernel specialization.
-    // useFp8 stays outside the struct so callers see, at the call site,
-    // which token-data-type variant is being launched.
-    bool useUe8m0 = false;
+    // Per-call behavior toggles that do not affect the quantization recipe.
     bool roundScale = false;
     bool nvlinkOnly = false;
     // recv_topk_idx numbering; the host wrapper resolves AUTO -> LOCAL before
@@ -244,9 +242,8 @@ struct DispatchParams {
     ncclWindow_t recvDataWindow = ncclWindow_t{};
     size_t recvDataOffset = 0;
 
-    // Token wire dtype (unquantized payload width). Selects the kTokenDtype
-    // kernel specialization: dispatch is a byte-copy so FP16 folds onto the
-    // BF16 kernel and only FP32 is distinct; FP8 paths always wire BF16.
+    // Actual token wire dtype. Selects the kTokenDtype kernel specialization;
+    // FP16 and BF16 share the same two-byte copy specialization.
     ncclDataType_t tokenDtype = ncclBfloat16;
 };
 
@@ -324,11 +321,14 @@ struct CleanLowLatencyBufferParams {
 // Host-side wrappers.
 //
 // Each wrapper resolves all runtime template parameters (hidden, layout,
-// useFp8/useUe8m0, nvlinkOnly, useLogFmt) and dispatches to a per-variant
+// nvlinkOnly and useLogFmt) and dispatches to a per-variant
 // JIT-compiled kernel.
 // ============================================================================
 
-void call_dispatch(const DispatchParams& params, bool useFp8, cudaStream_t stream = 0);
+ncclResult_t call_dispatch(
+    const DispatchParams& params,
+    ncclEpDispatchQuantizationRecipe_t quantization_recipe,
+    cudaStream_t stream = 0);
 
 void call_combine(const CombineParams& params, cudaStream_t stream = 0);
 

@@ -8,6 +8,7 @@
 
 #include "device/ll_ep_adapter.cuh"
 #include "device/jit/jit_runtime.hpp"
+#include "quantization_recipe.hpp"
 
 #include <cstdio>
 #include <cstdint>
@@ -27,9 +28,7 @@ inline const char* ll_dispatch_bool_literal(bool value) {
 }
 
 inline std::string ll_dispatch_jit_source(
-    bool useFp8,
-    bool useUe8m0,
-    bool useExternQuant,
+    const DispatchKernelSpec& kernel_spec,
     int hidden,
     ncclEpLayout_t layout,
     bool nvlinkOnly,
@@ -51,9 +50,7 @@ inline std::string ll_dispatch_jit_source(
         << "__global__ void " << kLlDispatchJitEntryName << "(\n"
         << "    const __grid_constant__ nccl_ep::internode_ll::dispatch_kernel_args_t p) {\n"
         << "  nccl_ep::internode_ll::dispatch_kernel_impl<\n"
-        << "      " << ll_dispatch_bool_literal(useFp8) << ",\n"
-        << "      " << ll_dispatch_bool_literal(useUe8m0) << ",\n"
-        << "      " << ll_dispatch_bool_literal(useExternQuant) << ",\n"
+        << "      " << kernel_spec.recipe_source_literal << ",\n"
         << "      " << hidden << ",\n"
         << "      " << layout_literal << ",\n"
         << "      " << ll_dispatch_bool_literal(nvlinkOnly) << ",\n"
@@ -80,14 +77,12 @@ inline std::string ll_dispatch_jit_source(
     return src.str();
 }
 
-inline void launch_ll_dispatch(
-    bool useFp8,
-    bool useUe8m0,
-    bool useExternQuant,
+inline ncclResult_t launch_ll_dispatch(
     int hidden,
     ncclEpLayout_t layout,
     bool nvlinkOnly,
     bool topkIdxIsInt64,
+    const DispatchKernelSpec& kernel_spec,
     ncclDataType_t tokenDtype,
     int numSms,
     int numWarps,
@@ -98,20 +93,14 @@ inline void launch_ll_dispatch(
         std::ostringstream name;
         name << "ll_dispatch"
              << "_hdim" << hidden << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_rm")
-             << (useFp8 ? "_fp8" : "_bf16") << (useUe8m0 ? "_ue8m0" : "") << (useExternQuant ? "_extern" : "")
+             << "_recipe" << kernel_spec.recipe_cache_tag
+             << "_payload" << kernel_spec.payload_cache_tag
              << (nvlinkOnly ? "_nvlinkonly" : "") << (topkIdxIsInt64 ? "_topk64" : "_topk32")
              << ll_token_dtype_name_tag(tokenDtype);
         return name.str();
     }();
     const std::string source = ll_dispatch_jit_source(
-        useFp8,
-        useUe8m0,
-        useExternQuant,
-        hidden,
-        layout,
-        nvlinkOnly,
-        topkIdxIsInt64,
-        tokenDtype);
+        kernel_spec, hidden, layout, nvlinkOnly, topkIdxIsInt64, tokenDtype);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ll_dispatch";
@@ -139,8 +128,9 @@ inline void launch_ll_dispatch(
         std::fprintf(stderr, "[nccl_ep jit] fatal LL dispatch JIT launch failure for %s: %s%s%s\n",
                      variant_name.c_str(), ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
                      error.empty() ? "" : error.c_str());
-        std::abort();
+        return ncclInternalError;
     }
+    return ncclSuccess;
 }
 
 } // namespace jit

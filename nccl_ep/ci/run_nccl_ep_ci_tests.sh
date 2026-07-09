@@ -113,6 +113,15 @@ run_ep_bench_layout_size_sweep low-latency em rm
 # not the size axis — already swept above).
 run_ep_bench_variants low-latency 128
 
+# SCALES_FORWARD is a byte-transport recipe. Keep a multi-token positive
+# validation in CI so both token rows and FP32 scale rows are checked.
+run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+  --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
+  --validate --dispatch-only --dispatch-quantization scales-forward
+run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+  --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
+  --validate --dispatch-only --dispatch-quantization ds-fp8e3m4
+
 # High-throughput ep_bench (set NCCL_EP_BENCH_HT=1 to run; off by default — cluster-dependent)
 if [[ "${NCCL_EP_BENCH_HT:-0}" == "1" ]]; then
   # bf16/fp16 at the full hidden dim, full batch range.
@@ -121,6 +130,9 @@ if [[ "${NCCL_EP_BENCH_HT:-0}" == "1" ]]; then
   EP_BENCH_HIDDEN=7168
   run_ep_bench_layout_size_sweep high-throughput fl em
   run_ep_bench_variants high-throughput 4096
+  run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+    --algorithm high-throughput --layout fl --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
+    --validate --dispatch-only --dispatch-quantization scales-forward
 
   # FOLLOW-UP: HT fp32 dispatch SMEM exceeds the device cap (~227KB on H100) at
   # hidden=7168 with the default stages/pipelines, and currently std::abort()s in

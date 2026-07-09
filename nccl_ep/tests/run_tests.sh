@@ -19,6 +19,7 @@ NUM_GPUS="${1:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
 export LD_LIBRARY_PATH="${NCCL_EP_BUILDDIR}/lib:${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
 
 GTEST_ARGS="${GTEST_FILTER:+--gtest_filter=${GTEST_FILTER}}"
+TEST_SUITE="${TEST_SUITE:-}"
 OVERALL_FAIL=0
 
 run_suite() {
@@ -94,12 +95,14 @@ SUITES=(
     "test_ht_stale_routing_map|EP HT Stale Routing Map Tests|1"
     "test_ht_overflow_drop|EP HT Overflow Drop Tests|0"
     "test_tensor_create|EP Tensor Create Tests|0"
+    "test_quantization_recipe|EP Quantization Recipe Tests|0"
     "test_zero_copy|EP Zero-Copy forced|0"
 )
 
 for entry in "${SUITES[@]}"; do
-    IFS='|' read -r bin desc _ <<<"${entry}"
-    run_suite "${bin}" "${desc}"
+    IFS='|' read -r bin desc min_gpus <<<"${entry}"
+    [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "${bin}" ]] || continue
+    run_suite "${bin}" "${desc}" "${min_gpus}"
 done
 
 for mode in LOCAL_DUP NVLINK_DUP; do
@@ -107,6 +110,7 @@ for mode in LOCAL_DUP NVLINK_DUP; do
     export "NCCL_EP_HT_EM_${mode}=1"
     for entry in "${SUITES[@]}"; do
         IFS='|' read -r bin desc em <<<"${entry}"
+        [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "${bin}" ]] || continue
         [[ ${em} == 1 ]] || continue
         run_suite "${bin}" "${desc} (${label})"
     done

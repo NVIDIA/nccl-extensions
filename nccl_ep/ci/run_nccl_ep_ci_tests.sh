@@ -136,7 +136,7 @@ if [[ "${NCCL_EP_BENCH_HT:-0}" == "1" ]]; then
 
   # FOLLOW-UP: HT fp32 dispatch SMEM exceeds the device cap (~227KB on H100) at
   # hidden=7168 with the default stages/pipelines, and currently std::abort()s in
-  # check_dispatch_smem_limit (device/hybridep_adapter.cu:806). That abort should be
+  # check_dispatch_smem_limit (device/ht_ep_adapter.cu:806). That abort should be
   # turned into a clean ncclInvalidArgument rejection (tracked separately). Until then,
   # exercise HT fp32 at half the hidden dim: fp32 is 4 B/elem vs 2 B for 16-bit, so
   # hidden=3584 gives the SAME per-token byte footprint as the 16-bit hidden=7168 runs

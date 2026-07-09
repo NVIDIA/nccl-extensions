@@ -6,8 +6,8 @@
 
 #pragma once
 
-#include "device/hybrid_ep.cuh"
-#include "device/hybridep_adapter.cuh"
+#include "device/ht_ep.cuh"
+#include "device/ht_ep_adapter.cuh"
 #include "device/jit/jit_runtime.hpp"
 #include "device/jit/jit_utils.hpp"
 #include "nccl_ep_env.h"
@@ -22,7 +22,7 @@
 #include <vector>
 
 namespace nccl_ep {
-namespace hybridep {
+namespace ht {
 namespace jit {
 
 constexpr const char* kDispatchJitEntryName = "nccl_ep_jit_ht_dispatch_kernel";
@@ -47,13 +47,13 @@ struct dispatch_warp_layout_t {
 inline dispatch_warp_layout_t compute_dispatch_warp_layout(int num_lsa_teams, ncclEpLayout_t layout) {
     const bool multinode_layout = (num_lsa_teams != 1);
     dispatch_warp_layout_t L{};
-    L.num_pipelines = HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
-    L.inter_node_group_warps = multinode_layout ? HYBRIDEP_DISPATCH_N2N_WARPS : 0;
+    L.num_pipelines = NCCL_EP_HT_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
+    L.inter_node_group_warps = multinode_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
     L.inter_node_group_start = 0;
     L.intra_node_g2s_group_warps = L.num_pipelines;
-    L.intra_node_g2s_group_start = multinode_layout ? HYBRIDEP_DISPATCH_N2N_WARPS : 0;
+    L.intra_node_g2s_group_start = multinode_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
     L.intra_node_s2g_group_warps = L.num_pipelines;
-    L.intra_node_s2g_group_start = multinode_layout ? (HYBRIDEP_DISPATCH_N2N_WARPS + L.num_pipelines) : L.num_pipelines;
+    L.intra_node_s2g_group_start = multinode_layout ? (NCCL_EP_HT_DISPATCH_N2N_WARPS + L.num_pipelines) : L.num_pipelines;
     L.pad_group_warps = (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? 1 : 0;
     L.pad_group_start = L.intra_node_s2g_group_start + L.intra_node_s2g_group_warps;
     L.block_dim = 32 * (L.inter_node_group_warps + L.intra_node_g2s_group_warps + L.intra_node_s2g_group_warps +
@@ -86,25 +86,25 @@ inline std::string dispatch_jit_source(
     const char* layout_literal =
         (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? "NCCL_EP_LAYOUT_EXPERT_MAJOR" : "NCCL_EP_LAYOUT_FLAT";
     std::ostringstream src;
-    src << "#include \"device/hybrid_ep.cuh\"\n"
+    src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
         << "using TOKEN_DATA_TYPE = " << kernel_spec.payload_type_literal << ";\n"
         << "static constexpr int kSfBytesPerToken = " << sf_bytes_per_token << ";\n"
-        << "using INTER_NODE_GROUP     = hybrid_ep::warp_group<" << inter_node_group_warps << ", "
+        << "using INTER_NODE_GROUP     = ht_ep::warp_group<" << inter_node_group_warps << ", "
         << inter_node_group_start << ">;\n"
-        << "using INTRA_NODE_G2S_GROUP = hybrid_ep::warp_group<" << intra_node_g2s_group_warps << ", "
+        << "using INTRA_NODE_G2S_GROUP = ht_ep::warp_group<" << intra_node_g2s_group_warps << ", "
         << intra_node_g2s_group_start << ">;\n"
-        << "using INTRA_NODE_S2G_GROUP = hybrid_ep::warp_group<" << intra_node_s2g_group_warps << ", "
+        << "using INTRA_NODE_S2G_GROUP = ht_ep::warp_group<" << intra_node_s2g_group_warps << ", "
         << intra_node_s2g_group_start << ">;\n"
-        << "using PAD_GROUP            = hybrid_ep::warp_group<" << pad_group_warps << ", " << pad_group_start << ">;\n"
+        << "using PAD_GROUP            = ht_ep::warp_group<" << pad_group_warps << ", " << pad_group_start << ">;\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + "
            "INTRA_NODE_S2G_GROUP::size() + PAD_GROUP::size(), 1)\n"
         << "__global__ void " << kDispatchJitEntryName << "(\n"
-        << "    const __grid_constant__ hybrid_ep::dispatch_kernel_param_t<TOKEN_DATA_TYPE, " << lsa_team_size
+        << "    const __grid_constant__ ht_ep::dispatch_kernel_param_t<TOKEN_DATA_TYPE, " << lsa_team_size
         << "> param) {\n"
         << "  extern __shared__ uint8_t smem_bytes[];\n"
-        << "  hybrid_ep::dispatch_kernel_impl<\n"
+        << "  ht_ep::dispatch_kernel_impl<\n"
         << "      TOKEN_DATA_TYPE,\n"
         << "      " << kernel_spec.recipe_source_literal << ",\n"
         << "      INTER_NODE_GROUP,\n"
@@ -238,11 +238,11 @@ inline ncclResult_t launch_dispatch(
     return ncclSuccess;
 }
 
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
 inline void dispatch_dump_warp_timing(
     const dispatch_warp_layout_t& L,
     int num_of_blocks,
-    ::hybrid_ep::dispatch_warp_timing_entry_t* d_wt,
+    ::ht_ep::dispatch_warp_timing_entry_t* d_wt,
     cudaStream_t stream) {
     const int wt_warps_per_block = L.block_dim / 32;
     const int wt_total = num_of_blocks * wt_warps_per_block;
@@ -253,11 +253,11 @@ inline void dispatch_dump_warp_timing(
     if (pmix_rank != 0 || iter_count != 40) return;
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::vector<::hybrid_ep::dispatch_warp_timing_entry_t> h_wt(wt_total);
+    std::vector<::ht_ep::dispatch_warp_timing_entry_t> h_wt(wt_total);
     CUDA_CHECK(cudaMemcpy(
         h_wt.data(),
         d_wt,
-        wt_total * sizeof(::hybrid_ep::dispatch_warp_timing_entry_t),
+        wt_total * sizeof(::ht_ep::dispatch_warp_timing_entry_t),
         cudaMemcpyDeviceToHost));
     int _wt_clock_khz;
     CUDA_CHECK(cudaDeviceGetAttribute(&_wt_clock_khz, cudaDevAttrClockRate, 0));
@@ -317,14 +317,14 @@ inline std::string local_dup_jit_source(
     bool forward_dispatch,
     const char* token_type_literal = "uint16_t") {
     std::ostringstream src;
-    src << "#include \"device/hybrid_ep.cuh\"\n"
+    src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
         << "using TOKEN_DATA_TYPE = " << token_type_literal << ";\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(64, 1)\n"
         << "__global__ void " << kLocalDupJitEntryName << "(\n"
-        << "    const __grid_constant__ hybrid_ep::local_dup_kernel_param_t<TOKEN_DATA_TYPE> p) {\n"
-        << "  hybrid_ep::local_dup_kernel_impl<\n"
+        << "    const __grid_constant__ ht_ep::local_dup_kernel_param_t<TOKEN_DATA_TYPE> p) {\n"
+        << "  ht_ep::local_dup_kernel_impl<\n"
         << "      TOKEN_DATA_TYPE,\n"
         << "      " << hidden_dim << ",\n"
         << "      " << pipe_depth << ",\n"
@@ -339,7 +339,7 @@ inline void launch_local_dup(
     int pipe_depth,
     bool forward_dispatch,
     int num_blocks,
-    ::hybrid_ep::local_dup_kernel_param_t<T>& param,
+    ::ht_ep::local_dup_kernel_param_t<T>& param,
     int dynamic_smem_bytes,
     cudaStream_t stream) {
     static const int variant_identity = 0;
@@ -385,7 +385,7 @@ constexpr const char* kLocalPermuteDupJitEntryName = "nccl_ep_jit_local_permute_
 // the {8,4,2,1} ladder keeps H=7168 (hidden_int4=896) at HiddenVec=4 while
 // promoting H=2048 (hidden_int4=256) and other H % 4096 == 0 cases to 8.
 inline int pick_dup_hidden_vec(int hidden_int4) {
-    constexpr int kThreads = ::hybrid_ep::kLocalPermuteThreadsPerSlot;
+    constexpr int kThreads = ::ht_ep::kLocalPermuteThreadsPerSlot;
     for (int v : {8, 4, 2, 1}) {
         if (hidden_int4 % (kThreads * v) == 0) return v;
     }
@@ -399,12 +399,12 @@ inline int pick_dup_blocks_per_sm(int hidden_int4) {
 
 inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec, int blocks_per_sm) {
     std::ostringstream src;
-    src << "#include \"device/hybrid_ep.cuh\"\n"
+    src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
-        << "extern \"C\" __launch_bounds__(" << ::hybrid_ep::kLocalPermuteThreads << ", " << blocks_per_sm << ")\n"
+        << "extern \"C\" __launch_bounds__(" << ::ht_ep::kLocalPermuteThreads << ", " << blocks_per_sm << ")\n"
         << "__global__ void " << kLocalPermuteDupJitEntryName << "(\n"
-        << "    const __grid_constant__ ::hybrid_ep::local_permute_dup_param_t p) {\n"
-        << "  ::hybrid_ep::local_permute_dup<" << hidden_int4 << ", " << hidden_vec << ">(\n"
+        << "    const __grid_constant__ ::ht_ep::local_permute_dup_param_t p) {\n"
+        << "  ::ht_ep::local_permute_dup<" << hidden_int4 << ", " << hidden_vec << ">(\n"
         << "      reinterpret_cast<uint8_t*>(p.recv_x_em),\n"
         << "      p.recv_topk_weights_em,\n"
         << "      reinterpret_cast<const uint8_t*>(p.flat_staging),\n"
@@ -422,7 +422,7 @@ inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec,
 }
 
 inline void
-launch_local_permute_dup(int num_blocks, ::hybrid_ep::local_permute_dup_param_t& param, cudaStream_t stream) {
+launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& param, cudaStream_t stream) {
     static const int variant_identity = 0;
     assert((param.row_bytes % 16) == 0);
     const int hidden_int4 = param.row_bytes / 16;
@@ -447,7 +447,7 @@ launch_local_permute_dup(int num_blocks, ::hybrid_ep::local_permute_dup_param_t&
     variant.runtime_key = (static_cast<std::uint64_t>(hidden_int4) << 16) |
                           (static_cast<std::uint64_t>(hidden_vec) << 8) | static_cast<std::uint64_t>(blocks_per_sm);
     variant.num_blocks = num_blocks * blocks_per_sm;
-    variant.block_dim = ::hybrid_ep::kLocalPermuteThreads;
+    variant.block_dim = ::ht_ep::kLocalPermuteThreads;
     variant.dynamic_smem_bytes = row_bytes_aligned;
 
     std::string error;
@@ -462,5 +462,5 @@ launch_local_permute_dup(int num_blocks, ::hybrid_ep::local_permute_dup_param_t&
 }
 
 } // namespace jit
-} // namespace hybridep
+} // namespace ht
 } // namespace nccl_ep

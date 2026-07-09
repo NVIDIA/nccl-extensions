@@ -26,8 +26,8 @@
 #include "common.hpp"
 
 // HT (High Throughput) includes
-#include "device/hybridep_adapter.cuh"
-#include "device/hybridep_configs.cuh"
+#include "device/ht_ep_adapter.cuh"
+#include "device/ht_ep_configs.cuh"
 #include "device/ll_ep_adapter.cuh"
 
 // NCCLCHECK macro for public API error checking
@@ -46,11 +46,11 @@
 
 // Forward declarations for HT functions
 static ncclResult_t
-init_hybridep_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* config, cudaStream_t stream);
-static ncclResult_t destroy_hybridep_intranode(ncclEpGroup_t ep_group);
+init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* config, cudaStream_t stream);
+static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group);
 static ncclResult_t
-init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* config, cudaStream_t stream);
-static ncclResult_t destroy_hybridep_internode(ncclEpGroup_t ep_group);
+init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* config, cudaStream_t stream);
+static ncclResult_t destroy_ht_internode(ncclEpGroup_t ep_group);
 
 // Forward declaration for LL helper (defined alongside ll_init_handle).
 static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_size);
@@ -682,7 +682,7 @@ struct ncclEpGroup {
         size_t combine_guard_offset = 0;
 
         unsigned signals_tail_base = 0;         // Base signal ID for tail tracking (sender -> receiver)
-        int num_max_rdma_chunked_send_tokens = HYBRIDEP_DISPATCH_RDMA_BATCH_SIZE;
+        int num_max_rdma_chunked_send_tokens = NCCL_EP_HT_DISPATCH_RDMA_BATCH_SIZE;
 
     } gin_config;
 
@@ -933,7 +933,7 @@ static ncclResult_t ht_query_num_recv_tokens(ncclEpHandle_t handle, cudaStream_t
 
 // HT Intranode Initialization (adapted for public NCCL APIs)
 static ncclResult_t
-init_hybridep_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, cudaStream_t stream) {
+init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, cudaStream_t stream) {
     ncclComm_t comm = ep_group->comm;
     // HT topology uses NCCL team semantics (rail/lsa)
     int lsa_ranks = ep_group->lsa_team_size;
@@ -1138,7 +1138,7 @@ init_hybridep_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
 }
 
 // HT Intranode Cleanup
-static ncclResult_t destroy_hybridep_intranode(ncclEpGroup_t ep_group) {
+static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
     if (!ep_group->ht_buffers.initialized) return ncclSuccess;
 
     if (ep_group->ht_buffers.intranode_mega_window != ncclWindow_t{}) {
@@ -1204,15 +1204,15 @@ static ncclResult_t destroy_hybridep_intranode(ncclEpGroup_t ep_group) {
 #endif
 
 // Constants for GIN configuration
-static constexpr int HYBRIDEP_GIN_MAX_CONTEXTS = 32;
-static constexpr int HYBRIDEP_GIN_CTXS_PER_COMM = 4;
+static constexpr int NCCL_EP_HT_GIN_MAX_CONTEXTS = 32;
+static constexpr int NCCL_EP_HT_GIN_CTXS_PER_COMM = 4;
 static constexpr int MAX_BARRIER_SESSIONS = 32;
 
 static ncclResult_t
-init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, cudaStream_t stream) {
+init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, cudaStream_t stream) {
     // Initialize using public NCCL APIs
     if (!in_config || !ep_group) {
-        fprintf(stderr, "init_hybridep_internode: null config or ep_group\n");
+        fprintf(stderr, "init_ht_internode: null config or ep_group\n");
         return ncclInvalidArgument;
     }
 
@@ -1226,7 +1226,7 @@ init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
         ep_group->gin_config.num_dcomms = 1;
         ep_group->gin_config.dcomms = new ncclDevComm_t[1];
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-        reqs.lsaBarrierCount = HYBRIDEP_DISPATCH_NUM_OF_BLOCKS + 1; // dispatch per-block [0,NB) + elected combine [NB]
+        reqs.lsaBarrierCount = NCCL_EP_HT_DISPATCH_NUM_OF_BLOCKS + 1; // dispatch per-block [0,NB) + elected combine [NB]
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
         CUDACHECK_RET(cudaMalloc(
             reinterpret_cast<void**>(&ep_group->gin_config.d_dcomms),
@@ -1396,7 +1396,7 @@ init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
     }
 
     int qps_per_rank = ep_group->config.num_qp_per_rank;
-    int min_required_ctx = ep_group->comm_num_sms * HYBRIDEP_DISPATCH_N2N_WARPS;
+    int min_required_ctx = ep_group->comm_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS;
     if (qps_per_rank == 0) qps_per_rank = min_required_ctx;
     if (qps_per_rank < min_required_ctx) {
         fprintf(stderr, "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d for dedicated N2N warp contexts\n",
@@ -1439,8 +1439,8 @@ init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
         reqs.ginContextCount = ep_group->gin_config.num_ctx_per_comm;
         reqs.ginQueueDepth = 3 * ht_tokens_per_chunk + 1;
         // LSA barriers for the HT sync-guard: per-block dispatch [0, NUM_OF_BLOCKS) + one
-        // for the elected combine-tail block [NUM_OF_BLOCKS]. NUM_OF_BLOCKS <= HYBRIDEP_DISPATCH_NUM_OF_BLOCKS.
-        reqs.lsaBarrierCount = HYBRIDEP_DISPATCH_NUM_OF_BLOCKS + 1; // dispatch per-block [0,NB) + elected combine [NB]
+        // for the elected combine-tail block [NUM_OF_BLOCKS]. NUM_OF_BLOCKS <= NCCL_EP_HT_DISPATCH_NUM_OF_BLOCKS.
+        reqs.lsaBarrierCount = NCCL_EP_HT_DISPATCH_NUM_OF_BLOCKS + 1; // dispatch per-block [0,NB) + elected combine [NB]
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
     }
 
@@ -1465,7 +1465,7 @@ init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
     return ncclSuccess;
 }
 
-static ncclResult_t destroy_hybridep_internode(ncclEpGroup_t ep_group) {
+static ncclResult_t destroy_ht_internode(ncclEpGroup_t ep_group) {
     if (!ep_group->ht_buffers.internode_initialized) return ncclSuccess;
 
     // =========================================================================
@@ -1581,7 +1581,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         "ncclEpCreateGroup: invalid algorithm, supported: low_latency, high_throughput");
 
     bool low_latency_mode = (in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY);
-    bool hybridep_mode = (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT);
+    bool ht_mode = (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT);
     assert(in_config->num_experts > 0 && "ncclEpCreateGroup: num_experts must be greater than 0");
     assert(in_config->max_token_bytes > 0 && "ncclEpCreateGroup: max_token_bytes must be greater than 0");
     assert(
@@ -1713,7 +1713,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     //   expands each token to up to num_topk slots, hence the config.num_topk
     //   factor. Eager relies on TRAP semantics, so DROP requires a fixed budget.
     //   LL AUTO/0: nRanks * max_dispatch_tokens_per_rank (layout-agnostic).
-    ep_group->eager_mode = hybridep_mode && (ep_group->config.max_recv_tokens_per_rank == NCCL_EP_AUTO);
+    ep_group->eager_mode = ht_mode && (ep_group->config.max_recv_tokens_per_rank == NCCL_EP_AUTO);
     if (ep_group->eager_mode) {
         EP_HOST_ASSERT(
             ep_group->config.overflow_policy != NCCL_EP_OVERFLOW_DROP &&
@@ -1746,7 +1746,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     }
 
     if (ep_group->config.num_qp_per_rank == NCCL_EP_AUTO) {
-        ep_group->config.num_qp_per_rank = ep_group->comm_num_sms * HYBRIDEP_DISPATCH_N2N_WARPS;
+        ep_group->config.num_qp_per_rank = ep_group->comm_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS;
     }
 
     // Resolve timeout_cycles: env var > config field > compile-time default
@@ -1795,7 +1795,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     ep_group->node_id = ep_group->rank / ep_group->gpus_per_node;
     ep_group->lsa_team_size = lsa_team.nRanks;
     ep_group->lsa_rank = lsa_team.rank;
-    if (hybridep_mode) {
+    if (ht_mode) {
         // HT uses rail-domain decomposition.
         ep_group->rdma_team_size = rail_team.nRanks;
         ep_group->rdma_rank = rail_team.rank;
@@ -1805,7 +1805,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         ep_group->rdma_team_size = ep_group->nRanks;
         ep_group->rdma_rank = ep_group->rank;
     }
-    if (hybridep_mode) {
+    if (ht_mode) {
         assert(
             ep_group->rdma_team_size > 0 && ep_group->lsa_team_size > 0 &&
             "ncclEpCreateGroup: invalid HT team cardinalities");
@@ -1850,7 +1850,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     }
 
     // Initialize HT intranode buffers (windows, completion flags, etc.)
-    if (hybridep_mode) {
+    if (ht_mode) {
         // Resolve the dispatch/combine tokens-per-chunk for this group. RDMA
         // (multi-node) configs use the tuned 64-token default; LSA-only configs
         // use a grid-proportional size so one chunk is one wave across all SMs
@@ -1862,7 +1862,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         int chunk =
             (ep_group->rdma_team_size > 1) ?
                 HT_TOKENS_PER_CHUNK_RDMA_DEFAULT :
-                round_up_32(HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP * static_cast<int>(ep_group->comm_num_sms));
+                round_up_32(NCCL_EP_HT_COMBINE_NUM_OF_TOKENS_PER_GROUP * static_cast<int>(ep_group->comm_num_sms));
         if (ep_group->env.tokens_per_chunk.is_set && ep_group->env.tokens_per_chunk.value.ul > 0) {
             const int requested = static_cast<int>(ep_group->env.tokens_per_chunk.value.ul);
             chunk = round_up_32(requested);
@@ -1876,8 +1876,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         // the dispatch/combine kernels (guarantees MAX_NUM_OF_TOKENS_PER_RANK % chunk == 0).
         ep_group->ht_aligned_max_tokens = ((ep_group->config.max_dispatch_tokens_per_rank + chunk - 1) / chunk) * chunk;
 
-        NCCL_CHECK_RESULT(init_hybridep_intranode(ep_group, in_config, stream));
-        NCCL_CHECK_RESULT(init_hybridep_internode(ep_group, in_config, stream));
+        NCCL_CHECK_RESULT(init_ht_intranode(ep_group, in_config, stream));
+        NCCL_CHECK_RESULT(init_ht_internode(ep_group, in_config, stream));
 
         // Group-scoped routing bitmap shared by all handles on this group.
         const size_t routing_bytes = static_cast<size_t>(ep_group->nRanks) *
@@ -1985,11 +1985,11 @@ ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group) {
 
     // Clean up HT intranode resources
     if (ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ep_group->ht_buffers.initialized) {
-        destroy_hybridep_intranode(ep_group);
+        destroy_ht_intranode(ep_group);
     }
     // Clean up HT internode resources (GIN deregistration must happen before ncclCommDestroy)
     if (ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ep_group->ht_buffers.internode_initialized) {
-        destroy_hybridep_internode(ep_group);
+        destroy_ht_internode(ep_group);
     }
     // Clean up mask buffer and async error flag
     if (ep_group->mask_buffer != nullptr) {
@@ -2075,7 +2075,7 @@ struct ncclEpHandle {
 
     ncclEpLayout_t layout;
 
-    // User-owned (do not free). LL reads directly; HT uses cached hybridep.topk_idx.
+    // User-owned (do not free). LL reads directly; HT uses cached ht.topk_idx.
     ncclEpTensor_t topk_idx;
     int num_tokens, num_topk;
     // True once `num_tokens` has been authoritatively populated by
@@ -2260,13 +2260,13 @@ struct ncclEpHandle {
             // to populate the recv-indexed em_slot table.
             int32_t* token_to_recv_slot;
 
-        } hybridep;
+        } ht;
     };
 
     ncclEpHandle()
         : group(nullptr), layout(NCCL_EP_LAYOUT_UNSET), topk_idx(NCCL_EP_TENSOR_INIT), num_tokens(0), num_topk(0),
           num_tokens_set(false), cached_mode(false), num_scales(0), hidden_int4(0) {
-        constexpr size_t union_size = std::max(sizeof(ll), sizeof(hybridep));
+        constexpr size_t union_size = std::max(sizeof(ll), sizeof(ht));
         memset(static_cast<void*>(&ll), 0, union_size);
     }
 
@@ -2354,12 +2354,12 @@ struct HtBlockLayout {
         L.sz_s2d = align256(static_cast<size_t>(rdma_team_size) * max_tokens * s2d_inner_dim * sizeof(int32_t));
         L.sz_rank_mask = align256(
             static_cast<size_t>(rdma_team_size) * max_tokens * lsa_team_size *
-            nccl_ep::hybridep::get_rank_mask_elem_size(lsa_team_size));
+            nccl_ep::ht::get_rank_mask_elem_size(lsa_team_size));
         // Size for device_sm_count blocks: the upper bound on the preprocessing
         // scan's block count (ep_group->preprocess_num_sms, incl. any
         // NCCL_EP_PREPROCESS_NUM_SMS override) so the buffer always fits.
         L.sz_scan_tmp = align256(
-            nccl_ep::hybridep::get_preprocessing_scan_tmp_size(
+            nccl_ep::ht::get_preprocessing_scan_tmp_size(
                 static_cast<int>(ep_group->device_sm_count),
                 lsa_team_size));
         L.sz_prob = !is_internode_available(ep_group) ?
@@ -2608,80 +2608,80 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
         ncclEpTensor_t handle_mem_local;
         const ncclEpTensor_t* resolved_handle_mem;
         NCCLCHECK(resolveTensorWindowBinding(ep_group, handle_mem, &handle_mem_local, 0, &resolved_handle_mem));
-        handle->hybridep.preprocessing_block = resolved_handle_mem->data;
-        handle->hybridep.owns_handle_mem = false;
+        handle->ht.preprocessing_block = resolved_handle_mem->data;
+        handle->ht.owns_handle_mem = false;
     } else {
-        CUDA_CHECK(ep_group->alloc.alloc_fn(&handle->hybridep.preprocessing_block, L.total, ep_group->alloc.context));
-        handle->hybridep.owns_handle_mem = true;
+        CUDA_CHECK(ep_group->alloc.alloc_fn(&handle->ht.preprocessing_block, L.total, ep_group->alloc.context));
+        handle->ht.owns_handle_mem = true;
     }
-    handle->hybridep.preprocessing_zero_region_size = L.zero_region;
-    handle->hybridep.preprocessing_s2d_size = L.sz_s2d;
+    handle->ht.preprocessing_zero_region_size = L.zero_region;
+    handle->ht.preprocessing_s2d_size = L.sz_s2d;
 
-    char* ptr = static_cast<char*>(handle->hybridep.preprocessing_block);
+    char* ptr = static_cast<char*>(handle->ht.preprocessing_block);
     size_t offset = 0;
 
     // global_routing_map: read directly from ep_group->ht_buffers (not duplicated on the handle).
-    handle->hybridep.rdma_to_attn_map = reinterpret_cast<bool*>(ptr + offset);
+    handle->ht.rdma_to_attn_map = reinterpret_cast<bool*>(ptr + offset);
     offset += L.sz_r2a;
-    handle->hybridep.attn_to_rdma_map = (ep_group->nNodes > 1) ? reinterpret_cast<bool*>(ptr + offset) : nullptr;
+    handle->ht.attn_to_rdma_map = (ep_group->nNodes > 1) ? reinterpret_cast<bool*>(ptr + offset) : nullptr;
     offset += L.sz_a2r;
-    handle->hybridep.local_expert_routing_map = reinterpret_cast<bool*>(ptr + offset);
+    handle->ht.local_expert_routing_map = reinterpret_cast<bool*>(ptr + offset);
     offset += L.sz_ler;
-    handle->hybridep.num_tokens_for_experts = reinterpret_cast<int32_t*>(ptr + offset);
+    handle->ht.num_tokens_for_experts = reinterpret_cast<int32_t*>(ptr + offset);
     offset += L.sz_ntfe;
     // --- end of zero_region (memset 0x00) ---
-    handle->hybridep.sparse_to_dense_map = reinterpret_cast<int32_t*>(ptr + offset);
+    handle->ht.sparse_to_dense_map = reinterpret_cast<int32_t*>(ptr + offset);
     offset += L.sz_s2d;
     // --- end of s2d region (memset 0xFF) ---
-    handle->hybridep.token_rank_mask = ptr + offset;
+    handle->ht.token_rank_mask = ptr + offset;
     offset += L.sz_rank_mask;
-    handle->hybridep.preprocessing_scan_tmp = reinterpret_cast<void*>(ptr + offset);
+    handle->ht.preprocessing_scan_tmp = reinterpret_cast<void*>(ptr + offset);
     offset += L.sz_scan_tmp;
     if (!is_internode_available(ep_group)) {
-        handle->hybridep.dense_prob_buffer = reinterpret_cast<float*>(ptr + offset);
+        handle->ht.dense_prob_buffer = reinterpret_cast<float*>(ptr + offset);
         offset += L.sz_prob;
     } else {
-        handle->hybridep.dense_prob_buffer = nullptr;
+        handle->ht.dense_prob_buffer = nullptr;
     }
-    handle->hybridep.topk_idx = (L.sz_topk_idx > 0) ? reinterpret_cast<void*>(ptr + offset) : nullptr;
+    handle->ht.topk_idx = (L.sz_topk_idx > 0) ? reinterpret_cast<void*>(ptr + offset) : nullptr;
     offset += L.sz_topk_idx;
     // EM remap counts/offsets live in handle_mem (EM only; FLAT must not read them).
-    handle->hybridep.per_expert_counts_active =
+    handle->ht.per_expert_counts_active =
         (L.sz_pec_active > 0) ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
     offset += L.sz_pec_active;
-    handle->hybridep.expert_token_offsets = (L.sz_eto > 0) ? reinterpret_cast<int64_t*>(ptr + offset) : nullptr;
+    handle->ht.expert_token_offsets = (L.sz_eto > 0) ? reinterpret_cast<int64_t*>(ptr + offset) : nullptr;
     offset += L.sz_eto;
     if (L.sz_emuf_group_buf > 0) {
-        handle->hybridep.emuf_group_buf = reinterpret_cast<int32_t*>(ptr + offset);
+        handle->ht.emuf_group_buf = reinterpret_cast<int32_t*>(ptr + offset);
         offset += L.sz_emuf_group_buf;
-        handle->hybridep.emuf_group_count = reinterpret_cast<int32_t*>(ptr + offset);
+        handle->ht.emuf_group_count = reinterpret_cast<int32_t*>(ptr + offset);
         offset += L.sz_emuf_group_count;
-        handle->hybridep.emuf_group_stride = L.emuf_group_stride;
-        handle->hybridep.emuf_max_groups = L.emuf_max_groups;
+        handle->ht.emuf_group_stride = L.emuf_group_stride;
+        handle->ht.emuf_max_groups = L.emuf_max_groups;
     } else {
-        handle->hybridep.emuf_group_buf = nullptr;
-        handle->hybridep.emuf_group_count = nullptr;
-        handle->hybridep.emuf_group_stride = 0;
-        handle->hybridep.emuf_max_groups = 0;
+        handle->ht.emuf_group_buf = nullptr;
+        handle->ht.emuf_group_count = nullptr;
+        handle->ht.emuf_group_stride = 0;
+        handle->ht.emuf_max_groups = 0;
     }
-    handle->hybridep.flat2em_slot_map =
+    handle->ht.flat2em_slot_map =
         (L.sz_flat2em_slot_map > 0) ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
     offset += L.sz_flat2em_slot_map;
-    handle->hybridep.recv_topk_weights_flat =
+    handle->ht.recv_topk_weights_flat =
         (L.sz_recv_topk_weights_flat > 0) ? reinterpret_cast<float*>(ptr + offset) : nullptr;
     offset += L.sz_recv_topk_weights_flat;
-    handle->hybridep.token_to_recv_slot =
+    handle->ht.token_to_recv_slot =
         (L.sz_token_to_recv_slot > 0) ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
     offset += L.sz_token_to_recv_slot;
-    handle->hybridep.dispatch_output_per_expert_alignment = 0;
+    handle->ht.dispatch_output_per_expert_alignment = 0;
 
     if (is_internode_available(ep_group)) {
-        handle->hybridep.dense_prob_buffer = ep_group->ht_buffers.dense_prob_buffer;
-        handle->hybridep.token_staging_buffer = ep_group->ht_buffers.token_staging_buffer;
-        handle->hybridep.scaling_factor_staging_buffer = ep_group->ht_buffers.scaling_factor_staging_buffer;
+        handle->ht.dense_prob_buffer = ep_group->ht_buffers.dense_prob_buffer;
+        handle->ht.token_staging_buffer = ep_group->ht_buffers.token_staging_buffer;
+        handle->ht.scaling_factor_staging_buffer = ep_group->ht_buffers.scaling_factor_staging_buffer;
     } else {
-        handle->hybridep.token_staging_buffer = nullptr;
-        handle->hybridep.scaling_factor_staging_buffer = nullptr;
+        handle->ht.token_staging_buffer = nullptr;
+        handle->ht.scaling_factor_staging_buffer = nullptr;
     }
     return ncclSuccess;
 }
@@ -2731,7 +2731,7 @@ ncclResult_t ncclEpInitHandle(
     } else {
         res = ht_init_handle(handle, ep_group, handle_mem, num_topk);
         if (res == ncclSuccess && is_ht_em) {
-            handle->hybridep.dispatch_output_per_expert_alignment = em_align;
+            handle->ht.dispatch_output_per_expert_alignment = em_align;
         }
     }
 
@@ -2799,16 +2799,16 @@ ncclResult_t ncclEpUpdateHandle(
     // Buffers are allocated at max_tokens capacity, so this clears beyond the active num_tokens
     // region — safe because allgather/preprocessing will overwrite the relevant portions.
     CUDA_CHECK(cudaMemsetAsync(
-        handle->hybridep.preprocessing_block,
+        handle->ht.preprocessing_block,
         0,
-        handle->hybridep.preprocessing_zero_region_size,
+        handle->ht.preprocessing_zero_region_size,
         stream));
     // sparse_to_dense_map (unified S2D) uses 0xFF sentinel (not zero)
-    if (handle->hybridep.preprocessing_s2d_size > 0) {
+    if (handle->ht.preprocessing_s2d_size > 0) {
         CUDA_CHECK(cudaMemsetAsync(
-            handle->hybridep.sparse_to_dense_map,
+            handle->ht.sparse_to_dense_map,
             0xFF,
-            handle->hybridep.preprocessing_s2d_size,
+            handle->ht.preprocessing_s2d_size,
             stream));
     }
 
@@ -2821,20 +2821,20 @@ ncclResult_t ncclEpUpdateHandle(
     // be interpreted as live routing by peers.
     // Cache the idx in the caller's native width (int32 or int64).
     if (handle->topk_idx.datatype == ncclInt32) {
-        nccl_ep::hybridep::convert_topk_to_routing_map(
+        nccl_ep::ht::convert_topk_to_routing_map(
             static_cast<const int32_t*>(handle->topk_idx.data),
             local_routing_send_ptr,
-            static_cast<int32_t*>(handle->hybridep.topk_idx),
+            static_cast<int32_t*>(handle->ht.topk_idx),
             handle->num_tokens,
             max_tokens,
             handle->num_topk,
             num_experts_packed,
             stream);
     } else {
-        nccl_ep::hybridep::convert_topk_to_routing_map(
+        nccl_ep::ht::convert_topk_to_routing_map(
             static_cast<const int64_t*>(handle->topk_idx.data),
             local_routing_send_ptr,
-            static_cast<int64_t*>(handle->hybridep.topk_idx),
+            static_cast<int64_t*>(handle->ht.topk_idx),
             handle->num_tokens,
             max_tokens,
             handle->num_topk,
@@ -2893,7 +2893,7 @@ ncclResult_t ncclEpUpdateHandle(
     // FLAT: authoritative counts go to caller's recv_expert_counter when provided.
     int32_t* per_expert_counts_device = nullptr;
     if (expert_major) {
-        per_expert_counts_device = handle->hybridep.per_expert_counts_active;
+        per_expert_counts_device = handle->ht.per_expert_counts_active;
     } else if (recv_expert_counter != nullptr) {
         assert(recv_expert_counter->ndim == 1 && "recv_expert_counter must be 1D");
         assert(recv_expert_counter->datatype == ncclInt32 && "HT flat: recv_expert_counter must be ncclInt32");
@@ -2911,7 +2911,7 @@ ncclResult_t ncclEpUpdateHandle(
         assert(resolved_recv_expert_counter->data != nullptr && "recv_expert_counter data must not be null");
         per_expert_counts_device = static_cast<int32_t*>(resolved_recv_expert_counter->data);
     }
-    // hybridep.expert_token_offsets is already the handle_mem slot for EM; FLAT path never reads it.
+    // ht.expert_token_offsets is already the handle_mem slot for EM; FLAT path never reads it.
 
     // layout_info->recv_total_counter: scalar total recv tokens (size 1, int32/64), written by metadata.
     void* recv_total_counter = nullptr;
@@ -2930,13 +2930,13 @@ ncclResult_t ncclEpUpdateHandle(
     }
 
     // Zero the EM-unfused dup-group counter before scan (when allocated).
-    if (handle->hybridep.emuf_group_count != nullptr) {
-        CUDA_CHECK(cudaMemsetAsync(handle->hybridep.emuf_group_count, 0, sizeof(int32_t), stream));
+    if (handle->ht.emuf_group_count != nullptr) {
+        CUDA_CHECK(cudaMemsetAsync(handle->ht.emuf_group_count, 0, sizeof(int32_t), stream));
     }
 
     const bool em_permute_active = em_local_permute_enabled(ep_group, handle);
     int max_recv_tpr = static_cast<int>(ep_group->config.max_recv_tokens_per_rank);
-    const int alignment = static_cast<int>(handle->hybridep.dispatch_output_per_expert_alignment);
+    const int alignment = static_cast<int>(handle->ht.dispatch_output_per_expert_alignment);
     if (ep_group->eager_mode && em_permute_active && (alignment > 0)) {
         // Eager local-permute: padded zones live in the caller buffer
         // Extend the zone-overflow budget by the worst-case padding.
@@ -2944,16 +2944,16 @@ ncclResult_t ncclEpUpdateHandle(
     }
 
     NCCLCHECK(
-        nccl_ep::hybridep::call_metadata_preprocessing(
+        nccl_ep::ht::call_metadata_preprocessing(
             global_routing_map,
-            handle->hybridep.sparse_to_dense_map,
-            handle->hybridep.rdma_to_attn_map,
-            handle->hybridep.attn_to_rdma_map,
-            handle->hybridep.token_rank_mask,
-            handle->hybridep.num_tokens_for_experts,
-            handle->hybridep.local_expert_routing_map,
+            handle->ht.sparse_to_dense_map,
+            handle->ht.rdma_to_attn_map,
+            handle->ht.attn_to_rdma_map,
+            handle->ht.token_rank_mask,
+            handle->ht.num_tokens_for_experts,
+            handle->ht.local_expert_routing_map,
             per_expert_counts_device,
-            handle->hybridep.preprocessing_scan_tmp,
+            handle->ht.preprocessing_scan_tmp,
             ep_group->rdma_rank,
             ep_group->lsa_rank,
             max_tokens,
@@ -2961,20 +2961,20 @@ ncclResult_t ncclEpUpdateHandle(
             n_ranks_per_node,
             experts_per_rank,
             expert_major,
-            expert_major ? handle->hybridep.expert_token_offsets : nullptr,
+            expert_major ? handle->ht.expert_token_offsets : nullptr,
             padded_out_counts,
             out_offsets,
-            expert_major ? handle->hybridep.dispatch_output_per_expert_alignment : size_t(0),
+            expert_major ? handle->ht.dispatch_output_per_expert_alignment : size_t(0),
             // Remap kernel writes authoritative per-expert counts (scan overcounts secondary hits).
             expert_major ? per_expert_counts_device : nullptr,
             expert_major ? handle->num_topk : 0,
             recv_total_counter,
             out_is_int64,
             max_recv_tpr,
-            handle->hybridep.emuf_group_buf,
-            handle->hybridep.emuf_group_count,
-            handle->hybridep.emuf_group_stride,
-            handle->hybridep.emuf_max_groups,
+            handle->ht.emuf_group_buf,
+            handle->ht.emuf_group_count,
+            handle->ht.emuf_group_stride,
+            handle->ht.emuf_max_groups,
             ep_group->preprocess_num_sms,
             // EM cooperative scan scratch carved from ep_workspace.
             expert_major ? ep_group->ep_workspace : nullptr,
@@ -2985,8 +2985,8 @@ ncclResult_t ncclEpUpdateHandle(
             // EM-permute bridge: scan_impl_flat fills token_to_recv_slot with the FLAT
             // recv slot per global token, and em_scan_kernel consumes it to
             // populate the recv-indexed em_slot table.
-            em_permute_active ? handle->hybridep.token_to_recv_slot : nullptr,
-            em_permute_active ? handle->hybridep.flat2em_slot_map : nullptr,
+            em_permute_active ? handle->ht.token_to_recv_slot : nullptr,
+            em_permute_active ? handle->ht.flat2em_slot_map : nullptr,
             em_permute_active ? handle->num_topk : 0,
             ep_group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP,
             stream));
@@ -3025,10 +3025,10 @@ ncclResult_t ncclEpHandleDestroy(ncclEpHandle_t handle) {
             handle->ll.handle_mem = nullptr;
         }
     } else if (handle->group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
-        if (handle->hybridep.owns_handle_mem) {
-            if (handle->hybridep.preprocessing_block) {
-                handle->group->alloc.free_fn(handle->hybridep.preprocessing_block, handle->group->alloc.context);
-                handle->hybridep.preprocessing_block = nullptr;
+        if (handle->ht.owns_handle_mem) {
+            if (handle->ht.preprocessing_block) {
+                handle->group->alloc.free_fn(handle->ht.preprocessing_block, handle->group->alloc.context);
+                handle->ht.preprocessing_block = nullptr;
             }
         }
     }
@@ -3054,7 +3054,7 @@ static ncclResult_t ht_query_num_recv_tokens(ncclEpHandle_t handle, cudaStream_t
         int64_t em_padded_total;
         CUDA_CHECK(cudaMemcpyAsync(
             &em_padded_total,
-            handle->hybridep.expert_token_offsets + handle->group->num_local_experts,
+            handle->ht.expert_token_offsets + handle->group->num_local_experts,
             sizeof(em_padded_total),
             cudaMemcpyDeviceToHost,
             stream));
@@ -3066,7 +3066,7 @@ static ncclResult_t ht_query_num_recv_tokens(ncclEpHandle_t handle, cudaStream_t
     int32_t actual_recv_tokens;
     CUDA_CHECK(cudaMemcpyAsync(
         &actual_recv_tokens,
-        handle->hybridep.num_tokens_for_experts,
+        handle->ht.num_tokens_for_experts,
         sizeof(actual_recv_tokens),
         cudaMemcpyDeviceToHost,
         stream));
@@ -3391,16 +3391,16 @@ ncclResult_t ncclEpDispatch(
         // This avoids ~60ms GIN registration overhead on the dispatch hot path
         void* token_ptr = x->data; // Default: use user buffer directly
         const bool x_uses_external_window = tensorUsesExternalWindow(group, x);
-        if (!is_single_node && handle->hybridep.token_staging_buffer != nullptr && !x_uses_external_window) {
+        if (!is_single_node && handle->ht.token_staging_buffer != nullptr && !x_uses_external_window) {
             // Copy user tokens to pre-registered staging buffer (D2D copy is ~0.1ms vs ~30ms GIN registration)
             size_t token_size = x->sizes[0] * x->sizes[1] * ncclTypeSize(x->datatype);
             CUDA_CHECK(cudaMemcpyAsync(
-                handle->hybridep.token_staging_buffer,
+                handle->ht.token_staging_buffer,
                 x->data,
                 token_size,
                 cudaMemcpyDeviceToDevice,
                 stream));
-            token_ptr = handle->hybridep.token_staging_buffer;
+            token_ptr = handle->ht.token_staging_buffer;
         }
         // The recipe selects external quantization; tensors only satisfy its contract.
         // local_dup / local_reduce JIT hard-codes uint16_t token type; SCALES_FORWARD is unsupported.
@@ -3433,17 +3433,17 @@ ncclResult_t ncclEpDispatch(
         // For SCALES_FORWARD: copy user scales to the pre-registered staging buffer.
         void* scales_ptr = (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) ? scales->data : nullptr;  // Default: use user buffer directly
         const bool scales_uses_external_window = (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) && tensorUsesExternalWindow(group, scales);
-        if ((quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) && !is_single_node && handle->hybridep.scaling_factor_staging_buffer != nullptr &&
+        if ((quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) && !is_single_node && handle->ht.scaling_factor_staging_buffer != nullptr &&
             !scales_uses_external_window) {
             // Copy user scaling factors to pre-registered staging buffer (D2D copy is ~0.1ms vs ~30ms GIN registration)
             size_t scales_size = scales->sizes[0] * scales->sizes[1] * ncclTypeSize(scales->datatype);
             CUDA_CHECK(cudaMemcpyAsync(
-                handle->hybridep.scaling_factor_staging_buffer,
+                handle->ht.scaling_factor_staging_buffer,
                 scales->data,
                 scales_size,
                 cudaMemcpyDeviceToDevice,
                 stream));
-            scales_ptr = handle->hybridep.scaling_factor_staging_buffer;
+            scales_ptr = handle->ht.scaling_factor_staging_buffer;
         }
 
         // HT dispatch kernel uses TMA for token/prob/scaling-factor payloads.
@@ -3525,18 +3525,18 @@ ncclResult_t ncclEpDispatch(
         }
 
         // FWD only: rebuild dense prob from cached topk_idx + caller topk_weights.
-        float* dense_prob = handle->hybridep.dense_prob_buffer;
+        float* dense_prob = handle->ht.dense_prob_buffer;
         if (forward_dispatch) {
             assert(
-                handle->hybridep.topk_idx != nullptr &&
-                "HT FWD dispatch: hybridep.topk_idx missing (ncclEpUpdateHandle not called?)");
+                handle->ht.topk_idx != nullptr &&
+                "HT FWD dispatch: ht.topk_idx missing (ncclEpUpdateHandle not called?)");
             size_t dense_prob_size =
                 static_cast<size_t>(handle->num_tokens) * group->config.num_experts * sizeof(float);
             CUDA_CHECK(cudaMemsetAsync(dense_prob, 0, dense_prob_size, stream));
 
             if (handle->topk_idx.datatype == ncclInt32) {
-                nccl_ep::hybridep::sparse_to_dense_prob(
-                    static_cast<const int32_t*>(handle->hybridep.topk_idx),
+                nccl_ep::ht::sparse_to_dense_prob(
+                    static_cast<const int32_t*>(handle->ht.topk_idx),
                     static_cast<const float*>(topk_weights->data),
                     dense_prob,
                     handle->num_tokens,
@@ -3544,8 +3544,8 @@ ncclResult_t ncclEpDispatch(
                     group->config.num_experts,
                     stream);
             } else {
-                nccl_ep::hybridep::sparse_to_dense_prob(
-                    static_cast<const int64_t*>(handle->hybridep.topk_idx),
+                nccl_ep::ht::sparse_to_dense_prob(
+                    static_cast<const int64_t*>(handle->ht.topk_idx),
                     static_cast<const float*>(topk_weights->data),
                     dense_prob,
                     handle->num_tokens,
@@ -3562,7 +3562,7 @@ ncclResult_t ncclEpDispatch(
         //   - RDMA staging buffers: rdma_inter_node_group_* (for multi-node only)
         //   - Metadata: sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map
         //   - Sync flags: expected_*_flag_value, intra_node_write_completion_flags
-        nccl_ep::hybridep::DispatchParams params;
+        nccl_ep::ht::DispatchParams params;
         params.hidden_dim = hidden;
         params.experts_per_rank = group->num_local_experts;
         params.lsa_team_size = group->lsa_team_size;
@@ -3636,9 +3636,9 @@ ncclResult_t ncclEpDispatch(
         // FLAT staging into EM zones via the local permute kernel below. BWD
         // reuses the FWD-populated handle maps; only the FWD-only weight scatter
         // is skipped (recv_topk_weights is null for BWD).
-        params.rdma_to_attn_map = handle->hybridep.rdma_to_attn_map;
-        params.attn_to_rdma_map = handle->hybridep.attn_to_rdma_map;
-        params.sparse_to_dense_map = handle->hybridep.sparse_to_dense_map;
+        params.rdma_to_attn_map = handle->ht.rdma_to_attn_map;
+        params.attn_to_rdma_map = handle->ht.attn_to_rdma_map;
+        params.sparse_to_dense_map = handle->ht.sparse_to_dense_map;
         params.s2d_inner_dim = (expert_major && !em_permute_active) ? handle->num_topk : group->lsa_team_size;
         params.layout = em_permute_active ? NCCL_EP_LAYOUT_RANK_MAJOR : handle->layout;
         // s2d_inner_dim must pair with layout (mismatch → OOB in combine reduction).
@@ -3648,10 +3648,10 @@ ncclResult_t ncclEpDispatch(
         // Expert-major zero-padding inputs for the in-kernel PAD warp; suppressed
         // in EM-permute mode (permute kernel writes pads after dispatch).
         const bool fused_em_pad = expert_major && !em_permute_active;
-        params.pad_actual_counts = fused_em_pad ? handle->hybridep.per_expert_counts_active : nullptr;
-        params.pad_expert_token_offsets = fused_em_pad ? handle->hybridep.expert_token_offsets : nullptr;
+        params.pad_actual_counts = fused_em_pad ? handle->ht.per_expert_counts_active : nullptr;
+        params.pad_expert_token_offsets = fused_em_pad ? handle->ht.expert_token_offsets : nullptr;
         params.pad_alignment =
-            fused_em_pad ? static_cast<int>(handle->hybridep.dispatch_output_per_expert_alignment) : 0;
+            fused_em_pad ? static_cast<int>(handle->ht.dispatch_output_per_expert_alignment) : 0;
         // Always pass a valid device pointer — the kernel unconditionally
         // dereferences this even in single-node mode (the value is just unused).
         params.expected_rdma_flag_value = group->ht_buffers.dev_dispatch_expected_rdma;
@@ -3717,7 +3717,7 @@ ncclResult_t ncclEpDispatch(
                 ? num_scales_per_token * scale_elem_bytes
                 : 0;
         NCCLCHECK(
-            nccl_ep::hybridep::call_dispatch(
+            nccl_ep::ht::call_dispatch(
                 params,
                 group->ht_aligned_max_tokens,
                 group->ht_tokens_per_chunk,
@@ -3733,14 +3733,14 @@ ncclResult_t ncclEpDispatch(
         // Fan primaries out to secondary em_slots in this rank's recv buffer.
         // Use the resolved output array (user window under zero_copy, IPC staging otherwise).
         if (em_unfused_active) {
-            nccl_ep::hybridep::call_local_dup(
+            nccl_ep::ht::call_local_dup(
                 /*expert_output_token=*/
                 params.expert_output_token_ptrs[group->lsa_rank],
                 /*expert_output_prob=*/
                 forward_dispatch ? group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank] : nullptr,
-                handle->hybridep.emuf_group_buf,
-                handle->hybridep.emuf_group_count,
-                handle->hybridep.emuf_group_stride,
+                handle->ht.emuf_group_buf,
+                handle->ht.emuf_group_count,
+                handle->ht.emuf_group_stride,
                 group->ht_buffers.intra_node_write_completion_flags,
                 /*expected_intra_node_flag_value=*/params.expected_intra_node_flag_value,
                 /*grid_barrier_counter=*/params.dispatch_grid_barrier_counter,
@@ -3752,9 +3752,6 @@ ncclResult_t ncclEpDispatch(
                 stream,
                 x->datatype);
         }
-
-
-
         /* ===== Copy intranode staging → caller outputs ===== */
         // External-window outputs are written directly by the kernel; regular tensors
         // need a D2D copy from the shared intranode staging buffers. On the
@@ -3831,14 +3828,14 @@ ncclResult_t ncclEpDispatch(
             // published by em_scan_kernel. The local permute kernel below
             // reshuffles FLAT scratch into the caller's EM recv buffer.
             const bool dsp_em = em && !em_permute_active;
-            float* dsp_topk_weights = em_permute_active ? handle->hybridep.recv_topk_weights_flat :
+            float* dsp_topk_weights = em_permute_active ? handle->ht.recv_topk_weights_flat :
                                                           static_cast<float*>(recv_topk_weights->data);
             int64_t* dsp_topk_idx =
                 em_permute_active ? nullptr : (recv_topk_idx ? static_cast<int64_t*>(recv_topk_idx->data) : nullptr);
 
-            nccl_ep::hybridep::dense_to_sparse_prob(
+            nccl_ep::ht::dense_to_sparse_prob(
                 group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank],
-                handle->hybridep.local_expert_routing_map,
+                handle->ht.local_expert_routing_map,
                 dsp_topk_weights,
                 dsp_topk_idx,
                 num_recv_tokens,
@@ -3868,15 +3865,15 @@ ncclResult_t ncclEpDispatch(
             if (row_bytes <= 0 || (row_bytes % 16) != 0) {
                 return ncclInvalidArgument; // int4-vectorized row copy requires 16B-aligned row
             }
-            nccl_ep::hybridep::launch_dispatch_permute(
+            nccl_ep::ht::launch_dispatch_permute(
                 recv_x->data,
                 recv_topk_weights ? static_cast<float*>(recv_topk_weights->data) : nullptr,
                 group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->lsa_rank],
-                forward_dispatch ? handle->hybridep.recv_topk_weights_flat : nullptr,
-                handle->hybridep.flat2em_slot_map,
-                handle->hybridep.num_tokens_for_experts,
-                handle->hybridep.expert_token_offsets,
-                handle->hybridep.per_expert_counts_active,
+                forward_dispatch ? handle->ht.recv_topk_weights_flat : nullptr,
+                handle->ht.flat2em_slot_map,
+                handle->ht.num_tokens_for_experts,
+                handle->ht.expert_token_offsets,
+                handle->ht.per_expert_counts_active,
                 handle->num_topk,
                 group->num_local_experts,
                 row_bytes,
@@ -4251,13 +4248,13 @@ ncclResult_t ncclEpCombine(
             if (row_bytes <= 0 || (row_bytes % 16) != 0) {
                 return ncclInvalidArgument; // int4-vectorized row copy requires 16B-aligned row
             }
-            nccl_ep::hybridep::launch_combine_reduce(
+            nccl_ep::ht::launch_combine_reduce(
                 group->ht_buffers.expert_input_token,
                 x->data,
-                handle->hybridep.flat2em_slot_map,
-                handle->hybridep.num_tokens_for_experts,
+                handle->ht.flat2em_slot_map,
+                handle->ht.num_tokens_for_experts,
                 em_permute_bwd_weights ? static_cast<const float*>(topk_weights->data) : nullptr,
-                em_permute_bwd_weights ? handle->hybridep.recv_topk_weights_flat : nullptr,
+                em_permute_bwd_weights ? handle->ht.recv_topk_weights_flat : nullptr,
                 handle->num_topk,
                 row_bytes,
                 static_cast<int>(group->device_sm_count),
@@ -4296,11 +4293,11 @@ ncclResult_t ncclEpCombine(
             // the 1D EM input keyed by the EM-shape LERM scratch.
             const bool use_flat_inputs = em_permute_combine;
             const float* prob_input = (use_flat_inputs && expert_major_in) ?
-                                          handle->hybridep.recv_topk_weights_flat :
+                                          handle->ht.recv_topk_weights_flat :
                                           static_cast<const float*>(topk_weights->data);
             const int prob_stride = use_flat_inputs ? num_topk : input_topk_stride;
-            const bool* lerm_for_combine = handle->hybridep.local_expert_routing_map;
-            nccl_ep::hybridep::sparse_to_dense_prob_combine(
+            const bool* lerm_for_combine = handle->ht.local_expert_routing_map;
+            nccl_ep::ht::sparse_to_dense_prob_combine(
                 prob_input,
                 lerm_for_combine,
                 group->ht_buffers.combine_expert_input_prob_buffer_ptrs[group->lsa_rank],
@@ -4313,7 +4310,7 @@ ncclResult_t ncclEpCombine(
         }
 
         // Use pre-allocated dense prob buffer for backward combine
-        float* dense_output_prob = handle->hybridep.dense_prob_buffer;
+        float* dense_output_prob = handle->ht.dense_prob_buffer;
         if (backward_combine) {
             size_t dense_output_prob_size =
                 static_cast<size_t>(num_combined_tokens) * group->config.num_experts * sizeof(float);
@@ -4327,7 +4324,7 @@ ncclResult_t ncclEpCombine(
         //   - RDMA buffers: rdma_intra_node_red_*, combine_rdma_inter_node_group_* (for multi-node)
         //   - Metadata: sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map, local_expert_routing_map
         //   - Sync flags: combine_expected_*_flag_value, combine_intra_node_write_completion_flags
-        nccl_ep::hybridep::CombineParams params;
+        nccl_ep::ht::CombineParams params;
         params.hidden_dim = hidden;
         params.experts_per_rank = group->num_local_experts;
         params.lsa_team_size = group->lsa_team_size;
@@ -4353,16 +4350,16 @@ ncclResult_t ncclEpCombine(
             (!is_single_node && backward_combine) ? group->ht_buffers.combine_rdma_inter_node_group_prob : nullptr;
         // Unified s2d: FLAT-shape for FLAT layout and EM em-permute mode;
         // EM-shape (packed rank/slot) only for EM kNvlinkDup / kLocalDup modes.
-        params.sparse_to_dense_map = handle->hybridep.sparse_to_dense_map;
+        params.sparse_to_dense_map = handle->ht.sparse_to_dense_map;
         const bool expert_major = (handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
         params.s2d_inner_dim = (expert_major && !em_permute_combine) ? handle->num_topk : group->lsa_team_size;
         params.layout = em_permute_combine ? NCCL_EP_LAYOUT_RANK_MAJOR : handle->layout;
         assert(
             (params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? (params.s2d_inner_dim == handle->num_topk) :
                                                              (params.s2d_inner_dim == group->lsa_team_size));
-        params.rdma_to_attn_map = handle->hybridep.rdma_to_attn_map;
-        params.attn_to_rdma_map = handle->hybridep.attn_to_rdma_map;
-        params.local_expert_routing_map = handle->hybridep.local_expert_routing_map;
+        params.rdma_to_attn_map = handle->ht.rdma_to_attn_map;
+        params.attn_to_rdma_map = handle->ht.attn_to_rdma_map;
+        params.local_expert_routing_map = handle->ht.local_expert_routing_map;
         // Always pass a valid device pointer — see dispatch path comment.
         params.combine_expected_rdma_flag_value = group->ht_buffers.dev_combine_expected_rdma;
         params.combine_rdma_inter_node_group_flags =
@@ -4409,16 +4406,16 @@ ncclResult_t ncclEpCombine(
         // Pre-sum secondary em_slots into primaries before combine reads them.
         if (params.combine_local_reduce_enabled) {
             assert(
-                handle->hybridep.emuf_group_buf != nullptr && handle->hybridep.emuf_group_count != nullptr &&
+                handle->ht.emuf_group_buf != nullptr && handle->ht.emuf_group_count != nullptr &&
                 "unfused combine requires emuf dup-group buf from dispatch scan");
-            nccl_ep::hybridep::call_local_reduce(
+            nccl_ep::ht::call_local_reduce(
                 /*expert_input_token=*/
                 params.expert_input_token_ptrs[group->lsa_rank],
                 /*expert_input_prob=*/
                 backward_combine ? params.expert_input_prob_ptrs[group->lsa_rank] : nullptr,
-                handle->hybridep.emuf_group_buf,
-                handle->hybridep.emuf_group_count,
-                handle->hybridep.emuf_group_stride,
+                handle->ht.emuf_group_buf,
+                handle->ht.emuf_group_count,
+                handle->ht.emuf_group_stride,
                 params.hidden_dim,
                 params.experts_per_rank,
                 params.lsa_team_size,
@@ -4430,7 +4427,7 @@ ncclResult_t ncclEpCombine(
 
         /* ===== Call combine kernel ===== */
         params.token_dtype = x->datatype;
-        nccl_ep::hybridep::call_combine(
+        nccl_ep::ht::call_combine(
             params,
             group->ht_aligned_max_tokens, // chunk-aligned stride
             group->ht_tokens_per_chunk, // tokens per dispatch/combine chunk
@@ -4440,24 +4437,24 @@ ncclResult_t ncclEpCombine(
             &group->env,
             stream);
 
-        // BWD combine: scatter dense output back to FWD k-slot ordering via hybridep.topk_idx.
+        // BWD combine: scatter dense output back to FWD k-slot ordering via ht.topk_idx.
         if (backward_combine) {
             assert(
-                handle->hybridep.topk_idx != nullptr &&
-                "HT BWD combine: hybridep.topk_idx missing (ncclEpUpdateHandle not called?)");
+                handle->ht.topk_idx != nullptr &&
+                "HT BWD combine: ht.topk_idx missing (ncclEpUpdateHandle not called?)");
             if (handle->topk_idx.datatype == ncclInt32) {
-                nccl_ep::hybridep::dense_to_sparse_prob_combine(
+                nccl_ep::ht::dense_to_sparse_prob_combine(
                     dense_output_prob,
-                    static_cast<const int32_t*>(handle->hybridep.topk_idx),
+                    static_cast<const int32_t*>(handle->ht.topk_idx),
                     static_cast<float*>(combined_topk_weights->data),
                     num_combined_tokens,
                     num_topk,
                     group->config.num_experts,
                     stream);
             } else {
-                nccl_ep::hybridep::dense_to_sparse_prob_combine(
+                nccl_ep::ht::dense_to_sparse_prob_combine(
                     dense_output_prob,
-                    static_cast<const int64_t*>(handle->hybridep.topk_idx),
+                    static_cast<const int64_t*>(handle->ht.topk_idx),
                     static_cast<float*>(combined_topk_weights->data),
                     num_combined_tokens,
                     num_topk,
@@ -4595,7 +4592,7 @@ ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group) {
 // depend on these implementation details.
 
 const int32_t* ncclEpHandle_test_getSparseToDenseMap(ncclEpHandle_t handle) {
-    return handle->hybridep.sparse_to_dense_map;
+    return handle->ht.sparse_to_dense_map;
 }
 
 int ncclEpHandle_test_getNumTopk(ncclEpHandle_t handle) {

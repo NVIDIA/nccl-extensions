@@ -1030,7 +1030,7 @@ void generateRandomTopkIndicesLL(
     int seed = 1);
 
 // Generate HT topk_idx for a given rank (deterministic)
-// Randperm routing (uniform), consistent with Hybrid-EP (test_hybrid_ep.py)
+// Randperm routing (uniform), consistent with HT reference (test_ht.py)
 static void generateTopkIndicesHT(
     int64_t* topk_idx_host,
     unsigned int num_tokens,
@@ -4117,7 +4117,7 @@ int main(int argc, char* argv[]) {
     NCCLCHECK(epMakeTensor(&topk_idx, 2, use_int32_topk ? ncclInt32 : ncclInt64, num_tokens, top_k));
 
     // Generate topk indices
-    // HT: randperm (uniform), consistent with Hybrid-EP (test_hybrid_ep.py)
+    // HT: randperm (uniform), consistent with HT reference (test_ht.py)
     // LL: abs(randn)+1 scores + topk + -1 masking, consistent with DeepEP (test_low_latency.py)
     int64_t* topk_idx_host = new int64_t[num_tokens * top_k];
 

@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include "device/hybrid_ep.cuh"
+#include "device/ht_ep.cuh"
 #include "device/jit/jit_runtime.hpp"
 
 #include <climits>
@@ -18,7 +18,7 @@
 #include <string>
 
 namespace nccl_ep {
-namespace hybridep {
+namespace ht {
 namespace jit {
 
 constexpr const char* kScanFlatJitEntryName = "nccl_ep_jit_ht_scan_flat_kernel";
@@ -42,13 +42,13 @@ inline std::string scan_flat_jit_source(
     // EM padded-counts / out-offsets dtype, baked as a template arg.
     const char* em_out_type = out_is_int64 ? "int64_t" : "int32_t";
     std::ostringstream src;
-    src << "#include \"device/hybrid_ep.cuh\"\n"
+    src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(" << num_threads_per_block << ", 1)\n"
         << "__global__ void " << kScanFlatJitEntryName << "(\n"
-        << "    const __grid_constant__ hybrid_ep::scan_flat_kernel_param_t p) {\n"
+        << "    const __grid_constant__ ht_ep::scan_flat_kernel_param_t p) {\n"
         << "  extern __shared__ uint8_t smem_bytes[];\n"
-        << "  hybrid_ep::scan_impl_flat<\n"
+        << "  ht_ep::scan_impl_flat<\n"
         << "      " << num_threads_per_block << ",\n"
         << "      " << num_of_blocks << ",\n"
         << "      " << num_lsa_teams << ",\n"
@@ -58,7 +58,7 @@ inline std::string scan_flat_jit_source(
         << "      " << (enable_em_permute ? experts_per_rank : 0) << ",\n"
         << "      " << em_out_type << ">(\n"
         << "      p.input_routing_map, p.tmp, p.sparse_to_dense_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"
-        << "      reinterpret_cast<hybrid_ep::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
+        << "      reinterpret_cast<ht_ep::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
         << "      p.num_of_tokens_for_experts, p.local_expert_routing_map, p.per_expert_token_counts,\n"
         << "      p.node_rank, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank,\n"
         << "      p.recv_total_counter, p.out_is_int64, p.max_recv_tokens_per_rank,\n"
@@ -79,18 +79,18 @@ scan_em_jit_source(int num_threads_per_block, int num_of_blocks, int num_lsa_tea
     constexpr int rank_mask_word_bits = CHAR_BIT * static_cast<int>(sizeof(uint64_t));
     const int rank_mask_words = (lsa_team_size + rank_mask_word_bits - 1) / rank_mask_word_bits;
     std::ostringstream src;
-    src << "#include \"device/hybrid_ep.cuh\"\n"
+    src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(" << num_threads_per_block << ", 1)\n"
         << "__global__ void " << kScanEmJitEntryName << "(\n"
-        << "    const __grid_constant__ hybrid_ep::scan_em_kernel_param_t p) {\n"
-        << "  hybrid_ep::scan_impl_em<\n"
+        << "    const __grid_constant__ ht_ep::scan_em_kernel_param_t p) {\n"
+        << "  ht_ep::scan_impl_em<\n"
         << "      " << num_threads_per_block << ",\n"
         << "      " << num_of_blocks << ",\n"
         << "      " << num_lsa_teams << ",\n"
         << "      " << lsa_team_size << ">(\n"
         << "      p.input_routing_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"
-        << "      reinterpret_cast<hybrid_ep::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
+        << "      reinterpret_cast<ht_ep::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
         << "      p.node_rank, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank);\n"
         << "}\n";
     return src.str();
@@ -105,7 +105,7 @@ inline void launch_scan_flat(
     bool enable_per_expert_counts,
     bool enable_em_permute,
     bool out_is_int64,
-    ::hybrid_ep::scan_flat_kernel_param_t& param,
+    ::ht_ep::scan_flat_kernel_param_t& param,
     int dynamic_smem_bytes,
     cudaStream_t stream) {
     static const int variant_identity = 0;
@@ -158,7 +158,7 @@ inline void launch_scan_em(
     int num_of_blocks,
     int num_lsa_teams,
     int lsa_team_size,
-    ::hybrid_ep::scan_em_kernel_param_t& param,
+    ::ht_ep::scan_em_kernel_param_t& param,
     cudaStream_t stream) {
     static const int variant_identity = 0;
     const std::string variant_name = [&] {
@@ -199,12 +199,12 @@ constexpr int kBuildEmTablesBlockDim = 1024;
 inline std::string build_em_tables_jit_source(int experts_per_rank, int lsa_team_size) {
     std::ostringstream src;
     src
-        << "#include \"device/hybrid_ep.cuh\"\n"
+        << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(" << kBuildEmTablesBlockDim << ", 1)\n"
         << "__global__ void " << kBuildEmTablesJitEntryName << "(\n"
-        << "    const __grid_constant__ hybrid_ep::build_em_tables_param_t p) {\n"
-        << "  hybrid_ep::build_em_tables_impl<" << experts_per_rank << ", " << lsa_team_size << ">(p);\n"
+        << "    const __grid_constant__ ht_ep::build_em_tables_param_t p) {\n"
+        << "  ht_ep::build_em_tables_impl<" << experts_per_rank << ", " << lsa_team_size << ">(p);\n"
         << "}\n";
     return src.str();
 }
@@ -212,7 +212,7 @@ inline std::string build_em_tables_jit_source(int experts_per_rank, int lsa_team
 inline void launch_build_em_tables_jit(
     int experts_per_rank,
     int lsa_team_size,
-    ::hybrid_ep::build_em_tables_param_t& param,
+    ::ht_ep::build_em_tables_param_t& param,
     int dynamic_smem_bytes,
     int num_blocks,
     cudaStream_t stream) {
@@ -255,5 +255,5 @@ inline void launch_build_em_tables_jit(
 }
 
 } // namespace jit
-} // namespace hybridep
+} // namespace ht
 } // namespace nccl_ep

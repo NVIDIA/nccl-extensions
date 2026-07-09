@@ -73,7 +73,7 @@ set(NCCL_EP_HOST_SRC
 
 set(NCCL_EP_DEVICE_SRC
     device/ll_ep_adapter.cu
-    device/hybridep_adapter.cu
+    device/ht_ep_adapter.cu
 )
 
 set(NCCL_EP_SRC
@@ -130,9 +130,9 @@ if(CUDAToolkit_INCLUDE_DIRS)
 endif()
 set(NCCL_EP_JIT_CONFIG_HEADER "${NCCL_EP_JIT_SOURCE_DIR}/config.h")
 set(NCCL_EP_JIT_HEADERS
-    device/hybrid_ep.cuh
+    device/ht_ep.cuh
     device/device_primitives.cuh
-    device/hybridep_configs.cuh
+    device/ht_ep_configs.cuh
     device/cuda_compat_shims.cuh
     device/scan_kernel.cuh
     device/macros.cuh

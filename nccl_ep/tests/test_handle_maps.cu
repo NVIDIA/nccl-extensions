@@ -99,7 +99,7 @@ public:
     }
 
     // Unpack em_s2d entry: rank_id from bits [31:22], slot from bits [21:0].
-    // Must mirror em_s2d_pack/em_s2d_unpack_* in hybrid_ep.cuh.
+    // Must mirror em_s2d_pack/em_s2d_unpack_* in ht_ep.cuh.
     static constexpr int kEmS2dSlotBits = 22;
     static constexpr uint32_t kEmS2dSlotMask = (1u << kEmS2dSlotBits) - 1u;
     static int em_unpack_rank(int32_t v) {

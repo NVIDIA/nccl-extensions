@@ -10,8 +10,8 @@
  */
 
 #include "nccl_device.h"
-#include "hybridep_adapter.cuh"
-#include "hybridep_configs.cuh"
+#include "ht_ep_adapter.cuh"
+#include "ht_ep_configs.cuh"
 #include "common.hpp"
 #include "jit/ht_combine_jit.cuh"
 #include "jit/ht_dispatch_jit.cuh"
@@ -24,7 +24,7 @@
 #include <vector>
 
 namespace nccl_ep {
-namespace hybridep {
+namespace ht {
 
 // ============================================================================
 // Kernel: Convert sparse topk_idx to dense routing map
@@ -415,7 +415,7 @@ ncclResult_t call_metadata_preprocessing(
         return ncclInvalidArgument;
     }
 
-    constexpr int NUM_THREADS_PER_BLOCK = HYBRIDEP_NUM_THREADS_PER_BLOCK_PREPROCESSING;
+    constexpr int NUM_THREADS_PER_BLOCK = NCCL_EP_HT_NUM_THREADS_PER_BLOCK_PREPROCESSING;
     const int NUM_OF_BLOCKS = num_blocks;
     constexpr int NUM_OF_WARPS_PER_BLOCK_SCAN = NUM_THREADS_PER_BLOCK / 32;
 
@@ -434,23 +434,23 @@ ncclResult_t call_metadata_preprocessing(
         }
 
         if (em_permute) {
-            const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * lsa_team_size * sizeof(::hybrid_ep::tmp_state_t);
+            const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * lsa_team_size * sizeof(::ht_ep::tmp_state_t);
             CUDA_CHECK(cudaMemsetAsync(ranks_scan_tmp, 0, preprocessing_tmp_sz, stream));
 
             // The shared gscratch (ep_workspace, fit-checked above) doubles as the
             // fused scan's per-expert decoupled-scan state; gscratch_needed is its
             // exact byte size on the local-permute path.
-            auto* expert_scan_tmp = reinterpret_cast<::hybrid_ep::tmp_state_t*>(scan_gscratch);
+            auto* expert_scan_tmp = reinterpret_cast<::ht_ep::tmp_state_t*>(scan_gscratch);
             CUDA_CHECK(cudaMemsetAsync(expert_scan_tmp, 0, gscratch_needed, stream));
 
             // Rank region + EM-permute region; sized by the single scan_flat_smem_t layout.
-            const int dynamic_smem_bytes = static_cast<int>(::hybrid_ep::scan_flat_smem_t::byte_size(
+            const int dynamic_smem_bytes = static_cast<int>(::ht_ep::scan_flat_smem_t::byte_size(
                 NUM_OF_WARPS_PER_BLOCK_SCAN, lsa_team_size, experts_per_rank,
                 /*has_expert_counts=*/false, /*has_em_permute=*/true));
 
-            ::hybrid_ep::scan_flat_kernel_param_t sp{};
+            ::ht_ep::scan_flat_kernel_param_t sp{};
             sp.input_routing_map = global_routing_map;
-            sp.tmp = reinterpret_cast<::hybrid_ep::tmp_state_t*>(ranks_scan_tmp);
+            sp.tmp = reinterpret_cast<::ht_ep::tmp_state_t*>(ranks_scan_tmp);
             sp.sparse_to_dense_map = sparse_to_dense_map;
             sp.rdma_to_attn_map = rdma_to_attn_map;
             sp.attn_to_rdma_map = attn_to_rdma_map;
@@ -502,7 +502,7 @@ ncclResult_t call_metadata_preprocessing(
         } else {
             // nvlink_dup / local_dup EM path: produce only the per-token rank mask + RDMA/attn
             // maps in the scan, then let em_scan_kernel build S2D / LERM / em offsets.
-            ::hybrid_ep::scan_em_kernel_param_t sp;
+            ::ht_ep::scan_em_kernel_param_t sp;
             sp.input_routing_map = global_routing_map;
             sp.rdma_to_attn_map = rdma_to_attn_map;
             sp.attn_to_rdma_map = attn_to_rdma_map;
@@ -568,17 +568,17 @@ ncclResult_t call_metadata_preprocessing(
         CUDA_CHECK(cudaMemsetAsync(per_expert_token_counts, 0, experts_per_rank * sizeof(int32_t), stream));
     }
 
-    const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * lsa_team_size * sizeof(::hybrid_ep::tmp_state_t);
+    const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * lsa_team_size * sizeof(::ht_ep::tmp_state_t);
     CUDA_CHECK(cudaMemsetAsync(ranks_scan_tmp, 0, preprocessing_tmp_sz, stream));
 
     // Rank region (+ optional per-expert counts); sized by the single scan_flat_smem_t layout.
-    const int dynamic_smem_bytes = static_cast<int>(::hybrid_ep::scan_flat_smem_t::byte_size(
+    const int dynamic_smem_bytes = static_cast<int>(::ht_ep::scan_flat_smem_t::byte_size(
         NUM_OF_WARPS_PER_BLOCK_SCAN, lsa_team_size, experts_per_rank,
         /*has_expert_counts=*/per_expert_token_counts != nullptr, /*has_em_permute=*/false));
 
-    ::hybrid_ep::scan_flat_kernel_param_t sp;
+    ::ht_ep::scan_flat_kernel_param_t sp;
     sp.input_routing_map = global_routing_map;
-    sp.tmp = reinterpret_cast<::hybrid_ep::tmp_state_t*>(ranks_scan_tmp);
+    sp.tmp = reinterpret_cast<::ht_ep::tmp_state_t*>(ranks_scan_tmp);
     sp.sparse_to_dense_map = sparse_to_dense_map;
     sp.rdma_to_attn_map = rdma_to_attn_map;
     sp.attn_to_rdma_map = attn_to_rdma_map;
@@ -621,7 +621,7 @@ ncclResult_t call_metadata_preprocessing(
 }
 
 size_t get_preprocessing_scan_tmp_size(int num_blocks, int lsa_team_size) {
-    return static_cast<size_t>(num_blocks) * lsa_team_size * sizeof(::hybrid_ep::tmp_state_t);
+    return static_cast<size_t>(num_blocks) * lsa_team_size * sizeof(::ht_ep::tmp_state_t);
 }
 
 size_t get_rank_mask_elem_size(int lsa_team_size) {
@@ -673,7 +673,7 @@ void launch_build_em_tables(
     constexpr int kNumWarps = jit::kBuildEmTablesBlockDim / 32;
     const size_t smem_bytes = static_cast<size_t>(kNumWarps + 1) * n_dle * sizeof(int32_t);
 
-    ::hybrid_ep::build_em_tables_param_t p{};
+    ::ht_ep::build_em_tables_param_t p{};
     p.input_routing_map        = input_routing_map;
     p.token_rank_mask_words    = static_cast<const uint64_t*>(token_rank_mask);
     p.num_mask_words           = num_mask_words;
@@ -719,7 +719,7 @@ size_t get_em_scan_gscratch_size(int lsa_team_size, int experts_per_rank, int nu
     if (is_local_permute) {
         // Fused em-permute scan: per-expert decoupled-scan state
         // expert_scan_tmp[num_sms * experts_per_rank] tmp_state_t (independent of nrpn).
-        return static_cast<size_t>(num_sms) * experts_per_rank * sizeof(::hybrid_ep::tmp_state_t);
+        return static_cast<size_t>(num_sms) * experts_per_rank * sizeof(::ht_ep::tmp_state_t);
     }
     // em_scan_kernel (kLocalDup / nvlink_dup path): block_count[num_sms][nrpn*epr] int32.
     return static_cast<size_t>(num_sms) * lsa_team_size * experts_per_rank * sizeof(int32_t);
@@ -733,7 +733,7 @@ int get_device_max_dynamic_smem() {
     return max_smem;
 }
 
-ncclResult_t check_dispatch_smem_limit(const ::hybrid_ep::dispatch_config_t& config, size_t smem_size) {
+ncclResult_t check_dispatch_smem_limit(const ::ht_ep::dispatch_config_t& config, size_t smem_size) {
     const int max_smem = get_device_max_dynamic_smem();
     if (smem_size <= static_cast<size_t>(max_smem)) return ncclSuccess;
 
@@ -754,8 +754,8 @@ ncclResult_t check_dispatch_smem_limit(const ::hybrid_ep::dispatch_config_t& con
 
 // Helper to populate the fixed-size dispatch parameter fields from DispatchParams.
 template <typename TOKEN_DATA_TYPE>
-::hybrid_ep::dispatch_kernel_param_base_t<TOKEN_DATA_TYPE> build_dispatch_param_base(const DispatchParams& params) {
-    ::hybrid_ep::dispatch_kernel_param_base_t<TOKEN_DATA_TYPE> kp{};
+::ht_ep::dispatch_kernel_param_base_t<TOKEN_DATA_TYPE> build_dispatch_param_base(const DispatchParams& params) {
+    ::ht_ep::dispatch_kernel_param_base_t<TOKEN_DATA_TYPE> kp{};
     // Model configuration
     kp.hidden_dim = params.hidden_dim;
     kp.experts_per_rank = params.experts_per_rank;
@@ -816,9 +816,9 @@ template <typename TOKEN_DATA_TYPE>
 
 template <typename TOKEN_DATA_TYPE>
 std::vector<uint8_t> build_dispatch_arg_buffer(
-    const ::hybrid_ep::dispatch_kernel_param_base_t<TOKEN_DATA_TYPE>& kp,
+    const ::ht_ep::dispatch_kernel_param_base_t<TOKEN_DATA_TYPE>& kp,
     const DispatchParams& params) {
-    using ParamBase = ::hybrid_ep::dispatch_kernel_param_base_t<TOKEN_DATA_TYPE>;
+    using ParamBase = ::ht_ep::dispatch_kernel_param_base_t<TOKEN_DATA_TYPE>;
     static_assert(sizeof(ParamBase) % alignof(void*) == 0);
 
     const size_t base_size = sizeof(ParamBase);
@@ -843,7 +843,7 @@ std::vector<uint8_t> build_dispatch_arg_buffer(
 }
 
 // Host dispatch launcher. The JIT source owns all device-kernel specialization;
-// the host only asks hybrid_ep for the matching dynamic-SMEM size.
+// the host only asks ht_ep for the matching dynamic-SMEM size.
 ncclResult_t dispatch_impl(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank,
@@ -875,17 +875,17 @@ ncclResult_t dispatch_impl(
 
         auto kp = build_dispatch_param_base<TOKEN_DATA_TYPE>(params);
 
-        // Compute dynamic SMEM size at host (was done inside hybrid_ep::dispatch).
-        ::hybrid_ep::dispatch_config_t d_config;
-        ::hybrid_ep::model_config_t d_model;
-        d_config.num_of_stages = HYBRIDEP_DISPATCH_NUM_OF_STAGES;
-        d_config.num_of_in_flight_s2g = HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G;
+        // Compute dynamic SMEM size at host (was done inside ht_ep::dispatch).
+        ::ht_ep::dispatch_config_t d_config;
+        ::ht_ep::model_config_t d_model;
+        d_config.num_of_stages = NCCL_EP_HT_DISPATCH_NUM_OF_STAGES;
+        d_config.num_of_in_flight_s2g = NCCL_EP_HT_DISPATCH_NUM_OF_IN_FLIGHT_S2G;
         d_config.num_of_tokens_per_chunk = num_tokens_per_chunk;
         d_config.num_of_blocks = num_blocks;
         d_config.forward_dispatch = forward_dispatch;
         d_config.sf_bytes_per_token = sf_bytes_per_token;
-        d_config.num_pipelines = HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
-        d_config.stages_per_pipeline = HYBRIDEP_DISPATCH_NUM_OF_STAGES / HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
+        d_config.num_pipelines = NCCL_EP_HT_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
+        d_config.stages_per_pipeline = NCCL_EP_HT_DISPATCH_NUM_OF_STAGES / NCCL_EP_HT_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
         d_config.s2d_inner_dim = kp.s2d_inner_dim;
         d_model.hidden_dim = kp.hidden_dim;
         d_model.max_num_of_tokens_per_rank = max_dispatch_tokens_per_rank;
@@ -893,7 +893,7 @@ ncclResult_t dispatch_impl(
         d_model.num_of_ranks_per_node = kp.num_of_ranks_per_node;
         d_model.num_of_nodes = num_nodes;
 
-        const int smem_size = static_cast<int>(::hybrid_ep::calculate_dispatch_smem_layout_size(
+        const int smem_size = static_cast<int>(::ht_ep::calculate_dispatch_smem_layout_size(
             params.layout, kernel_spec.payload_bytes, d_config, d_model));
         if (smem_size == 0) {
             std::fprintf(stderr, "NCCL EP warning: unsupported HT dispatch token size %u\n",
@@ -906,20 +906,20 @@ ncclResult_t dispatch_impl(
             return r;
         }
 
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
         const jit::dispatch_warp_layout_t dispatch_layout = jit::compute_dispatch_warp_layout(num_nodes, params.layout);
         const int dispatch_wt_total = num_blocks * (dispatch_layout.block_dim / 32);
-        ::hybrid_ep::dispatch_warp_timing_entry_t* d_wt = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_wt, dispatch_wt_total * sizeof(::hybrid_ep::dispatch_warp_timing_entry_t)));
+        ::ht_ep::dispatch_warp_timing_entry_t* d_wt = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_wt, dispatch_wt_total * sizeof(::ht_ep::dispatch_warp_timing_entry_t)));
         CUDA_CHECK(
-            cudaMemsetAsync(d_wt, 0, dispatch_wt_total * sizeof(::hybrid_ep::dispatch_warp_timing_entry_t), stream));
+            cudaMemsetAsync(d_wt, 0, dispatch_wt_total * sizeof(::ht_ep::dispatch_warp_timing_entry_t), stream));
         kp.warp_timing = d_wt;
 #endif
 
         std::vector<uint8_t> kernel_arg = build_dispatch_arg_buffer(kp, params);
         if (ncclResult_t r = jit::launch_dispatch(
-            HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-            HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+            NCCL_EP_HT_DISPATCH_NUM_OF_STAGES,
+            NCCL_EP_HT_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
             num_tokens_per_chunk,
             max_dispatch_tokens_per_rank,
             num_blocks,
@@ -937,7 +937,7 @@ ncclResult_t dispatch_impl(
             kernel_spec); r != ncclSuccess)
             return r;
 
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
         jit::dispatch_dump_warp_timing(dispatch_layout, num_blocks, d_wt, stream);
         CUDA_CHECK(cudaFree(d_wt));
 #endif
@@ -972,8 +972,8 @@ ncclResult_t call_dispatch(
 // ============================================================================
 
 // Helper to populate the fixed-size combine parameter fields from CombineParams.
-::hybrid_ep::combine_kernel_param_base_t build_combine_param_base(const CombineParams& params) {
-    ::hybrid_ep::combine_kernel_param_base_t kp{};
+::ht_ep::combine_kernel_param_base_t build_combine_param_base(const CombineParams& params) {
+    ::ht_ep::combine_kernel_param_base_t kp{};
     // Model configuration
     kp.hidden_dim = params.hidden_dim;
     kp.experts_per_rank = params.experts_per_rank;
@@ -1032,9 +1032,9 @@ ncclResult_t call_dispatch(
 }
 
 std::vector<uint8_t> build_combine_arg_buffer(
-    const ::hybrid_ep::combine_kernel_param_base_t& kp,
+    const ::ht_ep::combine_kernel_param_base_t& kp,
     const CombineParams& params) {
-    using ParamBase = ::hybrid_ep::combine_kernel_param_base_t;
+    using ParamBase = ::ht_ep::combine_kernel_param_base_t;
     static_assert(sizeof(ParamBase) % alignof(void*) == 0);
 
     const size_t base_size = sizeof(ParamBase);
@@ -1073,11 +1073,11 @@ void combine_impl(
 
     // Select config based on num_nodes (single-node: 12 stages/2 pipelines, multi-node: 5 stages/1 pipeline)
     const int num_stages_g2s =
-        (num_nodes == 1) ? HYBRIDEP_COMBINE_SINGLENODE_NUM_OF_STAGES_G2S : HYBRIDEP_COMBINE_MULTINODE_NUM_OF_STAGES_G2S;
+        (num_nodes == 1) ? NCCL_EP_HT_COMBINE_SINGLENODE_NUM_OF_STAGES_G2S : NCCL_EP_HT_COMBINE_MULTINODE_NUM_OF_STAGES_G2S;
     const int num_stages_s2g =
-        (num_nodes == 1) ? HYBRIDEP_COMBINE_SINGLENODE_NUM_OF_STAGES_S2G : HYBRIDEP_COMBINE_MULTINODE_NUM_OF_STAGES_S2G;
+        (num_nodes == 1) ? NCCL_EP_HT_COMBINE_SINGLENODE_NUM_OF_STAGES_S2G : NCCL_EP_HT_COMBINE_MULTINODE_NUM_OF_STAGES_S2G;
 
-    ::hybrid_ep::model_config_t model;
+    ::ht_ep::model_config_t model;
     model.hidden_dim = kp.hidden_dim;
     model.max_num_of_tokens_per_rank = max_dispatch_tokens_per_rank;
     model.num_of_experts_per_rank = kp.experts_per_rank;
@@ -1087,7 +1087,7 @@ void combine_impl(
     // template. Layout size depends only on element width, so FP16 and BF16 (both 2 B)
     // share the BF16 instantiation; only FP32 (4 B) is distinct.
     const int smem_size = (params.token_dtype == ncclFloat32) ?
-                              static_cast<int>(::hybrid_ep::calculate_combine_smem_layout_size<ncclFloat32>(
+                              static_cast<int>(::ht_ep::calculate_combine_smem_layout_size<ncclFloat32>(
                                   num_stages_g2s,
                                   num_stages_s2g,
                                   num_tokens_per_chunk,
@@ -1095,7 +1095,7 @@ void combine_impl(
                                   num_nodes,
                                   BACKWARD_COMBINE,
                                   model)) :
-                              static_cast<int>(::hybrid_ep::calculate_combine_smem_layout_size<ncclBfloat16>(
+                              static_cast<int>(::ht_ep::calculate_combine_smem_layout_size<ncclBfloat16>(
                                   num_stages_g2s,
                                   num_stages_s2g,
                                   num_tokens_per_chunk,
@@ -1104,15 +1104,15 @@ void combine_impl(
                                   BACKWARD_COMBINE,
                                   model));
 
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     const jit::combine_warp_layout_t combine_layout = jit::compute_combine_warp_layout(num_nodes);
     const int combine_wt_total = num_blocks * (combine_layout.block_dim / 32);
-    ::hybrid_ep::combine_warp_timing_entry_t* d_wt = nullptr;
-    ::hybrid_ep::combine_block_timing_entry_t* d_bt = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_wt, combine_wt_total * sizeof(::hybrid_ep::combine_warp_timing_entry_t)));
-    CUDA_CHECK(cudaMalloc(&d_bt, num_blocks * sizeof(::hybrid_ep::combine_block_timing_entry_t)));
-    CUDA_CHECK(cudaMemsetAsync(d_wt, 0, combine_wt_total * sizeof(::hybrid_ep::combine_warp_timing_entry_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(d_bt, 0, num_blocks * sizeof(::hybrid_ep::combine_block_timing_entry_t), stream));
+    ::ht_ep::combine_warp_timing_entry_t* d_wt = nullptr;
+    ::ht_ep::combine_block_timing_entry_t* d_bt = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_wt, combine_wt_total * sizeof(::ht_ep::combine_warp_timing_entry_t)));
+    CUDA_CHECK(cudaMalloc(&d_bt, num_blocks * sizeof(::ht_ep::combine_block_timing_entry_t)));
+    CUDA_CHECK(cudaMemsetAsync(d_wt, 0, combine_wt_total * sizeof(::ht_ep::combine_warp_timing_entry_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(d_bt, 0, num_blocks * sizeof(::ht_ep::combine_block_timing_entry_t), stream));
     kp.warp_timing = d_wt;
     kp.block_timing = d_bt;
 #endif
@@ -1123,9 +1123,9 @@ void combine_impl(
         num_stages_s2g,
         num_tokens_per_chunk,
         max_dispatch_tokens_per_rank,
-        HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP,
+        NCCL_EP_HT_COMBINE_NUM_OF_TOKENS_PER_GROUP,
         num_blocks,
-        HYBRIDEP_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
+        NCCL_EP_HT_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
         BACKWARD_COMBINE,
         num_nodes,
         params.lsa_team_size,
@@ -1138,7 +1138,7 @@ void combine_impl(
         stream,
         params.token_dtype);
 
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     jit::combine_dump_warp_timing(combine_layout, num_blocks, d_wt, d_bt, stream);
     CUDA_CHECK(cudaFree(d_wt));
     CUDA_CHECK(cudaFree(d_bt));
@@ -1161,13 +1161,13 @@ void call_local_dup(
     int num_blocks,
     cudaStream_t stream,
     ncclDataType_t token_dtype) {
-    constexpr int kPipeDepth = NCCLEP_LOCAL_DUP_PIPE_DEPTH;
+    constexpr int kPipeDepth = NCCL_EP_HT_LOCAL_DUP_PIPE_DEPTH;
     // local_dup is a byte-relocation fan-out: the wire type only sets the
     // per-token width (FP16/BF16 -> uint16_t, FP32 -> uint32_t). SCALES_FORWARD
     // is rejected upstream on this path.
     auto run = [&](auto tag) {
         using TOKEN_DATA_TYPE = decltype(tag);
-        const int smem_bytes = ::hybrid_ep::local_dup_dynamic_smem_bytes(
+        const int smem_bytes = ::ht_ep::local_dup_dynamic_smem_bytes(
             hidden_dim,
             kPipeDepth,
             forward_dispatch,
@@ -1175,7 +1175,7 @@ void call_local_dup(
             num_of_ranks_per_node,
             sizeof(TOKEN_DATA_TYPE));
 
-        ::hybrid_ep::local_dup_kernel_param_t<TOKEN_DATA_TYPE> pp{};
+        ::ht_ep::local_dup_kernel_param_t<TOKEN_DATA_TYPE> pp{};
         pp.expert_output_token = reinterpret_cast<TOKEN_DATA_TYPE*>(expert_output_token);
         pp.expert_output_prob = expert_output_prob;
         pp.emuf_group_buf = emuf_group_buf;
@@ -1216,7 +1216,7 @@ void call_local_reduce(
     // type collapses FP16->uint16_t (layout-identical), FP32 -> uint32_t.
     auto run = [&](auto tag) {
         using T = decltype(tag);
-        ::hybrid_ep::local_reduce_kernel_param_t<T> lp{};
+        ::ht_ep::local_reduce_kernel_param_t<T> lp{};
         lp.expert_input_token = reinterpret_cast<T*>(expert_input_token);
         lp.expert_input_prob = expert_input_prob;
         lp.emuf_group_buf = emuf_group_buf;
@@ -1284,7 +1284,7 @@ void launch_dispatch_permute(
     unsigned int prolog_epilog_sms,
     int caller_num_recv_tokens,
     cudaStream_t stream) {
-    assert(experts_per_rank > 0 && experts_per_rank <= ::hybrid_ep::kLocalPermuteMaxExpertsPerRank);
+    assert(experts_per_rank > 0 && experts_per_rank <= ::ht_ep::kLocalPermuteMaxExpertsPerRank);
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
     assert(sm_count > 0);
@@ -1292,7 +1292,7 @@ void launch_dispatch_permute(
 
     const unsigned int grid = local_permute_grid(sm_count, prolog_epilog_sms);
 
-    ::hybrid_ep::local_permute_dup_param_t p{};
+    ::ht_ep::local_permute_dup_param_t p{};
     p.recv_x_em = recv_x_em;
     p.recv_topk_weights_em = recv_topk_weights_em;
     p.flat_staging = flat_staging;
@@ -1306,7 +1306,7 @@ void launch_dispatch_permute(
     p.row_bytes = row_bytes;
     p.caller_num_recv_tokens = caller_num_recv_tokens;
 
-    ::nccl_ep::hybridep::jit::launch_local_permute_dup(static_cast<int>(grid), p, stream);
+    ::nccl_ep::ht::jit::launch_local_permute_dup(static_cast<int>(grid), p, stream);
 }
 
 void launch_combine_reduce(
@@ -1329,7 +1329,7 @@ void launch_combine_reduce(
 
     const unsigned int grid = local_permute_grid(sm_count, prolog_epilog_sms);
 
-    ::hybrid_ep::local_permute_reduce_param_t p{};
+    ::ht_ep::local_permute_reduce_param_t p{};
     p.flat_staging = flat_staging;
     p.recv_x_em = recv_x_em;
     p.flat2em_slot_map = flat2em_slot_map;
@@ -1339,7 +1339,7 @@ void launch_combine_reduce(
     p.top_k = top_k;
     p.row_bytes = row_bytes;
 
-    ::nccl_ep::hybridep::jit::launch_local_permute_reduce(
+    ::nccl_ep::ht::jit::launch_local_permute_reduce(
         top_k,
         row_bytes,
         static_cast<int>(grid),
@@ -1348,5 +1348,5 @@ void launch_combine_reduce(
         token_dtype);
 }
 
-} // namespace hybridep
+} // namespace ht
 } // namespace nccl_ep

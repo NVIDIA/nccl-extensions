@@ -23,7 +23,7 @@
 #define MAX_NUM_TOPK 32
 #define MAX_NCCL_GIN_CTX_PER_COMM 4
 #define NUM_WAIT_NANOSECONDS 500
-#define MAX_SUPPORTED_TOKENS_PER_RANK 8192  // Must match kernel template in hybridep_adapter.cu
+#define MAX_SUPPORTED_TOKENS_PER_RANK 8192  // Must match kernel template in ht_ep_adapter.cu
 #define FINISHED_SUM_TAG (MAX_SUPPORTED_TOKENS_PER_RANK * 2)
 // Default HT tokens-per-chunk for RDMA / multi-node configurations. LSA-only
 // (single-node) configs default to a grid-proportional size instead; either can

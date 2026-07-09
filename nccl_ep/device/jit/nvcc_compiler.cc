@@ -195,8 +195,8 @@ std::vector<std::string> NvccCompiler::compile_options(const JitCompileConfig& c
     } else {
         options.insert(options.end(), arch_options.begin(), arch_options.end());
     }
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
-    options.push_back("-DHYBRIDEP_ENABLE_WARP_TIMING=1");
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
+    options.push_back("-DNCCL_EP_HT_ENABLE_WARP_TIMING=1");
 #endif
 #ifdef NDEBUG
     options.push_back("-DNDEBUG=1");

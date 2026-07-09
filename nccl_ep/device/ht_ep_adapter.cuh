@@ -22,17 +22,17 @@
 #include "nccl_ep_env.h"
 
 namespace nccl_ep {
-namespace hybridep {
+namespace ht {
 
 // ============================================================================
 // Runtime constants (from ep_group, not hardcoded):
-//   lsa_team_size  - ncclTeamLsa(comm).nRanks  (1..HYBRIDEP_MAX_LSA_TEAM_SIZE)
+//   lsa_team_size  - ncclTeamLsa(comm).nRanks  (1..NCCL_EP_HT_MAX_LSA_TEAM_SIZE)
 //   rdma_team_size - ncclTeamRail(comm).nRanks
 //   num_local_experts, hidden
 //
 // Kernels are JIT-compiled per (lsa_team_size, num_lsa_teams, ...); templates
 // size their register/SMEM arrays exactly to the JIT lsa_team_size, so any
-// value in [1, HYBRIDEP_MAX_LSA_TEAM_SIZE] works.  The only runtime
+// value in [1, NCCL_EP_HT_MAX_LSA_TEAM_SIZE] works.  The only runtime
 // precondition is the S2D cp.async.bulk alignment asserted in dispatch_impl
 // (matters when s2d_inner_dim is not a multiple of 4).
 // ============================================================================
@@ -308,7 +308,7 @@ struct combine_memory_region_info_t {
 // Dispatch wrapper with template parameter resolution
 // ============================================================================
 
-// All parameters needed for dispatch kernel, needed redifine because those in hybrid_ep.cuh are with template on data type.
+// All parameters needed for dispatch kernel, needed redifine because those in ht_ep.cuh are with template on data type.
 struct DispatchParams {
     // User inputs
     int hidden_dim; // Model hidden dimension
@@ -324,7 +324,7 @@ struct DispatchParams {
     float* const* expert_output_prob_ptrs; // Forward only
     uint8_t* const* expert_output_scaling_factor_ptrs; // SCALES_FORWARD outputs, addressed as bytes
 
-    // Metadata (from handle->hybridep preprocessing outputs)
+    // Metadata (from handle->ht preprocessing outputs)
     const bool* rdma_to_attn_map;
     const bool* attn_to_rdma_map;
     const int32_t* sparse_to_dense_map;
@@ -410,7 +410,7 @@ struct CombineParams {
     const uint16_t* combine_rdma_inter_node_group_token;
     const float* combine_rdma_inter_node_group_prob; // Backward only
 
-    // Metadata (from handle->hybridep preprocessing outputs)
+    // Metadata (from handle->ht preprocessing outputs)
     const int32_t* sparse_to_dense_map;
     int s2d_inner_dim; // Inner dim of unified S2D (num_topk in expert-major, n_ranks_per_node in flat).
     ncclEpLayout_t layout; // Output layout (selects kernel template specialization).
@@ -498,5 +498,5 @@ void call_local_reduce(
     cudaStream_t stream,
     ncclDataType_t token_dtype = ncclBfloat16);
 
-} // namespace hybridep
+} // namespace ht
 } // namespace nccl_ep

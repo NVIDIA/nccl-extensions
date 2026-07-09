@@ -14,7 +14,7 @@
 #include "nccl_ep.h"
 #include "common.hpp"
 #include "device_primitives.cuh"
-#include "hybridep_configs.cuh"
+#include "ht_ep_configs.cuh"
 #include <assert.h>
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -22,7 +22,7 @@
 #include "nccl_device.h"
 #include "cuda_compat_shims.cuh" // Compatibility shims for CUDA 12.x
 
-namespace hybrid_ep {
+namespace ht_ep {
 
 template <int NUM_OF_BOOL_TO_REDUCE>
 using Reduce_t = typename std::conditional<
@@ -186,7 +186,7 @@ struct model_config_t {
     int num_of_nodes;
 };
 
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
 struct dispatch_warp_timing_entry_t {
     long long start_clock;
     long long end_clock;
@@ -946,7 +946,7 @@ struct dispatch_kernel_param_base_t {
     // above it (DROP masks the rest), so the S2G assert only fires on corrupted
     // or stale routing maps.
     int max_recv_tokens_per_rank;
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     dispatch_warp_timing_entry_t* warp_timing;
 #endif
 };
@@ -1013,7 +1013,7 @@ struct combine_kernel_param_base_t {
     // Cross-round WAR sync-guards: LSA (intra-node staging) uses the NCCL LSA barrier; RDMA
     // (inter-node staging) is hand-rolled. Only the enable flags are needed on the device now.
     bool guard_enabled; // cross-round WAR guard (LSA + RDMA share one enable)
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     combine_warp_timing_entry_t* warp_timing;
     combine_block_timing_entry_t* block_timing;
 #endif
@@ -1184,7 +1184,7 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
             LSA_TEAMS,
             LSA_TEAM_SZ,
             MAX_CHUNKS_PER_RANK);
-        constexpr int N2N_WARPS = (LSA_TEAMS == 1) ? 1 : HYBRIDEP_DISPATCH_N2N_WARPS;
+        constexpr int N2N_WARPS = (LSA_TEAMS == 1) ? 1 : NCCL_EP_HT_DISPATCH_N2N_WARPS;
         int signal_channel = cidx % (NBLOCKS * N2N_WARPS);
 
         int ctx_idx = signal_channel % num_ctx_per_comm;
@@ -2608,7 +2608,7 @@ __forceinline__ __device__ void combine_RED_intra_warp(
 
     // Streaming overlap: drain + signal every STREAMING_BATCH dst tokens. The counter is cumulative
     // across chunks (never reset), so the consumer never races a reset.
-    constexpr int STREAMING_BATCH = HYBRIDEP_COMBINE_RDMA_STREAMING_BATCH;
+    constexpr int STREAMING_BATCH = NCCL_EP_HT_COMBINE_RDMA_STREAMING_BATCH;
     int streaming_pending = 0;
     uint32_t cumulative_produced = 0;
 
@@ -2929,7 +2929,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
         int chunk_base_token_idx = lteam_id * rdma_map_size_per_node + chunk_id * TOKENS_PER_CHUNK;
         // Residue chunks carry no tokens; real chunks use the scheduled size (tail = remainder).
         const int token_range = is_residue ? 0 : meta.csize;
-        constexpr int STREAMING_BATCH = HYBRIDEP_COMBINE_RDMA_STREAMING_BATCH;
+        constexpr int STREAMING_BATCH = NCCL_EP_HT_COMBINE_RDMA_STREAMING_BATCH;
         // Per-token wire bytes (compile-time): hidden x element width.
         constexpr size_t token_bytes = static_cast<size_t>(HIDDEN_DIM) * nccl_ep::size_u8<kTokenDtype>();
         if constexpr (STREAMING_BATCH > 0) {
@@ -2975,7 +2975,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
             }
 
             if (!is_residue && INTER_NODE_RDMA_GROUP::thread_rank() == 0) {
-                constexpr int max_batch = HYBRIDEP_DISPATCH_RDMA_BATCH_SIZE;
+                constexpr int max_batch = NCCL_EP_HT_DISPATCH_RDMA_BATCH_SIZE;
                 combine_n2n_put_active_tokens</*STREAMING=*/false, BACKWARD_COMBINE, max_batch,
                                               MAX_NUM_OF_TOKENS_PER_RANK, token_bytes>(
                     net, rail, lteam_id, nccl_token_window, nccl_prob_window, nccl_internal_window, smem_mr_info_ptr,
@@ -3974,7 +3974,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
 
     __syncthreads();
 
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     long long _wt_start = 0;
     if (threadIdx.x % 32 == 0) _wt_start = clock64();
 #endif
@@ -4064,7 +4064,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             NBLOCKS,
             smem_buffer_ptr);
     }
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     if (threadIdx.x % 32 == 0) {
         constexpr int _WT_WARPS = (INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() +
                                    INTRA_NODE_S2G_GROUP::size() + PAD_GROUP::size()) /
@@ -4145,10 +4145,9 @@ template < // This type represent intra-node reduction warp group.
   // NONE output dtype, resolved at compile time (JIT literal) so the per-element
   // reduction branches fold away — BF16 (default) pays zero dtype-branch cost.
   ncclDataType_t kTokenDtype = ncclBfloat16>
-// Each CUDA block of combine kernel has 5 warp groups and has the following layout:
-// 1. intra-node reduction warp group(4 warps, only valid for multinode scenario). 2. inter-node reduction warp group(4 warps, 1 pipeline for multinode scenario, 2 pipeline otherwise).
-// 3. intra-node G2S warp group(1 warp, only valid for multinode scenario). 4. inter-node G2S warp group(1 warp for multinode scenario, 2 warps otherwise). 5. inter-node N2N rdma warp group(1 warp, only valid for multinode scenario).
-// Total 6(single-node) or 11(multi-node) warps per CUDA block/SM.
+// Each CUDA block of combine kernel has named warp groups:
+// intra/inter reduction, intra/inter G2S, and inter-node N2N RDMA. Group sizes are
+// set by the HT combine warp-count constants and the selected pipeline count.
 __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t<LSA_TEAM_SZ>& param,
                                                     uint8_t* smem_bytes) {
     const int my_lteam = param.node_rank;
@@ -4171,7 +4170,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
         MAX_NUM_OF_TOKENS_PER_RANK % TOKENS_PER_CHUNK == 0,
         "MAX_NUM_OF_TOKENS_PER_RANK must be multiple of TOKENS_PER_CHUNK.");
     constexpr int MAX_NUM_OF_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     constexpr int _WT_WARPS =
         (INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() +
          INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size()) /
@@ -4210,7 +4209,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     const int head_tid = (int)threadIdx.x;
     if (head_tid < head_init_warp::size()) {
         if (head_tid == 0) {
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
             _wt_head_start = clock64();
 #endif
             // Inter-rank completion barrier: block 0 signals (red.release orders prior stores), every block polls.
@@ -4221,7 +4220,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 flag_data = nccl_ep::ld_relaxed_sys_global(param.intra_node_write_completion_flags);
             } while (flag_data != expected_val);
             nccl_ep::memory_fence();
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
             _wt_head_end = clock64();
             param.block_timing[blockIdx.x].head_sync_start_clock = _wt_head_start;
             param.block_timing[blockIdx.x].head_sync_end_clock = _wt_head_end;
@@ -4262,7 +4261,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     // Make sure all the warps wait for mbarriers to be initialized before producing/consuming data.
     __syncthreads();
 
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     // Measure warp-group work only (starts after combine-head sync and setup barriers).
     long long _wt_start = 0;
     if (threadIdx.x % 32 == 0) _wt_start = clock64();
@@ -4399,7 +4398,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     } else {
         // Too many threads, should not goes here.
     }
-#ifdef HYBRIDEP_ENABLE_WARP_TIMING
+#ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     if (threadIdx.x % 32 == 0) {
         int _warp_id = threadIdx.x / 32;
         int _idx = blockIdx.x * _WT_WARPS + _warp_id;
@@ -4447,7 +4446,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                         ncclCoopWarp(),
                         param.dcomms[0],
                         ncclTeamTagLsa(),
-                        (uint32_t)HYBRIDEP_DISPATCH_NUM_OF_BLOCKS);
+                        (uint32_t)NCCL_EP_HT_DISPATCH_NUM_OF_BLOCKS);
                     bar.sync(ncclCoopWarp(), cuda::memory_order_relaxed);
                 }
             }
@@ -4696,8 +4695,8 @@ struct local_reduce_kernel_param_t {
 // Dynamic shared-memory bytes required by local_reduce_kernel_impl for the
 // given hidden_dim (token dtype is BF16/uint16_t).
 inline int local_reduce_dynamic_smem_bytes(int hidden_dim, int token_elem_bytes) {
-    constexpr int kPipeDepth = NCCLEP_LOCAL_REDUCE_PIPE_DEPTH;
-    constexpr int kOutStages = NCCLEP_LOCAL_REDUCE_OUT_STAGES;
+    constexpr int kPipeDepth = NCCL_EP_HT_LOCAL_REDUCE_PIPE_DEPTH;
+    constexpr int kOutStages = NCCL_EP_HT_LOCAL_REDUCE_OUT_STAGES;
     return (kPipeDepth + kOutStages) * hidden_dim * token_elem_bytes +
            2 * kPipeDepth * static_cast<int>(sizeof(uint64_t)) + 8;
 }
@@ -4720,8 +4719,8 @@ __device__ __forceinline__ void local_reduce_kernel_impl(const local_reduce_kern
     constexpr int VEC_PER_THREAD = (VEC_DIM + kConsThreads - 1) / kConsThreads;
     constexpr int kTokenBytes = HIDDEN_DIM * sizeof(T);
 
-    constexpr int PIPE_DEPTH = NCCLEP_LOCAL_REDUCE_PIPE_DEPTH;
-    constexpr int kOutStages = NCCLEP_LOCAL_REDUCE_OUT_STAGES;
+    constexpr int PIPE_DEPTH = NCCL_EP_HT_LOCAL_REDUCE_PIPE_DEPTH;
+    constexpr int kOutStages = NCCL_EP_HT_LOCAL_REDUCE_OUT_STAGES;
 
     const int N = *p.emuf_group_count;
     if (N == 0) return;
@@ -5265,6 +5264,6 @@ __device__ __forceinline__ void local_permute_reduce(
     }
 }
 
-} // namespace hybrid_ep
+} // namespace ht_ep
 
 #include "scan_kernel.cuh"

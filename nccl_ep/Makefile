@@ -66,9 +66,9 @@ JIT_CONFIG_HEADER := $(JIT_DIR)/config.h
 
 # NVCC JIT support is required for HT and LL modes.
 NCCL_EP_JIT_HEADERS := \
-    device/hybrid_ep.cuh \
+    device/ht_ep.cuh \
     device/device_primitives.cuh \
-    device/hybridep_configs.cuh \
+    device/ht_ep_configs.cuh \
     device/cuda_compat_shims.cuh \
     device/scan_kernel.cuh \
     device/macros.cuh \
@@ -104,8 +104,8 @@ CXXFLAGS += $(INCFLAGS) $(NCCL_EP_JIT_DEFS) -I$(CUDA_INC) -I$(CUDA_INC)/cccl -fP
 # Define on both the device build (NVCUFLAGS) and the host JIT compiler driver
 # (CXXFLAGS), since the latter forwards the macro to JIT-compiled device code.
 ifeq ($(WARP_TIMING),1)
-NVCUFLAGS += -DHYBRIDEP_ENABLE_WARP_TIMING
-CXXFLAGS  += -DHYBRIDEP_ENABLE_WARP_TIMING
+NVCUFLAGS += -DNCCL_EP_HT_ENABLE_WARP_TIMING
+CXXFLAGS  += -DNCCL_EP_HT_ENABLE_WARP_TIMING
 endif
 
 # Dependency generation flags for automatic header tracking
@@ -114,7 +114,7 @@ DEPFLAGS = -MMD -MP
 # Source files for library
 HOST_SRC := nccl_ep.cc nccl_ep_env.cc
 DEVICE_SRC := device/ll_ep_adapter.cu \
-              device/hybridep_adapter.cu
+              device/ht_ep_adapter.cu
 HOST_SRC += device/jit/jit_utils.cc \
             device/jit/jit_cache.cc \
             device/jit/nvcc_compiler.cc \

@@ -28,7 +28,7 @@ int ncclEpHandle_test_getNRanksPerNode(ncclEpHandle_t handle);
 int ncclEpHandle_test_getExpertsPerRank(ncclEpHandle_t handle);
 
 // HT only: total number of received tokens across all local experts.
-// Reads handle->hybridep.num_tokens_for_experts via cudaMemcpy.
+// Reads handle->ht.num_tokens_for_experts via cudaMemcpy.
 // Returns ncclInvalidUsage for non-HT algorithms.
 ncclResult_t ncclEpHandle_test_getNumRecvTokens(ncclEpHandle_t handle, unsigned int* num_recv_tokens);
 

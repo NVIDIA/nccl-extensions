@@ -9,7 +9,7 @@
 #include "device_primitives.cuh"
 #include <cooperative_groups.h>
 
-namespace hybrid_ep {
+namespace ht_ep {
 
 enum scan_state {
     EMPTY = 0,
@@ -942,7 +942,7 @@ __device__ __forceinline__ void scan_impl_flat(
         local_rank);
 }
 
-// EM-layout pre-scan: produces only what em_scan_kernel (see hybridep_adapter.cu)
+// EM-layout pre-scan: produces only what em_scan_kernel (see ht_ep_adapter.cu)
 // and the rest of the EM pipeline still need from the global routing bitmap --
 // the per-token rank mask, rdma_to_attn_map (filled by extract_lsa_ranks_meta), and
 // attn_to_rdma_map. The FLAT-only prefix scan / sparse_to_dense / per-expert
@@ -1367,4 +1367,4 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
     }
 }
 
-} // namespace hybrid_ep
+} // namespace ht_ep

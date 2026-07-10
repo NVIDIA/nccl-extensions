@@ -2869,6 +2869,42 @@ ncclResult_t ncclEpHandleDestroy(ncclEpHandle_t handle) {
 
 // EP Operations
 
+// Stream-ordered variant: the readback runs after prior work on `stream`
+// (e.g. the ncclEpUpdateHandle scan), so callers on the same stream need no
+// separate synchronization.
+static ncclResult_t ht_query_num_recv_tokens(ncclEpHandle_t handle, cudaStream_t stream, unsigned int* num_recv_tokens) {
+    if (handle->group->config.algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+        return ncclInvalidUsage;
+    }
+    // EM modes: total padded slots is the user-visible recv-token count.
+    // em_scan_kernel publishes it as em_internal_offsets[experts_per_rank].
+    // FLAT mode: num_tokens_for_experts holds the raw recv count.
+    if (handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+        int64_t em_padded_total;
+        CUDA_CHECK(cudaMemcpyAsync(
+            &em_padded_total,
+            handle->hybridep.expert_token_offsets + handle->group->num_local_experts,
+            sizeof(em_padded_total),
+            cudaMemcpyDeviceToHost,
+            stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        assert(em_padded_total >= 0);
+        *num_recv_tokens = static_cast<unsigned int>(em_padded_total);
+        return ncclSuccess;
+    }
+    int32_t actual_recv_tokens;
+    CUDA_CHECK(cudaMemcpyAsync(
+        &actual_recv_tokens,
+        handle->hybridep.num_tokens_for_experts,
+        sizeof(actual_recv_tokens),
+        cudaMemcpyDeviceToHost,
+        stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    assert(actual_recv_tokens >= 0);
+    *num_recv_tokens = static_cast<unsigned int>(actual_recv_tokens);
+    return ncclSuccess;
+}
+
 ncclResult_t ncclEpDispatch(
     ncclEpHandle_t handle,
     const ncclEpDispatchInputs_t* inputs,
@@ -3407,8 +3443,8 @@ ncclResult_t ncclEpDispatch(
         // For external output tensors with windows, resolve full per-rank output pointers
         // (local + same-node peers) so all writers target user buffers directly.
         std::vector<void*> dispatch_output_token_ptrs;
-        const bool recv_x_uses_external_window = tensorUsesExternalWindow(group, recv_x);
-        if (group->config.zero_copy == NCCL_EP_ZERO_COPY_ON && !recv_x_uses_external_window) {
+        const bool rcv_x_zcopy = tensorUsesExternalWindow(group, recv_x);
+        if (group->config.zero_copy == NCCL_EP_ZERO_COPY_ON && !rcv_x_zcopy) {
             fprintf(
                 stderr,
                 "NCCL EP: zero_copy requires ncclEpDispatch outputs->tokens to be backed by a "
@@ -3419,24 +3455,8 @@ ncclResult_t ncclEpDispatch(
         // staging -> recv_x->data); external-window vs. plain recv_x is irrelevant
         // since the permute kernel just dereferences recv_x->data.
         const bool em_permute_active = em_local_permute_enabled(group, handle);
-        // Required caller recv capacity: the full budget in fixed mode (recv_x
-        // checked above), the routing's actual recv count in eager mode. Eager
-        // validates before any kernel writes caller memory; the counts were
-        // published by the handle's scan, so they are final here.
-        unsigned int num_recv_tokens_required = static_cast<unsigned int>(group->max_recv_tokens);
-        if (group->eager_mode) {
-            NCCLCHECK(ht_query_num_recv_tokens(handle, stream, &num_recv_tokens_required));
-            if (recv_x->sizes[0] < num_recv_tokens_required) {
-                fprintf(
-                    stderr,
-                    "NCCL EP: eager dispatch recv buffer too small: %u tokens < %u required "
-                    "(size from ncclEpLayoutInfo_t::recv_total_counter)\n",
-                    static_cast<unsigned>(recv_x->sizes[0]),
-                    num_recv_tokens_required);
-                return ncclInvalidArgument;
-            }
-        }
-        if (recv_x_uses_external_window && !em_permute_active) {
+
+        if (rcv_x_zcopy && !em_permute_active) {
             NCCLCHECK(buildIntranodePtrArray<void>(group, recv_x, dispatch_output_token_ptrs));
             params.expert_output_token_ptrs = dispatch_output_token_ptrs.data();
         } else {
@@ -3444,8 +3464,8 @@ ncclResult_t ncclEpDispatch(
         }
         params.expert_output_prob_ptrs = group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs;
         std::vector<uint8_t*> dispatch_output_sf_ptrs;
-        const bool recv_scales_uses_external_window = use_fp8 && tensorUsesExternalWindow(group, recv_scales);
-        if (recv_scales_uses_external_window) {
+        const bool rcv_scales_zcopy = use_fp8 && tensorUsesExternalWindow(group, recv_scales);
+        if (rcv_scales_zcopy) {
             NCCLCHECK(buildIntranodePtrArray<uint8_t>(group, recv_scales, dispatch_output_sf_ptrs));
             params.expert_output_scaling_factor_ptrs = dispatch_output_sf_ptrs.data();
         } else {
@@ -3454,6 +3474,31 @@ ncclResult_t ncclEpDispatch(
                               group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs) :
                           nullptr;
         }
+
+        bool zcopy_only = rcv_x_zcopy;
+        if (use_fp8) {
+            zcopy_only = zcopy_only && rcv_scales_zcopy;
+        }
+        const bool need_recv_counts = !is_capturing && !em_permute_active && !zcopy_only;
+
+        // Required caller recv capacity: the full budget in fixed mode (recv_x
+        // checked above), the routing's actual recv count in eager mode. Eager
+        // validates before any kernel writes caller memory; the counts were
+        // published by the handle's scan, so they are final here.
+        unsigned int recv_copy_rows = static_cast<unsigned int>(group->max_recv_tokens);
+        if (group->eager_mode || need_recv_counts) {
+            NCCLCHECK(ht_query_num_recv_tokens(handle, stream, &recv_copy_rows));
+            if (recv_x->sizes[0] < recv_copy_rows) {
+                fprintf(
+                    stderr,
+                    "NCCL EP: eager dispatch recv buffer too small: %u tokens < %u required "
+                    "(size from ncclEpLayoutInfo_t::recv_total_counter)\n",
+                    static_cast<unsigned>(recv_x->sizes[0]),
+                    recv_copy_rows);
+                return ncclInvalidArgument;
+            }
+        }
+
         // EM-permute path runs the dispatch kernel in FLAT layout and reshuffles
         // FLAT staging into EM zones via the local permute kernel below. BWD
         // reuses the FWD-populated handle maps; only the FWD-only weight scatter
@@ -3567,32 +3612,7 @@ ncclResult_t ncclEpDispatch(
                 x->datatype);
         }
 
-        const unsigned int max_recv_tokens = static_cast<unsigned int>(handle->group->max_recv_tokens);
 
-        // Pick the staging→user copy size based on stream-capture state:
-        //   - Capturing (CUDA Graph): copy the full caller-allocated bound
-        //     (max_recv_tokens). No host sync, so the call records cleanly.
-        //     The caller must size recv_x (and recv_scales) >= max_recv_tokens.
-        //   - Not capturing: blocking D2H readback of the actual recv-token
-        //     total and copy only that many rows, keeping bandwidth cost
-        //     proportional to real traffic.
-        unsigned int actual_recv_tokens = 0;
-        // D2H readback sizes the byte_copy and FP8-scales D2D; skip when
-        // external-window outputs or em-permute make both copies unnecessary.
-        const bool need_recv_count_readback =
-            !em_permute_active &&
-            (!recv_x_uses_external_window || (use_fp8 && !recv_scales_uses_external_window));
-        if (!is_capturing && need_recv_count_readback) {
-            CUDA_CHECK(cudaMemcpyAsync(
-                &actual_recv_tokens,
-                handle->hybridep.num_tokens_for_experts,
-                sizeof(actual_recv_tokens),
-                cudaMemcpyDeviceToHost,
-                stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            assert(actual_recv_tokens <= max_recv_tokens);
-        }
-        const unsigned int recv_copy_rows = is_capturing ? max_recv_tokens : actual_recv_tokens;
 
         /* ===== Copy intranode staging → caller outputs ===== */
         // External-window outputs are written directly by the kernel; regular tensors
@@ -3602,7 +3622,7 @@ ncclResult_t ncclEpDispatch(
         // permute kernel uses that table to map FLAT slots to EM zones.
         assert(recv_x->ndim == 2);
         const int caller_num_recv_tokens = static_cast<int>(recv_x->sizes[0]);
-        if (!recv_x_uses_external_window && !em_permute_active) {
+        if (!rcv_x_zcopy && !em_permute_active) {
             if (recv_x->sizes[0] < recv_copy_rows) {
                 return ncclInvalidArgument;
             }
@@ -3647,14 +3667,14 @@ ncclResult_t ncclEpDispatch(
                     return ncclInvalidArgument;
                 }
             }
-            if (recv_topk_weights->sizes[0] < num_recv_tokens_required) {
+            if (recv_topk_weights->sizes[0] < recv_copy_rows) {
                 return ncclInvalidArgument;
             }
 
             // Non-permute paths write the caller buffer, so bound the row count to
             // recv_copy_rows. The em-permute path writes internal scratch here and
             // the caller buffer later in launch_dispatch_permute.
-            int num_recv_tokens = em_permute_active ? static_cast<int>(max_recv_tokens)
+            int num_recv_tokens = em_permute_active ? static_cast<int>(group->max_recv_tokens)
                                                     : static_cast<int>(recv_copy_rows);
             int experts_per_node = group->num_local_experts * group->lsa_team_size;
             // recv_topk_idx numbering selector (matches LL rank-major path):
@@ -3728,7 +3748,7 @@ ncclResult_t ncclEpDispatch(
         // FP8 scales output (async D2D, sized by caller).
         if (use_fp8) {
             assert(recv_scales->ndim == 2);
-            if (!recv_scales_uses_external_window) {
+            if (!rcv_scales_zcopy) {
                 if (recv_scales->sizes[0] < recv_copy_rows) {
                     return ncclInvalidArgument;
                 }
@@ -4448,42 +4468,6 @@ int ncclEpHandle_test_getNRanksPerNode(ncclEpHandle_t handle) {
 
 int ncclEpHandle_test_getExpertsPerRank(ncclEpHandle_t handle) {
     return handle->group->num_local_experts;
-}
-
-// Stream-ordered variant: the readback runs after prior work on `stream`
-// (e.g. the ncclEpUpdateHandle scan), so callers on the same stream need no
-// separate synchronization.
-static ncclResult_t ht_query_num_recv_tokens(ncclEpHandle_t handle, cudaStream_t stream, unsigned int* num_recv_tokens) {
-    if (handle->group->config.algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT) {
-        return ncclInvalidUsage;
-    }
-    // EM modes: total padded slots is the user-visible recv-token count.
-    // em_scan_kernel publishes it as em_internal_offsets[experts_per_rank].
-    // FLAT mode: num_tokens_for_experts holds the raw recv count.
-    if (handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-        int64_t em_padded_total;
-        CUDA_CHECK(cudaMemcpyAsync(
-            &em_padded_total,
-            handle->hybridep.expert_token_offsets + handle->group->num_local_experts,
-            sizeof(em_padded_total),
-            cudaMemcpyDeviceToHost,
-            stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        assert(em_padded_total >= 0);
-        *num_recv_tokens = static_cast<unsigned int>(em_padded_total);
-        return ncclSuccess;
-    }
-    int32_t actual_recv_tokens;
-    CUDA_CHECK(cudaMemcpyAsync(
-        &actual_recv_tokens,
-        handle->hybridep.num_tokens_for_experts,
-        sizeof(actual_recv_tokens),
-        cudaMemcpyDeviceToHost,
-        stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    assert(actual_recv_tokens >= 0);
-    *num_recv_tokens = static_cast<unsigned int>(actual_recv_tokens);
-    return ncclSuccess;
 }
 
 

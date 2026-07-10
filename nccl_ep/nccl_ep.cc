@@ -1544,7 +1544,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     //   expands each token to up to num_topk slots, hence the config.num_topk
     //   factor. Eager relies on TRAP semantics, so DROP requires a fixed budget.
     //   LL AUTO/0: nRanks * max_dispatch_tokens_per_rank (layout-agnostic).
-    ep_group->eager_mode = hybridep_mode && (ep_group->config.max_recv_tokens_per_rank == 0);
+    ep_group->eager_mode = hybridep_mode && (ep_group->config.max_recv_tokens_per_rank == NCCL_EP_AUTO);
     if (ep_group->eager_mode) {
         EP_HOST_ASSERT(
             ep_group->config.overflow_policy != NCCL_EP_OVERFLOW_DROP &&
@@ -2398,17 +2398,22 @@ ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
 static ncclResult_t
 ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor_t* handle_mem, int num_topk) {
     assert(ep_group->config.max_dispatch_tokens_per_rank > 0 && "HT requires max_dispatch_tokens_per_rank > 0");
-    assert(num_topk > 0 && "HT mode requires num_topk > 0 (pass top_k to ncclEpInitHandle)");
+    
+    if(num_topk <= 0) {
+        fprintf(stderr, "HT mode requires num_topk > 0 (pass top_k to ncclEpInitHandle)\n");
+        return ncclInvalidUsage;
+    }
+
     // Eager groups size internal buffers from config.num_topk; enforce it as the
     // per-handle upper bound, and require it for Expert-Major (per-expert slot
     // expansion is unbounded without it).
     if (ep_group->config.num_topk > 0) {
-        EP_HOST_ASSERT(
-            static_cast<unsigned int>(num_topk) <= ep_group->config.num_topk &&
-            "ncclEpInitHandle: num_topk exceeds ncclEpGroupConfig_t::num_topk");
+        if(static_cast<unsigned int>(num_topk) > ep_group->config.num_topk) {
+            fprintf(stderr, "NCCL EP: num_topk exceeds ncclEpGroupConfig_t::num_topk\n");
+            return ncclInvalidUsage;
+        }
     } else if (ep_group->eager_mode && handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-        fprintf(
-            stderr,
+        fprintf(stderr,
             "NCCL EP: eager mode (max_recv_tokens_per_rank = NCCL_EP_AUTO) requires "
             "ncclEpGroupConfig_t::num_topk for the Expert-Major layout\n");
         return ncclInvalidUsage;
@@ -2761,6 +2766,13 @@ ncclResult_t ncclEpUpdateHandle(
     }
 
     const bool em_permute_active = em_local_permute_enabled(ep_group, handle);
+    int max_recv_tpr = static_cast<int>(ep_group->config.max_recv_tokens_per_rank);
+    const int alignment = static_cast<int>(handle->hybridep.dispatch_output_per_expert_alignment);
+    if (ep_group->eager_mode && em_permute_active && (alignment > 0)) {
+        // Eager local-permute: padded zones live in the caller buffer
+        // Extend the zone-overflow budget by the worst-case padding.
+        max_recv_tpr += experts_per_rank * (alignment - 1);
+    }
 
     NCCLCHECK(
         nccl_ep::hybridep::call_metadata_preprocessing(
@@ -2789,17 +2801,7 @@ ncclResult_t ncclEpUpdateHandle(
             expert_major ? handle->num_topk : 0,
             recv_total_counter,
             out_is_int64,
-            // Eager local-permute: padded zones live only in the caller buffer
-            // (checked at dispatch), so extend the zone-overflow budget by the
-            // worst-case padding. Dup modes stage by padded em_slot in
-            // bound-sized buffers, so they keep the strict budget.
-            static_cast<int>(
-                ep_group->config.max_recv_tokens_per_rank +
-                ((ep_group->eager_mode && em_permute_active &&
-                  handle->hybridep.dispatch_output_per_expert_alignment > 1)
-                     ? static_cast<unsigned int>(experts_per_rank) *
-                           (static_cast<unsigned int>(handle->hybridep.dispatch_output_per_expert_alignment) - 1)
-                     : 0)),
+            max_recv_tpr,
             handle->hybridep.emuf_group_buf,
             handle->hybridep.emuf_group_count,
             handle->hybridep.emuf_group_stride,

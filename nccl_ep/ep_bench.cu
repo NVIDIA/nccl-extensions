@@ -1684,38 +1684,16 @@ static ValidationResult validateDispatchOutputHTRankMaj(
 
     const size_t* out0_sizes = dispatch_outputs.tokens->sizes;
     unsigned int buf_rows = out0_sizes[0];
-    size_t recv_size = static_cast<size_t>(buf_rows) * hidden;
-    size_t eb = tokenElemBytes(token_dtype);
-    char* recv_data = new char[recv_size * eb];
-    void* output0_data;
-    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.tokens, &output0_data));
-    CUDACHECK(cudaMemcpy(recv_data, output0_data, recv_size * eb, cudaMemcpyDeviceToHost));
-
-    bool* valid_slot = new bool[buf_rows]();
-    int64_t* recv_topk_idx = new int64_t[static_cast<size_t>(buf_rows) * top_k];
-    void* output2_data;
-    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.topk_idx, &output2_data));
-    CUDACHECK(cudaMemcpy(
-        recv_topk_idx,
-        output2_data,
-        static_cast<size_t>(buf_rows) * top_k * sizeof(int64_t),
-        cudaMemcpyDeviceToHost));
-    for (unsigned int j = 0; j < buf_rows; j++) {
-        for (unsigned int k = 0; k < top_k; k++) {
-            if (recv_topk_idx[j * top_k + k] >= 0) {
-                valid_slot[j] = true;
-                break;
-            }
-        }
-    }
 
     // recv_topk_idx numbering. Mirrors the kernel's AUTO -> LOCAL collapse.
     ncclEpExpertIdKind_t kind = dispatch_layout_info.recv_topk_idx_kind;
     if (kind == NCCL_EP_EXPERT_ID_AUTO) kind = NCCL_EP_EXPERT_ID_LOCAL;
 
-    // Save deterministic routing once per source rank. The flat expected set
-    // validates received token membership; per-slot topk_idx values are checked
-    // below against these same saved expert ids.
+    // Deterministic per-source routing. Built up-front so we can derive the
+    // actual populated recv range (expected.size()) and bound the scan to it.
+    // For HT/Eager mode (max_recv_tokens_per_rank = AUTO), the library only
+    // writes recv_topk_idx / recv_data for [0, actual_recv).
+    // The trailing [actual_recv, buf_rows) is undefined and should be ignored.
     std::vector<std::vector<int64_t>> topk_by_rank(nRanks);
     std::set<std::pair<int, int>> expected;
     for (int r = 0; r < nRanks; r++) {
@@ -1733,9 +1711,48 @@ static ValidationResult validateDispatchOutputHTRankMaj(
             }
         }
     }
+    const unsigned int actual_recv = static_cast<unsigned int>(expected.size());
+    // recv_x must be sufficient to cover the actual recv count (expected.size()).
+    if (buf_rows < actual_recv) {
+        result.passed = false;
+        result.errors = 1;
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "HT dispatch: recv buffer undersized: buf_rows=%u < expected actual_recv=%u",
+                 buf_rows, actual_recv);
+        result.message = msg;
+        printf("[Rank %d] %s\n", myRank, msg);
+        return result;
+    }
+    const unsigned int scan_rows = actual_recv;
+
+    size_t recv_size = static_cast<size_t>(buf_rows) * hidden;
+    size_t eb = tokenElemBytes(token_dtype);
+    char* recv_data = new char[recv_size * eb];
+    void* output0_data;
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.tokens, &output0_data));
+    CUDACHECK(cudaMemcpy(recv_data, output0_data, recv_size * eb, cudaMemcpyDeviceToHost));
+
+    bool* valid_slot = new bool[buf_rows]();
+    int64_t* recv_topk_idx = new int64_t[static_cast<size_t>(buf_rows) * top_k];
+    void* output2_data;
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.topk_idx, &output2_data));
+    CUDACHECK(cudaMemcpy(
+        recv_topk_idx,
+        output2_data,
+        static_cast<size_t>(buf_rows) * top_k * sizeof(int64_t),
+        cudaMemcpyDeviceToHost));
+    for (unsigned int j = 0; j < scan_rows; j++) {
+        for (unsigned int k = 0; k < top_k; k++) {
+            if (recv_topk_idx[j * top_k + k] >= 0) {
+                valid_slot[j] = true;
+                break;
+            }
+        }
+    }
 
     std::set<std::pair<int, int>> found;
-    for (unsigned int j = 0; j < buf_rows; j++) {
+    for (unsigned int j = 0; j < scan_rows; j++) {
         if (!valid_slot[j]) continue;
 
         size_t row_elem_offset = static_cast<size_t>(j) * hidden;

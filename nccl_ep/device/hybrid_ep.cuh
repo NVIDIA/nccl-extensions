@@ -353,8 +353,7 @@ struct combine_smem_layout_t {
 
 struct dispatch_smem_layout_t {
     void* intra_node_token_buffer;
-    // Prob: one GMEM source pointer per stage (pointer-handoff, not SMEM-staged).
-    const float** intra_node_prob_src_buffer;
+    float* intra_node_prob_buffer;
     uint8_t* intra_node_scaling_factor_buffer;
     bool* attn_to_rdma_map_buffer;
     uint64_t* intra_node_mbarrier_buffer;
@@ -364,6 +363,7 @@ struct dispatch_smem_layout_t {
     void* pad_tma_buffer;
 
     int token_buffer_stage_stride; // bytes
+    int prob_buffer_stage_stride; // bytes
     int sf_buffer_stage_stride; // bytes
     int pad_tma_slot_bytes; // bytes (= padded hidden_dim * sizeof(token))
     int s2d_inner_dim; // flat: lsa_team_size, expert-major: num_topk
@@ -376,9 +376,9 @@ struct dispatch_smem_layout_t {
         return reinterpret_cast<void*>(
             reinterpret_cast<uint8_t*>(intra_node_token_buffer) + stage * token_buffer_stage_stride);
     }
-    // This stage's prob GMEM source pointer (G2S writes, S2G reads).
-    __device__ __forceinline__ const float** get_prob_src_slot(int stage) const {
-        return intra_node_prob_src_buffer + stage;
+    __device__ __forceinline__ float* get_prob_buffer(int stage) const {
+        return reinterpret_cast<float*>(
+            reinterpret_cast<uint8_t*>(intra_node_prob_buffer) + stage * prob_buffer_stage_stride);
     }
     __device__ __forceinline__ void* get_sf_buffer(int stage) const {
         return reinterpret_cast<void*>(intra_node_scaling_factor_buffer + stage * sf_buffer_stage_stride);
@@ -394,8 +394,8 @@ struct dispatch_smem_layout_t {
     __device__ __forceinline__ void* get_token_buffer(int pipeline_id, int local_stage) const {
         return get_token_buffer(pipeline_id * stages_per_pipeline + local_stage);
     }
-    __device__ __forceinline__ const float** get_prob_src_slot(int pipeline_id, int local_stage) const {
-        return get_prob_src_slot(pipeline_id * stages_per_pipeline + local_stage);
+    __device__ __forceinline__ float* get_prob_buffer(int pipeline_id, int local_stage) const {
+        return get_prob_buffer(pipeline_id * stages_per_pipeline + local_stage);
     }
     __device__ __forceinline__ void* get_sf_buffer(int pipeline_id, int local_stage) const {
         return get_sf_buffer(pipeline_id * stages_per_pipeline + local_stage);
@@ -439,14 +439,15 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     // carried here (flat = num_ranks_per_node, expert-major = num_topk).
     layout.s2d_inner_dim = config.s2d_inner_dim;
 
-    // Prob source pointers (forward dispatch only, 8B aligned): one GMEM pointer per stage
+    // Prob buffer (only if forward dispatch, 16B aligned) -- total stages unchanged
     if (config.forward_dispatch) {
-        offset = (offset + alignof(const float*) - 1) & ~(size_t)(alignof(const float*) - 1);
-        layout.intra_node_prob_src_buffer =
-            reinterpret_cast<const float**>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-        offset += config.num_of_stages * sizeof(const float*);
+        layout.prob_buffer_stage_stride = model.num_of_experts_per_rank * model.num_of_ranks_per_node * sizeof(float);
+        layout.prob_buffer_stage_stride = (layout.prob_buffer_stage_stride + 15) & ~15;
+        layout.intra_node_prob_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
+        offset += config.num_of_stages * layout.prob_buffer_stage_stride;
     } else {
-        layout.intra_node_prob_src_buffer = nullptr;
+        layout.intra_node_prob_buffer = nullptr;
+        layout.prob_buffer_stage_stride = 0;
     }
 
     // Scaling factor buffer (only if quantized, 16B aligned) -- total stages unchanged
@@ -514,10 +515,11 @@ static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& confi
 
     // s2d map is read directly from GMEM (no SMEM staging)
 
-    // Prob source pointers (8B aligned per stage)
+    // Prob buffer (16B aligned per stage) -- total stages unchanged
     if (config.forward_dispatch) {
-        total_size = (total_size + alignof(const float*) - 1) & ~(size_t)(alignof(const float*) - 1);
-        total_size += config.num_of_stages * sizeof(const float*);
+        int prob_buffer_stage_stride = model.num_of_experts_per_rank * model.num_of_ranks_per_node * sizeof(float);
+        prob_buffer_stage_stride = (prob_buffer_stage_stride + 15) & ~15;
+        total_size += config.num_of_stages * prob_buffer_stage_stride;
     }
 
     // Scaling factor buffer (16B aligned per stage, only if quantized) -- total stages unchanged
@@ -1192,19 +1194,28 @@ __forceinline__ __device__ uint32_t bulk_copy(void* smem_ptr, const void* gmem_p
     return bytes;
 }
 
-// Copy a token bundle (token, +sf if quantized) between this stage's SMEM and gmem. Returns total bytes.
-template <typename TOKEN_DATA_TYPE, typename SMEM_TYPE, bool HAS_SF, copy_dir DIR>
+// Copy a token bundle (token, +prob if FWD, +sf if quantized) between this stage's SMEM and gmem. Returns total bytes.
+template <typename TOKEN_DATA_TYPE, typename SMEM_TYPE, bool FORWARD_DISPATCH, bool HAS_SF, copy_dir DIR>
 __forceinline__ __device__ uint32_t copy_token_bundle(
     SMEM_TYPE* smem_buffer_ptr,
     const int pipeline_rank,
     const int stage,
     const void* token_gmem_ptr,
+    const void* prob_gmem_ptr,
     const void* sf_gmem_ptr,
     const uint32_t token_bytes,
+    const uint32_t prob_bytes,
     const uint32_t sf_bytes,
     uint64_t* mbar) {
     uint32_t tx =
         bulk_copy<DIR>(smem_buffer_ptr->get_token_buffer(pipeline_rank, stage), token_gmem_ptr, token_bytes, mbar);
+    if constexpr (FORWARD_DISPATCH) {
+        tx += bulk_copy<DIR>(
+            reinterpret_cast<void*>(smem_buffer_ptr->get_prob_buffer(pipeline_rank, stage)),
+            prob_gmem_ptr,
+            prob_bytes,
+            mbar);
+    }
     if constexpr (HAS_SF) {
         tx += bulk_copy<DIR>(
             reinterpret_cast<void*>(smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage)),
@@ -1240,28 +1251,28 @@ __forceinline__ __device__ void dispatch_g2s_issue_token(
     const uint32_t prob_bytes = (uint32_t)((experts_per_rank * LSA_TEAM_SIZE) * sizeof(float));
     const uint32_t sf_bytes = (uint32_t)sf_bytes_per_token;
     uint32_t tx_bytes;
-    const float* prob_src = nullptr;
 
     if (src.use_packed) {
         // Packed entry is contiguous [token | prob | sf].
         const uint8_t* packed_src_base = src.packed_base + packed_dense_idx * mr_info->bytes_per_entry;
         const void* token_src = packed_src_base;
+        const void* prob_src = packed_src_base + token_bytes;
         const void* sf_src = packed_src_base + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
-        if constexpr (FORWARD_DISPATCH) {
-            prob_src = reinterpret_cast<const float*>(packed_src_base + token_bytes);
-        }
-        tx_bytes = copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, HAS_SF, copy_dir::to_smem>(
+        tx_bytes = copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH, HAS_SF, copy_dir::to_smem>(
             smem_buffer_ptr,
             pipeline_rank,
             stage,
             token_src,
+            prob_src,
             sf_src,
             token_bytes,
+            prob_bytes,
             sf_bytes,
             mbar);
     } else {
         // Strided-local: each field has its own base.
         const void* token_src = src.token_base + (current_token_id * HIDDEN_DIM);
+        const void* prob_src = nullptr;
         const void* sf_src = nullptr;
         if constexpr (FORWARD_DISPATCH) {
             // Advance by whole token rows, then pick this node's expert slice within the row.
@@ -1272,20 +1283,17 @@ __forceinline__ __device__ void dispatch_g2s_issue_token(
         if constexpr (HAS_SF) {
             sf_src = src.sf_base + current_token_id * sf_bytes_per_token;
         }
-        tx_bytes = copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, HAS_SF, copy_dir::to_smem>(
+        tx_bytes = copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH, HAS_SF, copy_dir::to_smem>(
             smem_buffer_ptr,
             pipeline_rank,
             stage,
             token_src,
+            prob_src,
             sf_src,
             token_bytes,
+            prob_bytes,
             sf_bytes,
             mbar);
-    }
-
-    // Hand the prob GMEM source pointer to S2G via SMEM; published by the release-arrive below.
-    if constexpr (FORWARD_DISPATCH) {
-        *smem_buffer_ptr->get_prob_src_slot(pipeline_rank, stage) = prob_src;
     }
 
     cuda::ptx::mbarrier_arrive_expect_tx(
@@ -1336,19 +1344,22 @@ dispatch_s2g_resolve_dest(const int32_t* s2d_row, const int flat_idx, const bool
     return dst;
 }
 
-// TMA-store one token (+sf if quantized) from this stage's SMEM to one resolved remote destination.
-template <typename TOKEN_DATA_TYPE, typename SMEM_TYPE, bool HAS_SF>
+// TMA-store one token (+prob if FWD, +sf if quantized) from this stage's SMEM to one resolved remote destination.
+template <typename TOKEN_DATA_TYPE, typename SMEM_TYPE, int LSA_TEAM_SIZE, bool FORWARD_DISPATCH, bool HAS_SF>
 __forceinline__ __device__ void dispatch_s2g_issue_token(
     const s2g_dest_t& dst,
     SMEM_TYPE* smem_buffer_ptr,
     TOKEN_DATA_TYPE* const* remote_expert_output_token,
+    float* const* remote_expert_output_prob,
     uint8_t* const* remote_expert_output_scaling_factor,
     const int pipeline_rank,
     const int stage,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
-    const int max_recv_tokens_per_rank) {
+    const int max_recv_tokens_per_rank,
+    const int experts_per_rank) {
     const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE));
+    const uint32_t prob_bytes = (uint32_t)((experts_per_rank * LSA_TEAM_SIZE) * sizeof(float));
     const uint32_t sf_bytes = (uint32_t)sf_bytes_per_token;
 
     // Remote fan-out: each field has its own output array, indexed [rank]+slot*stride.
@@ -1356,51 +1367,26 @@ __forceinline__ __device__ void dispatch_s2g_issue_token(
     // corrupted or stale routing maps before they overrun a recv buffer.
     EP_DEVICE_ASSERT(dst.output_buffer_index < max_recv_tokens_per_rank);
     const void* token_dst = remote_expert_output_token[dst.remote_rank_id] + (dst.output_buffer_index * HIDDEN_DIM);
+    const void* prob_dst = nullptr;
     const void* sf_dst = nullptr;
+    if constexpr (FORWARD_DISPATCH) {
+        prob_dst = remote_expert_output_prob[dst.remote_rank_id] +
+                   (dst.output_buffer_index * (experts_per_rank * LSA_TEAM_SIZE));
+    }
     if constexpr (HAS_SF) {
         sf_dst = remote_expert_output_scaling_factor[dst.remote_rank_id] + dst.output_buffer_index * sf_bytes_per_token;
     }
-    copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, HAS_SF, copy_dir::to_gmem>(
+    copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH, HAS_SF, copy_dir::to_gmem>(
         smem_buffer_ptr,
         pipeline_rank,
         stage,
         token_dst,
+        prob_dst,
         sf_dst,
         token_bytes,
+        prob_bytes,
         sf_bytes,
         /*mbar=*/nullptr);
-}
-
-// Store the prob row (GMEM source) to each issuing lane's remote dest; all 32 lanes stripe each row for coalescing.
-template <int LSA_TEAM_SIZE, int EXPERTS_PER_RANK>
-__forceinline__ __device__ void dispatch_s2g_store_prob(
-    const s2g_dest_t& dst,
-    const float* prob_src,
-    float* const* remote_expert_output_prob,
-    const int s2g_lane) {
-    constexpr int prob_count = EXPERTS_PER_RANK * LSA_TEAM_SIZE;
-    // float4 requires a 16B-aligned prob row
-    static_assert(
-        (prob_count % 4) == 0,
-        "prob row (experts_per_rank * ranks_per_node) must be a multiple of 4 floats for float4 stores.");
-    constexpr int prob_vec4 = prob_count / 4;
-    const float4* prob_src4 = reinterpret_cast<const float4*>(prob_src);
-    float* my_prob_dst =
-        dst.issue ? remote_expert_output_prob[dst.remote_rank_id] + dst.output_buffer_index * prob_count : nullptr;
-
-    unsigned prob_mask = __ballot_sync(0xffffffffu, dst.issue);
-    while (prob_mask) {
-        int src_lane = __ffs(prob_mask) - 1;
-        unsigned long long pd_bits = __shfl_sync(
-            0xffffffffu, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(my_prob_dst)), src_lane);
-        float4* dst_ptr4 = reinterpret_cast<float4*>(static_cast<uintptr_t>(pd_bits));
-
-        #pragma unroll
-        for (int e = s2g_lane; e < prob_vec4; e += 32) {
-            dst_ptr4[e] = prob_src4[e];
-        }
-        prob_mask &= (prob_mask - 1);
-    }
 }
 
 // Device function for inter-node node2node(RDMA) warp for dispatch kernel.
@@ -1574,8 +1560,7 @@ template <
     int NUM_PIPELINES,
     bool FORWARD_DISPATCH,
     bool HAS_SF,
-    ncclEpLayout_t kLayout,
-    int EXPERTS_PER_RANK>
+    ncclEpLayout_t kLayout>
 __forceinline__ __device__ void dispatch_S2G_warp(
     // INPUT
     const bool* rdma_to_attn_map,
@@ -1589,6 +1574,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
     const int num_of_tokens_per_rank,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
+    const int experts_per_rank,
     const bool local_dup_enabled,
     const int max_recv_tokens_per_rank,
     SMEM_TYPE* smem_buffer_ptr) {
@@ -1673,45 +1659,28 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                                 smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage),
                                 producer_parity);
 
-                            // Prob GMEM source for this token (warp-uniform), handed off by G2S.
-                            const float* prob_src = nullptr;
-                            if constexpr (FORWARD_DISPATCH) {
-                                prob_src = *smem_buffer_ptr->get_prob_src_slot(pipeline_rank, stage);
-                            }
-
-                            // Group-based fan-out keeps all 32 lanes convergent for the cooperative prob store's ballot/shuffle.
-                            const int s2d_groups = (s2d_inner_dim + 31) / 32;
-                            for (int g = 0; g < s2d_groups; ++g) {
-                                int flat_idx = g * 32 + s2g_lane;
-                                s2g_dest_t dst = (flat_idx < s2d_inner_dim) ?
-                                                     dispatch_s2g_resolve_dest<kLayout>(
-                                                         s2d_row, flat_idx, local_dup_enabled) :
-                                                     s2g_dest_t{false, -1, -1};
-                                // token (+sf) via TMA: one descriptor per active destination lane.
+                            // Per-entry parallel issue (lane handles flat_idx=lane,lane+32,...); empty/EM-dup entries resolve to issue=false.
+                            for (int flat_idx = s2g_lane; flat_idx < s2d_inner_dim; flat_idx += 32) {
+                                s2g_dest_t dst =
+                                    dispatch_s2g_resolve_dest<kLayout>(s2d_row, flat_idx, local_dup_enabled);
                                 if (dst.issue) {
                                     dispatch_s2g_issue_token<
                                         TOKEN_DATA_TYPE,
                                         SMEM_TYPE,
+                                        LSA_TEAM_SIZE,
+                                        FORWARD_DISPATCH,
                                         HAS_SF>(
                                         dst,
                                         smem_buffer_ptr,
                                         remote_expert_output_token,
+                                        remote_expert_output_prob,
                                         remote_expert_output_scaling_factor,
                                         pipeline_rank,
                                         stage,
                                         HIDDEN_DIM,
                                         sf_bytes_per_token,
-                                        max_recv_tokens_per_rank);
-                                }
-                                // prob via cooperative (coalesced) SM stores (off the TMA path), GMEM source -> remote.
-                                if constexpr (FORWARD_DISPATCH) {
-                                    dispatch_s2g_store_prob<
-                                        LSA_TEAM_SIZE,
-                                        EXPERTS_PER_RANK>(
-                                        dst,
-                                        prob_src,
-                                        remote_expert_output_prob,
-                                        s2g_lane);
+                                        max_recv_tokens_per_rank,
+                                        experts_per_rank);
                                 }
                             }
                             // S1: only issuing lanes commit/wait — idle lanes skip the empty pair.
@@ -1744,10 +1713,6 @@ __forceinline__ __device__ void dispatch_S2G_warp(
         cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
         // Drain TMA stores into the generic memory path so the dispatch-tail barrier sees them.
         nccl_ep::fence_proxy_async();
-        // SM st.global prob writes need a system fence before the dispatch-tail completion flag.
-        if constexpr (FORWARD_DISPATCH) {
-            __threadfence_system();
-        }
     }
 }
 
@@ -3791,8 +3756,7 @@ template <
     int LSA_TEAM_SIZE,
     ncclEpLayout_t kLayout,
     int HIDDEN_DIM,
-    int SF_BYTES_PER_TOKEN,
-    int EXPERTS_PER_RANK>
+    int SF_BYTES_PER_TOKEN>
 __device__ __forceinline__ void dispatch_kernel_impl(
     const dispatch_kernel_param_t<TOKEN_DATA_TYPE, LSA_TEAM_SIZE>& param,
     uint8_t* smem_bytes) {
@@ -3959,8 +3923,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             NUM_PIPELINES,
             FORWARD_DISPATCH,
             HAS_SF,
-            kLayout,
-            EXPERTS_PER_RANK>(
+            kLayout>(
             param.rdma_to_attn_map,
             param.sparse_to_dense_map,
             param.expert_output_token,
@@ -3970,6 +3933,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             param.num_of_tokens_per_rank,
             HIDDEN_DIM,
             SF_BYTES_PER_TOKEN,
+            param.experts_per_rank,
             param.local_dup_enabled,
             param.max_recv_tokens_per_rank,
             smem_buffer_ptr);

@@ -929,7 +929,6 @@ ncclResult_t dispatch_impl(
             params.layout,
             kp.hidden_dim,
             sf_bytes_per_token,
-            kp.experts_per_rank,
             env,
             kernel_arg.data(),
             kernel_arg.size(),

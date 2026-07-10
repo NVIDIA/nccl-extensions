@@ -82,7 +82,6 @@ inline std::string dispatch_jit_source(
     ncclEpLayout_t layout,
     int hidden_dim,
     int sf_bytes_per_token,
-    int experts_per_rank,
     const DispatchKernelSpec& kernel_spec) {
     const char* layout_literal =
         (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? "NCCL_EP_LAYOUT_EXPERT_MAJOR" : "NCCL_EP_LAYOUT_FLAT";
@@ -123,8 +122,7 @@ inline std::string dispatch_jit_source(
         << "      " << lsa_team_size << ",\n"
         << "      " << layout_literal << ",\n"
         << "      " << hidden_dim << ",\n"
-        << "      kSfBytesPerToken,\n"
-        << "      " << experts_per_rank << ">(param, smem_bytes);\n"
+        << "      kSfBytesPerToken>(param, smem_bytes);\n"
         << "}\n";
     return src.str();
 }
@@ -141,7 +139,6 @@ inline ncclResult_t launch_dispatch(
     ncclEpLayout_t layout,
     int hidden_dim,
     int sf_bytes_per_token,
-    int experts_per_rank,
     const ncclEpEnvConfig* env,  // for rank-0-gated verbose param dump; may be null
     void* param,
     size_t param_size,
@@ -162,7 +159,7 @@ inline ncclResult_t launch_dispatch(
              << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_fl")
              << "_recipe" << kernel_spec.recipe_cache_tag
              << "_payload" << kernel_spec.payload_cache_tag
-             << "_sf" << sf_bytes_per_token << "_epr" << experts_per_rank;
+             << "_sf" << sf_bytes_per_token;
         return name.str();
     }();
     const std::string source = dispatch_jit_source(
@@ -186,7 +183,6 @@ inline ncclResult_t launch_dispatch(
         layout,
         hidden_dim,
         sf_bytes_per_token,
-        experts_per_rank,
         kernel_spec);
 
     ::nccl_ep::jit::JitKernelVariant variant;
@@ -209,7 +205,7 @@ inline ncclResult_t launch_dispatch(
             "[nccl_ep][env]   nodes(lsa_teams)=%d lsa_team_size=%d hidden_dim=%d\n"
             "[nccl_ep][env]   stages=%d in_flight_s2g=%d pipelines=%d tokens_per_chunk=%d max_tokens_per_rank=%d\n"
             "[nccl_ep][env]   num_blocks=%d block_dim=%d dynamic_smem_bytes=%d\n"
-            "[nccl_ep][env]   forward=%s layout=%s wire_dtype=%s dispatch_recipe=%s sf_bytes_per_token=%d experts_per_rank=%d\n",
+            "[nccl_ep][env]   forward=%s layout=%s wire_dtype=%s dispatch_recipe=%s sf_bytes_per_token=%d\n",
             variant_name.c_str(),
             num_lsa_teams,
             lsa_team_size,
@@ -226,8 +222,7 @@ inline ncclResult_t launch_dispatch(
             (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "EXPERT_MAJOR" : "FLAT"),
             kernel_spec.wire_dtype_literal,
             kernel_spec.recipe_source_literal,
-            sf_bytes_per_token,
-            experts_per_rank);
+            sf_bytes_per_token);
     }
 
     std::string error;

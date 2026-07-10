@@ -211,6 +211,9 @@ static_assert(
     MAX_SUPPORTED_TOKENS_PER_RANK < (1 << EM_S2D_SLOT_BITS),
     "MAX_SUPPORTED_TOKENS_PER_RANK exceeds em_s2d slot field width");
 
+// s2d-map double-buffer depth: consume one stage while prefetching the next (chunk, node) row.
+constexpr int S2D_MAP_RING_STAGES = 2;
+
 __host__ __device__ __forceinline__ int32_t em_s2d_pack(int rank_id, int slot) {
     return static_cast<int32_t>(
         (static_cast<uint32_t>(rank_id) << EM_S2D_SLOT_BITS) | (static_cast<uint32_t>(slot) & EM_S2D_SLOT_MASK));
@@ -355,8 +358,10 @@ struct dispatch_smem_layout_t {
     void* intra_node_token_buffer;
     float* intra_node_prob_buffer;
     uint8_t* intra_node_scaling_factor_buffer;
+    int32_t* sparse_to_dense_map_buffer;
     bool* attn_to_rdma_map_buffer;
     uint64_t* intra_node_mbarrier_buffer;
+    uint64_t* sparse_to_dense_map_mbarrier_buffer;
     uint64_t* S2G_group_mbarrier_buffer;
     // Single TMA staging slot used by the PAD warp to broadcast a zeroed token
     // row to padding slots (expert-major only; nullptr otherwise).
@@ -365,6 +370,7 @@ struct dispatch_smem_layout_t {
     int token_buffer_stage_stride; // bytes
     int prob_buffer_stage_stride; // bytes
     int sf_buffer_stage_stride; // bytes
+    int s2d_map_stage_stride; // bytes (flat: tokens * ranks, expert-major: tokens * topk)
     int pad_tma_slot_bytes; // bytes (= padded hidden_dim * sizeof(token))
     int s2d_inner_dim; // flat: lsa_team_size, expert-major: num_topk
     int num_pipelines;
@@ -407,6 +413,30 @@ struct dispatch_smem_layout_t {
         return get_intra_node_mbarrier_consumer(pipeline_id * stages_per_pipeline + local_stage);
     }
 
+    // Per-pipeline s2d_map accessors: each pipeline has its own S2D_MAP_RING_STAGES ping-pong stages
+    __device__ __forceinline__ int32_t* get_s2d_map_buffer(int pipeline_id, int stage, int token_idx) const {
+        int abs_stage = pipeline_id * S2D_MAP_RING_STAGES + stage;
+        return reinterpret_cast<int32_t*>(
+                   reinterpret_cast<uint8_t*>(sparse_to_dense_map_buffer) + abs_stage * s2d_map_stage_stride) +
+               token_idx * s2d_inner_dim;
+    }
+    __device__ __forceinline__ int32_t* get_s2d_map_buffer_base(int pipeline_id, int stage) const {
+        int abs_stage = pipeline_id * S2D_MAP_RING_STAGES + stage;
+        return reinterpret_cast<int32_t*>(
+            reinterpret_cast<uint8_t*>(sparse_to_dense_map_buffer) + abs_stage * s2d_map_stage_stride);
+    }
+    // Legacy s2d accessors (pipeline_id=0)
+    __device__ __forceinline__ int32_t* get_s2d_map_buffer(int stage, int token_idx) const {
+        return get_s2d_map_buffer(0, stage, token_idx);
+    }
+    __device__ __forceinline__ int32_t* get_s2d_map_buffer_base(int stage) const {
+        return get_s2d_map_buffer_base(0, stage);
+    }
+
+    // Per-pipeline s2d_map mbarrier: each pipeline has S2D_MAP_RING_STAGES ping-pong mbarriers
+    __device__ __forceinline__ uint64_t* get_s2d_map_mbar(int pipeline_id, int stage) const {
+        return sparse_to_dense_map_mbarrier_buffer + pipeline_id * S2D_MAP_RING_STAGES + stage;
+    }
     // Per-pipeline S2G group mbarrier
     __device__ __forceinline__ uint64_t* get_S2G_group_mbar(int pipeline_id) const {
         return S2G_group_mbarrier_buffer + pipeline_id;
@@ -435,9 +465,13 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     layout.intra_node_token_buffer = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += config.num_of_stages * layout.token_buffer_stage_stride;
 
-    // s2d map is read directly from GMEM; only the inner dim is
-    // carried here (flat = num_ranks_per_node, expert-major = num_topk).
+    // Sparse to dense map buffer: S2D_MAP_RING_STAGES ping-pong stages PER PIPELINE (128B aligned)
+    // Inner dim is mode-dependent: flat = lsa_team_size, expert-major = num_topk.
     layout.s2d_inner_dim = config.s2d_inner_dim;
+    layout.s2d_map_stage_stride = config.num_of_tokens_per_chunk * config.s2d_inner_dim * sizeof(int32_t);
+    layout.s2d_map_stage_stride = (layout.s2d_map_stage_stride + 127) & ~127;
+    layout.sparse_to_dense_map_buffer = reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
+    offset += S2D_MAP_RING_STAGES * num_pipelines * layout.s2d_map_stage_stride;
 
     // Prob buffer (only if forward dispatch, 16B aligned) -- total stages unchanged
     if (config.forward_dispatch) {
@@ -474,6 +508,11 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     offset = (offset + 7) & ~7;
     layout.intra_node_mbarrier_buffer = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += config.num_of_stages * 2 * sizeof(uint64_t);
+
+    // Per-pipeline s2d_map mbarriers: 2 per pipeline
+    layout.sparse_to_dense_map_mbarrier_buffer =
+        reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
+    offset += 2 * num_pipelines * sizeof(uint64_t);
 
     // Per-pipeline S2G group mbarrier: 1 per pipeline
     layout.S2G_group_mbarrier_buffer = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
@@ -513,7 +552,11 @@ static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& confi
     token_buffer_stage_stride = (token_buffer_stage_stride + 127) & ~127;
     total_size += config.num_of_stages * token_buffer_stage_stride;
 
-    // s2d map is read directly from GMEM (no SMEM staging)
+    // Sparse to dense map buffer: S2D_MAP_RING_STAGES ping-pong stages PER PIPELINE (128B aligned)
+    // Inner dim is mode-dependent: flat = lsa_team_size, expert-major = num_topk.
+    int s2d_map_stage_stride = config.num_of_tokens_per_chunk * config.s2d_inner_dim * sizeof(int32_t);
+    s2d_map_stage_stride = (s2d_map_stage_stride + 127) & ~127;
+    total_size += S2D_MAP_RING_STAGES * num_pipelines * s2d_map_stage_stride;
 
     // Prob buffer (16B aligned per stage) -- total stages unchanged
     if (config.forward_dispatch) {
@@ -536,6 +579,9 @@ static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& confi
     // Mbarrier buffers (aligned to 8B) -- total stages unchanged
     total_size = (total_size + 7) & ~7;
     total_size += config.num_of_stages * 2 * sizeof(uint64_t);
+    // Per-pipeline s2d_map mbarriers: 2 per pipeline
+    total_size = (total_size + 7) & ~7;
+    total_size += 2 * num_pipelines * sizeof(uint64_t);
     // Per-pipeline S2G group mbarrier: 1 per pipeline
     total_size = (total_size + 7) & ~7;
     total_size += num_pipelines * sizeof(uint64_t);
@@ -1311,6 +1357,41 @@ struct s2g_dest_t {
     int output_buffer_index;
 };
 
+// TMA-load one (node, chunk)'s s2d-map slice into the SMEM stage and publish. Caller elects one lane.
+template <typename SMEM_TYPE, int NUM_OF_TOKENS_PER_CHUNK>
+__forceinline__ __device__ void dispatch_s2g_prefetch_s2d_map(
+    const int32_t* sparse_to_dense_map,
+    SMEM_TYPE* smem_buffer_ptr,
+    const int pipeline_rank,
+    const uint32_t s2d_map_stage,
+    const int node_id,
+    const int chunk_id,
+    const int chunk_size,
+    const int num_of_tokens_per_rank,
+    const int s2d_inner_dim) {
+    const int32_t* s2d_base =
+        sparse_to_dense_map + (node_id * num_of_tokens_per_rank + chunk_id * NUM_OF_TOKENS_PER_CHUNK) * s2d_inner_dim;
+    void* smem_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_s2d_map_buffer_base(pipeline_rank, s2d_map_stage));
+    uint64_t* mbar = smem_buffer_ptr->get_s2d_map_mbar(pipeline_rank, s2d_map_stage);
+    // cp.async.bulk needs a 16B-multiple size: round up. Safe because the source S2D buffer
+    // is over-allocated for max_tokens_per_rank and the smem dest stage is padded to 128B.
+    uint32_t copy_bytes = (uint32_t)(chunk_size * s2d_inner_dim * sizeof(int32_t));
+    copy_bytes = (copy_bytes + 15u) & ~15u;
+    cuda::ptx::cp_async_bulk(
+        cuda::ptx::space_shared,
+        cuda::ptx::space_global,
+        smem_dst,
+        reinterpret_cast<const void*>(s2d_base),
+        copy_bytes,
+        mbar);
+    cuda::ptx::mbarrier_arrive_expect_tx(
+        cuda::ptx::sem_release,
+        cuda::ptx::scope_cta,
+        cuda::ptx::space_shared,
+        mbar,
+        copy_bytes);
+}
+
 // Decode one s2d-map entry into its remote destination. `issue` is false for an empty entry (-1)
 // or an EM secondary duplicate (the receiver's local_dup kernel fills it from the primary slot).
 template <ncclEpLayout_t kLayout>
@@ -1601,12 +1682,38 @@ __forceinline__ __device__ void dispatch_S2G_warp(
     int in_flight_s2g = 0;
     int stage = 0;
     uint32_t producer_parity = 0;
+    uint32_t s2d_stage = 0;
+    uint32_t s2d_parity = 0;
 
     // S2G on all 32 lanes (warp-uniform state); cp_async_bulk striped by lane=flat_idx (up to s2d_inner_dim stores/token).
     const int s2g_lane = INTRA_NODE_S2G_GROUP::thread_rank() % 32;
 
-    // s2d map rows are read directly from GMEM in the fan-out below (it is a kernel
-    // input from preprocessing, always ready), so there is no SMEM staging/prefetch.
+    // Each pipeline prefetches its own first s2d map for its first chunk (single TMA load, lane 0 only).
+    if (s2g_lane == 0) {
+        int chunk_iter = 0;
+        for (int chunk_idx = blockIdx.x; chunk_idx < num_of_chunks_per_rank; chunk_idx += NUM_OF_BLOCKS) {
+            if ((chunk_iter++ % NUM_PIPELINES) == pipeline_rank) {
+                int current_chunk_size;
+                if (remainder_chunk_size != 0 && chunk_idx == num_of_chunks_per_rank - 1) {
+                    current_chunk_size = remainder_chunk_size;
+                } else {
+                    current_chunk_size = NUM_OF_TOKENS_PER_CHUNK;
+                }
+                dispatch_s2g_prefetch_s2d_map<SMEM_TYPE, NUM_OF_TOKENS_PER_CHUNK>(
+                    sparse_to_dense_map,
+                    smem_buffer_ptr,
+                    pipeline_rank,
+                    s2d_stage,
+                    node_rank,
+                    chunk_idx,
+                    current_chunk_size,
+                    num_of_tokens_per_rank,
+                    s2d_inner_dim);
+                break;
+            }
+        }
+    }
+    __syncwarp();
 
     {
         int chunk_iter = 0;
@@ -1634,10 +1741,56 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                 }
                 __syncwarp();
 
+                // Prefetch next (chunk, node) s2d map for THIS pipeline (single TMA load, lane 0 only).
+                if (s2g_lane == 0) {
+                    int next_chunk_id;
+                    int next_node_id;
+                    int next_node_iter = j + 1;
+                    if (next_node_iter < NUM_LSA_TEAMS) {
+                        next_chunk_id = chunk_idx;
+                        next_node_id = (node_rank + NUM_LSA_TEAMS - next_node_iter) % NUM_LSA_TEAMS;
+                    } else {
+                        // Find the next chunk this pipeline will process
+                        int future_chunk_iter = chunk_iter; // chunk_iter was already incremented for current chunk
+                        next_chunk_id = -1;
+                        for (int fi = chunk_idx + NUM_OF_BLOCKS; fi < num_of_chunks_per_rank; fi += NUM_OF_BLOCKS) {
+                            if ((future_chunk_iter++ % NUM_PIPELINES) == pipeline_rank) {
+                                next_chunk_id = fi;
+                                break;
+                            }
+                        }
+                        next_node_id = node_rank;
+                    }
+
+                    if (next_chunk_id >= 0 && next_chunk_id < num_of_chunks_per_rank) {
+                        int next_chunk_size;
+                        if (remainder_chunk_size != 0 && next_chunk_id == num_of_chunks_per_rank - 1) {
+                            next_chunk_size = remainder_chunk_size;
+                        } else {
+                            next_chunk_size = NUM_OF_TOKENS_PER_CHUNK;
+                        }
+                        dispatch_s2g_prefetch_s2d_map<SMEM_TYPE, NUM_OF_TOKENS_PER_CHUNK>(
+                            sparse_to_dense_map,
+                            smem_buffer_ptr,
+                            pipeline_rank,
+                            s2d_stage ^ 1,
+                            next_node_id,
+                            next_chunk_id,
+                            next_chunk_size,
+                            num_of_tokens_per_rank,
+                            s2d_inner_dim);
+                    }
+                }
+
                 // Walk nodes backward from self around the ring (j=0 -> self, j>=1 -> remote)
                 int node_id = (node_rank + NUM_LSA_TEAMS - j) % NUM_LSA_TEAMS;
                 const routing_loads_t* routing_map_ptr = reinterpret_cast<const routing_loads_t*>(
                     rdma_to_attn_map + (node_id * routing_map_node_stride + chunk_idx * NUM_OF_TOKENS_PER_CHUNK));
+
+                {
+                    uint64_t* wait_mbar = smem_buffer_ptr->get_s2d_map_mbar(pipeline_rank, s2d_stage);
+                    mbarrier_wait(wait_mbar, s2d_parity);
+                }
 
                 for (int load_idx = 0; load_idx < routing_loads_in_chunk; load_idx++) {
                     routing_loads_t routing_flags = routing_map_ptr[load_idx];
@@ -1649,12 +1802,8 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                         }
                         bool token_needed = *(reinterpret_cast<bool*>(&routing_flags) + token_in_load);
                         if (token_needed) {
-                            // s2d row read directly from GMEM (no SMEM staging); the map is a kernel input from preprocessing.
-                            const int32_t* s2d_row =
-                                sparse_to_dense_map +
-                                ((size_t)node_id * num_of_tokens_per_rank + chunk_idx * NUM_OF_TOKENS_PER_CHUNK +
-                                 current_token_id) *
-                                    s2d_inner_dim;
+                            const int32_t* s2d_smem_row =
+                                smem_buffer_ptr->get_s2d_map_buffer(pipeline_rank, s2d_stage, current_token_id);
                             mbarrier_wait(
                                 smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage),
                                 producer_parity);
@@ -1662,7 +1811,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                             // Per-entry parallel issue (lane handles flat_idx=lane,lane+32,...); empty/EM-dup entries resolve to issue=false.
                             for (int flat_idx = s2g_lane; flat_idx < s2d_inner_dim; flat_idx += 32) {
                                 s2g_dest_t dst =
-                                    dispatch_s2g_resolve_dest<kLayout>(s2d_row, flat_idx, local_dup_enabled);
+                                    dispatch_s2g_resolve_dest<kLayout>(s2d_smem_row, flat_idx, local_dup_enabled);
                                 if (dst.issue) {
                                     dispatch_s2g_issue_token<
                                         TOKEN_DATA_TYPE,
@@ -1707,6 +1856,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                         }
                     }
                 }
+                ring_advance(s2d_stage, s2d_parity, S2D_MAP_RING_STAGES);
             }
         }
         // Drain in-flight TMA S2G writes before returning (each lane drains its own commit groups).
@@ -3810,6 +3960,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                     cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_mbarrier_buffer + 2 * abs_stage, 1);
                     cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_mbarrier_buffer + 2 * abs_stage + 1, 1);
                 }
+                cuda::ptx::mbarrier_init(smem_buffer_ptr->get_s2d_map_mbar(p, 0), 1);
+                cuda::ptx::mbarrier_init(smem_buffer_ptr->get_s2d_map_mbar(p, 1), 1);
                 cuda::ptx::mbarrier_init(smem_buffer_ptr->get_S2G_group_mbar(p), 1);
             }
             cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);

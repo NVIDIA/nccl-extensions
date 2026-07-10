@@ -1,12 +1,5 @@
-# NCCL EP downstream CI: build and test the Expert Parallelism extension.
-# Triggered by the main pipeline's nccl_ep_ci after parent setup-ipp6, setup-eos, setup-pre-nyx, and setup-pre-tyche.
-# IPP6: build_ipp6 after parent setup-ipp6; srun + container image from ipp6-slurm-config.sh.
-# Pre-Nyx: reuses EP build from build_ipp6 (same as base NCCL from IPP6 via parent setup-pre-nyx).
-# setup_prenyx merges nccl_ep_install_artifact/ into PRE_NYX_INSTALL_DIR/build on prenyx runners.
-# Pre-Tyche: arm64 cluster, needs its own build_pretyche (cannot reuse build_ipp6 x86_64 binaries);
-# uses parent setup-pre-tyche's NCCL install at PRE_TYCHE_INSTALL_DIR/build as the base.
-# setup_pretyche merges nccl_ep_install_artifact/ into PRE_TYCHE_INSTALL_DIR/build on ptyche runners.
-# Build runs inside a container via srun (same pattern as main NCCL build).
+# Standalone port of NCCL's contrib/nccl_ep child pipeline.
+# Reference: NCCL commit 540cf9684e99a7b3444dade0a54e827c68a3adc0.
 
 stages:
   - build
@@ -15,44 +8,37 @@ stages:
   - integration_test
 
 include:
-  - local: '.gitlab/cluster-paths.yml'
+  - local: .gitlab/ci/nccl-build.yml
+  - local: .gitlab/cluster-paths.yml
 
 variables:
   FF_USE_FASTZIP: "true"
   FF_ENABLE_JOB_CLEANUP: "true"
-  FF_TIMESTAMPS: true
+  FF_TIMESTAMPS: "true"
   GIT_DEPTH: "1"
-  # Per-job subpath under CI_BUILDS_DIR — keeps each job's checkout isolated.
   CI_JOB_SUBPATH: "${CI_PIPELINE_ID}/${CI_JOB_ID}"
-  # Per-cluster install dirs (child scope: keyed by parent's PARENT_PIPELINE_ID).
+
   EOS_INSTALL_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/install/${PARENT_PIPELINE_ID}"
   PRE_NYX_INSTALL_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/install/${PARENT_PIPELINE_ID}"
   PRE_TYCHE_INSTALL_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/install/${PARENT_PIPELINE_ID}"
   IPP6_INSTALL_DIR: "/storage/gitlab-runner/nccl/install/${PARENT_PIPELINE_ID}"
-  # IPP6 cluster
-  IPP6_SLURM_PARTITION: a100-cicd
+
+  IPP6_SLURM_PARTITION: "a100-cicd"
   IPP6_CUDA_HOME: "/storage/toolkits/cuda-12.9"
-  # Reuse parent's NCCL build (same path as unit-tests-ipp6-*, apitest-ipp6-*, etc.)
   NCCL_HOME: "${IPP6_INSTALL_DIR}/build"
-  # MPI path inside IPP6 build container for ep_test / ep_bench
   MPI_HOME: "/usr/local/openmpi"
-  # EOS
+
   EOS_CUDA_HOME: "/lustre/fsw/coreai_libraries_nccl/toolkits/cuda-12.8.0"
   EOS_MPI_HOME: "/usr/mpi/gcc/openmpi-4.1.5rc2"
-  # Pre-Nyx host CUDA/MPI for EP tests (see docker/clusters/pre-nyx-config.sh)
   PRE_NYX_CUDA_HOME: "/lustre/fsw/coreai_libraries_nccl/toolkits/cuda-12.8.0"
   PRE_NYX_MPI_HOME: "/lustre/fsw/coreai_libraries_nccl/toolkits/openmpi-5.0.6"
-  # Pre-Tyche host CUDA/MPI for EP tests (see docker/clusters/pre-tyche-config.sh)
   PRE_TYCHE_CUDA_HOME: "/lustre/fsw/coreai_libraries_nccl/toolkits/cuda-13.0"
   PRE_TYCHE_MPI_HOME: "/lustre/fsw/coreai_libraries_nccl/toolkits/openmpi-5.0.6"
 
 workflow:
   rules:
-    - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+    - if: '$CI_PIPELINE_SOURCE == "parent_pipeline"'
     - when: never
-
-default:
-  retry: 1
 
 
 ##
@@ -63,70 +49,90 @@ build_ipp6:
   stage: build
   tags:
     - ipp6-nccl
+  timeout: 2h
+  needs:
+    - pipeline: "${PARENT_PIPELINE_ID}"
+      job: build:nccl
+      artifacts: true
   variables:
     NCCL_HOME: "${IPP6_INSTALL_DIR}/build"
     MPI_HOME: "/usr/local/openmpi"
     NVIDIA_VISIBLE_DEVICES: "void"
     SLURM_PARTITION: ""
-    GIT_CLONE_PATH: "${CI_BUILDS_DIR}/${CI_JOB_ID}/${CI_PROJECT_PATH}" # Use a unique path for each job to avoid conflicts
+    GIT_CLONE_PATH: "${CI_BUILDS_DIR}/${CI_JOB_ID}/${CI_PROJECT_PATH}"
   script:
     - |
       set -euxo pipefail
-      source docker/clusters/ipp6-slurm-config.sh
+      source "${CI_PROJECT_DIR}/.gitlab/ci/clusters/ipp6-slurm-config.sh"
       current_dir="$(realpath .)"
       build_image_version="$(get_build_image_version)"
-      container_image="$(get_build_tools_image "$build_image_version")"
-      container_mounts="${current_dir}:/nccl,${IPP6_INSTALL_DIR}:/nccl_install"
-      # ep_test/ep_bench pull in lib via Makefile (MPI=1); NVCC_GENCODE hardcoded for CI until generalized
+      container_image="$(get_build_tools_image "${build_image_version}")"
+
+      rm -rf "${IPP6_INSTALL_DIR}/build"
+      mkdir -p "${IPP6_INSTALL_DIR}/build"
+      cp -a .ci/nccl/build/. "${IPP6_INSTALL_DIR}/build/"
+
+      container_mounts="${current_dir}:/workspace,${current_dir}/.ci/nccl:/nccl,${IPP6_INSTALL_DIR}:/nccl_install"
       srun \
         -p cpuonly \
         -J nccl-ep:build \
         -t 01:00:00 \
         -n 1 \
         --exclusive \
-        --container-image="$container_image" \
-        --container-mounts="$container_mounts" \
+        --container-image="${container_image}" \
+        --container-mounts="${container_mounts}" \
         env NCCL_HOME=/nccl_install/build \
-        MPI_HOME="$MPI_HOME" \
-        make -C /nccl/contrib/nccl_ep \
+        NCCL_EP_BUILDDIR=/nccl_install/build \
+        MPI_HOME="${MPI_HOME}" \
+        make -C /workspace/nccl_ep \
           MPI=1 \
-          MPI_HOME="$MPI_HOME" \
+          MPI_HOME="${MPI_HOME}" \
+          NCCL_SUBMODULE_HOME=/nccl \
           BUILDDIR=/nccl_install/build \
-          NVCC_GENCODE='-gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_100,code=sm_100' \
+          NVCC_GENCODE="${NVCC_GENCODE}" \
           ep_test ep_bench
+
       srun \
         -p cpuonly \
         -J nccl-ep:unit-build \
         -t 01:00:00 \
         -n 1 \
         --exclusive \
-        --container-image="$container_image" \
-        --container-mounts="$container_mounts" \
+        --container-image="${container_image}" \
+        --container-mounts="${container_mounts}" \
         env NCCL_HOME=/nccl_install/build \
         NCCL_EP_BUILDDIR=/nccl_install/build \
-        make -C /nccl/contrib/nccl_ep/tests \
-          NVCC_GENCODE='-gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_100,code=sm_100'
+        make -C /workspace/nccl_ep/tests \
+          BUILDDIR=/nccl_install/build \
+          GTEST_DIR=/workspace/.ci/googletest/googletest \
+          NVCC_GENCODE="${NVCC_GENCODE}"
+
       ART="${NCCL_EP_ARTIFACT_STAGING:-nccl_ep_install_artifact}"
-      rm -rf "$ART"
-      mkdir -p "$ART/lib" "$ART/include" "$ART/test/nccl_ep"
-      cp -a "${NCCL_HOME}/lib"/libnccl_ep.* "$ART/lib/"
-      cp -a "${NCCL_HOME}/include/nccl_ep.h" "$ART/include/"
-      cp -a "${NCCL_HOME}/include/nccl_ep" "$ART/include/"
-      cp -a "${NCCL_HOME}/test/nccl_ep/ep_test" "${NCCL_HOME}/test/nccl_ep/ep_bench" "$ART/test/nccl_ep/"
+      rm -rf "${ART}"
+      mkdir -p "${ART}/lib" "${ART}/include" "${ART}/test/nccl_ep"
+      cp -a "${NCCL_HOME}/lib"/libnccl_ep.* "${ART}/lib/"
+      cp -a "${NCCL_HOME}/include/nccl_ep.h" "${ART}/include/"
+      cp -a "${NCCL_HOME}/include/nccl_ep" "${ART}/include/"
+      cp -a "${NCCL_HOME}/test/nccl_ep/ep_test" "${NCCL_HOME}/test/nccl_ep/ep_bench" "${ART}/test/nccl_ep/"
       for unit_test in "${NCCL_HOME}/test/nccl_ep"/test_*; do
-        if [ -f "$unit_test" ] && [ -x "$unit_test" ]; then
-          cp -a "$unit_test" "$ART/test/nccl_ep/"
+        if [[ -f "${unit_test}" && -x "${unit_test}" ]]; then
+          cp -a "${unit_test}" "${ART}/test/nccl_ep/"
         fi
       done
   artifacts:
     paths:
       - nccl_ep_install_artifact/
-    expire_in: 48 hrs
+    expire_in: 48 hours
 
 build_pretyche:
   stage: build
   tags:
     - ptyche
+  timeout: 2h
+  needs:
+    - pipeline: "${PARENT_PIPELINE_ID}"
+      job: build:nccl
+      artifacts: true
   variables:
     CI_BUILDS_DIR: "${PRE_TYCHE_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
     NCCL_HOME: "${PRE_TYCHE_INSTALL_DIR}/build"
@@ -136,12 +142,28 @@ build_pretyche:
   script:
     - |
       set -euxo pipefail
-      source docker/clusters/pre-tyche-config.sh
+      source "${CI_PROJECT_DIR}/.gitlab/ci/clusters/pre-tyche-config.sh"
       current_dir="$(realpath .)"
       build_image_version="$(get_build_image_version)"
-      container_image="$(get_build_tools_image "$build_image_version")"
-      container_mounts="${current_dir}:/nccl,${PRE_TYCHE_INSTALL_DIR}:/nccl_install"
-      # GB200 (sm_100) only; reuse parent setup-pre-tyche's NCCL install as build base
+      container_image="$(get_build_tools_image "${build_image_version}")"
+
+      rm -rf "${PRE_TYCHE_INSTALL_DIR}/build"
+      mkdir -p "${PRE_TYCHE_INSTALL_DIR}/build"
+      cp -a "${CI_PROJECT_DIR}/.gitlab/ci/clusters/pre-tyche-config.sh" "${PRE_TYCHE_INSTALL_DIR}/"
+      container_mounts="${current_dir}:/workspace,${current_dir}/.ci/nccl:/nccl,${PRE_TYCHE_INSTALL_DIR}:/nccl_install"
+
+      srun \
+        --account="$(get_slurm_account)" \
+        -p batch \
+        -J nccl:build \
+        -t 01:00:00 \
+        -n 1 \
+        --exclusive \
+        --container-image="${container_image}" \
+        --container-mounts="${container_mounts}" \
+        env NVCC_GENCODE='-gencode=arch=compute_100,code=sm_100' \
+        make -C /nccl BUILDDIR=/nccl_install/build src.build
+
       srun \
         --account="$(get_slurm_account)" \
         -p batch \
@@ -149,16 +171,19 @@ build_pretyche:
         -t 01:00:00 \
         -n 1 \
         --exclusive \
-        --container-image="$container_image" \
-        --container-mounts="$container_mounts" \
+        --container-image="${container_image}" \
+        --container-mounts="${container_mounts}" \
         env NCCL_HOME=/nccl_install/build \
-        MPI_HOME="$MPI_HOME" \
-        make -C /nccl/contrib/nccl_ep \
+        NCCL_EP_BUILDDIR=/nccl_install/build \
+        MPI_HOME="${MPI_HOME}" \
+        make -C /workspace/nccl_ep \
           MPI=1 \
-          MPI_HOME="$MPI_HOME" \
+          MPI_HOME="${MPI_HOME}" \
+          NCCL_SUBMODULE_HOME=/nccl \
           BUILDDIR=/nccl_install/build \
           NVCC_GENCODE='-gencode=arch=compute_100,code=sm_100' \
           ep_test ep_bench
+
       srun \
         --account="$(get_slurm_account)" \
         -p batch \
@@ -166,52 +191,67 @@ build_pretyche:
         -t 01:00:00 \
         -n 1 \
         --exclusive \
-        --container-image="$container_image" \
-        --container-mounts="$container_mounts" \
+        --container-image="${container_image}" \
+        --container-mounts="${container_mounts}" \
         env NCCL_HOME=/nccl_install/build \
         NCCL_EP_BUILDDIR=/nccl_install/build \
-        make -C /nccl/contrib/nccl_ep/tests \
+        make -C /workspace/nccl_ep/tests \
+          BUILDDIR=/nccl_install/build \
+          GTEST_DIR=/workspace/.ci/googletest/googletest \
           NVCC_GENCODE='-gencode=arch=compute_100,code=sm_100'
+
       ART="${NCCL_EP_ARTIFACT_STAGING:-nccl_ep_install_artifact}"
-      rm -rf "$ART"
-      mkdir -p "$ART/lib" "$ART/include" "$ART/test/nccl_ep"
-      cp -a "${NCCL_HOME}/lib"/libnccl_ep.* "$ART/lib/"
-      cp -a "${NCCL_HOME}/include/nccl_ep.h" "$ART/include/"
-      cp -a "${NCCL_HOME}/include/nccl_ep" "$ART/include/"
-      cp -a "${NCCL_HOME}/test/nccl_ep/ep_test" "${NCCL_HOME}/test/nccl_ep/ep_bench" "$ART/test/nccl_ep/"
+      rm -rf "${ART}"
+      mkdir -p "${ART}/lib" "${ART}/include" "${ART}/test/nccl_ep"
+      cp -a "${NCCL_HOME}/lib"/libnccl_ep.* "${ART}/lib/"
+      cp -a "${NCCL_HOME}/include/nccl_ep.h" "${ART}/include/"
+      cp -a "${NCCL_HOME}/include/nccl_ep" "${ART}/include/"
+      cp -a "${NCCL_HOME}/test/nccl_ep/ep_test" "${NCCL_HOME}/test/nccl_ep/ep_bench" "${ART}/test/nccl_ep/"
       for unit_test in "${NCCL_HOME}/test/nccl_ep"/test_*; do
-        if [ -f "$unit_test" ] && [ -x "$unit_test" ]; then
-          cp -a "$unit_test" "$ART/test/nccl_ep/"
+        if [[ -f "${unit_test}" && -x "${unit_test}" ]]; then
+          cp -a "${unit_test}" "${ART}/test/nccl_ep/"
         fi
       done
   artifacts:
     paths:
       - nccl_ep_install_artifact/
-    expire_in: 48 hrs
+    expire_in: 48 hours
+
 
 ##
-## Stage: setup — merge nccl_ep artifact into cluster NCCL install (parent setups already finished before child runs)
+## Stage: setup
 ##
 
 .setup_base:
   stage: setup
   needs:
-    - build_ipp6
+    - pipeline: "${PARENT_PIPELINE_ID}"
+      job: build:nccl
+      artifacts: true
+    - job: build_ipp6
+      artifacts: true
   variables:
     GIT_STRATEGY: clone
+    NCCL_BASE_ARTIFACT_DIR: "${CI_PROJECT_DIR}/.ci/nccl/build"
   script:
     - |
       set -euxo pipefail
-      ART="${NCCL_EP_ARTIFACT_DIR:-${CI_PROJECT_DIR:-.}/nccl_ep_install_artifact}"
+      ART="${NCCL_EP_ARTIFACT_DIR:-${CI_PROJECT_DIR}/nccl_ep_install_artifact}"
       DST="${NCCL_EP_MERGE_TARGET}"
       mkdir -p "${DST}/lib" "${DST}/include" "${DST}/test/nccl_ep"
+      if [[ -n "${NCCL_BASE_ARTIFACT_DIR:-}" ]]; then
+        cp -a "${NCCL_BASE_ARTIFACT_DIR}/." "${DST}/"
+      fi
+      if [[ -n "${NCCL_CLUSTER_CONFIG_SOURCE:-}" ]]; then
+        cp -a "${NCCL_CLUSTER_CONFIG_SOURCE}" "${NCCL_CLUSTER_CONFIG_TARGET}"
+      fi
       cp -a "${ART}/lib"/libnccl_ep.* "${DST}/lib/"
       cp -a "${ART}/include/nccl_ep.h" "${DST}/include/"
       cp -a "${ART}/include/nccl_ep" "${DST}/include/"
       cp -a "${ART}/test/nccl_ep/ep_test" "${ART}/test/nccl_ep/ep_bench" "${DST}/test/nccl_ep/"
       for unit_test in "${ART}/test/nccl_ep"/test_*; do
-        if [ -f "$unit_test" ] && [ -x "$unit_test" ]; then
-          cp -a "$unit_test" "${DST}/test/nccl_ep/"
+        if [[ -f "${unit_test}" && -x "${unit_test}" ]]; then
+          cp -a "${unit_test}" "${DST}/test/nccl_ep/"
         fi
       done
 
@@ -232,19 +272,24 @@ setup_prenyx:
   variables:
     NCCL_EP_MERGE_TARGET: "${PRE_NYX_INSTALL_DIR}/build"
     CI_BUILDS_DIR: "${PRE_NYX_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
+    NCCL_CLUSTER_CONFIG_SOURCE: "${CI_PROJECT_DIR}/.gitlab/ci/clusters/pre-nyx-config.sh"
+    NCCL_CLUSTER_CONFIG_TARGET: "${PRE_NYX_INSTALL_DIR}/pre-nyx-config.sh"
 
 setup_pretyche:
   extends: .setup_base
   needs:
-    - build_pretyche
+    - job: build_pretyche
+      artifacts: true
   tags:
     - ptyche
   variables:
     NCCL_EP_MERGE_TARGET: "${PRE_TYCHE_INSTALL_DIR}/build"
+    NCCL_BASE_ARTIFACT_DIR: ""
     CI_BUILDS_DIR: "${PRE_TYCHE_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
 
+
 ##
-## Stage: unit_test — run nccl_ep gtest unit binaries
+## Stage: unit_test
 ##
 
 unit_test_eos:
@@ -255,23 +300,28 @@ unit_test_eos:
     - setup_eos
   variables:
     NCCL_HOME: "${EOS_INSTALL_DIR}/build"
+    NCCL_EP_HOME: "${EOS_INSTALL_DIR}/build"
     NCCL_EP_BUILDDIR: "${EOS_INSTALL_DIR}/build"
     CI_BUILDS_DIR: "${EOS_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
-    NNODES: 1
-    NP: 8
-    NGPUS: 8
-    NCCL_EP_UNIT_GPUS: 4
-    SLURM_ACCOUNT: coreai_libraries_nccl
-    SLURM_TIME: 30
+    NNODES: "1"
+    NP: "8"
+    NGPUS: "8"
+    NCCL_EP_UNIT_GPUS: "4"
+    SLURM_ACCOUNT: "coreai_libraries_nccl"
+    SLURM_TIME: "30"
   script:
-    - set -ex
-    - export NCCL_HOME="${NCCL_HOME}"
-    - export NCCL_EP_BUILDDIR="${NCCL_EP_BUILDDIR}"
-    - export CUDA_HOME="${EOS_CUDA_HOME}"
-    - export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
-    - export SLURM_ACCOUNT="${SLURM_ACCOUNT}"
-    - export SALLOC="salloc -N ${NNODES} --ntasks-per-node ${NP} --exclusive --account=${SLURM_ACCOUNT} -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN}:nccl-ep-unit-eos::${CI_COMMIT_BRANCH}:${CI_COMMIT_SHORT_SHA}" -t ${SLURM_TIME}"
-    - $SALLOC ./contrib/nccl_ep/ci/run_nccl_ep_unit_tests.sh
+    - |
+      set -euxo pipefail
+      export CUDA_HOME="${EOS_CUDA_HOME}"
+      export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
+      salloc \
+        -N "${NNODES}" \
+        --ntasks-per-node "${NP}" \
+        --exclusive \
+        --account="${SLURM_ACCOUNT}" \
+        -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN:-ci}:nccl-ep-unit-eos::${CI_COMMIT_REF_NAME:-detached}:${CI_COMMIT_SHORT_SHA}" \
+        -t "${SLURM_TIME}" \
+        bash nccl_ep/ci/run_nccl_ep_unit_tests.sh
 
 unit_test_pretyche:
   stage: unit_test
@@ -281,31 +331,37 @@ unit_test_pretyche:
     - setup_pretyche
   variables:
     NCCL_HOME: "${PRE_TYCHE_INSTALL_DIR}/build"
+    NCCL_EP_HOME: "${PRE_TYCHE_INSTALL_DIR}/build"
     NCCL_EP_BUILDDIR: "${PRE_TYCHE_INSTALL_DIR}/build"
-    NNODES: 1
-    NP: 4
-    NGPUS: 4
-    NCCL_EP_UNIT_GPUS: 4
-    SLURM_PARTITION: batch
-    SLURM_ACCOUNT: coreai_libraries_nccl
-    SLURM_TIME: 30
     CI_BUILDS_DIR: "${PRE_TYCHE_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
+    NNODES: "1"
+    NP: "4"
+    NGPUS: "4"
+    NCCL_EP_UNIT_GPUS: "4"
+    SLURM_PARTITION: "batch"
+    SLURM_ACCOUNT: "coreai_libraries_nccl"
+    SLURM_TIME: "30"
   script:
-    - set -ex
-    - source docker/clusters/pre-tyche-config.sh && configure_test_env
-    - export NCCL_HOME="${NCCL_HOME}"
-    - export NCCL_EP_BUILDDIR="${NCCL_EP_BUILDDIR}"
-    - export CUDA_HOME="${PRE_TYCHE_CUDA_HOME}"
-    - export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
-    - export SLURM_ACCOUNT="${SLURM_ACCOUNT}"
-    - export SALLOC="salloc -N ${NNODES} --ntasks-per-node ${NP} --exclusive -p ${SLURM_PARTITION} --account=${SLURM_ACCOUNT} -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN}:nccl-ep-unit-pretyche::${CI_COMMIT_BRANCH}:${CI_COMMIT_SHORT_SHA}" -t ${SLURM_TIME}"
-    - $SALLOC ./contrib/nccl_ep/ci/run_nccl_ep_unit_tests.sh
+    - |
+      set -euxo pipefail
+      source "${PRE_TYCHE_INSTALL_DIR}/pre-tyche-config.sh"
+      export CUDA_HOME="${PRE_TYCHE_CUDA_HOME}"
+      export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
+      salloc \
+        -N "${NNODES}" \
+        --ntasks-per-node "${NP}" \
+        --exclusive \
+        -p "${SLURM_PARTITION}" \
+        --account="${SLURM_ACCOUNT}" \
+        -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN:-ci}:nccl-ep-unit-pretyche::${CI_COMMIT_REF_NAME:-detached}:${CI_COMMIT_SHORT_SHA}" \
+        -t "${SLURM_TIME}" \
+        bash nccl_ep/ci/run_nccl_ep_unit_tests.sh
+
 
 ##
-## Stage: integration_test (srun on GPU partition; runs contrib/nccl_ep/ci/run_nccl_ep_ci_tests.sh)
+## Stage: integration_test
 ##
 
-# Temporary: drop the `rules` block (or remove `- when: never`) to re-enable IPP6 EP tests.
 integration_test_ipp6:
   stage: integration_test
   rules:
@@ -316,17 +372,26 @@ integration_test_ipp6:
   tags:
     - ipp6-nccl
   variables:
-    NNODES: 1
-    NP: 8
-    NGPUS: 8
-    SLURM_PARTITION: h100x8-cicd
-    SLURM_ACCOUNT: coreai_libraries_nccl
-    SLURM_TIME: 30
+    NCCL_HOME: "${IPP6_INSTALL_DIR}/build"
+    NCCL_EP_HOME: "${IPP6_INSTALL_DIR}/build"
+    NNODES: "1"
+    NP: "8"
+    NGPUS: "8"
+    SLURM_PARTITION: "h100x8-cicd"
+    SLURM_ACCOUNT: "coreai_libraries_nccl"
+    SLURM_TIME: "30"
     NCCL_EP_BENCH_HT: "0"
   script:
-    - set -ex
-    - export SALLOC="salloc -N ${NNODES} --exclusive -p ${SLURM_PARTITION} --account=${SLURM_ACCOUNT} -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN}:nccl-ep-test::${CI_COMMIT_BRANCH}:${CI_COMMIT_SHORT_SHA}" -t ${SLURM_TIME}"
-    - $SALLOC ./contrib/nccl_ep/ci/run_nccl_ep_ci_tests.sh
+    - |
+      set -euxo pipefail
+      salloc \
+        -N "${NNODES}" \
+        --exclusive \
+        -p "${SLURM_PARTITION}" \
+        --account="${SLURM_ACCOUNT}" \
+        -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN:-ci}:nccl-ep-test::${CI_COMMIT_REF_NAME:-detached}:${CI_COMMIT_SHORT_SHA}" \
+        -t "${SLURM_TIME}" \
+        bash nccl_ep/ci/run_nccl_ep_ci_tests.sh
 
 integration_test_eos:
   stage: integration_test
@@ -339,27 +404,29 @@ integration_test_eos:
     NCCL_HOME: "${EOS_INSTALL_DIR}/build"
     NCCL_EP_HOME: "${EOS_INSTALL_DIR}/build"
     CI_BUILDS_DIR: "${EOS_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
-    NNODES: 1
-    NP: 8
-    NGPUS: 8
-    SLURM_ACCOUNT: coreai_libraries_nccl
-    SLURM_TIME: 60
+    NNODES: "1"
+    NP: "8"
+    NGPUS: "8"
+    SLURM_ACCOUNT: "coreai_libraries_nccl"
+    SLURM_TIME: "60"
     NCCL_EP_BENCH_HT: "0"
   script:
-    - set -ex
-    - export NCCL_HOME="${NCCL_HOME}"
-    - export NCCL_EP_HOME="${NCCL_EP_HOME}"
-    - export CUDA_HOME="${EOS_CUDA_HOME}"
-    - export MPI_HOME="${EOS_MPI_HOME}"
-    - export PATH="${MPI_HOME}/bin:${PATH}"
-    - export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
-    - export SLURM_ACCOUNT="${SLURM_ACCOUNT}"
-    # OpenMPI TCP BTL on EOS (see docker/clusters/eos-config.sh); used by srun --mpi=pmix tasks
-    - export OMPI_MCA_btl_tcp_if_include=eth3
-    - export OMPI_MCA_btl=tcp,self
-    # Same salloc as perftest-single-eos; tests use srun --mpi=pmix inside allocation
-    - export SALLOC="salloc -N ${NNODES} --ntasks-per-node ${NP} --exclusive --account=${SLURM_ACCOUNT} -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN}:nccl-ep-test-eos::${CI_COMMIT_BRANCH}:${CI_COMMIT_SHORT_SHA}" -t ${SLURM_TIME}"
-    - $SALLOC ./contrib/nccl_ep/ci/run_nccl_ep_ci_tests.sh
+    - |
+      set -euxo pipefail
+      export CUDA_HOME="${EOS_CUDA_HOME}"
+      export MPI_HOME="${EOS_MPI_HOME}"
+      export PATH="${MPI_HOME}/bin:${PATH}"
+      export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
+      export OMPI_MCA_btl_tcp_if_include="eth3"
+      export OMPI_MCA_btl="tcp,self"
+      salloc \
+        -N "${NNODES}" \
+        --ntasks-per-node "${NP}" \
+        --exclusive \
+        --account="${SLURM_ACCOUNT}" \
+        -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN:-ci}:nccl-ep-test-eos::${CI_COMMIT_REF_NAME:-detached}:${CI_COMMIT_SHORT_SHA}" \
+        -t "${SLURM_TIME}" \
+        bash nccl_ep/ci/run_nccl_ep_ci_tests.sh
 
 integration_test_prenyx:
   stage: integration_test
@@ -372,26 +439,31 @@ integration_test_prenyx:
   variables:
     NCCL_HOME: "${PRE_NYX_INSTALL_DIR}/build"
     NCCL_EP_HOME: "${PRE_NYX_INSTALL_DIR}/build"
-    NNODES: 1
-    NP: 8
-    NGPUS: 8
-    SLURM_PARTITION: batch
-    SLURM_ACCOUNT: coreai_libraries_nccl
-    SLURM_TIME: 60
     CI_BUILDS_DIR: "${PRE_NYX_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
+    NNODES: "1"
+    NP: "8"
+    NGPUS: "8"
+    SLURM_PARTITION: "batch"
+    SLURM_ACCOUNT: "coreai_libraries_nccl"
+    SLURM_TIME: "60"
     NCCL_EP_BENCH_HT: "1"
   script:
-    - set -ex
-    - source docker/clusters/pre-nyx-config.sh && configure_test_env
-    - export NCCL_HOME="${NCCL_HOME}"
-    - export NCCL_EP_HOME="${NCCL_EP_HOME}"
-    - export CUDA_HOME="${PRE_NYX_CUDA_HOME}"
-    - export MPI_HOME="${PRE_NYX_MPI_HOME}"
-    - export PATH="${MPI_HOME}/bin:${PATH}"
-    - export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
-    - export SLURM_ACCOUNT="${SLURM_ACCOUNT}"
-    - export SALLOC="salloc -N ${NNODES} --ntasks-per-node ${NP} --exclusive -p ${SLURM_PARTITION} --account=${SLURM_ACCOUNT} -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN}:nccl-ep-test-prenyx::${CI_COMMIT_BRANCH}:${CI_COMMIT_SHORT_SHA}" -t ${SLURM_TIME}"
-    - $SALLOC ./contrib/nccl_ep/ci/run_nccl_ep_ci_tests.sh
+    - |
+      set -euxo pipefail
+      source "${PRE_NYX_INSTALL_DIR}/pre-nyx-config.sh"
+      export CUDA_HOME="${PRE_NYX_CUDA_HOME}"
+      export MPI_HOME="${PRE_NYX_MPI_HOME}"
+      export PATH="${MPI_HOME}/bin:${PATH}"
+      export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
+      salloc \
+        -N "${NNODES}" \
+        --ntasks-per-node "${NP}" \
+        --exclusive \
+        -p "${SLURM_PARTITION}" \
+        --account="${SLURM_ACCOUNT}" \
+        -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN:-ci}:nccl-ep-test-prenyx::${CI_COMMIT_REF_NAME:-detached}:${CI_COMMIT_SHORT_SHA}" \
+        -t "${SLURM_TIME}" \
+        bash nccl_ep/ci/run_nccl_ep_ci_tests.sh
 
 integration_test_pretyche:
   stage: integration_test
@@ -403,23 +475,28 @@ integration_test_pretyche:
   variables:
     NCCL_HOME: "${PRE_TYCHE_INSTALL_DIR}/build"
     NCCL_EP_HOME: "${PRE_TYCHE_INSTALL_DIR}/build"
-    NNODES: 1
-    NP: 4
-    NGPUS: 4
-    SLURM_PARTITION: batch
-    SLURM_ACCOUNT: coreai_libraries_nccl
-    SLURM_TIME: 60
     CI_BUILDS_DIR: "${PRE_TYCHE_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
+    NNODES: "1"
+    NP: "4"
+    NGPUS: "4"
+    SLURM_PARTITION: "batch"
+    SLURM_ACCOUNT: "coreai_libraries_nccl"
+    SLURM_TIME: "60"
     NCCL_EP_BENCH_HT: "1"
   script:
-    - set -ex
-    - source docker/clusters/pre-tyche-config.sh && configure_test_env
-    - export NCCL_HOME="${NCCL_HOME}"
-    - export NCCL_EP_HOME="${NCCL_EP_HOME}"
-    - export CUDA_HOME="${PRE_TYCHE_CUDA_HOME}"
-    - export MPI_HOME="${PRE_TYCHE_MPI_HOME}"
-    - export PATH="${MPI_HOME}/bin:${PATH}"
-    - export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
-    - export SLURM_ACCOUNT="${SLURM_ACCOUNT}"
-    - export SALLOC="salloc -N ${NNODES} --ntasks-per-node ${NP} --exclusive -p ${SLURM_PARTITION} --account=${SLURM_ACCOUNT} -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN}:nccl-ep-test-pretyche::${CI_COMMIT_BRANCH}:${CI_COMMIT_SHORT_SHA}" -t ${SLURM_TIME}"
-    - $SALLOC ./contrib/nccl_ep/ci/run_nccl_ep_ci_tests.sh
+    - |
+      set -euxo pipefail
+      source "${PRE_TYCHE_INSTALL_DIR}/pre-tyche-config.sh"
+      export CUDA_HOME="${PRE_TYCHE_CUDA_HOME}"
+      export MPI_HOME="${PRE_TYCHE_MPI_HOME}"
+      export PATH="${MPI_HOME}/bin:${PATH}"
+      export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
+      salloc \
+        -N "${NNODES}" \
+        --ntasks-per-node "${NP}" \
+        --exclusive \
+        -p "${SLURM_PARTITION}" \
+        --account="${SLURM_ACCOUNT}" \
+        -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN:-ci}:nccl-ep-test-pretyche::${CI_COMMIT_REF_NAME:-detached}:${CI_COMMIT_SHORT_SHA}" \
+        -t "${SLURM_TIME}" \
+        bash nccl_ep/ci/run_nccl_ep_ci_tests.sh

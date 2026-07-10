@@ -1,0 +1,36 @@
+# Root pipeline for the standalone NCCL Extensions repository.
+# Build NCCL once, then run the NCCL EP child pipeline.
+
+include:
+  - local: .gitlab/ci/nccl-build.yml
+
+stages:
+  - build_nccl
+  - test
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+
+build:nccl:
+  extends: .build-nccl
+  stage: build_nccl
+
+nccl_ep:
+  stage: test
+  needs:
+    - job: build:nccl
+      artifacts: false
+  variables:
+    PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
+  trigger:
+    include:
+      - local: nccl_ep/.gitlab-ci.yml
+    strategy: depend
+    forward:
+      yaml_variables: true
+      pipeline_variables: true

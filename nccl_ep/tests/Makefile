@@ -14,7 +14,7 @@ NCCL_EP_INCDIR := $(NCCL_EP_BUILDDIR)/include
 NCCL_EP_LIBDIR := $(NCCL_EP_BUILDDIR)/lib
 DST_DIR := $(NCCL_EP_BUILDDIR)/test/nccl_ep
 
-GTEST_DIR  := $(abspath ../../../test/googletest/googletest)
+GTEST_DIR  ?= $(abspath ../third_party/googletest/googletest)
 GTEST_OBJDIR := $(NCCL_EP_BUILDDIR)/test
 GTEST_LIBS := $(GTEST_OBJDIR)/gtest.a $(GTEST_OBJDIR)/gtest_main.a
 

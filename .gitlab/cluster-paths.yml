@@ -1,0 +1,11 @@
+# Shared CI checkout roots for the NCCL EP child pipeline.
+
+variables:
+  EOS_CI_BUILDS_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/builds"
+  EOS_ARCHIVER_STAGING_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/builds"
+
+  PRE_NYX_CI_BUILDS_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/builds"
+  PRE_NYX_ARCHIVER_STAGING_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/builds"
+
+  PRE_TYCHE_CI_BUILDS_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/builds"
+  PRE_TYCHE_ARCHIVER_STAGING_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/builds"

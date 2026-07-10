@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# NCCL EP CI: run the contrib/nccl_ep gtest unit binaries inside a Slurm allocation.
-# These tests do not require MPI; contrib/nccl_ep/tests/run_tests.sh launches one
+# NCCL EP CI: run the nccl_ep gtest unit binaries inside a Slurm allocation.
+# These tests do not require MPI; nccl_ep/tests/run_tests.sh launches one
 # process per GPU on the allocated node.
 
 set -euo pipefail
@@ -24,7 +24,8 @@ if [[ -n "${CUDA_HOME:-}" ]]; then
   export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${CUDA_HOME}/lib:${LD_LIBRARY_PATH}"
 fi
 
-RUN_TESTS="./contrib/nccl_ep/tests/run_tests.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_TESTS="${SCRIPT_DIR}/../tests/run_tests.sh"
 
 if [[ "${NCCL_EP_UNIT_USE_SRUN:-1}" == "1" && -n "${SLURM_JOB_ID:-}" ]]; then
   exec srun \
@@ -33,6 +34,7 @@ if [[ "${NCCL_EP_UNIT_USE_SRUN:-1}" == "1" && -n "${SLURM_JOB_ID:-}" ]]; then
     --exclusive \
     --cpu-bind=none \
     --export=ALL \
+    ${NCCL_EP_SRUN_EXTRA:-} \
     bash "$RUN_TESTS" "$NUM_GPUS"
 fi
 

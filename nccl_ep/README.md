@@ -235,9 +235,12 @@ This repo vendors a compatible NCCL build via git submodule at
 `third_party/nccl`. Build it once:
 
 ```bash
-git submodule update --init third_party/nccl
+git submodule update --init --recursive third_party/nccl nccl_ep/third_party/googletest
 make -C nccl_ep nccl-submodule   # -> third_party/nccl/build/{include,lib}
 ```
+
+The EP unit tests use the independently pinned GoogleTest submodule at
+`nccl_ep/third_party/googletest`; they do not rely on a copy inside NCCL.
 
 `NCCL_HOME` defaults to `third_party/nccl/build` automatically — no export
 needed. To use your own NCCL build instead (e.g. a different version, or one

@@ -1,0 +1,50 @@
+# Standalone NCCL M2N child pipeline, dispatched by the repository root CI.
+
+include:
+  - local: .gitlab/ci/nccl-build.yml
+
+stages:
+  - build
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "parent_pipeline"'
+    - when: never
+
+build:nccl_m2n:
+  extends: .ipp6-build
+  stage: build
+  timeout: 1h
+  needs:
+    - pipeline: "${PARENT_PIPELINE_ID}"
+      job: build:nccl
+      artifacts: true
+  script:
+    - |
+      set -euxo pipefail
+      test -s "${CI_PROJECT_DIR}/.ci/nccl/NCCL_COMMIT"
+      echo "Using NCCL commit $(cat "${CI_PROJECT_DIR}/.ci/nccl/NCCL_COMMIT")"
+      srun \
+        -p cpuonly \
+        -J nccl-extensions:m2n \
+        -t 01:00:00 \
+        -n 1 \
+        --exclusive \
+        --container-image="${BUILD_CONTAINER_IMAGE}" \
+        --container-mounts="${CI_PROJECT_DIR}:${CI_PROJECT_DIR}" \
+        env \
+        NCCL_HOME="${CI_PROJECT_DIR}/.ci/nccl/build" \
+        make -C "${CI_PROJECT_DIR}/nccl_m2n" -j"$(nproc)" \
+        GTEST_DIR="${CI_PROJECT_DIR}/.ci/googletest/googletest" \
+        NVCC_GENCODE="$NVCC_GENCODE" \
+        lib tests
+      test -s nccl_m2n/build/lib/libnccl_m2n.so
+      test -x nccl_m2n/build/bin/basic_api_test_local
+      test -x nccl_m2n/build/bin/basic_api_test_mpi
+  artifacts:
+    name: "nccl-m2n-${CI_COMMIT_SHORT_SHA}"
+    expire_in: 24 hours
+    paths:
+      - nccl_m2n/build/bin/
+      - nccl_m2n/build/include/
+      - nccl_m2n/build/lib/

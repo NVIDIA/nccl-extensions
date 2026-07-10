@@ -1,0 +1,62 @@
+# Shared NCCL source-build template used independently by each child pipeline.
+
+default:
+  interruptible: true
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+variables:
+  GIT_DEPTH: "20"
+  # Extension jobs consume the NCCL build artifact rather than cloning their
+  # own potentially different revision of the moving NCCL master branch.
+  GIT_SUBMODULE_STRATEGY: none
+  FF_USE_FASTZIP: "true"
+  FF_ENABLE_JOB_CLEANUP: "true"
+  FF_TIMESTAMPS: "true"
+  BUILD_CONTAINER_IMAGE: "/storage/toolkits/docker_sqsh/nccl_build_tools-2.1.1-c12.8.0-u20.04.sqsh"
+  NVCC_GENCODE: "-gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_100,code=sm_100"
+
+.ipp6-build:
+  tags:
+    - ipp6-nccl
+  variables:
+    NVIDIA_VISIBLE_DEVICES: "void"
+    SLURM_PARTITION: ""
+    GIT_CLONE_PATH: "${CI_BUILDS_DIR}/${CI_JOB_ID}/${CI_PROJECT_PATH}"
+
+.build-nccl:
+  extends: .ipp6-build
+  timeout: 1h
+  variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_SUBMODULE_DEPTH: "1"
+  script:
+    - |
+      set -euxo pipefail
+      current_dir="$(realpath .)"
+      NCCL_COMMIT="$(git -C third_party/nccl rev-parse HEAD)"
+      echo "Building public NCCL at ${NCCL_COMMIT}"
+      test -f nccl_ep/third_party/googletest/googletest/src/gtest-all.cc
+      srun \
+        -p cpuonly \
+        -J nccl-extensions:nccl \
+        -t 00:45:00 \
+        -n 1 \
+        --exclusive \
+        --container-image="${BUILD_CONTAINER_IMAGE}" \
+        --container-mounts="${current_dir}:${current_dir}" \
+        env NVCC_GENCODE="${NVCC_GENCODE}" \
+        make -C "${current_dir}/third_party/nccl" -j"$(nproc)" src.build
+      mkdir -p .ci
+      cp -a third_party/nccl .ci/nccl
+      cp -a nccl_ep/third_party/googletest .ci/googletest
+      printf '%s\n' "${NCCL_COMMIT}" > .ci/nccl/NCCL_COMMIT
+  artifacts:
+    name: "nccl-${CI_COMMIT_SHORT_SHA}"
+    expire_in: 24 hours
+    paths:
+      - .ci/nccl/
+      - .ci/googletest/

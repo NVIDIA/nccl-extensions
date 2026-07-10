@@ -27,7 +27,7 @@ This repo vendors NCCL as a git submodule. Clone with:
 git clone --recursive <repo-url>
 ```
 
-(or `git submodule update --init` after a normal clone). See each
+(or `git submodule update --init --recursive` after a normal clone). See each
 subproject's README for build instructions.
 
 ## Contributing
@@ -39,4 +39,3 @@ started.
 
 This project is licensed under the Apache License, Version 2.0 — see
 [LICENSE.txt](LICENSE.txt) for details.
-

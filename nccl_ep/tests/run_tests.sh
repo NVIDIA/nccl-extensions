@@ -100,9 +100,9 @@ SUITES=(
 )
 
 for entry in "${SUITES[@]}"; do
-    IFS='|' read -r bin desc min_gpus <<<"${entry}"
+    IFS='|' read -r bin desc _ <<<"${entry}"
     [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "${bin}" ]] || continue
-    run_suite "${bin}" "${desc}" "${min_gpus}"
+    run_suite "${bin}" "${desc}"
 done
 
 for mode in LOCAL_DUP NVLINK_DUP; do

@@ -618,10 +618,11 @@ typedef struct {
     unsigned int send_only; // if non-zero, only initiate transfers; requires ncclEpComplete() afterward
   //   supported for LL mode only; output tensors must still be preallocated
     unsigned int round_scales; // whether to round the scaling factors tensor into a power of 2
-    ncclEpDispatchQuantizationRecipe_t quantization_recipe; // NONE by default; selects the required scale tensors
     ncclEpPassDir_t pass_direction; // forward (default) or backward pass; HT-only.
   //   FWD requires inputs->topk_weights; BWD forbids it and forbids
   //   outputs->topk_weights / outputs->topk_idx.
+    // New fields must be appended here to keep existing field offsets stable for ABI compatibility.
+    ncclEpDispatchQuantizationRecipe_t quantization_recipe; // NONE by default; selects the required scale tensors
 } ncclEpDispatchConfig_t;
 
 #define NCCL_EP_DISPATCH_CONFIG_INIT \
@@ -705,10 +706,11 @@ typedef struct {
     unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
     unsigned int send_only; // if non-zero, only initiate transfers; requires ncclEpComplete() afterward
     //   supported for LL mode only; output tensors must still be preallocated
-    ncclEpCombineQuantizationRecipe_t quantization_recipe; // NONE by default; reserved recipes validate future combine support
     ncclEpPassDir_t pass_direction; // forward (default) or backward pass; HT-only.
     //   FWD forbids inputs->topk_weights; BWD requires inputs->topk_weights
     //   and outputs->topk_weights.
+    // New fields must be appended here to keep existing field offsets stable for ABI compatibility.
+    ncclEpCombineQuantizationRecipe_t quantization_recipe; // NONE by default; reserved recipes validate future combine support
 } ncclEpCombineConfig_t;
 
 #define NCCL_EP_COMBINE_CONFIG_INIT \

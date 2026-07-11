@@ -11,6 +11,30 @@
 
 class QuantizationRecipeTest : public EpTestBase {};
 
+// Per-token scale count for the recipe tests. kHidden (16) is not divisible by a
+// realistic quantization block size, so use a fixed non-zero count: 4 scales/token
+// (block size 4), which keeps scale bytes (4*4=16) 16-byte aligned.
+static constexpr int kScalesPerToken = 4;
+
+// Bytes per element for the dtypes exercised by the recipe tests. Kept local
+// because ncclTypeSize is not exposed to the test translation units.
+static size_t recipe_elem_bytes(ncclDataType_t dtype) {
+    switch (dtype) {
+        case ncclFloat32:
+            return 4;
+        case ncclFloat16:
+        case ncclBfloat16:
+            return 2;
+        case ncclFloat8e4m3:
+        case ncclFloat8e5m2:
+        case ncclInt8:
+        case ncclUint8:
+            return 1;
+        default:
+            throw std::runtime_error("unsupported dtype " + std::to_string(static_cast<int>(dtype)));
+    }
+}
+
 struct RecipeTensor {
     ncclEpTensor_t tensor = NCCL_EP_TENSOR_INIT;
     void* data = nullptr;
@@ -18,7 +42,7 @@ struct RecipeTensor {
 
     RecipeTensor(ncclDataType_t dtype, size_t rows = kNumTokens, size_t cols = kHidden)
         : sizes{rows, cols} {
-        if (cudaMalloc(&data, rows * cols * (dtype == ncclFloat32 ? sizeof(float) : 1)) != cudaSuccess)
+        if (cudaMalloc(&data, rows * cols * recipe_elem_bytes(dtype)) != cudaSuccess)
             throw std::runtime_error("cudaMalloc failed while creating quantization recipe test tensor");
         tensor.ndim = 2;
         tensor.datatype = dtype;
@@ -37,8 +61,6 @@ static bool has_nonzero_scales(const std::vector<float>& values) {
 }
 
 TEST_F(QuantizationRecipeTest, ScalesForwardDispatchCompletes) {
-    constexpr int kScalesPerToken = 4;
-
     uint8_t *d_tokens = nullptr, *d_recv_tokens = nullptr;
     float *d_scales = nullptr, *d_recv_scales = nullptr;
     float *d_topk_weights = nullptr, *d_recv_topk_weights = nullptr;
@@ -224,7 +246,7 @@ TEST_F(QuantizationRecipeTest, DsFp8E3M4DispatchCompletes) {
 TEST_F(QuantizationRecipeTest, DispatchNoneRejectsScaleTensors) {
     RecipeTensor tokens(ncclBfloat16);
     RecipeTensor output_tokens(ncclBfloat16);
-    RecipeTensor scales(ncclFloat32, kNumTokens, kHidden / 128);
+    RecipeTensor scales(ncclFloat32, kNumTokens, kScalesPerToken);
     ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
     ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
     ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
@@ -252,8 +274,8 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRequiresInputAndOutputScales) {
 TEST_F(QuantizationRecipeTest, ScalesForwardRejectsNonFloatScales) {
     RecipeTensor tokens(ncclFloat8e4m3);
     RecipeTensor output_tokens(ncclFloat8e4m3);
-    RecipeTensor input_scales(ncclUint8, kNumTokens, kHidden / 128);
-    RecipeTensor output_scales(ncclFloat32, kNumTokens, kHidden / 128);
+    RecipeTensor input_scales(ncclUint8, kNumTokens, kScalesPerToken);
+    RecipeTensor output_scales(ncclFloat32, kNumTokens, kScalesPerToken);
     ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
     ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
     ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;

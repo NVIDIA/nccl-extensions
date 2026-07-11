@@ -4113,7 +4113,7 @@ ncclResult_t ncclEpCombine(
         // Execute combine with appropriate phase flags
         const int combine_phases =
             send_only ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
-        combine_fn(combine_phases);
+        NCCLCHECK(combine_fn(combine_phases));
 
         if (send_only) {
             handle->ll.continue_fn = combine_fn;

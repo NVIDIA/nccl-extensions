@@ -914,6 +914,51 @@ static inline void fillScalesForwardScaleRow(uint8_t* dst, int rank, unsigned in
         for (unsigned int b = 0; b < numScales; b++) f[b] = scalesForwardScaleValue(rank, t, b);
     }
 }
+// DS_FP8E3M4 benchmark-only wire pattern. This is the single source of truth
+// for both input construction and output validation.
+struct DsFp8E3M4IdentityPattern {
+    static constexpr unsigned kIdentityBytes = 4;       // rank16 + token16
+    static constexpr unsigned kBitsPerSymbol = 2;
+    static constexpr unsigned kSentinelSymbols = 32 / kBitsPerSymbol;
+    static constexpr unsigned kAmaxAnchorElement = kSentinelSymbols;
+    static constexpr unsigned kIdentityScaleCount = kIdentityBytes;
+    static constexpr float kFp8Max = 448.0f;
+    static constexpr float kPayloadTolerance = 1e-3f;
+    // Scale values are hundreds in this pattern; this is far below the
+    // smallest adjacent table entry (512 / 448), but accommodates FP32 math.
+    static constexpr float kScaleTolerance = 1e-3f;
+    static constexpr uint8_t kFirstAmaxBandBytes = 128;
+    static constexpr float kFirstAmaxBase = 65536.0f;
+    static constexpr float kFirstAmaxStep = 512.0f;
+    static constexpr float kSecondAmaxBase = 131072.0f;
+    static constexpr float kSecondAmaxStep = 1024.0f;
+
+    static uint32_t identity(int rank, unsigned int token) {
+        return static_cast<uint32_t>(rank) | (static_cast<uint32_t>(token) << 16);
+    }
+    static uint8_t identityByte(int rank, unsigned int token, unsigned int byte_index) {
+        return static_cast<uint8_t>(identity(rank, token) >> (8 * (byte_index % kIdentityBytes)));
+    }
+    static float amaxForByte(uint8_t byte) {
+        return byte < kFirstAmaxBandBytes
+            ? kFirstAmaxBase + kFirstAmaxStep * byte
+            : kSecondAmaxBase + kSecondAmaxStep * (byte - kFirstAmaxBandBytes);
+    }
+    static float amax(int rank, unsigned int token, unsigned int block_index) {
+        return amaxForByte(identityByte(rank, token, block_index));
+    }
+    static float scaleInv(int rank, unsigned int token, unsigned int block_index) {
+        return amax(rank, token, block_index) / kFp8Max;
+    }
+    static unsigned symbol(uint32_t source_identity, unsigned int symbol_index) {
+        return (source_identity >> (kBitsPerSymbol * symbol_index)) &
+            ((1u << kBitsPerSymbol) - 1);
+    }
+    static float symbolInputFactor(unsigned int symbol) {
+        // Pick exactly representable normalized E4M3 values: 0, 112, 224, 448.
+        return symbol == 3 ? 1.0f : static_cast<float>(symbol) / 4.0f;
+    }
+};
 
 // Combine-validation thresholds for the cosine-similarity discrepancy metric.
 // HT is looser to absorb reduction-order noise at high topk.
@@ -980,8 +1025,44 @@ void initializeValidationData(
             }
             delete[] scale_data_host;
         }
+    } else if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
+        // Every DS block retains the normal rank/token pattern except for 17
+        // sentinel values. The first 16 encode rank16/token16 in 2-bit FP8
+        // symbols; element 16 anchors amax for the generated scale.
+        size_t token_size = num_tokens * hidden;
+        size_t eb = tokenElemBytes(token_dtype);
+        char* token_data_host = new char[token_size * eb];
+        for (unsigned int t = 0; t < num_tokens; ++t) {
+            for (unsigned int h = 0; h < hidden; ++h) {
+                const unsigned int block = h / DS_FP8E3M4_ELEMENTS_PER_SCALE;
+                const unsigned int in_block = h % DS_FP8E3M4_ELEMENTS_PER_SCALE;
+                const float amax = DsFp8E3M4IdentityPattern::amax(myRank, t, block);
+                float val;
+                if (in_block < DsFp8E3M4IdentityPattern::kSentinelSymbols) {
+                    val = amax * DsFp8E3M4IdentityPattern::symbolInputFactor(
+                        DsFp8E3M4IdentityPattern::symbol(
+                            DsFp8E3M4IdentityPattern::identity(myRank, t), in_block));
+                } else if (in_block == DsFp8E3M4IdentityPattern::kAmaxAnchorElement) {
+                    val = amax;
+                } else {
+                    float rank_value = static_cast<float>(myRank - RANK_OFFSET);
+                    float token_hi_f = static_cast<float>(t / 256);
+                    float token_lo_f = static_cast<float>(t % 256);
+                    if (h == hidden - TOKEN_ID_COLS) val = token_hi_f;
+                    else if (h > hidden - TOKEN_ID_COLS) val = token_lo_f;
+                    else val = rank_value;
+                }
+                floatToTokenElem(token_data_host, t * hidden + h, val, token_dtype);
+            }
+        }
+        {
+            void* input0_data;
+            NCCLCHECK(epGetTensorData(alloc, dispatch_inputs.tokens, &input0_data));
+            CUDACHECK(cudaMemcpy(input0_data, token_data_host, token_size * eb, cudaMemcpyHostToDevice));
+        }
+        delete[] token_data_host;
     } else {
-        // NONE and DS_FP8E3M4 inputs are BF16/FP16/FP32 tensors. Fill with a
+        // NONE inputs are BF16/FP16/FP32 tensors. Fill with a
         // rank value and a token ID in the final TOKEN_ID_COLS columns.
         float rank_value = static_cast<float>(myRank - RANK_OFFSET);
         size_t token_size = num_tokens * hidden;
@@ -1421,14 +1502,51 @@ static float dsFp8E3M4ScaleValue(
     unsigned int source_token,
     unsigned int scale_idx,
     unsigned int num_scales) {
-    float amax = 1e-4f;
-    if (scale_idx + 1 == num_scales) {
-        amax = std::max(amax, static_cast<float>(source_token / 256));
-        amax = std::max(amax, static_cast<float>(source_token % 256));
-    } else {
-        amax = std::max(amax, std::abs(static_cast<float>(source_rank - RANK_OFFSET)));
+    (void)num_scales;
+    return DsFp8E3M4IdentityPattern::scaleInv(source_rank, source_token, scale_idx);
+}
+
+static int dsFp8E3M4DecodeIdentityByteFromScale(float scale_value) {
+    for (unsigned int byte = 0; byte <= UINT8_MAX; ++byte) {
+        if (std::abs(scale_value - DsFp8E3M4IdentityPattern::amaxForByte(byte) /
+                DsFp8E3M4IdentityPattern::kFp8Max) <= DsFp8E3M4IdentityPattern::kScaleTolerance) {
+            return static_cast<int>(byte);
+        }
     }
-    return amax / 448.0f;
+    return -1;
+}
+
+// Decode an E4M3 finite FP8 byte on the host. Validation only uses positive
+// finite sentinel values, but reject non-finite encodings defensively.
+static bool dsFp8E3M4DecodeFinite(uint8_t bits, float* value) {
+    const int sign = (bits & 0x80) ? -1 : 1;
+    const int exponent = (bits >> 3) & 0xf;
+    const int mantissa = bits & 0x7;
+    if (exponent == 0) {
+        *value = sign * std::ldexp(static_cast<float>(mantissa), -9);
+        return true;
+    }
+    if (exponent == 0xf && mantissa == 0x7) return false;
+    *value = sign * std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f, exponent - 7);
+    return true;
+}
+
+static bool validateDsFp8E3M4PayloadIdentity(
+    const uint8_t* block, float scale_inv, int source_rank, unsigned int source_token,
+    unsigned int block_index) {
+    const float amax = DsFp8E3M4IdentityPattern::amax(source_rank, source_token, block_index);
+    const uint32_t identity = DsFp8E3M4IdentityPattern::identity(source_rank, source_token);
+    for (unsigned int symbol = 0; symbol < DsFp8E3M4IdentityPattern::kSentinelSymbols; ++symbol) {
+        float fp8_value;
+        if (!dsFp8E3M4DecodeFinite(block[symbol], &fp8_value)) return false;
+        const float expected = amax * DsFp8E3M4IdentityPattern::symbolInputFactor(
+            DsFp8E3M4IdentityPattern::symbol(identity, symbol));
+        if (std::abs(fp8_value * scale_inv - expected) >
+            amax * DsFp8E3M4IdentityPattern::kPayloadTolerance) return false;
+    }
+    float anchor;
+    return dsFp8E3M4DecodeFinite(block[DsFp8E3M4IdentityPattern::kAmaxAnchorElement], &anchor) &&
+        std::abs(anchor * scale_inv - amax) <= amax * DsFp8E3M4IdentityPattern::kPayloadTolerance;
 }
 
 static ValidationResult validateDispatchOutputLLExpertMajDsFp8E3M4(
@@ -1494,26 +1612,45 @@ static ValidationResult validateDispatchOutputLLExpertMajDsFp8E3M4(
             const size_t row = static_cast<size_t>(expert) * slots_per_expert + slot;
             const uint8_t* token_row = recv_tokens.data() + row * hidden;
             const float* scale_row = recv_scales.data() + row * num_scales;
-            const auto match = std::find_if(
-                expected[expert].begin(), expected[expert].end(), [&](const auto& source) {
-                    for (unsigned int scale = 0; scale < num_scales; ++scale) {
-                        if (std::abs(scale_row[scale] - dsFp8E3M4ScaleValue(
-                                source.first, source.second, scale, num_scales)) > 1e-6f) {
-                            return false;
-                        }
-                    }
-                    return true;
-                });
-            if (match == expected[expert].end()) {
-                rep.error("[Rank %d] LL DS_FP8E3M4: expert %u slot %d has an unexpected scale row\n",
-                          myRank, expert, slot);
+            int identity_bytes[DsFp8E3M4IdentityPattern::kIdentityScaleCount];
+            bool valid_identity_prefix = true;
+            for (unsigned int byte = 0; byte < DsFp8E3M4IdentityPattern::kIdentityScaleCount; ++byte) {
+                identity_bytes[byte] = dsFp8E3M4DecodeIdentityByteFromScale(scale_row[byte]);
+                valid_identity_prefix &= identity_bytes[byte] >= 0;
+            }
+            if (!valid_identity_prefix) {
+                rep.error("[Rank %d] LL DS_FP8E3M4: expert %u slot %d has an invalid identity scale prefix "
+                          "[%g, %g, %g, %g]\n",
+                          myRank, expert, slot, scale_row[0], scale_row[1], scale_row[2], scale_row[3]);
                 continue;
             }
-            if (std::all_of(token_row, token_row + hidden, [](uint8_t value) { return value == 0; })) {
-                rep.error("[Rank %d] LL DS_FP8E3M4: expert %u slot %d has an all-zero token row\n",
-                          myRank, expert, slot);
+            const int source_rank = identity_bytes[0] | (identity_bytes[1] << 8);
+            const int source_token = identity_bytes[2] | (identity_bytes[3] << 8);
+            for (unsigned int scale = 0; scale < num_scales; ++scale) {
+                const float expected_scale =
+                    dsFp8E3M4ScaleValue(source_rank, source_token, scale, num_scales);
+                if (std::abs(scale_row[scale] - expected_scale) >
+                    DsFp8E3M4IdentityPattern::kScaleTolerance) {
+                    rep.error("[Rank %d] LL DS_FP8E3M4: expert %u slot %d scale %u does not match source identity\n",
+                              myRank, expert, slot, scale);
+                }
+                const uint8_t* block = token_row + scale * DS_FP8E3M4_ELEMENTS_PER_SCALE;
+                if (!validateDsFp8E3M4PayloadIdentity(
+                        block, scale_row[scale], source_rank, source_token, scale)) {
+                    rep.error("[Rank %d] LL DS_FP8E3M4: expert %u slot %d block %u payload does not match scale identity\n",
+                              myRank, expert, slot, scale);
+                }
             }
-            found.insert(*match);
+            const auto source = std::make_pair(source_rank, source_token);
+            if (source_rank < 0 || source_rank >= nRanks || source_token < 0 ||
+                source_token >= static_cast<int>(num_tokens_per_rank[source_rank]) ||
+                expected[expert].find(source) == expected[expert].end()) {
+                rep.error("[Rank %d] LL DS_FP8E3M4: expert %u slot %d has unexpected source (%d, %d)\n",
+                          myRank, expert, slot, source_rank, source_token);
+            } else if (!found.insert(source).second) {
+                rep.error("[Rank %d] LL DS_FP8E3M4: expert %u has duplicate source (%d, %d)\n",
+                          myRank, expert, source_rank, source_token);
+            }
         }
         for (const auto& source : expected[expert]) {
             if (found.find(source) == found.end()) {
@@ -4461,6 +4598,17 @@ int main(int argc, char* argv[]) {
                                                                                   "AUTO";
         printf("[DEBUG] recv_topk_idx_kind = %s\n", kind_str);
         fflush(stdout);
+    }
+
+    // The DS benchmark pattern stores rank16/token16 in quantized payload bits.
+    if (validate_data && dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4 &&
+        (nRanks > 65536 || *std::max_element(num_tokens_per_rank.begin(), num_tokens_per_rank.end()) > 65536)) {
+        if (myRank == 0) {
+            fprintf(stderr,
+                    "DS_FP8E3M4 benchmark identity pattern supports at most 65536 ranks and tokens per rank\n");
+        }
+        MPI_Finalize();
+        return 1;
     }
 
     // Initialize validation data if enabled (fills tensors with rank-based patterns)

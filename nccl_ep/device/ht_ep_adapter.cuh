@@ -83,8 +83,8 @@ void sparse_to_dense_prob_combine(
     int num_tokens,
     int num_topk,
     int experts_per_rank,
-    int experts_per_lsa_team, // = experts_per_rank * ranks_per_node
-    int local_rank, // rank within node
+    int experts_per_lsa_team, // = experts_per_rank * ranks_per_lsa_team
+    int local_rank, // rank within lsa team
     cudaStream_t stream);
 
 // ============================================================================
@@ -106,8 +106,8 @@ void dense_to_sparse_prob(
     int num_recv_tokens,
     int topk,
     int experts_per_rank,
-    int experts_per_lsa_team, // = experts_per_rank * ranks_per_node
-    int local_rank, // rank within node
+    int experts_per_lsa_team, // = experts_per_rank * ranks_per_lsa_team
+    int local_rank, // rank within lsa team
     int global_expert_offset, // = group_rank * experts_per_rank; added to local id under GLOBAL
     ncclEpExpertIdKind_t recv_topk_idx_kind,
     bool expert_major, // true = 1D recv_topk_weights, false = 2D
@@ -142,10 +142,10 @@ ncclResult_t call_metadata_preprocessing(
     bool* local_expert_routing_map, // Output: per-expert routing for local tokens
     int32_t* per_expert_token_counts, // Optional output: per-expert counts (nullptr to skip)
     void* ranks_scan_tmp, // Pre-allocated per-rank scan state (from get_preprocessing_scan_tmp_size)
-    int node_rank, // This node's rank (0 to num_nodes-1)
-    int local_rank, // Rank within node (0 to lsa_team_size-1)
+    int lsa_team, // This LSA team's index (0 to num_lsa_teams-1)
+    int local_rank, // Rank within lsa team (0 to lsa_team_size-1)
     int num_tokens_per_rank, // Actual tokens per rank this iteration (runtime)
-    int num_nodes, // Number of nodes (RDMA domain size)
+    int num_lsa_teams, // Number of LSA teams (RDMA domain size)
     int lsa_team_size, // Ranks per LSA (NVLink) team
     int experts_per_rank, // Experts per GPU
     bool expert_major = false, // true = expert-major layout (gates fused remap)
@@ -156,7 +156,7 @@ ncclResult_t call_metadata_preprocessing(
     size_t alignment =
         0, // Per-expert zone alignment in tokens (pow2; 0/1 = no padding). Ignored when expert_major=false.
     int32_t* actual_counts_out = nullptr, // Expert-major: authoritative per-expert dispatch counts
-    int s2d_inner_dim = 0, // 0 = flat (n_ranks_per_node); >0 = expert-major (top_k)
+    int s2d_inner_dim = 0, // 0 = flat (ranks_per_lsa_team); >0 = expert-major (top_k)
     void* recv_total_counter = nullptr, // Optional scalar: total recv tokens (int32 or int64; nullable)
     bool out_is_int64 = true, // Shared dtype for the 3 int output tensors above
     int max_recv_tokens_per_rank = 0, // HT recv-budget; __trap on overflow.
@@ -202,7 +202,7 @@ void launch_build_em_tables(
     int lsa_team_size,
     int experts_per_rank,
     int num_lsa_teams,
-    int node_rank,
+    int lsa_team,
     int local_rank,
     int s2d_inner_dim,
     int max_recv_tokens_per_rank,
@@ -357,8 +357,8 @@ struct DispatchParams {
 
     // Runtime config
     int local_rank;
-    int node_rank;
-    int num_tokens_per_rank;
+    int lsa_team;
+    int tokens_per_lsa;
 
     // EM local-fanout: > 0 enables sender S2G dedup + a receiver local_dup kernel.
     int local_dup_num_sms = 0;
@@ -376,7 +376,7 @@ ncclResult_t call_dispatch(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank, // Max tokens for buffer sizing (chunk-aligned)
     int num_tokens_per_chunk, // Dispatch/combine tokens per chunk (resolved per group)
-    int num_nodes, // Number of nodes (RDMA domain size)
+    int num_lsa_teams, // Number of LSA teams (RDMA domain size)
     ncclEpDispatchQuantizationRecipe_t quantization_recipe,
     ncclEpPassDir_t pass_direction,
     int num_blocks, // Number of SMs/blocks for the kernel grid
@@ -441,8 +441,8 @@ struct CombineParams {
 
     // Runtime config
     int local_rank;
-    int node_rank;
-    int num_tokens_per_rank; // Stride for map indexing (= max_tokens_per_rank)
+    int lsa_team;
+    int tokens_per_lsa; // Stride for map indexing (= max_tokens_per_rank)
     int num_real_tokens; // Actual token count for output write gate
     int num_recv_tokens; // Actual received tokens this rank
 
@@ -459,7 +459,7 @@ void call_combine(
     const CombineParams& params,
     int max_dispatch_tokens_per_rank, // Max tokens for buffer sizing (chunk-aligned)
     int num_tokens_per_chunk, // Dispatch/combine tokens per chunk (resolved per group)
-    int num_nodes, // Number of nodes (RDMA domain size)
+    int num_lsa_teams, // Number of LSA teams (RDMA domain size)
     bool backward_combine, // True for backward (training), false for forward
     int num_blocks, // Number of SMs/blocks for the kernel grid
     const ncclEpEnvConfig* env, // Group env config; gates rank-0 verbose param dump (may be null)

@@ -292,7 +292,7 @@ __device__ __forceinline__ void write_local_routing(
     int token_out_of_bound,
     bool token_needed_by_local_rank,
     int32_t local_rank_slot,
-    int node_rank,
+    int lsa_team,
     int local_rank,
     int experts_per_rank,
     // EM-permute related params
@@ -304,7 +304,7 @@ __device__ __forceinline__ void write_local_routing(
 
     if (lane_participates) {
         local_rank_bitmap_row =
-            input_routing_map + current_token_id * g.packed_row_bytes + node_rank * g.experts_per_lsa_team_packed;
+            input_routing_map + current_token_id * g.packed_row_bytes + lsa_team * g.experts_per_lsa_team_packed;
         local_expert_routing_map_store_base_addr = local_expert_routing_map + local_rank_slot * experts_per_rank;
     }
 
@@ -376,7 +376,7 @@ __device__ __forceinline__ void assign_recv_slots(
     const scan_geometry_t& g,
     int tokens_per_rank,
     int experts_per_rank,
-    int node_rank,
+    int lsa_team,
     int local_rank,
     bool out_is_int64,
     int max_recv_tokens_per_rank,
@@ -474,7 +474,7 @@ __device__ __forceinline__ void assign_recv_slots(
             token_out_of_bound,
             token_needed_by_local_rank,
             local_rank_slot,
-            node_rank,
+            lsa_team,
             local_rank,
             experts_per_rank,
             flat2em_slot_map,
@@ -503,7 +503,7 @@ __device__ __forceinline__ void assign_recv_slots(
                     "or set ncclEpGroupConfig_t::overflow_policy = NCCL_EP_OVERFLOW_DROP\n",
                     true_total,
                     max_recv_tokens_per_rank,
-                    node_rank,
+                    lsa_team,
                     local_rank);
                 __trap();
             }
@@ -533,7 +533,7 @@ __device__ __forceinline__ void fill_attn_to_rdma(
     const scan_geometry_t& g,
     int num_of_tokens_per_rank,
     int experts_per_rank,
-    int node_rank,
+    int lsa_team,
     int local_rank) {
     if constexpr (NUM_LSA_TEAMS == 1) return;
 
@@ -548,12 +548,12 @@ __device__ __forceinline__ void fill_attn_to_rdma(
         if (current_token_id >= num_of_total_token_rows) break;
 
         int attn_node_id = current_token_id % (NUM_LSA_TEAMS - 1);
-        int current_token_node_id = attn_node_id < node_rank ? attn_node_id : attn_node_id + 1;
+        int current_token_node_id = attn_node_id < lsa_team ? attn_node_id : attn_node_id + 1;
         int current_token_local_id = current_token_id / (NUM_LSA_TEAMS - 1);
 
         const uint8_t* bitmap_row =
             input_routing_map +
-            ((node_rank * LSA_TEAM_SIZE + local_rank) * num_of_tokens_per_rank + current_token_local_id) *
+            ((lsa_team * LSA_TEAM_SIZE + local_rank) * num_of_tokens_per_rank + current_token_local_id) *
                 g.packed_row_bytes +
             current_token_node_id * g.experts_per_lsa_team_packed;
 
@@ -796,7 +796,7 @@ __device__ __forceinline__ void scan_impl_flat(
     int32_t* num_of_tokens_for_experts,
     bool* local_expert_routing_map,
     int32_t* per_expert_token_counts,
-    const int node_rank,
+    const int lsa_team,
     const int local_rank,
     const int num_of_tokens_per_rank,
     const int experts_per_rank,
@@ -855,12 +855,12 @@ __device__ __forceinline__ void scan_impl_flat(
         g,
         num_of_tokens_per_rank,
         experts_per_rank,
-        node_rank,
+        lsa_team,
         local_rank,
         &smem);
 
     if constexpr (ENABLE_EM_PERMUTE) {
-        extract_local_experts_meta<EXPERTS_PER_RANK>(input_routing_map, smem, g, node_rank, local_rank);
+        extract_local_experts_meta<EXPERTS_PER_RANK>(input_routing_map, smem, g, lsa_team, local_rank);
     }
 
     __syncthreads();
@@ -912,7 +912,7 @@ __device__ __forceinline__ void scan_impl_flat(
         g,
         num_of_tokens_per_rank,
         experts_per_rank,
-        node_rank,
+        lsa_team,
         local_rank,
         out_is_int64,
         max_recv_tokens_per_rank,
@@ -936,7 +936,7 @@ __device__ __forceinline__ void scan_impl_flat(
         g,
         num_of_tokens_per_rank,
         experts_per_rank,
-        node_rank,
+        lsa_team,
         local_rank);
 }
 
@@ -951,7 +951,7 @@ __device__ __forceinline__ void scan_impl_em(
     bool* rdma_to_attn_map,
     bool* attn_to_rdma_map,
     rank_mask_t<(LSA_TEAM_SIZE + 63) / 64>* token_rank_mask,
-    const int node_rank,
+    const int lsa_team,
     const int local_rank,
     const int num_of_tokens_per_rank,
     const int experts_per_rank) {
@@ -974,7 +974,7 @@ __device__ __forceinline__ void scan_impl_em(
         g,
         num_of_tokens_per_rank,
         experts_per_rank,
-        node_rank,
+        lsa_team,
         local_rank);
 
     fill_attn_to_rdma<NUM_LSA_TEAMS, NUM_THREADS_PER_BLOCK, NUM_OF_BLOCKS, LSA_TEAM_SIZE>(
@@ -983,7 +983,7 @@ __device__ __forceinline__ void scan_impl_em(
         g,
         num_of_tokens_per_rank,
         experts_per_rank,
-        node_rank,
+        lsa_team,
         local_rank);
 }
 
@@ -1001,7 +1001,7 @@ struct scan_flat_kernel_param_t {
     int32_t* num_of_tokens_for_experts;
     bool* local_expert_routing_map;
     int32_t* per_expert_token_counts;
-    int node_rank;
+    int lsa_team;
     int local_rank;
     int num_of_tokens_per_rank;
     int experts_per_rank;
@@ -1030,7 +1030,7 @@ struct scan_em_kernel_param_t {
     bool* rdma_to_attn_map;
     bool* attn_to_rdma_map;
     void* token_rank_mask;
-    int node_rank;
+    int lsa_team;
     int local_rank;
     int num_of_tokens_per_rank;
     int experts_per_rank;
@@ -1043,7 +1043,7 @@ struct build_em_tables_param_t {
     int num_total_attn_tokens;
     int num_tokens_per_rank;
     int num_lsa_teams;
-    int node_rank;
+    int lsa_team;
     int local_rank;
     int s2d_inner_dim;
     int max_recv_tokens_per_rank;
@@ -1122,7 +1122,7 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
         const uint64_t mw1 = (p.num_mask_words >= 2) ? mw[1] : 0;
         if (mw0 == 0 && mw1 == 0) continue;
         const uint8_t* row = p.input_routing_map + (size_t)tok * packed_row_bytes
-                           + (size_t)p.node_rank * local_per_node_bytes;
+                           + (size_t)p.lsa_team * local_per_node_bytes;
         for (int wi = 0; wi < n_local_words_ph1; wi++) {
             const int word_bit_base = wi * 64;
             const int remaining = n_local_bits_ph1 - word_bit_base;
@@ -1252,7 +1252,7 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
         int src_local_id = 0;
         if (any_hit) {
             row_local = p.input_routing_map + (size_t)tok * packed_row_bytes
-                      + (size_t)p.node_rank * local_per_node_bytes;
+                      + (size_t)p.lsa_team * local_per_node_bytes;
             const int sgr = tok / p.num_tokens_per_rank;
             const int sn  = sgr / nrpn;
             const int slr = sgr % nrpn;

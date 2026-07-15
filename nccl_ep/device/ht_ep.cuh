@@ -667,7 +667,7 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     layout.prob_S2G_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team;
     layout.prob_S2G_inter_stage_stride = layout.prob_S2G_stage_stride * model.num_of_nodes;
 
-    // intra_node_token_* buffers (128B aligned, multi-node only). Stage stride scales
+    // lsa_token_* buffers (128B aligned, multi-node only). Stage stride scales
     // with the on-wire element width (2 B for BF16/FP16, 4 B for FP32).
     if (multinode) {
         align_offset(128);
@@ -920,7 +920,7 @@ struct dispatch_kernel_param_base_t {
     uint64_t* expected_rdma_flag_value;
     uint32_t* expected_intra_node_flag_value;
     int local_rank;
-    int node_rank;
+    int lsa_team;
     // The number of token output by attn layer on a rank/GPU.
     int num_of_tokens_per_rank;
     // NCCL GIN context
@@ -991,7 +991,7 @@ struct combine_kernel_param_base_t {
     uint64_t* expected_rdma_flag_value;
     uint32_t* expected_intra_node_flag_value;
     int local_rank;
-    int node_rank;
+    int lsa_team;
     // Stride for routing-map indexing (= max_tokens_per_rank).
     int num_of_tokens_per_rank;
     // Actual token count; gates the inter_node_red TMA store.
@@ -3893,7 +3893,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     static_assert(kQuantizationRecipe == NCCL_EP_DISPATCH_QUANT_NONE ||
                       kQuantizationRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD,
                   "unsupported dispatch quantization recipe");
-    const int my_lteam = param.node_rank;
+    const int my_lteam = param.lsa_team;
     if constexpr (LSA_TEAMS != 1) {
         static_assert(
             GIN_GROUP::size() % 32 == 0 && GIN_GROUP::size() <= 64,
@@ -4150,7 +4150,7 @@ template < // This type represent intra-node reduction warp group.
 // set by the HT combine warp-count constants and the selected pipeline count.
 __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t<LSA_TEAM_SZ>& param,
                                                     uint8_t* smem_bytes) {
-    const int my_lteam = param.node_rank;
+    const int my_lteam = param.lsa_team;
     // Compile-time check (only enforce for multi-node layout).
     if constexpr (LSA_TEAMS != 1) {
         static_assert(

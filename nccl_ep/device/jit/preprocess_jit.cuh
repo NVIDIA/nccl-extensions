@@ -60,7 +60,7 @@ inline std::string scan_flat_jit_source(
         << "      p.input_routing_map, p.tmp, p.sparse_to_dense_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"
         << "      reinterpret_cast<ht_ep::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
         << "      p.num_of_tokens_for_experts, p.local_expert_routing_map, p.per_expert_token_counts,\n"
-        << "      p.node_rank, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank,\n"
+        << "      p.lsa_team, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank,\n"
         << "      p.recv_total_counter, p.out_is_int64, p.max_recv_tokens_per_rank,\n"
         << "      p.allow_overflow_drop, p.token_to_recv_slot, smem_bytes";
     if (enable_em_permute) {
@@ -91,7 +91,7 @@ scan_em_jit_source(int num_threads_per_block, int num_of_blocks, int num_lsa_tea
         << "      " << lsa_team_size << ">(\n"
         << "      p.input_routing_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"
         << "      reinterpret_cast<ht_ep::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
-        << "      p.node_rank, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank);\n"
+        << "      p.lsa_team, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank);\n"
         << "}\n";
     return src.str();
 }

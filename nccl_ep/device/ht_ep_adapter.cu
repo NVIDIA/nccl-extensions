@@ -378,10 +378,10 @@ ncclResult_t call_metadata_preprocessing(
     bool* local_expert_routing_map,
     int32_t* per_expert_token_counts,
     void* ranks_scan_tmp,
-    int node_rank,
+    int lsa_team,
     int local_rank,
     int num_tokens_per_rank,
-    int num_nodes,
+    int num_lsa_teams,
     int lsa_team_size,
     int experts_per_rank,
     bool expert_major,
@@ -459,7 +459,7 @@ ncclResult_t call_metadata_preprocessing(
             sp.num_of_tokens_for_experts = num_tokens_for_experts;
             sp.local_expert_routing_map = local_expert_routing_map;
             sp.per_expert_token_counts = nullptr; // unused for Expert-major path
-            sp.node_rank = node_rank;
+            sp.lsa_team = lsa_team;
             sp.local_rank = local_rank;
             sp.num_of_tokens_per_rank = num_tokens_per_rank;
             sp.experts_per_rank = experts_per_rank;
@@ -482,7 +482,7 @@ ncclResult_t call_metadata_preprocessing(
             jit::launch_scan_flat(
                 NUM_THREADS_PER_BLOCK,
                 NUM_OF_BLOCKS,
-                num_nodes,
+                num_lsa_teams,
                 lsa_team_size,
                 experts_per_rank,
                 /*enable_per_expert_counts=*/false,
@@ -507,16 +507,16 @@ ncclResult_t call_metadata_preprocessing(
             sp.rdma_to_attn_map = rdma_to_attn_map;
             sp.attn_to_rdma_map = attn_to_rdma_map;
             sp.token_rank_mask = token_rank_mask;
-            sp.node_rank = node_rank;
+            sp.lsa_team = lsa_team;
             sp.local_rank = local_rank;
             sp.num_of_tokens_per_rank = num_tokens_per_rank;
             sp.experts_per_rank = experts_per_rank;
 
-            jit::launch_scan_em(NUM_THREADS_PER_BLOCK, NUM_OF_BLOCKS, num_nodes, lsa_team_size, sp, stream);
+            jit::launch_scan_em(NUM_THREADS_PER_BLOCK, NUM_OF_BLOCKS, num_lsa_teams, lsa_team_size, sp, stream);
         }
 
         const int num_mask_words = (lsa_team_size + 63) / 64;
-        const int num_total_attn_tokens = num_tokens_per_rank * lsa_team_size * num_nodes;
+        const int num_total_attn_tokens = num_tokens_per_rank * lsa_team_size * num_lsa_teams;
         launch_build_em_tables(
             global_routing_map,
             token_rank_mask,
@@ -525,8 +525,8 @@ ncclResult_t call_metadata_preprocessing(
             num_tokens_per_rank,
             lsa_team_size,
             experts_per_rank,
-            num_nodes,
-            node_rank,
+            num_lsa_teams,
+            lsa_team,
             local_rank,
             s2d_inner_dim,
             max_recv_tokens_per_rank,
@@ -586,7 +586,7 @@ ncclResult_t call_metadata_preprocessing(
     sp.num_of_tokens_for_experts = num_tokens_for_experts;
     sp.local_expert_routing_map = local_expert_routing_map;
     sp.per_expert_token_counts = per_expert_token_counts;
-    sp.node_rank = node_rank;
+    sp.lsa_team = lsa_team;
     sp.local_rank = local_rank;
     sp.num_of_tokens_per_rank = num_tokens_per_rank;
     sp.experts_per_rank = experts_per_rank;
@@ -599,7 +599,7 @@ ncclResult_t call_metadata_preprocessing(
     jit::launch_scan_flat(
         NUM_THREADS_PER_BLOCK,
         NUM_OF_BLOCKS,
-        num_nodes,
+        num_lsa_teams,
         lsa_team_size,
         experts_per_rank,
         per_expert_token_counts != nullptr,
@@ -638,7 +638,7 @@ void launch_build_em_tables(
     int lsa_team_size,
     int experts_per_rank,
     int num_lsa_teams,
-    int node_rank,
+    int lsa_team,
     int local_rank,
     int s2d_inner_dim,
     int max_recv_tokens_per_rank,
@@ -680,7 +680,7 @@ void launch_build_em_tables(
     p.num_total_attn_tokens    = num_total_attn_tokens;
     p.num_tokens_per_rank      = num_tokens_per_rank;
     p.num_lsa_teams            = num_lsa_teams;
-    p.node_rank                = node_rank;
+    p.lsa_team                = lsa_team;
     p.local_rank               = local_rank;
     p.s2d_inner_dim            = s2d_inner_dim;
     p.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
@@ -781,8 +781,8 @@ template <typename TOKEN_DATA_TYPE>
 
     // Runtime config
     kp.local_rank = params.local_rank;
-    kp.node_rank = params.node_rank;
-    kp.num_of_tokens_per_rank = params.num_tokens_per_rank;
+    kp.lsa_team = params.lsa_team;
+    kp.num_of_tokens_per_rank = params.tokens_per_lsa;
     kp.local_dup_enabled = (params.local_dup_num_sms > 0);
     kp.guard_enabled = params.guard_enabled;
     kp.max_recv_tokens_per_rank = params.max_recv_tokens_per_rank;
@@ -848,7 +848,7 @@ ncclResult_t dispatch_impl(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank,
     int num_tokens_per_chunk,
-    int num_nodes,
+    int num_lsa_teams,
     ncclEpPassDir_t pass_direction,
     int num_blocks,
     int sf_bytes_per_token,
@@ -869,7 +869,7 @@ ncclResult_t dispatch_impl(
             (experts_per_lsa_team * sizeof(float)) % 16 == 0 && "experts_per_lsa_team must be multiple of 4 for TMA alignment");
         // 16B cp.async.bulk alignment for the S2D map fetch; matters when s2d_inner_dim < 4.
         assert(
-            (static_cast<int64_t>(params.num_tokens_per_rank) * params.s2d_inner_dim) % 4 == 0 &&
+            (static_cast<int64_t>(params.tokens_per_lsa) * params.s2d_inner_dim) % 4 == 0 &&
             "Dispatch S2D cp.async.bulk: num_tokens_per_rank * s2d_inner_dim must be a "
             "multiple of 4 (flat layout with lsa_team_size <= 3 requires even num_tokens_per_rank)");
 
@@ -891,7 +891,7 @@ ncclResult_t dispatch_impl(
         d_model.max_num_of_tokens_per_rank = max_dispatch_tokens_per_rank;
         d_model.num_of_experts_per_rank = kp.experts_per_rank;
         d_model.ranks_per_lsa_team = kp.ranks_per_lsa_team;
-        d_model.num_of_nodes = num_nodes;
+        d_model.num_of_nodes = num_lsa_teams;
 
         const int smem_size = static_cast<int>(::ht_ep::calculate_dispatch_smem_layout_size(
             params.layout, kernel_spec.payload_bytes, d_config, d_model));
@@ -907,7 +907,7 @@ ncclResult_t dispatch_impl(
         }
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
-        const jit::dispatch_warp_layout_t dispatch_layout = jit::compute_dispatch_warp_layout(num_nodes, params.layout);
+        const jit::dispatch_warp_layout_t dispatch_layout = jit::compute_dispatch_warp_layout(num_lsa_teams, params.layout);
         const int dispatch_wt_total = num_blocks * (dispatch_layout.block_dim / 32);
         ::ht_ep::dispatch_warp_timing_entry_t* d_wt = nullptr;
         CUDA_CHECK(cudaMalloc(&d_wt, dispatch_wt_total * sizeof(::ht_ep::dispatch_warp_timing_entry_t)));
@@ -924,7 +924,7 @@ ncclResult_t dispatch_impl(
             max_dispatch_tokens_per_rank,
             num_blocks,
             forward_dispatch,
-            num_nodes,
+            num_lsa_teams,
             params.lsa_team_size,
             params.layout,
             kp.hidden_dim,
@@ -949,7 +949,7 @@ ncclResult_t call_dispatch(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank,
     int num_tokens_per_chunk,
-    int num_nodes,
+    int num_lsa_teams,
     ncclEpDispatchQuantizationRecipe_t quantization_recipe,
     ncclEpPassDir_t pass_direction,
     int num_blocks,
@@ -963,7 +963,7 @@ ncclResult_t call_dispatch(
         return r;
     }
     return dispatch_impl(
-        params, max_dispatch_tokens_per_rank, num_tokens_per_chunk, num_nodes,
+        params, max_dispatch_tokens_per_rank, num_tokens_per_chunk, num_lsa_teams,
         pass_direction, num_blocks, sf_bytes_per_token, env, stream, kernel_spec);
 }
 
@@ -1004,8 +1004,8 @@ ncclResult_t call_dispatch(
 
     // Runtime config
     kp.local_rank = params.local_rank;
-    kp.node_rank = params.node_rank;
-    kp.num_of_tokens_per_rank = params.num_tokens_per_rank;
+    kp.lsa_team = params.lsa_team;
+    kp.num_of_tokens_per_rank = params.tokens_per_lsa;
     kp.num_real_tokens = params.num_real_tokens;
     kp.combine_local_reduce_enabled = params.combine_local_reduce_enabled;
 
@@ -1061,7 +1061,7 @@ void combine_impl(
     const CombineParams& params,
     int max_dispatch_tokens_per_rank,
     int num_tokens_per_chunk,
-    int num_nodes,
+    int num_lsa_teams,
     int num_blocks,
     const ncclEpEnvConfig* env,
     cudaStream_t stream) {
@@ -1071,18 +1071,18 @@ void combine_impl(
 
     auto kp = build_combine_param_base(params);
 
-    // Select config based on num_nodes (single-node: 12 stages/2 pipelines, multi-node: 5 stages/1 pipeline)
+    // Select config based on num_lsa_teams (single-node: 12 stages/2 pipelines, multi-node: 5 stages/1 pipeline)
     const int num_stages_g2s =
-        (num_nodes == 1) ? NCCL_EP_HT_COMBINE_SINGLENODE_NUM_OF_STAGES_G2S : NCCL_EP_HT_COMBINE_MULTINODE_NUM_OF_STAGES_G2S;
+        (num_lsa_teams == 1) ? NCCL_EP_HT_COMBINE_SINGLENODE_NUM_OF_STAGES_G2S : NCCL_EP_HT_COMBINE_MULTINODE_NUM_OF_STAGES_G2S;
     const int num_stages_s2g =
-        (num_nodes == 1) ? NCCL_EP_HT_COMBINE_SINGLENODE_NUM_OF_STAGES_S2G : NCCL_EP_HT_COMBINE_MULTINODE_NUM_OF_STAGES_S2G;
+        (num_lsa_teams == 1) ? NCCL_EP_HT_COMBINE_SINGLENODE_NUM_OF_STAGES_S2G : NCCL_EP_HT_COMBINE_MULTINODE_NUM_OF_STAGES_S2G;
 
     ::ht_ep::model_config_t model;
     model.hidden_dim = kp.hidden_dim;
     model.max_num_of_tokens_per_rank = max_dispatch_tokens_per_rank;
     model.num_of_experts_per_rank = kp.experts_per_rank;
     model.ranks_per_lsa_team = kp.ranks_per_lsa_team;
-    model.num_of_nodes = num_nodes;
+    model.num_of_nodes = num_lsa_teams;
     // Pick the layout-size instantiation by wire dtype; the width is derived inside the
     // template. Layout size depends only on element width, so FP16 and BF16 (both 2 B)
     // share the BF16 instantiation; only FP32 (4 B) is distinct.
@@ -1092,7 +1092,7 @@ void combine_impl(
                                   num_stages_s2g,
                                   num_tokens_per_chunk,
                                   max_dispatch_tokens_per_rank,
-                                  num_nodes,
+                                  num_lsa_teams,
                                   BACKWARD_COMBINE,
                                   model)) :
                               static_cast<int>(::ht_ep::calculate_combine_smem_layout_size<ncclBfloat16>(
@@ -1100,12 +1100,12 @@ void combine_impl(
                                   num_stages_s2g,
                                   num_tokens_per_chunk,
                                   max_dispatch_tokens_per_rank,
-                                  num_nodes,
+                                  num_lsa_teams,
                                   BACKWARD_COMBINE,
                                   model));
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
-    const jit::combine_warp_layout_t combine_layout = jit::compute_combine_warp_layout(num_nodes);
+    const jit::combine_warp_layout_t combine_layout = jit::compute_combine_warp_layout(num_lsa_teams);
     const int combine_wt_total = num_blocks * (combine_layout.block_dim / 32);
     ::ht_ep::combine_warp_timing_entry_t* d_wt = nullptr;
     ::ht_ep::combine_block_timing_entry_t* d_bt = nullptr;
@@ -1127,7 +1127,7 @@ void combine_impl(
         num_blocks,
         NCCL_EP_HT_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
         BACKWARD_COMBINE,
-        num_nodes,
+        num_lsa_teams,
         params.lsa_team_size,
         params.layout,
         kp.hidden_dim,
@@ -1234,7 +1234,7 @@ void call_combine(
     const CombineParams& params,
     int max_dispatch_tokens_per_rank,
     int num_tokens_per_chunk,
-    int num_nodes,
+    int num_lsa_teams,
     bool backward_combine,
     int num_blocks,
     const ncclEpEnvConfig* env,
@@ -1244,7 +1244,7 @@ void call_combine(
             params,
             max_dispatch_tokens_per_rank,
             num_tokens_per_chunk,
-            num_nodes,
+            num_lsa_teams,
             num_blocks,
             env,
             stream);
@@ -1253,7 +1253,7 @@ void call_combine(
             params,
             max_dispatch_tokens_per_rank,
             num_tokens_per_chunk,
-            num_nodes,
+            num_lsa_teams,
             num_blocks,
             env,
             stream);

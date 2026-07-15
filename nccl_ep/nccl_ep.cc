@@ -1123,10 +1123,10 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
 
     // Merged completion flags: resolve rank0 pointer from window.
     if (lsa_rank != 0) {
-        int node_rank0_global = ncclTeamRankToWorld(comm, lsa_team, 0);
+        int lsa_rank0_global = ncclTeamRankToWorld(comm, lsa_team, 0);
         void* ptr = nullptr;
         NCCL_CHECK_RESULT(
-            ncclGetPeerDevicePointer(ep_group->ht_buffers.completion_flags_window, 0, node_rank0_global, &ptr));
+            ncclGetPeerDevicePointer(ep_group->ht_buffers.completion_flags_window, 0, lsa_rank0_global, &ptr));
         ep_group->ht_buffers.intra_node_write_completion_flags = static_cast<uint32_t*>(ptr);
         ep_group->ht_buffers.combine_intra_node_write_completion_flags = static_cast<uint32_t*>(ptr) + 1;
     }
@@ -2121,7 +2121,7 @@ struct ncclEpHandle {
             // the destination rank's expert buffer. Used by NVLink (intra-node) warps.
             // Value of -1 indicates token is not routed to that rank.
             // dtype: int32_t
-            // layout: [num_nodes * max_dispatch_tokens_per_rank, lsa_team_size]
+            // layout: [num_lsa_teams * max_dispatch_tokens_per_rank, lsa_team_size]
             // usage: dispatch S2G warp group, combine G2S warp group
             // lifetime: valid after metadata_preprocessing, constant within iteration
             // vs NCCL HT: no direct equivalent.
@@ -2133,7 +2133,7 @@ struct ncclEpHandle {
             // to RECEIVE from RDMA (inter-node). Indexed by [node_id, token_id].
             // Primarily used during combine to know which remote tokens to wait for.
             // dtype: bool
-            // layout: [num_nodes, max_dispatch_tokens_per_rank_padded_to_16]
+            // layout: [num_lsa_teams, max_dispatch_tokens_per_rank_padded_to_16]
             //        (padding to 16 required for TMA alignment)
             // usage: dispatch G2S warp (polling), combine inter-node G2S/reduction warps
             // lifetime: valid after metadata_preprocessing, constant within iteration
@@ -2144,19 +2144,19 @@ struct ncclEpHandle {
 
             // Attention-to-RDMA map: boolean mask indicating which local tokens need to be
             // SENT via RDMA (inter-node) to each remote node.
-            // Only allocated when num_nodes > 1.
+            // Only allocated when num_lsa_teams > 1.
             // dtype: bool
-            // layout: [max_dispatch_tokens_per_rank, num_nodes - 1]
+            // layout: [max_dispatch_tokens_per_rank, num_lsa_teams - 1]
             // usage: dispatch N2N (RDMA) warp group
             // lifetime: valid after metadata_preprocessing, constant within iteration
             // vs NCCL HT: closest equivalent to is_token_in_rank for inter-node RDMA.
             //   - is_token_in_rank: per-rank granularity [num_tokens, num_ranks]
-            //   - attn_to_rdma_map: per-node granularity [num_tokens, num_nodes-1] (RDMA only)
+            //   - attn_to_rdma_map: per-node granularity [num_tokens, num_lsa_teams-1] (RDMA only)
             bool* attn_to_rdma_map;
 
             // Per-token per-rank bitmask cache produced during preprocessing.
             // dtype: rank_mask_t<ceil(lsa_team_size/64)> (one uint64_t word per 64 ranks)
-            // layout: [num_nodes * max_send_tokens_per_rank * ranks_per_node]
+            // layout: [num_lsa_teams * max_send_tokens_per_rank * ranks_per_node]
             void* token_rank_mask;
 
             // Local expert routing map: per-expert routing for tokens in this rank's buffer.
@@ -2211,9 +2211,9 @@ struct ncclEpHandle {
 
             // RDMA inter-node group flags: atomic completion flags for each remote node.
             // Remote ranks increment via RDMA atomic fetch-add to signal chunk completion.
-            // Only allocated when num_nodes > 1.
+            // Only allocated when num_lsa_teams > 1.
             // dtype: uint64_t
-            // layout: [num_nodes - 1]
+            // layout: [num_lsa_teams - 1]
             // usage: dispatch N2N warp (signaling), dispatch G2S warp (polling)
             // lifetime: reset to 0 at init, incremented by remote RDMA atomics
             // uint64_t* rdma_inter_node_group_flags;
@@ -3701,8 +3701,8 @@ ncclResult_t ncclEpDispatch(
         params.mr_info.num_max_rdma_chunked_send_tokens =
             is_single_node ? 0 : group->gin_config.num_max_rdma_chunked_send_tokens;
         params.local_rank = group->lsa_rank;
-        params.node_rank = group->rdma_rank;
-        params.num_tokens_per_rank = group->config.max_dispatch_tokens_per_rank;
+        params.lsa_team = group->rdma_rank;
+        params.tokens_per_lsa = group->config.max_dispatch_tokens_per_rank;
         // EM local-fanout: dispatch dedups S2G; receiver local_dup fills secondaries.
         const bool em_unfused_active = em_local_dup_active(group, handle->layout);
         params.local_dup_num_sms = em_unfused_active ? static_cast<int>(group->prolog_epilog_sms) : 0;
@@ -4397,8 +4397,8 @@ ncclResult_t ncclEpCombine(
             .guard_offset = is_single_node ? 0 : group->gin_config.combine_guard_offset,
         };
         params.local_rank = group->lsa_rank;
-        params.node_rank = group->rdma_rank;
-        params.num_tokens_per_rank = group->config.max_dispatch_tokens_per_rank;
+        params.lsa_team = group->rdma_rank;
+        params.tokens_per_lsa = group->config.max_dispatch_tokens_per_rank;
         params.num_real_tokens = num_combined_tokens;
         params.num_recv_tokens = num_tokens;
         params.combine_local_reduce_enabled = em_local_dup_active(group, handle->layout);
@@ -4431,7 +4431,7 @@ ncclResult_t ncclEpCombine(
             params,
             group->ht_aligned_max_tokens, // chunk-aligned stride
             group->ht_tokens_per_chunk, // tokens per dispatch/combine chunk
-            group->rdma_team_size, // num_nodes (RDMA domain size)
+            group->rdma_team_size, // num_lsa_teams (RDMA domain size)
             backward_combine, // backward mode flag
             static_cast<int>(group->comm_num_sms),
             &group->env,

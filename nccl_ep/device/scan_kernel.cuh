@@ -106,7 +106,7 @@ struct scan_geometry_t {
     int num_of_tokens_per_warp;
     int num_of_tokens_per_block;
     int rdma_to_attn_map_size_per_node;
-    int experts_per_node_packed;
+    int experts_per_lsa_team_packed;
     int packed_row_bytes;
     int thread_starting_token;
     int warp_id;
@@ -190,7 +190,7 @@ __device__ __forceinline__ void extract_lsa_ranks_meta(
         int rdma_map_id = src_lsa_team * g.rdma_to_attn_map_size_per_node + src_token_id;
 
         const uint8_t* bitmap_row =
-            input_routing_map + token_id * g.packed_row_bytes + lsa_team_id * g.experts_per_node_packed;
+            input_routing_map + token_id * g.packed_row_bytes + lsa_team_id * g.experts_per_lsa_team_packed;
         rank_mask_t<NUM_MASK_WORDS> rank_mask =
             bitmap_row_to_rank_mask<NUM_MASK_WORDS, LSA_TEAM_SIZE>(bitmap_row, experts_per_rank);
 
@@ -304,7 +304,7 @@ __device__ __forceinline__ void write_local_routing(
 
     if (lane_participates) {
         local_rank_bitmap_row =
-            input_routing_map + current_token_id * g.packed_row_bytes + node_rank * g.experts_per_node_packed;
+            input_routing_map + current_token_id * g.packed_row_bytes + node_rank * g.experts_per_lsa_team_packed;
         local_expert_routing_map_store_base_addr = local_expert_routing_map + local_rank_slot * experts_per_rank;
     }
 
@@ -541,7 +541,7 @@ __device__ __forceinline__ void fill_attn_to_rdma(
     const int num_of_total_token_rows = (NUM_LSA_TEAMS - 1) * num_of_tokens_per_rank;
     const int num_of_token_rows_per_thread = ((num_of_total_token_rows - 1) / NUM_OF_TOTAL_THREADS) + 1;
     int tid = threadIdx.x + blockIdx.x * NUM_THREADS_PER_BLOCK;
-    const int experts_per_node = experts_per_rank * LSA_TEAM_SIZE;
+    const int experts_per_lsa_team = experts_per_rank * LSA_TEAM_SIZE;
 
     for (int i = 0; i < num_of_token_rows_per_thread; i++) {
         int current_token_id = i * NUM_OF_TOTAL_THREADS + tid;
@@ -555,11 +555,11 @@ __device__ __forceinline__ void fill_attn_to_rdma(
             input_routing_map +
             ((node_rank * LSA_TEAM_SIZE + local_rank) * num_of_tokens_per_rank + current_token_local_id) *
                 g.packed_row_bytes +
-            current_token_node_id * g.experts_per_node_packed;
+            current_token_node_id * g.experts_per_lsa_team_packed;
 
         bool* attn_to_rdma_map_base_addr =
             attn_to_rdma_map + (current_token_local_id * (NUM_LSA_TEAMS - 1) + attn_node_id);
-        *attn_to_rdma_map_base_addr = bitmap_range_has_set_bit(bitmap_row, 0, experts_per_node);
+        *attn_to_rdma_map_base_addr = bitmap_range_has_set_bit(bitmap_row, 0, experts_per_lsa_team);
     }
 }
 
@@ -576,9 +576,9 @@ compute_scan_geometry(int num_of_tokens_per_rank, int experts_per_rank) {
     g.num_of_tokens_per_block = g.num_of_tokens_per_warp * NUM_OF_WARPS_PER_BLOCK;
     g.rdma_to_attn_map_size_per_node = rdma_to_attn_row_stride(num_of_tokens_per_rank);
 
-    const int experts_per_node = experts_per_rank * LSA_TEAM_SIZE;
-    g.experts_per_node_packed = (experts_per_node + 7) / 8;
-    g.packed_row_bytes = g.experts_per_node_packed * NUM_LSA_TEAMS;
+    const int experts_per_lsa_team = experts_per_rank * LSA_TEAM_SIZE;
+    g.experts_per_lsa_team_packed = (experts_per_lsa_team + 7) / 8;
+    g.packed_row_bytes = g.experts_per_lsa_team_packed * NUM_LSA_TEAMS;
 
     const int block_starting_token = blockIdx.x * g.num_of_tokens_per_block;
     g.warp_id = threadIdx.x / WARP_SIZE;
@@ -617,7 +617,7 @@ __device__ __forceinline__ void extract_local_experts_meta(
         if (tok >= g.num_of_total_attn_tokens) break;
         const uint8_t* row =
             input_routing_map + static_cast<size_t>(tok) * g.packed_row_bytes +
-            lsa_team_id * g.experts_per_node_packed;
+            lsa_team_id * g.experts_per_lsa_team_packed;
 #pragma unroll
         for (int k = 0; k < EXPERTS_PER_RANK; k++) {
             const int bit = local_expert_bit_base + k;

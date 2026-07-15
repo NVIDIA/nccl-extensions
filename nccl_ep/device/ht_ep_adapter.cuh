@@ -79,18 +79,18 @@ void sparse_to_dense_prob(
 void sparse_to_dense_prob_combine(
     const float* topk_weights, // [num_tokens, topk] - sparse weights from combine input
     const bool* local_expert_routing_map, // [num_tokens, experts_per_rank] - from handle
-    float* dense_prob, // [num_tokens, experts_per_node] - output (pre-zeroed)
+    float* dense_prob, // [num_tokens, experts_per_lsa_team] - output (pre-zeroed)
     int num_tokens,
     int num_topk,
     int experts_per_rank,
-    int experts_per_node, // = experts_per_rank * ranks_per_node
+    int experts_per_lsa_team, // = experts_per_rank * ranks_per_node
     int local_rank, // rank within node
     cudaStream_t stream);
 
 // ============================================================================
 // Kernel: Convert dense prob output to sparse format (for dispatch output)
 // ============================================================================
-// HT outputs: dense_prob[recv_token][experts_per_node]
+// HT outputs: dense_prob[recv_token][experts_per_lsa_team]
 // HT expects: recv_topk_weights[recv_token][topk], recv_topk_idx[recv_token][topk]
 // Uses local_expert_routing_map to know which experts each token is routed to.
 // recv_topk_idx numbering is selected by recv_topk_idx_kind:
@@ -99,14 +99,14 @@ void sparse_to_dense_prob_combine(
 //             matching the LL rank-major GLOBAL contract.
 // recv_topk_idx_kind must be resolved (no AUTO) by the caller.
 void dense_to_sparse_prob(
-    const float* dense_prob, // [num_recv_tokens, experts_per_node] - from IPC buffer
+    const float* dense_prob, // [num_recv_tokens, experts_per_lsa_team] - from IPC buffer
     const bool* local_expert_routing_map, // [num_recv_tokens, experts_per_rank] - from preprocessing
     float* recv_topk_weights, // EM: [N]; FLAT/RM: [N, topk]
     int64_t* recv_topk_idx, // [num_recv_tokens, topk] - LOCAL or GLOBAL expert id (see kind); nullptr under EM
     int num_recv_tokens,
     int topk,
     int experts_per_rank,
-    int experts_per_node, // = experts_per_rank * ranks_per_node
+    int experts_per_lsa_team, // = experts_per_rank * ranks_per_node
     int local_rank, // rank within node
     int global_expert_offset, // = group_rank * experts_per_rank; added to local id under GLOBAL
     ncclEpExpertIdKind_t recv_topk_idx_kind,

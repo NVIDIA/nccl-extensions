@@ -3448,10 +3448,10 @@ ncclResult_t ncclEpDispatch(
 
         // HT dispatch kernel uses TMA for token/prob/scaling-factor payloads.
         // Keep these constraints at API-entry to fail fast on unsupported shapes.
-        const int experts_per_node = group->num_local_experts * group->lsa_team_size;
+        const int experts_per_lsa_team = group->num_local_experts * group->lsa_team_size;
         assert(
-            (experts_per_node * static_cast<int>(sizeof(float))) % 16 == 0 &&
-            "HT dispatch requires experts_per_node to be multiple of 4 (16B prob TMA alignment)");
+            (experts_per_lsa_team * static_cast<int>(sizeof(float))) % 16 == 0 &&
+            "HT dispatch requires experts_per_lsa_team to be multiple of 4 (16B prob TMA alignment)");
 
         const size_t token_bytes_per_token = static_cast<size_t>(hidden) * ncclTypeSize(x->datatype);
         assert(
@@ -3814,7 +3814,7 @@ ncclResult_t ncclEpDispatch(
             // the caller buffer later in launch_dispatch_permute.
             int num_recv_tokens = em_permute_active ? static_cast<int>(group->max_recv_tokens)
                                                     : static_cast<int>(recv_copy_rows);
-            int experts_per_node = group->num_local_experts * group->lsa_team_size;
+            int experts_per_lsa_team = group->num_local_experts * group->lsa_team_size;
             // recv_topk_idx numbering selector (matches LL rank-major path):
             // version-safe read of layout_info, resolve AUTO -> LOCAL, pass the
             // concrete kind plus the per-group GLOBAL offset to the kernel.
@@ -3841,7 +3841,7 @@ ncclResult_t ncclEpDispatch(
                 num_recv_tokens,
                 handle->num_topk,
                 group->num_local_experts,
-                experts_per_node,
+                experts_per_lsa_team,
                 group->lsa_rank,
                 global_expert_offset,
                 recv_topk_idx_kind,
@@ -4277,8 +4277,8 @@ ncclResult_t ncclEpCombine(
         /* ===== Convert sparse topk_weights to dense prob for backward combine ===== */
         // For backward combine, convert sparse input weights to dense format for HT kernel
         if (backward_combine) {
-            int experts_per_node = group->num_local_experts * group->lsa_team_size;
-            size_t dense_prob_size = static_cast<size_t>(num_tokens) * experts_per_node * sizeof(float);
+            int experts_per_lsa_team = group->num_local_experts * group->lsa_team_size;
+            size_t dense_prob_size = static_cast<size_t>(num_tokens) * experts_per_lsa_team * sizeof(float);
 
             // Zero-initialize the dense prob buffer before scattering
             CUDA_CHECK(cudaMemsetAsync(
@@ -4287,7 +4287,7 @@ ncclResult_t ncclEpCombine(
                 dense_prob_size,
                 stream));
 
-            // Scatter sparse weights into dense prob [num_recv, experts_per_node].
+            // Scatter sparse weights into dense prob [num_recv, experts_per_lsa_team].
             // em-permute uses FLAT inputs (gathered above for EM, or passed
             // through for FLAT) keyed by the FLAT main LERM; nvlink_dup/local_dup EM keeps
             // the 1D EM input keyed by the EM-shape LERM scratch.
@@ -4304,7 +4304,7 @@ ncclResult_t ncclEpCombine(
                 num_tokens,
                 prob_stride,
                 group->num_local_experts, // experts_per_rank
-                experts_per_node,
+                experts_per_lsa_team,
                 group->lsa_rank,
                 stream);
         }

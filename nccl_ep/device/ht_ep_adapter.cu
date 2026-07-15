@@ -155,11 +155,11 @@ template void sparse_to_dense_prob<int64_t>(const int64_t*, const float*, float*
 __global__ void sparse_to_dense_prob_combine_kernel(
     const float* __restrict__ topk_weights,           // [num_tokens, topk]
     const bool* __restrict__ local_expert_routing_map, // [num_tokens, experts_per_rank]
-    float* __restrict__ dense_prob,                   // [num_tokens, experts_per_node]
+    float* __restrict__ dense_prob,                   // [num_tokens, experts_per_lsa_team]
     int num_tokens,
     int num_topk,
     int experts_per_rank,
-    int experts_per_node,
+    int experts_per_lsa_team,
     int local_rank) {
     int token = blockIdx.x * blockDim.x + threadIdx.x;
     if (token >= num_tokens) return;
@@ -173,7 +173,7 @@ __global__ void sparse_to_dense_prob_combine_kernel(
 
             // Place at correct position in dense matrix
             // Local expert e on local_rank maps to: local_rank * experts_per_rank + e
-            int dense_idx = token * experts_per_node + local_rank * experts_per_rank + e;
+            int dense_idx = token * experts_per_lsa_team + local_rank * experts_per_rank + e;
             dense_prob[dense_idx] = weight;
 
             k_in++;
@@ -191,7 +191,7 @@ void sparse_to_dense_prob_combine(
     int num_tokens,
     int num_topk,
     int experts_per_rank,
-    int experts_per_node,
+    int experts_per_lsa_team,
     int local_rank,
     cudaStream_t stream) {
     int block_size = 256;
@@ -204,7 +204,7 @@ void sparse_to_dense_prob_combine(
         num_tokens,
         num_topk,
         experts_per_rank,
-        experts_per_node,
+        experts_per_lsa_team,
         local_rank);
 }
 
@@ -218,14 +218,14 @@ void sparse_to_dense_prob_combine(
 // wire-format global id (= global_expert_offset + local_expert) when kind=GLOBAL.
 // kind must be resolved (no AUTO) by the host wrapper.
 __global__ void dense_to_sparse_prob_kernel(
-    const float* __restrict__ dense_prob,              // [num_recv_tokens, experts_per_node]
+    const float* __restrict__ dense_prob,              // [num_recv_tokens, experts_per_lsa_team]
     const bool* __restrict__ local_expert_routing_map, // [num_recv_tokens, experts_per_rank]
     float* __restrict__ recv_topk_weights,             // EM: [N]; FLAT/RM: [N, topk]
     int64_t* __restrict__ recv_topk_idx,               // [num_recv_tokens, topk]; nullptr under EM
     int num_recv_tokens,
     int topk,
     int experts_per_rank,
-    int experts_per_node,
+    int experts_per_lsa_team,
     int local_rank,
     int global_expert_offset, // = group_rank * experts_per_rank; added to local id under GLOBAL
     ncclEpExpertIdKind_t recv_topk_idx_kind,
@@ -239,7 +239,7 @@ __global__ void dense_to_sparse_prob_kernel(
         float weight = 0.0f;
         for (int e = 0; e < experts_per_rank; e++) {
             if (local_expert_routing_map[token * experts_per_rank + e]) {
-                int dense_idx = token * experts_per_node + local_rank * experts_per_rank + e;
+                int dense_idx = token * experts_per_lsa_team + local_rank * experts_per_rank + e;
                 weight = dense_prob[dense_idx];
                 break;
             }
@@ -264,9 +264,9 @@ __global__ void dense_to_sparse_prob_kernel(
                                     static_cast<int64_t>(e);
 
       // Get weight from dense output (indexed by local expert within node)
-            // dense_prob layout: [token, experts_per_node] where experts_per_node = experts_per_rank * ranks_per_node
+            // dense_prob layout: [token, experts_per_lsa_team] where experts_per_lsa_team = experts_per_rank * ranks_per_node
             // Local rank's experts are at offset: local_rank * experts_per_rank
-            int dense_idx = token * experts_per_node + local_rank * experts_per_rank + e;
+            int dense_idx = token * experts_per_lsa_team + local_rank * experts_per_rank + e;
             float weight = dense_prob[dense_idx];
 
             // Write outputs
@@ -341,7 +341,7 @@ void dense_to_sparse_prob(
     int num_recv_tokens,
     int topk,
     int experts_per_rank,
-    int experts_per_node,
+    int experts_per_lsa_team,
     int local_rank,
     int global_expert_offset,
     ncclEpExpertIdKind_t recv_topk_idx_kind,
@@ -358,7 +358,7 @@ void dense_to_sparse_prob(
         num_recv_tokens,
         topk,
         experts_per_rank,
-        experts_per_node,
+        experts_per_lsa_team,
         local_rank,
         global_expert_offset,
         recv_topk_idx_kind,
@@ -862,11 +862,11 @@ ncclResult_t dispatch_impl(
         // token_dtype (dispatch_token_data_type_literal in launch_dispatch). No host-side
         // compile-time token-type switch is needed -- rely on the JIT.
         using TOKEN_DATA_TYPE = uint16_t;
-        // TMA requires prob buffer (experts_per_node * sizeof(float)) to be 16B aligned
+        // TMA requires prob buffer (experts_per_lsa_team * sizeof(float)) to be 16B aligned
         // Check alignment at runtime now that experts_per_rank is dynamic
-        const int experts_per_node = params.experts_per_rank * params.lsa_team_size;
+        const int experts_per_lsa_team = params.experts_per_rank * params.lsa_team_size;
         assert(
-            (experts_per_node * sizeof(float)) % 16 == 0 && "experts_per_node must be multiple of 4 for TMA alignment");
+            (experts_per_lsa_team * sizeof(float)) % 16 == 0 && "experts_per_lsa_team must be multiple of 4 for TMA alignment");
         // 16B cp.async.bulk alignment for the S2D map fetch; matters when s2d_inner_dim < 4.
         assert(
             (static_cast<int64_t>(params.num_tokens_per_rank) * params.s2d_inner_dim) % 4 == 0 &&
@@ -1065,9 +1065,9 @@ void combine_impl(
     int num_blocks,
     const ncclEpEnvConfig* env,
     cudaStream_t stream) {
-    // TMA requires prob buffer (experts_per_node * sizeof(float)) to be 16B aligned
-    const int experts_per_node = params.experts_per_rank * params.lsa_team_size;
-    assert((experts_per_node * sizeof(float)) % 16 == 0 && "experts_per_node must be multiple of 4 for TMA alignment");
+    // TMA requires prob buffer (experts_per_lsa_team * sizeof(float)) to be 16B aligned
+    const int experts_per_lsa_team = params.experts_per_rank * params.lsa_team_size;
+    assert((experts_per_lsa_team * sizeof(float)) % 16 == 0 && "experts_per_lsa_team must be multiple of 4 for TMA alignment");
 
     auto kp = build_combine_param_base(params);
 

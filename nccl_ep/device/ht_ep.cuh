@@ -1202,9 +1202,9 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
         int chunk_first_token = cidx * TOKENS_PER_CHUNK;
         src.token_base = attn_input_token + chunk_first_token * HIDDEN_DIM;
         if constexpr (FORWARD_DISPATCH) {
-            // attn_input_prob is laid out per token as LSA_TEAMS blocks of experts_per_node floats.
-            const int experts_per_node = experts_per_rank * LSA_TEAM_SZ;
-            const int prob_row_stride = experts_per_node * LSA_TEAMS;
+            // attn_input_prob is laid out per token as LSA_TEAMS blocks of experts_per_lsa_team floats.
+            const int experts_per_lsa_team = experts_per_rank * LSA_TEAM_SZ;
+            const int prob_row_stride = experts_per_lsa_team * LSA_TEAMS;
             src.prob_base = attn_input_prob + chunk_first_token * prob_row_stride;
         }
         if constexpr (HAS_SF) {
@@ -1323,9 +1323,9 @@ __forceinline__ __device__ void dispatch_g2s_issue_token(
         const void* sf_src = nullptr;
         if constexpr (FORWARD_DISPATCH) {
             // Advance by whole token rows, then pick this node's expert slice within the row.
-            const int experts_per_node = experts_per_rank * LSA_TEAM_SZ;
-            const int prob_row_stride = experts_per_node * LSA_TEAMS;
-            prob_src = src.prob_base + cur_tokid * prob_row_stride + my_lteam * experts_per_node;
+            const int experts_per_lsa_team = experts_per_rank * LSA_TEAM_SZ;
+            const int prob_row_stride = experts_per_lsa_team * LSA_TEAMS;
+            prob_src = src.prob_base + cur_tokid * prob_row_stride + my_lteam * experts_per_lsa_team;
         }
         if constexpr (HAS_SF) {
             sf_src = src.sf_base + cur_tokid * sf_bytes_per_token;

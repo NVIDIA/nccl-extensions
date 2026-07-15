@@ -155,7 +155,7 @@ inline void launch_combine(
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "combine"
-             << "_nodes" << num_lsa_teams << "_lsa" << lsa_team_size << "_hdim" << hidden_dim << "_g2s"
+             << "_LSATeams" << num_lsa_teams << "_lsa" << lsa_team_size << "_hdim" << hidden_dim << "_g2s"
              << num_of_stages_g2s << "_s2g" << num_of_stages_s2g << "_chunk" << num_of_tokens_per_chunk << "_maxt"
              << max_tokens_per_rank << "_group" << num_of_tokens_per_group << "_blocks" << num_of_blocks << "_extra"
              << num_of_additional_in_flight_s2g << (backward_combine ? "_bwd" : "_fwd")

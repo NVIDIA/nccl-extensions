@@ -153,7 +153,7 @@ inline ncclResult_t launch_dispatch(
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "dispatch"
-             << "_nodes" << num_lsa_teams << "_lsa" << lsa_team_size << "_hdim" << hidden_dim << "_stages"
+             << "_LSATeams" << num_lsa_teams << "_lsa" << lsa_team_size << "_hdim" << hidden_dim << "_stages"
              << num_of_stages << "_inflt" << num_of_in_flight_s2g << "_chunk" << num_of_tokens_per_chunk << "_maxt"
              << max_tokens_per_rank << "_blocks" << num_of_blocks << (forward_dispatch ? "_fwd" : "_bwd")
              << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_fl")

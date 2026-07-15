@@ -112,7 +112,7 @@ inline void launch_scan_flat(
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "scan_flat"
-             << "_nodes" << num_lsa_teams << "_lsa" << lsa_team_size << "_threads" << num_threads_per_block << "_blocks"
+             << "_LSATeams" << num_lsa_teams << "_lsa" << lsa_team_size << "_threads" << num_threads_per_block << "_blocks"
              << num_of_blocks << (enable_per_expert_counts ? "_pec" : "_nopec") << (enable_em_permute ? "_em" : "_noem");
         // EM out dtype is baked into the variant, so it's part of the cache key.
         if (enable_em_permute) name << "_epr" << experts_per_rank << (out_is_int64 ? "_i64" : "_i32");
@@ -164,7 +164,7 @@ inline void launch_scan_em(
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "scan_em"
-             << "_nodes" << num_lsa_teams << "_lsa" << lsa_team_size << "_threads" << num_threads_per_block << "_blocks"
+             << "_LSATeams" << num_lsa_teams << "_lsa" << lsa_team_size << "_threads" << num_threads_per_block << "_blocks"
              << num_of_blocks;
         return name.str();
     }();

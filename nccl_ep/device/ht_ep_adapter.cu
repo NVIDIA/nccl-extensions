@@ -775,7 +775,7 @@ template <typename TOKEN_DATA_TYPE>
     kp.pad_alignment = params.pad_alignment;
     kp.expected_rdma_flag_value = params.expected_rdma_flag_value;
     kp.expected_intra_node_flag_value = params.expected_intra_node_flag_value;
-    kp.rdma_inter_node_group_flags = params.rdma_inter_node_group_flags;
+    kp.dispatch_gin_G2S_flags = params.dispatch_gin_G2S_flags;
     kp.intra_node_write_completion_flags = params.intra_node_write_completion_flags;
     kp.dispatch_grid_barrier_counter = params.dispatch_grid_barrier_counter;
 
@@ -983,10 +983,10 @@ ncclResult_t call_dispatch(
     kp.attn_output_prob = params.attn_output_prob;
 
     // RDMA buffers (multiple LSA teams only)
-    kp.rdma_intra_node_red_token = params.rdma_intra_node_red_token;
-    kp.rdma_intra_node_red_prob = params.rdma_intra_node_red_prob;
-    kp.rdma_inter_node_group_token = params.combine_rdma_inter_node_group_token;
-    kp.rdma_inter_node_group_prob = params.combine_rdma_inter_node_group_prob;
+    kp.combine_gin_RED_tokens = params.combine_gin_RED_tokens;
+    kp.combine_gin_RED_prob = params.combine_gin_RED_prob;
+    kp.combine_gin_G2S_tokens = params.combine_gin_G2S_tokens;
+    kp.combine_gin_G2S_prob = params.combine_gin_G2S_prob;
 
     // Metadata
     kp.sparse_to_dense_map = params.sparse_to_dense_map;
@@ -997,7 +997,7 @@ ncclResult_t call_dispatch(
     // Sync flags
     kp.expected_rdma_flag_value = params.combine_expected_rdma_flag_value;
     kp.expected_intra_node_flag_value = params.combine_expected_intra_node_flag_value;
-    kp.rdma_inter_node_group_flags = params.combine_rdma_inter_node_group_flags;
+    kp.combine_gin_G2S_flags = params.combine_gin_G2S_flags;
     kp.intra_node_write_completion_flags = params.combine_intra_node_write_completion_flags;
     kp.combine_grid_barrier_counter = params.combine_grid_barrier_counter;
     kp.guard_enabled = params.guard_enabled;
@@ -1022,9 +1022,9 @@ ncclResult_t call_dispatch(
     // Use offsets relative to gin_base_ptr
     kp.mr_info = {
         .combine_red_token_offset = params.mr_info.combine_red_token_offset,
-        .combine_n2n_token_offset = params.mr_info.combine_n2n_token_offset,
+        .combine_g2s_token_offset = params.mr_info.combine_g2s_token_offset,
         .combine_red_prob_offset = params.mr_info.combine_red_prob_offset,
-        .combine_n2n_prob_offset = params.mr_info.combine_n2n_prob_offset,
+        .combine_g2s_prob_offset = params.mr_info.combine_g2s_prob_offset,
         .guard_offset = params.mr_info.guard_offset
     };
 

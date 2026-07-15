@@ -636,8 +636,8 @@ struct ncclEpGroup {
     // nccl_ep_env_* accessors.
     ncclEpEnvConfig env;
 
-    // HT inter-node RDMA stride: max_dispatch_tokens_per_rank rounded up to a whole
-    // number of dispatch chunks so a partial final chunk stays within a node's region.
+    // HT cross-LSA-team RDMA stride: max_dispatch_tokens_per_rank rounded up to a whole
+    // number of dispatch chunks so a partial final chunk stays within an LSA team's region.
     int ht_aligned_max_tokens = 0;
 
     // Resolved HT dispatch/combine tokens-per-chunk for this group. RDMA configs
@@ -648,7 +648,7 @@ struct ncclEpGroup {
 
     struct {
         // Device communicator (single comm, multiple contexts)
-        // HT internode uses ncclTeamRail on the base communicator
+        // HT cross-LSA-team comms use ncclTeamRail on the base communicator
         ncclDevComm_t* dcomms = nullptr;       // Host array of device communicators
         ncclDevComm_t* d_dcomms = nullptr;     // Device array of device communicators
         int num_comms = 0;                     // Number of communicators (always 1)
@@ -665,9 +665,9 @@ struct ncclEpGroup {
 
         // Used by kernels to calculate actual addresses for RDMA puts
         size_t combine_red_token_offset = 0;
-        size_t combine_n2n_token_offset = 0;
+        size_t combine_g2s_token_offset = 0;
         size_t combine_red_prob_offset = 0;
-        size_t combine_n2n_prob_offset = 0;
+        size_t combine_g2s_prob_offset = 0;
         size_t token_staging_offset = 0;
         size_t dense_prob_offset = 0;
         size_t scaling_factor_staging_offset = 0;
@@ -728,7 +728,7 @@ struct ncclEpGroup {
     void* sync_buffer = nullptr; // device buffer, int[nRanks] aligned
     ncclWindow_t* sync_window = nullptr; // device ptr to the registered window handle
 
-  // HT buffers for intranode communication
+  // HT buffers for intra-LSA communication
     struct {
     // IPC-mapped buffer pointer arrays (fixed-size, indexed by local NVL rank)
     // Host arrays for population and cleanup
@@ -764,13 +764,13 @@ struct ncclEpGroup {
         uint64_t* dev_combine_expected_rdma = nullptr;
         uint32_t* dev_combine_expected_intra = nullptr;
 
-    // RDMA buffers (multi-node only)
-        uint64_t* rdma_inter_node_group_flags;
-        uint16_t* rdma_intra_node_red_token;
-        float* rdma_intra_node_red_prob;
-        uint16_t* combine_rdma_inter_node_group_token;
-        float* combine_rdma_inter_node_group_prob;
-        uint64_t* combine_rdma_inter_node_group_flags;
+    // RDMA buffers (multi-LSA-team only)
+        uint64_t* dispatch_gin_G2S_flags;
+        uint16_t* combine_gin_RED_tokens;
+        float* combine_gin_RED_prob;
+        uint16_t* combine_gin_G2S_tokens;
+        float* combine_gin_G2S_prob;
+        uint64_t* combine_gin_G2S_flags;
 
     // Pre-registered dispatch buffers (group-level, allocated during Group Create)
     // These are pre-registered with GIN to avoid ~60ms registration overhead during dispatch
@@ -931,7 +931,7 @@ buildIntranodePtrArray(const ncclEpGroup_t group, const ncclEpTensor_t* tensor, 
 static bool em_staging_indexed_by_em_slot(ncclEpGroup_t group);
 static ncclResult_t ht_query_num_recv_tokens(ncclEpHandle_t handle, cudaStream_t stream, unsigned int* num_recv_tokens);
 
-// HT Intranode Initialization (adapted for public NCCL APIs)
+// HT Intra-LSA Initialization (adapted for public NCCL APIs)
 static ncclResult_t
 init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, cudaStream_t stream) {
     ncclComm_t comm = ep_group->comm;
@@ -949,7 +949,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // Phase 1: Allocate all buffers upfront
     // =========================================================================
 
-    // Consolidated intranode mega-buffer: single allocation for all 4 shared buffers.
+    // Consolidated intra-LSA mega-buffer: single allocation for all 4 shared buffers.
     // Expert-prob buffers are sized by HT inner-domain cardinality (LSA team size).
     auto align_ipc = [](size_t s) -> size_t { return (s + 255) & ~size_t(255); };
 
@@ -1070,7 +1070,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     }
 
     // =========================================================================
-    // Phase 2: Register windows for shared intranode regions
+    // Phase 2: Register windows for shared intra-LSA regions
     // Consolidated registration: mega buffer (token+prob+combine) & completion flags
     // =========================================================================
     // Register the mega buffer
@@ -1137,7 +1137,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     return ncclSuccess;
 }
 
-// HT Intranode Cleanup
+// HT Intra-LSA Cleanup
 static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
     if (!ep_group->ht_buffers.initialized) return ncclSuccess;
 
@@ -1150,7 +1150,7 @@ static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
         ep_group->ht_buffers.completion_flags_window = {};
     }
 
-    // Free consolidated intranode mega-buffer (replaces 4 individual cudaFree calls)
+    // Free consolidated intra-LSA mega-buffer (replaces 4 individual cudaFree calls)
     if (ep_group->ht_buffers.ipc_mega_buffer) {
         NCCL_CHECK_RESULT(ncclMemFree(ep_group->ht_buffers.ipc_mega_buffer));
         ep_group->ht_buffers.ipc_mega_buffer = nullptr;
@@ -1217,12 +1217,12 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     }
 
     int rdma_team_size = ep_group->rdma_team_size;
-    // HT internode uses NCCL team semantics: outer domain=rail, inner domain=lsa.
+    // HT cross-LSA-team comms use NCCL team semantics: outer domain=rail (cross-LSA-team), inner domain=lsa.
     int lsa_team_size = ep_group->lsa_team_size;
     ep_group->ht_buffers.internode_initialized = false;
 
     if (rdma_team_size <= 1) {
-        // Single HT outer-domain node — no internode RDMA, but the LSA guard needs a minimal devComm.
+        // Single HT outer-domain LSA team — no cross-LSA-team RDMA, but the LSA guard needs a minimal devComm.
         ep_group->gin_config.num_dcomms = 1;
         ep_group->gin_config.dcomms = new ncclDevComm_t[1];
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
@@ -1248,20 +1248,20 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     constexpr size_t GIN_ALIGNMENT = 4096;
     auto align_size = [](size_t sz, size_t alignment) { return (sz + alignment - 1) & ~(alignment - 1); };
 
-    // Chunk-aligned stride for the inter-node RDMA buffers, resolved once at group
+    // Chunk-aligned stride for the cross-LSA-team RDMA buffers, resolved once at group
     // creation (ep_group->ht_aligned_max_tokens / ht_tokens_per_chunk); the
     // dispatch/combine kernels must use the same stride and chunk size.
     const int ht_max_tokens = ep_group->ht_aligned_max_tokens;
     const int ht_tokens_per_chunk = ep_group->ht_tokens_per_chunk;
-    size_t rdma_intra_node_red_token_sz = align_size(
+    size_t combine_gin_RED_tokens_sz = align_size(
         static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * ep_group->config.max_token_bytes,
         GIN_ALIGNMENT);
-    size_t combine_rdma_inter_node_group_token_sz = rdma_intra_node_red_token_sz;
-    size_t rdma_intra_node_red_prob_sz = align_size(
+    size_t combine_gin_G2S_tokens_sz = combine_gin_RED_tokens_sz;
+    size_t combine_gin_RED_prob_sz = align_size(
         static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * (ep_group->num_local_experts * lsa_team_size) *
             sizeof(float),
         GIN_ALIGNMENT);
-    size_t combine_rdma_inter_node_group_prob_sz = rdma_intra_node_red_prob_sz;
+    size_t combine_gin_G2S_prob_sz = combine_gin_RED_prob_sz;
 
     int max_chunks_per_rank = (ht_max_tokens + ht_tokens_per_chunk - 1) / ht_tokens_per_chunk;
     size_t flags_sz =
@@ -1293,10 +1293,10 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         GIN_ALIGNMENT);
 
     size_t total_gin_buffer_size = 0;
-    total_gin_buffer_size += rdma_intra_node_red_token_sz;
-    total_gin_buffer_size += combine_rdma_inter_node_group_token_sz;
-    total_gin_buffer_size += rdma_intra_node_red_prob_sz;
-    total_gin_buffer_size += combine_rdma_inter_node_group_prob_sz;
+    total_gin_buffer_size += combine_gin_RED_tokens_sz;
+    total_gin_buffer_size += combine_gin_G2S_tokens_sz;
+    total_gin_buffer_size += combine_gin_RED_prob_sz;
+    total_gin_buffer_size += combine_gin_G2S_prob_sz;
     total_gin_buffer_size += flags_sz * 2;
     total_gin_buffer_size += guard_sz * 2;
     total_gin_buffer_size += token_staging_sz;
@@ -1311,24 +1311,24 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     uint8_t* ptr = reinterpret_cast<uint8_t*>(ep_group->gin_config.gin_base_ptr);
     size_t offset = 0;
 
-    ep_group->ht_buffers.rdma_intra_node_red_token = reinterpret_cast<uint16_t*>(ptr + offset);
-    offset += rdma_intra_node_red_token_sz;
+    ep_group->ht_buffers.combine_gin_RED_tokens = reinterpret_cast<uint16_t*>(ptr + offset);
+    offset += combine_gin_RED_tokens_sz;
 
-    ep_group->ht_buffers.combine_rdma_inter_node_group_token = reinterpret_cast<uint16_t*>(ptr + offset);
-    offset += combine_rdma_inter_node_group_token_sz;
+    ep_group->ht_buffers.combine_gin_G2S_tokens = reinterpret_cast<uint16_t*>(ptr + offset);
+    offset += combine_gin_G2S_tokens_sz;
 
-    ep_group->ht_buffers.rdma_intra_node_red_prob = reinterpret_cast<float*>(ptr + offset);
-    offset += rdma_intra_node_red_prob_sz;
+    ep_group->ht_buffers.combine_gin_RED_prob = reinterpret_cast<float*>(ptr + offset);
+    offset += combine_gin_RED_prob_sz;
 
-    ep_group->ht_buffers.combine_rdma_inter_node_group_prob = reinterpret_cast<float*>(ptr + offset);
-    offset += combine_rdma_inter_node_group_prob_sz;
+    ep_group->ht_buffers.combine_gin_G2S_prob = reinterpret_cast<float*>(ptr + offset);
+    offset += combine_gin_G2S_prob_sz;
 
-    ep_group->ht_buffers.rdma_inter_node_group_flags = reinterpret_cast<uint64_t*>(ptr + offset);
-    CUDACHECK_RET(cudaMemset(ep_group->ht_buffers.rdma_inter_node_group_flags, 0, flags_sz));
+    ep_group->ht_buffers.dispatch_gin_G2S_flags = reinterpret_cast<uint64_t*>(ptr + offset);
+    CUDACHECK_RET(cudaMemset(ep_group->ht_buffers.dispatch_gin_G2S_flags, 0, flags_sz));
     offset += flags_sz;
 
-    ep_group->ht_buffers.combine_rdma_inter_node_group_flags = reinterpret_cast<uint64_t*>(ptr + offset);
-    CUDACHECK_RET(cudaMemset(ep_group->ht_buffers.combine_rdma_inter_node_group_flags, 0, flags_sz));
+    ep_group->ht_buffers.combine_gin_G2S_flags = reinterpret_cast<uint64_t*>(ptr + offset);
+    CUDACHECK_RET(cudaMemset(ep_group->ht_buffers.combine_gin_G2S_flags, 0, flags_sz));
     offset += flags_sz;
 
     // RDMA sync-guard regions (dispatch, combine): addressed by window+offset only.
@@ -1351,16 +1351,16 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // Calculate offsets for kernel mr_info
     size_t cur_offset = 0;
     ep_group->gin_config.combine_red_token_offset = cur_offset;
-    cur_offset += rdma_intra_node_red_token_sz;
+    cur_offset += combine_gin_RED_tokens_sz;
 
-    ep_group->gin_config.combine_n2n_token_offset = cur_offset;
-    cur_offset += combine_rdma_inter_node_group_token_sz;
+    ep_group->gin_config.combine_g2s_token_offset = cur_offset;
+    cur_offset += combine_gin_G2S_tokens_sz;
 
     ep_group->gin_config.combine_red_prob_offset = cur_offset;
-    cur_offset += rdma_intra_node_red_prob_sz;
+    cur_offset += combine_gin_RED_prob_sz;
 
-    ep_group->gin_config.combine_n2n_prob_offset = cur_offset;
-    cur_offset += combine_rdma_inter_node_group_prob_sz;
+    ep_group->gin_config.combine_g2s_prob_offset = cur_offset;
+    cur_offset += combine_gin_G2S_prob_sz;
 
     cur_offset += flags_sz * 2;
 
@@ -1385,9 +1385,9 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     cur_offset += rdma_recv_packed_sz;
 
     // =========================================================================
-    // Phase 2: configure internode GIN resources
+    // Phase 2: configure cross-LSA-team GIN resources
     // =========================================================================
-    // Verify that configured HT node count matches NCCL rail team size.
+    // Verify that configured HT LSA-team count matches NCCL rail team size.
     ncclTeam rail_team = ncclTeamRail(ep_group->comm);
     if (rail_team.nRanks != rdma_team_size) {
         fprintf(stderr, "[HT GIN] Error: rail team size (%d) must equal number of LSA domains (%d)\n", rail_team.nRanks,
@@ -1502,12 +1502,12 @@ static ncclResult_t destroy_ht_internode(ncclEpGroup_t ep_group) {
         ep_group->gin_config.gin_base_ptr = nullptr;
 
         // Clear buffer pointers (they pointed into gin_base_ptr)
-        ep_group->ht_buffers.rdma_intra_node_red_token = nullptr;
-        ep_group->ht_buffers.combine_rdma_inter_node_group_token = nullptr;
-        ep_group->ht_buffers.rdma_intra_node_red_prob = nullptr;
-        ep_group->ht_buffers.combine_rdma_inter_node_group_prob = nullptr;
-        ep_group->ht_buffers.rdma_inter_node_group_flags = nullptr;
-        ep_group->ht_buffers.combine_rdma_inter_node_group_flags = nullptr;
+        ep_group->ht_buffers.combine_gin_RED_tokens = nullptr;
+        ep_group->ht_buffers.combine_gin_G2S_tokens = nullptr;
+        ep_group->ht_buffers.combine_gin_RED_prob = nullptr;
+        ep_group->ht_buffers.combine_gin_G2S_prob = nullptr;
+        ep_group->ht_buffers.dispatch_gin_G2S_flags = nullptr;
+        ep_group->ht_buffers.combine_gin_G2S_flags = nullptr;
         ep_group->ht_buffers.token_staging_buffer = nullptr;
         ep_group->ht_buffers.dense_prob_buffer = nullptr;
         ep_group->ht_buffers.scaling_factor_staging_buffer = nullptr;
@@ -1590,7 +1590,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     assert(
         !(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && in_config->max_dispatch_tokens_per_rank == 0) &&
         "ncclEpCreateGroup: max_dispatch_tokens_per_rank must be set for HT backend");
-    // HT max_dispatch_tokens_per_rank need not be a chunk multiple; the inter-node
+    // HT max_dispatch_tokens_per_rank need not be a chunk multiple; the cross-LSA-team
     // stride is chunk-aligned internally (ep_group->ht_aligned_max_tokens).
     // Create teams: LSA and Rail
     ncclTeam lsa_team = ncclTeamLsa(comm);
@@ -1849,10 +1849,10 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         return ncclInvalidUsage;
     }
 
-    // Initialize HT intranode buffers (windows, completion flags, etc.)
+    // Initialize HT intra-LSA buffers (windows, completion flags, etc.)
     if (ht_mode) {
         // Resolve the dispatch/combine tokens-per-chunk for this group. RDMA
-        // (multi-node) configs use the tuned 64-token default; LSA-only configs
+        // (multi-LSA-team) configs use the tuned 64-token default; LSA-only configs
         // use a grid-proportional size so one chunk is one wave across all SMs
         // (NUM_OF_TOKENS_PER_GROUP tokens per SM). Either may be overridden by
         // NCCL_EP_TOKENS_PER_CHUNK. The chunk must be a multiple of 32 (warp width;
@@ -1872,7 +1872,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             }
         }
         ep_group->ht_tokens_per_chunk = chunk;
-        // Chunk-aligned inter-node RDMA stride; also the max-tokens template arg for
+        // Chunk-aligned cross-LSA-team RDMA stride; also the max-tokens template arg for
         // the dispatch/combine kernels (guarantees MAX_NUM_OF_TOKENS_PER_RANK % chunk == 0).
         ep_group->ht_aligned_max_tokens = ((ep_group->config.max_dispatch_tokens_per_rank + chunk - 1) / chunk) * chunk;
 
@@ -1983,11 +1983,11 @@ ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group) {
 
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Clean up HT intranode resources
+    // Clean up HT intra-LSA resources
     if (ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ep_group->ht_buffers.initialized) {
         destroy_ht_intranode(ep_group);
     }
-    // Clean up HT internode resources (GIN deregistration must happen before ncclCommDestroy)
+    // Clean up HT cross-LSA-team resources (GIN deregistration must happen before ncclCommDestroy)
     if (ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ep_group->ht_buffers.internode_initialized) {
         destroy_ht_internode(ep_group);
     }
@@ -2118,7 +2118,7 @@ struct ncclEpHandle {
             // =================================================================================
 
             // Sparse-to-dense map: maps each (token, source_rank) pair to its position in
-            // the destination rank's expert buffer. Used by NVLink (intra-node) warps.
+            // the destination rank's expert buffer. Used by NVLink (intra-LSA) warps.
             // Value of -1 indicates token is not routed to that rank.
             // dtype: int32_t
             // layout: [num_lsa_teams * max_dispatch_tokens_per_rank, lsa_team_size]
@@ -2126,16 +2126,16 @@ struct ncclEpHandle {
             // lifetime: valid after metadata_preprocessing, constant within iteration
             // vs NCCL HT: no direct equivalent.
             //   - HT: uses is_token_in_rank (local tokens only) + atomics to compute positions
-            //   - HT: precomputes positions for ALL nodes' tokens, -1 sentinel for not routed
+            //   - HT: precomputes positions for ALL LSA teams' tokens, -1 sentinel for not routed
             int32_t* sparse_to_dense_map;
 
-            // RDMA-to-attention map: boolean mask indicating which tokens this node needs
-            // to RECEIVE from RDMA (inter-node). Indexed by [node_id, token_id].
+            // RDMA-to-attention map: boolean mask indicating which tokens this LSA team needs
+            // to RECEIVE from RDMA (cross-LSA-team). Indexed by [node_id, token_id].
             // Primarily used during combine to know which remote tokens to wait for.
             // dtype: bool
             // layout: [num_lsa_teams, max_dispatch_tokens_per_rank_padded_to_16]
             //        (padding to 16 required for TMA alignment)
-            // usage: dispatch G2S warp (polling), combine inter-node G2S/reduction warps
+            // usage: dispatch G2S warp (polling), combine cross-LSA-team G2S/reduction warps
             // lifetime: valid after metadata_preprocessing, constant within iteration
             // vs NCCL HT: inverse perspective of is_token_in_rank.
             //   - is_token_in_rank: outbound - "where do MY tokens go?" [my_token, dest_rank]
@@ -2143,20 +2143,20 @@ struct ncclEpHandle {
             bool* rdma_to_attn_map;
 
             // Attention-to-RDMA map: boolean mask indicating which local tokens need to be
-            // SENT via RDMA (inter-node) to each remote node.
+            // SENT via RDMA (cross-LSA-team) to each remote LSA team.
             // Only allocated when num_lsa_teams > 1.
             // dtype: bool
             // layout: [max_dispatch_tokens_per_rank, num_lsa_teams - 1]
             // usage: dispatch N2N (RDMA) warp group
             // lifetime: valid after metadata_preprocessing, constant within iteration
-            // vs NCCL HT: closest equivalent to is_token_in_rank for inter-node RDMA.
+            // vs NCCL HT: closest equivalent to is_token_in_rank for cross-LSA-team RDMA.
             //   - is_token_in_rank: per-rank granularity [num_tokens, num_ranks]
-            //   - attn_to_rdma_map: per-node granularity [num_tokens, num_lsa_teams-1] (RDMA only)
+            //   - attn_to_rdma_map: per-LSA-team granularity [num_tokens, num_lsa_teams-1] (RDMA only)
             bool* attn_to_rdma_map;
 
             // Per-token per-rank bitmask cache produced during preprocessing.
             // dtype: rank_mask_t<ceil(lsa_team_size/64)> (one uint64_t word per 64 ranks)
-            // layout: [num_lsa_teams * max_send_tokens_per_rank * ranks_per_node]
+            // layout: [num_lsa_teams * max_send_tokens_per_rank * ranks_per_lsa_team]
             void* token_rank_mask;
 
             // Local expert routing map: per-expert routing for tokens in this rank's buffer.
@@ -2189,15 +2189,15 @@ struct ncclEpHandle {
             //   - combine backward: dense→sparse output prob conversion
             // lifetime: allocated at handle creation, freed at handle destroy
             // note: dispatch and combine are sequential, so one buffer suffices
-            // For multi-node: points to group-level pre-registered buffer
-            // For single-node: handle-owned buffer
+            // For multi-LSA-team: points to group-level pre-registered buffer
+            // For single-LSA-team: handle-owned buffer
             float* dense_prob_buffer;
 
             // Token staging buffer: pre-registered buffer to avoid GIN registration during dispatch
             // User tokens are copied here during dispatch, then this buffer is used for RDMA
             // dtype: uint16_t (two-byte transport) or uint8_t (one-byte transport)
             // layout: [max_dispatch_tokens_per_rank, hidden]
-            // usage: copy user tokens → use for inter-node RDMA
+            // usage: copy user tokens → use for cross-LSA-team RDMA
             // lifetime: group-owned (allocated in Group Create, freed in Group Destroy)
             void* token_staging_buffer; // Pointer to group-level buffer (not handle-owned)
 
@@ -2205,18 +2205,18 @@ struct ncclEpHandle {
             // User scaling factors are copied here during dispatch, then this buffer is used for RDMA
             // dtype: float
             // layout: [max_dispatch_tokens_per_rank]
-            // usage: copy user scaling factors → use for inter-node RDMA
+            // usage: copy user scaling factors → use for cross-LSA-team RDMA
             // lifetime: group-owned (allocated in Group Create, freed in Group Destroy)
             float* scaling_factor_staging_buffer; // Pointer to group-level buffer (not handle-owned)
 
-            // RDMA inter-node group flags: atomic completion flags for each remote node.
+            // RDMA inter-node group flags: atomic completion flags for each remote LSA team.
             // Remote ranks increment via RDMA atomic fetch-add to signal chunk completion.
             // Only allocated when num_lsa_teams > 1.
             // dtype: uint64_t
             // layout: [num_lsa_teams - 1]
             // usage: dispatch N2N warp (signaling), dispatch G2S warp (polling)
             // lifetime: reset to 0 at init, incremented by remote RDMA atomics
-            // uint64_t* rdma_inter_node_group_flags;
+            // uint64_t* dispatch_gin_G2S_flags;
 
             // Per-handle preprocessing block (single allocation for all preprocessing buffers)
             void* preprocessing_block;
@@ -2274,7 +2274,7 @@ struct ncclEpHandle {
 };
 
 static bool is_internode_available(ncclEpGroup_t ep_group) {
-    // True when there are multiple HT outer-domain nodes
+    // True when there are multiple HT outer-domain LSA teams
     return ep_group->rdma_team_size > 1;
 }
 
@@ -3386,7 +3386,7 @@ ncclResult_t ncclEpDispatch(
             static_cast<uint64_t>(group->gin_config.token_staging_offset),
             &x));
 
-        // For multi-node: copy user buffers to pre-registered staging buffers
+        // For multi-LSA-team: copy user buffers to pre-registered staging buffers
         // The staging buffers were allocated and GIN-registered during Group Create
         // This avoids ~60ms GIN registration overhead on the dispatch hot path
         void* token_ptr = x->data; // Default: use user buffer directly
@@ -3558,8 +3558,8 @@ ncclResult_t ncclEpDispatch(
         /* ===== Build DispatchParams ===== */
         // DispatchParams encapsulates all buffers and metadata needed by HT dispatch kernel:
         //   - Input buffers: attn_input_token, attn_input_prob, attn_input_scaling_factor
-        //   - Intranode output buffers: expert_output_token_ptrs, expert_output_prob_ptrs (per-rank pointers)
-        //   - RDMA staging buffers: rdma_inter_node_group_* (for multi-node only)
+        //   - Intra-LSA output buffers: expert_output_token_ptrs, expert_output_prob_ptrs (per-rank pointers)
+        //   - RDMA staging buffers: dispatch_gin_G2S_flags (for multi-LSA-team only)
         //   - Metadata: sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map
         //   - Sync flags: expected_*_flag_value, intra_node_write_completion_flags
         nccl_ep::ht::DispatchParams params;
@@ -3653,16 +3653,16 @@ ncclResult_t ncclEpDispatch(
         params.pad_alignment =
             fused_em_pad ? static_cast<int>(handle->ht.dispatch_output_per_expert_alignment) : 0;
         // Always pass a valid device pointer — the kernel unconditionally
-        // dereferences this even in single-node mode (the value is just unused).
+        // dereferences this even in single-LSA-team mode (the value is just unused).
         params.expected_rdma_flag_value = group->ht_buffers.dev_dispatch_expected_rdma;
-        params.rdma_inter_node_group_flags = is_single_node ? nullptr : group->ht_buffers.rdma_inter_node_group_flags;
+        params.dispatch_gin_G2S_flags = is_single_node ? nullptr : group->ht_buffers.dispatch_gin_G2S_flags;
         params.expected_intra_node_flag_value = group->ht_buffers.dev_dispatch_expected_intra;
         params.intra_node_write_completion_flags = group->ht_buffers.intra_node_write_completion_flags;
         params.dispatch_grid_barrier_counter = group->ht_buffers.dispatch_grid_barrier_counter;
         params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
         // Pass device communicators and windows
-        // Always pass a valid devComm (single-node too): the HT LSA sync-guard uses the NCCL LSA
-        // barrier (needs comm.lsaBarrier). GIN/RDMA paths stay if-constexpr-gated (out single-node).
+        // Always pass a valid devComm (single-LSA-team too): the HT LSA sync-guard uses the NCCL LSA
+        // barrier (needs comm.lsaBarrier). GIN/RDMA paths stay if-constexpr-gated (out single-LSA-team).
         // TODO: remove multiple gin comm notion from group
         params.dcomm = group->gin_config.dcomms[0];
         params.nccl_token_window = x->win_hdl;
@@ -3752,9 +3752,9 @@ ncclResult_t ncclEpDispatch(
                 stream,
                 x->datatype);
         }
-        /* ===== Copy intranode staging → caller outputs ===== */
+        /* ===== Copy intra-LSA staging → caller outputs ===== */
         // External-window outputs are written directly by the kernel; regular tensors
-        // need a D2D copy from the shared intranode staging buffers. On the
+        // need a D2D copy from the shared intra-LSA staging buffers. On the
         // EM-permute path (HT + EM + zero_copy != ON), the copy is deferred until
         // after dense_to_sparse_prob has populated recv_topk_idx_flat, since the
         // permute kernel uses that table to map FLAT slots to EM zones.
@@ -4321,7 +4321,7 @@ ncclResult_t ncclEpCombine(
         // CombineParams encapsulates all buffers and metadata needed by HT combine kernel:
         //   - IPC input buffers: expert_input_token_ptrs, expert_input_prob_ptrs (per-rank pointers)
         //   - Output buffers: attn_output_token, attn_output_prob (user-provided)
-        //   - RDMA buffers: rdma_intra_node_red_*, combine_rdma_inter_node_group_* (for multi-node)
+        //   - RDMA buffers: combine_gin_RED_*, combine_gin_G2S_* (for multi-LSA-team)
         //   - Metadata: sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map, local_expert_routing_map
         //   - Sync flags: combine_expected_*_flag_value, combine_intra_node_write_completion_flags
         nccl_ep::ht::CombineParams params;
@@ -4341,13 +4341,13 @@ ncclResult_t ncclEpCombine(
             backward_combine ? group->ht_buffers.combine_expert_input_prob_buffer_ptrs : nullptr;
         params.attn_output_token = combined_x->data;
         params.attn_output_prob = backward_combine ? dense_output_prob : nullptr;
-        params.rdma_intra_node_red_token = is_single_node ? nullptr : group->ht_buffers.rdma_intra_node_red_token;
-        params.rdma_intra_node_red_prob =
-            (!is_single_node && backward_combine) ? group->ht_buffers.rdma_intra_node_red_prob : nullptr;
-        params.combine_rdma_inter_node_group_token =
-            is_single_node ? nullptr : group->ht_buffers.combine_rdma_inter_node_group_token;
-        params.combine_rdma_inter_node_group_prob =
-            (!is_single_node && backward_combine) ? group->ht_buffers.combine_rdma_inter_node_group_prob : nullptr;
+        params.combine_gin_RED_tokens = is_single_node ? nullptr : group->ht_buffers.combine_gin_RED_tokens;
+        params.combine_gin_RED_prob =
+            (!is_single_node && backward_combine) ? group->ht_buffers.combine_gin_RED_prob : nullptr;
+        params.combine_gin_G2S_tokens =
+            is_single_node ? nullptr : group->ht_buffers.combine_gin_G2S_tokens;
+        params.combine_gin_G2S_prob =
+            (!is_single_node && backward_combine) ? group->ht_buffers.combine_gin_G2S_prob : nullptr;
         // Unified s2d: FLAT-shape for FLAT layout and EM em-permute mode;
         // EM-shape (packed rank/slot) only for EM kNvlinkDup / kLocalDup modes.
         params.sparse_to_dense_map = handle->ht.sparse_to_dense_map;
@@ -4362,8 +4362,8 @@ ncclResult_t ncclEpCombine(
         params.local_expert_routing_map = handle->ht.local_expert_routing_map;
         // Always pass a valid device pointer — see dispatch path comment.
         params.combine_expected_rdma_flag_value = group->ht_buffers.dev_combine_expected_rdma;
-        params.combine_rdma_inter_node_group_flags =
-            is_single_node ? nullptr : group->ht_buffers.combine_rdma_inter_node_group_flags;
+        params.combine_gin_G2S_flags =
+            is_single_node ? nullptr : group->ht_buffers.combine_gin_G2S_flags;
         params.combine_expected_intra_node_flag_value = group->ht_buffers.dev_combine_expected_intra;
         params.combine_grid_barrier_counter = group->ht_buffers.combine_grid_barrier_counter;
         params.combine_intra_node_write_completion_flags = group->ht_buffers.combine_intra_node_write_completion_flags;
@@ -4375,7 +4375,7 @@ ncclResult_t ncclEpCombine(
                              (!combine_x_uses_external_window ? static_cast<size_t>(x->win_offset) :
                                                                 group->gin_config.combine_red_token_offset);
         // Pass device communicators and windows
-        // Always pass the devComm (single-node too): the HT LSA sync-guard now uses the
+        // Always pass the devComm (single-LSA-team too): the HT LSA sync-guard now uses the
         // NCCL LSA barrier (needs comm.lsaBarrier). RDMA paths stay if-constexpr-gated.
         params.dcomms = group->gin_config.d_dcomms;
         params.nccl_token_window = combine_token_window;
@@ -4389,11 +4389,11 @@ ncclResult_t ncclEpCombine(
         // Use offsets relative to gin_base_ptr
         params.mr_info = {
             .combine_red_token_offset = combine_token_offset,
-            .combine_n2n_token_offset =
-                is_single_node ? 0 : group->gin_config.combine_n2n_token_offset,
+            .combine_g2s_token_offset =
+                is_single_node ? 0 : group->gin_config.combine_g2s_token_offset,
             .combine_red_prob_offset = is_single_node ? 0 : group->gin_config.combine_red_prob_offset,
-            .combine_n2n_prob_offset =
-                is_single_node ? 0 : group->gin_config.combine_n2n_prob_offset,
+            .combine_g2s_prob_offset =
+                is_single_node ? 0 : group->gin_config.combine_g2s_prob_offset,
             .guard_offset = is_single_node ? 0 : group->gin_config.combine_guard_offset,
         };
         params.local_rank = group->lsa_rank;

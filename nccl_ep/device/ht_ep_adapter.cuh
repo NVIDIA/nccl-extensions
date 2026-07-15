@@ -298,9 +298,9 @@ struct dispatch_memory_region_info_t {
 struct combine_memory_region_info_t {
     // Offsets relative to gin_base_ptr for RDMA operations
     size_t combine_red_token_offset; // Offset of combine LSA-team-reduced token buffer
-    size_t combine_n2n_token_offset; // Offset of combine cross-LSA-team (N2N RDMA) token buffer
+    size_t combine_g2s_token_offset; // Offset of combine cross-LSA-team (N2N RDMA) token buffer
     size_t combine_red_prob_offset; // Offset of combine LSA-team-reduced prob buffer
-    size_t combine_n2n_prob_offset; // Offset of combine cross-LSA-team (N2N RDMA) prob buffer
+    size_t combine_g2s_prob_offset; // Offset of combine cross-LSA-team (N2N RDMA) prob buffer
     size_t guard_offset; // Offset of combine's RDMA sync-guard readiness flags
 };
 
@@ -340,7 +340,7 @@ struct DispatchParams {
     // bumped by the dispatch kernel tail so CUDA-graph replays self-sequence.
     uint64_t* expected_rdma_flag_value;
     uint32_t* expected_intra_node_flag_value;
-    uint64_t* rdma_inter_node_group_flags;
+    uint64_t* dispatch_gin_G2S_flags;
     uint32_t* intra_node_write_completion_flags;
     // Grid barrier counter for fused device_sync in dispatch tail
     uint32_t* dispatch_grid_barrier_counter;
@@ -405,10 +405,10 @@ struct CombineParams {
     float* attn_output_prob; // Backward only (dense format for kernel)
 
     // RDMA buffers (multi-LSA-team only, from ep_group)
-    uint16_t* rdma_intra_node_red_token;
-    float* rdma_intra_node_red_prob; // Backward only
-    const uint16_t* combine_rdma_inter_node_group_token;
-    const float* combine_rdma_inter_node_group_prob; // Backward only
+    uint16_t* combine_gin_RED_tokens;
+    float* combine_gin_RED_prob; // Backward only
+    const uint16_t* combine_gin_G2S_tokens;
+    const float* combine_gin_G2S_prob; // Backward only
 
     // Metadata (from handle->ht preprocessing outputs)
     const int32_t* sparse_to_dense_map;
@@ -422,7 +422,7 @@ struct CombineParams {
     // bumped by the combine kernel tail so CUDA-graph replays self-sequence.
     uint64_t* combine_expected_rdma_flag_value;
     uint32_t* combine_expected_intra_node_flag_value;
-    uint64_t* combine_rdma_inter_node_group_flags;
+    uint64_t* combine_gin_G2S_flags;
     uint32_t* combine_intra_node_write_completion_flags;
     // Per-rank grid-barrier counter that elects the last block at the combine tail.
     uint32_t* combine_grid_barrier_counter;

@@ -118,9 +118,9 @@ dispatch_packed_entry_offset(const dispatch_memory_region_info_t* mr, int remote
 
 struct combine_memory_region_info_t {
     size_t combine_red_token_offset; // Offset of combine LSA-team-reduced token buffer
-    size_t combine_n2n_token_offset; // Offset of combine cross-LSA-team (N2N RDMA) token buffer
+    size_t combine_g2s_token_offset; // Offset of combine cross-LSA-team (N2N RDMA) token buffer
     size_t combine_red_prob_offset; // Offset of combine LSA-team-reduced prob buffer
-    size_t combine_n2n_prob_offset; // Offset of combine cross-LSA-team (N2N RDMA) prob buffer
+    size_t combine_g2s_prob_offset; // Offset of combine cross-LSA-team (N2N RDMA) prob buffer
     size_t guard_offset; // RDMA sync-guard: offset of combine's internal-buffer readiness flags
 } __attribute__((__aligned__(8)));
 
@@ -903,7 +903,7 @@ struct dispatch_kernel_param_base_t {
     const uint8_t*
         attn_input_token_scaling_factor; // FP8 EXTERN: per-token scales (float* for FP32, uint8_t* for UE8M0 — pure byte transport).
     // Internal temp buffers. These buffers are local buffers.
-    uint64_t* rdma_inter_node_group_flags; // For RDMA Atomic flags.
+    uint64_t* dispatch_gin_G2S_flags; // For RDMA Atomic flags.
     uint32_t* intra_node_write_completion_flags; // For intra-LSA S2G write completion notification.
     // Metadata buffers. These buffers are local buffers.
     const bool* rdma_to_attn_map;
@@ -975,11 +975,11 @@ struct combine_kernel_param_base_t {
     uint16_t* attn_output_token;
     float* attn_output_prob;
     // Internal temp buffers. These buffers are local buffers.
-    uint16_t* rdma_intra_node_red_token;
-    float* rdma_intra_node_red_prob;
-    const uint16_t* rdma_inter_node_group_token;
-    const float* rdma_inter_node_group_prob;
-    uint64_t* rdma_inter_node_group_flags;
+    uint16_t* combine_gin_RED_tokens;
+    float* combine_gin_RED_prob;
+    const uint16_t* combine_gin_G2S_tokens;
+    const float* combine_gin_G2S_prob;
+    uint64_t* combine_gin_G2S_flags;
     uint32_t* intra_node_write_completion_flags; // For intra-LSA src ready notification.
     // Metadata buffers. These buffers are local buffers.
     const bool* rdma_to_attn_map;
@@ -1889,7 +1889,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
     const float* attn_input_prob,
     const uint8_t* attn_input_token_scaling_factor,
     // OUTPUT
-    uint64_t* rdma_inter_node_group_flags,
+    uint64_t* dispatch_gin_G2S_flags,
     // CONFIG
     const int local_rank,
     const int my_lteam,
@@ -2030,7 +2030,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
 
         for (int lteam_id = blockIdx.x; lteam_id < LSA_TEAMS - 1; lteam_id += gridDim.x) {
             uint64_t* residue_flag_base_ptr =
-                rdma_inter_node_group_flags + (lteam_id * max_num_of_chunks_per_rank) + num_of_chunks_per_rank;
+                dispatch_gin_G2S_flags + (lteam_id * max_num_of_chunks_per_rank) + num_of_chunks_per_rank;
             if (LSA_G2S_GROUP::thread_rank() < residue_flag_count) {
                 residue_flag_base_ptr[LSA_G2S_GROUP::thread_rank()] = expected_flag_value;
             }
@@ -2567,8 +2567,8 @@ __forceinline__ __device__ void combine_RED_intra_warp(
     // INPUT
     const bool* rdma_to_attn_map,
     // OUTPUT
-    uint16_t* rdma_intra_node_red_token,
-    float* rdma_intra_node_red_prob,
+    uint16_t* combine_gin_RED_tokens,
+    float* combine_gin_RED_prob,
     // CONFIG
     const int my_lteam,
     const int num_of_tokens_per_rank,
@@ -2628,10 +2628,10 @@ __forceinline__ __device__ void combine_RED_intra_warp(
 
         // Per-token stride scaled into uint16_t units (HIDDEN_DIM for BF16/FP16, 2*HIDDEN_DIM for FP32).
         uint16_t* red_token_base =
-            rdma_intra_node_red_token + rdma_intra_node_red_id * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
+            combine_gin_RED_tokens + rdma_intra_node_red_id * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
         float* red_prob_base = nullptr;
         if constexpr (BACKWARD_COMBINE) {
-            red_prob_base = rdma_intra_node_red_prob + rdma_intra_node_red_id * prob_dim;
+            red_prob_base = combine_gin_RED_prob + rdma_intra_node_red_id * prob_dim;
         }
 
         streaming_pending = 0;
@@ -2772,7 +2772,7 @@ __forceinline__ __device__ void combine_n2n_put_active_tokens(
                 smem_mr_info_ptr->combine_red_token_offset +
                 (rdma_tile_id * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * TOKEN_BYTES;
             size_t token_dst_offset =
-                smem_mr_info_ptr->combine_n2n_token_offset +
+                smem_mr_info_ptr->combine_g2s_token_offset +
                 (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * TOKEN_BYTES;
             net.put(
                 rail,
@@ -2791,7 +2791,7 @@ __forceinline__ __device__ void combine_n2n_put_active_tokens(
                     smem_mr_info_ptr->combine_red_prob_offset +
                     (rdma_tile_id * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * prob_dim * sizeof(float);
                 size_t prob_dst_offset =
-                    smem_mr_info_ptr->combine_n2n_prob_offset +
+                    smem_mr_info_ptr->combine_g2s_prob_offset +
                     (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * prob_dim * sizeof(float);
                 net.put(
                     rail,
@@ -3024,18 +3024,18 @@ struct g2s_src_t {
 
 template <bool BACKWARD_COMBINE, int HIDDEN_DIM, ncclDataType_t kTokenDtype, int MAX_NUM_OF_TOKENS_PER_RANK>
 __forceinline__ __device__ g2s_src_t combine_g2s_resolve_rdma_source(
-    const uint16_t* rdma_inter_node_group_token,
-    const float* rdma_inter_node_group_prob,
+    const uint16_t* combine_gin_G2S_tokens,
+    const float* combine_gin_G2S_prob,
     int tile_id,
     int flat_token_id,
     int experts_per_rank,
     int lteam_sz) {
     const int rdma_row = tile_id * MAX_NUM_OF_TOKENS_PER_RANK + flat_token_id;
     const uint16_t* token_src =
-        rdma_inter_node_group_token + rdma_row * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
+        combine_gin_G2S_tokens + rdma_row * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
     const float* prob_src = nullptr;
     if constexpr (BACKWARD_COMBINE) {
-        prob_src = rdma_inter_node_group_prob + rdma_row * (experts_per_rank * lteam_sz);
+        prob_src = combine_gin_G2S_prob + rdma_row * (experts_per_rank * lteam_sz);
     }
     return g2s_src_t{token_src, prob_src};
 }
@@ -3055,8 +3055,8 @@ template <
 __forceinline__ __device__ void issue_rdma_g2s_row(
     SMEM_TYPE* smem_buffer_ptr,
     const bool* attn_to_rdma_addr,
-    const uint16_t* rdma_inter_node_group_token,
-    const float* rdma_inter_node_group_prob,
+    const uint16_t* combine_gin_G2S_tokens,
+    const float* combine_gin_G2S_prob,
     int flat_token_id,
     int& global_offset,
     int starting_G2S_index,
@@ -3092,8 +3092,8 @@ __forceinline__ __device__ void issue_rdma_g2s_row(
             const int rank_in_batch = rdma_local_rank - rdma_ranks_issued;
             const g2s_src_t src =
                 combine_g2s_resolve_rdma_source<BACKWARD_COMBINE, HIDDEN_DIM, kTokenDtype, MAX_NUM_OF_TOKENS_PER_RANK>(
-                    rdma_inter_node_group_token,
-                    rdma_inter_node_group_prob,
+                    combine_gin_G2S_tokens,
+                    combine_gin_G2S_prob,
                     lane.tile_id,
                     flat_token_id,
                     experts_per_rank,
@@ -3142,10 +3142,10 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     const int32_t* sparse_to_dense_map,
     uint16_t* const* remote_expert_input_token,
     float* const* remote_expert_input_prob,
-    const uint16_t* rdma_inter_node_group_token,
-    const float* rdma_inter_node_group_prob,
+    const uint16_t* combine_gin_G2S_tokens,
+    const float* combine_gin_G2S_prob,
     // OUTPUT
-    uint64_t* rdma_inter_node_group_flags,
+    uint64_t* combine_gin_G2S_flags,
     SMEM_TYPE* smem_buffer_ptr,
     // CONFIG
     const int local_rank,
@@ -3295,8 +3295,8 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
                         LSA_TEAMS>(
                         smem_buffer_ptr,
                         attn_to_rdma_addr,
-                        rdma_inter_node_group_token,
-                        rdma_inter_node_group_prob,
+                        combine_gin_G2S_tokens,
+                        combine_gin_G2S_prob,
                         flat_token_id,
                         global_offset,
                         starting_G2S_index,
@@ -3316,7 +3316,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
         int residue_flag_count = max_chunks_per_rank - cpr;
         for (int lteam_id = blockIdx.x; lteam_id < LSA_TEAMS - 1; lteam_id += gridDim.x) {
             uint64_t* residue_flag_base =
-                rdma_inter_node_group_flags + (lteam_id * max_chunks_per_rank + cpr);
+                combine_gin_G2S_flags + (lteam_id * max_chunks_per_rank + cpr);
             for (int flag_id = G2S_GROUP::thread_rank(); flag_id < residue_flag_count;
                  flag_id += G2S_GROUP::size()) {
                 residue_flag_base[flag_id] = expected_flag_value;
@@ -4013,7 +4013,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             param.attn_input_token,
             param.attn_input_prob,
             param.attn_input_token_scaling_factor,
-            param.rdma_inter_node_group_flags,
+            param.dispatch_gin_G2S_flags,
             param.local_rank,
             my_lteam,
             param.num_of_tokens_per_rank,
@@ -4283,8 +4283,8 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 // INPUT
                 param.rdma_to_attn_map,
                 // OUTPUT
-                param.rdma_intra_node_red_token,
-                param.rdma_intra_node_red_prob,
+                param.combine_gin_RED_tokens,
+                param.combine_gin_RED_prob,
                 // CONFIG
                 my_lteam,
                 param.num_of_tokens_per_rank,
@@ -4346,10 +4346,10 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             param.sparse_to_dense_map,
             param.expert_input_token,
             param.expert_input_prob,
-            param.rdma_inter_node_group_token,
-            param.rdma_inter_node_group_prob,
+            param.combine_gin_G2S_tokens,
+            param.combine_gin_G2S_prob,
             // OUTPUT
-            param.rdma_inter_node_group_flags,
+            param.combine_gin_G2S_flags,
             smem_buffer_ptr,
             // CONFIG
             param.local_rank,

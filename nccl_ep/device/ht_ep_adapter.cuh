@@ -477,7 +477,7 @@ void call_local_dup(
     uint32_t* grid_barrier_counter,
     int hidden_dim,
     int experts_per_rank,
-    int num_of_ranks_per_node,
+    int ranks_per_lsa_team,
     bool forward_dispatch,
     int num_blocks,
     cudaStream_t stream,
@@ -492,7 +492,7 @@ void call_local_reduce(
     int emuf_group_stride, // row width (= experts_per_rank)
     int hidden_dim,
     int experts_per_rank,
-    int num_of_ranks_per_node,
+    int ranks_per_lsa_team,
     bool backward_combine,
     int num_blocks,
     cudaStream_t stream,

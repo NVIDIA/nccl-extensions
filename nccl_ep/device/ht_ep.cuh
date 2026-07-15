@@ -100,13 +100,13 @@ __forceinline__ __device__ unsigned dispatch_tail_signal_id(
     int local_rank,
     int cidx,
     int lsa_teams,
-    int ranks_per_node,
+    int ranks_per_lsa_team,
     int max_chunks_per_rank) {
     return signals_tail_base +
-           ((src_lteam * lsa_teams + dst_lteam) * ranks_per_node + local_rank) * max_chunks_per_rank + cidx;
+           ((src_lteam * lsa_teams + dst_lteam) * ranks_per_lsa_team + local_rank) * max_chunks_per_rank + cidx;
 }
 
-// Byte offset (from the packed inter-node receive region start) of one source slot's chunk.
+// Byte offset (from the packed inter-lsa-team receive region start) of one source slot's chunk.
 // Packed layout is [remote_slot][token-in-slot], each entry bytes_per_entry (token + prob + sf).
 __forceinline__ __device__ size_t
 dispatch_packed_entry_offset(const dispatch_memory_region_info_t* mr, int remote_slot, int chunk_first_token) {
@@ -182,7 +182,7 @@ struct model_config_t {
     int hidden_dim;
     int max_num_of_tokens_per_rank;
     int num_of_experts_per_rank;
-    int num_of_ranks_per_node;
+    int ranks_per_lsa_team;
     int num_of_nodes;
 };
 
@@ -476,7 +476,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
 
     // Prob buffer (only if forward dispatch, 16B aligned) -- total stages unchanged
     if (config.forward_dispatch) {
-        layout.prob_buffer_stage_stride = model.num_of_experts_per_rank * model.num_of_ranks_per_node * sizeof(float);
+        layout.prob_buffer_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
         layout.prob_buffer_stage_stride = (layout.prob_buffer_stage_stride + 15) & ~15;
         layout.intra_node_prob_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
         offset += config.num_of_stages * layout.prob_buffer_stage_stride;
@@ -561,7 +561,7 @@ static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& confi
 
     // Prob buffer (16B aligned per stage) -- total stages unchanged
     if (config.forward_dispatch) {
-        int prob_buffer_stage_stride = model.num_of_experts_per_rank * model.num_of_ranks_per_node * sizeof(float);
+        int prob_buffer_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
         prob_buffer_stage_stride = (prob_buffer_stage_stride + 15) & ~15;
         total_size += config.num_of_stages * prob_buffer_stage_stride;
     }
@@ -663,8 +663,8 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     // Stage strides in uint16_t units, so FP32 stages advance 2× and don't overlap.
     layout.token_G2S_stage_stride = token_stride_u16;
     layout.token_S2G_stage_stride = token_stride_u16;
-    layout.prob_G2S_stage_stride = model.num_of_experts_per_rank * model.num_of_ranks_per_node;
-    layout.prob_S2G_stage_stride = model.num_of_experts_per_rank * model.num_of_ranks_per_node;
+    layout.prob_G2S_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team;
+    layout.prob_S2G_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team;
     layout.prob_S2G_inter_stage_stride = layout.prob_S2G_stage_stride * model.num_of_nodes;
 
     // intra_node_token_* buffers (128B aligned, multi-node only). Stage stride scales
@@ -701,13 +701,13 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
             align_offset(16);
             layout.intra_node_prob_G2S_buffer =
                 reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-            offset += num_of_stages_g2s * model.num_of_experts_per_rank * model.num_of_ranks_per_node * sizeof(float);
+            offset += num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
 
             // intra_node_prob_S2G_buffer
             align_offset(16);
             layout.intra_node_prob_S2G_buffer =
                 reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-            offset += num_of_stages_s2g * model.num_of_experts_per_rank * model.num_of_ranks_per_node * sizeof(float);
+            offset += num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
         } else {
             layout.intra_node_prob_G2S_buffer = nullptr;
             layout.intra_node_prob_S2G_buffer = nullptr;
@@ -716,12 +716,12 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
         // inter_node_prob_G2S_buffer
         align_offset(16);
         layout.inter_node_prob_G2S_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-        offset += num_of_stages_g2s * model.num_of_experts_per_rank * model.num_of_ranks_per_node * sizeof(float);
+        offset += num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
 
         // inter_node_prob_S2G_buffer
         align_offset(16);
         layout.inter_node_prob_S2G_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-        offset += num_of_stages_s2g * model.num_of_experts_per_rank * model.num_of_ranks_per_node * model.num_of_nodes *
+        offset += num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * model.num_of_nodes *
                   sizeof(float);
     } else {
         layout.intra_node_prob_G2S_buffer = nullptr;
@@ -835,21 +835,21 @@ static size_t calculate_combine_smem_layout_size(
             // intra_node_prob_G2S_buffer
             total_size = (total_size + 15) & ~15;
             total_size +=
-                num_of_stages_g2s * model.num_of_experts_per_rank * model.num_of_ranks_per_node * sizeof(float);
+                num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
 
             // intra_node_prob_S2G_buffer
             total_size = (total_size + 15) & ~15;
             total_size +=
-                num_of_stages_s2g * model.num_of_experts_per_rank * model.num_of_ranks_per_node * sizeof(float);
+                num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
         }
 
         // inter_node_prob_G2S_buffer
         total_size = (total_size + 15) & ~15;
-        total_size += num_of_stages_g2s * model.num_of_experts_per_rank * model.num_of_ranks_per_node * sizeof(float);
+        total_size += num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
 
         // inter_node_prob_S2G_buffer
         total_size = (total_size + 15) & ~15;
-        total_size += num_of_stages_s2g * model.num_of_experts_per_rank * model.num_of_ranks_per_node * num_lsa_teams *
+        total_size += num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * num_lsa_teams *
                       sizeof(float);
     }
 
@@ -896,7 +896,7 @@ template <typename TOKEN_DATA_TYPE>
 struct dispatch_kernel_param_base_t {
     int hidden_dim;
     int experts_per_rank;
-    int num_of_ranks_per_node;
+    int ranks_per_lsa_team;
     // Input buffers. These buffers are local buffers.
     const TOKEN_DATA_TYPE* attn_input_token;
     const float* attn_input_prob; // Needed by expert layer, so only valid in forward dispatch.
@@ -966,7 +966,7 @@ struct dispatch_kernel_param_t : dispatch_kernel_param_base_t<TOKEN_DATA_TYPE> {
 struct combine_kernel_param_base_t {
     int hidden_dim;
     int experts_per_rank;
-    int num_of_ranks_per_node;
+    int ranks_per_lsa_team;
     // EM unfused-combine: when true, the inter-node G2S warp group skips local-dup
     // secondary em_slots (primaries already carry the pre-reduced weighted sum
     // written by the local_reduce kernel). Default false => fused fanout.
@@ -2155,7 +2155,7 @@ __forceinline__ __device__ void issue_local_g2s_row(
     uint32_t token_bytes,
     uint32_t prob_bytes,
     int experts_per_rank,
-    int num_of_ranks_per_node,
+    int ranks_per_lsa_team,
     bool combine_local_reduce_enabled) {
     constexpr int WARP_SIZE = 32;
     int total_valid_count = 0;
@@ -2179,7 +2179,7 @@ __forceinline__ __device__ void issue_local_g2s_row(
             remote_expert_input_token[rank_id] + (slot * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>());
         const float* prob_src = nullptr;
         if constexpr (BACKWARD_COMBINE) {
-            prob_src = remote_expert_input_prob[rank_id] + (slot * (experts_per_rank * num_of_ranks_per_node));
+            prob_src = remote_expert_input_prob[rank_id] + (slot * (experts_per_rank * ranks_per_lsa_team));
         }
         issue_g2s_entry<INTER_NODE, BACKWARD_COMBINE, /*WRITE_LAST_FLAG=*/true>(
             smem_buffer_ptr,
@@ -3919,7 +3919,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     d_model.hidden_dim = HIDDEN_DIM;
     d_model.max_num_of_tokens_per_rank = MAX_NUM_OF_TOKENS_PER_RANK;
     d_model.num_of_experts_per_rank = param.experts_per_rank;
-    d_model.num_of_ranks_per_node = param.num_of_ranks_per_node;
+    d_model.ranks_per_lsa_team = param.ranks_per_lsa_team;
     d_model.num_of_nodes = LSA_TEAMS;
     create_dispatch_smem_layout<kLayout, sizeof(TOKEN_DATA_TYPE)>(smem_layout, smem_bytes, d_config, d_model);
     cur_smem_t* smem_buffer_ptr = &smem_layout;
@@ -4094,7 +4094,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                 nccl_ep::memory_fence();
                 atomicExch((unsigned int*)param.dispatch_grid_barrier_counter, 0u);
                 if (!param.local_dup_enabled)
-                    *param.expected_intra_node_flag_value += static_cast<uint32_t>(param.num_of_ranks_per_node);
+                    *param.expected_intra_node_flag_value += static_cast<uint32_t>(param.ranks_per_lsa_team);
             }
         } else if (tail_tid < tail_completion_warp::size() + tail_rdma_warp::size()) {
             // warp 1: publish the inter-node RDMA guard + bump the RDMA round.
@@ -4163,7 +4163,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     // The token and its properties should meet size and alignment requirement.
     // Currently, we use TMA to copy prob data, which need at least 16B size and alignment(which requires expert per node to be multiple of 4).
     // We need to add padding or not using TMA for prob, if we want to support other scenario.
-    // assert((param.experts_per_rank * param.num_of_ranks_per_node * sizeof(float)) % 16 == 0);
+    // assert((param.experts_per_rank * param.ranks_per_lsa_team * sizeof(float)) % 16 == 0);
     static_assert((HIDDEN_DIM % 2) == 0, "HIDDEN_DIM must be even for BF16x2.");
     static_assert((HIDDEN_DIM * sizeof(uint16_t)) % 16 == 0, "HIDDEN_DIM must satisfy TMA alignment.");
     static_assert(
@@ -4188,7 +4188,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     c_model.hidden_dim = HIDDEN_DIM;
     c_model.max_num_of_tokens_per_rank = MAX_NUM_OF_TOKENS_PER_RANK;
     c_model.num_of_experts_per_rank = param.experts_per_rank;
-    c_model.num_of_ranks_per_node = param.num_of_ranks_per_node;
+    c_model.ranks_per_lsa_team = param.ranks_per_lsa_team;
     c_model.num_of_nodes = LSA_TEAMS;
     // Layout derives the element width from kTokenDtype (FP32 doubles the per-stage
     // token-buffer bytes vs BF16/FP16).
@@ -4421,7 +4421,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             // warp 0: reset the grid counter + bump the intra-node round.
             if (tail_tid == 0) {
                 atomicExch((unsigned int*)param.combine_grid_barrier_counter, 0u);
-                *param.expected_intra_node_flag_value += static_cast<uint32_t>(param.num_of_ranks_per_node);
+                *param.expected_intra_node_flag_value += static_cast<uint32_t>(param.ranks_per_lsa_team);
             }
         } else if (tail_tid < tail_reset_warp::size() + tail_rdma_warp::size()) {
             // warp 1: publish the inter-node RDMA guard, then bump the RDMA round.
@@ -4462,7 +4462,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
 template <typename T>
 struct local_dup_kernel_param_t {
     T* expert_output_token; // [max_recv_tokens, hidden]
-    float* expert_output_prob; // [max_recv_tokens, epr * num_of_ranks_per_node]; valid iff FORWARD_DISPATCH
+    float* expert_output_prob; // [max_recv_tokens, epr * ranks_per_lsa_team]; valid iff FORWARD_DISPATCH
     const int32_t* emuf_group_buf; // [num_groups, group_stride] = [primary, sec0, ..., -1]
     const int32_t* emuf_group_count; // scalar (produced by scan)
     int emuf_group_stride; // = experts_per_rank
@@ -4474,7 +4474,7 @@ struct local_dup_kernel_param_t {
     // Reused from dispatch_grid_barrier_counter (dispatch leaves it at 0).
     uint32_t* grid_barrier_counter;
     int experts_per_rank;
-    int num_of_ranks_per_node;
+    int ranks_per_lsa_team;
 };
 
 // Dynamic shared-memory bytes required by local_dup_kernel_impl for the given
@@ -4484,11 +4484,11 @@ inline int local_dup_dynamic_smem_bytes(
     int pipe_depth,
     bool forward_dispatch,
     int experts_per_rank,
-    int num_of_ranks_per_node,
+    int ranks_per_lsa_team,
     size_t token_elem_bytes) {
     const int token_bytes = hidden_dim * static_cast<int>(token_elem_bytes);
     const int prob_bytes =
-        forward_dispatch ? experts_per_rank * num_of_ranks_per_node * static_cast<int>(sizeof(float)) : 0;
+        forward_dispatch ? experts_per_rank * ranks_per_lsa_team * static_cast<int>(sizeof(float)) : 0;
     const int rings = pipe_depth * (token_bytes + prob_bytes);
     const int mbar_bytes = pipe_depth * 2 * static_cast<int>(sizeof(uint64_t)) + 8;
     return rings + mbar_bytes;
@@ -4511,7 +4511,7 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
     __syncthreads();
 
     constexpr int kTokenBytes = HIDDEN_DIM * sizeof(T);
-    const int prob_floats = FORWARD_DISPATCH ? (p.experts_per_rank * p.num_of_ranks_per_node) : 0;
+    const int prob_floats = FORWARD_DISPATCH ? (p.experts_per_rank * p.ranks_per_lsa_team) : 0;
     const int prob_bytes = prob_floats * static_cast<int>(sizeof(float));
 
     extern __shared__ __align__(16) uint8_t smem_raw[];
@@ -4559,7 +4559,7 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
                 nccl_ep::atomic_add_acqrel_global(reinterpret_cast<const int*>(p.grid_barrier_counter), 1));
             if (arrived == gridDim.x - 1) {
                 atomicExch((unsigned int*)p.grid_barrier_counter, 0u);
-                *p.expected_intra_node_flag_value += static_cast<uint32_t>(p.num_of_ranks_per_node);
+                *p.expected_intra_node_flag_value += static_cast<uint32_t>(p.ranks_per_lsa_team);
             }
         }
         return;
@@ -4592,7 +4592,7 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
                     &prod_mbar[stage]);
                 if constexpr (FORWARD_DISPATCH) {
                     const float* src_prob = p.expert_output_prob + static_cast<size_t>(primary_em) *
-                                                                       (p.experts_per_rank * p.num_of_ranks_per_node);
+                                                                       (p.experts_per_rank * p.ranks_per_lsa_team);
                     cuda::ptx::cp_async_bulk(
                         cuda::ptx::space_shared,
                         cuda::ptx::space_global,
@@ -4636,7 +4636,7 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
                         kTokenBytes);
                     if constexpr (FORWARD_DISPATCH) {
                         float* dst_prob = p.expert_output_prob +
-                                          static_cast<size_t>(sec) * (p.experts_per_rank * p.num_of_ranks_per_node);
+                                          static_cast<size_t>(sec) * (p.experts_per_rank * p.ranks_per_lsa_team);
                         cuda::ptx::cp_async_bulk(
                             cuda::ptx::space_global,
                             cuda::ptx::space_shared,
@@ -4670,7 +4670,7 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
             nccl_ep::atomic_add_acqrel_global(reinterpret_cast<const int*>(p.grid_barrier_counter), 1));
         if (arrived == gridDim.x - 1) {
             atomicExch((unsigned int*)p.grid_barrier_counter, 0u);
-            *p.expected_intra_node_flag_value += static_cast<uint32_t>(p.num_of_ranks_per_node);
+            *p.expected_intra_node_flag_value += static_cast<uint32_t>(p.ranks_per_lsa_team);
         }
     }
 }
@@ -4684,12 +4684,12 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
 template <typename T>
 struct local_reduce_kernel_param_t {
     T* expert_input_token; // [max_recv_tokens, hidden]
-    float* expert_input_prob; // [max_recv_tokens, epr * num_of_ranks_per_node]; valid iff BACKWARD_COMBINE
+    float* expert_input_prob; // [max_recv_tokens, epr * ranks_per_lsa_team]; valid iff BACKWARD_COMBINE
     const int32_t* emuf_group_buf; // [num_groups, group_stride] = [primary, sec0, ..., -1]
     const int32_t* emuf_group_count; // scalar
     int emuf_group_stride; // = experts_per_rank
     int experts_per_rank;
-    int num_of_ranks_per_node;
+    int ranks_per_lsa_team;
 };
 
 // Dynamic shared-memory bytes required by local_reduce_kernel_impl for the
@@ -4732,7 +4732,7 @@ __device__ __forceinline__ void local_reduce_kernel_impl(const local_reduce_kern
 
     // n_src per group must be <= PIPE_DEPTH (also <= 32 since PIPE_DEPTH <= 32);
     // enforced by __trap in the producer loop once n_src is known.
-    const int PROB_DIM = BACKWARD_COMBINE ? (p.experts_per_rank * p.num_of_ranks_per_node) : 0;
+    const int PROB_DIM = BACKWARD_COMBINE ? (p.experts_per_rank * p.ranks_per_lsa_team) : 0;
 
     // Shmem layout:
     //   s_in[PIPE_DEPTH] x kTokenBytes        (G2S ring)

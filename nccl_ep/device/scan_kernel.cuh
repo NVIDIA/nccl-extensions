@@ -829,8 +829,6 @@ __device__ __forceinline__ void scan_impl_flat(
     constexpr int NUM_MASK_WORDS = (LSA_TEAM_SIZE + 63) / 64;
     constexpr int NUM_RANK_TILES = (LSA_TEAM_SIZE + 31) / 32;
 
-    // LSA_TEAM_SIZE (compile-time ranks-per-LSA-team) is the runtime
-    // num_of_ranks_per_node by construction, so use it directly.
     const scan_geometry_t g = compute_scan_geometry<NUM_THREADS_PER_BLOCK, NUM_OF_BLOCKS, NUM_LSA_TEAMS, LSA_TEAM_SIZE>(
         num_of_tokens_per_rank,
         experts_per_rank);
@@ -963,8 +961,6 @@ __device__ __forceinline__ void scan_impl_em(
 
     constexpr int NUM_MASK_WORDS = (LSA_TEAM_SIZE + 63) / 64;
 
-    // LSA_TEAM_SIZE (compile-time ranks-per-LSA-team) equals the runtime
-    // num_of_ranks_per_node by construction, so use it directly.
     const scan_geometry_t g = compute_scan_geometry<NUM_THREADS_PER_BLOCK, NUM_OF_BLOCKS, NUM_LSA_TEAMS, LSA_TEAM_SIZE>(
         num_of_tokens_per_rank,
         experts_per_rank);

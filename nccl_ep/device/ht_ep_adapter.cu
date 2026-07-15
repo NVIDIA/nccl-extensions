@@ -759,7 +759,7 @@ template <typename TOKEN_DATA_TYPE>
     // Model configuration
     kp.hidden_dim = params.hidden_dim;
     kp.experts_per_rank = params.experts_per_rank;
-    kp.num_of_ranks_per_node = params.lsa_team_size;
+    kp.ranks_per_lsa_team = params.lsa_team_size;
     // User input buffers
     kp.attn_input_token = reinterpret_cast<const TOKEN_DATA_TYPE*>(params.attn_input_token);
     kp.attn_input_prob = params.attn_input_prob;
@@ -890,7 +890,7 @@ ncclResult_t dispatch_impl(
         d_model.hidden_dim = kp.hidden_dim;
         d_model.max_num_of_tokens_per_rank = max_dispatch_tokens_per_rank;
         d_model.num_of_experts_per_rank = kp.experts_per_rank;
-        d_model.num_of_ranks_per_node = kp.num_of_ranks_per_node;
+        d_model.ranks_per_lsa_team = kp.ranks_per_lsa_team;
         d_model.num_of_nodes = num_nodes;
 
         const int smem_size = static_cast<int>(::ht_ep::calculate_dispatch_smem_layout_size(
@@ -977,7 +977,7 @@ ncclResult_t call_dispatch(
     // Model configuration
     kp.hidden_dim = params.hidden_dim;
     kp.experts_per_rank = params.experts_per_rank;
-    kp.num_of_ranks_per_node = params.lsa_team_size;
+    kp.ranks_per_lsa_team = params.lsa_team_size;
     // User output buffers
     kp.attn_output_token = reinterpret_cast<uint16_t*>(params.attn_output_token);
     kp.attn_output_prob = params.attn_output_prob;
@@ -1081,7 +1081,7 @@ void combine_impl(
     model.hidden_dim = kp.hidden_dim;
     model.max_num_of_tokens_per_rank = max_dispatch_tokens_per_rank;
     model.num_of_experts_per_rank = kp.experts_per_rank;
-    model.num_of_ranks_per_node = kp.num_of_ranks_per_node;
+    model.ranks_per_lsa_team = kp.ranks_per_lsa_team;
     model.num_of_nodes = num_nodes;
     // Pick the layout-size instantiation by wire dtype; the width is derived inside the
     // template. Layout size depends only on element width, so FP16 and BF16 (both 2 B)
@@ -1156,7 +1156,7 @@ void call_local_dup(
     uint32_t* grid_barrier_counter,
     int hidden_dim,
     int experts_per_rank,
-    int num_of_ranks_per_node,
+    int ranks_per_lsa_team,
     bool forward_dispatch,
     int num_blocks,
     cudaStream_t stream,
@@ -1172,7 +1172,7 @@ void call_local_dup(
             kPipeDepth,
             forward_dispatch,
             experts_per_rank,
-            num_of_ranks_per_node,
+            ranks_per_lsa_team,
             sizeof(TOKEN_DATA_TYPE));
 
         ::ht_ep::local_dup_kernel_param_t<TOKEN_DATA_TYPE> pp{};
@@ -1185,7 +1185,7 @@ void call_local_dup(
         pp.expected_intra_node_flag_value = expected_intra_node_flag_value;
         pp.grid_barrier_counter = grid_barrier_counter;
         pp.experts_per_rank = experts_per_rank;
-        pp.num_of_ranks_per_node = num_of_ranks_per_node;
+        pp.ranks_per_lsa_team = ranks_per_lsa_team;
         jit::launch_local_dup<TOKEN_DATA_TYPE>(
             hidden_dim,
             kPipeDepth,
@@ -1207,7 +1207,7 @@ void call_local_reduce(
     int emuf_group_stride,
     int hidden_dim,
     int experts_per_rank,
-    int num_of_ranks_per_node,
+    int ranks_per_lsa_team,
     bool backward_combine,
     int num_blocks,
     cudaStream_t stream,
@@ -1223,7 +1223,7 @@ void call_local_reduce(
         lp.emuf_group_count = emuf_group_count;
         lp.emuf_group_stride = emuf_group_stride;
         lp.experts_per_rank = experts_per_rank;
-        lp.num_of_ranks_per_node = num_of_ranks_per_node;
+        lp.ranks_per_lsa_team = ranks_per_lsa_team;
         jit::launch_local_reduce<T>(hidden_dim, backward_combine, experts_per_rank, num_blocks, lp, stream, token_dtype);
     };
     if (token_dtype == ncclFloat32) run(uint32_t{});

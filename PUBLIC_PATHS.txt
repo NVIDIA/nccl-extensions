@@ -1,0 +1,24 @@
+# This config is downloaded and parsed by the GitHub-First filtering pipeline
+# Filtering script: https://gitlab-master.nvidia.com/nccl/ci-infra/-/blob/main/github-first/scripts/filter_repo.sh?ref_type=heads
+
+[include]
+# Paths to include in the filtered repository
+# The repo is filtered down to these paths first before continuing to exclusions
+
+nccl_ep
+nccl_m2n
+third_party
+.clang-format
+.clang-format-ignore
+.gitmodules
+CONTRIBUTING.md
+LICENSE.txt
+README.md
+
+[exclude]
+# Any paths within the inclusions above that should be removed
+# Can be glob patterns
+
+.gitlab/
+**/.gitlab-ci.yml
+PUBLIC_PATHS.txt

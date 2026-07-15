@@ -17,7 +17,7 @@
 #include <string>
 
 namespace nccl_ep {
-namespace internode_ll {
+namespace ll {
 namespace jit {
 
 constexpr const char* kLlCombineJitEntryName = "nccl_ep_jit_ll_combine_kernel";
@@ -48,8 +48,8 @@ inline std::string ll_combine_jit_source(
         << "\n"
         << "extern \"C\" __launch_bounds__(1024, 1)\n"
         << "__global__ void " << kLlCombineJitEntryName << "(\n"
-        << "    const __grid_constant__ nccl_ep::internode_ll::combine_kernel_args_t p) {\n"
-        << "  nccl_ep::internode_ll::combine_kernel_impl<\n"
+        << "    const __grid_constant__ nccl_ep::ll::combine_kernel_args_t p) {\n"
+        << "  nccl_ep::ll::combine_kernel_impl<\n"
         << "      " << ll_combine_bool_literal(useLogFmt) << ",\n"
         << "      " << hidden << ",\n"
         << "      " << kLlCombineMaxTopk << ",\n"
@@ -126,5 +126,5 @@ inline void launch_ll_combine(
 }
 
 } // namespace jit
-} // namespace internode_ll
+} // namespace ll
 } // namespace nccl_ep

@@ -14,7 +14,7 @@
 #include <algorithm>
 
 namespace nccl_ep {
-namespace internode_ll {
+namespace ll {
 
 // Forward-declare the host-side `ceil_div` helper used here. `common.hpp`
 // provides templated ceil_div in namespace nccl_ep; we reuse it via ADL.
@@ -227,5 +227,5 @@ void call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cu
     jit::launch_ll_clean_low_latency_buffer(args, stream);
 }
 
-} // namespace internode_ll
+} // namespace ll
 } // namespace nccl_ep

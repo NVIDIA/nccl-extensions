@@ -18,7 +18,7 @@
 #include <string>
 
 namespace nccl_ep {
-namespace internode_ll {
+namespace ll {
 namespace jit {
 
 constexpr const char* kLlDispatchJitEntryName = "nccl_ep_jit_ll_dispatch_kernel";
@@ -48,8 +48,8 @@ inline std::string ll_dispatch_jit_source(
         << "\n"
         << "extern \"C\" __launch_bounds__(1024, 1)\n"
         << "__global__ void " << kLlDispatchJitEntryName << "(\n"
-        << "    const __grid_constant__ nccl_ep::internode_ll::dispatch_kernel_args_t p) {\n"
-        << "  nccl_ep::internode_ll::dispatch_kernel_impl<\n"
+        << "    const __grid_constant__ nccl_ep::ll::dispatch_kernel_args_t p) {\n"
+        << "  nccl_ep::ll::dispatch_kernel_impl<\n"
         << "      " << kernel_spec.recipe_source_literal << ",\n"
         << "      " << hidden << ",\n"
         << "      " << layout_literal << ",\n"
@@ -134,5 +134,5 @@ inline ncclResult_t launch_ll_dispatch(
 }
 
 } // namespace jit
-} // namespace internode_ll
+} // namespace ll
 } // namespace nccl_ep

@@ -93,7 +93,7 @@ namespace nccl_ep {
 constexpr int kDsFp8E3M4ElementsPerScale = 128;
 
 // Internode low-latency kernels
-namespace internode_ll {
+namespace ll {
 
 // Helper function for alignment (host/device compatible)
 template <typename dtype_t>
@@ -149,7 +149,7 @@ __host__ __forceinline__ size_t get_dispatch_hdr_sz(int num_topk, ncclEpLayout_t
     return layout == NCCL_EP_LAYOUT_RANK_MAJOR ? get_dispatch_hdr_sz<NCCL_EP_LAYOUT_RANK_MAJOR>(num_topk) :
                                                  get_dispatch_hdr_sz<NCCL_EP_LAYOUT_EXPERT_MAJOR>(num_topk);
 }
-} // namespace internode_ll
+} // namespace ll
 
 template <typename dtype_t>
 __host__ __device__ constexpr dtype_t ceil_div(dtype_t a, dtype_t b) {
@@ -215,7 +215,7 @@ struct LowLatencyLayout {
         const size_t num_scales = max_token_bytes / sizeof(nv_bfloat16) / 128;
         size_t scale_metadata_bytes = num_scales * sizeof(nv_bfloat162);
 
-        size_t disp_hdr_sz = internode_ll::get_dispatch_hdr_sz(num_topk, layout);
+        size_t disp_hdr_sz = ll::get_dispatch_hdr_sz(num_topk, layout);
         size_t num_bytes_per_dispatch_msg = disp_hdr_sz + max_token_bytes;
         size_t num_bytes_per_combine_msg = scale_metadata_bytes + max_token_bytes;
 

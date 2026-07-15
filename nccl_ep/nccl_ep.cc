@@ -3262,7 +3262,7 @@ ncclResult_t ncclEpDispatch(
             auto launch_dispatch = [&](auto* topk_idx_data, bool topk_is_int64) -> ncclResult_t {
                 auto* in_scales_data = (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)
                     ? static_cast<const uint8_t*>(in_scales_outer->data) : nullptr;
-                nccl_ep::internode_ll::DispatchParams params{};
+                nccl_ep::ll::DispatchParams params{};
                 params.inData = x_data;
                 params.inScalesBuf = in_scales_data;
                 params.inTopkIdx = topk_idx_data;
@@ -3319,13 +3319,13 @@ ncclResult_t ncclEpDispatch(
                 // selected branch becomes the JIT kernel's quantization variant.
                 switch (quantization_recipe) {
                     case NCCL_EP_DISPATCH_QUANT_NONE:
-                        return nccl_ep::internode_ll::call_dispatch(
+                        return nccl_ep::ll::call_dispatch(
                             params, NCCL_EP_DISPATCH_QUANT_NONE, stream);
                     case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
-                        return nccl_ep::internode_ll::call_dispatch(
+                        return nccl_ep::ll::call_dispatch(
                             params, NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD, stream);
                     case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
-                        return nccl_ep::internode_ll::call_dispatch(
+                        return nccl_ep::ll::call_dispatch(
                             params, NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4, stream);
                     default:
                         std::fprintf(stderr,
@@ -4053,7 +4053,7 @@ ncclResult_t ncclEpCombine(
             // translate peer recv-buffer ptrs; the kernel's zeroCopy mode is
             // dispatch-shaped, so config.zero_copy is a dispatch-only switch.
             auto launch_combine = [&](auto* topk_idx_data, bool topk_is_int64) {
-                nccl_ep::internode_ll::CombineParams params{};
+                nccl_ep::ll::CombineParams params{};
                 params.inData = x_data;
                 params.srcInfo = src_info_data;
                 params.layoutRange = layout_range_data;
@@ -4091,7 +4091,7 @@ ncclResult_t ncclEpCombine(
                 params.zeroCopy = false;
                 params.phases = phases;
                 params.tokenDtype = x->datatype;
-                nccl_ep::internode_ll::call_combine(params, stream);
+                nccl_ep::ll::call_combine(params, stream);
             };
             switch (topk_idx->datatype) {
             case ncclInt32:
@@ -4539,7 +4539,7 @@ ncclResult_t ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) {
     int* clean_0_ptr = reinterpret_cast<int*>(rdma_base + clean_0.first);
     int* clean_1_ptr = reinterpret_cast<int*>(rdma_base + clean_1.first);
 
-    nccl_ep::internode_ll::CleanLowLatencyBufferParams clean_params{};
+    nccl_ep::ll::CleanLowLatencyBufferParams clean_params{};
     clean_params.clean_0 = clean_0_ptr;
     clean_params.num_clean_int_0 = clean_0.second;
     clean_params.clean_1 = clean_1_ptr;
@@ -4551,7 +4551,7 @@ ncclResult_t ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) {
     clean_params.barrierSignalBase = ep_group->clean_barrier_signal_base;
     clean_params.timeoutCycles = ep_group->timeout_cycles;
 
-    nccl_ep::internode_ll::call_clean_low_latency_buffer(clean_params, stream);
+    nccl_ep::ll::call_clean_low_latency_buffer(clean_params, stream);
 
     // Reset all ranks to active (1 = active).
     // Sync the stream before returning so all_active outlives the async copy.

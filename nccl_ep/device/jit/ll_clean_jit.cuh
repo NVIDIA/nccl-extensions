@@ -17,7 +17,7 @@
 #include <string>
 
 namespace nccl_ep {
-namespace internode_ll {
+namespace ll {
 namespace jit {
 
 constexpr const char* kLlCleanJitEntryName = "nccl_ep_jit_ll_clean_kernel";
@@ -30,8 +30,8 @@ inline std::string ll_clean_jit_source() {
         << "\n"
         << "extern \"C\" __launch_bounds__(" << kLlCleanNumThreads << ", 1)\n"
         << "__global__ void " << kLlCleanJitEntryName << "(\n"
-        << "    const __grid_constant__ nccl_ep::internode_ll::clean_low_latency_buffer_kernel_args_t p) {\n"
-        << "  nccl_ep::internode_ll::clean_low_latency_buffer_kernel_impl<" << kLlCleanNumThreads << ">(\n"
+        << "    const __grid_constant__ nccl_ep::ll::clean_low_latency_buffer_kernel_args_t p) {\n"
+        << "  nccl_ep::ll::clean_low_latency_buffer_kernel_impl<" << kLlCleanNumThreads << ">(\n"
         << "      p.clean_0, p.num_clean_int_0,\n"
         << "      p.clean_1, p.num_clean_int_1,\n"
         << "      p.rankMask,\n"
@@ -79,5 +79,5 @@ inline void launch_ll_clean_low_latency_buffer(
 }
 
 } // namespace jit
-} // namespace internode_ll
+} // namespace ll
 } // namespace nccl_ep

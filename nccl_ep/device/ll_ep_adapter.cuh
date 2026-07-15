@@ -15,7 +15,7 @@
 #include "common.hpp"
 
 namespace nccl_ep {
-namespace internode_ll {
+namespace ll {
 
 // Token-wire-dtype helpers shared by the LL dispatch/combine JIT generators.
 // `*_template_literal` is the ncclDataType_t enumerator emitted into the JIT
@@ -334,5 +334,5 @@ void call_combine(const CombineParams& params, cudaStream_t stream = 0);
 
 void call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStream_t stream = 0);
 
-} // namespace internode_ll
+} // namespace ll
 } // namespace nccl_ep

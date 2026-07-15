@@ -21,7 +21,7 @@ namespace cg = cooperative_groups;
 
 namespace nccl_ep {
 
-namespace internode_ll {
+namespace ll {
 // Mask convention: 1 = active, 0 = masked/failed. nullptr means masking disabled.
 template <bool useWarpSync = false>
 __forceinline__ __device__ bool isRankMasked(int* rankMask, int rank) {
@@ -2250,6 +2250,6 @@ __device__ __forceinline__ void clean_low_latency_buffer_kernel_impl(
     }
 }
 
-} // namespace internode_ll
+} // namespace ll
 
 } // namespace nccl_ep

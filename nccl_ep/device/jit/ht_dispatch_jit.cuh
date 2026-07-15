@@ -32,12 +32,12 @@ inline const char* dispatch_bool_literal(bool value) {
 }
 
 struct dispatch_warp_layout_t {
-    int inter_node_group_warps;
-    int inter_node_group_start;
-    int intra_node_g2s_group_warps;
-    int intra_node_g2s_group_start;
-    int intra_node_s2g_group_warps;
-    int intra_node_s2g_group_start;
+    int cross_lsa_group_warps;
+    int cross_lsa_group_start;
+    int lsa_g2s_group_warps;
+    int lsa_g2s_group_start;
+    int lsa_s2g_group_warps;
+    int lsa_s2g_group_start;
     int pad_group_warps;
     int pad_group_start;
     int num_pipelines;
@@ -48,26 +48,26 @@ inline dispatch_warp_layout_t compute_dispatch_warp_layout(int num_lsa_teams, nc
     const bool multinode_layout = (num_lsa_teams != 1);
     dispatch_warp_layout_t L{};
     L.num_pipelines = NCCL_EP_HT_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
-    L.inter_node_group_warps = multinode_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
-    L.inter_node_group_start = 0;
-    L.intra_node_g2s_group_warps = L.num_pipelines;
-    L.intra_node_g2s_group_start = multinode_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
-    L.intra_node_s2g_group_warps = L.num_pipelines;
-    L.intra_node_s2g_group_start = multinode_layout ? (NCCL_EP_HT_DISPATCH_N2N_WARPS + L.num_pipelines) : L.num_pipelines;
+    L.cross_lsa_group_warps = multinode_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
+    L.cross_lsa_group_start = 0;
+    L.lsa_g2s_group_warps = L.num_pipelines;
+    L.lsa_g2s_group_start = multinode_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
+    L.lsa_s2g_group_warps = L.num_pipelines;
+    L.lsa_s2g_group_start = multinode_layout ? (NCCL_EP_HT_DISPATCH_N2N_WARPS + L.num_pipelines) : L.num_pipelines;
     L.pad_group_warps = (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? 1 : 0;
-    L.pad_group_start = L.intra_node_s2g_group_start + L.intra_node_s2g_group_warps;
-    L.block_dim = 32 * (L.inter_node_group_warps + L.intra_node_g2s_group_warps + L.intra_node_s2g_group_warps +
+    L.pad_group_start = L.lsa_s2g_group_start + L.lsa_s2g_group_warps;
+    L.block_dim = 32 * (L.cross_lsa_group_warps + L.lsa_g2s_group_warps + L.lsa_s2g_group_warps +
                         L.pad_group_warps);
     return L;
 }
 
 inline std::string dispatch_jit_source(
-    int inter_node_group_warps,
-    int inter_node_group_start,
-    int intra_node_g2s_group_warps,
-    int intra_node_g2s_group_start,
-    int intra_node_s2g_group_warps,
-    int intra_node_s2g_group_start,
+    int cross_lsa_group_warps,
+    int cross_lsa_group_start,
+    int lsa_g2s_group_warps,
+    int lsa_g2s_group_start,
+    int lsa_s2g_group_warps,
+    int lsa_s2g_group_start,
     int pad_group_warps,
     int pad_group_start,
     int num_of_stages,
@@ -90,16 +90,16 @@ inline std::string dispatch_jit_source(
         << "\n"
         << "using TOKEN_DATA_TYPE = " << kernel_spec.payload_type_literal << ";\n"
         << "static constexpr int kSfBytesPerToken = " << sf_bytes_per_token << ";\n"
-        << "using INTER_NODE_GROUP     = ht_ep::warp_group<" << inter_node_group_warps << ", "
-        << inter_node_group_start << ">;\n"
-        << "using INTRA_NODE_G2S_GROUP = ht_ep::warp_group<" << intra_node_g2s_group_warps << ", "
-        << intra_node_g2s_group_start << ">;\n"
-        << "using INTRA_NODE_S2G_GROUP = ht_ep::warp_group<" << intra_node_s2g_group_warps << ", "
-        << intra_node_s2g_group_start << ">;\n"
+        << "using GIN_GROUP     = ht_ep::warp_group<" << cross_lsa_group_warps << ", "
+        << cross_lsa_group_start << ">;\n"
+        << "using LSA_G2S_GROUP = ht_ep::warp_group<" << lsa_g2s_group_warps << ", "
+        << lsa_g2s_group_start << ">;\n"
+        << "using LSA_S2G_GROUP = ht_ep::warp_group<" << lsa_s2g_group_warps << ", "
+        << lsa_s2g_group_start << ">;\n"
         << "using PAD_GROUP            = ht_ep::warp_group<" << pad_group_warps << ", " << pad_group_start << ">;\n"
         << "\n"
-        << "extern \"C\" __launch_bounds__(INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + "
-           "INTRA_NODE_S2G_GROUP::size() + PAD_GROUP::size(), 1)\n"
+        << "extern \"C\" __launch_bounds__(GIN_GROUP::size() + LSA_G2S_GROUP::size() + "
+           "LSA_S2G_GROUP::size() + PAD_GROUP::size(), 1)\n"
         << "__global__ void " << kDispatchJitEntryName << "(\n"
         << "    const __grid_constant__ ht_ep::dispatch_kernel_param_t<TOKEN_DATA_TYPE, " << lsa_team_size
         << "> param) {\n"
@@ -107,9 +107,9 @@ inline std::string dispatch_jit_source(
         << "  ht_ep::dispatch_kernel_impl<\n"
         << "      TOKEN_DATA_TYPE,\n"
         << "      " << kernel_spec.recipe_source_literal << ",\n"
-        << "      INTER_NODE_GROUP,\n"
-        << "      INTRA_NODE_G2S_GROUP,\n"
-        << "      INTRA_NODE_S2G_GROUP,\n"
+        << "      GIN_GROUP,\n"
+        << "      LSA_G2S_GROUP,\n"
+        << "      LSA_S2G_GROUP,\n"
         << "      PAD_GROUP,\n"
         << "      " << num_of_stages << ",\n"
         << "      " << num_of_in_flight_s2g << ",\n"
@@ -163,12 +163,12 @@ inline ncclResult_t launch_dispatch(
         return name.str();
     }();
     const std::string source = dispatch_jit_source(
-        L.inter_node_group_warps,
-        L.inter_node_group_start,
-        L.intra_node_g2s_group_warps,
-        L.intra_node_g2s_group_start,
-        L.intra_node_s2g_group_warps,
-        L.intra_node_s2g_group_start,
+        L.cross_lsa_group_warps,
+        L.cross_lsa_group_start,
+        L.lsa_g2s_group_warps,
+        L.lsa_g2s_group_start,
+        L.lsa_s2g_group_warps,
+        L.lsa_s2g_group_start,
         L.pad_group_warps,
         L.pad_group_start,
         num_of_stages,
@@ -298,9 +298,9 @@ inline void dispatch_dump_warp_timing(
     };
     std::printf("[DISPATCH WORK WARP TIMING] (%d blocks, %d warps/block, %d pipelines, clock=%d kHz)\n", num_of_blocks,
                 wt_warps_per_block, L.num_pipelines, _wt_clock_khz);
-    _wt_print_group("INTER_N2N", L.inter_node_group_start, L.inter_node_group_warps);
-    _wt_print_group("INTRA_G2S", L.intra_node_g2s_group_start, L.intra_node_g2s_group_warps);
-    _wt_print_group("INTRA_S2G", L.intra_node_s2g_group_start, L.intra_node_s2g_group_warps);
+    _wt_print_group("INTER_N2N", L.cross_lsa_group_start, L.cross_lsa_group_warps);
+    _wt_print_group("INTRA_G2S", L.lsa_g2s_group_start, L.lsa_g2s_group_warps);
+    _wt_print_group("INTRA_S2G", L.lsa_s2g_group_start, L.lsa_s2g_group_warps);
     _wt_print_group("PAD", L.pad_group_start, L.pad_group_warps);
     _wt_print_block_span();
 }

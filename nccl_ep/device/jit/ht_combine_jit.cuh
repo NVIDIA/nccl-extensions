@@ -32,16 +32,16 @@ inline const char* bool_literal(bool value) {
 }
 
 struct combine_warp_layout_t {
-    int intra_node_red_group_warps;
-    int intra_node_red_group_start;
-    int inter_node_red_group_warps;
-    int inter_node_red_group_start;
-    int intra_node_g2s_group_warps;
-    int intra_node_g2s_group_start;
-    int inter_node_g2s_group_warps;
-    int inter_node_g2s_group_start;
-    int inter_node_rdma_group_warps;
-    int inter_node_rdma_group_start;
+    int lsa_red_group_warps;
+    int lsa_red_group_start;
+    int cross_lsa_red_group_warps;
+    int cross_lsa_red_group_start;
+    int lsa_g2s_group_warps;
+    int lsa_g2s_group_start;
+    int cross_lsa_g2s_group_warps;
+    int cross_lsa_g2s_group_start;
+    int cross_lsa_rdma_group_warps;
+    int cross_lsa_rdma_group_start;
     int num_of_data_pipeline_per_block;
     int block_dim;
 };
@@ -49,19 +49,19 @@ struct combine_warp_layout_t {
 inline combine_warp_layout_t compute_combine_warp_layout(int num_lsa_teams) {
     const bool multinode_layout = (num_lsa_teams != 1);
     combine_warp_layout_t L{};
-    L.intra_node_red_group_warps = multinode_layout ? 4 : 0;
-    L.intra_node_red_group_start = 0;
-    L.inter_node_red_group_warps = 4;
-    L.inter_node_red_group_start = multinode_layout ? 4 : 0;
-    L.intra_node_g2s_group_warps = multinode_layout ? 1 : 0;
-    L.intra_node_g2s_group_start = multinode_layout ? 8 : 4;
-    L.inter_node_g2s_group_warps = multinode_layout ? 1 : 2;
-    L.inter_node_g2s_group_start = multinode_layout ? 9 : 4;
-    L.inter_node_rdma_group_warps = multinode_layout ? 1 : 0;
-    L.inter_node_rdma_group_start = multinode_layout ? 10 : 6;
+    L.lsa_red_group_warps = multinode_layout ? 4 : 0;
+    L.lsa_red_group_start = 0;
+    L.cross_lsa_red_group_warps = 4;
+    L.cross_lsa_red_group_start = multinode_layout ? 4 : 0;
+    L.lsa_g2s_group_warps = multinode_layout ? 1 : 0;
+    L.lsa_g2s_group_start = multinode_layout ? 8 : 4;
+    L.cross_lsa_g2s_group_warps = multinode_layout ? 1 : 2;
+    L.cross_lsa_g2s_group_start = multinode_layout ? 9 : 4;
+    L.cross_lsa_rdma_group_warps = multinode_layout ? 1 : 0;
+    L.cross_lsa_rdma_group_start = multinode_layout ? 10 : 6;
     L.num_of_data_pipeline_per_block = multinode_layout ? 1 : 2;
-    L.block_dim = 32 * (L.intra_node_red_group_warps + L.inter_node_red_group_warps + L.intra_node_g2s_group_warps +
-                        L.inter_node_g2s_group_warps + L.inter_node_rdma_group_warps);
+    L.block_dim = 32 * (L.lsa_red_group_warps + L.cross_lsa_red_group_warps + L.lsa_g2s_group_warps +
+                        L.cross_lsa_g2s_group_warps + L.cross_lsa_rdma_group_warps);
     return L;
 }
 
@@ -88,28 +88,28 @@ inline std::string combine_jit_source(
     std::ostringstream src;
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
-        << "using INTRA_NODE_RED_GROUP = ht_ep::warp_group<" << L.intra_node_red_group_warps << ", "
-        << L.intra_node_red_group_start << ">;\n"
-        << "using INTER_NODE_RED_GROUP = ht_ep::warp_group<" << L.inter_node_red_group_warps << ", "
-        << L.inter_node_red_group_start << ">;\n"
-        << "using INTRA_NODE_G2S_GROUP = ht_ep::warp_group<" << L.intra_node_g2s_group_warps << ", "
-        << L.intra_node_g2s_group_start << ">;\n"
-        << "using INTER_NODE_G2S_GROUP = ht_ep::warp_group<" << L.inter_node_g2s_group_warps << ", "
-        << L.inter_node_g2s_group_start << ">;\n"
-        << "using INTER_NODE_RDMA_GROUP = ht_ep::warp_group<" << L.inter_node_rdma_group_warps << ", "
-        << L.inter_node_rdma_group_start << ">;\n"
+        << "using LSA_RED_GROUP = ht_ep::warp_group<" << L.lsa_red_group_warps << ", "
+        << L.lsa_red_group_start << ">;\n"
+        << "using CROSS_LSA_RED_GROUP = ht_ep::warp_group<" << L.cross_lsa_red_group_warps << ", "
+        << L.cross_lsa_red_group_start << ">;\n"
+        << "using LSA_G2S_GROUP = ht_ep::warp_group<" << L.lsa_g2s_group_warps << ", "
+        << L.lsa_g2s_group_start << ">;\n"
+        << "using CROSS_LSA_G2S_GROUP = ht_ep::warp_group<" << L.cross_lsa_g2s_group_warps << ", "
+        << L.cross_lsa_g2s_group_start << ">;\n"
+        << "using GIN_GROUP = ht_ep::warp_group<" << L.cross_lsa_rdma_group_warps << ", "
+        << L.cross_lsa_rdma_group_start << ">;\n"
         << "\n"
-        << "extern \"C\" __launch_bounds__(INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + "
-           "INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size(), 1)\n"
+        << "extern \"C\" __launch_bounds__(LSA_RED_GROUP::size() + CROSS_LSA_RED_GROUP::size() + "
+           "LSA_G2S_GROUP::size() + CROSS_LSA_G2S_GROUP::size() + GIN_GROUP::size(), 1)\n"
         << "__global__ void " << kCombineJitEntryName << "(\n"
         << "    const __grid_constant__ ht_ep::combine_kernel_param_t<" << lsa_team_size << "> param) {\n"
         << "  extern __shared__ uint8_t smem_bytes[];\n"
         << "  ht_ep::combine_kernel_impl<\n"
-        << "      INTRA_NODE_RED_GROUP,\n"
-        << "      INTER_NODE_RED_GROUP,\n"
-        << "      INTRA_NODE_G2S_GROUP,\n"
-        << "      INTER_NODE_G2S_GROUP,\n"
-        << "      INTER_NODE_RDMA_GROUP,\n"
+        << "      LSA_RED_GROUP,\n"
+        << "      CROSS_LSA_RED_GROUP,\n"
+        << "      LSA_G2S_GROUP,\n"
+        << "      CROSS_LSA_G2S_GROUP,\n"
+        << "      GIN_GROUP,\n"
         << "      " << L.num_of_data_pipeline_per_block << ",\n"
         << "      " << num_of_stages_g2s << ",\n"
         << "      " << num_of_stages_s2g << ",\n"
@@ -315,11 +315,11 @@ inline void combine_dump_warp_timing(
     _wt_print_head_sync();
     std::printf("[COMBINE WORK WARP TIMING] (%d blocks, %d warps/block, %d pipelines, clock=%d kHz)\n", num_of_blocks,
                 wt_warps_per_block, L.num_of_data_pipeline_per_block, _wt_clock_khz);
-    _wt_print_work_group("INTRA_RED", L.intra_node_red_group_start, L.intra_node_red_group_warps);
-    _wt_print_work_group("INTER_RED", L.inter_node_red_group_start, L.inter_node_red_group_warps);
-    _wt_print_work_group("INTRA_G2S", L.intra_node_g2s_group_start, L.intra_node_g2s_group_warps);
-    _wt_print_work_group("INTER_G2S", L.inter_node_g2s_group_start, L.inter_node_g2s_group_warps);
-    _wt_print_work_group("INTER_N2N", L.inter_node_rdma_group_start, L.inter_node_rdma_group_warps);
+    _wt_print_work_group("INTRA_RED", L.lsa_red_group_start, L.lsa_red_group_warps);
+    _wt_print_work_group("INTER_RED", L.cross_lsa_red_group_start, L.cross_lsa_red_group_warps);
+    _wt_print_work_group("INTRA_G2S", L.lsa_g2s_group_start, L.lsa_g2s_group_warps);
+    _wt_print_work_group("INTER_G2S", L.cross_lsa_g2s_group_start, L.cross_lsa_g2s_group_warps);
+    _wt_print_work_group("INTER_N2N", L.cross_lsa_rdma_group_start, L.cross_lsa_rdma_group_warps);
     _wt_print_block_span();
 }
 #endif

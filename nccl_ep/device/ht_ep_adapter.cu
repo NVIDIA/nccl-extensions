@@ -1021,10 +1021,10 @@ ncclResult_t call_dispatch(
     kp.combine_signal_offset = params.combine_signal_offset;
     // Use offsets relative to gin_base_ptr
     kp.mr_info = {
-        .rdma_intra_node_red_token_offset = params.mr_info.rdma_intra_node_red_token_offset,
-        .combine_rdma_inter_node_group_token_offset = params.mr_info.combine_rdma_inter_node_group_token_offset,
-        .rdma_intra_node_red_prob_offset = params.mr_info.rdma_intra_node_red_prob_offset,
-        .combine_rdma_inter_node_group_prob_offset = params.mr_info.combine_rdma_inter_node_group_prob_offset,
+        .combine_red_token_offset = params.mr_info.combine_red_token_offset,
+        .combine_n2n_token_offset = params.mr_info.combine_n2n_token_offset,
+        .combine_red_prob_offset = params.mr_info.combine_red_prob_offset,
+        .combine_n2n_prob_offset = params.mr_info.combine_n2n_prob_offset,
         .guard_offset = params.mr_info.guard_offset
     };
 

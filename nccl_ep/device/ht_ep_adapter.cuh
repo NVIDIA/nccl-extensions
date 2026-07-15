@@ -297,10 +297,10 @@ struct dispatch_memory_region_info_t {
 
 struct combine_memory_region_info_t {
     // Offsets relative to gin_base_ptr for RDMA operations
-    size_t rdma_intra_node_red_token_offset; // Offset of intra-node reduced token buffer
-    size_t combine_rdma_inter_node_group_token_offset; // Offset of combine rdma token buffer
-    size_t rdma_intra_node_red_prob_offset; // Offset of intra-node reduced prob buffer
-    size_t combine_rdma_inter_node_group_prob_offset; // Offset of combine rdma prob buffer
+    size_t combine_red_token_offset; // Offset of combine LSA-team-reduced token buffer
+    size_t combine_n2n_token_offset; // Offset of combine cross-LSA-team (N2N RDMA) token buffer
+    size_t combine_red_prob_offset; // Offset of combine LSA-team-reduced prob buffer
+    size_t combine_n2n_prob_offset; // Offset of combine cross-LSA-team (N2N RDMA) prob buffer
     size_t guard_offset; // Offset of combine's RDMA sync-guard readiness flags
 };
 

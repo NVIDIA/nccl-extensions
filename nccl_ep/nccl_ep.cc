@@ -664,10 +664,10 @@ struct ncclEpGroup {
         int num_total_signals = 0;            // Total number of signals
 
         // Used by kernels to calculate actual addresses for RDMA puts
-        size_t rdma_intra_node_red_token_offset = 0;
-        size_t combine_rdma_inter_node_group_token_offset = 0;
-        size_t rdma_intra_node_red_prob_offset = 0;
-        size_t combine_rdma_inter_node_group_prob_offset = 0;
+        size_t combine_red_token_offset = 0;
+        size_t combine_n2n_token_offset = 0;
+        size_t combine_red_prob_offset = 0;
+        size_t combine_n2n_prob_offset = 0;
         size_t token_staging_offset = 0;
         size_t dense_prob_offset = 0;
         size_t scaling_factor_staging_offset = 0;
@@ -1350,16 +1350,16 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
 
     // Calculate offsets for kernel mr_info
     size_t cur_offset = 0;
-    ep_group->gin_config.rdma_intra_node_red_token_offset = cur_offset;
+    ep_group->gin_config.combine_red_token_offset = cur_offset;
     cur_offset += rdma_intra_node_red_token_sz;
 
-    ep_group->gin_config.combine_rdma_inter_node_group_token_offset = cur_offset;
+    ep_group->gin_config.combine_n2n_token_offset = cur_offset;
     cur_offset += combine_rdma_inter_node_group_token_sz;
 
-    ep_group->gin_config.rdma_intra_node_red_prob_offset = cur_offset;
+    ep_group->gin_config.combine_red_prob_offset = cur_offset;
     cur_offset += rdma_intra_node_red_prob_sz;
 
-    ep_group->gin_config.combine_rdma_inter_node_group_prob_offset = cur_offset;
+    ep_group->gin_config.combine_n2n_prob_offset = cur_offset;
     cur_offset += combine_rdma_inter_node_group_prob_sz;
 
     cur_offset += flags_sz * 2;
@@ -4136,7 +4136,7 @@ ncclResult_t ncclEpCombine(
             group,
             x,
             &x_local,
-            static_cast<uint64_t>(group->gin_config.rdma_intra_node_red_token_offset),
+            static_cast<uint64_t>(group->gin_config.combine_red_token_offset),
             &x));
 
         // Get dimensions from input tensor
@@ -4197,7 +4197,7 @@ ncclResult_t ncclEpCombine(
                 group,
                 topk_weights,
                 &topk_weights_local,
-                static_cast<uint64_t>(group->gin_config.rdma_intra_node_red_prob_offset),
+                static_cast<uint64_t>(group->gin_config.combine_red_prob_offset),
                 &topk_weights));
             NCCLCHECK(resolveTensorWindowBinding(
                 group,
@@ -4373,7 +4373,7 @@ ncclResult_t ncclEpCombine(
         const size_t combine_token_offset =
             is_single_node ? 0 :
                              (!combine_x_uses_external_window ? static_cast<size_t>(x->win_offset) :
-                                                                group->gin_config.rdma_intra_node_red_token_offset);
+                                                                group->gin_config.combine_red_token_offset);
         // Pass device communicators and windows
         // Always pass the devComm (single-node too): the HT LSA sync-guard now uses the
         // NCCL LSA barrier (needs comm.lsaBarrier). RDMA paths stay if-constexpr-gated.
@@ -4388,12 +4388,12 @@ ncclResult_t ncclEpCombine(
         params.combine_signal_offset = group->gin_config.combine_signal_offset;
         // Use offsets relative to gin_base_ptr
         params.mr_info = {
-            .rdma_intra_node_red_token_offset = combine_token_offset,
-            .combine_rdma_inter_node_group_token_offset =
-                is_single_node ? 0 : group->gin_config.combine_rdma_inter_node_group_token_offset,
-            .rdma_intra_node_red_prob_offset = is_single_node ? 0 : group->gin_config.rdma_intra_node_red_prob_offset,
-            .combine_rdma_inter_node_group_prob_offset =
-                is_single_node ? 0 : group->gin_config.combine_rdma_inter_node_group_prob_offset,
+            .combine_red_token_offset = combine_token_offset,
+            .combine_n2n_token_offset =
+                is_single_node ? 0 : group->gin_config.combine_n2n_token_offset,
+            .combine_red_prob_offset = is_single_node ? 0 : group->gin_config.combine_red_prob_offset,
+            .combine_n2n_prob_offset =
+                is_single_node ? 0 : group->gin_config.combine_n2n_prob_offset,
             .guard_offset = is_single_node ? 0 : group->gin_config.combine_guard_offset,
         };
         params.local_rank = group->lsa_rank;

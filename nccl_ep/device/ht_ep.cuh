@@ -117,10 +117,10 @@ dispatch_packed_entry_offset(const dispatch_memory_region_info_t* mr, int remote
 }
 
 struct combine_memory_region_info_t {
-    size_t rdma_intra_node_red_token_offset; // Offset of intra-node reduced token buffer
-    size_t combine_rdma_inter_node_group_token_offset; // Offset of combine rdma token buffer
-    size_t rdma_intra_node_red_prob_offset; // Offset of intra-node reduced prob buffer
-    size_t combine_rdma_inter_node_group_prob_offset; // Offset of combine rdma prob buffer
+    size_t combine_red_token_offset; // Offset of combine LSA-team-reduced token buffer
+    size_t combine_n2n_token_offset; // Offset of combine cross-LSA-team (N2N RDMA) token buffer
+    size_t combine_red_prob_offset; // Offset of combine LSA-team-reduced prob buffer
+    size_t combine_n2n_prob_offset; // Offset of combine cross-LSA-team (N2N RDMA) prob buffer
     size_t guard_offset; // RDMA sync-guard: offset of combine's internal-buffer readiness flags
 } __attribute__((__aligned__(8)));
 
@@ -2769,10 +2769,10 @@ __forceinline__ __device__ void combine_n2n_put_active_tokens(
             }
             int batch_start_token = batch_start_in_chunk + chunk_first_token;
             size_t token_src_offset =
-                smem_mr_info_ptr->rdma_intra_node_red_token_offset +
+                smem_mr_info_ptr->combine_red_token_offset +
                 (rdma_tile_id * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * TOKEN_BYTES;
             size_t token_dst_offset =
-                smem_mr_info_ptr->combine_rdma_inter_node_group_token_offset +
+                smem_mr_info_ptr->combine_n2n_token_offset +
                 (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * TOKEN_BYTES;
             net.put(
                 rail,
@@ -2788,10 +2788,10 @@ __forceinline__ __device__ void combine_n2n_put_active_tokens(
 
             if constexpr (BACKWARD_COMBINE) {
                 size_t prob_src_offset =
-                    smem_mr_info_ptr->rdma_intra_node_red_prob_offset +
+                    smem_mr_info_ptr->combine_red_prob_offset +
                     (rdma_tile_id * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * prob_dim * sizeof(float);
                 size_t prob_dst_offset =
-                    smem_mr_info_ptr->combine_rdma_inter_node_group_prob_offset +
+                    smem_mr_info_ptr->combine_n2n_prob_offset +
                     (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * prob_dim * sizeof(float);
                 net.put(
                     rail,

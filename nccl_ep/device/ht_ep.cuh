@@ -212,7 +212,7 @@ static_assert(
     MAX_SUPPORTED_TOKENS_PER_RANK < (1 << EM_S2D_SLOT_BITS),
     "MAX_SUPPORTED_TOKENS_PER_RANK exceeds em_s2d slot field width");
 
-// s2d-map double-buffer depth: consume one stage while prefetching the next (chunk, node) row.
+// s2d-map double-buffer depth: consume one stage while prefetching the next (chunk, LSA team) row.
 constexpr int S2D_MAP_RING_STAGES = 2;
 
 __host__ __device__ __forceinline__ int32_t em_s2d_pack(int rank_id, int slot) {
@@ -235,7 +235,7 @@ __host__ __device__ __forceinline__ int32_t drop_overflow_slot(int32_t slot, boo
     return (drop && slot_overflows(slot, capacity)) ? -1 : slot;
 }
 
-// Combine kernels pad each node's rdma_to_attn_map row to a multiple of 16 bools;
+// Combine kernels pad each LSA team's rdma_to_attn_map row to a multiple of 16 bools;
 // producers of the map must use the same stride.
 __host__ __device__ __forceinline__ int rdma_to_attn_row_stride(int tokens_per_rank) {
     return (((tokens_per_rank - 1) / 16) + 1) * 16;
@@ -306,14 +306,14 @@ struct combine_smem_layout_t {
     int token_G2S_stage_stride; // elements (not bytes)
     int token_S2G_stage_stride; // elements (not bytes)
     int prob_G2S_stage_stride; // elements (not bytes)
-    int prob_S2G_stage_stride; // intra-node elements (not bytes)
-    int prob_S2G_inter_stage_stride; // inter-node elements (not bytes)
+    int prob_S2G_stage_stride; // intra-LSA elements (not bytes)
+    int prob_S2G_inter_stage_stride; // cross-LSA-team elements (not bytes)
     combine_memory_region_info_t* combine_memory_region_info;
 
     // Streaming overlap: reduction warp -> RDMA warp within a chunk
     uint32_t* rdma_streaming_counter; // [1] cumulative tokens produced for the current chunk
 
-    int s2d_inner_dim; // Inner dimension of unified S2D map (n_ranks_per_node or num_topk)
+    int s2d_inner_dim; // Inner dimension of unified S2D map (ranks per LSA team or num_topk)
 
     // Accessor methods for staged buffers
     __device__ __forceinline__ uint16_t* get_lsa_token_G2S(int stage) const {
@@ -651,8 +651,8 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
         }
     };
 
-    // In the single-node case (num_of_nodes == 1), the combine kernel does not use the
-    // intra-node staging buffers. Skipping these buffers can cut SMEM roughly in half.
+    // In the single-LSA-team case (num_of_nodes == 1), the combine kernel does not use the
+    // intra-LSA staging buffers. Skipping these buffers can cut SMEM roughly in half.
     const bool multinode = (model.num_of_nodes > 1);
 
     // Per-token wire size: bytes for buffer offsets, uint16_t units for stage strides (the
@@ -667,7 +667,7 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     layout.prob_S2G_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team;
     layout.prob_S2G_inter_stage_stride = layout.prob_S2G_stage_stride * model.num_of_nodes;
 
-    // lsa_token_* buffers (128B aligned, multi-node only). Stage stride scales
+    // lsa_token_* buffers (128B aligned, multi-LSA-team only). Stage stride scales
     // with the on-wire element width (2 B for BF16/FP16, 4 B for FP32).
     if (multinode) {
         align_offset(128);
@@ -731,7 +731,7 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     }
 
     // Mbarrier buffers (8B aligned)
-    // lsa_mbarrier_G2S_buffer (multi-node only)
+    // lsa_mbarrier_G2S_buffer (multi-LSA-team only)
     if (multinode) {
         align_offset(8);
         layout.lsa_mbarrier_G2S_buffer =
@@ -746,7 +746,7 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     layout.cross_lsa_mbarrier_G2S_buffer = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += num_of_stages_g2s * 2 * sizeof(uint64_t);
 
-    // lsa_to_rdma_mbarrier_buffer (only if multi-node)
+    // lsa_to_rdma_mbarrier_buffer (only if multi-LSA-team)
     if (model.num_of_nodes > 1) {
         int max_num_of_chunks_per_rank =
             (model.max_num_of_tokens_per_rank + num_of_tokens_per_chunk - 1) / num_of_tokens_per_chunk;
@@ -778,7 +778,7 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     layout.cross_lsa_flag_G2S_buffer = reinterpret_cast<bool*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += num_of_stages_g2s * sizeof(bool);
 
-    // Streaming overlap fields (multi-node only, 4B aligned)
+    // Streaming overlap fields (multi-LSA-team only, 4B aligned)
     if (multinode) {
         align_offset(4);
         layout.rdma_streaming_counter = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
@@ -812,7 +812,7 @@ static size_t calculate_combine_smem_layout_size(
 
     // Token buffers (128B aligned for TMA). Stage stride scales with the wire element
     // width (2 B for BF16/FP16, 4 B for FP32).
-    // intra_node_token_* buffers (multi-node only)
+    // lsa_token_* buffers (multi-LSA-team only)
     if (multinode) {
         total_size = (total_size + 127) & ~127;
         total_size += num_of_stages_g2s * token_bytes;
@@ -854,7 +854,7 @@ static size_t calculate_combine_smem_layout_size(
     }
 
     // Mbarrier buffers (8B aligned)
-    // lsa_mbarrier_G2S_buffer [stages][2] (multi-node only)
+    // lsa_mbarrier_G2S_buffer [stages][2] (multi-LSA-team only)
     if (multinode) {
         total_size = (total_size + 7) & ~7;
         total_size += num_of_stages_g2s * 2 * sizeof(uint64_t);
@@ -864,13 +864,13 @@ static size_t calculate_combine_smem_layout_size(
     total_size = (total_size + 7) & ~7;
     total_size += num_of_stages_g2s * 2 * sizeof(uint64_t);
 
-    // lsa_to_rdma_mbarrier_buffer [(nodes-1)][chunks] (only if multi-node)
+    // lsa_to_rdma_mbarrier_buffer [(LSA teams-1)][chunks] (only if multi-LSA-team)
     if (multinode) {
         total_size = (total_size + 7) & ~7;
         total_size += (num_lsa_teams - 1) * max_num_of_chunks_per_rank * sizeof(uint64_t);
     }
 
-    // combine_memory_region_info [(nodes-1)] (align 8B, only if multi-node)
+    // combine_memory_region_info [(LSA teams-1)] (align 8B, only if multi-LSA-team)
     if (multinode) {
         total_size = (total_size + 7) & ~7;
         total_size += (num_lsa_teams - 1) * sizeof(combine_memory_region_info_t);
@@ -882,7 +882,7 @@ static size_t calculate_combine_smem_layout_size(
     }
     total_size += num_of_stages_g2s * sizeof(bool);
 
-    // Streaming overlap fields (multi-node only, 4B aligned)
+    // Streaming overlap fields (multi-LSA-team only, 4B aligned)
     if (multinode) {
         total_size = (total_size + 3) & ~3;
         total_size += sizeof(uint32_t); // rdma_streaming_counter
@@ -904,7 +904,7 @@ struct dispatch_kernel_param_base_t {
         attn_input_token_scaling_factor; // FP8 EXTERN: per-token scales (float* for FP32, uint8_t* for UE8M0 — pure byte transport).
     // Internal temp buffers. These buffers are local buffers.
     uint64_t* rdma_inter_node_group_flags; // For RDMA Atomic flags.
-    uint32_t* intra_node_write_completion_flags; // For intra-node S2G write completion notification.
+    uint32_t* intra_node_write_completion_flags; // For intra-LSA S2G write completion notification.
     // Metadata buffers. These buffers are local buffers.
     const bool* rdma_to_attn_map;
     const bool* attn_to_rdma_map;
@@ -939,8 +939,8 @@ struct dispatch_kernel_param_base_t {
     // sender S2G dedups consecutive same-dest entries; secondary slots are filled
     // afterwards by the local_dup kernel.
     bool local_dup_enabled;
-    // Cross-round WAR sync-guards: LSA (intra-node staging) uses the NCCL LSA barrier; RDMA
-    // (inter-node staging) is hand-rolled. Only the enable flags are needed on the device now.
+    // Cross-round WAR sync-guards: LSA (intra-LSA staging) uses the NCCL LSA barrier; RDMA
+    // (cross-LSA-team staging) is hand-rolled. Only the enable flags are needed on the device now.
     bool guard_enabled; // cross-round WAR guard (LSA + RDMA share one enable)
     // Backstop bound for recv slot indices; the scan never publishes slots at or
     // above it (DROP masks the rest), so the S2G assert only fires on corrupted
@@ -967,7 +967,7 @@ struct combine_kernel_param_base_t {
     int hidden_dim;
     int experts_per_rank;
     int ranks_per_lsa_team;
-    // EM unfused-combine: when true, the inter-node G2S warp group skips local-dup
+    // EM unfused-combine: when true, the cross-LSA-team G2S warp group skips local-dup
     // secondary em_slots (primaries already carry the pre-reduced weighted sum
     // written by the local_reduce kernel). Default false => fused fanout.
     bool combine_local_reduce_enabled;
@@ -980,7 +980,7 @@ struct combine_kernel_param_base_t {
     const uint16_t* rdma_inter_node_group_token;
     const float* rdma_inter_node_group_prob;
     uint64_t* rdma_inter_node_group_flags;
-    uint32_t* intra_node_write_completion_flags; // For intra-node src ready notification.
+    uint32_t* intra_node_write_completion_flags; // For intra-LSA src ready notification.
     // Metadata buffers. These buffers are local buffers.
     const bool* rdma_to_attn_map;
     const bool* attn_to_rdma_map;
@@ -994,7 +994,7 @@ struct combine_kernel_param_base_t {
     int lsa_team;
     // Stride for routing-map indexing (= max_tokens_per_rank).
     int num_of_tokens_per_rank;
-    // Actual token count; gates the inter_node_red TMA store.
+    // Actual token count; gates the cross_lsa_red TMA store.
     int num_real_tokens;
     // Per-rank grid-barrier counter that elects the last block at the combine tail.
     uint32_t* combine_grid_barrier_counter;
@@ -1010,8 +1010,8 @@ struct combine_kernel_param_base_t {
     unsigned combine_signal_offset; // Signal offset for combine operations
     // qp info and mr info
     struct combine_memory_region_info_t mr_info;
-    // Cross-round WAR sync-guards: LSA (intra-node staging) uses the NCCL LSA barrier; RDMA
-    // (inter-node staging) is hand-rolled. Only the enable flags are needed on the device now.
+    // Cross-round WAR sync-guards: LSA (intra-LSA staging) uses the NCCL LSA barrier; RDMA
+    // (cross-LSA-team staging) is hand-rolled. Only the enable flags are needed on the device now.
     bool guard_enabled; // cross-round WAR guard (LSA + RDMA share one enable)
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     combine_warp_timing_entry_t* warp_timing;
@@ -1030,7 +1030,7 @@ struct combine_kernel_param_t : combine_kernel_param_base_t {
 
 // Each CUDA block has sixteen named barriers numbered 0..15.
 // __syncthreads(); will use the 0 named barriers, so we want to avoid that.
-// We want to use 1 for intra-node reduction warp group, >= 2 for inter-node reduction warp group,
+// We want to use 1 for intra-LSA reduction warp group, >= 2 for cross-LSA-team reduction warp group,
 // RDMA warp group currently only contains 1 warp so does not use named bar yet, if it need to use, it should use 2 + NUM_OF_DATA_PIPELINE_PER_BLOCK.
 __forceinline__ __device__ void arrive_and_wait(uint32_t num_threads, uint32_t barrier_id = 0) {
     asm volatile("bar.sync %0, %1;" : : "r"(barrier_id), "r"(num_threads));
@@ -1059,7 +1059,7 @@ __forceinline__ __device__ void mbarrier_wait(uint64_t* mbar, uint32_t parity) {
     }
 }
 
-// Put one token's bundle (token, +prob if FWD, +sf if quantized) to a remote node, packed from dst_offset.
+// Put one token's bundle (token, +prob if FWD, +sf if quantized) to a remote LSA team, packed from dst_offset.
 template <typename TOKEN_DATA_TYPE, bool FORWARD_DISPATCH, bool HAS_SF, int LSA_TEAMS>
 __forceinline__ __device__ void dispatch_n2n_put_token(
     ncclGin& net,
@@ -1129,7 +1129,7 @@ __forceinline__ __device__ void dispatch_n2n_put_token(
     }
 }
 
-// Resolved G2S source for one (node, chunk): packed-remote entry base, or strided-local base pointers.
+// Resolved G2S source for one (LSA team, chunk): packed-remote entry base, or strided-local base pointers.
 template <typename TOKEN_DATA_TYPE>
 struct g2s_source_t {
     bool use_packed;
@@ -1139,7 +1139,7 @@ struct g2s_source_t {
     const uint8_t* sf_base;
 };
 
-// Resolve a (node, chunk) source: packed-remote base (after waiting the RDMA arrival signal) or strided-local bases.
+// Resolve a (LSA team, chunk) source: packed-remote base (after waiting the RDMA arrival signal) or strided-local bases.
 template <
     typename TOKEN_DATA_TYPE,
     int LSA_TEAMS,
@@ -1322,7 +1322,7 @@ __forceinline__ __device__ void dispatch_g2s_issue_token(
         const void* prob_src = nullptr;
         const void* sf_src = nullptr;
         if constexpr (FORWARD_DISPATCH) {
-            // Advance by whole token rows, then pick this node's expert slice within the row.
+            // Advance by whole token rows, then pick this LSA team's expert slice within the row.
             const int experts_per_lsa_team = experts_per_rank * LSA_TEAM_SZ;
             const int prob_row_stride = experts_per_lsa_team * LSA_TEAMS;
             prob_src = src.prob_base + cur_tokid * prob_row_stride + my_lteam * experts_per_lsa_team;
@@ -1358,7 +1358,7 @@ struct s2g_dest_t {
     int output_buffer_index;
 };
 
-// TMA-load one (node, chunk)'s s2d-map slice into the SMEM stage and publish. Caller elects one lane.
+// TMA-load one (LSA team, chunk)'s s2d-map slice into the SMEM stage and publish. Caller elects one lane.
 template <typename SMEM_TYPE, int NUM_OF_TOKENS_PER_CHUNK>
 __forceinline__ __device__ void dispatch_s2g_prefetch_s2d_map(
     const int32_t* sparse_to_dense_map,
@@ -1471,7 +1471,7 @@ __forceinline__ __device__ void dispatch_s2g_issue_token(
         /*mbar=*/nullptr);
 }
 
-// Device function for inter-node node2node(RDMA) warp for dispatch kernel.
+// Device function for cross-LSA-team node2node(RDMA) warp for dispatch kernel.
 template <
     typename GIN_GROUP,
     typename TOKEN_DATA_TYPE,
@@ -1547,7 +1547,7 @@ __forceinline__ __device__ void dispatch_N2N_warp(
         }
 
         for (int j = 0; j < NUM_REMOTE_NODES; ++j) {
-            // Skip-self ring over the other nodes, load-balanced start at my_lteam.
+            // Skip-self ring over the other LSA teams, load-balanced start at my_lteam.
             int remote_idx = (j + my_lteam) % NUM_REMOTE_NODES;
             int remote_lteam_id = remote_idx < my_lteam ? remote_idx : remote_idx + 1;
             int remote_slot = remote_idx < my_lteam ? my_lteam - 1 : my_lteam;
@@ -1627,7 +1627,7 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     net.flush(ncclCoopWarp(), cuda::memory_order_acquire);
 }
 
-// Dispatch intra-node S2G warp group. With NUM_PIPELINES > 1, each warp is an
+// Dispatch intra-LSA S2G warp group. With NUM_PIPELINES > 1, each warp is an
 // independent pipeline consumer paired with the G2S warp of the same pipeline_rank.
 template <
     typename LSA_S2G_GROUP,
@@ -1742,7 +1742,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                 }
                 __syncwarp();
 
-                // Prefetch next (chunk, node) s2d map for THIS pipeline (single TMA load, lane 0 only).
+                // Prefetch next (chunk, LSA team) s2d map for THIS pipeline (single TMA load, lane 0 only).
                 if (s2g_lane == 0) {
                     int next_chunk_id;
                     int next_node_id;
@@ -1783,7 +1783,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                     }
                 }
 
-                // Walk nodes backward from self around the ring (j=0 -> self, j>=1 -> remote)
+                // Walk LSA teams backward from self around the ring (j=0 -> self, j>=1 -> remote)
                 int lteam_id = (my_lteam + LSA_TEAMS - j) % LSA_TEAMS;
                 const routing_loads_t* routing_map_ptr = reinterpret_cast<const routing_loads_t*>(
                     rdma_to_attn_map + (lteam_id * routing_map_node_stride + cidx * TOKENS_PER_CHUNK));
@@ -1867,7 +1867,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
     }
 }
 
-// Dispatch intra-node G2S warp group. With NUM_PIPELINES > 1, each warp is an independent
+// Dispatch intra-LSA G2S warp group. With NUM_PIPELINES > 1, each warp is an independent
 // pipeline processing disjoint chunks through its own partition of the shared-memory FIFO.
 template <
     typename LSA_G2S_GROUP,
@@ -1943,7 +1943,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
             }
 
             for (int j = 0; j < LSA_TEAMS; j++) {
-                // Walk nodes backward from self around the ring (j=0 -> self, j>=1 -> remote)
+                // Walk LSA teams backward from self around the ring (j=0 -> self, j>=1 -> remote)
                 int lteam_id = (my_lteam + LSA_TEAMS - j) % LSA_TEAMS;
 
                 g2s_source_t<TOKEN_DATA_TYPE> src = dispatch_g2s_resolve_source<
@@ -2038,9 +2038,9 @@ __forceinline__ __device__ void dispatch_G2S_warp(
     }
 }
 
-// Shared single-entry G2S issue for both the intra- and inter-node combine
-// G2S warps. INTER_NODE selects the inter-node staged-buffer accessors and
-// flag buffer; otherwise the intra-node ones (both sets live on the same
+// Shared single-entry G2S issue for both the intra- and cross-LSA-team combine
+// G2S warps. INTER_NODE selects the cross-LSA-team staged-buffer accessors and
+// flag buffer; otherwise the intra-LSA ones (both sets live on the same
 // combine smem layout, so one helper covers both tiers).
 //   - derive stage_idx + parity from (global_offset + rank_in_batch)
 //   - wait for consumer to free the stage (mbarrier_try_wait_parity)
@@ -2126,8 +2126,8 @@ __forceinline__ __device__ void issue_g2s_entry(
 }
 
 // Warp-cooperative scan of one sparse_to_dense_map row plus its inline
-// broadcast-issue, shared by the intra-node G2S warp and the LOCAL tier of
-// the inter-node G2S warp (the two differ only in INTER_NODE, starting_G2S_index,
+// broadcast-issue, shared by the intra-LSA G2S warp and the LOCAL tier of
+// the cross-LSA-team G2S warp (the two differ only in INTER_NODE, starting_G2S_index,
 // and which s2d row / FIFO slice they target -- all passed in).
 //
 //  * Process s2d entries in WARP_SIZE steps
@@ -2236,8 +2236,8 @@ __forceinline__ __device__ void issue_local_g2s_row(
     global_offset += total_valid_count;
 }
 
-// Decode a block's flat chunk index into its destination node, per-node chunk id, and token
-// count. Emit order (chunk c for node+1..node-1, then c+1) matches the RDMA consume order.
+// Decode a block's flat chunk index into its destination LSA team, per-LSA-team chunk id, and token
+// count. Emit order (chunk c for LSA team+1..LSA team-1, then c+1) matches the RDMA consume order.
 // Shared by the combine warp groups.
 struct comb_chunk_meta_t {
     int lteam_id;
@@ -2255,7 +2255,7 @@ combine_chunk_meta(int cidx, int my_lteam, int cpr, int rem_chunk_sz) {
     return c;
 }
 
-// Intra-node G2S warp for the combine kernel. Exactly one such warp per block.
+// Intra-LSA G2S warp for the combine kernel. Exactly one such warp per block.
 template <
     typename SMEM_TYPE,
     int STAGES_G2S,
@@ -2284,7 +2284,7 @@ __forceinline__ __device__ void combine_G2S_intra_warp(
     const int rem_chunk_sz = num_of_tokens_per_rank % TOKENS_PER_CHUNK;
     const int cpr = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHUNK);
     const int total_chunks = (LSA_TEAMS - 1) * cpr;
-    // rdma_to_attn_map is padded to 16B (16 bools) per node.
+    // rdma_to_attn_map is padded to 16B (16 bools) per LSA team.
     const int rdma_map_size_per_node = nccl_ep::align(num_of_tokens_per_rank, 16);
 
     // Warp-cooperative G2S: lanes scan sparse_to_dense_map in parallel and issue TMA to distinct
@@ -2316,7 +2316,7 @@ __forceinline__ __device__ void combine_G2S_intra_warp(
             (meta.lteam_id * num_of_tokens_per_rank + meta.chunk_id * TOKENS_PER_CHUNK) * s2d_entries_g2s;
 
         for (int cur_tokid = 0; cur_tokid < meta.csize; cur_tokid++) {
-            // Skip dst tokens this node doesn't need.
+            // Skip dst tokens this LSA team doesn't need.
             if (!rdma_row_base[cur_tokid]) {
                 continue;
             }
@@ -2436,7 +2436,7 @@ __forceinline__ __device__ void combine_reduce_dst_token(
 }
 
 // Store one reduced destination token (+prob) from FP32 registers into an S2G SMEM stage and
-// TMA-copy it to the per-destination intra-node red buffer. Advances the S2G stage cursor.
+// TMA-copy it to the per-destination intra-LSA red buffer. Advances the S2G stage cursor.
 template <
     typename RED_GROUP,
     int NUM_OF_STAGES_S2G,
@@ -2548,7 +2548,7 @@ __forceinline__ __device__ void combine_streaming_drain(
     streaming_pending = 0;
 }
 
-// Intra-node reduction warp group for the combine kernel.
+// Intra-LSA reduction warp group for the combine kernel.
 template <
     typename RED_GROUP,
     typename SMEM_TYPE,
@@ -2598,7 +2598,7 @@ __forceinline__ __device__ void combine_RED_intra_warp(
     const int rem_chunk_sz = num_of_tokens_per_rank % TOKENS_PER_CHUNK;
     const int cpr = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHUNK);
     const int total_chunks = (LSA_TEAMS - 1) * cpr;
-    // rdma_to_attn_map is padded to 16B (16 bools) per node.
+    // rdma_to_attn_map is padded to 16B (16 bools) per LSA team.
     const int rdma_map_size_per_node = nccl_ep::align(num_of_tokens_per_rank, 16);
 
     // G2S FIFO cursor + producer parity (source tokens); S2G FIFO cursor (reduced dst tokens).
@@ -2645,7 +2645,7 @@ __forceinline__ __device__ void combine_RED_intra_warp(
                 if (cur_tokid >= meta.csize) {
                     break;
                 }
-                // Skip dst tokens this node doesn't need.
+                // Skip dst tokens this LSA team doesn't need.
                 if (!*(reinterpret_cast<bool*>(&routing_data) + token_in_load)) {
                     continue;
                 }
@@ -2725,9 +2725,9 @@ __forceinline__ __device__ void combine_RED_intra_warp(
     }
 }
 
-// RDMA-put the active tokens (per rdma_to_attn_map) of one chunk to the remote node, coalescing
+// RDMA-put the active tokens (per rdma_to_attn_map) of one chunk to the remote LSA team, coalescing
 // contiguous runs into batches of at most MAX_BATCH (token + optional prob). Under STREAMING each flush
-// first waits for the intra-node reduction warp to publish enough produced tokens (streaming_counter)
+// first waits for the intra-LSA reduction warp to publish enough produced tokens (streaming_counter)
 // and advances cumulative_sent; otherwise the whole chunk is assumed reduced. Lane 0 only.
 template <
     bool STREAMING,
@@ -2815,7 +2815,7 @@ __forceinline__ __device__ void combine_n2n_put_active_tokens(
     }
 }
 
-// Signal the remote node (via ncclGin) that this chunk has been delivered. Lane 0 only.
+// Signal the remote LSA team (via ncclGin) that this chunk has been delivered. Lane 0 only.
 template <int MAX_NUM_OF_TOKENS_PER_RANK, int TOKENS_PER_CHUNK, int LSA_TEAMS>
 __forceinline__ __device__ void combine_n2n_signal_remote(
     ncclGin& net,
@@ -2840,7 +2840,7 @@ __forceinline__ __device__ void combine_n2n_signal_remote(
         cuda::thread_scope_thread);
 }
 
-// Inter-node N2N (RDMA) warp group for the combine kernel. Exactly one such warp per block;
+// Cross-LSA-team N2N (RDMA) warp group for the combine kernel. Exactly one such warp per block;
 // uses the ncclGin API (net.put / net.signal).
 template <
     typename GIN_GROUP,
@@ -2888,7 +2888,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     static_assert(
         TOKENS_PER_CHUNK % sizeof(routing_loads_t) == 0,
         "TOKENS_PER_CHUNK must be multiple of sizeof(routing_loads_t).");
-    // mr_info and the intra-node -> rdma mbarrier buffer are staged in shared memory.
+    // mr_info and the intra-LSA -> rdma mbarrier buffer are staged in shared memory.
     struct combine_memory_region_info_t* smem_mr_info_ptr = nullptr;
     uint64_t* lsa_to_rdma_mbarrier_buffer_ptr = nullptr;
     constexpr int MAX_NUM_OF_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
@@ -2905,16 +2905,16 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     const int rem_chunk_sz = num_of_tokens_per_rank % TOKENS_PER_CHUNK;
     const int cpr = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHUNK);
     const int total_chunks = (LSA_TEAMS - 1) * MAX_NUM_OF_CHUNKS_PER_RANK;
-    // rdma_to_attn_map is padded to 16B (16 bools) per node.
+    // rdma_to_attn_map is padded to 16B (16 bools) per LSA team.
     const int rdma_map_size_per_node = nccl_ep::align(num_of_tokens_per_rank, 16);
     uint32_t token_consumer_parity = 0;
     uint32_t cumulative_sent = 0; // Cumulative active tokens RDMA-put across all chunks (never reset).
     for (int cidx = blockIdx.x; cidx < total_chunks; cidx += NBLOCKS) {
-        // Node/chunk mapping shared with the G2S receiver so signals match.
+        // LSA-team/chunk mapping shared with the G2S receiver so signals match.
         const auto meta = combine_chunk_meta<LSA_TEAMS, TOKENS_PER_CHUNK>(cidx, my_lteam, cpr, rem_chunk_sz);
         const int lteam_id = meta.lteam_id;
         const int chunk_id = meta.chunk_id;
-        // With rail-scoped GIN comms, node index maps to rail-team rank.
+        // With rail-scoped GIN comms, LSA-team index maps to rail-team rank.
         const int rank_in_remote = lteam_id < my_lteam ? my_lteam - 1 : my_lteam;
         const bool is_residue = (chunk_id >= cpr);
 
@@ -2996,14 +2996,14 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     token_consumer_parity ^= 1;
 }
 
-// One warp lane's remote node for the combine inter-node RDMA tier and whether that node
-// needs the current dst token. tile_id indexes the per-remote-node RDMA buffers.
+// One warp lane's remote LSA team for the combine cross-LSA-team RDMA tier and whether that LSA team
+// needs the current dst token. tile_id indexes the per-remote-LSA-team RDMA buffers.
 struct rdma_lane_t {
     bool valid;
     int tile_id;
 };
 
-// Map lane_id -> remote node (lane 0 -> my_lteam-1, wrapping past self) and read its routing bit.
+// Map lane_id -> remote LSA team (lane 0 -> my_lteam-1, wrapping past self) and read its routing bit.
 template <int LSA_TEAMS>
 __forceinline__ __device__ rdma_lane_t
 combine_g2s_resolve_rdma_lane(int lane_id, int my_lteam, const bool* attn_to_rdma_addr) {
@@ -3016,7 +3016,7 @@ combine_g2s_resolve_rdma_lane(int lane_id, int my_lteam, const bool* attn_to_rdm
     return rdma_lane_t{attn_to_rdma_addr[tile_id], tile_id};
 }
 
-// Token (+prob) source pointers for one remote token in the RDMA inter-node group buffers.
+// Token (+prob) source pointers for one remote token in the RDMA cross-LSA-team group buffers.
 struct g2s_src_t {
     const uint16_t* token_src;
     const float* prob_src;
@@ -3040,8 +3040,8 @@ __forceinline__ __device__ g2s_src_t combine_g2s_resolve_rdma_source(
     return g2s_src_t{token_src, prob_src};
 }
 
-// Cooperatively issue every remote node's src token for one dst token into this warp's G2S ring.
-// Each lane owns one remote node; valid lanes issue in parallel to distinct stages, batched by
+// Cooperatively issue every remote LSA team's src token for one dst token into this warp's G2S ring.
+// Each lane owns one remote LSA team; valid lanes issue in parallel to distinct stages, batched by
 // ring_len so parity resolves cleanly when valid remotes exceed the ring depth (RED consumes
 // stages sequentially). Advances global_offset by the number of entries issued. Mirrors the
 // LOCAL tier's issue_local_g2s_row.
@@ -3120,7 +3120,7 @@ __forceinline__ __device__ void issue_rdma_g2s_row(
     }
 }
 
-// Inter-node G2S warp group for the combine kernel.
+// Cross-LSA-team G2S warp group for the combine kernel.
 template <
     typename SMEM_TYPE,
     typename G2S_GROUP,
@@ -3160,7 +3160,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     unsigned combine_signal_offset,
     int num_gin_comms,
     int num_ctx_per_comm) {
-    // The G2S group is split into single-warp pipelines (warp == pipeline), matching the inter-node red
+    // The G2S group is split into single-warp pipelines (warp == pipeline), matching the cross-LSA-team red
     // group; each warp owns an equal slice of the G2S FIFO.
     static_assert(
         STAGES_G2S % G2S_GROUP::warp_size() == 0,
@@ -3173,12 +3173,12 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
 
     // Produces the local rank's output chunks in order; RDMA feeds matching chunk IDs from
-    // node-1, ..., node+1, so src chunks arrive in the order the RED group consumes them.
+    // LSA team-1, ..., LSA team+1, so src chunks arrive in the order the RED group consumes them.
     const int rem_chunk_sz = num_of_tokens_per_rank % TOKENS_PER_CHUNK;
     const int cpr = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHUNK);
     const int max_chunks_per_rank = nccl_ep::ceil_div(MAX_NUM_OF_TOKENS_PER_RANK, TOKENS_PER_CHUNK);
     const int total_chunks = cpr;
-    // rdma_to_attn_map is padded to 16B (16 bools) per node.
+    // rdma_to_attn_map is padded to 16B (16 bools) per LSA team.
     const int rdma_map_size_per_node = nccl_ep::align(num_of_tokens_per_rank, 16);
     // This warp's G2S FIFO sub-range.
     const int starting_G2S_index = NUM_OF_STAGES_G2S_PER_WARP * G2S_GROUP::warp_rank();
@@ -3186,7 +3186,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
 
     // Unified body for NVLink-only (LSA_TEAMS==1) and RDMA+NVLink (>1).
     //   LOCAL tier: warp-cooperative s2d-row scan -> issue_local_g2s_row.
-    //   RDMA tier (>1): chunk-level ncclGin signal pre-wait, warp-parallel per-node TMA issue, residue flags.
+    //   RDMA tier (>1): chunk-level ncclGin signal pre-wait, warp-parallel per-LSA-team TMA issue, residue flags.
     // Parity: global_offset counts stages filled this warp; entry rank R lands at
     //   stage = starting + (global_offset+R) % ring_len, parity = 1 ^ (((global_offset+R)/ring_len) & 1),
     // matching RED's sequential consumption.
@@ -3280,7 +3280,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
                         combine_local_reduce_enabled);
                 }
 
-                // RDMA tier: each lane maps to a remote node; valid lanes issue TMAs in parallel to
+                // RDMA tier: each lane maps to a remote LSA team; valid lanes issue TMAs in parallel to
                 // distinct stages, batched by ring_len so parity resolves cleanly.
                 if constexpr (LSA_TEAMS > 1) {
                     const int flat_token_id =
@@ -3325,8 +3325,8 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     }
 }
 
-// Consume one inter-node G2S stage into the FP32 accumulators: token is accumulated; prob is written
-// into node slot `prob_slot` (accumulated for the local phase, assigned for remote phases). Advances
+// Consume one cross-LSA-team G2S stage into the FP32 accumulators: token is accumulated; prob is written
+// into LSA-team slot `prob_slot` (accumulated for the local phase, assigned for remote phases). Advances
 // this pipeline's G2S cursor/parity. Returns the producer's last-src flag when READ_LAST_FLAG.
 template <
     int NUM_OF_THREADS_PER_PIPELINE,
@@ -3415,7 +3415,7 @@ __forceinline__ __device__ bool combine_inter_consume_src(
     return last_src_token;
 }
 
-// Store one reduced dst token (+per-node prob) from FP32 registers into an S2G SMEM stage and TMA-copy
+// Store one reduced dst token (+per-LSA-team prob) from FP32 registers into an S2G SMEM stage and TMA-copy
 // it to the attn output. Advances this pipeline's S2G cursor.
 template <
     int NUM_OF_THREADS_PER_PIPELINE,
@@ -3467,7 +3467,7 @@ __forceinline__ __device__ void combine_inter_store_token(
     }
     if constexpr (BACKWARD_COMBINE) {
         float* store_prob_base_ptr = smem_buffer_ptr->get_cross_lsa_prob_S2G(dst_token_stage);
-        // Gather per-source-node prob into output node order (my_lteam, my_lteam-1, ...).
+        // Gather per-source-LSA-team prob into output LSA-team order (my_lteam, my_lteam-1, ...).
 #pragma unroll
         for (int n = 0; n < LSA_TEAMS; n++) {
             int output_lteam_id = (my_lteam - n) >= 0 ? my_lteam - n : my_lteam + LSA_TEAMS - n;
@@ -3515,7 +3515,7 @@ __forceinline__ __device__ void combine_inter_store_token(
     }
 }
 
-// Inter-node reduction warp group for the combine kernel.
+// Cross-LSA-team reduction warp group for the combine kernel.
 template <
     typename SMEM_TYPE,
     typename RED_GROUP,
@@ -3544,7 +3544,7 @@ __forceinline__ __device__ void combine_RED_inter_warp(
     const int experts_per_rank,
     SMEM_TYPE* smem_buffer_ptr) {
     // The warp group is split into NUM_OF_DATA_PIPELINE_PER_BLOCK independent pipelines (matching the
-    // inter-node G2S group); each pipeline owns an equal slice of the G2S/S2G FIFOs.
+    // cross-LSA-team G2S group); each pipeline owns an equal slice of the G2S/S2G FIFOs.
     static_assert(
         RED_GROUP::warp_size() % NUM_OF_DATA_PIPELINE_PER_BLOCK == 0,
         "Inter-node red warp count must be a multiple of NUM_OF_DATA_PIPELINE_PER_BLOCK.");
@@ -3577,11 +3577,11 @@ __forceinline__ __device__ void combine_RED_inter_warp(
         nccl_ep::ceil_div(NUM_MAX_LOCAL_EXPERTS * LSA_TEAM_SZ, NUM_OF_THREADS_PER_PIPELINE);
 
     // Each block produces token groups of the local rank's output chunks in order; the RDMA network feeds
-    // matching chunk IDs from node-1, node-2, ..., node+1, so src chunks arrive in the same order.
+    // matching chunk IDs from LSA team-1, LSA team-2, ..., LSA team+1, so src chunks arrive in the same order.
     const int rem_chunk_sz = num_of_tokens_per_rank % TOKENS_PER_CHUNK;
     const int cpr = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHUNK);
     const int total_chunks = cpr;
-    // rdma_to_attn_map is padded to 16B (16 bools) per node.
+    // rdma_to_attn_map is padded to 16B (16 bools) per LSA team.
     const int rdma_map_size_per_node = nccl_ep::align(num_of_tokens_per_rank, 16);
     // Dtype-aware per-token output stride in uint16_t units.
     const size_t out_token_stride_u16 = (size_t)HIDDEN_DIM * nccl_ep::size_u8<kTokenDtype>() / sizeof(uint16_t);
@@ -3627,8 +3627,8 @@ __forceinline__ __device__ void combine_RED_inter_warp(
                     break;
                 }
 
-                // Each dst token accumulates local-node src tokens (like intra reduction) then remote-node
-                // RDMA src tokens. Prob is gathered per source node: slot 0 = local, 1..LSA-1 = remote.
+                // Each dst token accumulates local-LSA-team src tokens (like intra reduction) then remote-LSA-team
+                // RDMA src tokens. Prob is gathered per source LSA team: slot 0 = local, 1..LSA-1 = remote.
                 float2 acc_token_fp32[NUM_OF_ACC_ELEMENTS_PER_THREAD];
                 using acc_prob_storage_type =
                     acc_prob_storage_t<BACKWARD_COMBINE, LSA_TEAMS * MAX_NUM_OF_PROB_VEC_ELEMENT_PER_THREAD>;
@@ -3651,7 +3651,7 @@ __forceinline__ __device__ void combine_RED_inter_warp(
                     }
                 }
 
-                // Local-node accumulation: consume staged src tokens until the producer marks the last one.
+                // Local-LSA-team accumulation: consume staged src tokens until the producer marks the last one.
                 if (rdma_to_attn_map_base[cur_tokid]) {
                     bool last_local_src = false;
                     do {
@@ -3678,7 +3678,7 @@ __forceinline__ __device__ void combine_RED_inter_warp(
                     } while (!last_local_src);
                 }
 
-                // Remote-node accumulation: at most one src token per remote node (node-1, node-2, ..., node+1).
+                // Remote-LSA-team accumulation: at most one src token per remote LSA team (LSA team-1, LSA team-2, ..., LSA team+1).
                 if constexpr (LSA_TEAMS > 1) {
                     const bool* attn_to_rdma_addr = attn_to_rdma_map_base + cur_tokid * (LSA_TEAMS - 1);
 #pragma unroll
@@ -3832,7 +3832,7 @@ __forceinline__ __device__ void PAD_warp_group_device_function(
     __syncwarp();
 }
 
-// Inter-node RDMA (GIN) cross-round WAR guard, warp-collective (lane i -> peer i), relaxed (WAR only).
+// Cross-LSA-team RDMA (GIN) cross-round WAR guard, warp-collective (lane i -> peer i), relaxed (WAR only).
 
 // Wait until every rail peer's flag reaches the expected round.
 __device__ __forceinline__ void
@@ -3948,7 +3948,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
         }
     } else if (head_tid < head_init_warp::size() + head_rdma_warp::size()) {
-        // warp 1: inter-node RDMA guard wait.
+        // warp 1: cross-LSA-team RDMA guard wait.
         if constexpr (LSA_TEAMS != 1) {
             if (param.guard_enabled)
                 warp_rdma_guard_wait(
@@ -3959,7 +3959,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                     *param.expected_rdma_flag_value);
         }
     } else if (head_tid < head_init_warp::size() + head_rdma_warp::size() + head_lsa_warp::size()) {
-        // warp 2: intra-node LSA barrier.
+        // warp 2: intra-LSA LSA barrier.
         if constexpr (LSA_TEAM_SZ != 1) {
             if (param.guard_enabled) {
                 ncclLsaBarrierSession<ncclCoopWarp> bar(
@@ -4082,7 +4082,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
         using tail_rdma_warp = warp_group<1, 1>; // warp 1
         const int tail_tid = (int)threadIdx.x;
         if (tail_tid < tail_completion_warp::size()) {
-            // warp 0 (thread 0): inter-rank completion barrier, then reset + bump the intra-node round
+            // warp 0 (thread 0): inter-rank completion barrier, then reset + bump the intra-LSA round
             // (local_dup defers that bump to its own tail).
             if (tail_tid == 0) {
                 const uint32_t expected_val = *param.expected_intra_node_flag_value;
@@ -4097,7 +4097,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                     *param.expected_intra_node_flag_value += static_cast<uint32_t>(param.ranks_per_lsa_team);
             }
         } else if (tail_tid < tail_completion_warp::size() + tail_rdma_warp::size()) {
-            // warp 1: publish the inter-node RDMA guard + bump the RDMA round.
+            // warp 1: publish the cross-LSA-team RDMA guard + bump the RDMA round.
             if constexpr (LSA_TEAMS != 1) {
                 const uint64_t expected = *param.expected_rdma_flag_value;
                 if (param.guard_enabled)
@@ -4114,15 +4114,15 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     }
 }
 
-template < // This type represent intra-node reduction warp group.
+template < // This type represent intra-LSA reduction warp group.
   typename LSA_RED_GROUP,
-  // This type represent inter-node reduction warp group.
+  // This type represent cross-LSA-team reduction warp group.
   typename CROSS_LSA_RED_GROUP,
-  // This type represent intra-node G2S warp group.
+  // This type represent intra-LSA G2S warp group.
   typename LSA_G2S_GROUP,
-  // This type represent inter-node G2S warp group.
+  // This type represent cross-LSA-team G2S warp group.
   typename CROSS_LSA_G2S_GROUP,
-  // This type represent inter-node rdma warp group.
+  // This type represent cross-LSA-team rdma warp group.
   typename GIN_GROUP,
   // Number of independent data pipeline per CUDA block.
   int NUM_OF_DATA_PIPELINE_PER_BLOCK,
@@ -4130,7 +4130,7 @@ template < // This type represent intra-node reduction warp group.
   int STAGES_G2S,
   // Number of token entry in the shared memory for S2G operations.
   int NUM_OF_STAGES_S2G,
-  // Number of token per group in the inter-node reduction/G2S warp group.
+  // Number of token per group in the cross-LSA-team reduction/G2S warp group.
   int NUM_OF_TOKENS_PER_GROUP,
   // Size of each chunk.
   int TOKENS_PER_CHUNK,
@@ -4138,7 +4138,7 @@ template < // This type represent intra-node reduction warp group.
   int MAX_NUM_OF_TOKENS_PER_RANK, int LSA_TEAMS,
   // Number of CUDA block running dispatch kernel.
   int NBLOCKS,
-  // Number of fully in-flight S2G in intra-node reduction warp group.
+  // Number of fully in-flight S2G in intra-LSA reduction warp group.
   int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
   // Whether the combine kernel is used in backward process. If so, need to transfer the prob for each token as well.
   bool BACKWARD_COMBINE, int HIDDEN_DIM, int LSA_TEAM_SZ, ncclEpLayout_t kLayout,
@@ -4146,12 +4146,12 @@ template < // This type represent intra-node reduction warp group.
   // reduction branches fold away — BF16 (default) pays zero dtype-branch cost.
   ncclDataType_t kTokenDtype = ncclBfloat16>
 // Each CUDA block of combine kernel has named warp groups:
-// intra/inter reduction, intra/inter G2S, and inter-node N2N RDMA. Group sizes are
+// intra/inter reduction, intra/inter G2S, and cross-LSA-team N2N RDMA. Group sizes are
 // set by the HT combine warp-count constants and the selected pipeline count.
 __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t<LSA_TEAM_SZ>& param,
                                                     uint8_t* smem_bytes) {
     const int my_lteam = param.lsa_team;
-    // Compile-time check (only enforce for multi-node layout).
+    // Compile-time check (only enforce for multi-LSA-team layout).
     if constexpr (LSA_TEAMS != 1) {
         static_assert(
             LSA_G2S_GROUP::size() == 32,
@@ -4161,7 +4161,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             "Combine kernel only support 1 INTER_NODE_G2S warp currently.");
     }
     // The token and its properties should meet size and alignment requirement.
-    // Currently, we use TMA to copy prob data, which need at least 16B size and alignment(which requires expert per node to be multiple of 4).
+    // Currently, we use TMA to copy prob data, which need at least 16B size and alignment(which requires expert per LSA team to be multiple of 4).
     // We need to add padding or not using TMA for prob, if we want to support other scenario.
     // assert((param.experts_per_rank * param.ranks_per_lsa_team * sizeof(float)) % 16 == 0);
     static_assert((HIDDEN_DIM % 2) == 0, "HIDDEN_DIM must be even for BF16x2.");
@@ -4246,7 +4246,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 cuda::ptx::space_shared); // make mbarrier init visible to the async (TMA) proxy
         }
     } else if (head_tid < head_init_warp::size() + head_rdma_warp::size()) {
-        // warp 1: inter-node RDMA guard wait.
+        // warp 1: cross-LSA-team RDMA guard wait.
         if constexpr (LSA_TEAMS != 1) {
             if (param.guard_enabled)
                 warp_rdma_guard_wait(
@@ -4273,7 +4273,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     int threadIdx_x_int = (int)threadIdx.x;
     if (threadIdx_x_int < LSA_RED_GROUP::size()) {
         if constexpr (LSA_TEAMS != 1) {
-            // Intra-node reduction warp group.
+            // Intra-LSA reduction warp group.
 #define COMBINE_RED_INTRA_TEMPLATE \
             combine_RED_intra_warp<LSA_RED_GROUP, cur_smem_t, STAGES_G2S, NUM_OF_STAGES_S2G, \
                                    TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, LSA_TEAMS, NBLOCKS, \
@@ -4293,7 +4293,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
 #undef COMBINE_RED_INTRA_TEMPLATE
         }
     } else if (threadIdx_x_int < LSA_RED_GROUP::size() + CROSS_LSA_RED_GROUP::size()) {
-        // Inter-node reduction warp group.
+        // Cross-LSA-team reduction warp group.
 #define COMBINE_RED_INTER_TEMPLATE \
         combine_RED_inter_warp<cur_smem_t, CROSS_LSA_RED_GROUP, NUM_OF_DATA_PIPELINE_PER_BLOCK, STAGES_G2S, \
                                 NUM_OF_STAGES_S2G, TOKENS_PER_CHUNK, LSA_TEAMS, NBLOCKS, NUM_OF_TOKENS_PER_GROUP, \
@@ -4314,7 +4314,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
 #undef COMBINE_RED_INTER_TEMPLATE
     } else if (
         threadIdx_x_int < LSA_RED_GROUP::size() + CROSS_LSA_RED_GROUP::size() + LSA_G2S_GROUP::size()) {
-        // Intra-node G2S warp group.
+        // Intra-LSA G2S warp group.
         if constexpr (LSA_TEAMS != 1) {
 #define COMBINE_G2S_INTRA_TEMPLATE \
             combine_G2S_intra_warp<cur_smem_t, STAGES_G2S, TOKENS_PER_CHUNK, LSA_TEAMS, \
@@ -4334,7 +4334,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     } else if (
         threadIdx_x_int < LSA_RED_GROUP::size() + CROSS_LSA_RED_GROUP::size() + LSA_G2S_GROUP::size() +
                               CROSS_LSA_G2S_GROUP::size()) {
-        // Inter-node G2S warp group.
+        // Cross-LSA-team G2S warp group.
 #define COMBINE_G2S_INTER_TEMPLATE \
         combine_G2S_inter_warp<cur_smem_t, CROSS_LSA_G2S_GROUP, STAGES_G2S, TOKENS_PER_CHUNK, \
                                 MAX_NUM_OF_TOKENS_PER_RANK, LSA_TEAMS, NBLOCKS, NUM_OF_TOKENS_PER_GROUP, \
@@ -4367,7 +4367,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     } else if (
         threadIdx_x_int < LSA_RED_GROUP::size() + CROSS_LSA_RED_GROUP::size() + LSA_G2S_GROUP::size() +
                               CROSS_LSA_G2S_GROUP::size() + GIN_GROUP::size()) {
-        // Inter-node rdma warp group.
+        // Cross-LSA-team rdma warp group.
         if constexpr (LSA_TEAMS != 1) {
 #define COMBINE_N2N_INTER_TEMPLATE \
             combine_N2N_inter_warp<GIN_GROUP, cur_smem_t, NUM_OF_STAGES_S2G, TOKENS_PER_CHUNK, \
@@ -4418,13 +4418,13 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             "combine tail needs 3 warps");
         const int tail_tid = (int)threadIdx.x;
         if (tail_tid < tail_reset_warp::size()) {
-            // warp 0: reset the grid counter + bump the intra-node round.
+            // warp 0: reset the grid counter + bump the intra-LSA round.
             if (tail_tid == 0) {
                 atomicExch((unsigned int*)param.combine_grid_barrier_counter, 0u);
                 *param.expected_intra_node_flag_value += static_cast<uint32_t>(param.ranks_per_lsa_team);
             }
         } else if (tail_tid < tail_reset_warp::size() + tail_rdma_warp::size()) {
-            // warp 1: publish the inter-node RDMA guard, then bump the RDMA round.
+            // warp 1: publish the cross-LSA-team RDMA guard, then bump the RDMA round.
             if constexpr (LSA_TEAMS != 1) {
                 const uint64_t expected = *param.expected_rdma_flag_value;
                 if (param.guard_enabled)
@@ -4438,7 +4438,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 if (tail_rdma_warp::thread_rank() == 0) *param.expected_rdma_flag_value = expected + 1ull;
             }
         } else if (tail_tid < tail_reset_warp::size() + tail_rdma_warp::size() + tail_lsa_warp::size()) {
-            // warp 2: intra-node LSA WAR barrier. Relaxed -- the tail __syncthreads already drained this
+            // warp 2: intra-LSA LSA WAR barrier. Relaxed -- the tail __syncthreads already drained this
             // round's reads. Index = dispatch's block count (disjoint from dispatch's per-block [0, NB)).
             if constexpr (LSA_TEAM_SZ != 1) {
                 if (param.guard_enabled) {

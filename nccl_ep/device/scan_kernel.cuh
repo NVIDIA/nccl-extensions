@@ -1090,7 +1090,7 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
     int32_t* g_block_count = p.gscratch;
 
     const int local_per_node_bytes = ((nrpn * epr) + 7) / 8;
-    // Matches the combine kernels' rdma_to_attn_map row padding (16 bools/node).
+    // Matches the combine kernels' rdma_to_attn_map row padding (16 bools/LSA-team).
     const int rdma_to_attn_map_size_per_node = rdma_to_attn_row_stride(p.num_tokens_per_rank);
     const int tid       = threadIdx.x;
     const int lane      = tid & 31;
@@ -1264,7 +1264,7 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
         }
 
         int my_packed_idx = 0;
-        // Drop policy: whether any local-node slot for this send token survived.
+        // Drop policy: whether any LSA-local slot for this send token survived.
         bool token_any_slot_kept = false;
         int primary_em_slot = -1;
         int n_local_sec = 0;

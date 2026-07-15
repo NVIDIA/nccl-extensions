@@ -263,8 +263,8 @@ __global__ void dense_to_sparse_prob_kernel(
                                     static_cast<int64_t>(global_expert_offset + e) :
                                     static_cast<int64_t>(e);
 
-      // Get weight from dense output (indexed by local expert within node)
-            // dense_prob layout: [token, experts_per_lsa_team] where experts_per_lsa_team = experts_per_rank * ranks_per_node
+      // Get weight from dense output (indexed by local expert within LSA team)
+            // dense_prob layout: [token, experts_per_lsa_team] where experts_per_lsa_team = experts_per_rank * ranks_per_lsa_team
             // Local rank's experts are at offset: local_rank * experts_per_rank
             int dense_idx = token * experts_per_lsa_team + local_rank * experts_per_rank + e;
             float weight = dense_prob[dense_idx];
@@ -982,7 +982,7 @@ ncclResult_t call_dispatch(
     kp.attn_output_token = reinterpret_cast<uint16_t*>(params.attn_output_token);
     kp.attn_output_prob = params.attn_output_prob;
 
-    // RDMA buffers (multi-node only)
+    // RDMA buffers (multiple LSA teams only)
     kp.rdma_intra_node_red_token = params.rdma_intra_node_red_token;
     kp.rdma_intra_node_red_prob = params.rdma_intra_node_red_prob;
     kp.rdma_inter_node_group_token = params.combine_rdma_inter_node_group_token;
@@ -1071,7 +1071,7 @@ void combine_impl(
 
     auto kp = build_combine_param_base(params);
 
-    // Select config based on num_lsa_teams (single-node: 12 stages/2 pipelines, multi-node: 5 stages/1 pipeline)
+    // Select config based on num_lsa_teams (single LSA team: 12 stages/2 pipelines, multiple LSA teams: 5 stages/1 pipeline)
     const int num_stages_g2s =
         (num_lsa_teams == 1) ? NCCL_EP_HT_COMBINE_SINGLENODE_NUM_OF_STAGES_G2S : NCCL_EP_HT_COMBINE_MULTINODE_NUM_OF_STAGES_G2S;
     const int num_stages_s2g =

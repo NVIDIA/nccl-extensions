@@ -328,7 +328,7 @@ struct DispatchParams {
     const bool* rdma_to_attn_map;
     const bool* attn_to_rdma_map;
     const int32_t* sparse_to_dense_map;
-    int s2d_inner_dim; // Inner dim of unified S2D (num_topk in expert-major, n_ranks_per_node in flat).
+    int s2d_inner_dim; // Inner dim of unified S2D (num_topk in expert-major, ranks per LSA team in flat).
     ncclEpLayout_t layout; // Output layout (selects kernel template specialization).
 
     // EM zero-padding inputs for the in-kernel PAD warp (alignment==0 disables; ptrs may be null).
@@ -345,7 +345,7 @@ struct DispatchParams {
     // Grid barrier counter for fused device_sync in dispatch tail
     uint32_t* dispatch_grid_barrier_counter;
 
-    // GIN context (from ep_group, multi-node only)
+    // GIN context (from ep_group, multi-LSA-team only)
     ncclDevComm dcomm; // Device communicator (single comm, by value)
     ncclWindow_t nccl_token_window; // Source window handle for token data
     ncclWindow_t nccl_prob_window; // Registered window handle for probability data
@@ -404,7 +404,7 @@ struct CombineParams {
     void* attn_output_token;
     float* attn_output_prob; // Backward only (dense format for kernel)
 
-    // RDMA buffers (multi-node only, from ep_group)
+    // RDMA buffers (multi-LSA-team only, from ep_group)
     uint16_t* rdma_intra_node_red_token;
     float* rdma_intra_node_red_prob; // Backward only
     const uint16_t* combine_rdma_inter_node_group_token;
@@ -412,10 +412,10 @@ struct CombineParams {
 
     // Metadata (from handle->ht preprocessing outputs)
     const int32_t* sparse_to_dense_map;
-    int s2d_inner_dim; // Inner dim of unified S2D (num_topk in expert-major, n_ranks_per_node in flat).
+    int s2d_inner_dim; // Inner dim of unified S2D (num_topk in expert-major, ranks per LSA team in flat).
     ncclEpLayout_t layout; // Output layout (selects kernel template specialization).
     const bool* rdma_to_attn_map;
-    const bool* attn_to_rdma_map; // For multi-node RDMA routing
+    const bool* attn_to_rdma_map; // For multi-LSA-team RDMA routing
     const bool* local_expert_routing_map; // For backward gradient routing
 
     // Device pointers to the expected counters; initialized at bootstrap and
@@ -427,7 +427,7 @@ struct CombineParams {
     // Per-rank grid-barrier counter that elects the last block at the combine tail.
     uint32_t* combine_grid_barrier_counter;
 
-    // GIN context (multi-node only)
+    // GIN context (multi-LSA-team only)
     ncclDevComm_t* dcomms; // Device communicators array
     ncclWindow_t nccl_token_window; // Source window handle for token data
     ncclWindow_t nccl_prob_window; // Source window handle for probability data
@@ -468,7 +468,7 @@ void call_combine(
 // EM local-fanout: fill secondary em_slots from primaries after dispatch.
 void call_local_dup(
     void* expert_output_token, // [recv_total, hidden]
-    float* expert_output_prob, // forward: [recv_total, epr * nranks_per_node]
+    float* expert_output_prob, // forward: [recv_total, epr * ranks_per_lsa_team]
     const int32_t* emuf_group_buf, // device [num_groups, group_stride]
     const int32_t* emuf_group_count, // device scalar (read by kernel)
     int emuf_group_stride,
@@ -486,7 +486,7 @@ void call_local_dup(
 // EM local-fanout: pre-sum secondaries into primaries before combine.
 void call_local_reduce(
     void* expert_input_token, // [recv_total, hidden]
-    float* expert_input_prob, // backward: [recv_total, epr * nranks_per_node]
+    float* expert_input_prob, // backward: [recv_total, epr * ranks_per_lsa_team]
     const int32_t* emuf_group_buf, // device [num_groups, group_stride]
     const int32_t* emuf_group_count, // device scalar (read by kernel)
     int emuf_group_stride, // row width (= experts_per_rank)

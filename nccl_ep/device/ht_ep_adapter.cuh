@@ -284,8 +284,8 @@ struct dispatch_memory_region_info_t {
     size_t attn_input_prob_offset; // Offset of prob staging buffer from gin_base_ptr
     size_t attn_input_scaling_factor_offset; // Offset of scaling factor staging buffer
     // Batched RDMA staging (packed layout: token+prob+sf per entry)
-    size_t rdma_send_staging_offset; // Offset of per-destination staging buffer
-    size_t rdma_inter_node_group_packed_offset; // Offset of packed receive buffer (token+prob+sf per entry)
+    size_t gin_send_staging_offset; // Offset of per-destination staging buffer
+    size_t gin_recv_staging_offset; // Offset of packed receive buffer (token+prob+sf per entry)
     size_t guard_offset; // Offset of RDMA sync-guard readiness flags (NUM_LSA_TEAMS uint64 slots)
     size_t bytes_per_entry; // Size of packed entry (token + prob + sf)
     size_t max_tokens_per_dest; // Max tokens that can be staged per destination

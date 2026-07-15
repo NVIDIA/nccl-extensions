@@ -801,8 +801,8 @@ template <typename TOKEN_DATA_TYPE>
         .attn_input_prob_offset = params.mr_info.attn_input_prob_offset,
         .attn_input_scaling_factor_offset = params.mr_info.attn_input_scaling_factor_offset,
         // Batched staging parameters (packed layout)
-        .rdma_send_staging_offset = params.mr_info.rdma_send_staging_offset,
-        .rdma_inter_node_group_packed_offset = params.mr_info.rdma_inter_node_group_packed_offset,
+        .gin_send_staging_offset = params.mr_info.gin_send_staging_offset,
+        .gin_recv_staging_offset = params.mr_info.gin_recv_staging_offset,
         .guard_offset = params.mr_info.guard_offset,
         .bytes_per_entry = params.mr_info.bytes_per_entry,
         .max_tokens_per_dest = params.mr_info.max_tokens_per_dest,

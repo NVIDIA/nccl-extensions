@@ -80,8 +80,8 @@ struct dispatch_memory_region_info_t {
     size_t attn_input_prob_offset;             // Offset of prob staging buffer from gin_base_ptr
     size_t attn_input_scaling_factor_offset;   // Offset of scaling factor staging buffer
   // Batched RDMA staging (packed layout: token+prob+sf per entry)
-    size_t rdma_send_staging_offset;           // Offset of per-destination staging buffer
-    size_t rdma_inter_node_group_packed_offset; // Offset of packed receive buffer (token+prob+sf per entry)
+    size_t gin_send_staging_offset;           // Offset of per-destination staging buffer
+    size_t gin_recv_staging_offset; // Offset of packed receive buffer (token+prob+sf per entry)
     size_t guard_offset; // Offset of RDMA sync-guard readiness flags (LSA_TEAMS uint64 slots)
     size_t bytes_per_entry; // Size of packed entry (token + prob + sf)
     size_t max_tokens_per_dest; // Max tokens that can be staged per destination
@@ -110,7 +110,7 @@ __forceinline__ __device__ unsigned dispatch_tail_signal_id(
 // Packed layout is [remote_slot][token-in-slot], each entry bytes_per_entry (token + prob + sf).
 __forceinline__ __device__ size_t
 dispatch_packed_entry_offset(const dispatch_memory_region_info_t* mr, int remote_slot, int chunk_first_token) {
-    return mr->rdma_inter_node_group_packed_offset +
+    return mr->gin_recv_staging_offset +
            (static_cast<size_t>(remote_slot) * mr->max_tokens_per_dest +
             static_cast<size_t>(chunk_first_token)) *
                mr->bytes_per_entry;
@@ -289,19 +289,19 @@ __device__ __forceinline__ uint64_t extract_bits64(const uint8_t* row, int start
 }
 
 struct combine_smem_layout_t {
-    uint16_t* intra_node_token_G2S_buffer;
-    uint16_t* intra_node_token_S2G_buffer;
-    uint16_t* inter_node_token_G2S_buffer;
-    uint16_t* inter_node_token_S2G_buffer;
-    float* intra_node_prob_G2S_buffer;
-    float* intra_node_prob_S2G_buffer;
-    float* inter_node_prob_G2S_buffer;
-    float* inter_node_prob_S2G_buffer;
-    uint64_t* intra_node_mbarrier_G2S_buffer;
-    uint64_t* inter_node_mbarrier_G2S_buffer;
-    uint64_t* intra_node_to_rdma_mbarrier_buffer;
-    bool* intra_node_flag_G2S_buffer;
-    bool* inter_node_flag_G2S_buffer;
+    uint16_t* lsa_token_G2S_buffer;
+    uint16_t* lsa_token_S2G_buffer;
+    uint16_t* cross_lsa_token_G2S_buffer;
+    uint16_t* cross_lsa_token_S2G_buffer;
+    float* lsa_prob_G2S_buffer;
+    float* lsa_prob_S2G_buffer;
+    float* cross_lsa_prob_G2S_buffer;
+    float* cross_lsa_prob_S2G_buffer;
+    uint64_t* lsa_mbarrier_G2S_buffer;
+    uint64_t* cross_lsa_mbarrier_G2S_buffer;
+    uint64_t* lsa_to_rdma_mbarrier_buffer;
+    bool* lsa_flag_G2S_buffer;
+    bool* cross_lsa_flag_G2S_buffer;
 
     int token_G2S_stage_stride; // elements (not bytes)
     int token_S2G_stage_stride; // elements (not bytes)
@@ -316,52 +316,52 @@ struct combine_smem_layout_t {
     int s2d_inner_dim; // Inner dimension of unified S2D map (n_ranks_per_node or num_topk)
 
     // Accessor methods for staged buffers
-    __device__ __forceinline__ uint16_t* get_intra_node_token_G2S(int stage) const {
-        return intra_node_token_G2S_buffer + stage * token_G2S_stage_stride;
+    __device__ __forceinline__ uint16_t* get_lsa_token_G2S(int stage) const {
+        return lsa_token_G2S_buffer + stage * token_G2S_stage_stride;
     }
-    __device__ __forceinline__ uint16_t* get_intra_node_token_S2G(int stage) const {
-        return intra_node_token_S2G_buffer + stage * token_S2G_stage_stride;
+    __device__ __forceinline__ uint16_t* get_lsa_token_S2G(int stage) const {
+        return lsa_token_S2G_buffer + stage * token_S2G_stage_stride;
     }
-    __device__ __forceinline__ uint16_t* get_inter_node_token_G2S(int stage) const {
-        return inter_node_token_G2S_buffer + stage * token_G2S_stage_stride;
+    __device__ __forceinline__ uint16_t* get_cross_lsa_token_G2S(int stage) const {
+        return cross_lsa_token_G2S_buffer + stage * token_G2S_stage_stride;
     }
-    __device__ __forceinline__ uint16_t* get_inter_node_token_S2G(int stage) const {
-        return inter_node_token_S2G_buffer + stage * token_S2G_stage_stride;
+    __device__ __forceinline__ uint16_t* get_cross_lsa_token_S2G(int stage) const {
+        return cross_lsa_token_S2G_buffer + stage * token_S2G_stage_stride;
     }
-    __device__ __forceinline__ float* get_intra_node_prob_G2S(int stage) const {
-        return intra_node_prob_G2S_buffer + stage * prob_G2S_stage_stride;
+    __device__ __forceinline__ float* get_lsa_prob_G2S(int stage) const {
+        return lsa_prob_G2S_buffer + stage * prob_G2S_stage_stride;
     }
-    __device__ __forceinline__ float* get_intra_node_prob_S2G(int stage) const {
-        return intra_node_prob_S2G_buffer + stage * prob_S2G_stage_stride;
+    __device__ __forceinline__ float* get_lsa_prob_S2G(int stage) const {
+        return lsa_prob_S2G_buffer + stage * prob_S2G_stage_stride;
     }
-    __device__ __forceinline__ float* get_inter_node_prob_G2S(int stage) const {
-        return inter_node_prob_G2S_buffer + stage * prob_G2S_stage_stride;
+    __device__ __forceinline__ float* get_cross_lsa_prob_G2S(int stage) const {
+        return cross_lsa_prob_G2S_buffer + stage * prob_G2S_stage_stride;
     }
-    __device__ __forceinline__ float* get_inter_node_prob_S2G(int stage) const {
-        return inter_node_prob_S2G_buffer + stage * prob_S2G_inter_stage_stride;
+    __device__ __forceinline__ float* get_cross_lsa_prob_S2G(int stage) const {
+        return cross_lsa_prob_S2G_buffer + stage * prob_S2G_inter_stage_stride;
     }
     // Accessor methods for mbarrier buffers (producer = stage*2, consumer = stage*2+1)
-    __device__ __forceinline__ uint64_t* get_intra_node_mbarrier_G2S_producer(int stage) const {
-        return intra_node_mbarrier_G2S_buffer + stage * 2;
+    __device__ __forceinline__ uint64_t* get_lsa_mbarrier_G2S_producer(int stage) const {
+        return lsa_mbarrier_G2S_buffer + stage * 2;
     }
-    __device__ __forceinline__ uint64_t* get_intra_node_mbarrier_G2S_consumer(int stage) const {
-        return intra_node_mbarrier_G2S_buffer + stage * 2 + 1;
+    __device__ __forceinline__ uint64_t* get_lsa_mbarrier_G2S_consumer(int stage) const {
+        return lsa_mbarrier_G2S_buffer + stage * 2 + 1;
     }
-    __device__ __forceinline__ uint64_t* get_inter_node_mbarrier_G2S_producer(int stage) const {
-        return inter_node_mbarrier_G2S_buffer + stage * 2;
+    __device__ __forceinline__ uint64_t* get_cross_lsa_mbarrier_G2S_producer(int stage) const {
+        return cross_lsa_mbarrier_G2S_buffer + stage * 2;
     }
-    __device__ __forceinline__ uint64_t* get_inter_node_mbarrier_G2S_consumer(int stage) const {
-        return inter_node_mbarrier_G2S_buffer + stage * 2 + 1;
+    __device__ __forceinline__ uint64_t* get_cross_lsa_mbarrier_G2S_consumer(int stage) const {
+        return cross_lsa_mbarrier_G2S_buffer + stage * 2 + 1;
     }
 };
 
 struct dispatch_smem_layout_t {
-    void* intra_node_token_buffer;
-    float* intra_node_prob_buffer;
-    uint8_t* intra_node_scaling_factor_buffer;
+    void* lsa_token_buffer;
+    float* lsa_prob_buffer;
+    uint8_t* lsa_scaling_factor_buffer;
     int32_t* sparse_to_dense_map_buffer;
     bool* attn_to_rdma_map_buffer;
-    uint64_t* intra_node_mbarrier_buffer;
+    uint64_t* lsa_mbarrier_buffer;
     uint64_t* sparse_to_dense_map_mbarrier_buffer;
     uint64_t* S2G_group_mbarrier_buffer;
     // Single TMA staging slot used by the PAD warp to broadcast a zeroed token
@@ -381,20 +381,20 @@ struct dispatch_smem_layout_t {
     // Flat stage accessors (used when pipeline_id is already folded into stage)
     __device__ __forceinline__ void* get_token_buffer(int stage) const {
         return reinterpret_cast<void*>(
-            reinterpret_cast<uint8_t*>(intra_node_token_buffer) + stage * token_buffer_stage_stride);
+            reinterpret_cast<uint8_t*>(lsa_token_buffer) + stage * token_buffer_stage_stride);
     }
     __device__ __forceinline__ float* get_prob_buffer(int stage) const {
         return reinterpret_cast<float*>(
-            reinterpret_cast<uint8_t*>(intra_node_prob_buffer) + stage * prob_buffer_stage_stride);
+            reinterpret_cast<uint8_t*>(lsa_prob_buffer) + stage * prob_buffer_stage_stride);
     }
     __device__ __forceinline__ void* get_sf_buffer(int stage) const {
-        return reinterpret_cast<void*>(intra_node_scaling_factor_buffer + stage * sf_buffer_stage_stride);
+        return reinterpret_cast<void*>(lsa_scaling_factor_buffer + stage * sf_buffer_stage_stride);
     }
-    __device__ __forceinline__ uint64_t* get_intra_node_mbarrier_producer(int stage) const {
-        return intra_node_mbarrier_buffer + stage * 2;
+    __device__ __forceinline__ uint64_t* get_lsa_mbarrier_producer(int stage) const {
+        return lsa_mbarrier_buffer + stage * 2;
     }
-    __device__ __forceinline__ uint64_t* get_intra_node_mbarrier_consumer(int stage) const {
-        return intra_node_mbarrier_buffer + stage * 2 + 1;
+    __device__ __forceinline__ uint64_t* get_lsa_mbarrier_consumer(int stage) const {
+        return lsa_mbarrier_buffer + stage * 2 + 1;
     }
 
     // Pipeline-indexed stage accessors: translate (pipeline_id, local_stage) to absolute stage
@@ -407,11 +407,11 @@ struct dispatch_smem_layout_t {
     __device__ __forceinline__ void* get_sf_buffer(int pipeline_id, int local_stage) const {
         return get_sf_buffer(pipeline_id * stages_per_pipeline + local_stage);
     }
-    __device__ __forceinline__ uint64_t* get_intra_node_mbarrier_producer(int pipeline_id, int local_stage) const {
-        return get_intra_node_mbarrier_producer(pipeline_id * stages_per_pipeline + local_stage);
+    __device__ __forceinline__ uint64_t* get_lsa_mbarrier_producer(int pipeline_id, int local_stage) const {
+        return get_lsa_mbarrier_producer(pipeline_id * stages_per_pipeline + local_stage);
     }
-    __device__ __forceinline__ uint64_t* get_intra_node_mbarrier_consumer(int pipeline_id, int local_stage) const {
-        return get_intra_node_mbarrier_consumer(pipeline_id * stages_per_pipeline + local_stage);
+    __device__ __forceinline__ uint64_t* get_lsa_mbarrier_consumer(int pipeline_id, int local_stage) const {
+        return get_lsa_mbarrier_consumer(pipeline_id * stages_per_pipeline + local_stage);
     }
 
     // Per-pipeline s2d_map accessors: each pipeline has its own S2D_MAP_RING_STAGES ping-pong stages
@@ -463,7 +463,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     // Token buffer (aligned to 128B for TMA) -- total stages unchanged
     layout.token_buffer_stage_stride = model.hidden_dim * kTokenSize;
     layout.token_buffer_stage_stride = (layout.token_buffer_stage_stride + 127) & ~127;
-    layout.intra_node_token_buffer = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
+    layout.lsa_token_buffer = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += config.num_of_stages * layout.token_buffer_stage_stride;
 
     // Sparse to dense map buffer: S2D_MAP_RING_STAGES ping-pong stages PER PIPELINE (128B aligned)
@@ -478,10 +478,10 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     if (config.forward_dispatch) {
         layout.prob_buffer_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
         layout.prob_buffer_stage_stride = (layout.prob_buffer_stage_stride + 15) & ~15;
-        layout.intra_node_prob_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
+        layout.lsa_prob_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
         offset += config.num_of_stages * layout.prob_buffer_stage_stride;
     } else {
-        layout.intra_node_prob_buffer = nullptr;
+        layout.lsa_prob_buffer = nullptr;
         layout.prob_buffer_stage_stride = 0;
     }
 
@@ -489,10 +489,10 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     if (config.sf_bytes_per_token > 0) {
         layout.sf_buffer_stage_stride = config.sf_bytes_per_token;
         layout.sf_buffer_stage_stride = (layout.sf_buffer_stage_stride + 15) & ~15;
-        layout.intra_node_scaling_factor_buffer = reinterpret_cast<uint8_t*>(smem_base) + offset;
+        layout.lsa_scaling_factor_buffer = reinterpret_cast<uint8_t*>(smem_base) + offset;
         offset += config.num_of_stages * layout.sf_buffer_stage_stride;
     } else {
-        layout.intra_node_scaling_factor_buffer = nullptr;
+        layout.lsa_scaling_factor_buffer = nullptr;
         layout.sf_buffer_stage_stride = 0;
     }
 
@@ -507,7 +507,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
 
     // Mbarrier buffers (8B aligned) -- total stages unchanged (producer+consumer per stage)
     offset = (offset + 7) & ~7;
-    layout.intra_node_mbarrier_buffer = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
+    layout.lsa_mbarrier_buffer = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += config.num_of_stages * 2 * sizeof(uint64_t);
 
     // Per-pipeline s2d_map mbarriers: 2 per pipeline
@@ -671,91 +671,91 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     // with the on-wire element width (2 B for BF16/FP16, 4 B for FP32).
     if (multinode) {
         align_offset(128);
-        layout.intra_node_token_G2S_buffer =
+        layout.lsa_token_G2S_buffer =
             reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
         offset += num_of_stages_g2s * token_bytes;
 
         align_offset(128);
-        layout.intra_node_token_S2G_buffer =
+        layout.lsa_token_S2G_buffer =
             reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
         offset += num_of_stages_s2g * token_bytes;
     } else {
-        layout.intra_node_token_G2S_buffer = nullptr;
-        layout.intra_node_token_S2G_buffer = nullptr;
+        layout.lsa_token_G2S_buffer = nullptr;
+        layout.lsa_token_S2G_buffer = nullptr;
     }
 
-    // inter_node_token_G2S_buffer (128B aligned)
+    // cross_lsa_token_G2S_buffer (128B aligned)
     align_offset(128);
-    layout.inter_node_token_G2S_buffer = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
+    layout.cross_lsa_token_G2S_buffer = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += num_of_stages_g2s * token_bytes;
 
-    // inter_node_token_S2G_buffer (128B aligned)
+    // cross_lsa_token_S2G_buffer (128B aligned)
     align_offset(128);
-    layout.inter_node_token_S2G_buffer = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
+    layout.cross_lsa_token_S2G_buffer = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += num_of_stages_s2g * token_bytes;
 
     // Prob buffers (only if backward_combine, 16B aligned)
     if (backward_combine) {
         if (multinode) {
-            // intra_node_prob_G2S_buffer
+            // lsa_prob_G2S_buffer
             align_offset(16);
-            layout.intra_node_prob_G2S_buffer =
+            layout.lsa_prob_G2S_buffer =
                 reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
             offset += num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
 
-            // intra_node_prob_S2G_buffer
+            // lsa_prob_S2G_buffer
             align_offset(16);
-            layout.intra_node_prob_S2G_buffer =
+            layout.lsa_prob_S2G_buffer =
                 reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
             offset += num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
         } else {
-            layout.intra_node_prob_G2S_buffer = nullptr;
-            layout.intra_node_prob_S2G_buffer = nullptr;
+            layout.lsa_prob_G2S_buffer = nullptr;
+            layout.lsa_prob_S2G_buffer = nullptr;
         }
 
-        // inter_node_prob_G2S_buffer
+        // cross_lsa_prob_G2S_buffer
         align_offset(16);
-        layout.inter_node_prob_G2S_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
+        layout.cross_lsa_prob_G2S_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
         offset += num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
 
-        // inter_node_prob_S2G_buffer
+        // cross_lsa_prob_S2G_buffer
         align_offset(16);
-        layout.inter_node_prob_S2G_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
+        layout.cross_lsa_prob_S2G_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
         offset += num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * model.num_of_nodes *
                   sizeof(float);
     } else {
-        layout.intra_node_prob_G2S_buffer = nullptr;
-        layout.intra_node_prob_S2G_buffer = nullptr;
-        layout.inter_node_prob_G2S_buffer = nullptr;
-        layout.inter_node_prob_S2G_buffer = nullptr;
+        layout.lsa_prob_G2S_buffer = nullptr;
+        layout.lsa_prob_S2G_buffer = nullptr;
+        layout.cross_lsa_prob_G2S_buffer = nullptr;
+        layout.cross_lsa_prob_S2G_buffer = nullptr;
     }
 
     // Mbarrier buffers (8B aligned)
-    // intra_node_mbarrier_G2S_buffer (multi-node only)
+    // lsa_mbarrier_G2S_buffer (multi-node only)
     if (multinode) {
         align_offset(8);
-        layout.intra_node_mbarrier_G2S_buffer =
+        layout.lsa_mbarrier_G2S_buffer =
             reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
         offset += num_of_stages_g2s * 2 * sizeof(uint64_t);
     } else {
-        layout.intra_node_mbarrier_G2S_buffer = nullptr;
+        layout.lsa_mbarrier_G2S_buffer = nullptr;
     }
 
-    // inter_node_mbarrier_G2S_buffer
+    // cross_lsa_mbarrier_G2S_buffer
     align_offset(8);
-    layout.inter_node_mbarrier_G2S_buffer = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
+    layout.cross_lsa_mbarrier_G2S_buffer = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += num_of_stages_g2s * 2 * sizeof(uint64_t);
 
-    // intra_node_to_rdma_mbarrier_buffer (only if multi-node)
+    // lsa_to_rdma_mbarrier_buffer (only if multi-node)
     if (model.num_of_nodes > 1) {
         int max_num_of_chunks_per_rank =
             (model.max_num_of_tokens_per_rank + num_of_tokens_per_chunk - 1) / num_of_tokens_per_chunk;
         align_offset(8);
-        layout.intra_node_to_rdma_mbarrier_buffer =
+        layout.lsa_to_rdma_mbarrier_buffer =
             reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
         offset += (model.num_of_nodes - 1) * max_num_of_chunks_per_rank * sizeof(uint64_t);
     } else {
-        layout.intra_node_to_rdma_mbarrier_buffer = nullptr;
+        layout.lsa_to_rdma_mbarrier_buffer = nullptr;
     }
 
     if (model.num_of_nodes > 1) {
@@ -769,13 +769,13 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
 
     // Flag buffers (no special alignment needed)
     if (multinode) {
-        layout.intra_node_flag_G2S_buffer = reinterpret_cast<bool*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
+        layout.lsa_flag_G2S_buffer = reinterpret_cast<bool*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
         offset += num_of_stages_g2s * sizeof(bool);
     } else {
-        layout.intra_node_flag_G2S_buffer = nullptr;
+        layout.lsa_flag_G2S_buffer = nullptr;
     }
 
-    layout.inter_node_flag_G2S_buffer = reinterpret_cast<bool*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
+    layout.cross_lsa_flag_G2S_buffer = reinterpret_cast<bool*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += num_of_stages_g2s * sizeof(bool);
 
     // Streaming overlap fields (multi-node only, 4B aligned)
@@ -821,50 +821,50 @@ static size_t calculate_combine_smem_layout_size(
         total_size += num_of_stages_s2g * token_bytes;
     }
 
-    // inter_node_token_G2S_buffer
+    // cross_lsa_token_G2S_buffer
     total_size = (total_size + 127) & ~127;
     total_size += num_of_stages_g2s * token_bytes;
 
-    // inter_node_token_S2G_buffer
+    // cross_lsa_token_S2G_buffer
     total_size = (total_size + 127) & ~127;
     total_size += num_of_stages_s2g * token_bytes;
 
     // Prob buffers (16B aligned, only if backward_combine)
     if (backward_combine) {
         if (multinode) {
-            // intra_node_prob_G2S_buffer
+            // lsa_prob_G2S_buffer
             total_size = (total_size + 15) & ~15;
             total_size +=
                 num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
 
-            // intra_node_prob_S2G_buffer
+            // lsa_prob_S2G_buffer
             total_size = (total_size + 15) & ~15;
             total_size +=
                 num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
         }
 
-        // inter_node_prob_G2S_buffer
+        // cross_lsa_prob_G2S_buffer
         total_size = (total_size + 15) & ~15;
         total_size += num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
 
-        // inter_node_prob_S2G_buffer
+        // cross_lsa_prob_S2G_buffer
         total_size = (total_size + 15) & ~15;
         total_size += num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * num_lsa_teams *
                       sizeof(float);
     }
 
     // Mbarrier buffers (8B aligned)
-    // intra_node_mbarrier_G2S_buffer [stages][2] (multi-node only)
+    // lsa_mbarrier_G2S_buffer [stages][2] (multi-node only)
     if (multinode) {
         total_size = (total_size + 7) & ~7;
         total_size += num_of_stages_g2s * 2 * sizeof(uint64_t);
     }
 
-    // inter_node_mbarrier_G2S_buffer [stages][2]
+    // cross_lsa_mbarrier_G2S_buffer [stages][2]
     total_size = (total_size + 7) & ~7;
     total_size += num_of_stages_g2s * 2 * sizeof(uint64_t);
 
-    // intra_node_to_rdma_mbarrier_buffer [(nodes-1)][chunks] (only if multi-node)
+    // lsa_to_rdma_mbarrier_buffer [(nodes-1)][chunks] (only if multi-node)
     if (multinode) {
         total_size = (total_size + 7) & ~7;
         total_size += (num_lsa_teams - 1) * max_num_of_chunks_per_rank * sizeof(uint64_t);
@@ -1293,7 +1293,7 @@ __forceinline__ __device__ void dispatch_g2s_issue_token(
     const int experts_per_rank,
     const int my_lteam,
     const struct dispatch_memory_region_info_t* mr_info) {
-    uint64_t* mbar = smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage);
+    uint64_t* mbar = smem_buffer_ptr->get_lsa_mbarrier_producer(pipeline_rank, stage);
     const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE));
     const uint32_t prob_bytes = (uint32_t)((experts_per_rank * LSA_TEAM_SZ) * sizeof(float));
     const uint32_t sf_bytes = (uint32_t)sf_bytes_per_token;
@@ -1806,7 +1806,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                             const int32_t* s2d_smem_row =
                                 smem_buffer_ptr->get_s2d_map_buffer(pipeline_rank, s2d_stage, cur_tokid);
                             mbarrier_wait(
-                                smem_buffer_ptr->get_intra_node_mbarrier_producer(pipeline_rank, stage),
+                                smem_buffer_ptr->get_lsa_mbarrier_producer(pipeline_rank, stage),
                                 producer_parity);
 
                             // Per-entry parallel issue (lane handles flat_idx=lane,lane+32,...); empty/EM-dup entries resolve to issue=false.
@@ -1849,7 +1849,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                                                        (stage - NUM_OF_IN_FLIGHT_S2G + STAGES_PER_PIPELINE);
                                 if (s2g_lane == 0) {
                                     cuda::ptx::mbarrier_arrive(
-                                        smem_buffer_ptr->get_intra_node_mbarrier_consumer(pipeline_rank, notify_stage));
+                                        smem_buffer_ptr->get_lsa_mbarrier_consumer(pipeline_rank, notify_stage));
                                 }
                             }
 
@@ -1989,7 +1989,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                         if (token_needed) {
                             if (tokens_produced >= STAGES_PER_PIPELINE) {
                                 uint64_t* mbar =
-                                    smem_buffer_ptr->get_intra_node_mbarrier_consumer(pipeline_rank, stage);
+                                    smem_buffer_ptr->get_lsa_mbarrier_consumer(pipeline_rank, stage);
                                 mbarrier_wait(mbar, consumer_parity);
                             }
 
@@ -2070,13 +2070,13 @@ __forceinline__ __device__ void issue_g2s_entry(
     uint64_t* producer_mbar;
     void* token_dst;
     if constexpr (INTER_NODE) {
-        consumer_mbar = smem_buffer_ptr->get_inter_node_mbarrier_G2S_consumer(stage_idx);
-        producer_mbar = smem_buffer_ptr->get_inter_node_mbarrier_G2S_producer(stage_idx);
-        token_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_inter_node_token_G2S(stage_idx));
+        consumer_mbar = smem_buffer_ptr->get_cross_lsa_mbarrier_G2S_consumer(stage_idx);
+        producer_mbar = smem_buffer_ptr->get_cross_lsa_mbarrier_G2S_producer(stage_idx);
+        token_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_cross_lsa_token_G2S(stage_idx));
     } else {
-        consumer_mbar = smem_buffer_ptr->get_intra_node_mbarrier_G2S_consumer(stage_idx);
-        producer_mbar = smem_buffer_ptr->get_intra_node_mbarrier_G2S_producer(stage_idx);
-        token_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_intra_node_token_G2S(stage_idx));
+        consumer_mbar = smem_buffer_ptr->get_lsa_mbarrier_G2S_consumer(stage_idx);
+        producer_mbar = smem_buffer_ptr->get_lsa_mbarrier_G2S_producer(stage_idx);
+        token_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_lsa_token_G2S(stage_idx));
     }
 
     while (!cuda::ptx::mbarrier_try_wait_parity(consumer_mbar, parity)) {
@@ -2095,9 +2095,9 @@ __forceinline__ __device__ void issue_g2s_entry(
     if constexpr (BACKWARD_COMBINE) {
         void* prob_dst;
         if constexpr (INTER_NODE) {
-            prob_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_inter_node_prob_G2S(stage_idx));
+            prob_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_cross_lsa_prob_G2S(stage_idx));
         } else {
-            prob_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_intra_node_prob_G2S(stage_idx));
+            prob_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_lsa_prob_G2S(stage_idx));
         }
         cuda::ptx::cp_async_bulk(
             cuda::ptx::space_shared,
@@ -2111,9 +2111,9 @@ __forceinline__ __device__ void issue_g2s_entry(
 
     if constexpr (WRITE_LAST_FLAG) {
         if constexpr (INTER_NODE) {
-            smem_buffer_ptr->inter_node_flag_G2S_buffer[stage_idx] = is_last_entry;
+            smem_buffer_ptr->cross_lsa_flag_G2S_buffer[stage_idx] = is_last_entry;
         } else {
-            smem_buffer_ptr->intra_node_flag_G2S_buffer[stage_idx] = is_last_entry;
+            smem_buffer_ptr->lsa_flag_G2S_buffer[stage_idx] = is_last_entry;
         }
     }
 
@@ -2380,17 +2380,17 @@ __forceinline__ __device__ void combine_reduce_dst_token(
     bool last_src_token = false;
     do {
         __nv_bfloat162* load_token_base_ptr =
-            reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_intra_node_token_G2S(token_stage));
+            reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_lsa_token_G2S(token_stage));
         float* load_prob_base_ptr;
         if constexpr (BACKWARD_COMBINE) {
-            load_prob_base_ptr = smem_buffer_ptr->get_intra_node_prob_G2S(token_stage);
+            load_prob_base_ptr = smem_buffer_ptr->get_lsa_prob_G2S(token_stage);
         }
 
         // Warp 0 waits for the producer; then the whole reduction group reads this stage.
         if (RED_GROUP::warp_rank() == 0) {
             if (cuda::ptx::elect_sync(~0)) {
                 while (!cuda::ptx::mbarrier_try_wait_parity(
-                    smem_buffer_ptr->get_intra_node_mbarrier_G2S_producer(token_stage), token_producer_parity)) {
+                    smem_buffer_ptr->get_lsa_mbarrier_G2S_producer(token_stage), token_producer_parity)) {
                 }
             }
         }
@@ -2417,13 +2417,13 @@ __forceinline__ __device__ void combine_reduce_dst_token(
             }
         }
 
-        last_src_token = smem_buffer_ptr->intra_node_flag_G2S_buffer[token_stage];
+        last_src_token = smem_buffer_ptr->lsa_flag_G2S_buffer[token_stage];
 
         // All reduction threads must finish reading before the producer reuses this stage.
         arrive_and_wait(RED_GROUP::size(), 1);
         if (RED_GROUP::warp_rank() == 0) {
             if (cuda::ptx::elect_sync(~0)) {
-                cuda::ptx::mbarrier_arrive(smem_buffer_ptr->get_intra_node_mbarrier_G2S_consumer(token_stage));
+                cuda::ptx::mbarrier_arrive(smem_buffer_ptr->get_lsa_mbarrier_G2S_consumer(token_stage));
             }
         }
 
@@ -2458,7 +2458,7 @@ __forceinline__ __device__ void combine_store_reduced_token(
     constexpr int NUM_OF_BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
 
     __nv_bfloat162* store_token_base_ptr =
-        reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_intra_node_token_S2G(dst_token_stage));
+        reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_lsa_token_S2G(dst_token_stage));
 
     // Ensure any earlier TMA read from this S2G stage has completed before we overwrite it.
     if (RED_GROUP::warp_rank() == 0) {
@@ -2477,7 +2477,7 @@ __forceinline__ __device__ void combine_store_reduced_token(
         }
     }
     if constexpr (BACKWARD_COMBINE) {
-        float* store_prob_base_ptr = smem_buffer_ptr->get_intra_node_prob_S2G(dst_token_stage);
+        float* store_prob_base_ptr = smem_buffer_ptr->get_lsa_prob_S2G(dst_token_stage);
 #pragma unroll
         for (int n = 0; n < prob_vec_per_thread; n++) {
             int prob_element_id = RED_GROUP::thread_rank() + n * RED_GROUP::size();
@@ -2500,7 +2500,7 @@ __forceinline__ __device__ void combine_store_reduced_token(
                 cuda::ptx::space_global,
                 cuda::ptx::space_shared,
                 reinterpret_cast<void*>(current_token_addr),
-                reinterpret_cast<const void*>(smem_buffer_ptr->get_intra_node_token_S2G(dst_token_stage)),
+                reinterpret_cast<const void*>(smem_buffer_ptr->get_lsa_token_S2G(dst_token_stage)),
                 (uint32_t)(red_token_bytes));
 
             if constexpr (BACKWARD_COMBINE) {
@@ -2509,7 +2509,7 @@ __forceinline__ __device__ void combine_store_reduced_token(
                     cuda::ptx::space_global,
                     cuda::ptx::space_shared,
                     reinterpret_cast<void*>(current_prob_addr),
-                    reinterpret_cast<const void*>(smem_buffer_ptr->get_intra_node_prob_S2G(dst_token_stage)),
+                    reinterpret_cast<const void*>(smem_buffer_ptr->get_lsa_prob_S2G(dst_token_stage)),
                     (uint32_t)(prob_dim * sizeof(float)));
             }
             cuda::ptx::cp_async_bulk_commit_group();
@@ -2717,7 +2717,7 @@ __forceinline__ __device__ void combine_RED_intra_warp(
         if constexpr (LSA_TEAMS != 1) {
             if (RED_GROUP::warp_rank() == 0) {
                 if (cuda::ptx::elect_sync(~0)) {
-                    cuda::ptx::mbarrier_arrive(&smem_buffer_ptr->intra_node_to_rdma_mbarrier_buffer
+                    cuda::ptx::mbarrier_arrive(&smem_buffer_ptr->lsa_to_rdma_mbarrier_buffer
                                                     [rdma_tile_id * MAX_NUM_OF_CHUNKS_PER_RANK + meta.chunk_id]);
                 }
             }
@@ -2890,14 +2890,14 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
         "TOKENS_PER_CHUNK must be multiple of sizeof(routing_loads_t).");
     // mr_info and the intra-node -> rdma mbarrier buffer are staged in shared memory.
     struct combine_memory_region_info_t* smem_mr_info_ptr = nullptr;
-    uint64_t* intra_node_to_rdma_mbarrier_buffer_ptr = nullptr;
+    uint64_t* lsa_to_rdma_mbarrier_buffer_ptr = nullptr;
     constexpr int MAX_NUM_OF_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
     if constexpr (LSA_TEAMS != 1) {
         smem_mr_info_ptr = smem_buffer_ptr->combine_memory_region_info;
         if (GIN_GROUP::thread_rank() == 0) {
             smem_mr_info_ptr[0] = mr_info[0];
         }
-        intra_node_to_rdma_mbarrier_buffer_ptr = smem_buffer_ptr->intra_node_to_rdma_mbarrier_buffer;
+        lsa_to_rdma_mbarrier_buffer_ptr = smem_buffer_ptr->lsa_to_rdma_mbarrier_buffer;
     }
     __syncwarp();
 
@@ -2948,7 +2948,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
             // Wait for mbarrier (parity tracking -- reduction warp always arrives)
             if (!is_residue) {
                 while (!cuda::ptx::mbarrier_try_wait_parity(
-                    &intra_node_to_rdma_mbarrier_buffer_ptr
+                    &lsa_to_rdma_mbarrier_buffer_ptr
                         [rdma_tile_id * MAX_NUM_OF_CHUNKS_PER_RANK + chunk_id],
                     token_consumer_parity)) {
                 }
@@ -2968,7 +2968,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
             // ---- FALLBACK PATH (STREAMING_BATCH == 0): mbarrier-first, then put ----
             if (!is_residue) {
                 while (!cuda::ptx::mbarrier_try_wait_parity(
-                    &intra_node_to_rdma_mbarrier_buffer_ptr
+                    &lsa_to_rdma_mbarrier_buffer_ptr
                         [rdma_tile_id * MAX_NUM_OF_CHUNKS_PER_RANK + chunk_id],
                     token_consumer_parity)) {
                 }
@@ -3098,7 +3098,7 @@ __forceinline__ __device__ void issue_rdma_g2s_row(
                     flat_token_id,
                     experts_per_rank,
                     lteam_sz);
-            // RDMA tier does not set inter_node_flag_G2S_buffer; the RED group reads
+            // RDMA tier does not set cross_lsa_flag_G2S_buffer; the RED group reads
             // attn_to_rdma_map to demarcate RDMA entries.
             issue_g2s_entry</*INTER_NODE=*/true, BACKWARD_COMBINE, /*WRITE_LAST_FLAG=*/false>(
                 smem_buffer_ptr,
@@ -3354,17 +3354,17 @@ __forceinline__ __device__ bool combine_inter_consume_src(
     constexpr int NUM_OF_BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
 
     __nv_bfloat162* load_token_base_ptr =
-        reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_inter_node_token_G2S(token_stage));
+        reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_cross_lsa_token_G2S(token_stage));
     float* load_prob_base_ptr;
     if constexpr (BACKWARD_COMBINE) {
-        load_prob_base_ptr = smem_buffer_ptr->get_inter_node_prob_G2S(token_stage);
+        load_prob_base_ptr = smem_buffer_ptr->get_cross_lsa_prob_G2S(token_stage);
     }
 
     // Wait until this src token is staged in SMEM, then let the whole pipeline read it.
     if (warp_rank_within_pipeline == 0) {
         if (cuda::ptx::elect_sync(~0)) {
             while (!cuda::ptx::mbarrier_try_wait_parity(
-                smem_buffer_ptr->get_inter_node_mbarrier_G2S_producer(token_stage), token_producer_parity)) {
+                smem_buffer_ptr->get_cross_lsa_mbarrier_G2S_producer(token_stage), token_producer_parity)) {
             }
         }
     }
@@ -3396,14 +3396,14 @@ __forceinline__ __device__ bool combine_inter_consume_src(
 
     bool last_src_token = false;
     if constexpr (READ_LAST_FLAG) {
-        last_src_token = smem_buffer_ptr->inter_node_flag_G2S_buffer[token_stage];
+        last_src_token = smem_buffer_ptr->cross_lsa_flag_G2S_buffer[token_stage];
     }
 
     // All pipeline threads finish reading before the producer reuses this stage.
     arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank);
     if (warp_rank_within_pipeline == 0) {
         if (cuda::ptx::elect_sync(~0)) {
-            cuda::ptx::mbarrier_arrive(smem_buffer_ptr->get_inter_node_mbarrier_G2S_consumer(token_stage));
+            cuda::ptx::mbarrier_arrive(smem_buffer_ptr->get_cross_lsa_mbarrier_G2S_consumer(token_stage));
         }
     }
 
@@ -3448,7 +3448,7 @@ __forceinline__ __device__ void combine_inter_store_token(
     constexpr int NUM_OF_BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
 
     __nv_bfloat162* store_token_base_ptr =
-        reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_inter_node_token_S2G(dst_token_stage));
+        reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_cross_lsa_token_S2G(dst_token_stage));
 
     // Wait for prior TMA reads of this S2G stage to finish before overwriting it.
     if (warp_rank_within_pipeline == 0) {
@@ -3466,7 +3466,7 @@ __forceinline__ __device__ void combine_inter_store_token(
         }
     }
     if constexpr (BACKWARD_COMBINE) {
-        float* store_prob_base_ptr = smem_buffer_ptr->get_inter_node_prob_S2G(dst_token_stage);
+        float* store_prob_base_ptr = smem_buffer_ptr->get_cross_lsa_prob_S2G(dst_token_stage);
         // Gather per-source-node prob into output node order (my_lteam, my_lteam-1, ...).
 #pragma unroll
         for (int n = 0; n < LSA_TEAMS; n++) {
@@ -3493,7 +3493,7 @@ __forceinline__ __device__ void combine_inter_store_token(
                 cuda::ptx::space_global,
                 cuda::ptx::space_shared,
                 reinterpret_cast<void*>(current_token_addr),
-                reinterpret_cast<const void*>(smem_buffer_ptr->get_inter_node_token_S2G(dst_token_stage)),
+                reinterpret_cast<const void*>(smem_buffer_ptr->get_cross_lsa_token_S2G(dst_token_stage)),
                 (uint32_t)(HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>())));
 
             if constexpr (BACKWARD_COMBINE) {
@@ -3502,7 +3502,7 @@ __forceinline__ __device__ void combine_inter_store_token(
                     cuda::ptx::space_global,
                     cuda::ptx::space_shared,
                     reinterpret_cast<void*>(current_prob_addr),
-                    reinterpret_cast<const void*>(smem_buffer_ptr->get_inter_node_prob_S2G(dst_token_stage)),
+                    reinterpret_cast<const void*>(smem_buffer_ptr->get_cross_lsa_prob_S2G(dst_token_stage)),
                     (uint32_t)((prob_dim * LSA_TEAMS) * sizeof(float)));
             }
             cuda::ptx::cp_async_bulk_commit_group();
@@ -3938,8 +3938,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             for (int p = 0; p < NUM_PIPELINES; p++) {
                 for (int s = 0; s < STAGES_PER_PIPELINE; s++) {
                     int abs_stage = p * STAGES_PER_PIPELINE + s;
-                    cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_mbarrier_buffer + 2 * abs_stage, 1);
-                    cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_mbarrier_buffer + 2 * abs_stage + 1, 1);
+                    cuda::ptx::mbarrier_init(smem_buffer_ptr->lsa_mbarrier_buffer + 2 * abs_stage, 1);
+                    cuda::ptx::mbarrier_init(smem_buffer_ptr->lsa_mbarrier_buffer + 2 * abs_stage + 1, 1);
                 }
                 cuda::ptx::mbarrier_init(smem_buffer_ptr->get_s2d_map_mbar(p, 0), 1);
                 cuda::ptx::mbarrier_init(smem_buffer_ptr->get_s2d_map_mbar(p, 1), 1);
@@ -4228,17 +4228,17 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             // mbarrier init (both producer/consumer arrival counts = 1).
             for (int i = 0; i < STAGES_G2S; i++) {
                 if constexpr (LSA_TEAMS != 1) {
-                    cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_mbarrier_G2S_buffer + 2 * i, 1);
-                    cuda::ptx::mbarrier_init(smem_buffer_ptr->intra_node_mbarrier_G2S_buffer + 2 * i + 1, 1);
+                    cuda::ptx::mbarrier_init(smem_buffer_ptr->lsa_mbarrier_G2S_buffer + 2 * i, 1);
+                    cuda::ptx::mbarrier_init(smem_buffer_ptr->lsa_mbarrier_G2S_buffer + 2 * i + 1, 1);
                 }
-                cuda::ptx::mbarrier_init(smem_buffer_ptr->inter_node_mbarrier_G2S_buffer + 2 * i, 1);
-                cuda::ptx::mbarrier_init(smem_buffer_ptr->inter_node_mbarrier_G2S_buffer + 2 * i + 1, 1);
+                cuda::ptx::mbarrier_init(smem_buffer_ptr->cross_lsa_mbarrier_G2S_buffer + 2 * i, 1);
+                cuda::ptx::mbarrier_init(smem_buffer_ptr->cross_lsa_mbarrier_G2S_buffer + 2 * i + 1, 1);
             }
             if constexpr (LSA_TEAMS != 1) {
                 for (int i = 0; i < LSA_TEAMS - 1; i++)
                     for (int j = 0; j < MAX_NUM_OF_CHUNKS_PER_RANK; j++)
                         cuda::ptx::mbarrier_init(
-                            smem_buffer_ptr->intra_node_to_rdma_mbarrier_buffer + i * MAX_NUM_OF_CHUNKS_PER_RANK + j,
+                            smem_buffer_ptr->lsa_to_rdma_mbarrier_buffer + i * MAX_NUM_OF_CHUNKS_PER_RANK + j,
                             1);
                 *(smem_buffer_ptr->rdma_streaming_counter) = 0u;
             }

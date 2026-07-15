@@ -674,8 +674,8 @@ struct ncclEpGroup {
 
         // Layout: [NUM_LSA_TEAMS-1][BATCH_SIZE * bytes_per_entry]
         // bytes_per_entry = hidden * sizeof(TOKEN_DATA_TYPE) + prob_size + sf_size
-        size_t rdma_send_staging_offset = 0;
-        size_t rdma_inter_node_group_packed_offset = 0;  // Packed receive buffer (token+prob+sf)
+        size_t gin_send_staging_offset = 0;
+        size_t gin_recv_staging_offset = 0;  // Packed receive buffer (token+prob+sf)
 
         // RDMA sync-guard readiness-flag regions (per direction)
         size_t dispatch_guard_offset = 0;
@@ -1378,10 +1378,10 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     ep_group->gin_config.scaling_factor_staging_offset = cur_offset;
     cur_offset += scaling_factor_staging_sz;
 
-    ep_group->gin_config.rdma_send_staging_offset = cur_offset;
+    ep_group->gin_config.gin_send_staging_offset = cur_offset;
     cur_offset += rdma_send_staging_sz;
 
-    ep_group->gin_config.rdma_inter_node_group_packed_offset = cur_offset;
+    ep_group->gin_config.gin_recv_staging_offset = cur_offset;
     cur_offset += rdma_recv_packed_sz;
 
     // =========================================================================
@@ -3689,10 +3689,10 @@ ncclResult_t ncclEpDispatch(
             (is_single_node || quantization_recipe != NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)
                 ? 0
                 : scales->win_offset;
-        params.mr_info.rdma_send_staging_offset =
-            is_single_node ? 0 : group->gin_config.rdma_send_staging_offset;
-        params.mr_info.rdma_inter_node_group_packed_offset =
-            is_single_node ? 0 : group->gin_config.rdma_inter_node_group_packed_offset;
+        params.mr_info.gin_send_staging_offset =
+            is_single_node ? 0 : group->gin_config.gin_send_staging_offset;
+        params.mr_info.gin_recv_staging_offset =
+            is_single_node ? 0 : group->gin_config.gin_recv_staging_offset;
         params.mr_info.guard_offset = is_single_node ? 0 : group->gin_config.dispatch_guard_offset;
         params.mr_info.bytes_per_entry = bytes_per_entry;
         params.mr_info.max_tokens_per_dest = static_cast<size_t>(group->config.max_dispatch_tokens_per_rank);

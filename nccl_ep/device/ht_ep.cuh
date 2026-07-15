@@ -903,8 +903,8 @@ struct dispatch_kernel_param_base_t {
     const uint8_t*
         attn_input_token_scaling_factor; // FP8 EXTERN: per-token scales (float* for FP32, uint8_t* for UE8M0 — pure byte transport).
     // Internal temp buffers. These buffers are local buffers.
-    uint64_t* dispatch_gin_G2S_flags; // For RDMA Atomic flags.
-    uint32_t* intra_node_write_completion_flags; // For intra-LSA S2G write completion notification.
+    uint64_t* gin_G2S_flags; // For RDMA Atomic flags.
+    uint32_t* lsa_S2G_flags; // For intra-LSA S2G write completion notification.
     // Metadata buffers. These buffers are local buffers.
     const bool* rdma_to_attn_map;
     const bool* attn_to_rdma_map;
@@ -917,8 +917,8 @@ struct dispatch_kernel_param_base_t {
     int pad_alignment; // per-expert zone alignment in tokens (<=1 = no padding)
     // Device-resident expected counters. Initialized at bootstrap; bumped in
     // this kernel's tail so CUDA-graph capture+replay self-sequences.
-    uint64_t* expected_rdma_flag_value;
-    uint32_t* expected_intra_node_flag_value;
+    uint64_t* expected_gin_flag_val;
+    uint32_t* expected_lsa_flag_val;
     int local_rank;
     int lsa_team;
     // The number of token output by attn layer on a rank/GPU.
@@ -979,8 +979,8 @@ struct combine_kernel_param_base_t {
     float* combine_gin_RED_prob;
     const uint16_t* combine_gin_G2S_tokens;
     const float* combine_gin_G2S_prob;
-    uint64_t* combine_gin_G2S_flags;
-    uint32_t* intra_node_write_completion_flags; // For intra-LSA src ready notification.
+    uint64_t* gin_G2S_flags;
+    uint32_t* lsa_S2G_flags; // For intra-LSA src ready notification.
     // Metadata buffers. These buffers are local buffers.
     const bool* rdma_to_attn_map;
     const bool* attn_to_rdma_map;
@@ -988,8 +988,8 @@ struct combine_kernel_param_base_t {
     int s2d_inner_dim; // flat: lsa_team_size, expert-major: num_topk
     // Device-resident expected counters. Initialized at bootstrap; bumped in
     // this kernel's tail so CUDA-graph capture+replay self-sequences.
-    uint64_t* expected_rdma_flag_value;
-    uint32_t* expected_intra_node_flag_value;
+    uint64_t* expected_gin_flag_val;
+    uint32_t* expected_lsa_flag_val;
     int local_rank;
     int lsa_team;
     // Stride for routing-map indexing (= max_tokens_per_rank).
@@ -1889,7 +1889,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
     const float* attn_input_prob,
     const uint8_t* attn_input_token_scaling_factor,
     // OUTPUT
-    uint64_t* dispatch_gin_G2S_flags,
+    uint64_t* gin_G2S_flags,
     // CONFIG
     const int local_rank,
     const int my_lteam,
@@ -2030,7 +2030,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
 
         for (int lteam_id = blockIdx.x; lteam_id < LSA_TEAMS - 1; lteam_id += gridDim.x) {
             uint64_t* residue_flag_base_ptr =
-                dispatch_gin_G2S_flags + (lteam_id * max_num_of_chunks_per_rank) + num_of_chunks_per_rank;
+                gin_G2S_flags + (lteam_id * max_num_of_chunks_per_rank) + num_of_chunks_per_rank;
             if (LSA_G2S_GROUP::thread_rank() < residue_flag_count) {
                 residue_flag_base_ptr[LSA_G2S_GROUP::thread_rank()] = expected_flag_value;
             }
@@ -2616,7 +2616,7 @@ __forceinline__ __device__ void combine_RED_intra_warp(
         const auto meta = combine_chunk_meta<LSA_TEAMS, TOKENS_PER_CHUNK>(cidx, my_lteam, cpr, rem_chunk_sz);
         // Compact destination-slot index + token offset in the RDMA reduction buffers.
         const int rdma_tile_id = meta.lteam_id > my_lteam ? meta.lteam_id - 1 : meta.lteam_id;
-        const int rdma_intra_node_red_id =
+        const int gin_RED_slot =
             rdma_tile_id * MAX_NUM_OF_TOKENS_PER_RANK + meta.chunk_id * TOKENS_PER_CHUNK;
         // Vector loads covering this chunk's routing flags (tail chunk is shorter).
         const int routing_loads_for_chunk = (rem_chunk_sz != 0 && meta.chunk_id == cpr - 1)
@@ -2628,10 +2628,10 @@ __forceinline__ __device__ void combine_RED_intra_warp(
 
         // Per-token stride scaled into uint16_t units (HIDDEN_DIM for BF16/FP16, 2*HIDDEN_DIM for FP32).
         uint16_t* red_token_base =
-            combine_gin_RED_tokens + rdma_intra_node_red_id * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
+            combine_gin_RED_tokens + gin_RED_slot * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
         float* red_prob_base = nullptr;
         if constexpr (BACKWARD_COMBINE) {
-            red_prob_base = combine_gin_RED_prob + rdma_intra_node_red_id * prob_dim;
+            red_prob_base = combine_gin_RED_prob + gin_RED_slot * prob_dim;
         }
 
         streaming_pending = 0;
@@ -3145,7 +3145,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     const uint16_t* combine_gin_G2S_tokens,
     const float* combine_gin_G2S_prob,
     // OUTPUT
-    uint64_t* combine_gin_G2S_flags,
+    uint64_t* gin_G2S_flags,
     SMEM_TYPE* smem_buffer_ptr,
     // CONFIG
     const int local_rank,
@@ -3316,7 +3316,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
         int residue_flag_count = max_chunks_per_rank - cpr;
         for (int lteam_id = blockIdx.x; lteam_id < LSA_TEAMS - 1; lteam_id += gridDim.x) {
             uint64_t* residue_flag_base =
-                combine_gin_G2S_flags + (lteam_id * max_chunks_per_rank + cpr);
+                gin_G2S_flags + (lteam_id * max_chunks_per_rank + cpr);
             for (int flag_id = G2S_GROUP::thread_rank(); flag_id < residue_flag_count;
                  flag_id += G2S_GROUP::size()) {
                 residue_flag_base[flag_id] = expected_flag_value;
@@ -3956,7 +3956,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                         reinterpret_cast<const uint8_t*>(param.gin_base_ptr) + param.mr_info.guard_offset),
                     my_lteam,
                     LSA_TEAMS,
-                    *param.expected_rdma_flag_value);
+                    *param.expected_gin_flag_val);
         }
     } else if (head_tid < head_init_warp::size() + head_rdma_warp::size() + head_lsa_warp::size()) {
         // warp 2: intra-LSA LSA barrier.
@@ -4013,14 +4013,14 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             param.attn_input_token,
             param.attn_input_prob,
             param.attn_input_token_scaling_factor,
-            param.dispatch_gin_G2S_flags,
+            param.gin_G2S_flags,
             param.local_rank,
             my_lteam,
             param.num_of_tokens_per_rank,
             HIDDEN_DIM,
             SF_BYTES_PER_TOKEN,
             param.experts_per_rank,
-            *param.expected_rdma_flag_value,
+            *param.expected_gin_flag_val,
             param.dcomm,
             param.num_ctx_per_comm,
             param.gin_base_ptr,
@@ -4085,21 +4085,21 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             // warp 0 (thread 0): inter-rank completion barrier, then reset + bump the intra-LSA round
             // (local_dup defers that bump to its own tail).
             if (tail_tid == 0) {
-                const uint32_t expected_val = *param.expected_intra_node_flag_value;
-                nccl_ep::red_add_release_sys_global(param.intra_node_write_completion_flags, 1u);
+                const uint32_t expected_val = *param.expected_lsa_flag_val;
+                nccl_ep::red_add_release_sys_global(param.lsa_S2G_flags, 1u);
                 uint32_t flag_data;
                 do {
-                    flag_data = nccl_ep::ld_relaxed_sys_global(param.intra_node_write_completion_flags);
+                    flag_data = nccl_ep::ld_relaxed_sys_global(param.lsa_S2G_flags);
                 } while (flag_data != expected_val);
                 nccl_ep::memory_fence();
                 atomicExch((unsigned int*)param.dispatch_grid_barrier_counter, 0u);
                 if (!param.local_dup_enabled)
-                    *param.expected_intra_node_flag_value += static_cast<uint32_t>(param.ranks_per_lsa_team);
+                    *param.expected_lsa_flag_val += static_cast<uint32_t>(param.ranks_per_lsa_team);
             }
         } else if (tail_tid < tail_completion_warp::size() + tail_rdma_warp::size()) {
             // warp 1: publish the cross-LSA-team RDMA guard + bump the RDMA round.
             if constexpr (LSA_TEAMS != 1) {
-                const uint64_t expected = *param.expected_rdma_flag_value;
+                const uint64_t expected = *param.expected_gin_flag_val;
                 if (param.guard_enabled)
                     warp_rdma_guard_publish(
                         param.dcomm,
@@ -4108,7 +4108,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                         my_lteam,
                         LSA_TEAMS,
                         expected);
-                if (tail_rdma_warp::thread_rank() == 0) *param.expected_rdma_flag_value = expected + 1ull;
+                if (tail_rdma_warp::thread_rank() == 0) *param.expected_gin_flag_val = expected + 1ull;
             }
         }
     }
@@ -4213,11 +4213,11 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             _wt_head_start = clock64();
 #endif
             // Inter-rank completion barrier: block 0 signals (red.release orders prior stores), every block polls.
-            if (blockIdx.x == 0) nccl_ep::red_add_release_sys_global(param.intra_node_write_completion_flags, 1u);
-            const uint32_t expected_val = *param.expected_intra_node_flag_value;
+            if (blockIdx.x == 0) nccl_ep::red_add_release_sys_global(param.lsa_S2G_flags, 1u);
+            const uint32_t expected_val = *param.expected_lsa_flag_val;
             uint32_t flag_data;
             do {
-                flag_data = nccl_ep::ld_relaxed_sys_global(param.intra_node_write_completion_flags);
+                flag_data = nccl_ep::ld_relaxed_sys_global(param.lsa_S2G_flags);
             } while (flag_data != expected_val);
             nccl_ep::memory_fence();
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
@@ -4254,7 +4254,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                         reinterpret_cast<const uint8_t*>(param.gin_base_ptr) + param.mr_info.guard_offset),
                     my_lteam,
                     LSA_TEAMS,
-                    *param.expected_rdma_flag_value);
+                    *param.expected_gin_flag_val);
         }
     }
 
@@ -4349,14 +4349,14 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             param.combine_gin_G2S_tokens,
             param.combine_gin_G2S_prob,
             // OUTPUT
-            param.combine_gin_G2S_flags,
+            param.gin_G2S_flags,
             smem_buffer_ptr,
             // CONFIG
             param.local_rank,
             my_lteam,
             param.num_of_tokens_per_rank,
             param.experts_per_rank,
-            *param.expected_rdma_flag_value,
+            *param.expected_gin_flag_val,
             param.combine_local_reduce_enabled,
             param.dcomms,
             param.signals_base,
@@ -4421,12 +4421,12 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             // warp 0: reset the grid counter + bump the intra-LSA round.
             if (tail_tid == 0) {
                 atomicExch((unsigned int*)param.combine_grid_barrier_counter, 0u);
-                *param.expected_intra_node_flag_value += static_cast<uint32_t>(param.ranks_per_lsa_team);
+                *param.expected_lsa_flag_val += static_cast<uint32_t>(param.ranks_per_lsa_team);
             }
         } else if (tail_tid < tail_reset_warp::size() + tail_rdma_warp::size()) {
             // warp 1: publish the cross-LSA-team RDMA guard, then bump the RDMA round.
             if constexpr (LSA_TEAMS != 1) {
-                const uint64_t expected = *param.expected_rdma_flag_value;
+                const uint64_t expected = *param.expected_gin_flag_val;
                 if (param.guard_enabled)
                     warp_rdma_guard_publish(
                         param.dcomms[0],
@@ -4435,7 +4435,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                         my_lteam,
                         LSA_TEAMS,
                         expected);
-                if (tail_rdma_warp::thread_rank() == 0) *param.expected_rdma_flag_value = expected + 1ull;
+                if (tail_rdma_warp::thread_rank() == 0) *param.expected_gin_flag_val = expected + 1ull;
             }
         } else if (tail_tid < tail_reset_warp::size() + tail_rdma_warp::size() + tail_lsa_warp::size()) {
             // warp 2: intra-LSA LSA WAR barrier. Relaxed -- the tail __syncthreads already drained this
@@ -4467,10 +4467,10 @@ struct local_dup_kernel_param_t {
     const int32_t* emuf_group_count; // scalar (produced by scan)
     int emuf_group_stride; // = experts_per_rank
     // S2G-completion flag dispatch polls; local_dup re-polls before reading primaries.
-    const uint32_t* intra_node_write_completion_flag;
+    const uint32_t* lsa_S2G_flag;
     // Shared with dispatch. When local_dup_enabled, dispatch defers the bump
     // here so peers only observe the flag move after secondaries are filled.
-    uint32_t* expected_intra_node_flag_value;
+    uint32_t* expected_lsa_flag_val;
     // Reused from dispatch_grid_barrier_counter (dispatch leaves it at 0).
     uint32_t* grid_barrier_counter;
     int experts_per_rank;
@@ -4501,10 +4501,10 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
     // Use >= rather than == so a future code path that overshoots the counter
     // (e.g. extra peer arrivals) doesn't hang.
     if (threadIdx.x == 0) {
-        const uint32_t expected_val = *p.expected_intra_node_flag_value;
+        const uint32_t expected_val = *p.expected_lsa_flag_val;
         uint32_t v;
         do {
-            v = nccl_ep::ld_relaxed_sys_global(p.intra_node_write_completion_flag);
+            v = nccl_ep::ld_relaxed_sys_global(p.lsa_S2G_flag);
         } while (v < expected_val);
         nccl_ep::memory_fence();
     }
@@ -4559,7 +4559,7 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
                 nccl_ep::atomic_add_acqrel_global(reinterpret_cast<const int*>(p.grid_barrier_counter), 1));
             if (arrived == gridDim.x - 1) {
                 atomicExch((unsigned int*)p.grid_barrier_counter, 0u);
-                *p.expected_intra_node_flag_value += static_cast<uint32_t>(p.ranks_per_lsa_team);
+                *p.expected_lsa_flag_val += static_cast<uint32_t>(p.ranks_per_lsa_team);
             }
         }
         return;
@@ -4670,7 +4670,7 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
             nccl_ep::atomic_add_acqrel_global(reinterpret_cast<const int*>(p.grid_barrier_counter), 1));
         if (arrived == gridDim.x - 1) {
             atomicExch((unsigned int*)p.grid_barrier_counter, 0u);
-            *p.expected_intra_node_flag_value += static_cast<uint32_t>(p.ranks_per_lsa_team);
+            *p.expected_lsa_flag_val += static_cast<uint32_t>(p.ranks_per_lsa_team);
         }
     }
 }

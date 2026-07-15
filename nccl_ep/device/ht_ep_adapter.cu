@@ -773,10 +773,10 @@ template <typename TOKEN_DATA_TYPE>
     kp.pad_actual_counts = params.pad_actual_counts;
     kp.pad_expert_token_offsets = params.pad_expert_token_offsets;
     kp.pad_alignment = params.pad_alignment;
-    kp.expected_rdma_flag_value = params.expected_rdma_flag_value;
-    kp.expected_intra_node_flag_value = params.expected_intra_node_flag_value;
-    kp.dispatch_gin_G2S_flags = params.dispatch_gin_G2S_flags;
-    kp.intra_node_write_completion_flags = params.intra_node_write_completion_flags;
+    kp.expected_gin_flag_val = params.expected_gin_flag_val;
+    kp.expected_lsa_flag_val = params.expected_lsa_flag_val;
+    kp.gin_G2S_flags = params.gin_G2S_flags;
+    kp.lsa_S2G_flags = params.lsa_S2G_flags;
     kp.dispatch_grid_barrier_counter = params.dispatch_grid_barrier_counter;
 
     // Runtime config
@@ -995,10 +995,10 @@ ncclResult_t call_dispatch(
     kp.attn_to_rdma_map = params.attn_to_rdma_map;
 
     // Sync flags
-    kp.expected_rdma_flag_value = params.combine_expected_rdma_flag_value;
-    kp.expected_intra_node_flag_value = params.combine_expected_intra_node_flag_value;
-    kp.combine_gin_G2S_flags = params.combine_gin_G2S_flags;
-    kp.intra_node_write_completion_flags = params.combine_intra_node_write_completion_flags;
+    kp.expected_gin_flag_val = params.expected_gin_flag_val;
+    kp.expected_lsa_flag_val = params.expected_lsa_flag_val;
+    kp.gin_G2S_flags = params.gin_G2S_flags;
+    kp.lsa_S2G_flags = params.lsa_S2G_flags;
     kp.combine_grid_barrier_counter = params.combine_grid_barrier_counter;
     kp.guard_enabled = params.guard_enabled;
 
@@ -1151,8 +1151,8 @@ void call_local_dup(
     const int32_t* emuf_group_buf,
     const int32_t* emuf_group_count,
     int emuf_group_stride,
-    const uint32_t* intra_node_write_completion_flag,
-    uint32_t* expected_intra_node_flag_value,
+    const uint32_t* lsa_S2G_flag,
+    uint32_t* expected_lsa_flag_val,
     uint32_t* grid_barrier_counter,
     int hidden_dim,
     int experts_per_rank,
@@ -1181,8 +1181,8 @@ void call_local_dup(
         pp.emuf_group_buf = emuf_group_buf;
         pp.emuf_group_count = emuf_group_count;
         pp.emuf_group_stride = emuf_group_stride;
-        pp.intra_node_write_completion_flag = intra_node_write_completion_flag;
-        pp.expected_intra_node_flag_value = expected_intra_node_flag_value;
+        pp.lsa_S2G_flag = lsa_S2G_flag;
+        pp.expected_lsa_flag_val = expected_lsa_flag_val;
         pp.grid_barrier_counter = grid_barrier_counter;
         pp.experts_per_rank = experts_per_rank;
         pp.ranks_per_lsa_team = ranks_per_lsa_team;

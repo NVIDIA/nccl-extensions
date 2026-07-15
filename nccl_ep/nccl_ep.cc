@@ -749,8 +749,8 @@ struct ncclEpGroup {
         size_t token_staging_slots;
 
     // Sync flags (rank 0 allocates, others IPC-map)
-        uint32_t* intra_node_write_completion_flags;
-        uint32_t* combine_intra_node_write_completion_flags;
+        uint32_t* dispatch_lsa_S2G_flags;
+        uint32_t* combine_lsa_S2G_flags;
     // Single device-resident counter block (one alloc, one free) backing
     // the grid-barrier counters and the per-kernel expected-flag counters.
     // The expected counters are initialized at bootstrap and bumped in the
@@ -759,10 +759,10 @@ struct ncclEpGroup {
         void* dev_counter_block = nullptr;
         uint32_t* dispatch_grid_barrier_counter = nullptr;
         uint32_t* combine_grid_barrier_counter = nullptr;
-        uint64_t* dev_dispatch_expected_rdma = nullptr;
-        uint32_t* dev_dispatch_expected_intra = nullptr;
-        uint64_t* dev_combine_expected_rdma = nullptr;
-        uint32_t* dev_combine_expected_intra = nullptr;
+        uint64_t* dispatch_expected_gin_flag_val = nullptr;
+        uint32_t* dispatch_expected_lsa_flag_val = nullptr;
+        uint64_t* combine_expected_gin_flag_val = nullptr;
+        uint32_t* combine_expected_lsa_flag_val = nullptr;
 
     // RDMA buffers (multi-LSA-team only)
         uint64_t* dispatch_gin_G2S_flags;
@@ -1031,14 +1031,14 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     NCCL_CHECK_RESULT(
         ncclMemAlloc(reinterpret_cast<void**>(&ep_group->ht_buffers.completion_flags_base), 2 * sizeof(uint32_t)));
     CUDA_CHECK(cudaMemsetAsync(ep_group->ht_buffers.completion_flags_base, 0, 2 * sizeof(uint32_t), stream));
-    ep_group->ht_buffers.intra_node_write_completion_flags = ep_group->ht_buffers.completion_flags_base;
-    ep_group->ht_buffers.combine_intra_node_write_completion_flags = ep_group->ht_buffers.completion_flags_base + 1;
+    ep_group->ht_buffers.dispatch_lsa_S2G_flags = ep_group->ht_buffers.completion_flags_base;
+    ep_group->ht_buffers.combine_lsa_S2G_flags = ep_group->ht_buffers.completion_flags_base + 1;
 
     // Per-rank (not IPC-shared) device counter block. Layout (offsets in bytes):
-    //   [ 0..8)  dev_dispatch_expected_rdma  (uint64_t)
-    //   [ 8..16) dev_combine_expected_rdma   (uint64_t)
-    //   [16..20) dev_dispatch_expected_intra (uint32_t)
-    //   [20..24) dev_combine_expected_intra  (uint32_t)
+    //   [ 0..8)  dispatch_expected_gin_flag_val  (uint64_t)
+    //   [ 8..16) combine_expected_gin_flag_val   (uint64_t)
+    //   [16..20) dispatch_expected_lsa_flag_val (uint32_t)
+    //   [20..24) combine_expected_lsa_flag_val  (uint32_t)
     //   [24..28) dispatch_grid_barrier_counter (uint32_t)
     //   [28..32) combine_grid_barrier_counter  (uint32_t)
     {
@@ -1047,10 +1047,10 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         CUDA_CHECK(ep_group->alloc.alloc_fn(&block, kCounterBlockBytes, ep_group->alloc.context));
         ep_group->ht_buffers.dev_counter_block = block;
         auto* base = reinterpret_cast<uint8_t*>(block);
-        ep_group->ht_buffers.dev_dispatch_expected_rdma = reinterpret_cast<uint64_t*>(base + 0);
-        ep_group->ht_buffers.dev_combine_expected_rdma = reinterpret_cast<uint64_t*>(base + 8);
-        ep_group->ht_buffers.dev_dispatch_expected_intra = reinterpret_cast<uint32_t*>(base + 16);
-        ep_group->ht_buffers.dev_combine_expected_intra = reinterpret_cast<uint32_t*>(base + 20);
+        ep_group->ht_buffers.dispatch_expected_gin_flag_val = reinterpret_cast<uint64_t*>(base + 0);
+        ep_group->ht_buffers.combine_expected_gin_flag_val = reinterpret_cast<uint64_t*>(base + 8);
+        ep_group->ht_buffers.dispatch_expected_lsa_flag_val = reinterpret_cast<uint32_t*>(base + 16);
+        ep_group->ht_buffers.combine_expected_lsa_flag_val = reinterpret_cast<uint32_t*>(base + 20);
         ep_group->ht_buffers.dispatch_grid_barrier_counter = reinterpret_cast<uint32_t*>(base + 24);
         ep_group->ht_buffers.combine_grid_barrier_counter = reinterpret_cast<uint32_t*>(base + 28);
 
@@ -1127,8 +1127,8 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         void* ptr = nullptr;
         NCCL_CHECK_RESULT(
             ncclGetPeerDevicePointer(ep_group->ht_buffers.completion_flags_window, 0, lsa_rank0_global, &ptr));
-        ep_group->ht_buffers.intra_node_write_completion_flags = static_cast<uint32_t*>(ptr);
-        ep_group->ht_buffers.combine_intra_node_write_completion_flags = static_cast<uint32_t*>(ptr) + 1;
+        ep_group->ht_buffers.dispatch_lsa_S2G_flags = static_cast<uint32_t*>(ptr);
+        ep_group->ht_buffers.combine_lsa_S2G_flags = static_cast<uint32_t*>(ptr) + 1;
     }
 
     ep_group->ht_buffers.initialized = true;
@@ -1167,10 +1167,10 @@ static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
         ep_group->ht_buffers.dev_counter_block = nullptr;
         ep_group->ht_buffers.dispatch_grid_barrier_counter = nullptr;
         ep_group->ht_buffers.combine_grid_barrier_counter = nullptr;
-        ep_group->ht_buffers.dev_dispatch_expected_rdma = nullptr;
-        ep_group->ht_buffers.dev_dispatch_expected_intra = nullptr;
-        ep_group->ht_buffers.dev_combine_expected_rdma = nullptr;
-        ep_group->ht_buffers.dev_combine_expected_intra = nullptr;
+        ep_group->ht_buffers.dispatch_expected_gin_flag_val = nullptr;
+        ep_group->ht_buffers.dispatch_expected_lsa_flag_val = nullptr;
+        ep_group->ht_buffers.combine_expected_gin_flag_val = nullptr;
+        ep_group->ht_buffers.combine_expected_lsa_flag_val = nullptr;
     }
 
     // Free merged completion flags local allocation
@@ -1178,8 +1178,8 @@ static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
         NCCL_CHECK_RESULT(ncclMemFree(ep_group->ht_buffers.completion_flags_base));
         ep_group->ht_buffers.completion_flags_base = nullptr;
     }
-    ep_group->ht_buffers.intra_node_write_completion_flags = nullptr;
-    ep_group->ht_buffers.combine_intra_node_write_completion_flags = nullptr;
+    ep_group->ht_buffers.dispatch_lsa_S2G_flags = nullptr;
+    ep_group->ht_buffers.combine_lsa_S2G_flags = nullptr;
 
     // Free consolidated host pointer block
     if (ep_group->ht_buffers.host_ptr_block) {
@@ -3358,7 +3358,7 @@ ncclResult_t ncclEpDispatch(
         }
     } else { // HT
 
-        bool is_single_node = !is_internode_available(group);
+        bool is_lsa_only = !is_internode_available(group);
 
         const bool expert_major = (handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
 
@@ -3391,7 +3391,7 @@ ncclResult_t ncclEpDispatch(
         // This avoids ~60ms GIN registration overhead on the dispatch hot path
         void* token_ptr = x->data; // Default: use user buffer directly
         const bool x_uses_external_window = tensorUsesExternalWindow(group, x);
-        if (!is_single_node && handle->ht.token_staging_buffer != nullptr && !x_uses_external_window) {
+        if (!is_lsa_only && handle->ht.token_staging_buffer != nullptr && !x_uses_external_window) {
             // Copy user tokens to pre-registered staging buffer (D2D copy is ~0.1ms vs ~30ms GIN registration)
             size_t token_size = x->sizes[0] * x->sizes[1] * ncclTypeSize(x->datatype);
             CUDA_CHECK(cudaMemcpyAsync(
@@ -3433,7 +3433,7 @@ ncclResult_t ncclEpDispatch(
         // For SCALES_FORWARD: copy user scales to the pre-registered staging buffer.
         void* scales_ptr = (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) ? scales->data : nullptr;  // Default: use user buffer directly
         const bool scales_uses_external_window = (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) && tensorUsesExternalWindow(group, scales);
-        if ((quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) && !is_single_node && handle->ht.scaling_factor_staging_buffer != nullptr &&
+        if ((quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) && !is_lsa_only && handle->ht.scaling_factor_staging_buffer != nullptr &&
             !scales_uses_external_window) {
             // Copy user scaling factors to pre-registered staging buffer (D2D copy is ~0.1ms vs ~30ms GIN registration)
             size_t scales_size = scales->sizes[0] * scales->sizes[1] * ncclTypeSize(scales->datatype);
@@ -3561,7 +3561,7 @@ ncclResult_t ncclEpDispatch(
         //   - Intra-LSA output buffers: expert_output_token_ptrs, expert_output_prob_ptrs (per-rank pointers)
         //   - RDMA staging buffers: dispatch_gin_G2S_flags (for multi-LSA-team only)
         //   - Metadata: sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map
-        //   - Sync flags: expected_*_flag_value, intra_node_write_completion_flags
+        //   - Sync flags: expected_*_flag_val, lsa_S2G_flags
         nccl_ep::ht::DispatchParams params;
         params.hidden_dim = hidden;
         params.experts_per_rank = group->num_local_experts;
@@ -3654,10 +3654,10 @@ ncclResult_t ncclEpDispatch(
             fused_em_pad ? static_cast<int>(handle->ht.dispatch_output_per_expert_alignment) : 0;
         // Always pass a valid device pointer — the kernel unconditionally
         // dereferences this even in single-LSA-team mode (the value is just unused).
-        params.expected_rdma_flag_value = group->ht_buffers.dev_dispatch_expected_rdma;
-        params.dispatch_gin_G2S_flags = is_single_node ? nullptr : group->ht_buffers.dispatch_gin_G2S_flags;
-        params.expected_intra_node_flag_value = group->ht_buffers.dev_dispatch_expected_intra;
-        params.intra_node_write_completion_flags = group->ht_buffers.intra_node_write_completion_flags;
+        params.expected_gin_flag_val = group->ht_buffers.dispatch_expected_gin_flag_val;
+        params.gin_G2S_flags = is_lsa_only ? nullptr : group->ht_buffers.dispatch_gin_G2S_flags;
+        params.expected_lsa_flag_val = group->ht_buffers.dispatch_expected_lsa_flag_val;
+        params.lsa_S2G_flags = group->ht_buffers.dispatch_lsa_S2G_flags;
         params.dispatch_grid_barrier_counter = group->ht_buffers.dispatch_grid_barrier_counter;
         params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
         // Pass device communicators and windows
@@ -3669,8 +3669,8 @@ ncclResult_t ncclEpDispatch(
         params.nccl_prob_window = forward_dispatch ? group->gin_config.nccl_window : ncclWindow_t{};
         params.nccl_sf_window = (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) ? scales->win_hdl : ncclWindow_t{};
         params.nccl_internal_window = group->gin_config.nccl_window;
-        params.num_ctx_per_comm = is_single_node ? 0 : group->gin_config.num_ctx_per_comm;
-        params.gin_base_ptr = is_single_node ? nullptr : group->gin_config.gin_base_ptr;
+        params.num_ctx_per_comm = is_lsa_only ? 0 : group->gin_config.num_ctx_per_comm;
+        params.gin_base_ptr = is_lsa_only ? nullptr : group->gin_config.gin_base_ptr;
         // Use offsets relative to gin_base_ptr
         // All buffers are part of one large registered window
         // Calculate bytes_per_entry for batched staging
@@ -3682,24 +3682,24 @@ ncclResult_t ncclEpDispatch(
                 : 0;
         size_t bytes_per_entry = bytes_per_token_entry + bytes_per_prob_entry + bytes_per_sf_entry;
 
-        params.mr_info.attn_input_token_offset = is_single_node ? 0 : x->win_offset;
+        params.mr_info.attn_input_token_offset = is_lsa_only ? 0 : x->win_offset;
         params.mr_info.attn_input_prob_offset =
-            (is_single_node || !forward_dispatch) ? 0 : group->gin_config.dense_prob_offset;
+            (is_lsa_only || !forward_dispatch) ? 0 : group->gin_config.dense_prob_offset;
         params.mr_info.attn_input_scaling_factor_offset =
-            (is_single_node || quantization_recipe != NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)
+            (is_lsa_only || quantization_recipe != NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)
                 ? 0
                 : scales->win_offset;
         params.mr_info.gin_send_staging_offset =
-            is_single_node ? 0 : group->gin_config.gin_send_staging_offset;
+            is_lsa_only ? 0 : group->gin_config.gin_send_staging_offset;
         params.mr_info.gin_recv_staging_offset =
-            is_single_node ? 0 : group->gin_config.gin_recv_staging_offset;
-        params.mr_info.guard_offset = is_single_node ? 0 : group->gin_config.dispatch_guard_offset;
+            is_lsa_only ? 0 : group->gin_config.gin_recv_staging_offset;
+        params.mr_info.guard_offset = is_lsa_only ? 0 : group->gin_config.dispatch_guard_offset;
         params.mr_info.bytes_per_entry = bytes_per_entry;
         params.mr_info.max_tokens_per_dest = static_cast<size_t>(group->config.max_dispatch_tokens_per_rank);
         params.mr_info.signals_tail_base =
-            is_single_node ? 0 : static_cast<unsigned>(group->gin_config.signals_tail_base);
+            is_lsa_only ? 0 : static_cast<unsigned>(group->gin_config.signals_tail_base);
         params.mr_info.num_max_rdma_chunked_send_tokens =
-            is_single_node ? 0 : group->gin_config.num_max_rdma_chunked_send_tokens;
+            is_lsa_only ? 0 : group->gin_config.num_max_rdma_chunked_send_tokens;
         params.local_rank = group->lsa_rank;
         params.lsa_team = group->rdma_rank;
         params.tokens_per_lsa = group->config.max_dispatch_tokens_per_rank;
@@ -3741,8 +3741,8 @@ ncclResult_t ncclEpDispatch(
                 handle->ht.emuf_group_buf,
                 handle->ht.emuf_group_count,
                 handle->ht.emuf_group_stride,
-                group->ht_buffers.intra_node_write_completion_flags,
-                /*expected_intra_node_flag_value=*/params.expected_intra_node_flag_value,
+                group->ht_buffers.dispatch_lsa_S2G_flags,
+                /*expected_lsa_flag_val=*/params.expected_lsa_flag_val,
                 /*grid_barrier_counter=*/params.dispatch_grid_barrier_counter,
                 params.hidden_dim,
                 params.experts_per_rank,
@@ -4121,8 +4121,8 @@ ncclResult_t ncclEpCombine(
         // Forward combine: just tokens (inference)
         // Backward combine: tokens + gradients (training, topk_weights provided)
         ncclEpGroup_t group = handle->group;
-        bool is_single_node = !is_internode_available(group);
-        // assert(is_single_node && "HT mode only supports single-node");
+        bool is_lsa_only = !is_internode_available(group);
+        // assert(is_lsa_only && "HT mode only supports single-node");
 
         /* ===== Inputs validation ===== */
         const ncclEpTensor_t* x = tensor_required(inputs->tokens);
@@ -4323,7 +4323,7 @@ ncclResult_t ncclEpCombine(
         //   - Output buffers: attn_output_token, attn_output_prob (user-provided)
         //   - RDMA buffers: combine_gin_RED_*, combine_gin_G2S_* (for multi-LSA-team)
         //   - Metadata: sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map, local_expert_routing_map
-        //   - Sync flags: combine_expected_*_flag_value, combine_intra_node_write_completion_flags
+        //   - Sync flags: expected_*_flag_val, lsa_S2G_flags
         nccl_ep::ht::CombineParams params;
         params.hidden_dim = hidden;
         params.experts_per_rank = group->num_local_experts;
@@ -4341,13 +4341,13 @@ ncclResult_t ncclEpCombine(
             backward_combine ? group->ht_buffers.combine_expert_input_prob_buffer_ptrs : nullptr;
         params.attn_output_token = combined_x->data;
         params.attn_output_prob = backward_combine ? dense_output_prob : nullptr;
-        params.combine_gin_RED_tokens = is_single_node ? nullptr : group->ht_buffers.combine_gin_RED_tokens;
+        params.combine_gin_RED_tokens = is_lsa_only ? nullptr : group->ht_buffers.combine_gin_RED_tokens;
         params.combine_gin_RED_prob =
-            (!is_single_node && backward_combine) ? group->ht_buffers.combine_gin_RED_prob : nullptr;
+            (!is_lsa_only && backward_combine) ? group->ht_buffers.combine_gin_RED_prob : nullptr;
         params.combine_gin_G2S_tokens =
-            is_single_node ? nullptr : group->ht_buffers.combine_gin_G2S_tokens;
+            is_lsa_only ? nullptr : group->ht_buffers.combine_gin_G2S_tokens;
         params.combine_gin_G2S_prob =
-            (!is_single_node && backward_combine) ? group->ht_buffers.combine_gin_G2S_prob : nullptr;
+            (!is_lsa_only && backward_combine) ? group->ht_buffers.combine_gin_G2S_prob : nullptr;
         // Unified s2d: FLAT-shape for FLAT layout and EM em-permute mode;
         // EM-shape (packed rank/slot) only for EM kNvlinkDup / kLocalDup modes.
         params.sparse_to_dense_map = handle->ht.sparse_to_dense_map;
@@ -4361,17 +4361,17 @@ ncclResult_t ncclEpCombine(
         params.attn_to_rdma_map = handle->ht.attn_to_rdma_map;
         params.local_expert_routing_map = handle->ht.local_expert_routing_map;
         // Always pass a valid device pointer — see dispatch path comment.
-        params.combine_expected_rdma_flag_value = group->ht_buffers.dev_combine_expected_rdma;
-        params.combine_gin_G2S_flags =
-            is_single_node ? nullptr : group->ht_buffers.combine_gin_G2S_flags;
-        params.combine_expected_intra_node_flag_value = group->ht_buffers.dev_combine_expected_intra;
+        params.expected_gin_flag_val = group->ht_buffers.combine_expected_gin_flag_val;
+        params.gin_G2S_flags =
+            is_lsa_only ? nullptr : group->ht_buffers.combine_gin_G2S_flags;
+        params.expected_lsa_flag_val = group->ht_buffers.combine_expected_lsa_flag_val;
         params.combine_grid_barrier_counter = group->ht_buffers.combine_grid_barrier_counter;
-        params.combine_intra_node_write_completion_flags = group->ht_buffers.combine_intra_node_write_completion_flags;
+        params.lsa_S2G_flags = group->ht_buffers.combine_lsa_S2G_flags;
         params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
         const ncclWindow_t combine_token_window =
             !combine_x_uses_external_window ? x->win_hdl : group->gin_config.nccl_window;
         const size_t combine_token_offset =
-            is_single_node ? 0 :
+            is_lsa_only ? 0 :
                              (!combine_x_uses_external_window ? static_cast<size_t>(x->win_offset) :
                                                                 group->gin_config.combine_red_token_offset);
         // Pass device communicators and windows
@@ -4381,20 +4381,20 @@ ncclResult_t ncclEpCombine(
         params.nccl_token_window = combine_token_window;
         params.nccl_prob_window = !backward_combine ? ncclWindow_t{} : group->gin_config.nccl_window;
         params.nccl_internal_window = group->gin_config.nccl_window;
-        params.num_gin_comms = is_single_node ? 0 : group->gin_config.num_comms;
-        params.num_ctx_per_comm = is_single_node ? 0 : group->gin_config.num_ctx_per_comm;
-        params.gin_base_ptr = is_single_node ? nullptr : group->gin_config.gin_base_ptr;
+        params.num_gin_comms = is_lsa_only ? 0 : group->gin_config.num_comms;
+        params.num_ctx_per_comm = is_lsa_only ? 0 : group->gin_config.num_ctx_per_comm;
+        params.gin_base_ptr = is_lsa_only ? nullptr : group->gin_config.gin_base_ptr;
         params.signals_base = group->gin_config.signals_base;
         params.combine_signal_offset = group->gin_config.combine_signal_offset;
         // Use offsets relative to gin_base_ptr
         params.mr_info = {
             .combine_red_token_offset = combine_token_offset,
             .combine_g2s_token_offset =
-                is_single_node ? 0 : group->gin_config.combine_g2s_token_offset,
-            .combine_red_prob_offset = is_single_node ? 0 : group->gin_config.combine_red_prob_offset,
+                is_lsa_only ? 0 : group->gin_config.combine_g2s_token_offset,
+            .combine_red_prob_offset = is_lsa_only ? 0 : group->gin_config.combine_red_prob_offset,
             .combine_g2s_prob_offset =
-                is_single_node ? 0 : group->gin_config.combine_g2s_prob_offset,
-            .guard_offset = is_single_node ? 0 : group->gin_config.combine_guard_offset,
+                is_lsa_only ? 0 : group->gin_config.combine_g2s_prob_offset,
+            .guard_offset = is_lsa_only ? 0 : group->gin_config.combine_guard_offset,
         };
         params.local_rank = group->lsa_rank;
         params.lsa_team = group->rdma_rank;

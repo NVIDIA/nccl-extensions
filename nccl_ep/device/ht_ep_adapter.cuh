@@ -338,10 +338,10 @@ struct DispatchParams {
 
     // Device pointers to the expected counters; initialized at bootstrap and
     // bumped by the dispatch kernel tail so CUDA-graph replays self-sequence.
-    uint64_t* expected_rdma_flag_value;
-    uint32_t* expected_intra_node_flag_value;
-    uint64_t* dispatch_gin_G2S_flags;
-    uint32_t* intra_node_write_completion_flags;
+    uint64_t* expected_gin_flag_val;
+    uint32_t* expected_lsa_flag_val;
+    uint64_t* gin_G2S_flags;
+    uint32_t* lsa_S2G_flags;
     // Grid barrier counter for fused device_sync in dispatch tail
     uint32_t* dispatch_grid_barrier_counter;
 
@@ -420,10 +420,10 @@ struct CombineParams {
 
     // Device pointers to the expected counters; initialized at bootstrap and
     // bumped by the combine kernel tail so CUDA-graph replays self-sequence.
-    uint64_t* combine_expected_rdma_flag_value;
-    uint32_t* combine_expected_intra_node_flag_value;
-    uint64_t* combine_gin_G2S_flags;
-    uint32_t* combine_intra_node_write_completion_flags;
+    uint64_t* expected_gin_flag_val;
+    uint32_t* expected_lsa_flag_val;
+    uint64_t* gin_G2S_flags;
+    uint32_t* lsa_S2G_flags;
     // Per-rank grid-barrier counter that elects the last block at the combine tail.
     uint32_t* combine_grid_barrier_counter;
 
@@ -472,8 +472,8 @@ void call_local_dup(
     const int32_t* emuf_group_buf, // device [num_groups, group_stride]
     const int32_t* emuf_group_count, // device scalar (read by kernel)
     int emuf_group_stride,
-    const uint32_t* intra_node_write_completion_flag,
-    uint32_t* expected_intra_node_flag_value,
+    const uint32_t* lsa_S2G_flag,
+    uint32_t* expected_lsa_flag_val,
     uint32_t* grid_barrier_counter,
     int hidden_dim,
     int experts_per_rank,

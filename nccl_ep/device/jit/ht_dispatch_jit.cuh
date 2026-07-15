@@ -45,15 +45,15 @@ struct dispatch_warp_layout_t {
 };
 
 inline dispatch_warp_layout_t compute_dispatch_warp_layout(int num_lsa_teams, ncclEpLayout_t layout) {
-    const bool multinode_layout = (num_lsa_teams != 1);
+    const bool multi_lsa_layout = (num_lsa_teams != 1);
     dispatch_warp_layout_t L{};
     L.num_pipelines = NCCL_EP_HT_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
-    L.cross_lsa_group_warps = multinode_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
+    L.cross_lsa_group_warps = multi_lsa_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
     L.cross_lsa_group_start = 0;
     L.lsa_g2s_group_warps = L.num_pipelines;
-    L.lsa_g2s_group_start = multinode_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
+    L.lsa_g2s_group_start = multi_lsa_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
     L.lsa_s2g_group_warps = L.num_pipelines;
-    L.lsa_s2g_group_start = multinode_layout ? (NCCL_EP_HT_DISPATCH_N2N_WARPS + L.num_pipelines) : L.num_pipelines;
+    L.lsa_s2g_group_start = multi_lsa_layout ? (NCCL_EP_HT_DISPATCH_N2N_WARPS + L.num_pipelines) : L.num_pipelines;
     L.pad_group_warps = (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? 1 : 0;
     L.pad_group_start = L.lsa_s2g_group_start + L.lsa_s2g_group_warps;
     L.block_dim = 32 * (L.cross_lsa_group_warps + L.lsa_g2s_group_warps + L.lsa_s2g_group_warps +

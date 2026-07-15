@@ -47,19 +47,19 @@ struct combine_warp_layout_t {
 };
 
 inline combine_warp_layout_t compute_combine_warp_layout(int num_lsa_teams) {
-    const bool multinode_layout = (num_lsa_teams != 1);
+    const bool multi_lsa_layout = (num_lsa_teams != 1);
     combine_warp_layout_t L{};
-    L.lsa_red_group_warps = multinode_layout ? 4 : 0;
+    L.lsa_red_group_warps = multi_lsa_layout ? 4 : 0;
     L.lsa_red_group_start = 0;
     L.cross_lsa_red_group_warps = 4;
-    L.cross_lsa_red_group_start = multinode_layout ? 4 : 0;
-    L.lsa_g2s_group_warps = multinode_layout ? 1 : 0;
-    L.lsa_g2s_group_start = multinode_layout ? 8 : 4;
-    L.cross_lsa_g2s_group_warps = multinode_layout ? 1 : 2;
-    L.cross_lsa_g2s_group_start = multinode_layout ? 9 : 4;
-    L.cross_lsa_rdma_group_warps = multinode_layout ? 1 : 0;
-    L.cross_lsa_rdma_group_start = multinode_layout ? 10 : 6;
-    L.num_of_data_pipeline_per_block = multinode_layout ? 1 : 2;
+    L.cross_lsa_red_group_start = multi_lsa_layout ? 4 : 0;
+    L.lsa_g2s_group_warps = multi_lsa_layout ? 1 : 0;
+    L.lsa_g2s_group_start = multi_lsa_layout ? 8 : 4;
+    L.cross_lsa_g2s_group_warps = multi_lsa_layout ? 1 : 2;
+    L.cross_lsa_g2s_group_start = multi_lsa_layout ? 9 : 4;
+    L.cross_lsa_rdma_group_warps = multi_lsa_layout ? 1 : 0;
+    L.cross_lsa_rdma_group_start = multi_lsa_layout ? 10 : 6;
+    L.num_of_data_pipeline_per_block = multi_lsa_layout ? 1 : 2;
     L.block_dim = 32 * (L.lsa_red_group_warps + L.cross_lsa_red_group_warps + L.lsa_g2s_group_warps +
                         L.cross_lsa_g2s_group_warps + L.cross_lsa_rdma_group_warps);
     return L;

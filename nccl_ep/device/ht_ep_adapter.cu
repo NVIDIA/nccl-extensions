@@ -891,7 +891,7 @@ ncclResult_t dispatch_impl(
         d_model.max_num_of_tokens_per_rank = max_dispatch_tokens_per_rank;
         d_model.num_of_experts_per_rank = kp.experts_per_rank;
         d_model.ranks_per_lsa_team = kp.ranks_per_lsa_team;
-        d_model.num_of_nodes = num_lsa_teams;
+        d_model.num_lsa_teams = num_lsa_teams;
 
         const int smem_size = static_cast<int>(::ht_ep::calculate_dispatch_smem_layout_size(
             params.layout, kernel_spec.payload_bytes, d_config, d_model));
@@ -1073,16 +1073,16 @@ void combine_impl(
 
     // Select config based on num_lsa_teams (single LSA team: 12 stages/2 pipelines, multiple LSA teams: 5 stages/1 pipeline)
     const int num_stages_g2s =
-        (num_lsa_teams == 1) ? NCCL_EP_HT_COMBINE_SINGLENODE_NUM_OF_STAGES_G2S : NCCL_EP_HT_COMBINE_MULTINODE_NUM_OF_STAGES_G2S;
+        (num_lsa_teams == 1) ? NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_STAGES_G2S : NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_STAGES_G2S;
     const int num_stages_s2g =
-        (num_lsa_teams == 1) ? NCCL_EP_HT_COMBINE_SINGLENODE_NUM_OF_STAGES_S2G : NCCL_EP_HT_COMBINE_MULTINODE_NUM_OF_STAGES_S2G;
+        (num_lsa_teams == 1) ? NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_STAGES_S2G : NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_STAGES_S2G;
 
     ::ht_ep::model_config_t model;
     model.hidden_dim = kp.hidden_dim;
     model.max_num_of_tokens_per_rank = max_dispatch_tokens_per_rank;
     model.num_of_experts_per_rank = kp.experts_per_rank;
     model.ranks_per_lsa_team = kp.ranks_per_lsa_team;
-    model.num_of_nodes = num_lsa_teams;
+    model.num_lsa_teams = num_lsa_teams;
     // Pick the layout-size instantiation by wire dtype; the width is derived inside the
     // template. Layout size depends only on element width, so FP16 and BF16 (both 2 B)
     // share the BF16 instantiation; only FP32 (4 B) is distinct.

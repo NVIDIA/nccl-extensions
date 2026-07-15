@@ -105,7 +105,7 @@ struct scan_geometry_t {
     int num_of_tokens_per_thread;
     int num_of_tokens_per_warp;
     int num_of_tokens_per_block;
-    int rdma_to_attn_map_size_per_node;
+    int rdma_to_attn_per_lsa_sz;
     int experts_per_lsa_team_packed;
     int packed_row_bytes;
     int thread_starting_token;
@@ -187,7 +187,7 @@ __device__ __forceinline__ void extract_lsa_ranks_meta(
         int src_lsa_team = token_id / TOKENS_PER_LSA_TEAM;
         int src_local_rank = (token_id % TOKENS_PER_LSA_TEAM) / tokens_per_rank;
         int src_token_id = token_id % tokens_per_rank;
-        int rdma_map_id = src_lsa_team * g.rdma_to_attn_map_size_per_node + src_token_id;
+        int rdma_map_id = src_lsa_team * g.rdma_to_attn_per_lsa_sz + src_token_id;
 
         const uint8_t* bitmap_row =
             input_routing_map + token_id * g.packed_row_bytes + lsa_team_id * g.experts_per_lsa_team_packed;
@@ -461,7 +461,7 @@ __device__ __forceinline__ void assign_recv_slots(
         // Drop policy: clear combine gate for fully-dropped tokens to avoid combine deadlock.
         if (allow_overflow_drop && token_out_of_bound == 0 &&
             src_local_rank == local_rank && rank_mask.any() && !token_any_slot_kept) {
-            rdma_to_attn_map[src_lsa_team * g.rdma_to_attn_map_size_per_node +
+            rdma_to_attn_map[src_lsa_team * g.rdma_to_attn_per_lsa_sz +
                              src_token_id] = false;
         }
 
@@ -498,7 +498,7 @@ __device__ __forceinline__ void assign_recv_slots(
             if (overflow && !allow_overflow_drop) {
                 printf(
                     "ncclEpUpdateHandle: HT FLAT actual recv tokens %d > "
-                    "max_recv_tokens_per_rank %d on (node %d local %d); "
+                    "max_recv_tokens_per_rank %d on (LSA team %d local %d); "
                     "increase ncclEpGroupConfig_t::max_recv_tokens_per_rank "
                     "or set ncclEpGroupConfig_t::overflow_policy = NCCL_EP_OVERFLOW_DROP\n",
                     true_total,
@@ -547,18 +547,18 @@ __device__ __forceinline__ void fill_attn_to_rdma(
         int current_token_id = i * NUM_OF_TOTAL_THREADS + tid;
         if (current_token_id >= num_of_total_token_rows) break;
 
-        int attn_node_id = current_token_id % (NUM_LSA_TEAMS - 1);
-        int current_token_node_id = attn_node_id < lsa_team ? attn_node_id : attn_node_id + 1;
+        int attn_lsa_id = current_token_id % (NUM_LSA_TEAMS - 1);
+        int token_lsa_team = attn_lsa_id < lsa_team ? attn_lsa_id : attn_lsa_id + 1;
         int current_token_local_id = current_token_id / (NUM_LSA_TEAMS - 1);
 
         const uint8_t* bitmap_row =
             input_routing_map +
             ((lsa_team * LSA_TEAM_SIZE + local_rank) * num_of_tokens_per_rank + current_token_local_id) *
                 g.packed_row_bytes +
-            current_token_node_id * g.experts_per_lsa_team_packed;
+            token_lsa_team * g.experts_per_lsa_team_packed;
 
         bool* attn_to_rdma_map_base_addr =
-            attn_to_rdma_map + (current_token_local_id * (NUM_LSA_TEAMS - 1) + attn_node_id);
+            attn_to_rdma_map + (current_token_local_id * (NUM_LSA_TEAMS - 1) + attn_lsa_id);
         *attn_to_rdma_map_base_addr = bitmap_range_has_set_bit(bitmap_row, 0, experts_per_lsa_team);
     }
 }
@@ -574,7 +574,7 @@ compute_scan_geometry(int num_of_tokens_per_rank, int experts_per_rank) {
     g.num_of_tokens_per_thread = ((g.num_of_total_attn_tokens - 1) / NUM_OF_TOTAL_THREADS) + 1;
     g.num_of_tokens_per_warp = g.num_of_tokens_per_thread * WARP_SIZE;
     g.num_of_tokens_per_block = g.num_of_tokens_per_warp * NUM_OF_WARPS_PER_BLOCK;
-    g.rdma_to_attn_map_size_per_node = rdma_to_attn_row_stride(num_of_tokens_per_rank);
+    g.rdma_to_attn_per_lsa_sz = rdma_to_attn_row_stride(num_of_tokens_per_rank);
 
     const int experts_per_lsa_team = experts_per_rank * LSA_TEAM_SIZE;
     g.experts_per_lsa_team_packed = (experts_per_lsa_team + 7) / 8;
@@ -1089,9 +1089,9 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
 
     int32_t* g_block_count = p.gscratch;
 
-    const int local_per_node_bytes = ((nrpn * epr) + 7) / 8;
+    const int local_per_lsa_bytes = ((nrpn * epr) + 7) / 8;
     // Matches the combine kernels' rdma_to_attn_map row padding (16 bools/LSA-team).
-    const int rdma_to_attn_map_size_per_node = rdma_to_attn_row_stride(p.num_tokens_per_rank);
+    const int rdma_to_attn_per_lsa_sz = rdma_to_attn_row_stride(p.num_tokens_per_rank);
     const int tid       = threadIdx.x;
     const int lane      = tid & 31;
     const int warp      = tid >> 5;
@@ -1122,7 +1122,7 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
         const uint64_t mw1 = (p.num_mask_words >= 2) ? mw[1] : 0;
         if (mw0 == 0 && mw1 == 0) continue;
         const uint8_t* row = p.input_routing_map + (size_t)tok * packed_row_bytes
-                           + (size_t)p.lsa_team * local_per_node_bytes;
+                           + (size_t)p.lsa_team * local_per_lsa_bytes;
         for (int wi = 0; wi < n_local_words_ph1; wi++) {
             const int word_bit_base = wi * 64;
             const int remaining = n_local_bits_ph1 - word_bit_base;
@@ -1248,18 +1248,18 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
         const uint8_t* row_local = nullptr;
         int send_idx = 0;
         bool is_our_send = false;
-        int src_node = 0;
+        int src_lsa_team = 0;
         int src_local_id = 0;
         if (any_hit) {
             row_local = p.input_routing_map + (size_t)tok * packed_row_bytes
-                      + (size_t)p.lsa_team * local_per_node_bytes;
+                      + (size_t)p.lsa_team * local_per_lsa_bytes;
             const int sgr = tok / p.num_tokens_per_rank;
             const int sn  = sgr / nrpn;
             const int slr = sgr % nrpn;
             const int lti = tok % p.num_tokens_per_rank;
             send_idx = sn * p.num_tokens_per_rank + lti;
             is_our_send = (slr == p.local_rank);
-            src_node = sn;
+            src_lsa_team = sn;
             src_local_id = lti;
         }
 
@@ -1345,7 +1345,7 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
         // Drop policy: clear combine gate for fully-dropped send tokens; em-permute delegates this to FLAT scan.
         if (p.allow_overflow_drop && p.rdma_to_attn_map != nullptr && p.sparse_to_dense_map != nullptr &&
             is_our_send && my_packed_idx > 0 && !token_any_slot_kept) {
-            p.rdma_to_attn_map[src_node * rdma_to_attn_map_size_per_node + src_local_id] = false;
+            p.rdma_to_attn_map[src_lsa_team * rdma_to_attn_per_lsa_sz + src_local_id] = false;
         }
 
         if (p.emuf_group_buf != nullptr && n_local_sec > 0) {

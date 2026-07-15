@@ -30,13 +30,13 @@
 // ============================================================================
 // Combine configuration constants
 // ============================================================================
-// Single-node configuration: optimized for intra-node only (2 pipelines, deep FIFO)
-#define NCCL_EP_HT_COMBINE_SINGLENODE_NUM_OF_STAGES_G2S 12
-#define NCCL_EP_HT_COMBINE_SINGLENODE_NUM_OF_STAGES_S2G 2
+// Single-LSA-team configuration: optimized for intra-LSA only (2 pipelines, deep FIFO)
+#define NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_STAGES_G2S 12
+#define NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_STAGES_S2G 2
 
-// Multi-node configuration: optimized for inter-node RDMA (1 pipeline, shallow FIFO)
-#define NCCL_EP_HT_COMBINE_MULTINODE_NUM_OF_STAGES_G2S 4
-#define NCCL_EP_HT_COMBINE_MULTINODE_NUM_OF_STAGES_S2G 2
+// Multi-LSA-team configuration: optimized for cross-LSA-team RDMA (1 pipeline, shallow FIFO)
+#define NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_STAGES_G2S 4
+#define NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_STAGES_S2G 2
 
 #define NCCL_EP_HT_COMBINE_NUM_OF_TOKENS_PER_GROUP 4
 #define NCCL_EP_HT_COMBINE_NUM_OF_BLOCKS NCCL_EP_HT_DFLT_NUM_SMS

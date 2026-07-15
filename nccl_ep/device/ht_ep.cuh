@@ -183,7 +183,7 @@ struct model_config_t {
     int max_num_of_tokens_per_rank;
     int num_of_experts_per_rank;
     int ranks_per_lsa_team;
-    int num_of_nodes;
+    int num_lsa_teams;
 };
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
@@ -496,11 +496,11 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
         layout.sf_buffer_stage_stride = 0;
     }
 
-    // attn_to_rdma_map buffer (16B aligned, only if multinode, shared across pipelines)
-    if (model.num_of_nodes > 1) {
+    // attn_to_rdma_map buffer (16B aligned, only if multi_lsa, shared across pipelines)
+    if (model.num_lsa_teams > 1) {
         offset = (offset + 15) & ~15;
         layout.attn_to_rdma_map_buffer = reinterpret_cast<bool*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-        offset += config.num_of_tokens_per_chunk * (model.num_of_nodes - 1) * sizeof(bool);
+        offset += config.num_of_tokens_per_chunk * (model.num_lsa_teams - 1) * sizeof(bool);
     } else {
         layout.attn_to_rdma_map_buffer = nullptr;
     }
@@ -519,11 +519,11 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     layout.S2G_group_mbarrier_buffer = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += num_pipelines * sizeof(uint64_t);
 
-    if (model.num_of_nodes > 1) {
+    if (model.num_lsa_teams > 1) {
         offset = (offset + 7) & ~7;
         layout.dispatch_memory_region_info =
             reinterpret_cast<dispatch_memory_region_info_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-        offset += (model.num_of_nodes - 1) * sizeof(dispatch_memory_region_info_t);
+        offset += (model.num_lsa_teams - 1) * sizeof(dispatch_memory_region_info_t);
     } else {
         layout.dispatch_memory_region_info = nullptr;
     }
@@ -572,10 +572,10 @@ static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& confi
         sf_buffer_stage_stride = (sf_buffer_stage_stride + 15) & ~15;
         total_size += config.num_of_stages * sf_buffer_stage_stride;
     }
-    // attn_to_rdma_map buffer (aligned to 16B, only if multinode, shared)
-    if (model.num_of_nodes > 1) {
+    // attn_to_rdma_map buffer (aligned to 16B, only if multi_lsa, shared)
+    if (model.num_lsa_teams > 1) {
         total_size = (total_size + 15) & ~15;
-        total_size += config.num_of_tokens_per_chunk * (model.num_of_nodes - 1) * sizeof(bool);
+        total_size += config.num_of_tokens_per_chunk * (model.num_lsa_teams - 1) * sizeof(bool);
     }
     // Mbarrier buffers (aligned to 8B) -- total stages unchanged
     total_size = (total_size + 7) & ~7;
@@ -586,10 +586,10 @@ static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& confi
     // Per-pipeline S2G group mbarrier: 1 per pipeline
     total_size = (total_size + 7) & ~7;
     total_size += num_pipelines * sizeof(uint64_t);
-    // Dispatch memory region info buffer (aligned to 8B, only if multinode)
-    if (model.num_of_nodes > 1) {
+    // Dispatch memory region info buffer (aligned to 8B, only if multi_lsa)
+    if (model.num_lsa_teams > 1) {
         total_size = (total_size + 7) & ~7;
-        total_size += (model.num_of_nodes - 1) * sizeof(dispatch_memory_region_info_t);
+        total_size += (model.num_lsa_teams - 1) * sizeof(dispatch_memory_region_info_t);
     }
     // PAD warp TMA slot (expert-major only, 128B aligned)
     if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
@@ -651,9 +651,9 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
         }
     };
 
-    // In the single-LSA-team case (num_of_nodes == 1), the combine kernel does not use the
+    // In the single-LSA-team case (num_lsa_teams == 1), the combine kernel does not use the
     // intra-LSA staging buffers. Skipping these buffers can cut SMEM roughly in half.
-    const bool multinode = (model.num_of_nodes > 1);
+    const bool multi_lsa = (model.num_lsa_teams > 1);
 
     // Per-token wire size: bytes for buffer offsets, uint16_t units for stage strides (the
     // token buffer base is uint16_t*). FP32 doubles both vs BF16/FP16.
@@ -665,11 +665,11 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     layout.token_S2G_stage_stride = token_stride_u16;
     layout.prob_G2S_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team;
     layout.prob_S2G_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team;
-    layout.prob_S2G_inter_stage_stride = layout.prob_S2G_stage_stride * model.num_of_nodes;
+    layout.prob_S2G_inter_stage_stride = layout.prob_S2G_stage_stride * model.num_lsa_teams;
 
     // lsa_token_* buffers (128B aligned, multi-LSA-team only). Stage stride scales
     // with the on-wire element width (2 B for BF16/FP16, 4 B for FP32).
-    if (multinode) {
+    if (multi_lsa) {
         align_offset(128);
         layout.lsa_token_G2S_buffer =
             reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
@@ -696,7 +696,7 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
 
     // Prob buffers (only if backward_combine, 16B aligned)
     if (backward_combine) {
-        if (multinode) {
+        if (multi_lsa) {
             // lsa_prob_G2S_buffer
             align_offset(16);
             layout.lsa_prob_G2S_buffer =
@@ -721,7 +721,7 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
         // cross_lsa_prob_S2G_buffer
         align_offset(16);
         layout.cross_lsa_prob_S2G_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-        offset += num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * model.num_of_nodes *
+        offset += num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * model.num_lsa_teams *
                   sizeof(float);
     } else {
         layout.lsa_prob_G2S_buffer = nullptr;
@@ -732,7 +732,7 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
 
     // Mbarrier buffers (8B aligned)
     // lsa_mbarrier_G2S_buffer (multi-LSA-team only)
-    if (multinode) {
+    if (multi_lsa) {
         align_offset(8);
         layout.lsa_mbarrier_G2S_buffer =
             reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
@@ -747,28 +747,28 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     offset += num_of_stages_g2s * 2 * sizeof(uint64_t);
 
     // lsa_to_rdma_mbarrier_buffer (only if multi-LSA-team)
-    if (model.num_of_nodes > 1) {
+    if (model.num_lsa_teams > 1) {
         int max_num_of_chunks_per_rank =
             (model.max_num_of_tokens_per_rank + num_of_tokens_per_chunk - 1) / num_of_tokens_per_chunk;
         align_offset(8);
         layout.lsa_to_rdma_mbarrier_buffer =
             reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-        offset += (model.num_of_nodes - 1) * max_num_of_chunks_per_rank * sizeof(uint64_t);
+        offset += (model.num_lsa_teams - 1) * max_num_of_chunks_per_rank * sizeof(uint64_t);
     } else {
         layout.lsa_to_rdma_mbarrier_buffer = nullptr;
     }
 
-    if (model.num_of_nodes > 1) {
+    if (model.num_lsa_teams > 1) {
         align_offset(8);
         layout.combine_memory_region_info =
             reinterpret_cast<combine_memory_region_info_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-        offset += (model.num_of_nodes - 1) * sizeof(combine_memory_region_info_t);
+        offset += (model.num_lsa_teams - 1) * sizeof(combine_memory_region_info_t);
     } else {
         layout.combine_memory_region_info = nullptr;
     }
 
     // Flag buffers (no special alignment needed)
-    if (multinode) {
+    if (multi_lsa) {
         layout.lsa_flag_G2S_buffer = reinterpret_cast<bool*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
         offset += num_of_stages_g2s * sizeof(bool);
     } else {
@@ -779,7 +779,7 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     offset += num_of_stages_g2s * sizeof(bool);
 
     // Streaming overlap fields (multi-LSA-team only, 4B aligned)
-    if (multinode) {
+    if (multi_lsa) {
         align_offset(4);
         layout.rdma_streaming_counter = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
         offset += sizeof(uint32_t);
@@ -808,12 +808,12 @@ static size_t calculate_combine_smem_layout_size(
     const int token_bytes = hidden_dim * nccl_ep::size_u8<kTokenDtype>(); // per-token wire bytes
     const int max_num_of_chunks_per_rank =
         (max_num_of_tokens_per_rank + num_of_tokens_per_chunk - 1) / num_of_tokens_per_chunk;
-    const bool multinode = (num_lsa_teams > 1);
+    const bool multi_lsa = (num_lsa_teams > 1);
 
     // Token buffers (128B aligned for TMA). Stage stride scales with the wire element
     // width (2 B for BF16/FP16, 4 B for FP32).
     // lsa_token_* buffers (multi-LSA-team only)
-    if (multinode) {
+    if (multi_lsa) {
         total_size = (total_size + 127) & ~127;
         total_size += num_of_stages_g2s * token_bytes;
 
@@ -831,7 +831,7 @@ static size_t calculate_combine_smem_layout_size(
 
     // Prob buffers (16B aligned, only if backward_combine)
     if (backward_combine) {
-        if (multinode) {
+        if (multi_lsa) {
             // lsa_prob_G2S_buffer
             total_size = (total_size + 15) & ~15;
             total_size +=
@@ -855,7 +855,7 @@ static size_t calculate_combine_smem_layout_size(
 
     // Mbarrier buffers (8B aligned)
     // lsa_mbarrier_G2S_buffer [stages][2] (multi-LSA-team only)
-    if (multinode) {
+    if (multi_lsa) {
         total_size = (total_size + 7) & ~7;
         total_size += num_of_stages_g2s * 2 * sizeof(uint64_t);
     }
@@ -865,25 +865,25 @@ static size_t calculate_combine_smem_layout_size(
     total_size += num_of_stages_g2s * 2 * sizeof(uint64_t);
 
     // lsa_to_rdma_mbarrier_buffer [(LSA teams-1)][chunks] (only if multi-LSA-team)
-    if (multinode) {
+    if (multi_lsa) {
         total_size = (total_size + 7) & ~7;
         total_size += (num_lsa_teams - 1) * max_num_of_chunks_per_rank * sizeof(uint64_t);
     }
 
     // combine_memory_region_info [(LSA teams-1)] (align 8B, only if multi-LSA-team)
-    if (multinode) {
+    if (multi_lsa) {
         total_size = (total_size + 7) & ~7;
         total_size += (num_lsa_teams - 1) * sizeof(combine_memory_region_info_t);
     }
 
     // Flag buffers (no special alignment needed)
-    if (multinode) {
+    if (multi_lsa) {
         total_size += num_of_stages_g2s * sizeof(bool);
     }
     total_size += num_of_stages_g2s * sizeof(bool);
 
     // Streaming overlap fields (multi-LSA-team only, 4B aligned)
-    if (multinode) {
+    if (multi_lsa) {
         total_size = (total_size + 3) & ~3;
         total_size += sizeof(uint32_t); // rdma_streaming_counter
     }
@@ -1365,13 +1365,13 @@ __forceinline__ __device__ void dispatch_s2g_prefetch_s2d_map(
     SMEM_TYPE* smem_buffer_ptr,
     const int pipeline_rank,
     const uint32_t s2d_map_stage,
-    const int node_id,
+    const int lsa_team_id,
     const int chunk_id,
     const int chunk_size,
     const int num_of_tokens_per_rank,
     const int s2d_inner_dim) {
     const int32_t* s2d_base =
-        sparse_to_dense_map + (node_id * num_of_tokens_per_rank + chunk_id * NUM_OF_TOKENS_PER_CHUNK) * s2d_inner_dim;
+        sparse_to_dense_map + (lsa_team_id * num_of_tokens_per_rank + chunk_id * NUM_OF_TOKENS_PER_CHUNK) * s2d_inner_dim;
     void* smem_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_s2d_map_buffer_base(pipeline_rank, s2d_map_stage));
     uint64_t* mbar = smem_buffer_ptr->get_s2d_map_mbar(pipeline_rank, s2d_map_stage);
     // cp.async.bulk needs a 16B-multiple size: round up. Safe because the source S2D buffer
@@ -1526,7 +1526,7 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     size_t token_bytes = HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE);
     size_t prob_bytes = (experts_per_rank * LSA_TEAM_SZ) * sizeof(float);
     constexpr int MAX_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
-    constexpr int NUM_REMOTE_NODES = LSA_TEAMS - 1;
+    constexpr int NUM_REMOTE_LSA = LSA_TEAMS - 1;
 
     // GIN device side setup. Single communicator; ctx_idx spreads QP traffic.
     int global_channel = blockIdx.x * N2N_WARPS + n2n_warp_id;
@@ -1546,9 +1546,9 @@ __forceinline__ __device__ void dispatch_N2N_warp(
             }
         }
 
-        for (int j = 0; j < NUM_REMOTE_NODES; ++j) {
+        for (int j = 0; j < NUM_REMOTE_LSA; ++j) {
             // Skip-self ring over the other LSA teams, load-balanced start at my_lteam.
-            int remote_idx = (j + my_lteam) % NUM_REMOTE_NODES;
+            int remote_idx = (j + my_lteam) % NUM_REMOTE_LSA;
             int remote_lteam_id = remote_idx < my_lteam ? remote_idx : remote_idx + 1;
             int remote_slot = remote_idx < my_lteam ? my_lteam - 1 : my_lteam;
 
@@ -1562,7 +1562,7 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                 int token_idx_in_chunk = i * 32 + ncclCoopWarp().thread_rank();
                 bool need_write =
                     token_idx_in_chunk < csize &&
-                    attn_to_rdma_map[((token_idx_in_chunk + chunk_first_token_idx) * NUM_REMOTE_NODES) + remote_idx];
+                    attn_to_rdma_map[((token_idx_in_chunk + chunk_first_token_idx) * NUM_REMOTE_LSA) + remote_idx];
                 need_write_bitmask[i] = __ballot_sync(~0u, need_write);
             }
 
@@ -1579,7 +1579,7 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                 }
 
                 bool need_write =
-                    attn_to_rdma_map[((chunk_first_token_idx + token_idx_in_chunk) * NUM_REMOTE_NODES) + remote_idx];
+                    attn_to_rdma_map[((chunk_first_token_idx + token_idx_in_chunk) * NUM_REMOTE_LSA) + remote_idx];
                 if (need_write) {
                     int token_idx = chunk_first_token_idx + token_idx_in_chunk;
                     dispatch_n2n_put_token<TOKEN_DATA_TYPE, FORWARD_DISPATCH, HAS_SF, LSA_TEAMS>(
@@ -1679,7 +1679,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
     const int rem_chunk_sz = num_of_tokens_per_rank % TOKENS_PER_CHUNK;
     const int num_of_chunks_per_rank = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHUNK);
     // TOKENS_PER_ROUTING_LOAD must match the producer's pad in scan_kernel.cuh
-    const int routing_map_node_stride = nccl_ep::align(num_of_tokens_per_rank, TOKENS_PER_ROUTING_LOAD);
+    const int routing_map_lsa_stride = nccl_ep::align(num_of_tokens_per_rank, TOKENS_PER_ROUTING_LOAD);
     int in_flight_s2g = 0;
     int stage = 0;
     uint32_t producer_parity = 0;
@@ -1745,11 +1745,11 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                 // Prefetch next (chunk, LSA team) s2d map for THIS pipeline (single TMA load, lane 0 only).
                 if (s2g_lane == 0) {
                     int next_chunk_id;
-                    int next_node_id;
-                    int next_node_iter = j + 1;
-                    if (next_node_iter < LSA_TEAMS) {
+                    int next_lsa_id;
+                    int next_lsa_iter = j + 1;
+                    if (next_lsa_iter < LSA_TEAMS) {
                         next_chunk_id = cidx;
-                        next_node_id = (my_lteam + LSA_TEAMS - next_node_iter) % LSA_TEAMS;
+                        next_lsa_id = (my_lteam + LSA_TEAMS - next_lsa_iter) % LSA_TEAMS;
                     } else {
                         // Find the next chunk this pipeline will process
                         int future_chunk_iter = chunk_iter; // chunk_iter was already incremented for current chunk
@@ -1760,7 +1760,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                                 break;
                             }
                         }
-                        next_node_id = my_lteam;
+                        next_lsa_id = my_lteam;
                     }
 
                     if (next_chunk_id >= 0 && next_chunk_id < num_of_chunks_per_rank) {
@@ -1775,7 +1775,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                             smem_buffer_ptr,
                             pipeline_rank,
                             s2d_stage ^ 1,
-                            next_node_id,
+                            next_lsa_id,
                             next_chunk_id,
                             next_chunk_size,
                             num_of_tokens_per_rank,
@@ -1786,7 +1786,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                 // Walk LSA teams backward from self around the ring (j=0 -> self, j>=1 -> remote)
                 int lteam_id = (my_lteam + LSA_TEAMS - j) % LSA_TEAMS;
                 const routing_loads_t* routing_map_ptr = reinterpret_cast<const routing_loads_t*>(
-                    rdma_to_attn_map + (lteam_id * routing_map_node_stride + cidx * TOKENS_PER_CHUNK));
+                    rdma_to_attn_map + (lteam_id * routing_map_lsa_stride + cidx * TOKENS_PER_CHUNK));
 
                 {
                     uint64_t* wait_mbar = smem_buffer_ptr->get_s2d_map_mbar(pipeline_rank, s2d_stage);
@@ -1922,7 +1922,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
     const int num_of_chunks_per_rank = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHUNK);
     const int max_num_of_chunks_per_rank = nccl_ep::ceil_div(MAX_NUM_OF_TOKENS_PER_RANK, TOKENS_PER_CHUNK);
     // TOKENS_PER_ROUTING_LOAD must match the producer's pad in scan_kernel.cuh
-    const int routing_map_node_stride = nccl_ep::align(num_of_tokens_per_rank, TOKENS_PER_ROUTING_LOAD);
+    const int routing_map_lsa_stride = nccl_ep::align(num_of_tokens_per_rank, TOKENS_PER_ROUTING_LOAD);
     int stage = 0;
     uint32_t consumer_parity = 1;
     int tokens_produced = 0;
@@ -1972,7 +1972,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                     mr_info);
 
                 const routing_loads_t* routing_map_ptr = reinterpret_cast<const routing_loads_t*>(
-                    rdma_to_attn_map + (lteam_id * routing_map_node_stride) + (cidx * TOKENS_PER_CHUNK));
+                    rdma_to_attn_map + (lteam_id * routing_map_lsa_stride) + (cidx * TOKENS_PER_CHUNK));
 
                 int packed_dense_idx = 0;
                 for (int load_idx = 0; load_idx < routing_loads_in_chunk; load_idx++) {
@@ -2039,7 +2039,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
 }
 
 // Shared single-entry G2S issue for both the intra- and cross-LSA-team combine
-// G2S warps. INTER_NODE selects the cross-LSA-team staged-buffer accessors and
+// G2S warps. CROSS_LSA selects the cross-LSA-team staged-buffer accessors and
 // flag buffer; otherwise the intra-LSA ones (both sets live on the same
 // combine smem layout, so one helper covers both tiers).
 //   - derive stage_idx + parity from (global_offset + rank_in_batch)
@@ -2050,7 +2050,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
 //
 // The caller has already computed the token (and prob) source pointers
 // and the `is_last_entry` boolean (only consulted when WRITE_LAST_FLAG).
-template <bool INTER_NODE, bool BACKWARD_COMBINE, bool WRITE_LAST_FLAG, typename SMEM_TYPE>
+template <bool CROSS_LSA, bool BACKWARD_COMBINE, bool WRITE_LAST_FLAG, typename SMEM_TYPE>
 __forceinline__ __device__ void issue_g2s_entry(
     SMEM_TYPE* smem_buffer_ptr,
     int global_offset,
@@ -2069,7 +2069,7 @@ __forceinline__ __device__ void issue_g2s_entry(
     uint64_t* consumer_mbar;
     uint64_t* producer_mbar;
     void* token_dst;
-    if constexpr (INTER_NODE) {
+    if constexpr (CROSS_LSA) {
         consumer_mbar = smem_buffer_ptr->get_cross_lsa_mbarrier_G2S_consumer(stage_idx);
         producer_mbar = smem_buffer_ptr->get_cross_lsa_mbarrier_G2S_producer(stage_idx);
         token_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_cross_lsa_token_G2S(stage_idx));
@@ -2094,7 +2094,7 @@ __forceinline__ __device__ void issue_g2s_entry(
 
     if constexpr (BACKWARD_COMBINE) {
         void* prob_dst;
-        if constexpr (INTER_NODE) {
+        if constexpr (CROSS_LSA) {
             prob_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_cross_lsa_prob_G2S(stage_idx));
         } else {
             prob_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_lsa_prob_G2S(stage_idx));
@@ -2110,7 +2110,7 @@ __forceinline__ __device__ void issue_g2s_entry(
     }
 
     if constexpr (WRITE_LAST_FLAG) {
-        if constexpr (INTER_NODE) {
+        if constexpr (CROSS_LSA) {
             smem_buffer_ptr->cross_lsa_flag_G2S_buffer[stage_idx] = is_last_entry;
         } else {
             smem_buffer_ptr->lsa_flag_G2S_buffer[stage_idx] = is_last_entry;
@@ -2127,7 +2127,7 @@ __forceinline__ __device__ void issue_g2s_entry(
 
 // Warp-cooperative scan of one sparse_to_dense_map row plus its inline
 // broadcast-issue, shared by the intra-LSA G2S warp and the LOCAL tier of
-// the cross-LSA-team G2S warp (the two differ only in INTER_NODE, starting_G2S_index,
+// the cross-LSA-team G2S warp (the two differ only in CROSS_LSA, starting_G2S_index,
 // and which s2d row / FIFO slice they target -- all passed in).
 //
 //  * Process s2d entries in WARP_SIZE steps
@@ -2136,7 +2136,7 @@ __forceinline__ __device__ void issue_g2s_entry(
 //    * NOTE: Using single lane allows to ensure the ordering of TMA loads so
 //      they are aligned with the RED process.
 template <
-    bool INTER_NODE,
+    bool CROSS_LSA,
     bool BACKWARD_COMBINE,
     ncclEpLayout_t kLayout,
     int HIDDEN_DIM,
@@ -2181,7 +2181,7 @@ __forceinline__ __device__ void issue_local_g2s_row(
         if constexpr (BACKWARD_COMBINE) {
             prob_src = remote_expert_input_prob[rank_id] + (slot * (experts_per_rank * ranks_per_lsa_team));
         }
-        issue_g2s_entry<INTER_NODE, BACKWARD_COMBINE, /*WRITE_LAST_FLAG=*/true>(
+        issue_g2s_entry<CROSS_LSA, BACKWARD_COMBINE, /*WRITE_LAST_FLAG=*/true>(
             smem_buffer_ptr,
             global_offset,
             valid_seen,
@@ -2285,7 +2285,7 @@ __forceinline__ __device__ void combine_G2S_intra_warp(
     const int cpr = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHUNK);
     const int total_chunks = (LSA_TEAMS - 1) * cpr;
     // rdma_to_attn_map is padded to 16B (16 bools) per LSA team.
-    const int rdma_map_size_per_node = nccl_ep::align(num_of_tokens_per_rank, 16);
+    const int rdma_per_lsa_sz = nccl_ep::align(num_of_tokens_per_rank, 16);
 
     // Warp-cooperative G2S: lanes scan sparse_to_dense_map in parallel and issue TMA to distinct
     // stages; global_offset counts total stages filled so RED consumes them in lockstep.
@@ -2307,7 +2307,7 @@ __forceinline__ __device__ void combine_G2S_intra_warp(
         const auto meta = combine_chunk_meta<LSA_TEAMS, TOKENS_PER_CHUNK>(cidx, my_lteam, cpr, rem_chunk_sz);
 
         const bool* rdma_row_base =
-            rdma_to_attn_map + (meta.lteam_id * rdma_map_size_per_node + meta.chunk_id * TOKENS_PER_CHUNK);
+            rdma_to_attn_map + (meta.lteam_id * rdma_per_lsa_sz + meta.chunk_id * TOKENS_PER_CHUNK);
 
         // S2D inner dim: mode-dependent, carried by SMEM layout struct.
         const int s2d_entries_g2s = smem_buffer_ptr->s2d_inner_dim;
@@ -2325,7 +2325,7 @@ __forceinline__ __device__ void combine_G2S_intra_warp(
 
             // Warp-cooperative s2d-row scan with inline broadcast-issue; advances global_offset
             // by the number of entries issued. See issue_local_g2s_row.
-            issue_local_g2s_row</*INTER_NODE=*/false, BACKWARD_COMBINE, kLayout, HIDDEN_DIM, kTokenDtype>(
+            issue_local_g2s_row</*CROSS_LSA=*/false, BACKWARD_COMBINE, kLayout, HIDDEN_DIM, kTokenDtype>(
                 smem_buffer_ptr,
                 sparse_to_dense_row,
                 s2d_entries_g2s,
@@ -2599,7 +2599,7 @@ __forceinline__ __device__ void combine_RED_intra_warp(
     const int cpr = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHUNK);
     const int total_chunks = (LSA_TEAMS - 1) * cpr;
     // rdma_to_attn_map is padded to 16B (16 bools) per LSA team.
-    const int rdma_map_size_per_node = nccl_ep::align(num_of_tokens_per_rank, 16);
+    const int rdma_per_lsa_sz = nccl_ep::align(num_of_tokens_per_rank, 16);
 
     // G2S FIFO cursor + producer parity (source tokens); S2G FIFO cursor (reduced dst tokens).
     int token_stage = 0;
@@ -2624,7 +2624,7 @@ __forceinline__ __device__ void combine_RED_intra_warp(
                                                  : ROUTING_LOADS_PER_CHUNK;
 
         const routing_loads_t* rdma_map_base = reinterpret_cast<const routing_loads_t*>(
-            rdma_to_attn_map + (meta.lteam_id * rdma_map_size_per_node + meta.chunk_id * TOKENS_PER_CHUNK));
+            rdma_to_attn_map + (meta.lteam_id * rdma_per_lsa_sz + meta.chunk_id * TOKENS_PER_CHUNK));
 
         // Per-token stride scaled into uint16_t units (HIDDEN_DIM for BF16/FP16, 2*HIDDEN_DIM for FP32).
         uint16_t* red_token_base =
@@ -2906,7 +2906,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     const int cpr = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHUNK);
     const int total_chunks = (LSA_TEAMS - 1) * MAX_NUM_OF_CHUNKS_PER_RANK;
     // rdma_to_attn_map is padded to 16B (16 bools) per LSA team.
-    const int rdma_map_size_per_node = nccl_ep::align(num_of_tokens_per_rank, 16);
+    const int rdma_per_lsa_sz = nccl_ep::align(num_of_tokens_per_rank, 16);
     uint32_t token_consumer_parity = 0;
     uint32_t cumulative_sent = 0; // Cumulative active tokens RDMA-put across all chunks (never reset).
     for (int cidx = blockIdx.x; cidx < total_chunks; cidx += NBLOCKS) {
@@ -2926,7 +2926,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
         ncclGin net(dcomms[comm_idx], ctx_idx);
         ncclTeam rail = ncclTeamRail(dcomms[comm_idx]);
         int rdma_tile_id = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
-        int chunk_base_token_idx = lteam_id * rdma_map_size_per_node + chunk_id * TOKENS_PER_CHUNK;
+        int chunk_base_token_idx = lteam_id * rdma_per_lsa_sz + chunk_id * TOKENS_PER_CHUNK;
         // Residue chunks carry no tokens; real chunks use the scheduled size (tail = remainder).
         const int token_range = is_residue ? 0 : meta.csize;
         constexpr int STREAMING_BATCH = NCCL_EP_HT_COMBINE_RDMA_STREAMING_BATCH;
@@ -3100,7 +3100,7 @@ __forceinline__ __device__ void issue_rdma_g2s_row(
                     lteam_sz);
             // RDMA tier does not set cross_lsa_flag_G2S_buffer; the RED group reads
             // attn_to_rdma_map to demarcate RDMA entries.
-            issue_g2s_entry</*INTER_NODE=*/true, BACKWARD_COMBINE, /*WRITE_LAST_FLAG=*/false>(
+            issue_g2s_entry</*CROSS_LSA=*/true, BACKWARD_COMBINE, /*WRITE_LAST_FLAG=*/false>(
                 smem_buffer_ptr,
                 global_offset,
                 rank_in_batch,
@@ -3179,7 +3179,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     const int max_chunks_per_rank = nccl_ep::ceil_div(MAX_NUM_OF_TOKENS_PER_RANK, TOKENS_PER_CHUNK);
     const int total_chunks = cpr;
     // rdma_to_attn_map is padded to 16B (16 bools) per LSA team.
-    const int rdma_map_size_per_node = nccl_ep::align(num_of_tokens_per_rank, 16);
+    const int rdma_per_lsa_sz = nccl_ep::align(num_of_tokens_per_rank, 16);
     // This warp's G2S FIFO sub-range.
     const int starting_G2S_index = NUM_OF_STAGES_G2S_PER_WARP * G2S_GROUP::warp_rank();
     const int ending_G2S_index = NUM_OF_STAGES_G2S_PER_WARP * (G2S_GROUP::warp_rank() + 1);
@@ -3212,7 +3212,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
             is_tail ? nccl_ep::ceil_div(rem_chunk_sz, NUM_OF_TOKENS_PER_GROUP) : NUM_OF_TOKEN_GROUPS_PER_CHUNK;
 
         const bool* rdma_to_attn_map_base =
-            rdma_to_attn_map + (my_lteam * rdma_map_size_per_node + cidx * TOKENS_PER_CHUNK);
+            rdma_to_attn_map + (my_lteam * rdma_per_lsa_sz + cidx * TOKENS_PER_CHUNK);
         const int s2d_entries = smem_buffer_ptr->s2d_inner_dim;
         const int32_t* sparse_to_dense_map_base =
             sparse_to_dense_map + (my_lteam * num_of_tokens_per_rank + cidx * TOKENS_PER_CHUNK) * s2d_entries;
@@ -3256,14 +3256,14 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
                 }
 
                 // Uniform across the warp. No early continue: the RDMA tier still runs when false.
-                bool token_needed_by_this_node = rdma_to_attn_map_base[cur_tokid];
+                bool reqired_by_local_lsa = rdma_to_attn_map_base[cur_tokid];
 
                 // LOCAL tier: warp-cooperative s2d-row scan with inline broadcast-issue. Advances
                 // global_offset by the entries issued, keeping later reads consistent on every lane.
-                if (token_needed_by_this_node) {
+                if (reqired_by_local_lsa) {
                     const int32_t* sparse_to_dense_row =
                         sparse_to_dense_map_base + (group_idx * NUM_OF_TOKENS_PER_GROUP + token_in_group) * s2d_entries;
-                    issue_local_g2s_row</*INTER_NODE=*/true, BACKWARD_COMBINE, kLayout, HIDDEN_DIM, kTokenDtype>(
+                    issue_local_g2s_row</*CROSS_LSA=*/true, BACKWARD_COMBINE, kLayout, HIDDEN_DIM, kTokenDtype>(
                         smem_buffer_ptr,
                         sparse_to_dense_row,
                         s2d_entries,
@@ -3582,7 +3582,7 @@ __forceinline__ __device__ void combine_RED_inter_warp(
     const int cpr = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHUNK);
     const int total_chunks = cpr;
     // rdma_to_attn_map is padded to 16B (16 bools) per LSA team.
-    const int rdma_map_size_per_node = nccl_ep::align(num_of_tokens_per_rank, 16);
+    const int rdma_per_lsa_sz = nccl_ep::align(num_of_tokens_per_rank, 16);
     // Dtype-aware per-token output stride in uint16_t units.
     const size_t out_token_stride_u16 = (size_t)HIDDEN_DIM * nccl_ep::size_u8<kTokenDtype>() / sizeof(uint16_t);
 
@@ -3605,7 +3605,7 @@ __forceinline__ __device__ void combine_RED_inter_warp(
             is_tail ? nccl_ep::ceil_div(rem_chunk_sz, NUM_OF_TOKENS_PER_GROUP) : NUM_OF_TOKEN_GROUPS_PER_CHUNK;
 
         const bool* rdma_to_attn_map_base =
-            rdma_to_attn_map + (my_lteam * rdma_map_size_per_node + cidx * TOKENS_PER_CHUNK);
+            rdma_to_attn_map + (my_lteam * rdma_per_lsa_sz + cidx * TOKENS_PER_CHUNK);
         const bool* attn_to_rdma_map_base = nullptr;
         if constexpr (LSA_TEAMS > 1) {
             attn_to_rdma_map_base = attn_to_rdma_map + (cidx * TOKENS_PER_CHUNK) * (LSA_TEAMS - 1);
@@ -3920,7 +3920,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     d_model.max_num_of_tokens_per_rank = MAX_NUM_OF_TOKENS_PER_RANK;
     d_model.num_of_experts_per_rank = param.experts_per_rank;
     d_model.ranks_per_lsa_team = param.ranks_per_lsa_team;
-    d_model.num_of_nodes = LSA_TEAMS;
+    d_model.num_lsa_teams = LSA_TEAMS;
     create_dispatch_smem_layout<kLayout, sizeof(TOKEN_DATA_TYPE)>(smem_layout, smem_bytes, d_config, d_model);
     cur_smem_t* smem_buffer_ptr = &smem_layout;
 
@@ -4189,7 +4189,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     c_model.max_num_of_tokens_per_rank = MAX_NUM_OF_TOKENS_PER_RANK;
     c_model.num_of_experts_per_rank = param.experts_per_rank;
     c_model.ranks_per_lsa_team = param.ranks_per_lsa_team;
-    c_model.num_of_nodes = LSA_TEAMS;
+    c_model.num_lsa_teams = LSA_TEAMS;
     // Layout derives the element width from kTokenDtype (FP32 doubles the per-stage
     // token-buffer bytes vs BF16/FP16).
     create_combine_smem_layout<kTokenDtype>(

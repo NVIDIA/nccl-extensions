@@ -91,13 +91,13 @@ __forceinline__ __device__ uint64_t ncclGetP2pPtr(
         return 0;
     }
 
-    // P2P/NVLink only works between ranks on the same node (LSA team)
+    // P2P/NVLink only works between ranks on the same LSA team
     // Use NCCL team APIs to check if dstRank is in the same LSA team.
     // Always use commId=0: single devComm with all GIN contexts (1-comm N-context design).
     constexpr int commId = 0;
     ncclTeam lsa = ncclTeamLsa(devComms[commId]);
     ncclTeam world = ncclTeamWorld(devComms[commId]);
-    if (!ncclTeamRankIsMember(lsa, world, dstRank)) return 0; // Different nodes (not in same LSA team), must use RDMA
+    if (!ncclTeamRankIsMember(lsa, world, dstRank)) return 0; // Different LSA teams, must use RDMA
 
     auto const p2pPtr = reinterpret_cast<uint64_t>(ncclGetPeerPointer(ncclWindows[commId], offset, dstRank));
 

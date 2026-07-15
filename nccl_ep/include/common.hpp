@@ -92,7 +92,7 @@ namespace nccl_ep {
 
 constexpr int kDsFp8E3M4ElementsPerScale = 128;
 
-// Internode low-latency kernels
+// low-latency kernels
 namespace ll {
 
 // Helper function for alignment (host/device compatible)

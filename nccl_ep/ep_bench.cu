@@ -861,7 +861,7 @@ static const int RANK_OFFSET = 128;
 // Matches DeepEP's approach: last 128 columns store token index
 static const int TOKEN_ID_COLS = 128;
 
-static const unsigned DS_FP8E3M4_ELEMENTS_PER_SCALE = 128;
+static constexpr unsigned DS_FP8E3M4_ELEMENTS_PER_SCALE = 128;
 static const unsigned SCALES_FORWARD_BENCHMARK_SCALES_PER_TOKEN = 4;
 
 // --mxfp8 overrides the SCALES_FORWARD test shape to MXFP8: scale block 32 (numScales =
@@ -921,6 +921,7 @@ struct DsFp8E3M4IdentityPattern {
     static constexpr unsigned kBitsPerSymbol = 2;
     static constexpr unsigned kSentinelSymbols = 32 / kBitsPerSymbol;
     static constexpr unsigned kAmaxAnchorElement = kSentinelSymbols;
+    static constexpr unsigned kPayloadPatternElements = kAmaxAnchorElement + 1;
     static constexpr unsigned kIdentityScaleCount = kIdentityBytes;
     static constexpr float kFp8Max = 448.0f;
     static constexpr float kPayloadTolerance = 1e-3f;
@@ -932,12 +933,23 @@ struct DsFp8E3M4IdentityPattern {
     static constexpr float kFirstAmaxStep = 512.0f;
     static constexpr float kSecondAmaxBase = 131072.0f;
     static constexpr float kSecondAmaxStep = 1024.0f;
+    // Whiten the packed source identity before turning it into scale bytes and
+    // payload symbols. The golden-ratio pattern has four varied, non-zero
+    // bytes (b9 79 37 9e in wire order); XOR preserves one-to-one identity.
+    static constexpr uint32_t kIdentityXorPattern = 0x9e3779b9u;
 
-    static uint32_t identity(int rank, unsigned int token) {
+    static constexpr uint32_t packIdentity(int rank, unsigned int token) {
         return static_cast<uint32_t>(rank) | (static_cast<uint32_t>(token) << 16);
     }
-    static uint8_t identityByte(int rank, unsigned int token, unsigned int byte_index) {
-        return static_cast<uint8_t>(identity(rank, token) >> (8 * (byte_index % kIdentityBytes)));
+    static constexpr uint32_t encodeIdentity(int rank, unsigned int token) {
+        return packIdentity(rank, token) ^ kIdentityXorPattern;
+    }
+    static constexpr uint32_t decodeIdentity(uint32_t encoded_identity) {
+        return encoded_identity ^ kIdentityXorPattern;
+    }
+    static uint8_t encodedIdentityByte(int rank, unsigned int token, unsigned int byte_index) {
+        return static_cast<uint8_t>(
+            encodeIdentity(rank, token) >> (8 * (byte_index % kIdentityBytes)));
     }
     static float amaxForByte(uint8_t byte) {
         return byte < kFirstAmaxBandBytes
@@ -945,7 +957,7 @@ struct DsFp8E3M4IdentityPattern {
             : kSecondAmaxBase + kSecondAmaxStep * (byte - kFirstAmaxBandBytes);
     }
     static float amax(int rank, unsigned int token, unsigned int block_index) {
-        return amaxForByte(identityByte(rank, token, block_index));
+        return amaxForByte(encodedIdentityByte(rank, token, block_index));
     }
     static float scaleInv(int rank, unsigned int token, unsigned int block_index) {
         return amax(rank, token, block_index) / kFp8Max;
@@ -958,7 +970,21 @@ struct DsFp8E3M4IdentityPattern {
         // Pick exactly representable normalized E4M3 values: 0, 112, 224, 448.
         return symbol == 3 ? 1.0f : static_cast<float>(symbol) / 4.0f;
     }
+    static float payloadInputFactor(uint32_t encoded_identity, unsigned int element) {
+        const unsigned int pattern_element = element % kPayloadPatternElements;
+        return pattern_element == kAmaxAnchorElement
+            ? 1.0f
+            : symbolInputFactor(symbol(encoded_identity, pattern_element));
+    }
 };
+
+static_assert(
+    DsFp8E3M4IdentityPattern::decodeIdentity(
+        DsFp8E3M4IdentityPattern::encodeIdentity(0x1234, 0xabcdu)) == 0xabcd1234u,
+    "DS_FP8E3M4 identity whitening must round-trip");
+static_assert(
+    DS_FP8E3M4_ELEMENTS_PER_SCALE > DsFp8E3M4IdentityPattern::kPayloadPatternElements,
+    "DS_FP8E3M4 blocks must be longer than one complete identity payload pattern");
 
 // Combine-validation thresholds for the cosine-similarity discrepancy metric.
 // HT is looser to absorb reduction-order noise at high topk.
@@ -1026,32 +1052,22 @@ void initializeValidationData(
             delete[] scale_data_host;
         }
     } else if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
-        // Every DS block retains the normal rank/token pattern except for 17
-        // sentinel values. The first 16 encode rank16/token16 in 2-bit FP8
-        // symbols; element 16 anchors amax for the generated scale.
+        // Fill every DS block by repeating a 17-element identity pattern. Its
+        // first 16 values encode the XOR-whitened rank16/token16 identity in
+        // 2-bit FP8 symbols, and the last value anchors amax for the scale.
+        // The final repetition is truncated at the 128-element block boundary.
         size_t token_size = num_tokens * hidden;
         size_t eb = tokenElemBytes(token_dtype);
         char* token_data_host = new char[token_size * eb];
         for (unsigned int t = 0; t < num_tokens; ++t) {
+            const uint32_t encoded_identity =
+                DsFp8E3M4IdentityPattern::encodeIdentity(myRank, t);
             for (unsigned int h = 0; h < hidden; ++h) {
                 const unsigned int block = h / DS_FP8E3M4_ELEMENTS_PER_SCALE;
                 const unsigned int in_block = h % DS_FP8E3M4_ELEMENTS_PER_SCALE;
                 const float amax = DsFp8E3M4IdentityPattern::amax(myRank, t, block);
-                float val;
-                if (in_block < DsFp8E3M4IdentityPattern::kSentinelSymbols) {
-                    val = amax * DsFp8E3M4IdentityPattern::symbolInputFactor(
-                        DsFp8E3M4IdentityPattern::symbol(
-                            DsFp8E3M4IdentityPattern::identity(myRank, t), in_block));
-                } else if (in_block == DsFp8E3M4IdentityPattern::kAmaxAnchorElement) {
-                    val = amax;
-                } else {
-                    float rank_value = static_cast<float>(myRank - RANK_OFFSET);
-                    float token_hi_f = static_cast<float>(t / 256);
-                    float token_lo_f = static_cast<float>(t % 256);
-                    if (h == hidden - TOKEN_ID_COLS) val = token_hi_f;
-                    else if (h > hidden - TOKEN_ID_COLS) val = token_lo_f;
-                    else val = rank_value;
-                }
+                const float val = amax * DsFp8E3M4IdentityPattern::payloadInputFactor(
+                    encoded_identity, in_block);
                 floatToTokenElem(token_data_host, t * hidden + h, val, token_dtype);
             }
         }
@@ -1535,20 +1551,45 @@ static bool validateDsFp8E3M4PayloadIdentity(
     const uint8_t* block, float scale_inv, int source_rank, unsigned int source_token,
     unsigned int block_index) {
     const float amax = DsFp8E3M4IdentityPattern::amax(source_rank, source_token, block_index);
-    const uint32_t identity = DsFp8E3M4IdentityPattern::identity(source_rank, source_token);
-    for (unsigned int symbol = 0; symbol < DsFp8E3M4IdentityPattern::kSentinelSymbols; ++symbol) {
+    const uint32_t encoded_identity =
+        DsFp8E3M4IdentityPattern::encodeIdentity(source_rank, source_token);
+    bool valid = true;
+    for (unsigned int element = 0; element < DS_FP8E3M4_ELEMENTS_PER_SCALE; ++element) {
+        const float input_factor =
+            DsFp8E3M4IdentityPattern::payloadInputFactor(encoded_identity, element);
         float fp8_value;
-        if (!dsFp8E3M4DecodeFinite(block[symbol], &fp8_value)) return false;
-        const float expected = amax * DsFp8E3M4IdentityPattern::symbolInputFactor(
-            DsFp8E3M4IdentityPattern::symbol(identity, symbol));
-        if (std::abs(fp8_value * scale_inv - expected) >
-            amax * DsFp8E3M4IdentityPattern::kPayloadTolerance) return false;
+        // The four expected values are exactly representable and have unique
+        // positive E4M3 encodings. Reject the sign bit to distinguish -0 from
+        // +0, then exact value comparison validates the complete payload byte.
+        bool element_valid = !(block[element] & 0x80u) &&
+            dsFp8E3M4DecodeFinite(block[element], &fp8_value);
+        if (element_valid) {
+            element_valid = fp8_value == DsFp8E3M4IdentityPattern::kFp8Max * input_factor &&
+                std::abs(fp8_value * scale_inv - amax * input_factor) <=
+                    amax * DsFp8E3M4IdentityPattern::kPayloadTolerance;
+        }
+        valid &= element_valid;
     }
-    float anchor;
-    return dsFp8E3M4DecodeFinite(block[DsFp8E3M4IdentityPattern::kAmaxAnchorElement], &anchor) &&
-        std::abs(anchor * scale_inv - amax) <= amax * DsFp8E3M4IdentityPattern::kPayloadTolerance;
+    return valid;
 }
 
+// DS_FP8E3M4 source-validation strategy:
+//
+// Pack rank16/token16 into a 32-bit identity and XOR-whiten it. Each 128-element
+// input block repeats a 17-element pattern. The first 16 elements encode the
+// complete identity as sixteen 2-bit symbols; sixteen elements are needed
+// because each quantized FP8 payload value carries only one 2-bit symbol. The
+// 17th element is an amax anchor, and the final repetition may be partial.
+//
+// Block i selects encoded identity byte (i % 4). amaxForByte() maps that byte
+// to a unique BF16-exact amax, which the quantizer reports directly through
+// scaleInv = amax / 448. Thus four consecutive scale blocks recover all four
+// identity bytes. The FP8 payload independently repeats the complete identity
+// in every block, while each 17th anchor binds that payload block to its scale.
+//
+// Validation decodes the first four scales into rank/token, verifies every
+// scale and all 128 payload bytes against that same identity, then checks the
+// decoded source against the locally generated expected (rank, token) routing.
 static ValidationResult validateDispatchOutputLLExpertMajDsFp8E3M4(
     const BenchmarkAllocState&     alloc,
     const ncclEpDispatchOutputs_t& dispatch_outputs,
@@ -1624,8 +1665,15 @@ static ValidationResult validateDispatchOutputLLExpertMajDsFp8E3M4(
                           myRank, expert, slot, scale_row[0], scale_row[1], scale_row[2], scale_row[3]);
                 continue;
             }
-            const int source_rank = identity_bytes[0] | (identity_bytes[1] << 8);
-            const int source_token = identity_bytes[2] | (identity_bytes[3] << 8);
+            const uint32_t encoded_identity =
+                static_cast<uint32_t>(identity_bytes[0]) |
+                (static_cast<uint32_t>(identity_bytes[1]) << 8) |
+                (static_cast<uint32_t>(identity_bytes[2]) << 16) |
+                (static_cast<uint32_t>(identity_bytes[3]) << 24);
+            const uint32_t source_identity =
+                DsFp8E3M4IdentityPattern::decodeIdentity(encoded_identity);
+            const int source_rank = static_cast<int>(source_identity & 0xffffu);
+            const int source_token = static_cast<int>(source_identity >> 16);
             for (unsigned int scale = 0; scale < num_scales; ++scale) {
                 const float expected_scale =
                     dsFp8E3M4ScaleValue(source_rank, source_token, scale, num_scales);
@@ -4600,15 +4648,35 @@ int main(int argc, char* argv[]) {
         fflush(stdout);
     }
 
-    // The DS benchmark pattern stores rank16/token16 in quantized payload bits.
-    if (validate_data && dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4 &&
-        (nRanks > 65536 || *std::max_element(num_tokens_per_rank.begin(), num_tokens_per_rank.end()) > 65536)) {
-        if (myRank == 0) {
-            fprintf(stderr,
-                    "DS_FP8E3M4 benchmark identity pattern supports at most 65536 ranks and tokens per rank\n");
+    // Check the benchmark identity pattern independently of the recipe's
+    // current shape restrictions, so future recipe changes cannot make the
+    // validator read an incomplete identity.
+    if (validate_data && dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
+        const unsigned int num_scale_blocks = hidden / DS_FP8E3M4_ELEMENTS_PER_SCALE;
+        if (hidden % DS_FP8E3M4_ELEMENTS_PER_SCALE != 0 ||
+            num_scale_blocks < DsFp8E3M4IdentityPattern::kIdentityScaleCount) {
+            if (myRank == 0) {
+                fprintf(stderr,
+                        "DS_FP8E3M4 benchmark identity validation requires complete %u-element blocks "
+                        "and at least %u blocks per token (got hidden=%u, blocks=%u)\n",
+                        DS_FP8E3M4_ELEMENTS_PER_SCALE,
+                        DsFp8E3M4IdentityPattern::kIdentityScaleCount,
+                        hidden,
+                        num_scale_blocks);
+            }
+            MPI_Finalize();
+            return 1;
         }
-        MPI_Finalize();
-        return 1;
+        if (nRanks > 65536 ||
+            *std::max_element(num_tokens_per_rank.begin(), num_tokens_per_rank.end()) > 65536) {
+            if (myRank == 0) {
+                fprintf(stderr,
+                        "DS_FP8E3M4 benchmark identity pattern supports at most 65536 ranks "
+                        "and tokens per rank\n");
+            }
+            MPI_Finalize();
+            return 1;
+        }
     }
 
     // Initialize validation data if enabled (fills tensors with rank-based patterns)

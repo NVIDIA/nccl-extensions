@@ -379,13 +379,17 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
 ## Algorithm-related configurations
 
 **High Throughput (HT)**:
-- Uses flat layout (`NCCL_EP_LAYOUT_FLAT`).
-- Dispatch output tokens are a contiguous flat sequence: `[N(r) x hidden]` where `N(r)` is the total number of tokens targeting this rank.
-  - Static allocation: `N(r) = num_ranks * max_dispatch_tokens_per_rank`.
-  - Dynamic allocation (`max_dispatch_tokens_per_rank = NCCL_EP_AUTO`): `N(r)` is the actual received count, written by the metadata kernel into the optional `ncclEpLayoutInfo_t.recv_total_counter` scalar tensor.
-- `dispatch_outputs.topk_idx` and `dispatch_outputs.topk_weights` carry per-slot routing metadata alongside the received tokens.
-- The caller uses `topk_idx` to route each slot to the correct local expert(s), applies the weighted reduction using `topk_weights`, and passes the pre-reduced `[N(r) x hidden]` tensor as `combine_inputs.tokens` to `ncclEpCombine`.
-- Supports dynamic `max_dispatch_tokens_per_rank` (set to `NCCL_EP_AUTO`)
+- Supports `NCCL_EP_LAYOUT_FLAT` and `NCCL_EP_LAYOUT_EXPERT_MAJOR` layouts.
+
+- **`NCCL_EP_LAYOUT_FLAT`**: dispatch output is a contiguous 2D sequence `[N(r) x hidden]` where `N(r)` is the total number of tokens targeting this rank.
+  - The output buffer must be pre-allocated with capacity for `max_recv_tokens_per_rank` tokens.
+  - The actual N(r) for a given dispatch is written by the metadata kernel into `ncclEpLayoutInfo_t.recv_total_counter` when that scalar tensor is provided.
+  - `dispatch_outputs.topk_idx` and `dispatch_outputs.topk_weights` carry per-slot routing metadata alongside the received tokens.
+  - The caller uses `topk_idx` to route each slot to the correct local expert(s), applies the weighted reduction using `topk_weights`, and passes the pre-reduced `[N(r) x hidden]` tensor as `combine_inputs.tokens` to `ncclEpCombine`.
+
+- **`NCCL_EP_LAYOUT_EXPERT_MAJOR`**: dispatch output is grouped by local expert. Each expert's slice is optionally padded to a multiple of `dispatch_output_per_expert_alignment` (set via `ncclEpHandleConfig_t`).
+  - Tokens arrive pre-sorted by expert; the caller feeds each expert's slice directly without needing `topk_idx` for routing.
+  - Set `ncclEpLayoutInfo_t.expert_counters` (1D tensor, length = `num_local_experts`) to receive per-expert received token counts.
 
 **Low Latency (LL)**:
 - Supports `NCCL_EP_LAYOUT_EXPERT_MAJOR` and `NCCL_EP_LAYOUT_RANK_MAJOR` layouts.

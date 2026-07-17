@@ -1,12 +1,11 @@
 # Root pipeline for the standalone NCCL Extensions repository.
-# Build NCCL once, then run the extension child pipelines.
+# Build NCCL once, then run the NCCL EP child pipeline.
 
 include:
   - local: .gitlab/ci/nccl-build.yml
 
 stages:
   - build_nccl
-  - build_extensions
   - test
 
 workflow:
@@ -20,21 +19,6 @@ workflow:
 build:nccl:
   extends: .build-nccl
   stage: build_nccl
-
-nccl_m2n:
-  stage: build_extensions
-  needs:
-    - job: build:nccl
-      artifacts: false
-  variables:
-    PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
-  trigger:
-    include:
-      - local: nccl_m2n/.gitlab-ci.yml
-    strategy: depend
-    forward:
-      yaml_variables: true
-      pipeline_variables: true
 
 nccl_ep:
   stage: test

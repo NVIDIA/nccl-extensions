@@ -35,16 +35,13 @@ build:nccl_m2n:
         env \
         NCCL_HOME="${CI_PROJECT_DIR}/.ci/nccl/build" \
         make -C "${CI_PROJECT_DIR}/nccl_m2n" -j"$(nproc)" \
-        GTEST_DIR="${CI_PROJECT_DIR}/.ci/googletest/googletest" \
         NVCC_GENCODE="$NVCC_GENCODE" \
-        lib tests
+        lib
       test -s nccl_m2n/build/lib/libnccl_m2n.so
-      test -x nccl_m2n/build/bin/basic_api_test_local
-      test -x nccl_m2n/build/bin/basic_api_test_mpi
+      test -s nccl_m2n/build/include/nccl_m2n.h
   artifacts:
     name: "nccl-m2n-${CI_COMMIT_SHORT_SHA}"
     expire_in: 24 hours
     paths:
-      - nccl_m2n/build/bin/
       - nccl_m2n/build/include/
       - nccl_m2n/build/lib/

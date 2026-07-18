@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <vector>
 
 namespace nccl_ep {
@@ -734,8 +735,8 @@ int get_device_max_dynamic_smem() {
     return max_smem;
 }
 
-ncclResult_t check_dispatch_smem_limit(const ::ht_ep::dispatch_config_t& config, size_t smem_size) {
-    const int max_smem = get_device_max_dynamic_smem();
+ncclResult_t
+check_dispatch_smem_limit(const ::ht_ep::dispatch_config_t& config, size_t smem_size, int max_smem) {
     if (smem_size <= static_cast<size_t>(max_smem)) return ncclSuccess;
 
     std::fprintf(
@@ -749,8 +750,8 @@ ncclResult_t check_dispatch_smem_limit(const ::ht_ep::dispatch_config_t& config,
     return ncclInvalidArgument;
 }
 
-ncclResult_t check_combine_smem_limit(const ::ht_ep::combine_config_t& config, size_t smem_size) {
-    const int max_smem = get_device_max_dynamic_smem();
+ncclResult_t
+check_combine_smem_limit(const ::ht_ep::combine_config_t& config, size_t smem_size, int max_smem) {
     if (smem_size <= static_cast<size_t>(max_smem)) return ncclSuccess;
 
     std::fprintf(
@@ -768,6 +769,30 @@ ncclResult_t check_combine_smem_limit(const ::ht_ep::combine_config_t& config, s
 static int env_or_default(const ncclEpEnvVar* var, int default_value) {
     if (var == nullptr || !var->is_set) return default_value;
     return var->value.ul <= static_cast<unsigned long>(INT_MAX) ? static_cast<int>(var->value.ul) : 0;
+}
+
+template <typename CalculateSmem>
+static size_t fit_stages_to_smem(
+    int* stages,
+    int min_stages,
+    int stages_per_step,
+    size_t max_smem,
+    CalculateSmem calculate_smem) {
+    const int requested_steps = *stages / stages_per_step;
+    int low = min_stages / stages_per_step;
+    int high = requested_steps;
+
+    *stages = min_stages;
+    if (size_t smem = calculate_smem(); smem > max_smem) return smem;
+
+    while (low < high) {
+        const int mid = low + (high - low + 1) / 2;
+        *stages = mid * stages_per_step;
+        if (calculate_smem() <= max_smem) low = mid;
+        else high = mid - 1;
+    }
+    *stages = low * stages_per_step;
+    return calculate_smem();
 }
 
 // ============================================================================
@@ -921,6 +946,18 @@ ncclResult_t dispatch_impl(
             return ncclInvalidArgument;
         }
         d_config.stages_per_pipeline = d_config.num_of_stages / d_config.num_pipelines;
+        const int fixed_warps =
+            (num_lsa_teams != 1 ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0) +
+            (params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? 1 : 0);
+        const int max_pipelines = (32 - fixed_warps) / 2;
+        if (d_config.num_pipelines > max_pipelines) {
+            std::fprintf(
+                stderr,
+                "[nccl_ep] dispatch pipelines=%d exceeds block limit; maximum=%d.\n",
+                d_config.num_pipelines,
+                max_pipelines);
+            return ncclInvalidArgument;
+        }
 
         // Compute dynamic SMEM size at host (was done inside ht_ep::dispatch).
         d_model.hidden_dim = kp.hidden_dim;
@@ -929,28 +966,63 @@ ncclResult_t dispatch_impl(
         d_model.ranks_per_lsa_team = kp.ranks_per_lsa_team;
         d_model.num_lsa_teams = num_lsa_teams;
 
-        const size_t smem_size =
-            ::ht_ep::calculate_dispatch_smem_layout_size(params.layout, kernel_spec.payload_bytes, d_config, d_model);
+        auto dispatch_smem = [&]() {
+            return ::ht_ep::calculate_dispatch_smem_layout_size(
+                params.layout, kernel_spec.payload_bytes, d_config, d_model);
+        };
+        size_t smem_size = dispatch_smem();
         if (smem_size == 0) {
             std::fprintf(stderr, "NCCL EP warning: unsupported HT dispatch token size %u\n",
                          kernel_spec.payload_bytes);
             return ncclInvalidArgument;
         }
-        if (ncclResult_t r = check_dispatch_smem_limit(d_config, smem_size); r != ncclSuccess) {
+        const int requested_stages = d_config.num_of_stages;
+        const int requested_pipelines = d_config.num_pipelines;
+        const size_t requested_smem = smem_size;
+        const int max_smem = get_device_max_dynamic_smem();
+        while (smem_size > static_cast<size_t>(max_smem)) {
+            const int min_stages = (d_config.num_of_in_flight_s2g + 1) * d_config.num_pipelines;
+            smem_size = fit_stages_to_smem(
+                &d_config.num_of_stages,
+                min_stages,
+                d_config.num_pipelines,
+                static_cast<size_t>(max_smem),
+                dispatch_smem);
+            if (smem_size <= static_cast<size_t>(max_smem)) break;
+
+            int next_pipelines = d_config.num_pipelines - 1;
+            while (next_pipelines > 0 &&
+                   (d_config.num_of_stages % next_pipelines != 0 ||
+                    d_config.num_of_stages / next_pipelines <= d_config.num_of_in_flight_s2g)) {
+                --next_pipelines;
+            }
+            if (next_pipelines == 0) break;
+            d_config.num_pipelines = next_pipelines;
+            d_config.stages_per_pipeline = d_config.num_of_stages / d_config.num_pipelines;
+        }
+        if (ncclResult_t r = check_dispatch_smem_limit(d_config, smem_size, max_smem); r != ncclSuccess) {
             std::fprintf(stderr, "NCCL EP warning: dispatch shared-memory requirement %zu is unsupported\n",
                          smem_size);
             return r;
         }
-
-        const int dispatch_block_dim =
-            jit::compute_dispatch_warp_layout(num_lsa_teams, params.layout, d_config.num_pipelines).block_dim;
-        if (dispatch_block_dim > 1024) {
-            std::fprintf(
-                stderr,
-                "[nccl_ep] dispatch block_dim=%d exceeds 1024 threads (pipelines=%d); reduce pipelines.\n",
-                dispatch_block_dim,
-                d_config.num_pipelines);
-            return ncclInvalidArgument;
+        if ((d_config.num_of_stages != requested_stages || d_config.num_pipelines != requested_pipelines) &&
+            env != nullptr && env->rank == 0) {
+            std::ostringstream key;
+            key << "ht_dispatch_smem_autofit:" << requested_stages << ':' << requested_pipelines << ':'
+                << d_config.num_of_stages << ':' << d_config.num_pipelines << ':' << requested_smem << ':'
+                << smem_size;
+            if (::nccl_ep::jit::announce_once(key.str())) {
+                std::fprintf(
+                    stderr,
+                    "[nccl_ep] dispatch SMEM auto-fit: stages %d->%d, pipelines %d->%d, smem %zu->%zu, limit %d\n",
+                    requested_stages,
+                    d_config.num_of_stages,
+                    requested_pipelines,
+                    d_config.num_pipelines,
+                    requested_smem,
+                    smem_size,
+                    max_smem);
+            }
         }
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
@@ -1156,19 +1228,71 @@ ncclResult_t combine_impl(
     // Pick the layout-size instantiation by wire dtype; the width is derived inside the
     // template. Layout size depends only on element width, so FP16 and BF16 (both 2 B)
     // share the BF16 instantiation; only FP32 (4 B) is distinct.
-    const size_t smem_size =
-        (params.token_dtype == ncclFloat32) ?
-            ::ht_ep::calculate_combine_smem_layout_size<ncclFloat32>(
-                max_dispatch_tokens_per_rank,
-                num_lsa_teams,
-                c_config,
-                model) :
-            ::ht_ep::calculate_combine_smem_layout_size<ncclBfloat16>(
-                max_dispatch_tokens_per_rank,
-                num_lsa_teams,
-                c_config,
-                model);
-    if (ncclResult_t r = check_combine_smem_limit(c_config, smem_size); r != ncclSuccess) return r;
+    auto combine_smem = [&]() {
+        return (params.token_dtype == ncclFloat32) ?
+                   ::ht_ep::calculate_combine_smem_layout_size<ncclFloat32>(
+                       max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model) :
+                   ::ht_ep::calculate_combine_smem_layout_size<ncclBfloat16>(
+                       max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model);
+    };
+    size_t smem_size = combine_smem();
+    const int requested_g2s_stages = c_config.num_of_stages_g2s;
+    const int requested_s2g_stages = c_config.num_of_stages_s2g;
+    const int requested_pipelines = c_config.num_pipelines;
+    const size_t requested_smem = smem_size;
+    const int max_smem = get_device_max_dynamic_smem();
+    while (smem_size > static_cast<size_t>(max_smem)) {
+        smem_size = fit_stages_to_smem(
+            &c_config.num_of_stages_g2s,
+            c_config.num_pipelines,
+            c_config.num_pipelines,
+            static_cast<size_t>(max_smem),
+            combine_smem);
+        if (smem_size <= static_cast<size_t>(max_smem)) break;
+
+        smem_size = fit_stages_to_smem(
+            &c_config.num_of_stages_s2g,
+            c_config.num_pipelines,
+            c_config.num_pipelines,
+            static_cast<size_t>(max_smem),
+            combine_smem);
+        if (smem_size <= static_cast<size_t>(max_smem)) break;
+
+        int next_pipelines = c_config.num_pipelines - 1;
+        while (next_pipelines > 0 &&
+               (NCCL_EP_HT_COMBINE_RED_WARPS % next_pipelines != 0 ||
+                c_config.num_of_stages_g2s % next_pipelines != 0 ||
+                c_config.num_of_stages_s2g % next_pipelines != 0)) {
+            --next_pipelines;
+        }
+        if (next_pipelines == 0) break;
+        c_config.num_pipelines = next_pipelines;
+    }
+    if (ncclResult_t r = check_combine_smem_limit(c_config, smem_size, max_smem); r != ncclSuccess) return r;
+    if ((c_config.num_of_stages_g2s != requested_g2s_stages ||
+         c_config.num_of_stages_s2g != requested_s2g_stages ||
+         c_config.num_pipelines != requested_pipelines) &&
+        env != nullptr && env->rank == 0) {
+        std::ostringstream key;
+        key << "ht_combine_smem_autofit:" << requested_g2s_stages << ':' << requested_s2g_stages << ':'
+            << requested_pipelines << ':' << c_config.num_of_stages_g2s << ':' << c_config.num_of_stages_s2g << ':'
+            << c_config.num_pipelines << ':' << requested_smem << ':' << smem_size;
+        if (::nccl_ep::jit::announce_once(key.str())) {
+            std::fprintf(
+                stderr,
+                "[nccl_ep] combine SMEM auto-fit: g2s stages %d->%d, s2g stages %d->%d, "
+                "pipelines %d->%d, smem %zu->%zu, limit %d\n",
+                requested_g2s_stages,
+                c_config.num_of_stages_g2s,
+                requested_s2g_stages,
+                c_config.num_of_stages_s2g,
+                requested_pipelines,
+                c_config.num_pipelines,
+                requested_smem,
+                smem_size,
+                max_smem);
+        }
+    }
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     const jit::combine_warp_layout_t combine_layout =

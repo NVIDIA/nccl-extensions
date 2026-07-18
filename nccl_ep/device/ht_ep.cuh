@@ -552,7 +552,7 @@ static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& confi
     // Token buffer (aligned to 128B for TMA) -- total stages unchanged
     int token_buffer_stage_stride = model.hidden_dim * kTokenSize;
     token_buffer_stage_stride = (token_buffer_stage_stride + 127) & ~127;
-    total_size += config.num_of_stages * token_buffer_stage_stride;
+    total_size += static_cast<size_t>(config.num_of_stages) * token_buffer_stage_stride;
 
     // Sparse to dense map buffer: S2D_MAP_RING_STAGES ping-pong stages PER PIPELINE (128B aligned)
     // Inner dim is mode-dependent: flat = lsa_team_size, expert-major = num_topk.
@@ -564,14 +564,14 @@ static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& confi
     if (config.forward_dispatch) {
         int prob_buffer_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
         prob_buffer_stage_stride = (prob_buffer_stage_stride + 15) & ~15;
-        total_size += config.num_of_stages * prob_buffer_stage_stride;
+        total_size += static_cast<size_t>(config.num_of_stages) * prob_buffer_stage_stride;
     }
 
     // Scaling factor buffer (16B aligned per stage, only if quantized) -- total stages unchanged
     if (config.sf_bytes_per_token > 0) {
         int sf_buffer_stage_stride = config.sf_bytes_per_token;
         sf_buffer_stage_stride = (sf_buffer_stage_stride + 15) & ~15;
-        total_size += config.num_of_stages * sf_buffer_stage_stride;
+        total_size += static_cast<size_t>(config.num_of_stages) * sf_buffer_stage_stride;
     }
     // attn_to_rdma_map buffer (aligned to 16B, only if multi_lsa, shared)
     if (model.num_lsa_teams > 1) {
@@ -580,7 +580,7 @@ static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& confi
     }
     // Mbarrier buffers (aligned to 8B) -- total stages unchanged
     total_size = (total_size + 7) & ~7;
-    total_size += config.num_of_stages * 2 * sizeof(uint64_t);
+    total_size += static_cast<size_t>(config.num_of_stages) * 2 * sizeof(uint64_t);
     // Per-pipeline s2d_map mbarriers: 2 per pipeline
     total_size = (total_size + 7) & ~7;
     total_size += 2 * num_pipelines * sizeof(uint64_t);
@@ -813,55 +813,55 @@ static size_t calculate_combine_smem_layout_size(
     // lsa_token_* buffers (multi-LSA-team only)
     if (multi_lsa) {
         total_size = (total_size + 127) & ~127;
-        total_size += config.num_of_stages_g2s * token_bytes;
+        total_size += static_cast<size_t>(config.num_of_stages_g2s) * token_bytes;
 
         total_size = (total_size + 127) & ~127;
-        total_size += config.num_of_stages_s2g * token_bytes;
+        total_size += static_cast<size_t>(config.num_of_stages_s2g) * token_bytes;
     }
 
     // cross_lsa_token_G2S_buffer
     total_size = (total_size + 127) & ~127;
-    total_size += config.num_of_stages_g2s * token_bytes;
+    total_size += static_cast<size_t>(config.num_of_stages_g2s) * token_bytes;
 
     // cross_lsa_token_S2G_buffer
     total_size = (total_size + 127) & ~127;
-    total_size += config.num_of_stages_s2g * token_bytes;
+    total_size += static_cast<size_t>(config.num_of_stages_s2g) * token_bytes;
 
     // Prob buffers (16B aligned, only if backward_combine)
     if (config.backward_combine) {
         if (multi_lsa) {
             // lsa_prob_G2S_buffer
             total_size = (total_size + 15) & ~15;
-            total_size +=
-                config.num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+            total_size += static_cast<size_t>(config.num_of_stages_g2s) * model.num_of_experts_per_rank *
+                          model.ranks_per_lsa_team * sizeof(float);
 
             // lsa_prob_S2G_buffer
             total_size = (total_size + 15) & ~15;
-            total_size +=
-                config.num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+            total_size += static_cast<size_t>(config.num_of_stages_s2g) * model.num_of_experts_per_rank *
+                          model.ranks_per_lsa_team * sizeof(float);
         }
 
         // cross_lsa_prob_G2S_buffer
         total_size = (total_size + 15) & ~15;
-        total_size +=
-            config.num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+        total_size += static_cast<size_t>(config.num_of_stages_g2s) * model.num_of_experts_per_rank *
+                      model.ranks_per_lsa_team * sizeof(float);
 
         // cross_lsa_prob_S2G_buffer
         total_size = (total_size + 15) & ~15;
-        total_size += config.num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team *
-                      num_lsa_teams * sizeof(float);
+        total_size += static_cast<size_t>(config.num_of_stages_s2g) * model.num_of_experts_per_rank *
+                      model.ranks_per_lsa_team * num_lsa_teams * sizeof(float);
     }
 
     // Mbarrier buffers (8B aligned)
     // lsa_mbarrier_G2S_buffer [stages][2] (multi-LSA-team only)
     if (multi_lsa) {
         total_size = (total_size + 7) & ~7;
-        total_size += config.num_of_stages_g2s * 2 * sizeof(uint64_t);
+        total_size += static_cast<size_t>(config.num_of_stages_g2s) * 2 * sizeof(uint64_t);
     }
 
     // cross_lsa_mbarrier_G2S_buffer [stages][2]
     total_size = (total_size + 7) & ~7;
-    total_size += config.num_of_stages_g2s * 2 * sizeof(uint64_t);
+    total_size += static_cast<size_t>(config.num_of_stages_g2s) * 2 * sizeof(uint64_t);
 
     // lsa_to_rdma_mbarrier_buffer [(LSA teams-1)][chunks] (only if multi-LSA-team)
     if (multi_lsa) {
@@ -877,9 +877,9 @@ static size_t calculate_combine_smem_layout_size(
 
     // Flag buffers (no special alignment needed)
     if (multi_lsa) {
-        total_size += config.num_of_stages_g2s * sizeof(bool);
+        total_size += static_cast<size_t>(config.num_of_stages_g2s) * sizeof(bool);
     }
-    total_size += config.num_of_stages_g2s * sizeof(bool);
+    total_size += static_cast<size_t>(config.num_of_stages_g2s) * sizeof(bool);
 
     // Streaming overlap fields (multi-LSA-team only, 4B aligned)
     if (multi_lsa) {

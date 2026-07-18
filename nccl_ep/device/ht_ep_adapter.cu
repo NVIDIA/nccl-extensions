@@ -18,6 +18,7 @@
 #include "jit/preprocess_jit.cuh"
 
 #include <cassert>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -748,6 +749,11 @@ ncclResult_t check_dispatch_smem_limit(const ::ht_ep::dispatch_config_t& config,
     return ncclInvalidArgument;
 }
 
+static int env_or_default(const ncclEpEnvVar* var, int default_value) {
+    if (var == nullptr || !var->is_set) return default_value;
+    return var->value.ul <= static_cast<unsigned long>(INT_MAX) ? static_cast<int>(var->value.ul) : 0;
+}
+
 // ============================================================================
 // Dispatch wrapper implementation
 // ============================================================================
@@ -875,39 +881,65 @@ ncclResult_t dispatch_impl(
 
         auto kp = build_dispatch_param_base<TOKEN_DATA_TYPE>(params);
 
-        // Compute dynamic SMEM size at host (was done inside ht_ep::dispatch).
-        ::ht_ep::dispatch_config_t d_config;
+        ::ht_ep::dispatch_config_t d_config{};
+        d_config.num_of_stages = env_or_default(
+            env ? &env->dispatch_num_stages : nullptr, NCCL_EP_HT_DISPATCH_NUM_OF_STAGES);
         ::ht_ep::model_config_t d_model;
-        d_config.num_of_stages = NCCL_EP_HT_DISPATCH_NUM_OF_STAGES;
+        d_config.num_pipelines = env_or_default(
+            env ? &env->dispatch_num_pipelines : nullptr, NCCL_EP_HT_DISPATCH_NUM_OF_PIPELINES);
         d_config.num_of_in_flight_s2g = NCCL_EP_HT_DISPATCH_NUM_OF_IN_FLIGHT_S2G;
         d_config.num_of_tokens_per_chunk = num_tokens_per_chunk;
         d_config.num_of_blocks = num_blocks;
         d_config.forward_dispatch = forward_dispatch;
         d_config.sf_bytes_per_token = sf_bytes_per_token;
-        d_config.num_pipelines = NCCL_EP_HT_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
-        d_config.stages_per_pipeline = NCCL_EP_HT_DISPATCH_NUM_OF_STAGES / NCCL_EP_HT_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
         d_config.s2d_inner_dim = kp.s2d_inner_dim;
+        if (d_config.num_of_stages <= 0 || d_config.num_pipelines <= 0 ||
+            d_config.num_of_stages % d_config.num_pipelines != 0 ||
+            d_config.num_of_stages / d_config.num_pipelines <= d_config.num_of_in_flight_s2g) {
+            std::fprintf(
+                stderr,
+                "[nccl_ep] invalid dispatch config: stages=%d, pipelines=%d, in_flight_s2g=%d\n",
+                d_config.num_of_stages,
+                d_config.num_pipelines,
+                d_config.num_of_in_flight_s2g);
+            return ncclInvalidArgument;
+        }
+        d_config.stages_per_pipeline = d_config.num_of_stages / d_config.num_pipelines;
+
+        // Compute dynamic SMEM size at host (was done inside ht_ep::dispatch).
         d_model.hidden_dim = kp.hidden_dim;
         d_model.max_num_of_tokens_per_rank = max_dispatch_tokens_per_rank;
         d_model.num_of_experts_per_rank = kp.experts_per_rank;
         d_model.ranks_per_lsa_team = kp.ranks_per_lsa_team;
         d_model.num_lsa_teams = num_lsa_teams;
 
-        const int smem_size = static_cast<int>(::ht_ep::calculate_dispatch_smem_layout_size(
-            params.layout, kernel_spec.payload_bytes, d_config, d_model));
+        const size_t smem_size =
+            ::ht_ep::calculate_dispatch_smem_layout_size(params.layout, kernel_spec.payload_bytes, d_config, d_model);
         if (smem_size == 0) {
             std::fprintf(stderr, "NCCL EP warning: unsupported HT dispatch token size %u\n",
                          kernel_spec.payload_bytes);
             return ncclInvalidArgument;
         }
         if (ncclResult_t r = check_dispatch_smem_limit(d_config, smem_size); r != ncclSuccess) {
-            std::fprintf(stderr, "NCCL EP warning: dispatch shared-memory requirement %d is unsupported\n",
+            std::fprintf(stderr, "NCCL EP warning: dispatch shared-memory requirement %zu is unsupported\n",
                          smem_size);
             return r;
         }
 
+        const int dispatch_block_dim =
+            jit::compute_dispatch_warp_layout(num_lsa_teams, params.layout, d_config.num_pipelines).block_dim;
+        if (dispatch_block_dim > 1024) {
+            std::fprintf(
+                stderr,
+                "[nccl_ep] dispatch block_dim=%d exceeds 1024 threads (pipelines=%d); reduce pipelines.\n",
+                dispatch_block_dim,
+                d_config.num_pipelines);
+            return ncclInvalidArgument;
+        }
+
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
-        const jit::dispatch_warp_layout_t dispatch_layout = jit::compute_dispatch_warp_layout(num_lsa_teams, params.layout);
+        const jit::dispatch_warp_layout_t dispatch_layout =
+            jit::compute_dispatch_warp_layout(num_lsa_teams, params.layout, d_config.num_pipelines);
         const int dispatch_wt_total = num_blocks * (dispatch_layout.block_dim / 32);
         ::ht_ep::dispatch_warp_timing_entry_t* d_wt = nullptr;
         CUDA_CHECK(cudaMalloc(&d_wt, dispatch_wt_total * sizeof(::ht_ep::dispatch_warp_timing_entry_t)));
@@ -918,12 +950,8 @@ ncclResult_t dispatch_impl(
 
         std::vector<uint8_t> kernel_arg = build_dispatch_arg_buffer(kp, params);
         if (ncclResult_t r = jit::launch_dispatch(
-            NCCL_EP_HT_DISPATCH_NUM_OF_STAGES,
-            NCCL_EP_HT_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
-            num_tokens_per_chunk,
+            d_config,
             max_dispatch_tokens_per_rank,
-            num_blocks,
-            forward_dispatch,
             num_lsa_teams,
             params.lsa_team_size,
             params.layout,
@@ -932,7 +960,7 @@ ncclResult_t dispatch_impl(
             env,
             kernel_arg.data(),
             kernel_arg.size(),
-            smem_size,
+            static_cast<int>(smem_size),
             stream,
             kernel_spec); r != ncclSuccess)
             return r;
@@ -1057,7 +1085,7 @@ std::vector<uint8_t> build_combine_arg_buffer(
 
 // Template combine launcher for forward/backward
 template <bool BACKWARD_COMBINE>
-void combine_impl(
+ncclResult_t combine_impl(
     const CombineParams& params,
     int max_dispatch_tokens_per_rank,
     int num_tokens_per_chunk,
@@ -1071,11 +1099,37 @@ void combine_impl(
 
     auto kp = build_combine_param_base(params);
 
-    // Select config based on num_lsa_teams (single LSA team: 12 stages/2 pipelines, multiple LSA teams: 5 stages/1 pipeline)
-    const int num_stages_g2s =
-        (num_lsa_teams == 1) ? NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_STAGES_G2S : NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_STAGES_G2S;
-    const int num_stages_s2g =
-        (num_lsa_teams == 1) ? NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_STAGES_S2G : NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_STAGES_S2G;
+    const bool multi_lsa = (num_lsa_teams != 1);
+    ::ht_ep::combine_config_t c_config{};
+    c_config.num_of_stages_g2s = env_or_default(
+        env ? &env->combine_num_stages_g2s : nullptr,
+        multi_lsa ? NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_STAGES_G2S :
+                    NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_STAGES_G2S);
+    c_config.num_of_stages_s2g = env_or_default(
+        env ? &env->combine_num_stages_s2g : nullptr,
+        multi_lsa ? NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_STAGES_S2G :
+                    NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_STAGES_S2G);
+    c_config.num_pipelines = env_or_default(
+        env ? &env->combine_num_pipelines : nullptr,
+        multi_lsa ? NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_PIPELINES :
+                    NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_PIPELINES);
+    c_config.num_of_tokens_per_chunk = num_tokens_per_chunk;
+    c_config.num_of_tokens_per_group = NCCL_EP_HT_COMBINE_NUM_OF_TOKENS_PER_GROUP;
+    c_config.num_of_blocks = num_blocks;
+    c_config.num_of_additional_in_flight_s2g = NCCL_EP_HT_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G;
+    c_config.backward_combine = BACKWARD_COMBINE;
+    if (c_config.num_of_stages_g2s <= 0 || c_config.num_of_stages_s2g <= 0 ||
+        c_config.num_pipelines <= 0 || NCCL_EP_HT_COMBINE_RED_WARPS % c_config.num_pipelines != 0 ||
+        c_config.num_of_stages_g2s % c_config.num_pipelines != 0 ||
+        c_config.num_of_stages_s2g % c_config.num_pipelines != 0) {
+        std::fprintf(
+            stderr,
+            "[nccl_ep] invalid combine config: g2s_stages=%d, s2g_stages=%d, pipelines=%d\n",
+            c_config.num_of_stages_g2s,
+            c_config.num_of_stages_s2g,
+            c_config.num_pipelines);
+        return ncclInvalidArgument;
+    }
 
     ::ht_ep::model_config_t model;
     model.hidden_dim = kp.hidden_dim;
@@ -1086,26 +1140,22 @@ void combine_impl(
     // Pick the layout-size instantiation by wire dtype; the width is derived inside the
     // template. Layout size depends only on element width, so FP16 and BF16 (both 2 B)
     // share the BF16 instantiation; only FP32 (4 B) is distinct.
-    const int smem_size = (params.token_dtype == ncclFloat32) ?
-                              static_cast<int>(::ht_ep::calculate_combine_smem_layout_size<ncclFloat32>(
-                                  num_stages_g2s,
-                                  num_stages_s2g,
-                                  num_tokens_per_chunk,
-                                  max_dispatch_tokens_per_rank,
-                                  num_lsa_teams,
-                                  BACKWARD_COMBINE,
-                                  model)) :
-                              static_cast<int>(::ht_ep::calculate_combine_smem_layout_size<ncclBfloat16>(
-                                  num_stages_g2s,
-                                  num_stages_s2g,
-                                  num_tokens_per_chunk,
-                                  max_dispatch_tokens_per_rank,
-                                  num_lsa_teams,
-                                  BACKWARD_COMBINE,
-                                  model));
+    const size_t smem_size =
+        (params.token_dtype == ncclFloat32) ?
+            ::ht_ep::calculate_combine_smem_layout_size<ncclFloat32>(
+                max_dispatch_tokens_per_rank,
+                num_lsa_teams,
+                c_config,
+                model) :
+            ::ht_ep::calculate_combine_smem_layout_size<ncclBfloat16>(
+                max_dispatch_tokens_per_rank,
+                num_lsa_teams,
+                c_config,
+                model);
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
-    const jit::combine_warp_layout_t combine_layout = jit::compute_combine_warp_layout(num_lsa_teams);
+    const jit::combine_warp_layout_t combine_layout =
+        jit::compute_combine_warp_layout(num_lsa_teams, c_config.num_pipelines);
     const int combine_wt_total = num_blocks * (combine_layout.block_dim / 32);
     ::ht_ep::combine_warp_timing_entry_t* d_wt = nullptr;
     ::ht_ep::combine_block_timing_entry_t* d_bt = nullptr;
@@ -1119,14 +1169,8 @@ void combine_impl(
 
     std::vector<uint8_t> kernel_arg = build_combine_arg_buffer(kp, params);
     jit::launch_combine(
-        num_stages_g2s,
-        num_stages_s2g,
-        num_tokens_per_chunk,
+        c_config,
         max_dispatch_tokens_per_rank,
-        NCCL_EP_HT_COMBINE_NUM_OF_TOKENS_PER_GROUP,
-        num_blocks,
-        NCCL_EP_HT_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
-        BACKWARD_COMBINE,
         num_lsa_teams,
         params.lsa_team_size,
         params.layout,
@@ -1134,7 +1178,7 @@ void combine_impl(
         env,
         kernel_arg.data(),
         kernel_arg.size(),
-        smem_size,
+        static_cast<int>(smem_size),
         stream,
         params.token_dtype);
 
@@ -1143,6 +1187,7 @@ void combine_impl(
     CUDA_CHECK(cudaFree(d_wt));
     CUDA_CHECK(cudaFree(d_bt));
 #endif
+    return ncclSuccess;
 }
 
 void call_local_dup(
@@ -1238,7 +1283,7 @@ void call_local_reduce(
     else run(uint16_t{});
 }
 
-void call_combine(
+ncclResult_t call_combine(
     const CombineParams& params,
     int max_dispatch_tokens_per_rank,
     int num_tokens_per_chunk,
@@ -1248,16 +1293,7 @@ void call_combine(
     const ncclEpEnvConfig* env,
     cudaStream_t stream) {
     if (backward_combine) {
-        combine_impl<true>(
-            params,
-            max_dispatch_tokens_per_rank,
-            num_tokens_per_chunk,
-            num_lsa_teams,
-            num_blocks,
-            env,
-            stream);
-    } else {
-        combine_impl<false>(
+        return combine_impl<true>(
             params,
             max_dispatch_tokens_per_rank,
             num_tokens_per_chunk,
@@ -1266,6 +1302,14 @@ void call_combine(
             env,
             stream);
     }
+    return combine_impl<false>(
+        params,
+        max_dispatch_tokens_per_rank,
+        num_tokens_per_chunk,
+        num_lsa_teams,
+        num_blocks,
+        env,
+        stream);
 }
 
 // Grid sizing for local-permute kernels: one block per SM. Latency is hidden

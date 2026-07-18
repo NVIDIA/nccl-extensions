@@ -51,16 +51,17 @@ struct dispatch_warp_layout_t {
     int block_dim;
 };
 
-inline dispatch_warp_layout_t compute_dispatch_warp_layout(int num_lsa_teams, ncclEpLayout_t layout) {
+inline dispatch_warp_layout_t
+compute_dispatch_warp_layout(int num_lsa_teams, ncclEpLayout_t layout, int num_pipelines) {
     const bool multi_lsa_layout = (num_lsa_teams != 1);
     dispatch_warp_layout_t L{};
-    L.num_pipelines = NCCL_EP_HT_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
+    L.num_pipelines = num_pipelines;
     L.cross_lsa_group_warps = multi_lsa_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
     L.cross_lsa_group_start = 0;
     L.lsa_g2s_group_warps = L.num_pipelines;
     L.lsa_g2s_group_start = multi_lsa_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
     L.lsa_s2g_group_warps = L.num_pipelines;
-    L.lsa_s2g_group_start = multi_lsa_layout ? (NCCL_EP_HT_DISPATCH_N2N_WARPS + L.num_pipelines) : L.num_pipelines;
+    L.lsa_s2g_group_start = L.lsa_g2s_group_start + L.lsa_g2s_group_warps;
     L.pad_group_warps = (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? 1 : 0;
     L.pad_group_start = L.lsa_s2g_group_start + L.lsa_s2g_group_warps;
     L.block_dim = 32 * (L.cross_lsa_group_warps + L.lsa_g2s_group_warps + L.lsa_s2g_group_warps +
@@ -135,12 +136,8 @@ inline std::string dispatch_jit_source(
 }
 
 inline ncclResult_t launch_dispatch(
-    int num_of_stages,
-    int num_of_in_flight_s2g,
-    int num_of_tokens_per_chunk,
+    const ::ht_ep::dispatch_config_t& config,
     int max_tokens_per_rank,
-    int num_of_blocks,
-    bool forward_dispatch,
     int num_lsa_teams,
     int lsa_team_size,
     ncclEpLayout_t layout,
@@ -152,17 +149,20 @@ inline ncclResult_t launch_dispatch(
     int dynamic_smem_bytes,
     cudaStream_t stream,
     const DispatchKernelSpec& kernel_spec) {
-    const dispatch_warp_layout_t L = compute_dispatch_warp_layout(num_lsa_teams, layout);
+    const dispatch_warp_layout_t L =
+        compute_dispatch_warp_layout(num_lsa_teams, layout, config.num_pipelines);
 
     static const int fwd_variant_identity = 0;
     static const int bwd_variant_identity = 0;
-    const int& variant_identity = forward_dispatch ? fwd_variant_identity : bwd_variant_identity;
+    const int& variant_identity = config.forward_dispatch ? fwd_variant_identity : bwd_variant_identity;
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "dispatch"
              << "_LSATeams" << num_lsa_teams << "_lsa" << lsa_team_size << "_hdim" << hidden_dim << "_stages"
-             << num_of_stages << "_inflt" << num_of_in_flight_s2g << "_chunk" << num_of_tokens_per_chunk << "_maxt"
-             << max_tokens_per_rank << "_blocks" << num_of_blocks << (forward_dispatch ? "_fwd" : "_bwd")
+             << config.num_of_stages << "_pipe" << config.num_pipelines << "_inflt"
+             << config.num_of_in_flight_s2g << "_chunk" << config.num_of_tokens_per_chunk << "_maxt"
+             << max_tokens_per_rank << "_blocks" << config.num_of_blocks
+             << (config.forward_dispatch ? "_fwd" : "_bwd")
              << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_fl")
              << "_recipe" << kernel_spec.recipe_cache_tag
              << "_payload" << kernel_spec.payload_cache_tag
@@ -178,13 +178,13 @@ inline ncclResult_t launch_dispatch(
         L.lsa_s2g_group_start,
         L.pad_group_warps,
         L.pad_group_start,
-        num_of_stages,
-        num_of_in_flight_s2g,
-        num_of_tokens_per_chunk,
+        config.num_of_stages,
+        config.num_of_in_flight_s2g,
+        config.num_of_tokens_per_chunk,
         max_tokens_per_rank,
         num_lsa_teams,
-        num_of_blocks,
-        forward_dispatch,
+        config.num_of_blocks,
+        config.forward_dispatch,
         L.num_pipelines,
         lsa_team_size,
         layout,
@@ -199,7 +199,7 @@ inline ncclResult_t launch_dispatch(
     variant.entry_name = kDispatchJitEntryName;
     variant.identity = &variant_identity;
     variant.runtime_key = static_cast<std::uint64_t>(std::hash<std::string>{}(variant_name));
-    variant.num_blocks = num_of_blocks;
+    variant.num_blocks = config.num_of_blocks;
     variant.block_dim = L.block_dim;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
 
@@ -217,15 +217,15 @@ inline ncclResult_t launch_dispatch(
             num_lsa_teams,
             lsa_team_size,
             hidden_dim,
-            num_of_stages,
-            num_of_in_flight_s2g,
+            config.num_of_stages,
+            config.num_of_in_flight_s2g,
             L.num_pipelines,
-            num_of_tokens_per_chunk,
+            config.num_of_tokens_per_chunk,
             max_tokens_per_rank,
-            num_of_blocks,
+            config.num_of_blocks,
             L.block_dim,
             dynamic_smem_bytes,
-            dispatch_bool_literal(forward_dispatch),
+            dispatch_bool_literal(config.forward_dispatch),
             (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "EXPERT_MAJOR" : "FLAT"),
             kernel_spec.wire_dtype_literal,
             kernel_spec.recipe_source_literal,

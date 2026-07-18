@@ -46,22 +46,28 @@ struct combine_warp_layout_t {
     int block_dim;
 };
 
-inline combine_warp_layout_t compute_combine_warp_layout(int num_lsa_teams) {
+inline combine_warp_layout_t compute_combine_warp_layout(int num_lsa_teams, int num_pipelines) {
     const bool multi_lsa_layout = (num_lsa_teams != 1);
     combine_warp_layout_t L{};
-    L.lsa_red_group_warps = multi_lsa_layout ? 4 : 0;
-    L.lsa_red_group_start = 0;
-    L.cross_lsa_red_group_warps = 4;
-    L.cross_lsa_red_group_start = multi_lsa_layout ? 4 : 0;
+    L.lsa_red_group_warps = multi_lsa_layout ? NCCL_EP_HT_COMBINE_RED_WARPS : 0;
+    L.cross_lsa_red_group_warps = NCCL_EP_HT_COMBINE_RED_WARPS;
     L.lsa_g2s_group_warps = multi_lsa_layout ? 1 : 0;
-    L.lsa_g2s_group_start = multi_lsa_layout ? 8 : 4;
-    L.cross_lsa_g2s_group_warps = multi_lsa_layout ? 1 : 2;
-    L.cross_lsa_g2s_group_start = multi_lsa_layout ? 9 : 4;
-    L.cross_lsa_rdma_group_warps = multi_lsa_layout ? 1 : 0;
-    L.cross_lsa_rdma_group_start = multi_lsa_layout ? 10 : 6;
-    L.num_of_data_pipeline_per_block = multi_lsa_layout ? 1 : 2;
-    L.block_dim = 32 * (L.lsa_red_group_warps + L.cross_lsa_red_group_warps + L.lsa_g2s_group_warps +
-                        L.cross_lsa_g2s_group_warps + L.cross_lsa_rdma_group_warps);
+    L.cross_lsa_g2s_group_warps = num_pipelines;
+    L.cross_lsa_rdma_group_warps = multi_lsa_layout ? NCCL_EP_HT_COMBINE_N2N_WARPS : 0;
+    L.num_of_data_pipeline_per_block = num_pipelines;
+
+    int warp_cursor = 0;
+    L.lsa_red_group_start = warp_cursor;
+    warp_cursor += L.lsa_red_group_warps;
+    L.cross_lsa_red_group_start = warp_cursor;
+    warp_cursor += L.cross_lsa_red_group_warps;
+    L.lsa_g2s_group_start = warp_cursor;
+    warp_cursor += L.lsa_g2s_group_warps;
+    L.cross_lsa_g2s_group_start = warp_cursor;
+    warp_cursor += L.cross_lsa_g2s_group_warps;
+    L.cross_lsa_rdma_group_start = warp_cursor;
+    warp_cursor += L.cross_lsa_rdma_group_warps;
+    L.block_dim = 32 * warp_cursor;
     return L;
 }
 
@@ -129,14 +135,8 @@ inline std::string combine_jit_source(
 }
 
 inline void launch_combine(
-    int num_of_stages_g2s,
-    int num_of_stages_s2g,
-    int num_of_tokens_per_chunk,
+    const ::ht_ep::combine_config_t& config,
     int max_tokens_per_rank,
-    int num_of_tokens_per_group,
-    int num_of_blocks,
-    int num_of_additional_in_flight_s2g,
-    bool backward_combine,
     int num_lsa_teams,
     int lsa_team_size,
     ncclEpLayout_t layout,
@@ -147,18 +147,21 @@ inline void launch_combine(
     int dynamic_smem_bytes,
     cudaStream_t stream,
     ncclDataType_t token_dtype = ncclBfloat16) {
-    const combine_warp_layout_t L = compute_combine_warp_layout(num_lsa_teams);
+    const combine_warp_layout_t L =
+        compute_combine_warp_layout(num_lsa_teams, config.num_pipelines);
 
     static const int fwd_variant_identity = 0;
     static const int bwd_variant_identity = 0;
-    const int& variant_identity = backward_combine ? bwd_variant_identity : fwd_variant_identity;
+    const int& variant_identity = config.backward_combine ? bwd_variant_identity : fwd_variant_identity;
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "combine"
              << "_LSATeams" << num_lsa_teams << "_lsa" << lsa_team_size << "_hdim" << hidden_dim << "_g2s"
-             << num_of_stages_g2s << "_s2g" << num_of_stages_s2g << "_chunk" << num_of_tokens_per_chunk << "_maxt"
-             << max_tokens_per_rank << "_group" << num_of_tokens_per_group << "_blocks" << num_of_blocks << "_extra"
-             << num_of_additional_in_flight_s2g << (backward_combine ? "_bwd" : "_fwd")
+             << config.num_of_stages_g2s << "_s2g" << config.num_of_stages_s2g << "_pipe"
+             << config.num_pipelines << "_chunk" << config.num_of_tokens_per_chunk << "_maxt"
+             << max_tokens_per_rank << "_group" << config.num_of_tokens_per_group << "_blocks"
+             << config.num_of_blocks << "_extra" << config.num_of_additional_in_flight_s2g
+             << (config.backward_combine ? "_bwd" : "_fwd")
              << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_fl")
              << (token_dtype == ncclFloat32 ? "_fp32" :
                  token_dtype == ncclFloat16 ? "_fp16" :
@@ -167,15 +170,15 @@ inline void launch_combine(
     }();
     const std::string source = combine_jit_source(
         L,
-        num_of_stages_g2s,
-        num_of_stages_s2g,
-        num_of_tokens_per_group,
-        num_of_tokens_per_chunk,
+        config.num_of_stages_g2s,
+        config.num_of_stages_s2g,
+        config.num_of_tokens_per_group,
+        config.num_of_tokens_per_chunk,
         max_tokens_per_rank,
         num_lsa_teams,
-        num_of_blocks,
-        num_of_additional_in_flight_s2g,
-        backward_combine,
+        config.num_of_blocks,
+        config.num_of_additional_in_flight_s2g,
+        config.backward_combine,
         lsa_team_size,
         layout,
         hidden_dim,
@@ -188,7 +191,7 @@ inline void launch_combine(
     variant.entry_name = kCombineJitEntryName;
     variant.identity = &variant_identity;
     variant.runtime_key = static_cast<std::uint64_t>(std::hash<std::string>{}(variant_name));
-    variant.num_blocks = num_of_blocks;
+    variant.num_blocks = config.num_of_blocks;
     variant.block_dim = L.block_dim;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
 
@@ -199,7 +202,7 @@ inline void launch_combine(
             stderr,
             "[nccl_ep][env] HT combine kernel (%s):\n"
             "[nccl_ep][env]   nodes(lsa_teams)=%d lsa_team_size=%d hidden_dim=%d\n"
-            "[nccl_ep][env]   stages_g2s=%d stages_s2g=%d extra_in_flight_s2g=%d\n"
+            "[nccl_ep][env]   stages_g2s=%d stages_s2g=%d pipelines=%d extra_in_flight_s2g=%d\n"
             "[nccl_ep][env]   tokens_per_chunk=%d tokens_per_group=%d max_tokens_per_rank=%d\n"
             "[nccl_ep][env]   num_blocks=%d block_dim=%d dynamic_smem_bytes=%d\n"
             "[nccl_ep][env]   backward=%s layout=%s dtype=%s\n",
@@ -207,16 +210,17 @@ inline void launch_combine(
             num_lsa_teams,
             lsa_team_size,
             hidden_dim,
-            num_of_stages_g2s,
-            num_of_stages_s2g,
-            num_of_additional_in_flight_s2g,
-            num_of_tokens_per_chunk,
-            num_of_tokens_per_group,
+            config.num_of_stages_g2s,
+            config.num_of_stages_s2g,
+            L.num_of_data_pipeline_per_block,
+            config.num_of_additional_in_flight_s2g,
+            config.num_of_tokens_per_chunk,
+            config.num_of_tokens_per_group,
             max_tokens_per_rank,
-            num_of_blocks,
+            config.num_of_blocks,
             L.block_dim,
             dynamic_smem_bytes,
-            (backward_combine ? "true" : "false"),
+            (config.backward_combine ? "true" : "false"),
             (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "EXPERT_MAJOR" : "FLAT"),
             (token_dtype == ncclFloat32 ? "fp32" :
              token_dtype == ncclFloat16 ? "fp16" :

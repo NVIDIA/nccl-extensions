@@ -4457,15 +4457,16 @@ ncclResult_t ncclEpCombine(
 
         /* ===== Call combine kernel ===== */
         params.token_dtype = x->datatype;
-        nccl_ep::ht::call_combine(
-            params,
-            group->ht_aligned_max_tokens, // chunk-aligned stride
-            group->ht_tokens_per_chunk, // tokens per dispatch/combine chunk
-            group->rdma_team_size, // num_lsa_teams (RDMA domain size)
-            backward_combine, // backward mode flag
-            static_cast<int>(group->comm_num_sms),
-            &group->env,
-            stream);
+        NCCLCHECK(
+            nccl_ep::ht::call_combine(
+                params,
+                group->ht_aligned_max_tokens, // chunk-aligned stride
+                group->ht_tokens_per_chunk, // tokens per dispatch/combine chunk
+                group->rdma_team_size, // num_lsa_teams (RDMA domain size)
+                backward_combine, // backward mode flag
+                static_cast<int>(group->comm_num_sms),
+                &group->env,
+                stream));
 
         // BWD combine: scatter dense output back to FWD k-slot ordering via ht.topk_idx.
         if (backward_combine) {

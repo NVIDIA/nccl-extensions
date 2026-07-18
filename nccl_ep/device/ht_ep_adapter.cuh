@@ -459,7 +459,7 @@ struct CombineParams {
 };
 
 // Call combine kernel with runtime template parameter resolution
-void call_combine(
+ncclResult_t call_combine(
     const CombineParams& params,
     int max_dispatch_tokens_per_rank, // Max tokens for buffer sizing (chunk-aligned)
     int num_tokens_per_chunk, // Dispatch/combine tokens per chunk (resolved per group)

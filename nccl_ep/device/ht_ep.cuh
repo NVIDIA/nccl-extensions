@@ -170,6 +170,7 @@ struct dispatch_config_t {
 struct combine_config_t {
     int num_of_stages_g2s;
     int num_of_stages_s2g;
+    int num_pipelines;
     int num_of_tokens_per_chunk;
     int num_of_tokens_per_group;
     int num_of_blocks;
@@ -792,12 +793,9 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
 
 template <ncclDataType_t kTokenDtype = ncclBfloat16>
 static size_t calculate_combine_smem_layout_size(
-    int num_of_stages_g2s,
-    int num_of_stages_s2g,
-    int num_of_tokens_per_chunk,
     int max_num_of_tokens_per_rank,
     int num_lsa_teams,
-    bool backward_combine,
+    const combine_config_t& config,
     const model_config_t& model) {
     // Dynamically computes the size required for combine shared memory layout,
     // mirroring the logic from create_combine_smem_layout
@@ -807,7 +805,7 @@ static size_t calculate_combine_smem_layout_size(
     const int hidden_dim = model.hidden_dim;
     const int token_bytes = hidden_dim * nccl_ep::size_u8<kTokenDtype>(); // per-token wire bytes
     const int max_num_of_chunks_per_rank =
-        (max_num_of_tokens_per_rank + num_of_tokens_per_chunk - 1) / num_of_tokens_per_chunk;
+        (max_num_of_tokens_per_rank + config.num_of_tokens_per_chunk - 1) / config.num_of_tokens_per_chunk;
     const bool multi_lsa = (num_lsa_teams > 1);
 
     // Token buffers (128B aligned for TMA). Stage stride scales with the wire element
@@ -815,54 +813,55 @@ static size_t calculate_combine_smem_layout_size(
     // lsa_token_* buffers (multi-LSA-team only)
     if (multi_lsa) {
         total_size = (total_size + 127) & ~127;
-        total_size += num_of_stages_g2s * token_bytes;
+        total_size += config.num_of_stages_g2s * token_bytes;
 
         total_size = (total_size + 127) & ~127;
-        total_size += num_of_stages_s2g * token_bytes;
+        total_size += config.num_of_stages_s2g * token_bytes;
     }
 
     // cross_lsa_token_G2S_buffer
     total_size = (total_size + 127) & ~127;
-    total_size += num_of_stages_g2s * token_bytes;
+    total_size += config.num_of_stages_g2s * token_bytes;
 
     // cross_lsa_token_S2G_buffer
     total_size = (total_size + 127) & ~127;
-    total_size += num_of_stages_s2g * token_bytes;
+    total_size += config.num_of_stages_s2g * token_bytes;
 
     // Prob buffers (16B aligned, only if backward_combine)
-    if (backward_combine) {
+    if (config.backward_combine) {
         if (multi_lsa) {
             // lsa_prob_G2S_buffer
             total_size = (total_size + 15) & ~15;
             total_size +=
-                num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+                config.num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
 
             // lsa_prob_S2G_buffer
             total_size = (total_size + 15) & ~15;
             total_size +=
-                num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+                config.num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
         }
 
         // cross_lsa_prob_G2S_buffer
         total_size = (total_size + 15) & ~15;
-        total_size += num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+        total_size +=
+            config.num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
 
         // cross_lsa_prob_S2G_buffer
         total_size = (total_size + 15) & ~15;
-        total_size += num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * num_lsa_teams *
-                      sizeof(float);
+        total_size += config.num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team *
+                      num_lsa_teams * sizeof(float);
     }
 
     // Mbarrier buffers (8B aligned)
     // lsa_mbarrier_G2S_buffer [stages][2] (multi-LSA-team only)
     if (multi_lsa) {
         total_size = (total_size + 7) & ~7;
-        total_size += num_of_stages_g2s * 2 * sizeof(uint64_t);
+        total_size += config.num_of_stages_g2s * 2 * sizeof(uint64_t);
     }
 
     // cross_lsa_mbarrier_G2S_buffer [stages][2]
     total_size = (total_size + 7) & ~7;
-    total_size += num_of_stages_g2s * 2 * sizeof(uint64_t);
+    total_size += config.num_of_stages_g2s * 2 * sizeof(uint64_t);
 
     // lsa_to_rdma_mbarrier_buffer [(LSA teams-1)][chunks] (only if multi-LSA-team)
     if (multi_lsa) {
@@ -878,9 +877,9 @@ static size_t calculate_combine_smem_layout_size(
 
     // Flag buffers (no special alignment needed)
     if (multi_lsa) {
-        total_size += num_of_stages_g2s * sizeof(bool);
+        total_size += config.num_of_stages_g2s * sizeof(bool);
     }
-    total_size += num_of_stages_g2s * sizeof(bool);
+    total_size += config.num_of_stages_g2s * sizeof(bool);
 
     // Streaming overlap fields (multi-LSA-team only, 4B aligned)
     if (multi_lsa) {

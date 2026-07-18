@@ -60,6 +60,11 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_ulong(cfg->prolog_epilog_sms);
     parse_ulong(cfg->preprocess_num_sms);
     parse_ulong(cfg->tokens_per_chunk);
+    parse_ulong(cfg->dispatch_num_stages);
+    parse_ulong(cfg->dispatch_num_pipelines);
+    parse_ulong(cfg->combine_num_stages_g2s);
+    parse_ulong(cfg->combine_num_stages_s2g);
+    parse_ulong(cfg->combine_num_pipelines);
 }
 
 void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
@@ -76,6 +81,11 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.prolog_epilog_sms,
         &cfg.preprocess_num_sms,
         &cfg.tokens_per_chunk,
+        &cfg.dispatch_num_stages,
+        &cfg.dispatch_num_pipelines,
+        &cfg.combine_num_stages_g2s,
+        &cfg.combine_num_stages_s2g,
+        &cfg.combine_num_pipelines,
     };
 
     std::fprintf(stderr, "[nccl_ep][env] NCCL EP environment configuration:\n");

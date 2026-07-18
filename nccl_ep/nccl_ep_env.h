@@ -58,6 +58,11 @@ struct ncclEpEnvConfig {
     ncclEpEnvVar prolog_epilog_sms{"NCCL_EP_PROLOG_EPILOG_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar preprocess_num_sms{"NCCL_EP_PREPROCESS_NUM_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar tokens_per_chunk{"NCCL_EP_TOKENS_PER_CHUNK", ncclEpEnvType::ulong};
+    ncclEpEnvVar dispatch_num_stages{"NCCL_EP_DISPATCH_NUM_STAGES", ncclEpEnvType::ulong};
+    ncclEpEnvVar dispatch_num_pipelines{"NCCL_EP_DISPATCH_NUM_PIPELINES", ncclEpEnvType::ulong};
+    ncclEpEnvVar combine_num_stages_g2s{"NCCL_EP_COMBINE_NUM_STAGES_G2S", ncclEpEnvType::ulong};
+    ncclEpEnvVar combine_num_stages_s2g{"NCCL_EP_COMBINE_NUM_STAGES_S2G", ncclEpEnvType::ulong};
+    ncclEpEnvVar combine_num_pipelines{"NCCL_EP_COMBINE_NUM_PIPELINES", ncclEpEnvType::ulong};
 };
 
 // True iff a flag variable was explicitly set to an "on" value (1/on/true).

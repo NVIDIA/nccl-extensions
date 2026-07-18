@@ -749,6 +749,22 @@ ncclResult_t check_dispatch_smem_limit(const ::ht_ep::dispatch_config_t& config,
     return ncclInvalidArgument;
 }
 
+ncclResult_t check_combine_smem_limit(const ::ht_ep::combine_config_t& config, size_t smem_size) {
+    const int max_smem = get_device_max_dynamic_smem();
+    if (smem_size <= static_cast<size_t>(max_smem)) return ncclSuccess;
+
+    std::fprintf(
+        stderr,
+        "[nccl_ep] combine dynamic shared memory exceeds device limit: requested=%zu bytes, "
+        "limit=%d bytes. Tune combine stages/pipelines; current g2s_stages=%d, s2g_stages=%d, pipelines=%d.\n",
+        smem_size,
+        max_smem,
+        config.num_of_stages_g2s,
+        config.num_of_stages_s2g,
+        config.num_pipelines);
+    return ncclInvalidArgument;
+}
+
 static int env_or_default(const ncclEpEnvVar* var, int default_value) {
     if (var == nullptr || !var->is_set) return default_value;
     return var->value.ul <= static_cast<unsigned long>(INT_MAX) ? static_cast<int>(var->value.ul) : 0;
@@ -1152,6 +1168,7 @@ ncclResult_t combine_impl(
                 num_lsa_teams,
                 c_config,
                 model);
+    if (ncclResult_t r = check_combine_smem_limit(c_config, smem_size); r != ncclSuccess) return r;
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     const jit::combine_warp_layout_t combine_layout =

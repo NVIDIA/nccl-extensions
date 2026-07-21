@@ -8,6 +8,7 @@
 
 #include "device/ht_ep.cuh"
 #include "device/jit/jit_runtime.hpp"
+#include "device/jit/jit_source_literals.hpp"
 
 #include <climits>
 #include <cstdio>
@@ -23,10 +24,6 @@ namespace jit {
 
 constexpr const char* kScanFlatJitEntryName = "nccl_ep_jit_ht_scan_flat_kernel";
 constexpr const char* kScanEmJitEntryName = "nccl_ep_jit_ht_scan_em_kernel";
-
-inline const char* scan_bool_literal(bool value) {
-    return value ? "true" : "false";
-}
 
 inline std::string scan_flat_jit_source(
     int num_threads_per_block,
@@ -53,8 +50,8 @@ inline std::string scan_flat_jit_source(
         << "      " << num_of_blocks << ",\n"
         << "      " << num_lsa_teams << ",\n"
         << "      " << lsa_team_size << ",\n"
-        << "      " << scan_bool_literal(enable_per_expert_counts) << ",\n"
-        << "      " << scan_bool_literal(enable_em_permute) << ",\n"
+        << "      " << ::nccl_ep::jit::bool_literal(enable_per_expert_counts) << ",\n"
+        << "      " << ::nccl_ep::jit::bool_literal(enable_em_permute) << ",\n"
         << "      " << (enable_em_permute ? experts_per_rank : 0) << ",\n"
         << "      " << em_out_type << ">(\n"
         << "      p.input_routing_map, p.tmp, p.sparse_to_dense_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"

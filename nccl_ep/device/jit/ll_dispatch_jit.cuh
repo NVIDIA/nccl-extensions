@@ -8,6 +8,7 @@
 
 #include "device/ll_ep_adapter.cuh"
 #include "device/jit/jit_runtime.hpp"
+#include "device/jit/jit_source_literals.hpp"
 #include "quantization_recipe.hpp"
 
 #include <cstdio>
@@ -23,10 +24,6 @@ namespace jit {
 
 constexpr const char* kLlDispatchJitEntryName = "nccl_ep_jit_ll_dispatch_kernel";
 
-inline const char* ll_dispatch_bool_literal(bool value) {
-    return value ? "true" : "false";
-}
-
 inline std::string ll_dispatch_jit_source(
     const DispatchKernelSpec& kernel_spec,
     int hidden,
@@ -34,10 +31,9 @@ inline std::string ll_dispatch_jit_source(
     bool nvlinkOnly,
     bool topkIdxIsInt64,
     ncclDataType_t tokenDtype) {
-    const char* layout_literal =
-        (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? "NCCL_EP_LAYOUT_EXPERT_MAJOR" : "NCCL_EP_LAYOUT_RANK_MAJOR";
+    const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
     const char* topk_type = topkIdxIsInt64 ? "int64_t" : "int32_t";
-    const char* token_dtype_literal = ll_token_dtype_template_literal(tokenDtype);
+    const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(tokenDtype);
 
     // The JIT source must reference the same arg struct definition that the
     // host packs. Including device/ll_ep_adapter.cuh keeps the layout in sync;
@@ -53,7 +49,7 @@ inline std::string ll_dispatch_jit_source(
         << "      " << kernel_spec.recipe_source_literal << ",\n"
         << "      " << hidden << ",\n"
         << "      " << layout_literal << ",\n"
-        << "      " << ll_dispatch_bool_literal(nvlinkOnly) << ",\n"
+        << "      " << ::nccl_ep::jit::bool_literal(nvlinkOnly) << ",\n"
         << "      " << topk_type << ",\n"
         << "      " << token_dtype_literal << ">(\n"
         << "      p.inData, p.inScalesBuf,\n"
@@ -92,7 +88,7 @@ inline ncclResult_t launch_ll_dispatch(
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "ll_dispatch"
-             << "_hdim" << hidden << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_rm")
+             << "_hdim" << hidden << ::nccl_ep::jit::layout_name_tag(layout)
              << "_recipe" << kernel_spec.recipe_cache_tag
              << "_payload" << kernel_spec.payload_cache_tag
              << (nvlinkOnly ? "_nvlinkonly" : "") << (topkIdxIsInt64 ? "_topk64" : "_topk32")

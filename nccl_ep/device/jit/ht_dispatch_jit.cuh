@@ -10,6 +10,7 @@
 #include "device/ht_ep_adapter.cuh"
 #include "device/jit/jit_runtime.hpp"
 #include "device/jit/jit_utils.hpp"
+#include "device/jit/jit_source_literals.hpp"
 #include "nccl_ep_env.h"
 
 #include <climits>
@@ -26,10 +27,6 @@ namespace ht {
 namespace jit {
 
 constexpr const char* kDispatchJitEntryName = "nccl_ep_jit_ht_dispatch_kernel";
-
-inline const char* dispatch_bool_literal(bool value) {
-    return value ? "true" : "false";
-}
 
 inline const char* dispatch_recipe_literal(ncclEpDispatchQuantizationRecipe_t recipe) {
     switch (recipe) {
@@ -104,8 +101,7 @@ inline std::string dispatch_jit_source(
     int hidden_dim,
     int sf_bytes_per_token,
     const DispatchKernelSpec& kernel_spec) {
-    const char* layout_literal =
-        (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? "NCCL_EP_LAYOUT_EXPERT_MAJOR" : "NCCL_EP_LAYOUT_FLAT";
+    const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
     std::ostringstream src;
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
@@ -143,7 +139,7 @@ inline std::string dispatch_jit_source(
         << "      " << max_tokens_per_rank << ",\n"
         << "      " << num_lsa_teams << ",\n"
         << "      " << num_of_blocks << ",\n"
-        << "      " << dispatch_bool_literal(forward_dispatch) << ",\n"
+        << "      " << ::nccl_ep::jit::bool_literal(forward_dispatch) << ",\n"
         << "      " << num_pipelines << ",\n"
         << "      " << lsa_team_size << ",\n"
         << "      " << layout_literal << ",\n"
@@ -181,7 +177,7 @@ inline ncclResult_t launch_dispatch(
              << config.num_of_in_flight_s2g << "_chunk" << config.num_of_tokens_per_chunk << "_maxt"
              << max_tokens_per_rank << "_blocks" << config.num_of_blocks
              << (config.forward_dispatch ? "_fwd" : "_bwd")
-             << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_fl")
+             << ::nccl_ep::jit::layout_name_tag(layout)
              << "_recipe" << kernel_spec.recipe_cache_tag
              << "_payload" << kernel_spec.payload_cache_tag
              << "_scale" << kernel_spec.scale_cache_tag
@@ -246,7 +242,7 @@ inline ncclResult_t launch_dispatch(
             config.num_of_blocks,
             L.block_dim,
             dynamic_smem_bytes,
-            dispatch_bool_literal(config.forward_dispatch),
+            ::nccl_ep::jit::bool_literal(config.forward_dispatch),
             (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "EXPERT_MAJOR" : "FLAT"),
             kernel_spec.wire_dtype_literal,
             kernel_spec.recipe_source_literal,
@@ -357,7 +353,7 @@ inline std::string local_dup_jit_source(
         << "      TOKEN_DATA_TYPE,\n"
         << "      " << hidden_dim << ",\n"
         << "      " << pipe_depth << ",\n"
-        << "      " << dispatch_bool_literal(forward_dispatch) << ",\n"
+        << "      " << ::nccl_ep::jit::bool_literal(forward_dispatch) << ",\n"
         << "      " << dispatch_recipe_literal(recipe) << ">(p);\n"
         << "}\n";
     return src.str();

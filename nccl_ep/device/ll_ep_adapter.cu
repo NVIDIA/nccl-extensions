@@ -5,10 +5,11 @@
  */
 
 #include "device/ll_ep_adapter.cuh"
+#include "device/ll_ep.cuh"
+#include "device/macros.cuh"
 #include "common.hpp"
 #include "jit/ll_dispatch_jit.cuh"
 #include "jit/ll_combine_jit.cuh"
-#include "jit/ll_clean_jit.cuh"
 #include "quantization_recipe.hpp"
 
 #include <algorithm>
@@ -198,7 +199,9 @@ void call_combine(const CombineParams& params, cudaStream_t stream) {
     args.timeoutCycles = params.timeoutCycles;
 
     jit::launch_ll_combine(
-        params.useLogFmt,
+        // LogFMT compression is not wired into the current code flow; force it
+        // off until it is revisited (the template plumbing is kept).
+        /*useLogFmt=*/false,
         hidden,
         params.layout,
         params.topkIdxIsInt64,
@@ -208,6 +211,25 @@ void call_combine(const CombineParams& params, cudaStream_t stream) {
         smem_size,
         args,
         stream);
+}
+
+// ============================================================================
+// LL buffer-clean kernel (precompiled).
+//
+// Unlike dispatch/combine, clean has no runtime template parameters, so it is
+// statically compiled and launched directly (one cooperative block) instead of
+// going through JIT.
+// ============================================================================
+constexpr int kLlCleanNumThreads = 256;
+
+__launch_bounds__(kLlCleanNumThreads, 1) __global__ void ll_clean_low_latency_buffer_kernel(
+    const __grid_constant__ clean_low_latency_buffer_kernel_args_t p) {
+    clean_low_latency_buffer_kernel_impl<kLlCleanNumThreads>(
+        p.clean_0, p.num_clean_int_0,
+        p.clean_1, p.num_clean_int_1,
+        p.rankMask,
+        p.syncBuffer, p.syncWindow,
+        p.devComms, p.barrierSignalBase, p.timeoutCycles);
 }
 
 // ============================================================================
@@ -226,7 +248,8 @@ void call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cu
     args.barrierSignalBase = params.barrierSignalBase;
     args.timeoutCycles = params.timeoutCycles;
 
-    jit::launch_ll_clean_low_latency_buffer(args, stream);
+    SETUP_LAUNCH_CONFIG(1, kLlCleanNumThreads, stream);
+    LAUNCH_KERNEL(&cfg, ll_clean_low_latency_buffer_kernel, args);
 }
 
 } // namespace ll

@@ -36,11 +36,6 @@ __forceinline__ __device__ bool isRankMasked(int* rankMask, int rank) {
     }
 }
 
-// Compile-time switch reserved for future runtime P2P-disable wiring.
-// Kept as constexpr so the dead branches are eliminated, while preserving the
-// code paths that would activate if it were ever toggled.
-constexpr bool dP2pDisabled = false;
-
 __device__ __forceinline__ int getCommId(int hashKey) {
     return hashKey / MAX_NCCL_GIN_CTX_PER_COMM;
 }
@@ -85,11 +80,6 @@ __forceinline__ __device__ uint64_t ncclGetP2pPtr(
     // Local rank, no need for peer mapping
     if (rank == dstRank) {
         return dstPtr;
-    }
-
-    // If P2P is globally disabled, always use RDMA path
-    if (dP2pDisabled) {
-        return 0;
     }
 
     // P2P/NVLink only works between ranks on the same LSA team
@@ -357,10 +347,8 @@ __forceinline__ __device__ void sendToken(
 
 // Clean next receive count buffer
 __forceinline__ __device__ void cleanNextRecvCntBuf(int* nextRecvCntBuf, int nextRecvCntBufSize, int laneId) {
-    if (!dP2pDisabled) {
 #pragma unroll
-        for (int i = laneId; i < nextRecvCntBufSize; i += 32) nextRecvCntBuf[i] = 0;
-    }
+    for (int i = laneId; i < nextRecvCntBufSize; i += 32) nextRecvCntBuf[i] = 0;
 }
 
 // This function is very efficient and outperforms orignal expert counting
@@ -1343,10 +1331,8 @@ __forceinline__ __device__ void cleanNextRecvCntBufAndNotify(
     int* atomicCleanFlag,
     int numExperts,
     int laneId) {
-    if (!dP2pDisabled) {
 #pragma unroll
-        for (int i = laneId; i < nextRecvCntBufSize; i += 32) nextRecvCntBuf[i] = 0;
-    }
+    for (int i = laneId; i < nextRecvCntBufSize; i += 32) nextRecvCntBuf[i] = 0;
     // Notify before executing `int_p`
     __syncwarp();
     if (laneId == 0) atomic_add_release_global(atomicCleanFlag, numExperts);

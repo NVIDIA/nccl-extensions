@@ -27,7 +27,7 @@
  *
  *     void* base;
  *     ncclEpElasticBuffer buf;
- *     ncclEpElasticAlloc(&base, &buf, gpu_bytes, cpu_bytes, -1, -1);
+ *     ncclEpElasticAlloc(&base, &buf, gpu_bytes, cpu_bytes, -1);
  *
  *     ncclWindow_t win;
  *     ncclCommWindowRegister(comm, base, ncclEpElasticTotalBytes(&buf), &win, 0);
@@ -115,7 +115,13 @@ static inline int ncclEpElasticHandleTypes(CUdevice dev) {
 
 /*
  * Allocate an elastic buffer: a single contiguous VA mapping
- *   [gpu_bytes on the device] ++ [cpu_bytes on HOST_NUMA].
+ *   [gpu_bytes on the device] ++ [cpu_bytes on the GPU's HOST_NUMA node].
+ *
+ * The CPU segment is always placed on the GPU's host NUMA node (queried via
+ * CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID), so it is not exposed as a parameter: that
+ * attribute always names a host node — including on Grace systems, where GPU
+ * memory is itself NUMA-visible and an explicit id could otherwise select a
+ * device node by mistake.
  *
  * Either segment size may be 0 (degenerates to device-only or host-only); both
  * 0 is invalid. Each segment is rounded up to the cuMem allocation granularity,
@@ -128,7 +134,6 @@ static inline int ncclEpElasticHandleTypes(CUdevice dev) {
  *   gpu_bytes  [in]  Requested GPU-segment bytes (0 = no GPU segment).
  *   cpu_bytes  [in]  Requested CPU-segment bytes (0 = no CPU segment).
  *   gpu_dev_id [in]  CUDA device ordinal for the GPU segment (-1 = current device).
- *   numa_id    [in]  Host NUMA node for the CPU segment (-1 = the GPU's HOST_NUMA node).
  *
  * Returns CUDA_SUCCESS on success, otherwise the first failing CUresult.
  * The device is granted read/write access to BOTH segments (so device kernels
@@ -138,7 +143,7 @@ static inline int ncclEpElasticHandleTypes(CUdevice dev) {
 static inline CUresult ncclEpElasticAlloc(
     void** ptr, ncclEpElasticBuffer* buf,
     size_t gpu_bytes, size_t cpu_bytes,
-    int gpu_dev_id, int numa_id)
+    int gpu_dev_id)
 {
     if (ptr == NULL || buf == NULL || (gpu_bytes == 0 && cpu_bytes == 0)) {
         fprintf(stderr, "nccl_ep_elastic: invalid arguments to ncclEpElasticAlloc\n");
@@ -155,7 +160,7 @@ static inline CUresult ncclEpElasticAlloc(
     NCCL_EP_ELASTIC_CUCHECK(cuDeviceGet(&cuDev, gpuDev));
     int hostNuma = 0;
     NCCL_EP_ELASTIC_CUCHECK(cuDeviceGetAttribute(&hostNuma, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, cuDev));
-    const int numaNode = (numa_id >= 0) ? numa_id : hostNuma;
+    const int numaNode = hostNuma;  /* always the GPU's host NUMA node (Grace-safe) */
 
     const int handleTypes = ncclEpElasticHandleTypes(cuDev);
 

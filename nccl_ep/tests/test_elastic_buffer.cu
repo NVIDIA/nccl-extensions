@@ -8,8 +8,9 @@
  * https://github.com/NVIDIA/nccl/issues/2110 and
  * nccl_ep/examples/nccl_ep_elastic_buffer.h.
  *
- * Self-contained: builds its own HT group and uses the Expert-Major layout in
- * kLocalPermute mode (non-zero-copy) — the receiver expands the FLAT staging
+ * Self-contained: builds its own HT group and uses the Expert-Major layout with
+ * the EM duplication modes off (NCCL_EP_HT_EM_LOCAL_DUP / NCCL_EP_HT_EM_NVLINK_DUP,
+ * both default off), non-zero-copy — the receiver expands the FLAT staging
  * buffer into the user's recv buffer with a permute KERNEL (SASS stores) and
  * combine reads it back with a reduce kernel. That path never runs
  * cudaMemcpy/cudaMemset on the user buffer (which would crash on a cuMem
@@ -67,7 +68,7 @@ __global__ void zero_bytes(unsigned char* p, size_t n) {
 // Allocate a GPU+CPU elastic buffer; returns the VA base (or nullptr on failure).
 static void* alloc_elastic(ncclEpElasticBuffer* buf, size_t gpu_bytes, size_t cpu_bytes) {
     void* base = nullptr;
-    CUresult r = ncclEpElasticAlloc(&base, buf, gpu_bytes, cpu_bytes, -1, -1);
+    CUresult r = ncclEpElasticAlloc(&base, buf, gpu_bytes, cpu_bytes, -1);
     EXPECT_EQ(r, CUDA_SUCCESS) << "ncclEpElasticAlloc failed";
     return (r == CUDA_SUCCESS) ? base : nullptr;
 }
@@ -95,8 +96,8 @@ protected:
         if (d_topk_) cudaFree(d_topk_);
     }
 
-    // Expert-Major + non-zero-copy → kLocalPermute (permute/reduce kernels, no
-    // cudaMemcpy on the user recv buffer, so HOST_NUMA works).
+    // Expert-Major + non-zero-copy, EM dup modes off → permute/reduce kernels,
+    // no cudaMemcpy on the user recv buffer, so HOST_NUMA works.
     ncclEpHandle_t make_handle() {
         ncclEpHandle_t h = nullptr;
         EXPECT_EQ(ncclEpCreateHandle(&h, g_elastic_group, NCCL_EP_LAYOUT_EXPERT_MAJOR,

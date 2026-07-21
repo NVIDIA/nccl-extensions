@@ -54,6 +54,13 @@ std::vector<std::string> include_options(const JitCompileConfig& config) {
     // Include nccl_ep kernel headers and common.hpp
     add_include(config.source_dir);
     add_include(config.source_dir / "device");
+    // The EP install include root (parent of the staged nccl_ep/ dir). Needed so
+    // JIT-compiled kernels resolve the public "nccl_ep.h" (pulled in by ll_ep.cuh /
+    // ll_ep_adapter.cuh) and its internal "nccl_ep/ep_enums.h" self-reference. In a
+    // separate build tree (NCCL_EP_BUILDDIR != NCCL_HOME) build_include_dir points at
+    // the NCCL core include, which does not carry the EP public headers, so the EP
+    // include root must be added explicitly.
+    add_include(config.source_dir.parent_path());
 
     // Include all NCCL device headers
     if (!config.build_include_dir.empty()) {

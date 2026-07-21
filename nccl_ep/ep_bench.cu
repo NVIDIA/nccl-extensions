@@ -2913,13 +2913,19 @@ struct HighThroughputBytes {
 
 // Calculate all six byte metrics from topk_idx for High Throughput mode.
 //
-// Send side: count unique (token, node) pairs this rank sends to.
-//   total_send_tokens = all nodes (local + remote)
-//   rdma_send_tokens  = remote nodes only
+// Send side: count unique (token, target_rank) pairs this rank sends to.
+// NCCL EP sends a token to each target rank individually (intra-node over NVLink
+// P2P), so a token routed to several ranks -- even ranks on the same node -- is
+// counted once per rank. The implied NVLink send count (total_send - rdma_send)
+// is therefore the count of intra-node per-rank sends.
+//   total_send_tokens = all target ranks (local node via NVLink + remote nodes)
+//   rdma_send_tokens  = target ranks on remote nodes only
 //
 // Recv side: simulate all source ranks' randperm routing (deterministic from
 // seed = src_rank + 42) to count unique (src_rank, token) pairs where at least
-// one selected expert belongs to myRank.
+// one selected expert belongs to myRank. myRank is a single rank, so each such
+// pair is one received token regardless of how many local experts it targets --
+// this is already per-(source-rank) accounting.
 //   total_recv_tokens = all source ranks (NVL + RDMA)
 //   rdma_recv_tokens = remote source ranks only
 HighThroughputBytes calculateHighThroughputBytes(
@@ -2936,24 +2942,25 @@ HighThroughputBytes calculateHighThroughputBytes(
     ncclDataType_t token_dtype) {
     HighThroughputBytes bytes = {0, 0, 0, 0, 0, 0, 0, 0};
 
-    int num_nodes = (nRanks + lsa_team_size - 1) / lsa_team_size;
-    unsigned int num_experts_per_node = static_cast<unsigned int>(num_experts / num_nodes);
     int local_node = myRank / lsa_team_size;
     unsigned int num_experts_per_rank = num_experts / static_cast<unsigned int>(nRanks);
 
-    // Send side: count unique (token, node) pairs from this rank's topk_idx
-    // A token routed to multiple experts on the same node is counted only once, even though
-    // NCCL EP sends it to each target rank individually via NVLink P2P (not once per node).
-    // TODO: switch to per-rank counting for both nvl_send and nvl_recv.
+    // Send side: count unique (token, target_rank) pairs from this rank's topk_idx.
+    // NCCL EP sends a token to each target rank individually via NVLink P2P, so two
+    // experts that share the same node but live on different ranks are two distinct
+    // sends. Deduplicate per rank (not per node) so intra-node fan-out is counted
+    // correctly; a send is classified RDMA when the target rank is on a remote node.
     for (unsigned int t = 0; t < num_tokens; t++) {
-        std::set<int> nodes_for_token;
+        std::set<int> ranks_for_token;
         for (unsigned int k = 0; k < top_k; k++) {
             int64_t expert_id = topk_idx_host[t * top_k + k];
             if (expert_id < 0) continue;
-            int target_node = static_cast<int>(expert_id / num_experts_per_node);
-            if (nodes_for_token.insert(target_node).second) {
+            int target_rank = static_cast<int>(expert_id / num_experts_per_rank);
+            if (ranks_for_token.insert(target_rank).second) {
                 bytes.total_send_tokens++;
-                if (target_node != local_node) bytes.rdma_send_tokens++;
+                int target_node = target_rank / lsa_team_size;
+                if (target_node != local_node)
+                    bytes.rdma_send_tokens++;
             }
         }
     }

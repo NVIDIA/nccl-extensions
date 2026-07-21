@@ -9,6 +9,7 @@
 #include "device/ht_ep.cuh"
 #include "device/jit/jit_runtime.hpp"
 #include "device/jit/jit_utils.hpp"
+#include "device/jit/jit_source_literals.hpp"
 #include "nccl_ep_env.h"
 
 #include <cassert>
@@ -26,10 +27,6 @@ namespace ht {
 namespace jit {
 
 constexpr const char* kCombineJitEntryName = "nccl_ep_jit_ht_combine_kernel";
-
-inline const char* bool_literal(bool value) {
-    return value ? "true" : "false";
-}
 
 struct combine_warp_layout_t {
     int lsa_red_group_warps;
@@ -80,11 +77,8 @@ inline std::string combine_jit_source(
     ncclEpLayout_t layout,
     int hidden_dim,
     ncclDataType_t token_dtype = ncclBfloat16) {
-    const char* layout_literal =
-        (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? "NCCL_EP_LAYOUT_EXPERT_MAJOR" : "NCCL_EP_LAYOUT_FLAT";
-    const char* token_dtype_literal = token_dtype == ncclFloat32 ? "ncclFloat32" :
-                                      token_dtype == ncclFloat16 ? "ncclFloat16" :
-                                                                   "ncclBfloat16";
+    const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
+    const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
     std::ostringstream src;
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
@@ -119,7 +113,7 @@ inline std::string combine_jit_source(
         << "      " << num_lsa_teams << ",\n"
         << "      " << num_of_blocks << ",\n"
         << "      " << num_of_additional_in_flight_s2g << ",\n"
-        << "      " << bool_literal(backward_combine) << ",\n"
+        << "      " << ::nccl_ep::jit::bool_literal(backward_combine) << ",\n"
         << "      " << hidden_dim << ",\n"
         << "      " << lsa_team_size << ",\n"
         << "      " << layout_literal << ",\n"
@@ -159,7 +153,7 @@ inline void launch_combine(
              << num_of_stages_g2s << "_s2g" << num_of_stages_s2g << "_chunk" << num_of_tokens_per_chunk << "_maxt"
              << max_tokens_per_rank << "_group" << num_of_tokens_per_group << "_blocks" << num_of_blocks << "_extra"
              << num_of_additional_in_flight_s2g << (backward_combine ? "_bwd" : "_fwd")
-             << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_fl")
+             << ::nccl_ep::jit::layout_name_tag(layout)
              << (token_dtype == ncclFloat32 ? "_fp32" :
                  token_dtype == ncclFloat16 ? "_fp16" :
                                               "_bf16");
@@ -340,9 +334,7 @@ inline std::string local_reduce_jit_source(
     // Param/sizeof type collapses FP16->uint16_t (layout-identical); the decode
     // template arg keeps the real dtype so the reduce math is correct.
     const char* token_type_literal = (token_dtype == ncclFloat32) ? "uint32_t" : "uint16_t";
-    const char* token_dtype_literal = token_dtype == ncclFloat32 ? "ncclFloat32" :
-                                      token_dtype == ncclFloat16 ? "ncclFloat16" :
-                                                                   "ncclBfloat16";
+    const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
     std::ostringstream src;
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
@@ -355,7 +347,7 @@ inline std::string local_reduce_jit_source(
         << "      TOKEN_DATA_TYPE,\n"
         << "      " << hidden_dim << ",\n"
         << "      " << kLocalReduceBlockDim << ",\n"
-        << "      " << bool_literal(backward_combine) << ",\n"
+        << "      " << ::nccl_ep::jit::bool_literal(backward_combine) << ",\n"
         << "      " << token_dtype_literal << ",\n"
         << "      " << experts_per_rank << ">(p);\n"
         << "}\n";
@@ -423,9 +415,7 @@ inline std::string local_permute_reduce_jit_source(
     int hidden_int4,
     int blocks_per_sm,
     ncclDataType_t token_dtype = ncclBfloat16) {
-    const char* token_dtype_literal = token_dtype == ncclFloat32 ? "ncclFloat32" :
-                                      token_dtype == ncclFloat16 ? "ncclFloat16" :
-                                                                   "ncclBfloat16";
+    const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
     std::ostringstream src;
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"

@@ -17,20 +17,8 @@
 namespace nccl_ep {
 namespace ll {
 
-// Token-wire-dtype helpers shared by the LL dispatch/combine JIT generators.
-// `*_template_literal` is the ncclDataType_t enumerator emitted into the JIT
-// source as the kTokenDtype template argument; `*_name_tag` is a short suffix
-// folded into the variant_name so distinct wire dtypes get distinct cache keys.
-inline const char* ll_token_dtype_template_literal(ncclDataType_t dt) {
-    switch (dt) {
-    case ncclFloat32:
-        return "ncclFloat32";
-    case ncclFloat16:
-        return "ncclFloat16";
-    default:
-        return "ncclBfloat16";
-    }
-}
+// Short per-dtype suffix folded into the LL JIT variant_name so distinct wire
+// dtypes get distinct cache keys.
 inline const char* ll_token_dtype_name_tag(ncclDataType_t dt) {
     switch (dt) {
     case ncclFloat32:
@@ -50,10 +38,10 @@ inline const char* ll_token_dtype_name_tag(ncclDataType_t dt) {
 // `const __grid_constant__ <struct> p`, then unpacks `p.foo` into the
 // templated `*_kernel_impl(...)` device function defined in ll_ep.cuh.
 //
-// The struct layouts must match what the JIT source expects, so any field
-// added here must also be threaded through the corresponding JIT entry
-// declared in device/jit/ll_dispatch_jit.cuh, device/jit/ll_combine_jit.cuh,
-// or device/jit/ll_clean_jit.cuh.
+// The struct layouts must match what the kernel expects, so any field added
+// here must also be threaded through the matching kernel entry: the JIT sources
+// device/jit/ll_dispatch_jit.cuh / ll_combine_jit.cuh for dispatch and combine,
+// and the precompiled clean kernel in device/ll_ep_adapter.cu.
 // ============================================================================
 
 struct dispatch_kernel_args_t {

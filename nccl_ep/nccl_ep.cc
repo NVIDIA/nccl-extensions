@@ -388,8 +388,13 @@ static ncclResult_t validateDispatchRecipe(
             if (output_tokens == nullptr) {
                 return fail("outputs->tokens is required");
             }
-            if (input_scales->ndim != 2 || input_scales->datatype != ncclFloat32) {
-                return fail("inputs->scales must be FP32 2D [tokens, scales]");
+            // Scales forward as opaque bytes: any sized dtype up to sizeof(float)
+            // (FP32 block scaling, Uint8/E8M0 MXFP8 block 32, FP16/FP8, ...). The staging
+            // buffer reserves sizeof(float) per scale, so wider scales are rejected.
+            const int scale_dtype_bytes = ncclTypeSize(input_scales->datatype);
+            if (input_scales->ndim != 2 || scale_dtype_bytes <= 0 ||
+                scale_dtype_bytes > static_cast<int>(sizeof(float))) {
+                return fail("inputs->scales must be a sized dtype <= 4B, 2D [tokens, scales]");
             }
             if (input_scales->sizes[0] != tokens->sizes[0]) {
                 return fail("inputs->scales dimension 0 must equal the token count");
@@ -397,10 +402,11 @@ static ncclResult_t validateDispatchRecipe(
             if (input_scales->sizes[1] == 0) {
                 return fail("inputs->scales dimension 1 must be non-zero");
             }
-            if (static_cast<size_t>(launch.hidden) + input_scales->sizes[1] * sizeof(float) > launch.max_token_bytes) {
+            if (static_cast<size_t>(launch.hidden) + input_scales->sizes[1] * scale_dtype_bytes >
+                launch.max_token_bytes) {
                 return fail("token bytes plus scale bytes exceed the group token-byte limit");
             }
-            const size_t scale_bytes = input_scales->sizes[1] * sizeof(float);
+            const size_t scale_bytes = input_scales->sizes[1] * scale_dtype_bytes;
             if (scale_bytes % 16 != 0) {
                 return fail("scale bytes per token must be 16-byte aligned");
             }
@@ -408,6 +414,10 @@ static ncclResult_t validateDispatchRecipe(
                 return fail("outputs->tokens dtype must match inputs->tokens");
             }
             if (launch.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
+                // LL forwards scales as FP32 only (fixed vectorized transport layout).
+                if (input_scales->datatype != ncclFloat32) {
+                    return fail("LL SCALES_FORWARD requires FP32 scales");
+                }
                 const size_t expected_slots = static_cast<size_t>(launch.max_tokens_per_rank) * launch.num_ranks;
                 if (output_scales->ndim != 3 || output_scales->datatype != ncclFloat32) {
                     return fail("LL outputs->scales must be FP32 3D [local_experts, recv_slots, scales]");
@@ -418,8 +428,10 @@ static ncclResult_t validateDispatchRecipe(
                     return fail("LL outputs->scales dimensions do not match local experts, recv slots, and input scales");
                 }
             } else {
-                if (output_scales->ndim != 2 || output_scales->datatype != ncclFloat32) {
-                    return fail("HT outputs->scales must be FP32 2D [recv_tokens, scales]");
+                // HT stages scales as opaque bytes; any sized scale dtype works as long as
+                // input/output dtypes agree.
+                if (output_scales->ndim != 2 || output_scales->datatype != input_scales->datatype) {
+                    return fail("HT outputs->scales must match inputs->scales dtype, 2D [recv_tokens, scales]");
                 }
                 if (output_scales->sizes[0] == 0 || output_scales->sizes[1] != input_scales->sizes[1]) {
                     return fail("HT outputs->scales must have non-zero rows and match input scale count");
@@ -3402,25 +3414,14 @@ ncclResult_t ncclEpDispatch(
                 stream));
             token_ptr = handle->ht.token_staging_buffer;
         }
-        // The recipe selects external quantization; tensors only satisfy its contract.
-        // local_dup / local_reduce JIT hard-codes uint16_t token type; SCALES_FORWARD is unsupported.
-        if ((quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) && em_local_dup_active(group, handle->layout)) {
-            return ncclInvalidArgument;
-        }
-        // SCALES_FORWARD is incompatible with the FLAT-dispatch + local-permute path: the
-        // permute kernel is bf16-only and UpdateHandle has already populated
-        // the main LERM in FLAT shape (mismatched for the nvlink_dup
-        // dense_to_sparse_prob consumer). Hard-reject early before any kernel
-        // runs; the user can set NCCL_EP_HT_EM_NVLINK_DUP=1 to take that path.
-        if (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
-            em_local_permute_enabled(group, handle)) {
-            fprintf(
-                stderr,
-                "NCCL EP: HT EM scales-forward is not supported on the local-permute path; "
-                "set NCCL_EP_HT_EM_NVLINK_DUP=1 to use the nvlink_dup path.\n");
-            return ncclInvalidArgument;
-        }
-        const int scale_elem_bytes = static_cast<int>(sizeof(float));
+        // SCALES_FORWARD is supported on both EM paths: local_permute_dup relocates
+        // scale rows into EM order (permute), and local_dup fans the per-token scale
+        // row out to secondary EM slots (dedup fan-out) — see the calls below.
+        // SCALES_FORWARD forwards scales as opaque bytes: FP32 (block scaling) or
+        // Uint8 (MXFP8 E8M0). Derive bytes-per-scale from the caller's scales tensor.
+        const int scale_elem_bytes = (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)
+                                         ? static_cast<int>(ncclTypeSize(scales->datatype))
+                                         : static_cast<int>(sizeof(float));
         if ((quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)) {
             NCCLCHECK(resolveTensorWindowBinding(
                 group,
@@ -3750,7 +3751,11 @@ ncclResult_t ncclEpDispatch(
                 forward_dispatch,
                 params.local_dup_num_sms,
                 stream,
-                x->datatype);
+                x->datatype,
+                quantization_recipe,
+                /*expert_output_scale=*/
+                (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) ? group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[group->lsa_rank] : nullptr,
+                /*scale_row_bytes=*/sf_bytes_per_token);
         }
         /* ===== Copy intra-LSA staging → caller outputs ===== */
         // External-window outputs are written directly by the kernel; regular tensors
@@ -3856,14 +3861,32 @@ ncclResult_t ncclEpDispatch(
         if (em_permute_active) {
             // BWD passes recv_topk_weights == nullptr (weights are FWD-only).
             assert(forward_dispatch ? (recv_topk_weights != nullptr) : (recv_topk_weights == nullptr));
-            if (!validate_dtype(recv_x->datatype)) {
-                // local_permute_dup is a byte-relocation kernel: any NONE-mode
-                // wire dtype (bf16/fp16/fp32) works; SCALES_FORWARD is not supported here.
-                return ncclInvalidArgument;
+            if (quantization_recipe == NCCL_EP_DISPATCH_QUANT_NONE) {
+                if (!validate_dtype(recv_x->datatype)) {
+                    // local_permute_dup is a byte-relocation kernel: any NONE-mode wire
+                    // dtype (bf16/fp16/fp32) works; SCALES_FORWARD rows are 1B (fp8) or
+                    // 4B (fp32) and relocate the same way via row_bytes.
+                    return ncclInvalidArgument;
+                }
             }
             const int row_bytes = static_cast<int>(recv_x->sizes[1]) * ncclTypeSize(recv_x->datatype);
             if (row_bytes <= 0 || (row_bytes % 16) != 0) {
                 return ncclInvalidArgument; // int4-vectorized row copy requires 16B-aligned row
+            }
+            // SCALES_FORWARD: relocate the FLAT scale rows into EM order alongside the
+            // tokens (replaces the straight FLAT->caller scale copy below).
+            void* perm_recv_scales_em = nullptr;
+            const void* perm_flat_scale_staging = nullptr;
+            int perm_scale_row_bytes = 0;
+            if (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+                if (recv_scales->sizes[0] < static_cast<size_t>(group->max_recv_tokens)) {
+                    return ncclInvalidArgument; // EM scale slots, like recv_x
+                }
+                perm_recv_scales_em = recv_scales->data;
+                perm_flat_scale_staging =
+                    group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[group->lsa_rank];
+                perm_scale_row_bytes =
+                    static_cast<int>(recv_scales->sizes[1]) * ncclTypeSize(recv_scales->datatype);
             }
             nccl_ep::ht::launch_dispatch_permute(
                 recv_x->data,
@@ -3880,11 +3903,16 @@ ncclResult_t ncclEpDispatch(
                 static_cast<int>(group->device_sm_count),
                 group->prolog_epilog_sms,
                 caller_num_recv_tokens,
-                stream);
+                stream,
+                quantization_recipe,
+                perm_recv_scales_em,
+                perm_flat_scale_staging,
+                perm_scale_row_bytes);
         }
 
-        // SCALES_FORWARD output scales (async D2D, sized by caller).
-        if (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        // SCALES_FORWARD output scales (async D2D, sized by caller). On the EM-permute
+        // path the scales are already relocated into EM order by local_permute_dup above.
+        if (quantization_recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD && !em_permute_active) {
             assert(recv_scales->ndim == 2);
             if (!rcv_scales_zcopy) {
                 if (recv_scales->sizes[0] < recv_copy_rows) {

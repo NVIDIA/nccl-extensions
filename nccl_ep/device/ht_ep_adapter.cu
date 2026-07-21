@@ -1160,11 +1160,14 @@ void call_local_dup(
     bool forward_dispatch,
     int num_blocks,
     cudaStream_t stream,
-    ncclDataType_t token_dtype) {
+    ncclDataType_t token_dtype,
+    ncclEpDispatchQuantizationRecipe_t recipe,
+    void* expert_output_scale,
+    int scale_row_bytes) {
     constexpr int kPipeDepth = NCCL_EP_HT_LOCAL_DUP_PIPE_DEPTH;
-    // local_dup is a byte-relocation fan-out: the wire type only sets the
-    // per-token width (FP16/BF16 -> uint16_t, FP32 -> uint32_t). SCALES_FORWARD
-    // is rejected upstream on this path.
+    // local_dup is a byte-relocation fan-out: the wire type only sets the per-token
+    // width (fp8 -> uint8_t, FP16/BF16 -> uint16_t, FP32 -> uint32_t). SCALES_FORWARD
+    // fans a per-token scale row (scale_row_bytes) out alongside the token.
     auto run = [&](auto tag) {
         using TOKEN_DATA_TYPE = decltype(tag);
         const int smem_bytes = ::ht_ep::local_dup_dynamic_smem_bytes(
@@ -1173,7 +1176,8 @@ void call_local_dup(
             forward_dispatch,
             experts_per_rank,
             ranks_per_lsa_team,
-            sizeof(TOKEN_DATA_TYPE));
+            sizeof(TOKEN_DATA_TYPE),
+            scale_row_bytes);
 
         ::ht_ep::local_dup_kernel_param_t<TOKEN_DATA_TYPE> pp{};
         pp.expert_output_token = reinterpret_cast<TOKEN_DATA_TYPE*>(expert_output_token);
@@ -1186,16 +1190,20 @@ void call_local_dup(
         pp.grid_barrier_counter = grid_barrier_counter;
         pp.experts_per_rank = experts_per_rank;
         pp.ranks_per_lsa_team = ranks_per_lsa_team;
+        pp.expert_output_scale = expert_output_scale;
+        pp.scale_row_bytes = scale_row_bytes;
         jit::launch_local_dup<TOKEN_DATA_TYPE>(
             hidden_dim,
             kPipeDepth,
             forward_dispatch,
+            recipe,
             num_blocks,
             pp,
             smem_bytes,
             stream);
     };
     if (token_dtype == ncclFloat32) run(uint32_t{});
+    else if (token_dtype == ncclFloat8e4m3 || token_dtype == ncclFloat8e5m2) run(uint8_t{});
     else run(uint16_t{});
 }
 
@@ -1283,12 +1291,19 @@ void launch_dispatch_permute(
     int sm_count,
     unsigned int prolog_epilog_sms,
     int caller_num_recv_tokens,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    ncclEpDispatchQuantizationRecipe_t recipe,
+    void* recv_scales_em,
+    const void* flat_scale_staging,
+    int scale_row_bytes) {
     assert(experts_per_rank > 0 && experts_per_rank <= ::ht_ep::kLocalPermuteMaxExpertsPerRank);
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
     assert(sm_count > 0);
     assert((recv_topk_weights_em == nullptr) == (recv_topk_weights_flat == nullptr));
+    // SCALES_FORWARD: scale rows relocate alongside tokens; 16B-aligned like tokens.
+    assert(scale_row_bytes >= 0 && (scale_row_bytes % 16) == 0);
+    assert((scale_row_bytes > 0) == (recv_scales_em != nullptr && flat_scale_staging != nullptr));
 
     const unsigned int grid = local_permute_grid(sm_count, prolog_epilog_sms);
 
@@ -1305,8 +1320,11 @@ void launch_dispatch_permute(
     p.experts_per_rank = experts_per_rank;
     p.row_bytes = row_bytes;
     p.caller_num_recv_tokens = caller_num_recv_tokens;
+    p.recv_scales_em = recv_scales_em;
+    p.flat_scale_staging = flat_scale_staging;
+    p.scale_row_bytes = scale_row_bytes;
 
-    ::nccl_ep::ht::jit::launch_local_permute_dup(static_cast<int>(grid), p, stream);
+    ::nccl_ep::ht::jit::launch_local_permute_dup(static_cast<int>(grid), p, recipe, stream);
 }
 
 void launch_combine_reduce(

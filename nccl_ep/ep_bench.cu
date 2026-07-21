@@ -864,12 +864,20 @@ static const int TOKEN_ID_COLS = 128;
 static const unsigned DS_FP8E3M4_ELEMENTS_PER_SCALE = 128;
 static const unsigned SCALES_FORWARD_BENCHMARK_SCALES_PER_TOKEN = 4;
 
+// --mxfp8 overrides the SCALES_FORWARD test shape to MXFP8: scale block 32 (numScales =
+// hidden/32) and Uint8 (E8M0) scales. g_scaleBlockOverride == 0 keeps the recipe default.
+static unsigned g_scaleBlockOverride = 0;
+static ncclDataType_t g_scaleDtype = ncclFloat32;
+static inline unsigned scaleElemBytes() { return g_scaleDtype == ncclUint8 ? 1u : 4u; }
+
 static unsigned int benchmarkScalesPerToken(
     ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
     unsigned int hidden) {
     switch (dispatch_quantization) {
         case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
-            return SCALES_FORWARD_BENCHMARK_SCALES_PER_TOKEN;
+            // --mxfp8: block 32 -> hidden/32 scales; otherwise the recipe default.
+            return g_scaleBlockOverride > 0 ? (hidden / g_scaleBlockOverride)
+                                            : SCALES_FORWARD_BENCHMARK_SCALES_PER_TOKEN;
         case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
             return hidden / DS_FP8E3M4_ELEMENTS_PER_SCALE;
         case NCCL_EP_DISPATCH_QUANT_NONE:
@@ -890,6 +898,21 @@ static inline uint8_t scalesForwardTokenByte(int rank, unsigned int t, unsigned 
 
 static inline float scalesForwardScaleValue(int rank, unsigned int t, unsigned int b) {
     return static_cast<float>(rank * 1000 + static_cast<int>(t) * 10 + static_cast<int>(b));
+}
+
+// Deterministic 1-byte (E8M0) scale for MXFP8 byte-transport validation.
+static inline uint8_t scalesForwardScaleByte(int rank, unsigned int t, unsigned int b) {
+    return static_cast<uint8_t>((static_cast<unsigned>(rank) * 131u + t * 17u + b * 7u + 1u) & 0xFFu);
+}
+
+// Fill dst (numScales * scaleElemBytes() bytes) with the deterministic scale row for (rank,t).
+static inline void fillScalesForwardScaleRow(uint8_t* dst, int rank, unsigned int t, unsigned int numScales) {
+    if (g_scaleDtype == ncclUint8) {
+        for (unsigned int b = 0; b < numScales; b++) dst[b] = scalesForwardScaleByte(rank, t, b);
+    } else {
+        float* f = reinterpret_cast<float*>(dst);
+        for (unsigned int b = 0; b < numScales; b++) f[b] = scalesForwardScaleValue(rank, t, b);
+    }
 }
 
 // Combine-validation thresholds for the cosine-similarity discrepancy metric.
@@ -942,18 +965,18 @@ void initializeValidationData(
         }
         delete[] token_data_host;
 
-        // Fill input scales if present.
+        // Fill input scales if present (byte-generic: FP32 or Uint8/E8M0).
         if (dispatch_inputs.scales) {
             const unsigned int numScales = static_cast<unsigned int>(dispatch_inputs.scales->sizes[1]);
-            size_t scale_size = static_cast<size_t>(num_tokens) * numScales;
-            float* scale_data_host = new float[scale_size];
+            const size_t row_bytes = static_cast<size_t>(numScales) * scaleElemBytes();
+            size_t scale_bytes_total = static_cast<size_t>(num_tokens) * row_bytes;
+            uint8_t* scale_data_host = new uint8_t[scale_bytes_total];
             for (unsigned int t = 0; t < num_tokens; t++)
-                for (unsigned int b = 0; b < numScales; b++)
-                    scale_data_host[static_cast<size_t>(t) * numScales + b] = scalesForwardScaleValue(myRank, t, b);
+                fillScalesForwardScaleRow(scale_data_host + static_cast<size_t>(t) * row_bytes, myRank, t, numScales);
             {
                 void* scales_data;
                 NCCLCHECK(epGetTensorData(alloc, dispatch_inputs.scales, &scales_data));
-                CUDACHECK(cudaMemcpy(scales_data, scale_data_host, scale_size * sizeof(float), cudaMemcpyHostToDevice));
+                CUDACHECK(cudaMemcpy(scales_data, scale_data_host, scale_bytes_total, cudaMemcpyHostToDevice));
             }
             delete[] scale_data_host;
         }
@@ -1800,6 +1823,7 @@ static ValidationResult validateDispatchOutputHTScalesForward(
     ErrorReporter rep;
 
     const unsigned int numScales = static_cast<unsigned int>(dispatch_outputs.scales->sizes[1]);
+    const unsigned int scaleEB = scaleElemBytes();
 
     const size_t* out0_sizes = dispatch_outputs.tokens->sizes;
     unsigned int buf_rows = out0_sizes[0];
@@ -1810,11 +1834,11 @@ static ValidationResult validateDispatchOutputHTScalesForward(
     CUDACHECK(
         cudaMemcpy(recv_tok, dispatch_outputs.tokens->data, recv_tok_size * sizeof(uint8_t), cudaMemcpyDeviceToHost));
 
-    // Recv scales (FP32).
+    // Recv scales (raw bytes: FP32 4B or Uint8/E8M0 1B).
     size_t recv_sf_size = static_cast<size_t>(buf_rows) * numScales;
-    uint8_t* recv_sf_raw = new uint8_t[recv_sf_size * sizeof(float)];
+    uint8_t* recv_sf_raw = new uint8_t[recv_sf_size * scaleEB];
     CUDACHECK(
-        cudaMemcpy(recv_sf_raw, dispatch_outputs.scales->data, recv_sf_size * sizeof(float), cudaMemcpyDeviceToHost));
+        cudaMemcpy(recv_sf_raw, dispatch_outputs.scales->data, recv_sf_size * scaleEB, cudaMemcpyDeviceToHost));
 
     // Valid-slot scan. For flat layout, topk_idx is available and some slots may be empty.
     // For EM layout, topk_idx is not allocated; all output rows are valid tokens.
@@ -1836,7 +1860,6 @@ static ValidationResult validateDispatchOutputHTScalesForward(
         }
         delete[] recv_topk_idx;
     } else {
-        // EM: all rows are valid.
         for (unsigned int j = 0; j < buf_rows; j++) valid_slot[j] = true;
     }
 
@@ -1862,13 +1885,12 @@ static ValidationResult validateDispatchOutputHTScalesForward(
     // Per valid slot: decode identity from token bytes 0-2, memcmp token + scale rows.
     std::set<std::pair<int, int>> found;
     std::vector<uint8_t> exp_tok(hidden);
-    std::vector<float> exp_sf(numScales);
-    const float* recv_sf = reinterpret_cast<const float*>(recv_sf_raw);
+    std::vector<uint8_t> exp_sf(static_cast<size_t>(numScales) * scaleEB);
     for (unsigned int j = 0; j < buf_rows; j++) {
         if (!valid_slot[j]) continue;
 
         const uint8_t* tok_row = recv_tok + static_cast<size_t>(j) * hidden;
-        const float* sf_row = recv_sf + static_cast<size_t>(j) * numScales;
+        const uint8_t* sf_row = recv_sf_raw + static_cast<size_t>(j) * numScales * scaleEB;
 
         // Identity is in the first 3 bytes of the token row.
         int src_rank = static_cast<int>(tok_row[0]);
@@ -1914,16 +1936,16 @@ static ValidationResult validateDispatchOutputHTScalesForward(
                 exp_tok[bad]);
         }
 
-        // Recompute and compare the full scale row.
-        for (unsigned int b = 0; b < numScales; b++)
-            exp_sf[b] = scalesForwardScaleValue(src_rank, static_cast<unsigned>(token_id), b);
-        if (memcmp(sf_row, exp_sf.data(), numScales * sizeof(float)) != 0) {
-            unsigned int bad = 0;
-            for (; bad < numScales; bad++)
+        // Recompute and byte-compare the full scale row (FP32 or E8M0/Uint8).
+        fillScalesForwardScaleRow(exp_sf.data(), src_rank, static_cast<unsigned>(token_id), numScales);
+        const size_t sf_row_bytes = static_cast<size_t>(numScales) * scaleEB;
+        if (memcmp(sf_row, exp_sf.data(), sf_row_bytes) != 0) {
+            size_t bad = 0;
+            for (; bad < sf_row_bytes; bad++)
                 if (sf_row[bad] != exp_sf[bad]) break;
             rep.error(
                 "[Rank %d] SCALES_FORWARD dispatch: slot %u (rank=%d, token=%d): scale mismatch "
-                "at block=%u (got %.9g exp %.9g)\n",
+                "at byte=%zu (got 0x%02x exp 0x%02x)\n",
                 myRank,
                 j,
                 src_rank,
@@ -2862,7 +2884,7 @@ LowLatencyBytes calculateLowLatencyBytes(
     }
 
     const size_t quantized_bytes_per_selection = hidden +
-        benchmarkScalesPerToken(dispatch_quantization, hidden) * sizeof(float) + 16;
+        benchmarkScalesPerToken(dispatch_quantization, hidden) * scaleElemBytes() + 16;
     // NONE-mode bytes per selection: hidden * elem_bytes (2 for bf16/fp16, 4 for fp32)
     const size_t none_bytes_per_selection = hidden * tokenElemBytes(token_dtype);
 
@@ -2999,7 +3021,7 @@ HighThroughputBytes calculateHighThroughputBytes(
             break;
         case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
             bytes_per_token = hidden +
-                benchmarkScalesPerToken(dispatch_quantization, hidden) * sizeof(float);
+                benchmarkScalesPerToken(dispatch_quantization, hidden) * scaleElemBytes();
             break;
         default:
             fprintf(stderr, "NCCL EP benchmark warning: unsupported dispatch recipe %d\n",
@@ -3608,6 +3630,7 @@ int main(int argc, char* argv[]) {
         {"non-uniform-tokens", no_argument, 0, 'N'},
         {"topk-idx-int32", no_argument, 0, 'I'},
         {"dispatch-quantization", required_argument, 0, 0},
+        {"mxfp8", no_argument, 0, 0},
         {"expert-id-kind", required_argument, 0, 1000},
         {"datatype", required_argument, 0, 0},
         {"disable-token-dropping", no_argument, 0, 1001},
@@ -3753,6 +3776,11 @@ int main(int argc, char* argv[]) {
                         MPI_Finalize();
                         return 1;
                     }
+                } else if (strcmp(name, "mxfp8") == 0) {
+                    // MXFP8 scales-forward: E4M3 tokens, block 32, E8M0 (Uint8) scales. HT only.
+                    dispatch_quantization = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+                    g_scaleBlockOverride = 32;
+                    g_scaleDtype = ncclUint8;
                 } else if (strcmp(name, "datatype") == 0) {
                     if (strcmp(optarg, "bf16") == 0) token_dtype = ncclBfloat16;
                     else if (strcmp(optarg, "fp16") == 0) token_dtype = ncclFloat16;
@@ -4395,7 +4423,7 @@ int main(int argc, char* argv[]) {
         dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
         const unsigned int numScales = benchmarkScalesPerToken(dispatch_quantization, hidden);
         if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
-            NCCLCHECK(epMakeTensor(&dispatch_inputs.scales, 2, ncclFloat32, num_tokens, numScales));
+            NCCLCHECK(epMakeTensor(&dispatch_inputs.scales, 2, g_scaleDtype, num_tokens, numScales));
         }
         if (is_ll_mode) {
             NCCLCHECK(epMakeTensor(
@@ -4406,7 +4434,7 @@ int main(int argc, char* argv[]) {
                 (unsigned)nRanks * max_tokens_per_rank,
                 numScales));
         } else {
-            NCCLCHECK(epMakeTensor(&dispatch_outputs.scales, 2, ncclFloat32, num_recv_tokens, numScales));
+            NCCLCHECK(epMakeTensor(&dispatch_outputs.scales, 2, g_scaleDtype, num_recv_tokens, numScales));
         }
     }
     if (myRank == 0) {

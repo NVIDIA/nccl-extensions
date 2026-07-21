@@ -4475,6 +4475,8 @@ struct local_dup_kernel_param_t {
     uint32_t* grid_barrier_counter;
     int experts_per_rank;
     int ranks_per_lsa_team;
+    void* expert_output_scale; // SCALES_FORWARD: per-token scale row; void* (dtype varies by recipe)
+    int scale_row_bytes;
 };
 
 // Dynamic shared-memory bytes required by local_dup_kernel_impl for the given
@@ -4485,17 +4487,18 @@ inline int local_dup_dynamic_smem_bytes(
     bool forward_dispatch,
     int experts_per_rank,
     int ranks_per_lsa_team,
-    size_t token_elem_bytes) {
+    size_t token_elem_bytes,
+    int scale_row_bytes) {
     const int token_bytes = hidden_dim * static_cast<int>(token_elem_bytes);
     const int prob_bytes =
         forward_dispatch ? experts_per_rank * ranks_per_lsa_team * static_cast<int>(sizeof(float)) : 0;
-    const int rings = pipe_depth * (token_bytes + prob_bytes);
+    const int rings = pipe_depth * (token_bytes + prob_bytes + scale_row_bytes);
     const int mbar_bytes = pipe_depth * 2 * static_cast<int>(sizeof(uint64_t)) + 8;
     return rings + mbar_bytes;
 }
 
-// TODO: FP8 token duplication is not yet supported.
-template <typename T, int HIDDEN_DIM, int PIPE_DEPTH, bool FORWARD_DISPATCH>
+template <typename T, int HIDDEN_DIM, int PIPE_DEPTH, bool FORWARD_DISPATCH,
+          ncclEpDispatchQuantizationRecipe_t kRecipe = NCCL_EP_DISPATCH_QUANT_NONE>
 __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_param_t<T>& p) {
     // Wait until all peers have signaled S2G completion on this rank's recv buffer.
     // Use >= rather than == so a future code path that overshoots the counter
@@ -4518,6 +4521,7 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
     uint8_t* smem_ptr = smem_raw;
     T* smem_token[PIPE_DEPTH];
     float* smem_prob[PIPE_DEPTH];
+    uint8_t* smem_scale[PIPE_DEPTH];
 #pragma unroll
     for (int s = 0; s < PIPE_DEPTH; ++s) {
         smem_token[s] = reinterpret_cast<T*>(smem_ptr);
@@ -4527,6 +4531,12 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
         for (int s = 0; s < PIPE_DEPTH; ++s) {
             smem_prob[s] = reinterpret_cast<float*>(smem_ptr);
             smem_ptr += prob_bytes;
+        }
+    }
+    if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        for (int s = 0; s < PIPE_DEPTH; ++s) {
+            smem_scale[s] = smem_ptr;
+            smem_ptr += p.scale_row_bytes;
         }
     }
     smem_ptr = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(smem_ptr) + 7) & ~uintptr_t(7));
@@ -4568,7 +4578,7 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
     const int block_id = blockIdx.x;
     const int n_blocks = gridDim.x;
     const int group_stride = p.emuf_group_stride;
-    const uint32_t total_tx = static_cast<uint32_t>(kTokenBytes + prob_bytes);
+    const uint32_t total_tx = static_cast<uint32_t>(kTokenBytes + prob_bytes + p.scale_row_bytes);
 
     if (warp_id == 0) {
         // Producer (G2S): 1 TMA load of the primary token per group.
@@ -4599,6 +4609,17 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
                         smem_prob[stage],
                         src_prob,
                         prob_bytes,
+                        &prod_mbar[stage]);
+                }
+                if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+                    const uint8_t* src_scale =
+                        static_cast<const uint8_t*>(p.expert_output_scale) + static_cast<size_t>(primary_em) * p.scale_row_bytes;
+                    cuda::ptx::cp_async_bulk(
+                        cuda::ptx::space_shared,
+                        cuda::ptx::space_global,
+                        smem_scale[stage],
+                        src_scale,
+                        p.scale_row_bytes,
                         &prod_mbar[stage]);
                 }
                 cuda::ptx::mbarrier_arrive_expect_tx(
@@ -4643,6 +4664,15 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
                             dst_prob,
                             smem_prob[stage],
                             prob_bytes);
+                    }
+                    if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+                        uint8_t* dst_scale = static_cast<uint8_t*>(p.expert_output_scale) + static_cast<size_t>(sec) * p.scale_row_bytes;
+                        cuda::ptx::cp_async_bulk(
+                            cuda::ptx::space_global,
+                            cuda::ptx::space_shared,
+                            dst_scale,
+                            smem_scale[stage],
+                            p.scale_row_bytes);
                     }
                 }
                 cuda::ptx::cp_async_bulk_commit_group();
@@ -4975,9 +5005,16 @@ struct local_permute_dup_param_t {
     int experts_per_rank;
     int row_bytes;
     int caller_num_recv_tokens;   // caller recv buffer row capacity
+    // SCALES_FORWARD: per-token scale rows relocated with the same slot map as
+    // the tokens. recv_scales_em/flat_scale_staging are null and scale_row_bytes
+    // is 0 for NONE mode. scale_row_bytes is 16B-aligned (host-validated).
+    void* recv_scales_em;
+    const void* flat_scale_staging;
+    int scale_row_bytes;
 };
 
-template <int HiddenInt4, int HiddenVec>
+template <int HiddenInt4, int HiddenVec,
+          ncclEpDispatchQuantizationRecipe_t kRecipe = NCCL_EP_DISPATCH_QUANT_NONE>
 __device__ __forceinline__ void local_permute_dup(
     uint8_t* __restrict__ recv_x_em,
     float* __restrict__ recv_topk_weights_em,
@@ -4990,7 +5027,12 @@ __device__ __forceinline__ void local_permute_dup(
     int top_k,
     int experts_per_rank,
     int /*row_bytes*/,
-    int caller_num_recv_tokens) {
+    int caller_num_recv_tokens,
+    // SCALES_FORWARD: relocate a per-token scale row alongside the token row.
+    // scale_dst/scale_src null and scale_row_bytes==0 for NONE (scale copy skipped).
+    uint8_t* __restrict__ scale_dst,
+    const uint8_t* __restrict__ scale_src,
+    int scale_row_bytes) {
     constexpr int kThreadsPerSlot = kLocalPermuteThreadsPerSlot;
     constexpr int kHiddenVec = HiddenVec;
     constexpr int kPermuteWarps = kLocalPermutePermuteWarps;
@@ -5047,6 +5089,14 @@ __device__ __forceinline__ void local_permute_dup(
                     dst_g,
                     reinterpret_cast<uint8_t*>(s_zero),
                     row_bytes);
+                if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+                    cuda::ptx::cp_async_bulk(
+                        cuda::ptx::space_global,
+                        cuda::ptx::space_shared,
+                        scale_dst + static_cast<size_t>(slot) * scale_row_bytes,
+                        reinterpret_cast<uint8_t*>(s_zero),
+                        scale_row_bytes);
+                }
                 if (zero_weights) {
                     recv_topk_weights_em[slot] = 0.0f;
                 }
@@ -5107,6 +5157,19 @@ __device__ __forceinline__ void local_permute_dup(
                     for (int a = 0; a < cnt; ++a) {
                         int4* dst = dst_int4 + static_cast<size_t>(s_active[warp_id][a]) * row_int4;
                         nccl_ep::st_cg_global(&dst[j], v);
+                    }
+                }
+            }
+
+            if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+                const int scale_row_int4 = scale_row_bytes >> 4;
+                const int4* ssrc =
+                    reinterpret_cast<const int4*>(scale_src + static_cast<size_t>(token) * scale_row_bytes);
+                for (int a = 0; a < cnt; ++a) {
+                    int4* sdst = reinterpret_cast<int4*>(
+                        scale_dst + static_cast<size_t>(s_active[warp_id][a]) * scale_row_bytes);
+                    for (int j = lane; j < scale_row_int4; j += kThreadsPerSlot) {
+                        nccl_ep::st_cg_global(&sdst[j], ssrc[j]);
                     }
                 }
             }

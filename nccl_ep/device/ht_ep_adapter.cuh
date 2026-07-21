@@ -252,7 +252,11 @@ void launch_dispatch_permute(
     int sm_count,
     unsigned int prolog_epilog_sms,
     int caller_num_recv_tokens,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    ncclEpDispatchQuantizationRecipe_t recipe,
+    void* recv_scales_em,
+    const void* flat_scale_staging,
+    int scale_row_bytes);
 
 // Inverse of launch_dispatch_permute: gather caller EM combine input into
 // FLAT staging by summing the top_k EM rows per FLAT recv slot. Optional
@@ -481,7 +485,10 @@ void call_local_dup(
     bool forward_dispatch,
     int num_blocks,
     cudaStream_t stream,
-    ncclDataType_t token_dtype = ncclBfloat16);
+    ncclDataType_t token_dtype,
+    ncclEpDispatchQuantizationRecipe_t recipe,
+    void* expert_output_scale,
+    int scale_row_bytes);
 
 // EM local-fanout: pre-sum secondaries into primaries before combine.
 void call_local_reduce(

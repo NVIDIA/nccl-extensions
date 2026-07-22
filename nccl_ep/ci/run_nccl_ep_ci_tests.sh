@@ -113,11 +113,20 @@ run_ep_bench_layout_size_sweep low-latency em rm
 # not the size axis — already swept above).
 run_ep_bench_variants low-latency 128
 
-# SCALES_FORWARD is a byte-transport recipe. Keep a multi-token positive
-# validation in CI so both token rows and FP32 scale rows are checked.
+# SCALES_FORWARD preserves both tensor dtypes. Smoke the one-byte, packed-FP4,
+# multi-byte, and LL rank-major zero-copy paths; unit tests carry a broader dtype matrix.
 run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
   --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
-  --validate --dispatch-only --dispatch-quantization scales-forward
+  --validate --dispatch-only --dispatch-quantization scales-forward \
+  --scales-forward-token-dtype fp8e4m3 --scales-forward-scale-dtype fp32
+run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+  --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
+  --validate --dispatch-only --dispatch-quantization scales-forward \
+  --scales-forward-token-dtype bf16 --scales-forward-scale-dtype fp16
+run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+  --algorithm low-latency --layout rm --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
+  --validate --dispatch-only --zcopy --dispatch-quantization scales-forward \
+  --scales-forward-token-dtype uint8 --scales-forward-scale-dtype uint8
 run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
   --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
   --validate --dispatch-only --dispatch-quantization ds-fp8e3m4
@@ -132,7 +141,8 @@ if [[ "${NCCL_EP_BENCH_HT:-0}" == "1" ]]; then
   run_ep_bench_variants high-throughput 4096
   run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
     --algorithm high-throughput --layout fl --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
-    --validate --dispatch-only --dispatch-quantization scales-forward
+    --validate --dispatch-only --zcopy --dispatch-quantization scales-forward \
+    --scales-forward-token-dtype uint8 --scales-forward-scale-dtype uint8
 
   # FOLLOW-UP: HT fp32 dispatch SMEM exceeds the device cap (~227KB on H100) at
   # hidden=7168 with the default stages/pipelines, and currently std::abort()s in

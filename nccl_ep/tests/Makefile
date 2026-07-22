@@ -12,6 +12,7 @@ NCCL_INCDIR := $(NCCL_HOME)/include
 NCCL_LIBDIR := $(NCCL_HOME)/lib
 NCCL_EP_INCDIR := $(NCCL_EP_BUILDDIR)/include
 NCCL_EP_LIBDIR := $(NCCL_EP_BUILDDIR)/lib
+NCCL_EP_SRCDIR := $(abspath ..)
 DST_DIR := $(NCCL_EP_BUILDDIR)/test/nccl_ep
 
 GTEST_DIR  ?= $(abspath ../third_party/googletest/googletest)
@@ -24,6 +25,7 @@ CXXSTD       := -std=c++17
 
 NVCUFLAGS := $(NVCC_GENCODE) \
              -I$(NCCL_EP_INCDIR) \
+             -I$(NCCL_EP_SRCDIR) \
              -I$(NCCL_INCDIR) \
              -I$(GTEST_DIR)/include \
              --expt-relaxed-constexpr \
@@ -54,7 +56,8 @@ $(GTEST_OBJDIR)/gtest_main.a: $(GTEST_OBJDIR)/gtest-all.o $(GTEST_OBJDIR)/gtest_
 $(DST_DIR):
 	@mkdir -p $@
 
-INTERNAL_HEADERS := $(abspath ../nccl_ep_test_internal.h) test_common.h \
+INTERNAL_HEADERS := $(abspath ../nccl_ep_test_internal.h) \
+                    $(abspath ../quantization_recipe.hpp) test_common.h \
                     $(wildcard $(NCCL_EP_INCDIR)/nccl_ep*.h $(NCCL_EP_INCDIR)/ep_*.h)
 
 $(DST_DIR)/%.o: %.cu $(INTERNAL_HEADERS) | $(DST_DIR)

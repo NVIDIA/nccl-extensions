@@ -544,62 +544,104 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
 
     return layout;
 }
-template <ncclEpLayout_t kLayout, int kTokenSize>
-static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& config, const model_config_t& model) {
+// Bytes added to the dispatch SMEM layout by a SINGLE pipeline stage. The
+// token, probability, scaling-factor and mbarrier buffers are each replicated
+// once per stage, so the stage-scaled portion of the layout is exactly
+// config.num_of_stages * this value. Every per-stage stride is individually
+// aligned (128B token, 16B prob/sf, 8B mbarrier), so the returned size is a
+// multiple of 16B and never perturbs the 8B/16B alignment of the
+// stage-independent sections that follow it. kLayout is irrelevant here: no
+// per-stage buffer depends on the layout mode.
+template <int kTokenSize>
+static size_t calculate_dispatch_smem_per_stage_size(const dispatch_config_t& config, const model_config_t& model) {
     static_assert(kTokenSize > 0, "token size must be positive");
-    size_t total_size = 0;
-    const int num_pipelines = config.num_pipelines;
-    // Token buffer (aligned to 128B for TMA) -- total stages unchanged
+    size_t stage_size = 0;
+    // Token buffer (aligned to 128B for TMA)
     int token_buffer_stage_stride = model.hidden_dim * kTokenSize;
     token_buffer_stage_stride = (token_buffer_stage_stride + 127) & ~127;
-    total_size += static_cast<size_t>(config.num_of_stages) * token_buffer_stage_stride;
-
-    // Sparse to dense map buffer: S2D_MAP_RING_STAGES ping-pong stages PER PIPELINE (128B aligned)
-    // Inner dim is mode-dependent: flat = lsa_team_size, expert-major = num_topk.
-    int s2d_map_stage_stride = config.num_of_tokens_per_chunk * config.s2d_inner_dim * sizeof(int32_t);
-    s2d_map_stage_stride = (s2d_map_stage_stride + 127) & ~127;
-    total_size += S2D_MAP_RING_STAGES * num_pipelines * s2d_map_stage_stride;
-
-    // Prob buffer (16B aligned per stage) -- total stages unchanged
+    stage_size += token_buffer_stage_stride;
+    // Prob buffer (16B aligned per stage)
     if (config.forward_dispatch) {
         int prob_buffer_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
         prob_buffer_stage_stride = (prob_buffer_stage_stride + 15) & ~15;
-        total_size += static_cast<size_t>(config.num_of_stages) * prob_buffer_stage_stride;
+        stage_size += prob_buffer_stage_stride;
     }
-
-    // Scaling factor buffer (16B aligned per stage, only if quantized) -- total stages unchanged
+    // Scaling factor buffer (16B aligned per stage, only if quantized)
     if (config.sf_bytes_per_token > 0) {
         int sf_buffer_stage_stride = config.sf_bytes_per_token;
         sf_buffer_stage_stride = (sf_buffer_stage_stride + 15) & ~15;
-        total_size += static_cast<size_t>(config.num_of_stages) * sf_buffer_stage_stride;
+        stage_size += sf_buffer_stage_stride;
     }
-    // attn_to_rdma_map buffer (aligned to 16B, only if multi_lsa, shared)
+    // Mbarrier buffers: producer + consumer per stage (8B aligned)
+    stage_size += 2 * sizeof(uint64_t);
+    return stage_size;
+}
+
+// Bytes added to the dispatch SMEM layout by a SINGLE pipeline. Each pipeline
+// owns S2D_MAP_RING_STAGES ping-pong S2D map slots (128B aligned), 2 S2D map
+// mbarriers and 1 S2G group mbarrier, so the pipeline-scaled portion of the
+// layout is exactly config.num_pipelines * this value. The three buffers live
+// in separate sections of the real layout, but the S2D slot stride is 128B
+// aligned and the mbarriers are 8B multiples, so summing them here and scaling
+// by the pipeline count reproduces the per-section totals without introducing
+// alignment error.
+static size_t calculate_dispatch_smem_per_pipeline_size(const dispatch_config_t& config) {
+    size_t pipeline_size = 0;
+    // Sparse to dense map buffer: S2D_MAP_RING_STAGES ping-pong stages (128B aligned)
+    // Inner dim is mode-dependent: flat = lsa_team_size, expert-major = num_topk.
+    int s2d_map_stage_stride = config.num_of_tokens_per_chunk * config.s2d_inner_dim * sizeof(int32_t);
+    s2d_map_stage_stride = (s2d_map_stage_stride + 127) & ~127;
+    pipeline_size += S2D_MAP_RING_STAGES * s2d_map_stage_stride;
+    // s2d_map mbarriers: 2 per pipeline (8B aligned)
+    pipeline_size += 2 * sizeof(uint64_t);
+    // S2G group mbarrier: 1 per pipeline (8B aligned)
+    pipeline_size += sizeof(uint64_t);
+    return pipeline_size;
+}
+
+// Bytes of the dispatch SMEM layout that depend on neither the pipeline count
+// nor the stage count: the shared attn_to_rdma map, the dispatch region info,
+// and (expert-major only) the PAD warp TMA slot. attn_to_rdma is rounded to 8B
+// to absorb the alignment padding the real layout inserts before the following
+// mbarriers, keeping the composed total exact for flat layouts.
+template <ncclEpLayout_t kLayout, int kTokenSize>
+static size_t calculate_dispatch_smem_shared_size(const dispatch_config_t& config, const model_config_t& model) {
+    static_assert(kTokenSize > 0, "token size must be positive");
+    size_t shared_size = 0;
+    // attn_to_rdma_map buffer (only if multi_lsa, shared). Rounded to 8B so the
+    // per-pipeline mbarriers that follow it in the real layout stay 8B aligned.
     if (model.num_lsa_teams > 1) {
-        total_size = (total_size + 15) & ~15;
-        total_size += config.num_of_tokens_per_chunk * (model.num_lsa_teams - 1) * sizeof(bool);
+        int attn_bytes = config.num_of_tokens_per_chunk * (model.num_lsa_teams - 1) * sizeof(bool);
+        shared_size += (attn_bytes + 7) & ~7;
     }
-    // Mbarrier buffers (aligned to 8B) -- total stages unchanged
-    total_size = (total_size + 7) & ~7;
-    total_size += static_cast<size_t>(config.num_of_stages) * 2 * sizeof(uint64_t);
-    // Per-pipeline s2d_map mbarriers: 2 per pipeline
-    total_size = (total_size + 7) & ~7;
-    total_size += 2 * num_pipelines * sizeof(uint64_t);
-    // Per-pipeline S2G group mbarrier: 1 per pipeline
-    total_size = (total_size + 7) & ~7;
-    total_size += num_pipelines * sizeof(uint64_t);
-    // Dispatch memory region info buffer (aligned to 8B, only if multi_lsa)
+    // Dispatch memory region info buffer (only if multi_lsa)
     if (model.num_lsa_teams > 1) {
-        total_size = (total_size + 7) & ~7;
-        total_size += (model.num_lsa_teams - 1) * sizeof(dispatch_memory_region_info_t);
+        shared_size += (model.num_lsa_teams - 1) * sizeof(dispatch_memory_region_info_t);
     }
     // PAD warp TMA slot (expert-major only, 128B aligned)
     if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
         int pad_bytes = model.hidden_dim * kTokenSize;
         pad_bytes = (pad_bytes + 127) & ~127;
-        total_size = (total_size + 127) & ~127;
-        total_size += pad_bytes;
+        shared_size = (shared_size + 127) & ~127;
+        shared_size += pad_bytes;
     }
-    // Add padding for alignment
+    return shared_size;
+}
+
+template <ncclEpLayout_t kLayout, int kTokenSize>
+static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& config, const model_config_t& model) {
+    static_assert(kTokenSize > 0, "token size must be positive");
+    // The layout is bilinear in the pipeline and stage counts: a shared overhead
+    // plus one block replicated per pipeline plus one block replicated per stage.
+    size_t total_size =
+        calculate_dispatch_smem_shared_size<kLayout, kTokenSize>(config, model) +
+        static_cast<size_t>(config.num_pipelines) *
+            calculate_dispatch_smem_per_pipeline_size(config) +
+        static_cast<size_t>(config.num_of_stages) *
+            calculate_dispatch_smem_per_stage_size<kTokenSize>(config, model);
+    // Add padding for alignment. (For expert-major, folding the PAD slot's 128B
+    // alignment into the shared term can add up to 127B versus the fully
+    // interleaved layout; the result stays an exact-or-over upper bound.)
     total_size = (total_size + 127) & ~127;
     return total_size;
 }

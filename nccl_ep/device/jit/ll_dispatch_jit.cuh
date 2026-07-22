@@ -95,7 +95,8 @@ inline ncclResult_t launch_ll_dispatch(
              << "_hdim" << hidden << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_rm")
              << "_recipe" << kernel_spec.recipe_cache_tag
              << "_payload" << kernel_spec.payload_cache_tag
-             << (nvlinkOnly ? "_nvlinkonly" : "") << (topkIdxIsInt64 ? "_topk64" : "_topk32")
+             << (nvlinkOnly ? "_nvlinkonly" : "")
+             << (topkIdxIsInt64 ? "_topk64" : "_topk32")
              << ll_token_dtype_name_tag(tokenDtype);
         return name.str();
     }();

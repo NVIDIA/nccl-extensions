@@ -796,6 +796,18 @@ __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
             }
         }
     } else if (warpId == numWarps - 1) {
+        // The reserved control warp is not part of the forwarding pipeline. Clear every
+        // rank-major routing entry while sends are in flight; the cooperative
+        // grid barrier before receive makes the clear visible before receive
+        // overwrites the live rows. This makes every unwritten row an all--1
+        // sentinel row without relying on received-token counts.
+        if constexpr (kLayout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+            const size_t totalTopkEntries = static_cast<size_t>(numRanks) * maxTokensPerRank * numTopk;
+            for (size_t i = static_cast<size_t>(smId) * 32 + laneId; i < totalTopkEntries;
+                 i += static_cast<size_t>(numSms) * 32) {
+                outRecvTopkIdx[i] = -1;
+            }
+        }
         EP_DEVICE_ASSERT(numSms > 1);
         if (smId == 0) {
             cleanNextRecvCntBuf(nextRecvCntBuf, nextRecvCntBufSize, laneId);
@@ -945,7 +957,9 @@ LOW_LATENCY_DISPATCH_RECV:
         if (laneId == 0 and rankLaneIdx == 0) {
             // The first lane of the rank also stores the total number of tokens received from this rank
             outSrcInfo[srcRank] = numRecvTokens;
-            if (outRecvRankCounter) outRecvRankCounter[srcRank] = numRecvTokens;
+            if constexpr (kLayout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+                if (outRecvRankCounter != nullptr) outRecvRankCounter[srcRank] = numRecvTokens;
+            }
         }
 
         // Pick per srcRank wire layout: NVLink (split) if the sender is an
@@ -1106,6 +1120,7 @@ LOW_LATENCY_DISPATCH_RECV:
                 }
             }
         }
+
     }
 }
 

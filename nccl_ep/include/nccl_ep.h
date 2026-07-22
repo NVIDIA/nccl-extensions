@@ -626,7 +626,10 @@ typedef struct {
 } ncclEpDispatchConfig_t;
 
 #define NCCL_EP_DISPATCH_CONFIG_INIT \
-    ((ncclEpDispatchConfig_t){.size = (unsigned int)sizeof(ncclEpDispatchConfig_t), .magic = NCCL_EP_MAGIC})
+    ((ncclEpDispatchConfig_t){ \
+        .size = (unsigned int)sizeof(ncclEpDispatchConfig_t), \
+        .magic = NCCL_EP_MAGIC \
+    })
 
 // Perform EP dispatch
 //   * Sends tokens and metadata to the experts according to routing decisions.
@@ -684,7 +687,8 @@ typedef struct {
 //                              * For HT mode should be NULL, the counter information is available through ncclEpUpdateHandle.
 //                              * For LL mode, layout-specific counter tensors must be provided (see ncclEpLayoutInfo_t doc).
 //                                * Expert-major layout: expert_counters tensor is required.
-//                                * Rank-major layout: src_rank_counters tensor is required.
+//                                * Rank-major layout: src_rank_counters is optional; when provided,
+//                                  it receives one token count per source rank.
 //   config        - [IN]     Dispatch configuration (see ncclEpDispatchConfig_t). NULL = defaults.
 //   stream        - [IN]     CUDA stream. If `ncclEpDispatch()` is called on a different stream than the stream used in
 //                            `ncclEpCreateHandle()`,

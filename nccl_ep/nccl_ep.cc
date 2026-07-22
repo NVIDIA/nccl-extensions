@@ -3182,10 +3182,11 @@ ncclResult_t ncclEpDispatch(
             assert(recv_topk_idx->sizes[0] == static_cast<unsigned>(group->nRanks));
             assert(recv_topk_idx->sizes[1] == group->config.max_dispatch_tokens_per_rank);
             assert(recv_topk_idx->sizes[2] == static_cast<unsigned>(handle->num_topk));
-            assert(src_rank_counter != nullptr);
-            assert(src_rank_counter->ndim == 1);
-            assert(src_rank_counter->datatype == ncclInt32);
-            assert(src_rank_counter->sizes[0] == static_cast<unsigned>(group->nRanks));
+            if (src_rank_counter != nullptr) {
+                assert(src_rank_counter->ndim == 1);
+                assert(src_rank_counter->datatype == ncclInt32);
+                assert(src_rank_counter->sizes[0] == static_cast<unsigned>(group->nRanks));
+            }
             break;
         default:
             assert(recv_x->ndim == 3);
@@ -3253,7 +3254,8 @@ ncclResult_t ncclEpDispatch(
             auto* recv_x_data = recv_x->data;
             auto* scales_data = scales ? scales->data : nullptr;
             auto* expert_recv_source_indices_data = static_cast<int*>(handle->ll.expert_recv_source_indices.data);
-            auto* src_rank_counter_data = src_rank_counter ? static_cast<int*>(src_rank_counter->data) : nullptr;
+            auto* src_rank_counter_data =
+                src_rank_counter ? static_cast<int*>(src_rank_counter->data) : nullptr;
             auto* expert_dispatch_layout_data = static_cast<int64_t*>(handle->ll.expert_dispatch_layout.data);
             auto* recv_count_data = recv_count ? static_cast<int*>(recv_count->data) : nullptr;
             auto* x_data = x->data;

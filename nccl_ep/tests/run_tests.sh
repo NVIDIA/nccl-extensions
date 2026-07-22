@@ -97,6 +97,7 @@ SUITES=(
     "test_tensor_create|EP Tensor Create Tests|0"
     "test_quantization_recipe|EP Quantization Recipe Tests|0"
     "test_zero_copy|EP Zero-Copy forced|0"
+    "test_recv_topk_idx_flags|EP Recv Topk Idx Flags Tests|0"
 )
 
 for entry in "${SUITES[@]}"; do

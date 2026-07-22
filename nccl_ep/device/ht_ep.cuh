@@ -833,102 +833,103 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     return layout;
 }
 
+// Bytes added to the combine SMEM layout by a SINGLE G2S stage. G2S stages
+// carry four buffer families: token, prob (backward combine only), mbarrier and
+// flag. For each family the cross_lsa_* buffer is always present and the lsa_*
+// buffer is present only for multi-LSA-team. The token stride is rounded to 128B
+// (TMA) and the prob stride to 16B: this reproduces the per-buffer start
+// alignment exactly when the raw strides already meet it (the case in practice,
+// since hidden_dim * elem_width is a multiple of 128) and over-estimates safely
+// otherwise. kTokenDtype selects the wire element width (2 B BF16/FP16, 4 B FP32).
+template <ncclDataType_t kTokenDtype = ncclBfloat16>
+static size_t calculate_combine_smem_g2s_stage_size(
+    int num_lsa_teams, const combine_config_t& config, const model_config_t& model) {
+    const bool multi_lsa = (num_lsa_teams > 1);
+    int token_stride = model.hidden_dim * nccl_ep::size_u8<kTokenDtype>();
+    token_stride = (token_stride + 127) & ~127;
+    int prob_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+    prob_stride = (prob_stride + 15) & ~15;
+    size_t stage_size = 0;
+    // Token buffers (128B aligned): cross_lsa always, lsa_* only when multi-team.
+    stage_size += token_stride;
+    if (multi_lsa) stage_size += token_stride;
+    // Prob buffers (16B aligned, backward combine only).
+    if (config.backward_combine) {
+        stage_size += prob_stride;
+        if (multi_lsa) stage_size += prob_stride;
+    }
+    // Mbarriers: 2 per stage (8B aligned). cross_lsa always, lsa_* when multi-team.
+    stage_size += 2 * sizeof(uint64_t);
+    if (multi_lsa) stage_size += 2 * sizeof(uint64_t);
+    // Flags: 1 byte per stage. cross_lsa always, lsa_* when multi-team.
+    stage_size += sizeof(bool);
+    if (multi_lsa) stage_size += sizeof(bool);
+    return stage_size;
+}
+
+// Bytes added to the combine SMEM layout by a SINGLE S2G stage. S2G stages carry
+// only token and (backward combine only) prob buffers -- no mbarriers or flags
+// scale with the S2G stage count. Note cross_lsa_prob_S2G spans all LSA teams
+// (num_lsa_teams x the per-team prob width), unlike the G2S prob buffers. Same
+// 128B/16B stride rounding as the G2S helper.
+template <ncclDataType_t kTokenDtype = ncclBfloat16>
+static size_t calculate_combine_smem_s2g_stage_size(
+    int num_lsa_teams, const combine_config_t& config, const model_config_t& model) {
+    const bool multi_lsa = (num_lsa_teams > 1);
+    int token_stride = model.hidden_dim * nccl_ep::size_u8<kTokenDtype>();
+    token_stride = (token_stride + 127) & ~127;
+    const int prob_bytes = model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+    int prob_stride = (prob_bytes + 15) & ~15;
+    int cross_prob_stride = (prob_bytes * num_lsa_teams + 15) & ~15;
+    size_t stage_size = 0;
+    // Token buffers (128B aligned): cross_lsa always, lsa_* only when multi-team.
+    stage_size += token_stride;
+    if (multi_lsa) stage_size += token_stride;
+    // Prob buffers (16B aligned, backward combine only).
+    if (config.backward_combine) {
+        stage_size += cross_prob_stride;          // cross_lsa_prob_S2G spans all LSA teams
+        if (multi_lsa) stage_size += prob_stride; // lsa_prob_S2G is per-team width
+    }
+    return stage_size;
+}
+
+// Bytes of the combine SMEM layout that scale with neither stage count: the
+// LSA->RDMA mbarriers ((teams-1) x chunks), the combine region info ((teams-1)),
+// and the RDMA streaming counter. All three exist only for multi-LSA-team.
+static size_t calculate_combine_smem_fixed_size(
+    int max_num_of_tokens_per_rank, int num_lsa_teams, const combine_config_t& config) {
+    if (num_lsa_teams <= 1) return 0;
+    const int max_num_of_chunks_per_rank =
+        (max_num_of_tokens_per_rank + config.num_of_tokens_per_chunk - 1) / config.num_of_tokens_per_chunk;
+    size_t fixed_size = 0;
+    // lsa_to_rdma_mbarrier_buffer [(teams-1)][chunks] (8B aligned)
+    fixed_size += (num_lsa_teams - 1) * max_num_of_chunks_per_rank * sizeof(uint64_t);
+    // combine_memory_region_info [(teams-1)] (8B aligned)
+    fixed_size += (num_lsa_teams - 1) * sizeof(combine_memory_region_info_t);
+    // rdma_streaming_counter (4B aligned)
+    fixed_size += sizeof(uint32_t);
+    return fixed_size;
+}
+
 template <ncclDataType_t kTokenDtype = ncclBfloat16>
 static size_t calculate_combine_smem_layout_size(
     int max_num_of_tokens_per_rank,
     int num_lsa_teams,
     const combine_config_t& config,
     const model_config_t& model) {
-    // Dynamically computes the size required for combine shared memory layout,
-    // mirroring the logic from create_combine_smem_layout
-    size_t total_size = 0;
-
-    // Compute max number of chunks per rank
-    const int hidden_dim = model.hidden_dim;
-    const int token_bytes = hidden_dim * nccl_ep::size_u8<kTokenDtype>(); // per-token wire bytes
-    const int max_num_of_chunks_per_rank =
-        (max_num_of_tokens_per_rank + config.num_of_tokens_per_chunk - 1) / config.num_of_tokens_per_chunk;
-    const bool multi_lsa = (num_lsa_teams > 1);
-
-    // Token buffers (128B aligned for TMA). Stage stride scales with the wire element
-    // width (2 B for BF16/FP16, 4 B for FP32).
-    // lsa_token_* buffers (multi-LSA-team only)
-    if (multi_lsa) {
-        total_size = (total_size + 127) & ~127;
-        total_size += static_cast<size_t>(config.num_of_stages_g2s) * token_bytes;
-
-        total_size = (total_size + 127) & ~127;
-        total_size += static_cast<size_t>(config.num_of_stages_s2g) * token_bytes;
-    }
-
-    // cross_lsa_token_G2S_buffer
+    // The layout is bilinear in the two stage counts: a stage-independent fixed
+    // overhead plus one block replicated per G2S stage and one per S2G stage.
+    size_t total_size =
+        calculate_combine_smem_fixed_size(max_num_of_tokens_per_rank, num_lsa_teams, config) +
+        static_cast<size_t>(config.num_of_stages_g2s) *
+            calculate_combine_smem_g2s_stage_size<kTokenDtype>(num_lsa_teams, config, model) +
+        static_cast<size_t>(config.num_of_stages_s2g) *
+            calculate_combine_smem_s2g_stage_size<kTokenDtype>(num_lsa_teams, config, model);
+    // Round up to 128B. Matches the per-buffer TMA alignment and absorbs the
+    // small (<128B) alignment padding the fully interleaved layout inserts
+    // between buffers (including the streaming counter's 4B pad); the result
+    // stays an exact-or-over upper bound on the real layout.
     total_size = (total_size + 127) & ~127;
-    total_size += static_cast<size_t>(config.num_of_stages_g2s) * token_bytes;
-
-    // cross_lsa_token_S2G_buffer
-    total_size = (total_size + 127) & ~127;
-    total_size += static_cast<size_t>(config.num_of_stages_s2g) * token_bytes;
-
-    // Prob buffers (16B aligned, only if backward_combine)
-    if (config.backward_combine) {
-        if (multi_lsa) {
-            // lsa_prob_G2S_buffer
-            total_size = (total_size + 15) & ~15;
-            total_size += static_cast<size_t>(config.num_of_stages_g2s) * model.num_of_experts_per_rank *
-                          model.ranks_per_lsa_team * sizeof(float);
-
-            // lsa_prob_S2G_buffer
-            total_size = (total_size + 15) & ~15;
-            total_size += static_cast<size_t>(config.num_of_stages_s2g) * model.num_of_experts_per_rank *
-                          model.ranks_per_lsa_team * sizeof(float);
-        }
-
-        // cross_lsa_prob_G2S_buffer
-        total_size = (total_size + 15) & ~15;
-        total_size += static_cast<size_t>(config.num_of_stages_g2s) * model.num_of_experts_per_rank *
-                      model.ranks_per_lsa_team * sizeof(float);
-
-        // cross_lsa_prob_S2G_buffer
-        total_size = (total_size + 15) & ~15;
-        total_size += static_cast<size_t>(config.num_of_stages_s2g) * model.num_of_experts_per_rank *
-                      model.ranks_per_lsa_team * num_lsa_teams * sizeof(float);
-    }
-
-    // Mbarrier buffers (8B aligned)
-    // lsa_mbarrier_G2S_buffer [stages][2] (multi-LSA-team only)
-    if (multi_lsa) {
-        total_size = (total_size + 7) & ~7;
-        total_size += static_cast<size_t>(config.num_of_stages_g2s) * 2 * sizeof(uint64_t);
-    }
-
-    // cross_lsa_mbarrier_G2S_buffer [stages][2]
-    total_size = (total_size + 7) & ~7;
-    total_size += static_cast<size_t>(config.num_of_stages_g2s) * 2 * sizeof(uint64_t);
-
-    // lsa_to_rdma_mbarrier_buffer [(LSA teams-1)][chunks] (only if multi-LSA-team)
-    if (multi_lsa) {
-        total_size = (total_size + 7) & ~7;
-        total_size += (num_lsa_teams - 1) * max_num_of_chunks_per_rank * sizeof(uint64_t);
-    }
-
-    // combine_memory_region_info [(LSA teams-1)] (align 8B, only if multi-LSA-team)
-    if (multi_lsa) {
-        total_size = (total_size + 7) & ~7;
-        total_size += (num_lsa_teams - 1) * sizeof(combine_memory_region_info_t);
-    }
-
-    // Flag buffers (no special alignment needed)
-    if (multi_lsa) {
-        total_size += static_cast<size_t>(config.num_of_stages_g2s) * sizeof(bool);
-    }
-    total_size += static_cast<size_t>(config.num_of_stages_g2s) * sizeof(bool);
-
-    // Streaming overlap fields (multi-LSA-team only, 4B aligned)
-    if (multi_lsa) {
-        total_size = (total_size + 3) & ~3;
-        total_size += sizeof(uint32_t); // rdma_streaming_counter
-    }
-
     return total_size;
 }
 // Fixed-size part of dispatch kernel parameters. Peer pointer arrays are appended

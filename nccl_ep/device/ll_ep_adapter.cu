@@ -94,10 +94,12 @@ ncclResult_t call_dispatch(
     args.timeoutCycles = params.timeoutCycles;
     args.recvDataWindow = params.recvDataWindow;
     args.recvDataOffset = params.recvDataOffset;
+    args.rcvScalesWin = params.rcvScalesWin;
+    args.rcvScalesOffs = params.rcvScalesOffs;
 
     DispatchKernelSpec kernel_spec;
     ncclResult_t r = resolveDispatchKernelSpec(
-        quantization_recipe, params.tokenDtype, &kernel_spec);
+        quantization_recipe, params.tokenDtype, params.scaleDtype, &kernel_spec);
     if (r != ncclSuccess) {
         return r;
     }

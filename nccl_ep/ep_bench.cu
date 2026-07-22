@@ -444,6 +444,7 @@ static size_t tokenElemBytes(ncclDataType_t dtype) {
     switch (dtype) {
         case ncclFloat8e4m3:
         case ncclFloat8e5m2:
+        case ncclUint8:
             return 1u;
         case ncclBfloat16:
         case ncclFloat16:
@@ -459,10 +460,11 @@ static size_t tokenElemBytes(ncclDataType_t dtype) {
 
 static ncclDataType_t dispatchTokenDtype(
     ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
-    ncclDataType_t none_dtype) {
+    ncclDataType_t none_dtype,
+    ncclDataType_t scales_forward_dtype) {
     switch (dispatch_quantization) {
         case NCCL_EP_DISPATCH_QUANT_NONE: return none_dtype;
-        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD: return ncclFloat8e4m3;
+        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD: return scales_forward_dtype;
         case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4: return ncclFloat8e4m3;
         default:
             fprintf(stderr, "NCCL EP benchmark warning: unsupported dispatch recipe %d\n",
@@ -481,6 +483,33 @@ static const char* dispatchRecipeName(ncclEpDispatchQuantizationRecipe_t dispatc
                     static_cast<int>(dispatch_quantization));
             return "invalid";
     }
+}
+
+static const char* wireDtypeName(ncclDataType_t dtype) {
+    switch (dtype) {
+        case ncclFloat32: return "fp32";
+        case ncclFloat16: return "fp16";
+        case ncclBfloat16: return "bf16";
+        case ncclFloat8e4m3: return "fp8e4m3";
+        case ncclFloat8e5m2: return "fp8e5m2";
+        case ncclUint8: return "uint8";
+        default: return "unsupported";
+    }
+}
+
+static bool parseWireDtype(const char* value, ncclDataType_t* dtype) {
+    if (strcmp(value, "fp32") == 0) *dtype = ncclFloat32;
+    else if (strcmp(value, "fp16") == 0) *dtype = ncclFloat16;
+    else if (strcmp(value, "bf16") == 0) *dtype = ncclBfloat16;
+    else if (strcmp(value, "fp8e4m3") == 0) *dtype = ncclFloat8e4m3;
+    else if (strcmp(value, "fp8e5m2") == 0) *dtype = ncclFloat8e5m2;
+    else if (strcmp(value, "uint8") == 0) *dtype = ncclUint8;
+    else return false;
+    return true;
+}
+
+static bool usesPackedFp4Shape(ncclDataType_t scales_forward_token_dtype) {
+    return scales_forward_token_dtype == ncclUint8;
 }
 
 static float tokenElemToFloat(const void* data, size_t idx, ncclDataType_t dtype) {
@@ -587,7 +616,7 @@ static void setupLowLatencyTensorsRankMajLayout(
 
     // Optionally window-back the dispatch output tokens to exercise the LL
     // rank-major zero-copy dispatch path (sender writes payload directly to
-    // peer's recv_x via P2P; nvlinkOnly + bf16 only).
+    // peer's recv_x via P2P; SCALES_FORWARD also windows output scales).
     NCCLCHECK(epMakeTensor(
         &dispatch_outputs.tokens,
         3,
@@ -862,22 +891,25 @@ static const int RANK_OFFSET = 128;
 static const int TOKEN_ID_COLS = 128;
 
 static constexpr unsigned DS_FP8E3M4_ELEMENTS_PER_SCALE = 128;
-static const unsigned SCALES_FORWARD_BENCHMARK_SCALES_PER_TOKEN = 4;
+static const unsigned PACKED_FP4_ELEMENTS_PER_SCALE = 16;
 
 // --mxfp8 overrides the SCALES_FORWARD test shape to MXFP8: scale block 32 (numScales =
 // hidden/32) and Uint8 (E8M0) scales. g_scaleBlockOverride == 0 keeps the recipe default.
 static unsigned g_scaleBlockOverride = 0;
 static ncclDataType_t g_scaleDtype = ncclFloat32;
-static inline unsigned scaleElemBytes() { return g_scaleDtype == ncclUint8 ? 1u : 4u; }
+static bool g_scaleDtypeExplicit = false;
+static inline unsigned scaleElemBytes() {
+    return static_cast<unsigned>(tokenElemBytes(g_scaleDtype));
+}
 
 static unsigned int benchmarkScalesPerToken(
     ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
     unsigned int hidden) {
     switch (dispatch_quantization) {
         case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
-            // --mxfp8: block 32 -> hidden/32 scales; otherwise the recipe default.
+            // Keep the synthetic default scale row exactly one int4 wide.
             return g_scaleBlockOverride > 0 ? (hidden / g_scaleBlockOverride)
-                                            : SCALES_FORWARD_BENCHMARK_SCALES_PER_TOKEN;
+                                            : (16u / scaleElemBytes());
         case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
             return hidden / DS_FP8E3M4_ELEMENTS_PER_SCALE;
         case NCCL_EP_DISPATCH_QUANT_NONE:
@@ -889,30 +921,16 @@ static unsigned int benchmarkScalesPerToken(
     }
 }
 
-static inline uint8_t scalesForwardTokenByte(int rank, unsigned int t, unsigned int h) {
+static inline uint8_t scalesForwardTokenByte(int rank, unsigned int t, size_t h) {
     if (h == 0) return static_cast<uint8_t>(rank);
     if (h == 1) return static_cast<uint8_t>(t / 256u);
     if (h == 2) return static_cast<uint8_t>(t % 256u);
     return static_cast<uint8_t>((static_cast<unsigned>(rank) * 131u + t * 17u + h) & 0xFFu);
 }
 
-static inline float scalesForwardScaleValue(int rank, unsigned int t, unsigned int b) {
-    return static_cast<float>(rank * 1000 + static_cast<int>(t) * 10 + static_cast<int>(b));
-}
-
-// Deterministic 1-byte (E8M0) scale for MXFP8 byte-transport validation.
-static inline uint8_t scalesForwardScaleByte(int rank, unsigned int t, unsigned int b) {
-    return static_cast<uint8_t>((static_cast<unsigned>(rank) * 131u + t * 17u + b * 7u + 1u) & 0xFFu);
-}
-
-// Fill dst (numScales * scaleElemBytes() bytes) with the deterministic scale row for (rank,t).
-static inline void fillScalesForwardScaleRow(uint8_t* dst, int rank, unsigned int t, unsigned int numScales) {
-    if (g_scaleDtype == ncclUint8) {
-        for (unsigned int b = 0; b < numScales; b++) dst[b] = scalesForwardScaleByte(rank, t, b);
-    } else {
-        float* f = reinterpret_cast<float*>(dst);
-        for (unsigned int b = 0; b < numScales; b++) f[b] = scalesForwardScaleValue(rank, t, b);
-    }
+// SCALES_FORWARD validation uses an opaque byte pattern.
+static inline uint8_t scalesForwardScaleByte(int rank, unsigned int t, size_t byte) {
+    return static_cast<uint8_t>((rank * 73 + t * 29 + byte * 11 + 7) & 0xff);
 }
 // DS_FP8E3M4 benchmark-only wire pattern. This is the single source of truth
 // for both input construction and output validation.
@@ -1023,12 +1041,16 @@ void initializeValidationData(
     ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
     ncclDataType_t token_dtype = ncclBfloat16) {
     if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
-        // SCALES_FORWARD dispatch: fill one-byte token data with the validation pattern.
-        size_t token_size = static_cast<size_t>(num_tokens) * hidden;
+        // SCALES_FORWARD dispatch: fill every physical token byte with the
+        // validation pattern; forwarding does not interpret token values.
+        const unsigned int token_hidden = static_cast<unsigned int>(dispatch_inputs.tokens->sizes[1]);
+        const size_t token_bytes = tokenElemBytes(dispatch_inputs.tokens->datatype);
+        size_t token_size = static_cast<size_t>(num_tokens) * token_hidden * token_bytes;
         uint8_t* token_data_host = new uint8_t[token_size];
         for (unsigned int t = 0; t < num_tokens; t++)
-            for (unsigned int h = 0; h < hidden; h++)
-                token_data_host[static_cast<size_t>(t) * hidden + h] = scalesForwardTokenByte(myRank, t, h);
+            for (size_t b = 0; b < static_cast<size_t>(token_hidden) * token_bytes; b++)
+                token_data_host[static_cast<size_t>(t) * token_hidden * token_bytes + b] =
+                    scalesForwardTokenByte(myRank, t, b);
         {
             void* input0_data;
             NCCLCHECK(epGetTensorData(alloc, dispatch_inputs.tokens, &input0_data));
@@ -1036,18 +1058,20 @@ void initializeValidationData(
         }
         delete[] token_data_host;
 
-        // Fill input scales if present (byte-generic: FP32 or Uint8/E8M0).
+        // Fill input scales as opaque bytes for any supported scale tensor dtype.
         if (dispatch_inputs.scales) {
             const unsigned int numScales = static_cast<unsigned int>(dispatch_inputs.scales->sizes[1]);
-            const size_t row_bytes = static_cast<size_t>(numScales) * scaleElemBytes();
-            size_t scale_bytes_total = static_cast<size_t>(num_tokens) * row_bytes;
-            uint8_t* scale_data_host = new uint8_t[scale_bytes_total];
+            const size_t scale_bytes = tokenElemBytes(dispatch_inputs.scales->datatype);
+            size_t scale_size = static_cast<size_t>(num_tokens) * numScales * scale_bytes;
+            uint8_t* scale_data_host = new uint8_t[scale_size];
             for (unsigned int t = 0; t < num_tokens; t++)
-                fillScalesForwardScaleRow(scale_data_host + static_cast<size_t>(t) * row_bytes, myRank, t, numScales);
+                for (size_t b = 0; b < static_cast<size_t>(numScales) * scale_bytes; b++)
+                    scale_data_host[static_cast<size_t>(t) * numScales * scale_bytes + b] =
+                        scalesForwardScaleByte(myRank, t, b);
             {
                 void* scales_data;
                 NCCLCHECK(epGetTensorData(alloc, dispatch_inputs.scales, &scales_data));
-                CUDACHECK(cudaMemcpy(scales_data, scale_data_host, scale_bytes_total, cudaMemcpyHostToDevice));
+                CUDACHECK(cudaMemcpy(scales_data, scale_data_host, scale_size, cudaMemcpyHostToDevice));
             }
             delete[] scale_data_host;
         }
@@ -1129,7 +1153,7 @@ void initializeValidationData(
 
 // SCALES_FORWARD dispatch validation — simple byte-transport check.
 // Token row: byte[0]=rank, byte[1]=t/256, byte[2]=t%256, rest=(rank*131+t*17+h)&0xFF.
-// Identity is read from bytes 0-2; scales are FP32 deterministic pattern.
+// Identity is read from bytes 0-2; scales use a deterministic raw-byte pattern.
 // Dispatch is pure byte transport — we just verify the bytes arrive unchanged.
 
 // Validation result structure
@@ -1401,7 +1425,7 @@ static ValidationResult validateDispatchOutputLLExpertMaj(
 
 // ==================== LL expert-major SCALES_FORWARD validation ====================
 // Output tokens/scales are [local_expert, recv_slot, hidden/scales]. Verify
-// every populated expert slot carries the exact token bytes and FP32 scale row
+// every populated expert slot carries the exact token bytes and opaque scale row
 // from its routed source token.
 static ValidationResult validateDispatchOutputLLExpertMajScalesForward(
     const BenchmarkAllocState&     alloc,
@@ -1419,12 +1443,15 @@ static ValidationResult validateDispatchOutputLLExpertMajScalesForward(
     ValidationResult result = {true, 0, 0.0, ""};
     ErrorReporter rep;
     const unsigned int num_scales = static_cast<unsigned int>(dispatch_outputs.scales->sizes[2]);
+    const size_t scale_bytes = tokenElemBytes(dispatch_outputs.scales->datatype);
+    const size_t token_row_bytes =
+        static_cast<size_t>(hidden) * tokenElemBytes(dispatch_outputs.tokens->datatype);
     const size_t* token_sizes = dispatch_outputs.tokens->sizes;
     const unsigned int slots_per_expert = static_cast<unsigned int>(token_sizes[1]);
     const size_t total_slots = static_cast<size_t>(num_local_experts) * slots_per_expert;
 
-    std::vector<uint8_t> recv_tokens(total_slots * hidden);
-    std::vector<float> recv_scales(total_slots * num_scales);
+    std::vector<uint8_t> recv_tokens(total_slots * token_row_bytes);
+    std::vector<uint8_t> recv_scales(total_slots * num_scales * scale_bytes);
     std::vector<int> received_per_expert(num_local_experts);
     void* output_tokens = nullptr;
     void* output_scales = nullptr;
@@ -1433,8 +1460,7 @@ static ValidationResult validateDispatchOutputLLExpertMajScalesForward(
     NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.scales, &output_scales));
     NCCLCHECK(epGetTensorData(alloc, dispatch_layout_info.expert_counters, &expert_counters));
     CUDACHECK(cudaMemcpy(recv_tokens.data(), output_tokens, recv_tokens.size(), cudaMemcpyDeviceToHost));
-    CUDACHECK(cudaMemcpy(recv_scales.data(), output_scales,
-                         recv_scales.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_scales.data(), output_scales, recv_scales.size(), cudaMemcpyDeviceToHost));
     CUDACHECK(cudaMemcpy(received_per_expert.data(), expert_counters,
                          received_per_expert.size() * sizeof(int), cudaMemcpyDeviceToHost));
 
@@ -1454,8 +1480,8 @@ static ValidationResult validateDispatchOutputLLExpertMajScalesForward(
         }
     }
 
-    std::vector<uint8_t> expected_token(hidden);
-    std::vector<float> expected_scale(num_scales);
+    std::vector<uint8_t> expected_token(token_row_bytes);
+    std::vector<uint8_t> expected_scale(num_scales * scale_bytes);
     for (unsigned int expert = 0; expert < num_local_experts; ++expert) {
         const int count = received_per_expert[expert];
         if (count < 0 || count > static_cast<int>(slots_per_expert)) {
@@ -1466,8 +1492,8 @@ static ValidationResult validateDispatchOutputLLExpertMajScalesForward(
         std::set<std::pair<int, int>> found;
         for (int slot = 0; slot < count; ++slot) {
             const size_t row = static_cast<size_t>(expert) * slots_per_expert + slot;
-            const uint8_t* token_row = recv_tokens.data() + row * hidden;
-            const float* scale_row = recv_scales.data() + row * num_scales;
+            const uint8_t* token_row = recv_tokens.data() + row * token_row_bytes;
+            const uint8_t* scale_row = recv_scales.data() + row * num_scales * scale_bytes;
             const int source_rank = static_cast<int>(token_row[0]);
             const int source_token = static_cast<int>(token_row[1]) * 256 + token_row[2];
             if (source_rank < 0 || source_rank >= nRanks || source_token < 0 ||
@@ -1482,15 +1508,15 @@ static ValidationResult validateDispatchOutputLLExpertMajScalesForward(
                           myRank, expert, slot, source_rank, source_token);
             }
             found.insert(key);
-            for (unsigned int h = 0; h < hidden; ++h)
-                expected_token[h] = scalesForwardTokenByte(source_rank, source_token, h);
-            if (memcmp(token_row, expected_token.data(), hidden) != 0) {
+            for (size_t byte = 0; byte < token_row_bytes; ++byte)
+                expected_token[byte] = scalesForwardTokenByte(source_rank, source_token, byte);
+            if (memcmp(token_row, expected_token.data(), token_row_bytes) != 0) {
                 rep.error("[Rank %d] LL SCALES_FORWARD: expert %u slot %d token bytes differ\n",
                           myRank, expert, slot);
             }
-            for (unsigned int scale = 0; scale < num_scales; ++scale)
-                expected_scale[scale] = scalesForwardScaleValue(source_rank, source_token, scale);
-            if (memcmp(scale_row, expected_scale.data(), num_scales * sizeof(float)) != 0) {
+            for (size_t scale = 0; scale < expected_scale.size(); ++scale)
+                expected_scale[scale] = scalesForwardScaleByte(source_rank, source_token, scale);
+            if (memcmp(scale_row, expected_scale.data(), expected_scale.size()) != 0) {
                 rep.error("[Rank %d] LL SCALES_FORWARD: expert %u slot %d scale row differs\n",
                           myRank, expert, slot);
             }
@@ -1715,6 +1741,97 @@ static ValidationResult validateDispatchOutputLLExpertMajDsFp8E3M4(
         snprintf(message, sizeof(message), "LL DS_FP8E3M4 dispatch validation: %d errors", result.errors);
         result.message = message;
     }
+    return result;
+}
+
+// ==================== LL rank-major SCALES_FORWARD validation ====================
+// Rank-major stores received rows contiguously by source rank.  The recipe is
+// pure byte forwarding, so validate both the packed token row and opaque scale
+// row without interpreting either quantized format.
+static ValidationResult validateDispatchOutputLLRankMajScalesForward(
+    const BenchmarkAllocState& alloc,
+    const ncclEpDispatchOutputs_t& dispatch_outputs,
+    const ncclEpLayoutInfo_t& dispatch_layout_info,
+    unsigned int max_tokens_per_rank,
+    const unsigned int* num_tokens_per_rank,
+    unsigned int hidden,
+    unsigned int top_k,
+    unsigned int num_experts,
+    unsigned int num_local_experts,
+    int myRank,
+    int nRanks) {
+    ValidationResult result = {true, 0, 0.0, ""};
+    ErrorReporter rep;
+    const size_t max_tpr = dispatch_outputs.tokens->sizes[1];
+    const size_t total_slots = dispatch_outputs.tokens->sizes[0] * max_tpr;
+    const size_t num_scales = dispatch_outputs.scales->sizes[2];
+    const size_t scale_bytes = tokenElemBytes(dispatch_outputs.scales->datatype);
+    const size_t token_row_bytes =
+        static_cast<size_t>(hidden) * tokenElemBytes(dispatch_outputs.tokens->datatype);
+    std::vector<uint8_t> recv_tokens(total_slots * token_row_bytes);
+    std::vector<uint8_t> recv_scales(total_slots * num_scales * scale_bytes);
+    std::vector<int32_t> recv_counts(nRanks);
+    void *tokens = nullptr, *scales = nullptr, *counters = nullptr;
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.tokens, &tokens));
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.scales, &scales));
+    NCCLCHECK(epGetTensorData(alloc, dispatch_layout_info.src_rank_counters, &counters));
+    CUDACHECK(cudaMemcpy(recv_tokens.data(), tokens, recv_tokens.size(), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_scales.data(), scales, recv_scales.size(), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_counts.data(), counters, recv_counts.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+
+    std::vector<int64_t> source_topk(static_cast<size_t>(max_tokens_per_rank) * top_k);
+    std::vector<uint8_t> expected_token(token_row_bytes);
+    std::vector<uint8_t> expected_scale(num_scales * scale_bytes);
+    for (int source_rank = 0; source_rank < nRanks; ++source_rank) {
+        generateRandomTopkIndicesLL(source_topk.data(), num_tokens_per_rank[source_rank], num_experts,
+                                    top_k, source_rank);
+        std::set<int> expected;
+        for (unsigned int token = 0; token < num_tokens_per_rank[source_rank]; ++token) {
+            for (unsigned int k = 0; k < top_k; ++k) {
+                const int64_t expert = source_topk[token * top_k + k];
+                if (expert >= 0 && expert / static_cast<int>(num_local_experts) == myRank) {
+                    expected.insert(static_cast<int>(token));
+                    break;
+                }
+            }
+        }
+        if (recv_counts[source_rank] != static_cast<int32_t>(expected.size())) {
+            rep.error("[Rank %d] LL RM SCALES_FORWARD: source rank %d count=%d expected=%zu\n",
+                      myRank, source_rank, recv_counts[source_rank], expected.size());
+        }
+        if (recv_counts[source_rank] < 0 || static_cast<size_t>(recv_counts[source_rank]) > max_tpr) continue;
+        std::set<int> found;
+        for (int slot = 0; slot < recv_counts[source_rank]; ++slot) {
+            const size_t row = static_cast<size_t>(source_rank) * max_tpr + slot;
+            const uint8_t* token_row = recv_tokens.data() + row * token_row_bytes;
+            const uint8_t* scale_row = recv_scales.data() + row * num_scales * scale_bytes;
+            const int decoded_rank = token_row[0];
+            const int decoded_token = static_cast<int>(token_row[1]) * 256 + token_row[2];
+            if (decoded_rank != source_rank || decoded_token < 0 ||
+                decoded_token >= static_cast<int>(num_tokens_per_rank[source_rank])) {
+                rep.error("[Rank %d] LL RM SCALES_FORWARD: rank %d slot %d invalid identity (%d, %d)\n",
+                          myRank, source_rank, slot, decoded_rank, decoded_token);
+                continue;
+            }
+            found.insert(decoded_token);
+            for (size_t byte = 0; byte < token_row_bytes; ++byte)
+                expected_token[byte] = scalesForwardTokenByte(source_rank, decoded_token, byte);
+            for (size_t b = 0; b < expected_scale.size(); ++b)
+                expected_scale[b] = scalesForwardScaleByte(source_rank, decoded_token, b);
+            if (memcmp(token_row, expected_token.data(), token_row_bytes) != 0)
+                rep.error("[Rank %d] LL RM SCALES_FORWARD: rank %d slot %d token bytes differ\n",
+                          myRank, source_rank, slot);
+            if (memcmp(scale_row, expected_scale.data(), expected_scale.size()) != 0)
+                rep.error("[Rank %d] LL RM SCALES_FORWARD: rank %d slot %d scale bytes differ\n",
+                          myRank, source_rank, slot);
+        }
+        if (found != expected)
+            rep.error("[Rank %d] LL RM SCALES_FORWARD: source rank %d received token set differs\n",
+                      myRank, source_rank);
+    }
+    result.errors = rep.errors;
+    result.passed = rep.errors == 0;
+    if (!result.passed) result.message = "LL rank-major scales-forward dispatch validation failed";
     return result;
 }
 
@@ -1988,13 +2105,13 @@ static void preReduceRankMajor(
 }
 
 // ==================== HT SCALES_FORWARD dispatch byte-equality validation ====================
-// Output tokens: 2D [buf_rows, hidden] one-byte values; output scales: 2D [buf_rows, numScales] f32.
-// Dispatch is a pure byte transport. For each valid recv slot we recover the
+// Tokens and scales are opaque physical rows. For each valid recv slot we recover the
 // source (rank, token) from the first three token bytes, then memcmp the full token byte row and the
-// full scale row against the deterministic recompute (scalesForwardTokenByte / scalesForwardScaleValue). Routing replay
+// full scale row against the deterministic byte recompute. Routing replay
 // (generateTopkIndicesHT) gives the expected (rank, token) set for missing/unexpected accounting.
 // Mirrors validateDispatchOutputHTRankMaj's valid-slot scan via recv_topk_idx.
 static ValidationResult validateDispatchOutputHTScalesForward(
+    const BenchmarkAllocState& alloc,
     const ncclEpDispatchOutputs_t& dispatch_outputs,
     unsigned int max_tokens_per_rank,
     const unsigned int* num_tokens_per_rank,
@@ -2003,32 +2120,47 @@ static ValidationResult validateDispatchOutputHTScalesForward(
     unsigned int num_experts,
     unsigned int num_local_experts,
     int myRank,
-    int nRanks) {
+    int nRanks,
+    const int64_t* meta_expert_counts_padded = nullptr,
+    const int64_t* meta_expert_offsets = nullptr) {
     ValidationResult result = {true, 0, 0.0, ""};
     ErrorReporter rep;
 
     const unsigned int numScales = static_cast<unsigned int>(dispatch_outputs.scales->sizes[1]);
-    const unsigned int scaleEB = scaleElemBytes();
+    const size_t scale_bytes = tokenElemBytes(dispatch_outputs.scales->datatype);
+    const size_t token_row_bytes =
+        static_cast<size_t>(hidden) * tokenElemBytes(dispatch_outputs.tokens->datatype);
 
     const size_t* out0_sizes = dispatch_outputs.tokens->sizes;
     unsigned int buf_rows = out0_sizes[0];
 
-    // Recv token bytes (uint8).
-    size_t recv_tok_size = static_cast<size_t>(buf_rows) * hidden;
+    size_t recv_tok_size = static_cast<size_t>(buf_rows) * token_row_bytes;
     uint8_t* recv_tok = new uint8_t[recv_tok_size];
+    void* recv_tokens = nullptr;
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.tokens, &recv_tokens));
     CUDACHECK(
-        cudaMemcpy(recv_tok, dispatch_outputs.tokens->data, recv_tok_size * sizeof(uint8_t), cudaMemcpyDeviceToHost));
+        cudaMemcpy(recv_tok, recv_tokens, recv_tok_size * sizeof(uint8_t), cudaMemcpyDeviceToHost));
 
-    // Recv scales (raw bytes: FP32 4B or Uint8/E8M0 1B).
-    size_t recv_sf_size = static_cast<size_t>(buf_rows) * numScales;
-    uint8_t* recv_sf_raw = new uint8_t[recv_sf_size * scaleEB];
+    // Recv opaque scale payload bytes.
+    size_t recv_sf_size = static_cast<size_t>(buf_rows) * numScales * scale_bytes;
+    uint8_t* recv_sf_raw = new uint8_t[recv_sf_size];
+    void* recv_scales = nullptr;
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.scales, &recv_scales));
     CUDACHECK(
-        cudaMemcpy(recv_sf_raw, dispatch_outputs.scales->data, recv_sf_size * scaleEB, cudaMemcpyDeviceToHost));
+        cudaMemcpy(recv_sf_raw, recv_scales, recv_sf_size, cudaMemcpyDeviceToHost));
 
-    // Valid-slot scan. For flat layout, topk_idx is available and some slots may be empty.
-    // For EM layout, topk_idx is not allocated; all output rows are valid tokens.
     bool* valid_slot = new bool[buf_rows]();
-    if (dispatch_outputs.topk_idx != nullptr) {
+    if (meta_expert_counts_padded != nullptr && meta_expert_offsets != nullptr) {
+        for (unsigned int e = 0; e < num_local_experts; ++e) {
+            const int64_t begin = meta_expert_offsets[e];
+            const int64_t end = begin + meta_expert_counts_padded[e];
+            for (int64_t j = begin; j < end && j < static_cast<int64_t>(buf_rows); ++j) {
+                const uint8_t* row = recv_tok + static_cast<size_t>(j) * token_row_bytes;
+                valid_slot[j] =
+                    std::any_of(row, row + token_row_bytes, [](uint8_t value) { return value != 0; });
+            }
+        }
+    } else if (dispatch_outputs.topk_idx != nullptr) {
         int64_t* recv_topk_idx = new int64_t[static_cast<size_t>(buf_rows) * top_k];
         CUDACHECK(cudaMemcpy(
             recv_topk_idx,
@@ -2067,15 +2199,21 @@ static ValidationResult validateDispatchOutputHTScalesForward(
     }
     delete[] src_topk;
 
+    if (meta_expert_counts_padded == nullptr && dispatch_outputs.topk_idx != nullptr) {
+        std::fill(valid_slot, valid_slot + buf_rows, false);
+        const unsigned int populated = std::min<unsigned int>(buf_rows, expected.size());
+        for (unsigned int j = 0; j < populated; ++j) valid_slot[j] = true;
+    }
+
     // Per valid slot: decode identity from token bytes 0-2, memcmp token + scale rows.
     std::set<std::pair<int, int>> found;
-    std::vector<uint8_t> exp_tok(hidden);
-    std::vector<uint8_t> exp_sf(static_cast<size_t>(numScales) * scaleEB);
+    std::vector<uint8_t> exp_tok(token_row_bytes);
+    std::vector<uint8_t> exp_sf(numScales * scale_bytes);
     for (unsigned int j = 0; j < buf_rows; j++) {
         if (!valid_slot[j]) continue;
 
-        const uint8_t* tok_row = recv_tok + static_cast<size_t>(j) * hidden;
-        const uint8_t* sf_row = recv_sf_raw + static_cast<size_t>(j) * numScales * scaleEB;
+        const uint8_t* tok_row = recv_tok + static_cast<size_t>(j) * token_row_bytes;
+        const uint8_t* sf_row = recv_sf_raw + static_cast<size_t>(j) * numScales * scale_bytes;
 
         // Identity is in the first 3 bytes of the token row.
         int src_rank = static_cast<int>(tok_row[0]);
@@ -2103,15 +2241,15 @@ static ValidationResult validateDispatchOutputHTScalesForward(
         found.insert(key);
 
         // Recompute and byte-compare the full token row.
-        for (unsigned int h = 0; h < hidden; h++)
-            exp_tok[h] = scalesForwardTokenByte(src_rank, static_cast<unsigned>(token_id), h);
-        if (memcmp(tok_row, exp_tok.data(), hidden) != 0) {
-            unsigned int bad = 0;
-            for (; bad < hidden; bad++)
+        for (size_t byte = 0; byte < token_row_bytes; byte++)
+            exp_tok[byte] = scalesForwardTokenByte(src_rank, static_cast<unsigned>(token_id), byte);
+        if (memcmp(tok_row, exp_tok.data(), token_row_bytes) != 0) {
+            size_t bad = 0;
+            for (; bad < token_row_bytes; bad++)
                 if (tok_row[bad] != exp_tok[bad]) break;
             rep.error(
                 "[Rank %d] SCALES_FORWARD dispatch: slot %u (rank=%d, token=%d): token mismatch "
-                "at h=%u (got 0x%02x exp 0x%02x)\n",
+                "at byte=%zu (got 0x%02x exp 0x%02x)\n",
                 myRank,
                 j,
                 src_rank,
@@ -2121,23 +2259,22 @@ static ValidationResult validateDispatchOutputHTScalesForward(
                 exp_tok[bad]);
         }
 
-        // Recompute and byte-compare the full scale row (FP32 or E8M0/Uint8).
-        fillScalesForwardScaleRow(exp_sf.data(), src_rank, static_cast<unsigned>(token_id), numScales);
-        const size_t sf_row_bytes = static_cast<size_t>(numScales) * scaleEB;
-        if (memcmp(sf_row, exp_sf.data(), sf_row_bytes) != 0) {
-            size_t bad = 0;
-            for (; bad < sf_row_bytes; bad++)
+        for (size_t b = 0; b < exp_sf.size(); b++)
+            exp_sf[b] = scalesForwardScaleByte(src_rank, static_cast<unsigned>(token_id), b);
+        if (memcmp(sf_row, exp_sf.data(), exp_sf.size()) != 0) {
+            unsigned int bad = 0;
+            for (; bad < exp_sf.size(); bad++)
                 if (sf_row[bad] != exp_sf[bad]) break;
             rep.error(
                 "[Rank %d] SCALES_FORWARD dispatch: slot %u (rank=%d, token=%d): scale mismatch "
-                "at byte=%zu (got 0x%02x exp 0x%02x)\n",
+                "at byte=%u (got 0x%02x exp 0x%02x)\n",
                 myRank,
                 j,
                 src_rank,
                 token_id,
                 bad,
-                sf_row[bad],
-                exp_sf[bad]);
+                static_cast<unsigned>(sf_row[bad]),
+                static_cast<unsigned>(exp_sf[bad]));
         }
     }
 
@@ -2551,7 +2688,7 @@ ValidationResult validateDispatchOutput(
         case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
             if (is_ht_mode) {
                 return validateDispatchOutputHTScalesForward(
-                dispatch_outputs,
+                alloc, dispatch_outputs,
                 max_tokens_per_rank,
                 num_tokens_per_rank,
                 hidden,
@@ -2559,7 +2696,9 @@ ValidationResult validateDispatchOutput(
                 num_experts,
                 num_local_experts,
                 myRank,
-                nRanks);
+                nRanks,
+                is_expert_major ? meta_expert_counts_padded : nullptr,
+                is_expert_major ? meta_expert_offsets : nullptr);
             }
             if (is_expert_major) {
                 return validateDispatchOutputLLExpertMajScalesForward(
@@ -2567,10 +2706,10 @@ ValidationResult validateDispatchOutput(
                     max_tokens_per_rank, num_tokens_per_rank,
                     hidden, top_k, num_experts, num_local_experts, myRank, nRanks);
             }
-            fprintf(stderr,
-                    "NCCL EP benchmark warning: LL rank-major SCALES_FORWARD output validation is not implemented; "
-                    "the dispatch result is not byte-verified.\n");
-            return {true, 0, 0.0, "skipped (LL rank-major scales-forward dispatch validation not yet implemented)"};
+            return validateDispatchOutputLLRankMajScalesForward(
+                alloc, dispatch_outputs, dispatch_layout_info,
+                max_tokens_per_rank, num_tokens_per_rank,
+                hidden, top_k, num_experts, num_local_experts, myRank, nRanks);
         case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
             if (is_ht_mode || !is_expert_major) {
                 fprintf(stderr,
@@ -3029,7 +3168,9 @@ PairedBenchResult runPairedBenchmark(
             result.avg_ms = std::accumulate(times_trimmed.begin(), times_trimmed.end(), 0.0) / times_trimmed.size();
             result.min_ms = *std::min_element(times_trimmed.begin(), times_trimmed.end());
             result.max_ms = *std::max_element(times_trimmed.begin(), times_trimmed.end());
-            result.throughput_gbps = (data_bytes / 1e9) / (result.avg_ms / 1000.0);
+            result.throughput_gbps = data_bytes == 0 || result.avg_ms <= 0
+                ? 0
+                : (data_bytes / 1e9) / (result.avg_ms / 1000.0);
         }
         return result;
     };
@@ -3042,12 +3183,14 @@ PairedBenchResult runPairedBenchmark(
     return result;
 }
 
-// Structure to hold Low Latency byte calculation
-// Matches DeepEP test_low_latency.py methodology
+// Logical user payload transported by LL. Protocol headers are intentionally
+// excluded so dtype comparisons reflect tokens plus forwarded scales.
 struct LowLatencyBytes {
-    size_t dispatch_bytes;  // scales-forward or BF16 format per selection
-    size_t combine_bytes;   // NONE-mode format: hidden * elem_bytes per selection
+    size_t dispatch_bytes;
+    size_t combine_bytes;
     unsigned int num_valid_selections;
+    unsigned int num_dispatch_messages;
+    unsigned int num_combine_messages;
 };
 
 // Calculate bytes for Low Latency mode.
@@ -3057,38 +3200,57 @@ LowLatencyBytes calculateLowLatencyBytes(
     unsigned int num_tokens,
     unsigned int top_k,
     unsigned int hidden,
+    unsigned int num_experts,
+    int nRanks,
+    ncclEpLayout_t layout,
     ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
-    ncclDataType_t token_dtype) {
-    LowLatencyBytes bytes = {0, 0, 0};
+    ncclDataType_t token_dtype,
+    ncclDataType_t scales_forward_token_dtype) {
+    LowLatencyBytes bytes = {0, 0, 0, 0, 0};
 
-    // Count valid selections (non-masked entries)
-    for (unsigned int i = 0; i < num_tokens * top_k; i++) {
-        if (topk_idx_host[i] >= 0) {
-            bytes.num_valid_selections++;
+    const unsigned int num_local_experts = num_experts / static_cast<unsigned int>(nRanks);
+    for (unsigned int token = 0; token < num_tokens; ++token) {
+        std::set<int> destination_ranks;
+        for (unsigned int k = 0; k < top_k; ++k) {
+            const int64_t expert = topk_idx_host[token * top_k + k];
+            if (expert >= 0 && expert < static_cast<int64_t>(num_experts)) {
+                bytes.num_valid_selections++;
+                destination_ranks.insert(static_cast<int>(expert / num_local_experts));
+            }
         }
+        bytes.num_dispatch_messages += static_cast<unsigned int>(destination_ranks.size());
     }
+    bytes.num_combine_messages = layout == NCCL_EP_LAYOUT_RANK_MAJOR
+        ? bytes.num_dispatch_messages : bytes.num_valid_selections;
 
-    const size_t quantized_bytes_per_selection = hidden +
-        benchmarkScalesPerToken(dispatch_quantization, hidden) * scaleElemBytes() + 16;
-    // NONE-mode bytes per selection: hidden * elem_bytes (2 for bf16/fp16, 4 for fp32)
-    const size_t none_bytes_per_selection = hidden * tokenElemBytes(token_dtype);
+    const bool packed_fp4 = dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+        usesPackedFp4Shape(scales_forward_token_dtype);
+    size_t quantized_payload_bytes = 0;
+    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        quantized_payload_bytes = packed_fp4
+            ? hidden / 2 + hidden / PACKED_FP4_ELEMENTS_PER_SCALE * scaleElemBytes()
+            : hidden * tokenElemBytes(scales_forward_token_dtype) +
+                  benchmarkScalesPerToken(dispatch_quantization, hidden) * scaleElemBytes();
+    } else if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
+        quantized_payload_bytes = hidden + hidden / DS_FP8E3M4_ELEMENTS_PER_SCALE * sizeof(float);
+    }
+    const size_t none_payload_bytes = hidden * tokenElemBytes(token_dtype);
 
     // Dispatch: scales-forward or NONE-mode based on config
     switch (dispatch_quantization) {
         case NCCL_EP_DISPATCH_QUANT_NONE:
-            bytes.dispatch_bytes = static_cast<size_t>(bytes.num_valid_selections) * none_bytes_per_selection;
+            bytes.dispatch_bytes = static_cast<size_t>(bytes.num_dispatch_messages) * none_payload_bytes;
             break;
         case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
         case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
-            bytes.dispatch_bytes = static_cast<size_t>(bytes.num_valid_selections) * quantized_bytes_per_selection;
+            bytes.dispatch_bytes = static_cast<size_t>(bytes.num_dispatch_messages) * quantized_payload_bytes;
             break;
         default:
             fprintf(stderr, "NCCL EP benchmark warning: unsupported dispatch recipe %d\n",
                     static_cast<int>(dispatch_quantization));
             return bytes;
     }
-    // Combine: always NONE-mode (no scales-forward combine)
-    bytes.combine_bytes = static_cast<size_t>(bytes.num_valid_selections) * none_bytes_per_selection;
+    bytes.combine_bytes = static_cast<size_t>(bytes.num_combine_messages) * none_payload_bytes;
 
     return bytes;
 }
@@ -3146,7 +3308,8 @@ HighThroughputBytes calculateHighThroughputBytes(
     int nRanks,
     ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
     int lsa_team_size,
-    ncclDataType_t token_dtype) {
+    ncclDataType_t token_dtype,
+    ncclDataType_t scales_forward_token_dtype) {
     HighThroughputBytes bytes = {0, 0, 0, 0, 0, 0, 0, 0};
 
     int local_node = myRank / lsa_team_size;
@@ -3205,8 +3368,10 @@ HighThroughputBytes calculateHighThroughputBytes(
             bytes_per_token = none_bytes_per_token;
             break;
         case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
-            bytes_per_token = hidden +
-                benchmarkScalesPerToken(dispatch_quantization, hidden) * scaleElemBytes();
+            bytes_per_token = usesPackedFp4Shape(scales_forward_token_dtype)
+                ? hidden / 2 + hidden / PACKED_FP4_ELEMENTS_PER_SCALE * scaleElemBytes()
+                : hidden * tokenElemBytes(scales_forward_token_dtype) +
+                      benchmarkScalesPerToken(dispatch_quantization, hidden) * scaleElemBytes();
             break;
         default:
             fprintf(stderr, "NCCL EP benchmark warning: unsupported dispatch recipe %d\n",
@@ -3222,9 +3387,7 @@ HighThroughputBytes calculateHighThroughputBytes(
     return bytes;
 }
 
-// Print benchmark results with MPI aggregation across ranks
-// Print benchmark results for Low Latency mode
-// Uses BF16 bytes for both dispatch and combine
+// Print LL benchmark results with MPI aggregation across ranks.
 void printLowLatencyResults(
     int myRank,
     int nRanks,
@@ -3232,7 +3395,8 @@ void printLowLatencyResults(
     const BenchResult& combine_result,
     const BenchResult& combined_result,
     KernelTimer& ktimer,
-    const LowLatencyBytes& ll_bytes) {
+    const LowLatencyBytes& ll_bytes,
+    bool dispatch_only) {
     // Uncomment for detailed per-rank results
     // // Print per-rank results
     // printf("[Rank %d] Dispatch:         avg=%.2f us, min=%.2f us, max=%.2f us, throughput=%.2f GB/s\n",
@@ -3260,6 +3424,43 @@ void printLowLatencyResults(
     double local_total_avg = combined_result.avg_ms;
     double local_total_min = combined_result.min_ms;
     double local_total_max = combined_result.max_ms;
+
+    const unsigned long long local_dispatch_bytes = ll_bytes.dispatch_bytes;
+    const unsigned long long local_combine_bytes = ll_bytes.combine_bytes;
+    const unsigned long long local_dispatch_messages = ll_bytes.num_dispatch_messages;
+    const unsigned long long local_combine_messages = ll_bytes.num_combine_messages;
+    const unsigned long long local_valid_selections = ll_bytes.num_valid_selections;
+    unsigned long long global_dispatch_bytes = 0, global_combine_bytes = 0;
+    unsigned long long global_dispatch_messages = 0, global_combine_messages = 0;
+    unsigned long long global_valid_selections = 0;
+    MPI_Reduce(
+        &local_dispatch_bytes, &global_dispatch_bytes, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(
+        &local_combine_bytes, &global_combine_bytes, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(
+        &local_dispatch_messages,
+        &global_dispatch_messages,
+        1,
+        MPI_UNSIGNED_LONG_LONG,
+        MPI_SUM,
+        0,
+        MPI_COMM_WORLD);
+    MPI_Reduce(
+        &local_combine_messages,
+        &global_combine_messages,
+        1,
+        MPI_UNSIGNED_LONG_LONG,
+        MPI_SUM,
+        0,
+        MPI_COMM_WORLD);
+    MPI_Reduce(
+        &local_valid_selections,
+        &global_valid_selections,
+        1,
+        MPI_UNSIGNED_LONG_LONG,
+        MPI_SUM,
+        0,
+        MPI_COMM_WORLD);
 
     double global_dispatch_avg, global_dispatch_min, global_dispatch_max;
     double global_combine_avg, global_combine_min, global_combine_max;
@@ -3300,6 +3501,15 @@ void printLowLatencyResults(
     local_total_tp.value = combined_result.throughput_gbps;
     local_total_tp.rank = myRank;
 
+    double global_dispatch_tp_sum = 0.0;
+    double global_combine_tp_sum = 0.0;
+    double global_total_tp_sum = 0.0;
+    MPI_Reduce(
+        &local_dispatch_tp.value, &global_dispatch_tp_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(
+        &local_combine_tp.value, &global_combine_tp_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(
+        &local_total_tp.value, &global_total_tp_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_dispatch_tp, &global_dispatch_tp_min, 1, MPI_DOUBLE_INT, MPI_MINLOC, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_dispatch_tp, &global_dispatch_tp_max, 1, MPI_DOUBLE_INT, MPI_MAXLOC, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_combine_tp, &global_combine_tp_min, 1, MPI_DOUBLE_INT, MPI_MINLOC, 0, MPI_COMM_WORLD);
@@ -3310,9 +3520,18 @@ void printLowLatencyResults(
     double dispatch_kernel_avg = 0.0, combine_kernel_avg = 0.0;
     double dispatch_kernel_min = 0.0, combine_kernel_min = 0.0;
     double dispatch_kernel_max = 0.0, combine_kernel_max = 0.0;
+    double dispatch_kernel_tp_sum = 0.0, combine_kernel_tp_sum = 0.0;
+    double dispatch_kernel_tp_min = 0.0, combine_kernel_tp_min = 0.0;
+    double dispatch_kernel_tp_max = 0.0, combine_kernel_tp_max = 0.0;
     if (ktimer.is_valid()) {
         double local_disp_kern = ktimer.get_avg_us("dispatch");
         double local_comb_kern = ktimer.get_avg_us("combine");
+        const double local_disp_kern_tp = local_disp_kern <= 0 || local_dispatch_bytes == 0
+            ? 0
+            : (local_dispatch_bytes / 1e9) / (local_disp_kern / 1e6);
+        const double local_comb_kern_tp = local_comb_kern <= 0 || local_combine_bytes == 0
+            ? 0
+            : (local_combine_bytes / 1e9) / (local_comb_kern / 1e6);
         double global_disp_kern = 0.0, global_comb_kern = 0.0;
         MPI_Reduce(&local_disp_kern, &global_disp_kern, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&local_comb_kern, &global_comb_kern, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
@@ -3322,6 +3541,18 @@ void printLowLatencyResults(
         MPI_Reduce(&local_comb_kern, &combine_kernel_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
         MPI_Reduce(&local_disp_kern, &dispatch_kernel_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
         MPI_Reduce(&local_comb_kern, &combine_kernel_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(
+            &local_disp_kern_tp, &dispatch_kernel_tp_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(
+            &local_comb_kern_tp, &combine_kernel_tp_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(
+            &local_disp_kern_tp, &dispatch_kernel_tp_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(
+            &local_comb_kern_tp, &combine_kernel_tp_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(
+            &local_disp_kern_tp, &dispatch_kernel_tp_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(
+            &local_comb_kern_tp, &combine_kernel_tp_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     }
 
     // Print summary on rank 0
@@ -3330,10 +3561,14 @@ void printLowLatencyResults(
         global_combine_avg /= nRanks;
         global_total_avg /= nRanks;
 
-        double total_data_bytes = ll_bytes.dispatch_bytes + ll_bytes.combine_bytes;
-        double avg_dispatch_tp = (ll_bytes.dispatch_bytes / 1e9) / (global_dispatch_avg / 1000.0);
-        double avg_combine_tp = (ll_bytes.combine_bytes / 1e9) / (global_combine_avg / 1000.0);
-        double avg_total_tp = (total_data_bytes / 1e9) / (global_total_avg / 1000.0);
+        const double mean_dispatch_bytes = static_cast<double>(global_dispatch_bytes) / nRanks;
+        const double mean_combine_bytes = static_cast<double>(global_combine_bytes) / nRanks;
+        const double mean_dispatch_messages = static_cast<double>(global_dispatch_messages) / nRanks;
+        const double mean_combine_messages = static_cast<double>(global_combine_messages) / nRanks;
+        const double mean_valid_selections = static_cast<double>(global_valid_selections) / nRanks;
+        const double avg_dispatch_tp = global_dispatch_tp_sum / nRanks;
+        const double avg_combine_tp = global_combine_tp_sum / nRanks;
+        const double avg_total_tp = global_total_tp_sum / nRanks;
 
         printf("\n=== Summary (Low Latency, across %d ranks) ===\n", nRanks);
 
@@ -3341,40 +3576,49 @@ void printLowLatencyResults(
 
         printf("Dispatch:  avg=%.2f us, min=%.2f us, max=%.2f us\n", global_dispatch_avg * 1000,
                global_dispatch_min * 1000, global_dispatch_max * 1000);
-        printf("                  throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
+        printf("          logical payload throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
                avg_dispatch_tp, global_dispatch_tp_min.value, global_dispatch_tp_min.rank, global_dispatch_tp_max.value,
                global_dispatch_tp_max.rank);
-        printf("Combine:   avg=%.2f us, min=%.2f us, max=%.2f us\n", global_combine_avg * 1000,
-               global_combine_min * 1000, global_combine_max * 1000);
-        printf("                  throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
-               avg_combine_tp, global_combine_tp_min.value, global_combine_tp_min.rank, global_combine_tp_max.value,
-               global_combine_tp_max.rank);
-        printf("Total (D+C):      avg=%.2f us, min=%.2f us, max=%.2f us\n", global_total_avg * 1000,
-               global_total_min * 1000, global_total_max * 1000);
-        printf("                  throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
-               avg_total_tp, global_total_tp_min.value, global_total_tp_min.rank, global_total_tp_max.value,
-               global_total_tp_max.rank);
+        if (!dispatch_only) {
+            printf("Combine:   avg=%.2f us, min=%.2f us, max=%.2f us\n", global_combine_avg * 1000,
+                   global_combine_min * 1000, global_combine_max * 1000);
+            printf("          logical payload throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
+                   avg_combine_tp, global_combine_tp_min.value, global_combine_tp_min.rank,
+                   global_combine_tp_max.value, global_combine_tp_max.rank);
+            printf("Total (D+C):      avg=%.2f us, min=%.2f us, max=%.2f us\n", global_total_avg * 1000,
+                   global_total_min * 1000, global_total_max * 1000);
+            printf("          logical payload throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
+                   avg_total_tp, global_total_tp_min.value, global_total_tp_min.rank,
+                   global_total_tp_max.value, global_total_tp_max.rank);
+        }
 
         printf("\n--- Kernel-only performance ---\n");
         if (ktimer.is_valid()) {
             printf("Dispatch:    avg=%.2f us, min=%.2f us, max=%.2f us\n", dispatch_kernel_avg, dispatch_kernel_min,
                    dispatch_kernel_max);
-            printf("                  throughput: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
-                   (ll_bytes.dispatch_bytes / 1e9) / (dispatch_kernel_avg / 1e6),
-                   (ll_bytes.dispatch_bytes / 1e9) / (dispatch_kernel_min / 1e6),
-                   (ll_bytes.dispatch_bytes / 1e9) / (dispatch_kernel_max / 1e6));
-            printf("Combine:     avg=%.2f us, min=%.2f us, max=%.2f us\n", combine_kernel_avg, combine_kernel_min,
-                   combine_kernel_max);
-            printf("                  throughput: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
-                   (ll_bytes.combine_bytes / 1e9) / (combine_kernel_avg / 1e6),
-                   (ll_bytes.combine_bytes / 1e9) / (combine_kernel_min / 1e6),
-                   (ll_bytes.combine_bytes / 1e9) / (combine_kernel_max / 1e6));
+            printf("          logical payload throughput: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
+                   dispatch_kernel_tp_sum / nRanks,
+                   dispatch_kernel_tp_min,
+                   dispatch_kernel_tp_max);
+            if (!dispatch_only) {
+                printf("Combine:     avg=%.2f us, min=%.2f us, max=%.2f us\n", combine_kernel_avg,
+                       combine_kernel_min, combine_kernel_max);
+                printf("          logical payload throughput: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
+                       combine_kernel_tp_sum / nRanks,
+                       combine_kernel_tp_min,
+                       combine_kernel_tp_max);
+            }
         } else {
             printf("  NOTE: CUPTI support was not compiled.\n");
         }
 
-        printf("\nByte counts: dispatch=%.2f MB, combine=%.2f MB, selections=%u\n", ll_bytes.dispatch_bytes / 1e6,
-               ll_bytes.combine_bytes / 1e6, ll_bytes.num_valid_selections);
+        printf("\nMean logical payload/rank: dispatch=%.2f MB (%.1f messages), combine=%.2f MB (%.1f messages), "
+               "valid selections=%.1f\n",
+               mean_dispatch_bytes / 1e6,
+               mean_dispatch_messages,
+               mean_combine_bytes / 1e6,
+               mean_combine_messages,
+               mean_valid_selections);
         fflush(stdout);
     }
 }
@@ -3395,8 +3639,8 @@ void printHighThroughputResults(
     size_t global_rdma_send,
     size_t global_total_recv,
     size_t global_rdma_recv,
-    bool ht_em_local_dup,
-    ncclEpDispatchQuantizationRecipe_t dispatch_quantization) {
+    ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
+    bool dispatch_only) {
     double local_dispatch_avg = dispatch_result.avg_ms;
     double local_dispatch_min = dispatch_result.min_ms;
     double local_dispatch_max = dispatch_result.max_ms;
@@ -3486,18 +3730,20 @@ void printHighThroughputResults(
                    (avg_total_send / 1e9) / dk_total_s, (avg_nvl_send / 1e9) / dk_total_s,
                    (avg_rdma_send / 1e9) / dk_total_s);
         }
-        printf("Combine:     total=%.2f us (min=%.2f, max=%.2f)\n", global_combine_avg * 1000,
-               global_combine_min * 1000, global_combine_max * 1000);
-        if (ck_total_s > 0) {
-            printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
-                   (avg_total_recv / 1e9) / ck_total_s, (avg_nvl_recv / 1e9) / ck_total_s,
-                   (avg_rdma_recv / 1e9) / ck_total_s);
-            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
-                   (avg_total_send / 1e9) / ck_total_s, (avg_nvl_send / 1e9) / ck_total_s,
-                   (avg_rdma_send / 1e9) / ck_total_s);
+        if (!dispatch_only) {
+            printf("Combine:     total=%.2f us (min=%.2f, max=%.2f)\n", global_combine_avg * 1000,
+                   global_combine_min * 1000, global_combine_max * 1000);
+            if (ck_total_s > 0) {
+                printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                       (avg_total_recv / 1e9) / ck_total_s, (avg_nvl_recv / 1e9) / ck_total_s,
+                       (avg_rdma_recv / 1e9) / ck_total_s);
+                printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                       (avg_total_send / 1e9) / ck_total_s, (avg_nvl_send / 1e9) / ck_total_s,
+                       (avg_rdma_send / 1e9) / ck_total_s);
+            }
+            printf("Total (D+C): avg=%.2f us, min=%.2f us, max=%.2f us\n", global_total_avg * 1000,
+                   global_total_min * 1000, global_total_max * 1000);
         }
-        printf("Total (D+C): avg=%.2f us, min=%.2f us, max=%.2f us\n", global_total_avg * 1000, global_total_min * 1000,
-               global_total_max * 1000);
 
         // --- BW based on kernel time ---
         printf("\n--- BW based on kernel time ---\n");
@@ -3509,29 +3755,40 @@ void printHighThroughputResults(
             double dk_s = avg_kernel_dk_us / 1e6;
             double ck_s = avg_kernel_ck_us / 1e6;
             printf("Dispatch:    kernel=%.2f us\n", avg_kernel_dk_us);
-            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n", (avg_total_recv / 1e9) / dk_s,
-                   (avg_nvl_recv / 1e9) / dk_s, (avg_rdma_recv / 1e9) / dk_s);
-            printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n", (avg_total_send / 1e9) / dk_s,
-                   (avg_nvl_send / 1e9) / dk_s, (avg_rdma_send / 1e9) / dk_s);
+            if (dk_s > 0) {
+                printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                       (avg_total_recv / 1e9) / dk_s, (avg_nvl_recv / 1e9) / dk_s,
+                       (avg_rdma_recv / 1e9) / dk_s);
+                printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                       (avg_total_send / 1e9) / dk_s, (avg_nvl_send / 1e9) / dk_s,
+                       (avg_rdma_send / 1e9) / dk_s);
+            }
             if (avg_dispatch_epi_us > 0.0) {
                 printf("DispatchEpilogue: kernel=%.2f us\n", avg_dispatch_epi_us);
             }
 
-            printf("Combine:     kernel=%.2f us\n", avg_kernel_ck_us);
-            printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n", (avg_total_recv / 1e9) / ck_s,
-                   (avg_nvl_recv / 1e9) / ck_s, (avg_rdma_recv / 1e9) / ck_s);
-            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n", (avg_total_send / 1e9) / ck_s,
-                   (avg_nvl_send / 1e9) / ck_s, (avg_rdma_send / 1e9) / ck_s);
-            if (avg_combine_pro_us > 0.0) {
-                printf("CombinePrologue: kernel=%.2f us\n", avg_combine_pro_us);
+            if (!dispatch_only) {
+                printf("Combine:     kernel=%.2f us\n", avg_kernel_ck_us);
+                if (ck_s > 0) {
+                    printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                           (avg_total_recv / 1e9) / ck_s, (avg_nvl_recv / 1e9) / ck_s,
+                           (avg_rdma_recv / 1e9) / ck_s);
+                    printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                           (avg_total_send / 1e9) / ck_s, (avg_nvl_send / 1e9) / ck_s,
+                           (avg_rdma_send / 1e9) / ck_s);
+                }
+                if (avg_combine_pro_us > 0.0) {
+                    printf("CombinePrologue: kernel=%.2f us\n", avg_combine_pro_us);
+                }
+                printf("Total (D+C): kernel=%.2f us\n", avg_kernel_dk_us + avg_kernel_ck_us);
             }
-            printf("Total (D+C): kernel=%.2f us\n", avg_kernel_dk_us + avg_kernel_ck_us);
         } else {
             printf("  NOTE: CUPTI support was not compiled.\n");
         }
 
         printf(
-            "\nByte counts (per rank avg): total_send=%.2f MB (%u tokens), rdma_send=%.2f MB (%u tokens), "
+            "\nLogical payload bytes (tokens + forwarded scales, per-rank avg): "
+            "total_send=%.2f MB (%u tokens), rdma_send=%.2f MB (%u tokens), "
             "rdma_recv=%.2f MB (%u tokens), total_recv=%.2f MB (%u tokens)\n",
             avg_total_send / 1e6,
             ht_bytes.total_send_tokens,
@@ -3711,7 +3968,7 @@ void printUsage(const char* programName, int myRank) {
         printf(
             "  --max-recv-token-slots-per-rank <N>  Per-rank recv-slot budget (0 = auto; HT default: "
             "FLAT=nRanks*tokens, Expert-major=nRanks*tokens*top_k)\n");
-        printf("  --zcopy                 Use ncclMemAlloc buffers + windows for HT tensors that need peer access\n");
+        printf("  --zcopy                 Use ncclMemAlloc buffers + windows for supported direct token/scale paths\n");
         printf("  --max-num-sms <N>       Maximum SMs for EP kernels (0 = auto, default: 0)\n");
         printf("  --prolog-epilog-sms <N> SMs for the prolog/epilog kernels (0 = auto, default: 0)\n");
         printf("  --preprocess-num-sms <N> SMs for the preprocessing scan kernels (0 = auto, default: 0)\n");
@@ -3734,6 +3991,10 @@ void printUsage(const char* programName, int myRank) {
         printf("  --mask-test             Simulate rank failures and test active-mask (LL only, implies --validate)\n");
         printf("  --topk-idx-int32        LL only: pass ncclInt32 topk_idx instead of ncclInt64\n");
         printf("  --dispatch-quantization <recipe>  Dispatch quantization recipe: none|scales-forward|ds-fp8e3m4.\n");
+        printf("  --mxfp8                 Shorthand: FP8 E4M3 tokens with Uint8 block-32 scales.\n");
+        printf("  --scales-forward-token-dtype <t>  scales-forward wire type: fp32|fp16|bf16|fp8e4m3|fp8e5m2|uint8.\n");
+        printf("                                      uint8 is packed FP4: physical H/2 bytes, two values per byte.\n");
+        printf("  --scales-forward-scale-dtype <t>  scales-forward scale type: fp32|fp16|bf16|fp8e4m3|fp8e5m2|uint8.\n");
         printf(
             "  --expert-id-kind <k>    Numbering for recv_topk_idx writes: auto|local|global (LL-RM/HT-FLAT only; "
             "default: auto)\n");
@@ -3766,9 +4027,11 @@ int main(int argc, char* argv[]) {
     bool dynamic_tokens = false;  // Enable dynamic token allocation (HT only, for random topk)
     size_t expert_major_alignment = 0;  // 0 = no padding; >1 aligns each expert zone
     unsigned int max_recv_tokens_per_rank = UINT_MAX;  // UINT_MAX = unset -> bench auto; 0 = lib auto (worst case)
-    bool zcopy = false;  // Use ncclMemAlloc + windows for HT tensors that need peer access
+    bool zcopy = false;  // Use ncclMemAlloc + windows for supported direct token/scale paths
     unsigned int max_num_sms = NCCL_EP_AUTO;  // Automatic SM assignment for different EP stages
     bool ht_em_local_dup = false;
+    bool ht_em_mode_explicit = false;
+    bool ht_em_local_permute_explicit = false;
     unsigned int prolog_epilog_sms = NCCL_EP_AUTO;  // 0 = auto (all SMs) for local EM permute kernels
     unsigned int preprocess_num_sms = NCCL_EP_AUTO;  // 0 = auto for the preprocessing scan kernels
     bool mask_test = false;       // Simulate rank failures and test active-mask (LL only)
@@ -3782,6 +4045,8 @@ int main(int argc, char* argv[]) {
     // a stable contract end-to-end.
     ncclEpExpertIdKind_t recv_topk_idx_kind = NCCL_EP_EXPERT_ID_AUTO;
     ncclDataType_t token_dtype = ncclBfloat16;  // wire dtype for token tensors
+    ncclDataType_t scales_forward_token_dtype = ncclFloat8e4m3;
+    bool scales_forward_token_dtype_explicit = false;
     // Initialize MPI
     MPICHECK(MPI_Init(&argc, &argv));
     MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
@@ -3816,6 +4081,8 @@ int main(int argc, char* argv[]) {
         {"topk-idx-int32", no_argument, 0, 'I'},
         {"dispatch-quantization", required_argument, 0, 0},
         {"mxfp8", no_argument, 0, 0},
+        {"scales-forward-token-dtype", required_argument, 0, 1002},
+        {"scales-forward-scale-dtype", required_argument, 0, 1003},
         {"expert-id-kind", required_argument, 0, 1000},
         {"datatype", required_argument, 0, 0},
         {"disable-token-dropping", no_argument, 0, 1001},
@@ -3909,8 +4176,12 @@ int main(int argc, char* argv[]) {
             max_num_sms = static_cast<unsigned int>(atoi(optarg));
             break;
         case 'm':
+            ht_em_mode_explicit = true;
+            ht_em_local_dup = false;
+            em_nvlink_dup = false;
+            ht_em_local_permute_explicit = false;
             if (strcmp(optarg, "local_permute") == 0) {
-                    // default; nothing to do
+                ht_em_local_permute_explicit = true;
             } else if (strcmp(optarg, "local_dup") == 0) {
                 ht_em_local_dup = true;
             } else if (strcmp(optarg, "nvlink_dup") == 0) {
@@ -3962,10 +4233,13 @@ int main(int argc, char* argv[]) {
                         return 1;
                     }
                 } else if (strcmp(name, "mxfp8") == 0) {
-                    // MXFP8 scales-forward: E4M3 tokens, block 32, E8M0 (Uint8) scales. HT only.
+                    // MXFP8 scales-forward: E4M3 tokens, block 32, E8M0 (Uint8) scales.
                     dispatch_quantization = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+                    scales_forward_token_dtype = ncclFloat8e4m3;
+                    scales_forward_token_dtype_explicit = true;
                     g_scaleBlockOverride = 32;
                     g_scaleDtype = ncclUint8;
+                    g_scaleDtypeExplicit = true;
                 } else if (strcmp(name, "datatype") == 0) {
                     if (strcmp(optarg, "bf16") == 0) token_dtype = ncclBfloat16;
                     else if (strcmp(optarg, "fp16") == 0) token_dtype = ncclFloat16;
@@ -3995,6 +4269,26 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             break;
+        case 1002:  // --scales-forward-token-dtype
+            if (!parseWireDtype(optarg, &scales_forward_token_dtype)) {
+                if (myRank == 0) {
+                    printf("Error: --scales-forward-token-dtype must be fp32, fp16, bf16, fp8e4m3, fp8e5m2, or uint8, got '%s'\n", optarg);
+                }
+                MPI_Finalize();
+                return 1;
+            }
+            scales_forward_token_dtype_explicit = true;
+            break;
+        case 1003:  // --scales-forward-scale-dtype
+            if (!parseWireDtype(optarg, &g_scaleDtype)) {
+                if (myRank == 0) {
+                    printf("Error: --scales-forward-scale-dtype must be fp32, fp16, bf16, fp8e4m3, fp8e5m2, or uint8, got '%s'\n", optarg);
+                }
+                MPI_Finalize();
+                return 1;
+            }
+            g_scaleDtypeExplicit = true;
+            break;
         case 1001:  // --disable-token-dropping
             g_disable_token_dropping = true;
             break;
@@ -4004,6 +4298,48 @@ int main(int argc, char* argv[]) {
             return 0;
         default:
             printUsage(argv[0], myRank);
+            MPI_Finalize();
+            return 1;
+        }
+    }
+
+    // Packed FP4 uses Uint8 scales by default unless the caller
+    // explicitly selects another compile-time scale type.
+    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+        usesPackedFp4Shape(scales_forward_token_dtype) && !g_scaleDtypeExplicit) {
+        g_scaleDtype = ncclUint8;
+    }
+
+    if (dispatch_quantization != NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+        (scales_forward_token_dtype_explicit || g_scaleDtypeExplicit || g_scaleBlockOverride > 0)) {
+        if (myRank == 0) {
+            printf("Error: scales-forward dtype/block options require --dispatch-quantization scales-forward\n");
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        const bool packed_fp4 = usesPackedFp4Shape(scales_forward_token_dtype);
+        if (g_scaleBlockOverride > 0 && hidden % g_scaleBlockOverride != 0) {
+            if (myRank == 0) {
+                printf("Error: scales-forward hidden (%u) must be divisible by the scale block (%u)\n",
+                       hidden, g_scaleBlockOverride);
+            }
+            MPI_Finalize();
+            return 1;
+        }
+        const size_t token_elements = packed_fp4 ? hidden / 2u : hidden;
+        const size_t scale_elements = packed_fp4 ? hidden / PACKED_FP4_ELEMENTS_PER_SCALE
+                                                 : benchmarkScalesPerToken(dispatch_quantization, hidden);
+        const size_t token_row_bytes = token_elements * tokenElemBytes(scales_forward_token_dtype);
+        const size_t scale_row_bytes = scale_elements * scaleElemBytes();
+        if ((packed_fp4 && hidden % 2u != 0) || token_row_bytes == 0 || scale_row_bytes == 0 ||
+            token_row_bytes % 16u != 0 || scale_row_bytes % 16u != 0) {
+            if (myRank == 0) {
+                printf("Error: scales-forward requires non-empty 16-byte-aligned physical rows "
+                       "(token=%zu bytes, scale=%zu bytes)\n", token_row_bytes, scale_row_bytes);
+            }
             MPI_Finalize();
             return 1;
         }
@@ -4087,7 +4423,7 @@ int main(int argc, char* argv[]) {
     }
 
     // --ht-em-mode is only meaningful for HT + EM layout
-    if (ht_em_local_dup || em_nvlink_dup) {
+    if (ht_em_mode_explicit) {
         if (algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT || layout != NCCL_EP_LAYOUT_EXPERT_MAJOR) {
             if (myRank == 0) {
                 printf("Error: --ht-em-mode is only supported for HT algorithm with expert-major layout\n");
@@ -4095,6 +4431,14 @@ int main(int argc, char* argv[]) {
             MPI_Finalize();
             return 1;
         }
+    }
+    if (ht_em_local_permute_explicit && zcopy) {
+        if (myRank == 0) {
+            printf("Error: --ht-em-mode local_permute cannot be combined with --zcopy; "
+                   "zero_copy=ON selects the direct local_dup path\n");
+        }
+        MPI_Finalize();
+        return 1;
     }
 
     // --mask-test is only supported for LL mode and requires at least 4 ranks
@@ -4138,7 +4482,7 @@ int main(int argc, char* argv[]) {
         }
         if (algorithm == NCCL_EP_ALGO_LOW_LATENCY &&
             (layout != NCCL_EP_LAYOUT_EXPERT_MAJOR && layout != NCCL_EP_LAYOUT_RANK_MAJOR)) {
-            if (myRank == 0) printf("Error: LL mode only supports expert-major layout.\n");
+            if (myRank == 0) printf("Error: LL mode supports expert-major or rank-major layout.\n");
             MPI_Finalize();
             return 1;
         }
@@ -4192,10 +4536,20 @@ int main(int argc, char* argv[]) {
         printf("  Warmup iters:    %d\n", num_warmup);
         printf("  Benchmark iters: %d\n", num_iters);
         printf("  Dispatch recipe: %s\n", dispatchRecipeName(dispatch_quantization));
-        printf(
-            "  Dispatch dtype:  %s\n",
-            dispatch_quantization != NCCL_EP_DISPATCH_QUANT_NONE ? "1-byte wire" :
-            (token_dtype == ncclFloat32 ? "FP32" : (token_dtype == ncclFloat16 ? "FP16" : "BF16")));
+        const ncclDataType_t printed_token_dtype =
+            dispatchTokenDtype(dispatch_quantization, token_dtype, scales_forward_token_dtype);
+        printf("  Dispatch dtype:  %s\n", wireDtypeName(printed_token_dtype));
+        if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+            if (usesPackedFp4Shape(scales_forward_token_dtype)) {
+                printf("  Packed FP4:      yes (uint8 physical H/2, two logical values/byte)\n");
+            }
+            const unsigned int scale_count = usesPackedFp4Shape(scales_forward_token_dtype)
+                ? hidden / PACKED_FP4_ELEMENTS_PER_SCALE
+                : benchmarkScalesPerToken(dispatch_quantization, hidden);
+            printf("  Scale dtype:     %s (%u elements/token, %zu bytes/token)\n",
+                   wireDtypeName(g_scaleDtype), scale_count,
+                   static_cast<size_t>(scale_count) * scaleElemBytes());
+        }
         printf("  Profile mode:    %s\n", profile_mode ? "enabled" : "disabled");
         printf("  NVLink:          %s\n", disable_nvlink ? "disabled (force RDMA intranode, LL only)" : "enabled");
         printf("  Validate mode:   %s\n", validate_data ? "enabled" : "disabled");
@@ -4215,7 +4569,15 @@ int main(int argc, char* argv[]) {
             printf("  Output layout:   %s\n", layout_str);
             if (expert_major_alignment > 0) printf("  Align (tokens):  %zu\n", expert_major_alignment);
             if (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-                printf("  Local dup:       %s\n", ht_em_local_dup ? "on" : "off");
+                int ranks_on_first_node = 0;
+                for (int rank = 0; rank < nRanks; ++rank) {
+                    ranks_on_first_node += hostHashs[rank] == hostHashs[0];
+                }
+                const char* ht_em_mode = em_nvlink_dup ? "nvlink_dup" :
+                    ht_em_local_dup ? "local_dup" :
+                    zcopy ? (ranks_on_first_node < nRanks ? "nvlink_dup" : "local_dup") : "local_permute";
+                printf("  HT EM mode:      %s%s\n", ht_em_mode,
+                       (!ht_em_mode_explicit && zcopy) ? " (selected by zero_copy=ON)" : "");
             }
         }
         const char* zcopy_str = "disabled";
@@ -4223,7 +4585,9 @@ int main(int argc, char* argv[]) {
             if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
                 zcopy_str = "enabled (ncclMemAlloc + TensorCreateFromWindow)";
             } else if (algorithm == NCCL_EP_ALGO_LOW_LATENCY && layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
-                zcopy_str = "enabled (LL rank-major: recv_x window, P2P payload write)";
+                zcopy_str = dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD
+                    ? "enabled (LL rank-major: token + scale windows, P2P payload writes)"
+                    : "enabled (LL rank-major: recv_x window, P2P payload write)";
             }
         }
         printf("  Use zero-copy: %s\n", zcopy_str);
@@ -4268,10 +4632,22 @@ int main(int argc, char* argv[]) {
     // max_dispatch_tokens_per_rank is the per-rank batch size (max tokens any single rank will send).
     config.max_dispatch_tokens_per_rank = dynamic_tokens ? NCCL_EP_AUTO : max_tokens_per_rank;
 
-    // Group staging for SCALES_FORWARD is sized from the normal token-byte
-    // budget, which must retain at least the two-byte baseline used by the
-    // library's scale staging layout.
-    config.max_token_bytes = hidden * tokenElemBytes(token_dtype);
+    size_t max_dispatch_payload_bytes = static_cast<size_t>(hidden) * tokenElemBytes(token_dtype);
+    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        const bool packed_fp4 = usesPackedFp4Shape(scales_forward_token_dtype);
+        const size_t token_elements = packed_fp4 ? hidden / 2u : hidden;
+        const size_t scale_elements = packed_fp4 ? hidden / PACKED_FP4_ELEMENTS_PER_SCALE
+                                                 : benchmarkScalesPerToken(dispatch_quantization, hidden);
+        const size_t recipe_payload_bytes =
+            token_elements * tokenElemBytes(scales_forward_token_dtype) + scale_elements * scaleElemBytes();
+        max_dispatch_payload_bytes = std::max(max_dispatch_payload_bytes, recipe_payload_bytes);
+    }
+    if (max_dispatch_payload_bytes > UINT_MAX) {
+        if (myRank == 0) printf("Error: dispatch payload exceeds UINT_MAX bytes/token\n");
+        MPI_Finalize();
+        return 1;
+    }
+    config.max_token_bytes = static_cast<unsigned int>(max_dispatch_payload_bytes);
     // Use NCCL_EP_AUTO for buffer sizes (required for dynamic tokens with larger batches)
     // For LL mode with disable_nvlink: NCCL_P2P_DISABLE env var handles NCCL GIN P2P
     config.rdma_buffer_size = NCCL_EP_AUTO;
@@ -4295,6 +4671,7 @@ int main(int argc, char* argv[]) {
     }
     config.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
     config.max_num_sms = max_num_sms;
+    config.zero_copy = zcopy ? NCCL_EP_ZERO_COPY_ON : NCCL_EP_ZERO_COPY_AUTO;
     if (ht_em_local_dup) {
         setenv("NCCL_EP_HT_EM_LOCAL_DUP", "1", 1);
     }
@@ -4369,20 +4746,21 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Count valid token-expert pairs (excluding -1 masked entries)
-    unsigned int num_valid_selections = 0;
-    for (unsigned int i = 0; i < num_tokens * top_k; i++) {
-        if (topk_idx_host[i] != -1) {
-            num_valid_selections++;
-        }
-    }
-
-    // Calculate byte metrics based on algorithm mode (BF16)
+    // Calculate logical payload metrics for the selected recipe.
     LowLatencyBytes ll_bytes = {};
     HighThroughputBytes ht_bytes = {};
     if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        ll_bytes = calculateLowLatencyBytes(topk_idx_host, num_tokens, top_k, hidden,
-                                            dispatch_quantization, token_dtype);
+        ll_bytes = calculateLowLatencyBytes(
+            topk_idx_host,
+            num_tokens,
+            top_k,
+            hidden,
+            num_experts,
+            nRanks,
+            layout,
+            dispatch_quantization,
+            token_dtype,
+            scales_forward_token_dtype);
     } else {
         ht_bytes = calculateHighThroughputBytes(
             topk_idx_host,
@@ -4395,7 +4773,8 @@ int main(int argc, char* argv[]) {
             nRanks,
             dispatch_quantization,
             ncclTeamLsa(comm).nRanks,
-            token_dtype);
+            token_dtype,
+            scales_forward_token_dtype);
     }
 
     {
@@ -4538,22 +4917,27 @@ int main(int argc, char* argv[]) {
     const ncclDataType_t dispatch_input_dtype =
         dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4
             ? ncclBfloat16
-            : dispatchTokenDtype(dispatch_quantization, token_dtype);
+            : dispatchTokenDtype(dispatch_quantization, token_dtype, scales_forward_token_dtype);
     const ncclDataType_t dispatch_output_dtype =
-        dispatchTokenDtype(dispatch_quantization, token_dtype);
+        dispatchTokenDtype(dispatch_quantization, token_dtype, scales_forward_token_dtype);
+    const unsigned int dispatch_hidden =
+        (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+         usesPackedFp4Shape(scales_forward_token_dtype)) ? hidden / 2 : hidden;
+    EpTensorAllocOptions ll_zc_opts;
+    const EpTensorAllocOptions* ll_dispatch_out_opts = nullptr;
     if (is_ll_mode) {
         // LL rank-major zero-copy: window-back dispatch_outputs.tokens so the
         // kernel can write payload directly into peer recv_x via P2P.
-        EpTensorAllocOptions ll_zc_opts;
         ll_zc_opts.use_nccl_mem = true;
         ll_zc_opts.use_window = true;
         ll_zc_opts.window_comm = comm;
         ll_zc_opts.registered_windows = &alloc.registered_windows;
         ll_zc_opts.nccl_mem_ptrs = &alloc.external_data_ptrs;
         ll_zc_opts.tensor_data_ptrs = &alloc.tensor_data_ptrs;
-        const EpTensorAllocOptions* ll_dispatch_out_opts =
+        ll_dispatch_out_opts =
             (zcopy && layout == NCCL_EP_LAYOUT_RANK_MAJOR &&
-             dispatch_quantization == NCCL_EP_DISPATCH_QUANT_NONE) ? &ll_zc_opts : nullptr;
+             (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_NONE ||
+              dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)) ? &ll_zc_opts : nullptr;
         setupLowLatencyTensors(
             dispatch_inputs,
             dispatch_outputs,
@@ -4563,7 +4947,7 @@ int main(int argc, char* argv[]) {
             combine_outputs,
             topk_weights,
             num_tokens,
-            hidden,
+            dispatch_hidden,
             top_k,
             num_local_experts,
             config.max_dispatch_tokens_per_rank,
@@ -4593,7 +4977,7 @@ int main(int argc, char* argv[]) {
             combine_outputs,
             topk_weights,
             num_tokens,
-            hidden,
+            dispatch_hidden,
             top_k,
             num_local_experts,
             num_recv_tokens,
@@ -4604,22 +4988,69 @@ int main(int argc, char* argv[]) {
 
     // SCALES_FORWARD receives its input scales from the caller; DS_FP8E3M4
     // generates output scales during LL dispatch.
+    EpTensorAllocOptions ht_sf_zc_opts;
+    const EpTensorAllocOptions* ht_sf_window_opts = nullptr;
+    if (!is_ll_mode && zcopy) {
+        ht_sf_zc_opts.use_nccl_mem = true;
+        ht_sf_zc_opts.use_window = true;
+        ht_sf_zc_opts.window_comm = comm;
+        ht_sf_zc_opts.registered_windows = &alloc.registered_windows;
+        ht_sf_zc_opts.nccl_mem_ptrs = &alloc.external_data_ptrs;
+        ht_sf_zc_opts.tensor_data_ptrs = &alloc.tensor_data_ptrs;
+        ht_sf_window_opts = &ht_sf_zc_opts;
+    }
     if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD ||
         dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
-        const unsigned int numScales = benchmarkScalesPerToken(dispatch_quantization, hidden);
+        const bool packed_fp4 = dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+            usesPackedFp4Shape(scales_forward_token_dtype);
+        const unsigned int numScales = packed_fp4 ? hidden / PACKED_FP4_ELEMENTS_PER_SCALE
+                                             : benchmarkScalesPerToken(dispatch_quantization, hidden);
+        const ncclDataType_t scale_dtype = dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4
+            ? ncclFloat32 : g_scaleDtype;
         if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
-            NCCLCHECK(epMakeTensor(&dispatch_inputs.scales, 2, g_scaleDtype, num_tokens, numScales));
+            NCCLCHECK(epMakeTensor(
+                &dispatch_inputs.scales,
+                2,
+                scale_dtype,
+                num_tokens,
+                numScales,
+                1,
+                1,
+                1,
+                ht_sf_window_opts));
         }
         if (is_ll_mode) {
+            if (layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+                NCCLCHECK(epMakeTensor(
+                    &dispatch_outputs.scales,
+                    3,
+                    scale_dtype,
+                    (unsigned)nRanks,
+                    max_tokens_per_rank,
+                    numScales,
+                    1,
+                    1,
+                    ll_dispatch_out_opts));
+            } else {
+                NCCLCHECK(epMakeTensor(
+                    &dispatch_outputs.scales,
+                    3,
+                    scale_dtype,
+                    num_local_experts,
+                    (unsigned)nRanks * max_tokens_per_rank,
+                    numScales));
+            }
+        } else {
             NCCLCHECK(epMakeTensor(
                 &dispatch_outputs.scales,
-                3,
-                ncclFloat32,
-                num_local_experts,
-                (unsigned)nRanks * max_tokens_per_rank,
-                numScales));
-        } else {
-            NCCLCHECK(epMakeTensor(&dispatch_outputs.scales, 2, g_scaleDtype, num_recv_tokens, numScales));
+                2,
+                scale_dtype,
+                num_recv_tokens,
+                numScales,
+                1,
+                1,
+                1,
+                ht_sf_window_opts));
         }
     }
     if (myRank == 0) {
@@ -4713,13 +5144,17 @@ int main(int argc, char* argv[]) {
     // Calculate data sizes for bandwidth calculation based on algorithm mode
     size_t dispatch_data_bytes, combine_data_bytes;
     if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        // LL mode: BF16 for both dispatch and combine
+        // LL uses the recipe-specific dispatch payload and the configured combine dtype.
         dispatch_data_bytes = ll_bytes.dispatch_bytes;
-        combine_data_bytes = ll_bytes.combine_bytes;
+        combine_data_bytes = dispatch_only ? 0 : ll_bytes.combine_bytes;
+        if (dispatch_only) {
+            ll_bytes.combine_bytes = 0;
+            ll_bytes.num_combine_messages = 0;
+        }
     } else {
         // HT mode: RDMA_send + total_recv (matches DeepEP methodology)
         dispatch_data_bytes = ht_bytes.rdma_send_bytes + ht_bytes.total_recv_bytes;
-        combine_data_bytes = dispatch_data_bytes; // Symmetric
+        combine_data_bytes = dispatch_only ? 0 : dispatch_data_bytes;
     }
 
     // ==================== Paired Dispatch + Combine Benchmark ====================
@@ -4876,7 +5311,15 @@ int main(int argc, char* argv[]) {
 
     // Print results and summary based on algorithm mode
     if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        printLowLatencyResults(myRank, nRanks, dispatch_result, combine_result, combined_result, ktimer, ll_bytes);
+        printLowLatencyResults(
+            myRank,
+            nRanks,
+            dispatch_result,
+            combine_result,
+            combined_result,
+            ktimer,
+            ll_bytes,
+            dispatch_only);
     } else {
         printHighThroughputResults(
             myRank,
@@ -4890,8 +5333,8 @@ int main(int argc, char* argv[]) {
             global_rdma_send,
             global_total_recv,
             global_rdma_recv,
-            ht_em_local_dup,
-            dispatch_quantization);
+            dispatch_quantization,
+            dispatch_only);
     }
 
     // Aggregate group/handle creation times across ranks
@@ -4988,7 +5431,7 @@ int main(int argc, char* argv[]) {
             dispatch_layout_info,
             max_tokens_per_rank,
             num_tokens_per_rank.data(),
-            hidden,
+            dispatch_hidden,
             top_k,
             num_experts,
             num_local_experts,

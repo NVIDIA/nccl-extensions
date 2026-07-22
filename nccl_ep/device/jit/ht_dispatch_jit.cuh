@@ -110,6 +110,7 @@ inline std::string dispatch_jit_source(
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
         << "using TOKEN_DATA_TYPE = " << kernel_spec.payload_type_literal << ";\n"
+        << "using SCALE_DATA_TYPE = " << kernel_spec.scale_type_literal << ";\n"
         << "static constexpr int kSfBytesPerToken = " << sf_bytes_per_token << ";\n"
         << "using GIN_GROUP     = ht_ep::warp_group<" << cross_lsa_group_warps << ", "
         << cross_lsa_group_start << ">;\n"
@@ -129,6 +130,7 @@ inline std::string dispatch_jit_source(
         << "  extern __shared__ uint8_t smem_bytes[];\n"
         << "  ht_ep::dispatch_kernel_impl<\n"
         << "      TOKEN_DATA_TYPE,\n"
+        << "      SCALE_DATA_TYPE,\n"
         << "      " << kernel_spec.recipe_source_literal << ",\n"
         << "      GIN_GROUP,\n"
         << "      LSA_G2S_GROUP,\n"
@@ -182,6 +184,7 @@ inline ncclResult_t launch_dispatch(
              << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_fl")
              << "_recipe" << kernel_spec.recipe_cache_tag
              << "_payload" << kernel_spec.payload_cache_tag
+             << "_scale" << kernel_spec.scale_cache_tag
              << "_sf" << sf_bytes_per_token;
         return name.str();
     }();

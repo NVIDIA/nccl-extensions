@@ -528,10 +528,11 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
         layout.dispatch_memory_region_info = nullptr;
     }
 
-    // PAD warp TMA slot: one zeroed token row, broadcast to padding slots.
+    // PAD warp TMA slot: one zeroed token/scale row, broadcast to padding slots.
     // Only allocated for expert-major; flat leaves the pointer null.
     if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-        int pad_bytes = model.hidden_dim * kTokenSize;
+        const int token_bytes = model.hidden_dim * kTokenSize;
+        int pad_bytes = token_bytes > config.sf_bytes_per_token ? token_bytes : config.sf_bytes_per_token;
         layout.pad_tma_slot_bytes = (pad_bytes + 127) & ~127;
         offset = (offset + 127) & ~127;
         layout.pad_tma_buffer = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
@@ -619,7 +620,8 @@ static size_t calc_disp_fixed_smem(const dispatch_config_t& config, const model_
     }
     // PAD warp TMA slot (expert-major only, 128B aligned)
     if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-        int pad_bytes = model.hidden_dim * kTokenSize;
+        const int token_bytes = model.hidden_dim * kTokenSize;
+        int pad_bytes = token_bytes > config.sf_bytes_per_token ? token_bytes : config.sf_bytes_per_token;
         pad_bytes = (pad_bytes + 127) & ~127;
         shared_size = (shared_size + 127) & ~127;
         shared_size += pad_bytes;
@@ -689,7 +691,7 @@ inline disp_smem_cost_t calc_disp_smem_cost(
 
 // kTokenSize drives the per-stage token-buffer stride; everything else
 // (probabilities, mbarriers, scales) is element-width-invariant.
-template <ncclDataType_t kTokenDtype = ncclBfloat16>
+template <ncclDataType_t kTokenDtype>
 __device__ combine_smem_layout_t create_combine_smem_layout(
     combine_smem_layout_t& layout,
     void* smem_base,
@@ -972,8 +974,7 @@ struct dispatch_kernel_param_base_t {
     // Input buffers. These buffers are local buffers.
     const TOKEN_DATA_TYPE* attn_input_token;
     const float* attn_input_prob; // Needed by expert layer, so only valid in forward dispatch.
-    const uint8_t*
-        attn_input_token_scaling_factor; // FP8 EXTERN: per-token scales (float* for FP32, uint8_t* for UE8M0 — pure byte transport).
+    const uint8_t* attn_input_token_scaling_factor; // SCALES_FORWARD input bytes.
     // Internal temp buffers. These buffers are local buffers.
     uint64_t* gin_G2S_flags; // For RDMA Atomic flags.
     uint32_t* lsa_S2G_flags; // For intra-LSA S2G write completion notification.
@@ -3849,11 +3850,13 @@ __forceinline__ __device__ void combine_RED_inter_warp(
 template <typename PAD_GROUP, typename TOKEN_DATA_TYPE, typename SMEM_TYPE>
 __forceinline__ __device__ void PAD_warp_group_device_function(
     TOKEN_DATA_TYPE* __restrict__ local_buf,
+    uint8_t* __restrict__ local_scale_buf,
     const int32_t* __restrict__ actual_counts,
     const int64_t* __restrict__ zone_offsets,
     const int experts_per_rank,
     const int alignment,
     const int hidden_dim,
+    const int scale_row_bytes,
     const int num_blocks,
     SMEM_TYPE* smem) {
     // Caller zeroes alignment when not expert-major; alignment<=1 ⇒ no padding work.
@@ -3862,10 +3865,13 @@ __forceinline__ __device__ void PAD_warp_group_device_function(
     const int lane = PAD_GROUP::thread_rank();
     constexpr int warp_size = 32;
     const uint32_t token_bytes = static_cast<uint32_t>(hidden_dim * sizeof(TOKEN_DATA_TYPE));
+    const uint32_t zero_bytes = token_bytes > static_cast<uint32_t>(scale_row_bytes)
+        ? token_bytes
+        : static_cast<uint32_t>(scale_row_bytes);
 
     // Cooperatively zero the SMEM staging slot once per kernel invocation.
     auto* smem_u4 = reinterpret_cast<uint4*>(smem->get_pad_tma_slot());
-    const int vec_n = token_bytes / sizeof(uint4);
+    const int vec_n = zero_bytes / sizeof(uint4);
     const uint4 zero4{0, 0, 0, 0};
     for (int i = lane; i < vec_n; i += warp_size) smem_u4[i] = zero4;
     __syncwarp();
@@ -3891,6 +3897,15 @@ __forceinline__ __device__ void PAD_warp_group_device_function(
                     dst,
                     smem->get_pad_tma_slot(),
                     token_bytes);
+                if (local_scale_buf != nullptr && scale_row_bytes > 0) {
+                    cuda::ptx::cp_async_bulk(
+                        cuda::ptx::space_global,
+                        cuda::ptx::space_shared,
+                        local_scale_buf +
+                            static_cast<size_t>(zone_offsets[e] + count + p) * scale_row_bytes,
+                        smem->get_pad_tma_slot(),
+                        scale_row_bytes);
+                }
                 my_in_flight++;
             }
         }
@@ -3940,6 +3955,7 @@ __device__ __forceinline__ bool elect_last_block(const int* counter, int num_blo
 
 template <
     typename TOKEN_DATA_TYPE,
+    typename SCALE_DATA_TYPE,
     ncclEpDispatchQuantizationRecipe_t kQuantizationRecipe,
     typename GIN_GROUP,
     typename LSA_G2S_GROUP,
@@ -3964,6 +3980,9 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     static_assert(kQuantizationRecipe == NCCL_EP_DISPATCH_QUANT_NONE ||
                       kQuantizationRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD,
                   "unsupported dispatch quantization recipe");
+    // The JIT-selected ScaleT validates the caller's scale element packing.
+    static_assert(SF_BYTES_PER_TOKEN == 0 || SF_BYTES_PER_TOKEN % sizeof(SCALE_DATA_TYPE) == 0,
+                  "scale payload must contain a whole number of ScaleT elements");
     const int my_lteam = param.lsa_team;
     if constexpr (LSA_TEAMS != 1) {
         static_assert(
@@ -4133,11 +4152,13 @@ __device__ __forceinline__ void dispatch_kernel_impl(
         // in each expert's zone, so the two warps target disjoint global memory.
         PAD_warp_group_device_function<PAD_GROUP, TOKEN_DATA_TYPE>(
             param.expert_output_token[param.local_rank],
+            SF_BYTES_PER_TOKEN > 0 ? param.expert_output_scaling_factor[param.local_rank] : nullptr,
             param.pad_actual_counts,
             param.pad_expert_token_offsets,
             param.experts_per_rank,
             param.pad_alignment,
             HIDDEN_DIM,
+            SF_BYTES_PER_TOKEN,
             NBLOCKS,
             smem_buffer_ptr);
     }
@@ -4221,8 +4242,8 @@ template < // This type represent intra-LSA reduction warp group.
   // Whether the combine kernel is used in backward process. If so, need to transfer the prob for each token as well.
   bool BACKWARD_COMBINE, int HIDDEN_DIM, int LSA_TEAM_SZ, ncclEpLayout_t kLayout,
   // NONE output dtype, resolved at compile time (JIT literal) so the per-element
-  // reduction branches fold away — BF16 (default) pays zero dtype-branch cost.
-  ncclDataType_t kTokenDtype = ncclBfloat16>
+  // reduction branches fold away.
+  ncclDataType_t kTokenDtype>
 // Each CUDA block of combine kernel has named warp groups:
 // intra/inter reduction, intra/inter G2S, and cross-LSA-team N2N RDMA. Group sizes are
 // set by the HT combine warp-count constants and the selected pipeline count.
@@ -4716,8 +4737,10 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
         }
     } else if (warp_id == 1) {
         // Consumer (S2G): fan the primary stage out to every secondary in the row.
+        constexpr int kMaxInFlightS2G = PIPE_DEPTH - 1;
         int stage = 0;
         uint32_t producer_parity = 0;
+        int in_flight_s2g = 0;
         for (int i = block_id; i < N; i += n_blocks) {
             while (!cuda::ptx::mbarrier_try_wait_parity(&prod_mbar[stage], producer_parity)) {
             }
@@ -4754,8 +4777,15 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
                     }
                 }
                 cuda::ptx::cp_async_bulk_commit_group();
-                cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<PIPE_DEPTH - 1>{});
-                cuda::ptx::mbarrier_arrive(&cons_mbar[stage]);
+                in_flight_s2g++;
+                if (in_flight_s2g > kMaxInFlightS2G) {
+                    cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<kMaxInFlightS2G>{});
+                    in_flight_s2g--;
+                    const int notify_stage = stage >= kMaxInFlightS2G
+                        ? stage - kMaxInFlightS2G
+                        : stage - kMaxInFlightS2G + PIPE_DEPTH;
+                    cuda::ptx::mbarrier_arrive(&cons_mbar[notify_stage]);
+                }
             }
             stage++;
             if (stage == PIPE_DEPTH) {
@@ -5139,7 +5169,9 @@ __device__ __forceinline__ void local_permute_dup(
     // Source row for the pad warp's cp.async.bulk S2G.
     extern __shared__ int4 s_zero[];
 
-    for (int j = threadIdx.x; j < row_int4; j += blockDim.x) {
+    const int zero_bytes = row_bytes > scale_row_bytes ? row_bytes : scale_row_bytes;
+    const int zero_int4 = zero_bytes / sizeof(int4);
+    for (int j = threadIdx.x; j < zero_int4; j += blockDim.x) {
         s_zero[j] = int4{0, 0, 0, 0};
     }
     __syncthreads();
@@ -5279,7 +5311,7 @@ struct local_permute_reduce_param_t {
 // direct cached global loads, then write the packed bf16 result back to
 // flat_staging. HiddenInt4 = row_bytes / 16 is templated so the per-thread
 // strided element loop is a compile-time bound.
-template <int MaxTopK, int HiddenInt4, ncclDataType_t kTokenDtype = ncclBfloat16>
+template <int MaxTopK, int HiddenInt4, ncclDataType_t kTokenDtype>
 __device__ __forceinline__ void local_permute_reduce(
     uint8_t* __restrict__ flat_staging,
     const uint8_t* __restrict__ recv_x_em,

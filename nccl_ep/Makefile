@@ -252,11 +252,11 @@ ifeq ($(MPI), 1)
 MPI_CFLAGS := -DMPI_SUPPORT -I$(MPI_HOME)/include
 MPI_LDFLAGS := -L$(MPI_HOME)/lib -lmpi
 
-EP_TEST_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) --compiler-options "-fPIC" -ccbin $(NVCC_CXX_COMPILER) $(CXXSTD)
+EP_TEST_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) -I$(NCCL_INCDIR) $(MPI_CFLAGS) --compiler-options "-fPIC" -ccbin $(NVCC_CXX_COMPILER) $(CXXSTD)
 EP_TEST_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda
 
 # ep_bench: performance benchmark (NVTX for profiling, optional CUPTI for kernel timing)
-EP_BENCH_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) $(CUPTI_CFLAGS) --compiler-options "-fPIC" -ccbin $(NVCC_CXX_COMPILER) $(CXXSTD)
+EP_BENCH_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) -I$(NCCL_INCDIR) $(MPI_CFLAGS) $(CUPTI_CFLAGS) --compiler-options "-fPIC" -ccbin $(NVCC_CXX_COMPILER) $(CXXSTD)
 EP_BENCH_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(CUPTI_LDFLAGS)
 ep_test: lib $(DST_DIR)/ep_test
 ep_bench: lib $(DST_DIR)/ep_bench

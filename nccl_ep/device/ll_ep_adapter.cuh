@@ -27,6 +27,12 @@ inline const char* ll_token_dtype_template_literal(ncclDataType_t dt) {
         return "ncclFloat32";
     case ncclFloat16:
         return "ncclFloat16";
+    case ncclFloat8e4m3:
+        return "ncclFloat8e4m3";
+    case ncclFloat8e5m2:
+        return "ncclFloat8e5m2";
+    case ncclUint8:
+        return "ncclUint8";
     default:
         return "ncclBfloat16";
     }
@@ -37,6 +43,12 @@ inline const char* ll_token_dtype_name_tag(ncclDataType_t dt) {
         return "_tfp32";
     case ncclFloat16:
         return "_tfp16";
+    case ncclFloat8e4m3:
+        return "_te4m3";
+    case ncclFloat8e5m2:
+        return "_te5m2";
+    case ncclUint8:
+        return "_tu8";
     default:
         return "_tbf16";
     }
@@ -59,7 +71,7 @@ inline const char* ll_token_dtype_name_tag(ncclDataType_t dt) {
 struct dispatch_kernel_args_t {
     // INPUT
     const void* inData;
-    const uint8_t* inScalesBuf;   // non-null for SCALES_FORWARD
+    const void* inScalesBuf;      // non-null for SCALES_FORWARD; runtime-typed storage
     const void* inTopkIdx;        // cast to const TopkIdxT* by the JIT entry
     const float* inTopkWeights;
     int* rankMask;
@@ -88,7 +100,8 @@ struct dispatch_kernel_args_t {
     int64_t* waitStats;
     // CONFIG
     int numTokens;
-    int scalesPerToken;           // SCALES_FORWARD input scale count per token
+    // Derived from validated inputs->scales->sizes[1].
+    int scalesPerToken;
     int maxTokensPerRank;
     int numTopk;
     int numExperts;
@@ -105,10 +118,11 @@ struct dispatch_kernel_args_t {
     const ncclWindow_t* windows;
     unsigned signalsBase;
     uint64_t timeoutCycles;
-    // Zero-copy dispatch output: when recvDataWindow != {}, sender writes the
-    // payload directly into the peer's recv_x and the receiver skips the copy.
+    // Non-null windows enable peer payload writes.
     ncclWindow_t recvDataWindow;
     size_t recvDataOffset;
+    ncclWindow_t rcvScalesWin;
+    size_t rcvScalesOffs;
 };
 
 struct combine_kernel_args_t {
@@ -177,10 +191,12 @@ struct clean_low_latency_buffer_kernel_args_t {
 struct DispatchParams {
     // User inputs
     const void* inData;
-    const uint8_t* inScalesBuf = nullptr;  // non-null for SCALES_FORWARD
+    const void* inScalesBuf = nullptr;     // non-null for SCALES_FORWARD; runtime-typed storage
     const void* inTopkIdx;                  // int32_t* or int64_t*; see topkIdxIsInt64
     bool topkIdxIsInt64 = true;             // selects the TopkIdxT kernel specialization
-    int scalesPerToken = 0;                 // SCALES_FORWARD input scale count per token
+    // Derived from inputs->scales->sizes[1] by ncclEpDispatch.
+    int scalesPerToken = 0;
+    ncclDataType_t scaleDtype;              // SCALES_FORWARD tensor dtype; selects ScaleT in JIT
     const float* inTopkWeights;
 
     // User / pre-allocated output buffers
@@ -236,11 +252,12 @@ struct DispatchParams {
     ncclEpExpertIdKind_t recvTopkIdxKind = NCCL_EP_EXPERT_ID_LOCAL;
     int phases = 0;
 
-    // Zero-copy dispatch output (rank-major + nvlinkOnly + bf16). When
-    // recvDataWindow != {}, the sender writes payload directly into the peer's
-    // recv_x buffer and the receiver skips the staging->recv_x copy.
+    // Zero-copy dispatch output (rank-major + nvlinkOnly). Each supplied
+    // token or SCALES_FORWARD scale window is written directly to its peer output.
     ncclWindow_t recvDataWindow = ncclWindow_t{};
     size_t recvDataOffset = 0;
+    ncclWindow_t rcvScalesWin = ncclWindow_t{};
+    size_t rcvScalesOffs = 0;
 
     // Actual token wire dtype. Selects the kTokenDtype kernel specialization;
     // FP16 and BF16 share the same two-byte copy specialization.

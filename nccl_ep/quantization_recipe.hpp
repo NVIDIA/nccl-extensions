@@ -23,6 +23,8 @@ struct DispatchKernelSpec {
     const char* wire_dtype_literal;
     const char* payload_type_literal;
     const char* payload_cache_tag;
+    const char* scale_type_literal;
+    const char* scale_cache_tag;
     const char* recipe_source_literal;
     const char* recipe_cache_tag;
 };
@@ -30,6 +32,7 @@ struct DispatchKernelSpec {
 inline ncclResult_t resolveDispatchKernelSpec(
     ncclEpDispatchQuantizationRecipe_t quantization_recipe,
     ncclDataType_t token_dtype,
+    ncclDataType_t scale_dtype,
     DispatchKernelSpec* spec) {
     if (spec == nullptr) {
         std::fprintf(stderr, "NCCL EP warning: null dispatch kernel specification output\n");
@@ -37,6 +40,8 @@ inline ncclResult_t resolveDispatchKernelSpec(
     }
 
     spec->wire_token_dtype = token_dtype;
+    spec->scale_type_literal = "uint8_t";
+    spec->scale_cache_tag = "none";
     auto resolve_byte_copy_payload = [&]() -> ncclResult_t {
         switch (token_dtype) {
             case ncclFloat8e4m3:
@@ -46,7 +51,9 @@ inline ncclResult_t resolveDispatchKernelSpec(
                 spec->payload_cache_tag = "u8";
                 return ncclSuccess;
             case ncclFloat8e5m2:
+            case ncclUint8:
                 spec->wire_dtype_literal = "ncclFloat8e5m2";
+                if (token_dtype == ncclUint8) spec->wire_dtype_literal = "ncclUint8";
                 spec->payload_bytes = sizeof(uint8_t);
                 spec->payload_type_literal = "uint8_t";
                 spec->payload_cache_tag = "u8";
@@ -80,6 +87,18 @@ inline ncclResult_t resolveDispatchKernelSpec(
         case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
             spec->recipe_source_literal = "NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD";
             spec->recipe_cache_tag = "scales_forward";
+            switch (scale_dtype) {
+                case ncclFloat32: spec->scale_type_literal = "float"; spec->scale_cache_tag = "fp32"; break;
+                case ncclFloat16: spec->scale_type_literal = "__half"; spec->scale_cache_tag = "fp16"; break;
+                case ncclBfloat16: spec->scale_type_literal = "nv_bfloat16"; spec->scale_cache_tag = "bf16"; break;
+                case ncclFloat8e4m3: spec->scale_type_literal = "__nv_fp8_e4m3"; spec->scale_cache_tag = "e4m3"; break;
+                case ncclFloat8e5m2: spec->scale_type_literal = "__nv_fp8_e5m2"; spec->scale_cache_tag = "e5m2"; break;
+                case ncclUint8: spec->scale_type_literal = "uint8_t"; spec->scale_cache_tag = "u8"; break;
+                default:
+                    std::fprintf(stderr, "NCCL EP warning: SCALES_FORWARD cannot use scale dtype %d\n",
+                                 static_cast<int>(scale_dtype));
+                    return ncclInvalidArgument;
+            }
             return resolve_byte_copy_payload();
         case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
             spec->wire_token_dtype = ncclFloat8e4m3;
@@ -87,6 +106,8 @@ inline ncclResult_t resolveDispatchKernelSpec(
             spec->payload_bytes = sizeof(uint8_t);
             spec->payload_type_literal = "uint8_t";
             spec->payload_cache_tag = "u8";
+            spec->scale_type_literal = "float";
+            spec->scale_cache_tag = "fp32";
             spec->recipe_source_literal = "NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4";
             spec->recipe_cache_tag = "ds_fp8e3m4";
             return ncclSuccess;

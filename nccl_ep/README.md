@@ -136,15 +136,27 @@ names the struct and the **Field** column names the field within it.
 * R = number of ranks (nRanks)
 * N(r) = number of tokens targeting rank r
 
+`NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD` forwards the physical bytes of two 2D
+inputs: tokens `[B x H]` and scales `[B x S]`. `S` is taken directly from the
+scale tensor; the recipe does not infer a scale-block size. Tokens and scales
+may independently use FP32, FP16, BF16, FP8, or `ncclUint8`, and each physical
+row and storage base (or window offset) must be 16-byte aligned. `ncclUint8`
+is raw byte storage; packed FP4 callers conventionally use physical shape
+`[B x H/2]`, where each byte carries two logical FP4 values. Dispatch scale
+outputs have the same leading layout dimensions as token outputs and `S` as
+their final dimension. In LL rank-major mode, token and scale output descriptors
+can independently be backed by NCCL windows. See the full public API contract in
+`nccl_ep.h`.
+
 
 #### LL mode (same data type)
 
 | Operation | Struct             | Field             | Dims             |
 |:---------:|:-------------------|:------------------|:----------------:|
 | Dispatch  | dispatch_inputs    | tokens            | [B x H]          |
-|           | dispatch_outputs   | tokens            | [L x R x B x H]  |
+|           | dispatch_outputs   | tokens            | [L x (R*B) x H]  |
 |           | layout_info        | expert_counters   | [L]              |
-| Combine   | combine_inputs     | tokens            | [L x R x B x H]  |
+| Combine   | combine_inputs     | tokens            | [L x (R*B) x H]  |
 |           | combine_outputs    | tokens            | [B x H]          |
 |           | combine_outputs    | topk_weights      | [B x K]          |
 
@@ -286,6 +298,8 @@ For debugging, the following variables can be set
 ```bash
 export NCCL_DEBUG=INFO        # Enable NCCL debug output
 export NCCL_DEBUG_SUBSYS=ALL  # All subsystems
+export NCCL_EP_DEBUG=1        # NCCL-EP diagnostics, including zero-copy selection and fallback reasons
+export NCCL_EP_ENV_VERBOSE=true  # Resolved NCCL-EP environment at group creation
 ```
 
 ### High-Throughput tuning
@@ -301,7 +315,7 @@ export NCCL_EP_TOKENS_PER_CHUNK=128
 
 # Dump every resolved NCCL EP environment variable (name + value, or "unset")
 # at group creation, including NCCL_EP_TOKENS_PER_CHUNK.
-export NCCL_EP_ENV_VERBOSE=1
+export NCCL_EP_ENV_VERBOSE=true
 ```
 
 By default EP guards its internal communication buffers so that neighboring
@@ -353,7 +367,7 @@ typedef struct {
     unsigned int max_recv_tokens_per_rank;      // Max tokens any single rank receives
                                                 //   HT: required (must be >= max_dispatch_tokens_per_rank)
                                                 //   LL: NCCL_EP_AUTO → nRanks * max_dispatch_tokens_per_rank
-    unsigned int max_token_bytes;               // Upper bound on per-token bytes
+    unsigned int max_token_bytes;               // Max token-row bytes; LL SCALES_FORWARD also bounds token+scale payload
     unsigned long int rdma_buffer_size;         // RDMA buffer size for LL mode.
                                                 //   NCCL_EP_AUTO  → lazy: allocate on first ncclEpInitHandle, sized to that
                                                 //                  handle's actual (layout, num_topk); collective re-grow
@@ -371,6 +385,12 @@ typedef struct {
 
 // Use NCCL_EP_GROUP_CONFIG_INIT to pre-fill `size` and `version` correctly.
 ```
+
+`max_token_bytes` is a physical-byte budget for an individual token or scale
+row. LL `NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD` additionally requires their
+sum to fit its shared message slot; for example, packed FP4 uses `H/2` token
+bytes plus `S * sizeof(scale_dtype)` scale bytes. HT requires the configured
+bound to be a multiple of 16 bytes.
 
 ### `ncclEpHandle_t` - Operation Handle
 
@@ -394,7 +414,7 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
 **Low Latency (LL)**:
 - Supports `NCCL_EP_LAYOUT_EXPERT_MAJOR` and `NCCL_EP_LAYOUT_RANK_MAJOR` layouts.
 - Output tokens are 3D:
-  - expert-major: `[num_local_experts, N(e), hidden]`, where `N(e)` is the number of tokens routed to the specific expert `e`.
+  - expert-major: `[num_local_experts, num_ranks * max_dispatch_tokens_per_rank, hidden]`; `expert_counters[e]` gives the active rows for expert `e`.
   - rank-major:   `[num_ranks, max_dispatch_tokens_per_rank, hidden]`.
 - Supports `send_only` (in `ncclEpDispatchConfig_t` / `ncclEpCombineConfig_t`) to enable computation/communication overlapping.
 - Does not support dynamic `max_dispatch_tokens_per_rank` detection.

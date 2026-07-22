@@ -89,6 +89,10 @@ template <>
 __host__ __device__ constexpr int size_u8<ncclFloat8e5m2>() {
     return sizeof(uint8_t);
 }
+template <>
+__host__ __device__ constexpr int size_u8<ncclUint8>() {
+    return sizeof(uint8_t);
+}
 
 // Wire element width in uint16_t units (token buffers use a uint16_t* base; one-byte values have no
 // uint16_t-unit stride, so it is intentionally not specialized here).

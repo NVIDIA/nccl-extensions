@@ -197,10 +197,11 @@ typedef struct {
     //   ncclEpDispatch.
     //   LL: AUTO/0 → nRanks * max_dispatch_tokens_per_rank.
     unsigned int max_recv_tokens_per_rank;
-    // Upper bound on per-token bytes, covering both dispatch and combine.
-    // The group sizes all token buffers from this; per-call sizes flow through
-    // the input tensors' sizes/datatype and may be smaller. Independent of
-    // element type — purely byte-oriented.
+    // Upper bound on token-row bytes per token, covering both dispatch and combine.
+    // SCALES_FORWARD scale rows have the same independent byte bound; LL requires
+    // their combined message payload to fit. Per-call sizes flow through the
+    // tensors and may be smaller; this is byte-oriented.
+    // HT requires this configured upper bound to be a multiple of 16 bytes.
     unsigned int max_token_bytes;
     // RDMA buffer size in bytes for LL mode. Two modes:
     //   - NCCL_EP_AUTO: the library automatically selects the internal
@@ -233,9 +234,11 @@ typedef struct {
     // Can be overridden by the NCCL_EP_TIMEOUT_MS environment variable.
     // Setting too low risks false positives (slow ranks marked as failed).
     uint64_t timeout_ns;
-    // Bypass library-owned dispatch / combine token staging. When ON, the
-    // dispatch-output and combine-input tensors must be window-backed,
-    // else ncclInvalidArgument. AUTO (zero-init default) resolves to OFF.
+    // Control availability of library-owned dispatch / combine token staging.
+    // AUTO and OFF keep staging available, while compatible window-backed
+    // tensors may still use direct paths. ON requires HT dispatch-output and
+    // combine-input token windows. LL supports direct dispatch output and,
+    // for SCALES_FORWARD, can directly write either or both output payloads.
     ncclEpZeroCopyMode_t zero_copy;
     // Policy on recv overflow (HT only). Zero-init default = NCCL_EP_OVERFLOW_AUTO
     // (resolves to TRAP). NCCL_EP_OVERFLOW_DROP drops overflowing tokens and continues.
@@ -322,8 +325,8 @@ typedef struct {
     ncclEpTensor_t* topk_weights; // optional; 2D [num_tokens, top_k], ncclFloat32
   //   LL rank-major: per-token routing weights
   //   HT forward: routing weights (topk_idx taken from handle)
-    ncclEpTensor_t* scales;       // required by SCALES_FORWARD only;
-                                  // 2D [num_tokens, num_scales], ncclFloat32
+    ncclEpTensor_t* scales;       // required by SCALES_FORWARD; caller-provided scales are forwarded
+                                  // without conversion (see the recipe contract below)
 } ncclEpDispatchInputs_t;
 
 #define NCCL_EP_DISPATCH_INPUTS_INIT \
@@ -338,7 +341,7 @@ typedef struct {
     ncclEpTensor_t* tokens; // required; received tokens
     ncclEpTensor_t* topk_weights; // optional; LL rank-major or HT: received top-k weights
   //   LL rank-major: ncclFloat32 [num_ranks, max_dispatch_tokens_per_rank, top_k]
-    ncclEpTensor_t* scales;       // required by SCALES_FORWARD and DS_FP8E3M4; received per-token scales
+    ncclEpTensor_t* scales;       // required by recipes that forward or generate scales; received per-token scales
     ncclEpTensor_t* topk_idx; // optional; LL rank-major or HT FLAT: received top-k expert indices
   // Per-slot values are either the local or global expert id, selected via
   // ncclEpLayoutInfo_t::recv_topk_idx_kind (AUTO/LOCAL/GLOBAL; AUTO resolves
@@ -577,18 +580,22 @@ ncclResult_t ncclEpUpdateHandle(
     const ncclEpLayoutInfo_t* layout_info, // NULL = none
     cudaStream_t stream);
 
-// Dispatch quantization recipes are explicit contracts between the caller and
-// EP. Their semantics are shared by high-throughput (HT) and low-latency (LL)
-// dispatch; only tensor layouts may differ by algorithm.
+// Dispatch quantization contracts apply to both HT and LL; layouts may differ.
 //
 // NONE: the token tensor is transported in its declared dtype. Both scales
 // tensors must be absent.
 //
-// SCALES_FORWARD: the caller supplies already-encoded one-byte tokens
-// (ncclFloat8e4m3 or ncclFloat8e5m2) and FP32 per-token scales. Dispatch copies
-// both token bytes and scales unchanged; it performs no quantization or
-// dequantization, so config.round_scales must be zero. Both input and output
-// scales tensors are required.
+// SCALES_FORWARD: inputs->tokens and inputs->scales are 2D tensors of FP32,
+// FP16, BF16, FP8, or uint8 whose physical bytes are forwarded without
+// conversion. Output dtypes and physical row widths must match their respective
+// inputs, round_scales must be zero, and token/scale rows plus their storage
+// base (or window offset) must be 16-byte aligned. ncclUint8 is raw byte
+// storage; packed FP4 callers conventionally use physical shape [tokens, H/2],
+// where each byte stores two logical FP4 values. inputs->scales->sizes[1] is the
+// caller-provided scale-element count per token. LL outputs use the documented
+// 3D layout shapes; their token and scale outputs can independently be window-backed.
+// HT outputs are 2D and impose a both-or-neither window rule; expert-major
+// permutation may stage before writing those windows.
 //
 // DS_FP8E3M4: LL-only internal quantization. The caller supplies BF16 tokens;
 // dispatch emits E4M3 token bytes and generated FP32 scales, one per 128 token
@@ -674,7 +681,8 @@ typedef struct {
 //                            LL mode:
 //                              The set and shapes of the output tokens vary depending on the layout.
 //                              * Expert-major layout:
-//                                requires only outputs->tokens [local_experts, max_dispatch_tokens_per_rank, hidden]
+//                                requires only outputs->tokens
+//                                [local_experts, num_ranks * max_dispatch_tokens_per_rank, hidden]
 //                                The actual number of tokens received by expert `e` is obtained via
 //                                layout_info->expert_counters[`e`] (see below).
 //                              * Rank-major layout:

@@ -888,7 +888,7 @@ template <typename TOKEN_DATA_TYPE>
     // User input buffers
     kp.attn_input_token = reinterpret_cast<const TOKEN_DATA_TYPE*>(params.attn_input_token);
     kp.attn_input_prob = params.attn_input_prob;
-    kp.attn_input_token_scaling_factor = params.attn_input_scaling_factor;
+    kp.attn_input_token_scaling_factor = static_cast<const uint8_t*>(params.attn_input_scaling_factor);
 
     // Metadata and sync flags
     kp.rdma_to_attn_map = params.rdma_to_attn_map;
@@ -961,7 +961,10 @@ std::vector<uint8_t> build_dispatch_arg_buffer(
     for (int i = 0; i < params.lsa_team_size; i++) {
         token_ptrs[i] = reinterpret_cast<TOKEN_DATA_TYPE*>(params.expert_output_token_ptrs[i]);
         prob_ptrs[i] = params.expert_output_prob_ptrs ? params.expert_output_prob_ptrs[i] : nullptr;
-        sf_ptrs[i] = params.expert_output_scaling_factor_ptrs ? params.expert_output_scaling_factor_ptrs[i] : nullptr;
+        sf_ptrs[i] = nullptr;
+        if (params.expert_output_scaling_factor_ptrs) {
+            sf_ptrs[i] = static_cast<uint8_t*>(params.expert_output_scaling_factor_ptrs[i]);
+        }
     }
 
     return arg;
@@ -1181,7 +1184,7 @@ ncclResult_t call_dispatch(
     cudaStream_t stream,
     ncclDataType_t token_dtype) {
     DispatchKernelSpec kernel_spec;
-    if (ncclResult_t r = resolveDispatchKernelSpec(quantization_recipe, token_dtype, &kernel_spec);
+    if (ncclResult_t r = resolveDispatchKernelSpec(quantization_recipe, token_dtype, params.scale_dtype, &kernel_spec);
         r != ncclSuccess) {
         return r;
     }
@@ -1502,7 +1505,8 @@ void call_local_dup(
             stream);
     };
     if (token_dtype == ncclFloat32) run(uint32_t{});
-    else if (token_dtype == ncclFloat8e4m3 || token_dtype == ncclFloat8e5m2) run(uint8_t{});
+    else if (token_dtype == ncclFloat8e4m3 || token_dtype == ncclFloat8e5m2 ||
+             token_dtype == ncclUint8) run(uint8_t{});
     else run(uint16_t{});
 }
 

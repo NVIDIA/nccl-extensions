@@ -51,7 +51,10 @@ std::vector<std::string> include_options(const JitCompileConfig& config) {
         if (!path.empty()) options.push_back("-I" + path.string());
     };
 
-    // Include nccl_ep kernel headers and common.hpp
+    // Include both the public-header root and staged nccl_ep kernel headers.
+    // Kernel headers include "nccl_ep.h" while that public header includes
+    // "nccl_ep/ep_enums.h", so both roots are required.
+    add_include(config.source_dir.parent_path());
     add_include(config.source_dir);
     add_include(config.source_dir / "device");
 

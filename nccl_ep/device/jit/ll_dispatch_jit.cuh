@@ -55,8 +55,9 @@ inline std::string ll_dispatch_jit_source(
         << "      " << layout_literal << ",\n"
         << "      " << ll_dispatch_bool_literal(nvlinkOnly) << ",\n"
         << "      " << topk_type << ",\n"
-        << "      " << token_dtype_literal << ">(\n"
-        << "      p.inData, p.inScalesBuf,\n"
+        << "      " << token_dtype_literal << ",\n"
+        << "      " << kernel_spec.scale_type_literal << ">(\n"
+        << "      p.inData, static_cast<const uint8_t*>(p.inScalesBuf),\n"
         << "      static_cast<const " << topk_type << "*>(p.inTopkIdx), p.inTopkWeights,\n"
         << "      p.rankMask, p.asyncErrorFlag,\n"
         << "      p.outDataBuf, p.outScalesBuf, p.outSrcInfo,\n"
@@ -72,7 +73,7 @@ inline std::string ll_dispatch_jit_source(
         << "      p.numWarpGroups, p.numWarpsPerGroup,\n"
         << "      p.roundScale, p.recvTopkIdxKind, p.phases, p.numComms,\n"
         << "      p.devComms, p.windows, p.signalsBase, p.timeoutCycles,\n"
-        << "      p.recvDataWindow, p.recvDataOffset);\n"
+        << "      p.recvDataWindow, p.recvDataOffset, p.rcvScalesWin, p.rcvScalesOffs);\n"
         << "}\n";
     return src.str();
 }
@@ -95,6 +96,7 @@ inline ncclResult_t launch_ll_dispatch(
              << "_hdim" << hidden << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_rm")
              << "_recipe" << kernel_spec.recipe_cache_tag
              << "_payload" << kernel_spec.payload_cache_tag
+             << "_scale" << kernel_spec.scale_cache_tag
              << (nvlinkOnly ? "_nvlinkonly" : "")
              << (topkIdxIsInt64 ? "_topk64" : "_topk32")
              << ll_token_dtype_name_tag(tokenDtype);

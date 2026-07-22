@@ -95,7 +95,7 @@ SUITES=(
     "test_ht_stale_routing_map|EP HT Stale Routing Map Tests|1"
     "test_ht_overflow_drop|EP HT Overflow Drop Tests|0"
     "test_tensor_create|EP Tensor Create Tests|0"
-    "test_quantization_recipe|EP Quantization Recipe Tests|0"
+    "test_quantization_recipe|EP Quantization Recipe Tests|1"
     "test_zero_copy|EP Zero-Copy forced|0"
     "test_recv_topk_idx_flags|EP Recv Topk Idx Flags Tests|0"
 )

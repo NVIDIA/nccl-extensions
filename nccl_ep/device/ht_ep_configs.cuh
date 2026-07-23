@@ -18,11 +18,11 @@
 // ============================================================================
 // Dispatch configuration constants
 // ============================================================================
-// Defaults for NCCL_EP_DISPATCH_NUM_STAGES / NCCL_EP_DISPATCH_NUM_PIPELINES.
-#define NCCL_EP_HT_DISPATCH_NUM_OF_STAGES 12
-#define NCCL_EP_HT_DISPATCH_NUM_OF_IN_FLIGHT_S2G 4
-#define NCCL_EP_HT_DISPATCH_NUM_OF_BLOCKS NCCL_EP_HT_DFLT_NUM_SMS
-#define NCCL_EP_HT_DISPATCH_NUM_OF_PIPELINES 2
+// Defaults for NCCL_EP_DISPATCH_STAGES / NCCL_EP_DISPATCH_PIPELINES.
+#define NCCL_EP_HT_DISPATCH_STAGES 12
+#define NCCL_EP_HT_DISPATCH_IN_FLIGHT_S2G 4
+#define NCCL_EP_HT_DISPATCH_BLOCKS NCCL_EP_HT_DFLT_NUM_SMS
+#define NCCL_EP_HT_DISPATCH_PIPELINES 2
 #define NCCL_EP_HT_DISPATCH_N2N_WARPS 2
 // Maximum consecutive tokens batched into a single RDMA put in dispatch N2N.
 // Larger batches reduce NIC doorbell overhead but may delay first-byte latency.
@@ -32,21 +32,21 @@
 // Combine configuration constants
 // ============================================================================
 // Single-LSA-team configuration: optimized for intra-LSA only (2 pipelines, deep FIFO)
-#define NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_STAGES_G2S 12
-#define NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_STAGES_S2G 2
-#define NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_PIPELINES 2
+#define NCCL_EP_HT_COMBINE_LSA_STAGES_G2S 12
+#define NCCL_EP_HT_COMBINE_LSA_STAGES_S2G 2
+#define NCCL_EP_HT_COMBINE_LSA_PIPELINES 2
 
 // Multi-LSA-team configuration: optimized for cross-LSA-team RDMA (1 pipeline, shallow FIFO)
-#define NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_STAGES_G2S 4
-#define NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_STAGES_S2G 2
-#define NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_PIPELINES 1
+#define NCCL_EP_HT_COMBINE_CROSS_LSA_STAGES_G2S 4
+#define NCCL_EP_HT_COMBINE_CROSS_LSA_STAGES_S2G 2
+#define NCCL_EP_HT_COMBINE_CROSS_LSA_PIPELINES 1
 
 #define NCCL_EP_HT_COMBINE_RED_WARPS 4
 #define NCCL_EP_HT_COMBINE_N2N_WARPS 1
 
-#define NCCL_EP_HT_COMBINE_NUM_OF_TOKENS_PER_GROUP 4
-#define NCCL_EP_HT_COMBINE_NUM_OF_BLOCKS NCCL_EP_HT_DFLT_NUM_SMS
-#define NCCL_EP_HT_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G 2
+#define NCCL_EP_HT_COMBINE_TOK_PER_GROUP 4
+#define NCCL_EP_HT_COMBINE_BLOCKS NCCL_EP_HT_DFLT_NUM_SMS
+#define NCCL_EP_HT_COMBINE_EXTRA_IN_FLIGHT_S2G 2
 
 // Streaming overlap: tokens between drain+signal from reduction warp to RDMA warp.
 // 0 = disable streaming (fall back to chunk-level mbarrier only).

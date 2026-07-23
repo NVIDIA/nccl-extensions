@@ -981,6 +981,8 @@ ncclResult_t dispatch_impl(
     cudaStream_t stream,
     const DispatchKernelSpec& kernel_spec) {
     {
+        // env is a required argument: callers pass &group->env, which is never null.
+        assert(env != nullptr && "dispatch_impl requires a non-null env config");
         const bool forward_dispatch = (pass_direction == NCCL_EP_FWD_PASS);
         // The dispatch param/arg buffers are pointer-only (wire-width-invariant), so the
         // host packs with one fixed type; the JIT specializes the actual kernel by
@@ -1002,11 +1004,11 @@ ncclResult_t dispatch_impl(
 
         ::ht_ep::dispatch_config_t d_config{};
         d_config.num_of_stages = env_or_default(
-            env ? &env->dispatch_num_stages : nullptr, NCCL_EP_HT_DISPATCH_NUM_OF_STAGES);
+            &env->dispatch_num_stages, NCCL_EP_HT_DISPATCH_STAGES);
         ::ht_ep::model_config_t d_model;
         d_config.num_pipelines = env_or_default(
-            env ? &env->dispatch_num_pipelines : nullptr, NCCL_EP_HT_DISPATCH_NUM_OF_PIPELINES);
-        d_config.num_of_in_flight_s2g = NCCL_EP_HT_DISPATCH_NUM_OF_IN_FLIGHT_S2G;
+            &env->dispatch_num_pipelines, NCCL_EP_HT_DISPATCH_PIPELINES);
+        d_config.num_of_in_flight_s2g = NCCL_EP_HT_DISPATCH_IN_FLIGHT_S2G;
         d_config.num_of_tokens_per_chunk = num_tokens_per_chunk;
         d_config.num_of_blocks = num_blocks;
         d_config.forward_dispatch = forward_dispatch;
@@ -1025,8 +1027,8 @@ ncclResult_t dispatch_impl(
         d_model.num_lsa_teams = num_lsa_teams;
 
         // Requested config (env-pinned values are honored exactly, never reduced).
-        const bool stages_from_env = env != nullptr && env->dispatch_num_stages.is_set;
-        const bool pipelines_from_env = env != nullptr && env->dispatch_num_pipelines.is_set;
+        const bool stages_from_env = env->dispatch_num_stages.is_set;
+        const bool pipelines_from_env = env->dispatch_num_pipelines.is_set;
         const int requested_stages = d_config.num_of_stages;
         const int requested_pipelines = d_config.num_pipelines;
         const int requested_in_flight = d_config.num_of_in_flight_s2g;
@@ -1110,7 +1112,7 @@ ncclResult_t dispatch_impl(
 
         // Report the resolved config (once per distinct outcome) when verbose is
         // requested -- always, whether or not auto-fit changed anything.
-        if (env != nullptr && nccl_ep_env_verbose(*env)) {
+        if (nccl_ep_env_verbose(*env)) {
             std::ostringstream key;
             key << "ht_dispatch_smem_fit:" << requested_stages << ':' << requested_pipelines << ':'
                 << requested_in_flight << ':' << d_config.num_of_stages << ':' << d_config.num_pipelines
@@ -1286,6 +1288,8 @@ ncclResult_t combine_impl(
     int num_blocks,
     const ncclEpEnvConfig* env,
     cudaStream_t stream) {
+    // env is a required argument: callers pass &group->env, which is never null.
+    assert(env != nullptr && "combine_impl requires a non-null env config");
     // TMA requires prob buffer (experts_per_lsa_team * sizeof(float)) to be 16B aligned
     const int experts_per_lsa_team = params.experts_per_rank * params.lsa_team_size;
     assert((experts_per_lsa_team * sizeof(float)) % 16 == 0 && "experts_per_lsa_team must be multiple of 4 for TMA alignment");
@@ -1295,26 +1299,26 @@ ncclResult_t combine_impl(
     const bool multi_lsa = (num_lsa_teams != 1);
     ::ht_ep::combine_config_t c_config{};
     c_config.num_of_stages_g2s = env_or_default(
-        env ? &env->combine_num_stages_g2s : nullptr,
-        multi_lsa ? NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_STAGES_G2S :
-                    NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_STAGES_G2S);
+        &env->combine_num_stages_g2s,
+        multi_lsa ? NCCL_EP_HT_COMBINE_CROSS_LSA_STAGES_G2S :
+                    NCCL_EP_HT_COMBINE_LSA_STAGES_G2S);
     c_config.num_of_stages_s2g = env_or_default(
-        env ? &env->combine_num_stages_s2g : nullptr,
-        multi_lsa ? NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_STAGES_S2G :
-                    NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_STAGES_S2G);
+        &env->combine_num_stages_s2g,
+        multi_lsa ? NCCL_EP_HT_COMBINE_CROSS_LSA_STAGES_S2G :
+                    NCCL_EP_HT_COMBINE_LSA_STAGES_S2G);
     c_config.num_pipelines = env_or_default(
-        env ? &env->combine_num_pipelines : nullptr,
-        multi_lsa ? NCCL_EP_HT_COMBINE_MULTI_LSA_NUM_OF_PIPELINES :
-                    NCCL_EP_HT_COMBINE_SINGLE_LSA_NUM_OF_PIPELINES);
+        &env->combine_num_pipelines,
+        multi_lsa ? NCCL_EP_HT_COMBINE_CROSS_LSA_PIPELINES :
+                    NCCL_EP_HT_COMBINE_LSA_PIPELINES);
     c_config.num_of_tokens_per_chunk = num_tokens_per_chunk;
-    c_config.num_of_tokens_per_group = NCCL_EP_HT_COMBINE_NUM_OF_TOKENS_PER_GROUP;
+    c_config.num_of_tokens_per_group = NCCL_EP_HT_COMBINE_TOK_PER_GROUP;
     c_config.num_of_blocks = num_blocks;
-    c_config.num_of_additional_in_flight_s2g = NCCL_EP_HT_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G;
+    c_config.num_of_additional_in_flight_s2g = NCCL_EP_HT_COMBINE_EXTRA_IN_FLIGHT_S2G;
     c_config.backward_combine = BACKWARD_COMBINE;
     // Requested config (env-pinned values are honored exactly, never reduced).
-    const bool g2s_from_env = env != nullptr && env->combine_num_stages_g2s.is_set;
-    const bool s2g_from_env = env != nullptr && env->combine_num_stages_s2g.is_set;
-    const bool pipelines_from_env = env != nullptr && env->combine_num_pipelines.is_set;
+    const bool g2s_from_env = env->combine_num_stages_g2s.is_set;
+    const bool s2g_from_env = env->combine_num_stages_s2g.is_set;
+    const bool pipelines_from_env = env->combine_num_pipelines.is_set;
     const int requested_g2s_stages = c_config.num_of_stages_g2s;
     const int requested_s2g_stages = c_config.num_of_stages_s2g;
     const int requested_pipelines = c_config.num_pipelines;
@@ -1384,7 +1388,7 @@ ncclResult_t combine_impl(
 
     // Report the resolved config (once per distinct outcome) when verbose is
     // requested -- always, whether or not auto-fit changed anything.
-    if (env != nullptr && nccl_ep_env_verbose(*env)) {
+    if (nccl_ep_env_verbose(*env)) {
         std::ostringstream key;
         key << "ht_combine_smem_fit:" << requested_g2s_stages << ':' << requested_s2g_stages << ':'
             << requested_pipelines << ':' << c_config.num_of_stages_g2s << ':' << c_config.num_of_stages_s2g << ':'

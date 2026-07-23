@@ -1238,7 +1238,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         ep_group->gin_config.num_dcomms = 1;
         ep_group->gin_config.dcomms = new ncclDevComm_t[1];
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-        reqs.lsaBarrierCount = NCCL_EP_HT_DISPATCH_NUM_OF_BLOCKS + 1; // dispatch per-block [0,NB) + elected combine [NB]
+        reqs.lsaBarrierCount = NCCL_EP_HT_DISPATCH_BLOCKS + 1; // dispatch per-block [0,NB) + elected combine [NB]
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
         CUDACHECK_RET(cudaMalloc(
             reinterpret_cast<void**>(&ep_group->gin_config.d_dcomms),
@@ -1451,8 +1451,8 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         reqs.ginContextCount = ep_group->gin_config.num_ctx_per_comm;
         reqs.ginQueueDepth = 3 * ht_tokens_per_chunk + 1;
         // LSA barriers for the HT sync-guard: per-block dispatch [0, NUM_OF_BLOCKS) + one
-        // for the elected combine-tail block [NUM_OF_BLOCKS]. NUM_OF_BLOCKS <= NCCL_EP_HT_DISPATCH_NUM_OF_BLOCKS.
-        reqs.lsaBarrierCount = NCCL_EP_HT_DISPATCH_NUM_OF_BLOCKS + 1; // dispatch per-block [0,NB) + elected combine [NB]
+        // for the elected combine-tail block [NUM_OF_BLOCKS]. NUM_OF_BLOCKS <= NCCL_EP_HT_DISPATCH_BLOCKS.
+        reqs.lsaBarrierCount = NCCL_EP_HT_DISPATCH_BLOCKS + 1; // dispatch per-block [0,NB) + elected combine [NB]
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
     }
 
@@ -1874,7 +1874,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         int chunk =
             (ep_group->rdma_team_size > 1) ?
                 HT_TOKENS_PER_CHUNK_RDMA_DEFAULT :
-                round_up_32(NCCL_EP_HT_COMBINE_NUM_OF_TOKENS_PER_GROUP * static_cast<int>(ep_group->comm_num_sms));
+                round_up_32(NCCL_EP_HT_COMBINE_TOK_PER_GROUP * static_cast<int>(ep_group->comm_num_sms));
         if (ep_group->env.tokens_per_chunk.is_set && ep_group->env.tokens_per_chunk.value.ul > 0) {
             const int requested = static_cast<int>(ep_group->env.tokens_per_chunk.value.ul);
             chunk = round_up_32(requested);

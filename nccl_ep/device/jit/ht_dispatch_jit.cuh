@@ -47,9 +47,16 @@ struct dispatch_warp_layout_t {
     int lsa_s2g_group_start;
     int pad_group_warps;
     int pad_group_start;
+    int head_extra_group_warps;
+    int head_extra_group_start;
     int num_pipelines;
     int block_dim;
 };
+
+// The dispatch head runs on warps 0, 1, 2 (mbarrier init / RDMA guard / intra-LSA
+// barrier), so every block needs at least this many warps even when the
+// communication groups need fewer.
+inline constexpr int kDispatchHeadWarps = 3;
 
 inline dispatch_warp_layout_t
 compute_dispatch_warp_layout(int num_lsa_teams, ncclEpLayout_t layout, int num_pipelines) {
@@ -64,8 +71,12 @@ compute_dispatch_warp_layout(int num_lsa_teams, ncclEpLayout_t layout, int num_p
     L.lsa_s2g_group_start = L.lsa_g2s_group_start + L.lsa_g2s_group_warps;
     L.pad_group_warps = (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? 1 : 0;
     L.pad_group_start = L.lsa_s2g_group_start + L.lsa_s2g_group_warps;
-    L.block_dim = 32 * (L.cross_lsa_group_warps + L.lsa_g2s_group_warps + L.lsa_s2g_group_warps +
-                        L.pad_group_warps);
+    // Filler warps appended after PAD to guarantee the head always has 3 warps.
+    const int comm_warps = L.cross_lsa_group_warps + L.lsa_g2s_group_warps +
+                           L.lsa_s2g_group_warps + L.pad_group_warps;
+    L.head_extra_group_start = comm_warps;
+    L.head_extra_group_warps = (comm_warps >= kDispatchHeadWarps) ? 0 : (kDispatchHeadWarps - comm_warps);
+    L.block_dim = 32 * (comm_warps + L.head_extra_group_warps);
     return L;
 }
 
@@ -78,6 +89,8 @@ inline std::string dispatch_jit_source(
     int lsa_s2g_group_start,
     int pad_group_warps,
     int pad_group_start,
+    int head_extra_group_warps,
+    int head_extra_group_start,
     int num_of_stages,
     int num_of_in_flight_s2g,
     int num_of_tokens_per_chunk,
@@ -105,9 +118,11 @@ inline std::string dispatch_jit_source(
         << "using LSA_S2G_GROUP = ht_ep::warp_group<" << lsa_s2g_group_warps << ", "
         << lsa_s2g_group_start << ">;\n"
         << "using PAD_GROUP            = ht_ep::warp_group<" << pad_group_warps << ", " << pad_group_start << ">;\n"
+        << "using HEAD_EXTRA_GROUP     = ht_ep::warp_group<" << head_extra_group_warps << ", "
+        << head_extra_group_start << ">;\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(GIN_GROUP::size() + LSA_G2S_GROUP::size() + "
-           "LSA_S2G_GROUP::size() + PAD_GROUP::size(), 1)\n"
+           "LSA_S2G_GROUP::size() + PAD_GROUP::size() + HEAD_EXTRA_GROUP::size(), 1)\n"
         << "__global__ void " << kDispatchJitEntryName << "(\n"
         << "    const __grid_constant__ ht_ep::dispatch_kernel_param_t<TOKEN_DATA_TYPE, " << lsa_team_size
         << "> param) {\n"
@@ -119,6 +134,7 @@ inline std::string dispatch_jit_source(
         << "      LSA_G2S_GROUP,\n"
         << "      LSA_S2G_GROUP,\n"
         << "      PAD_GROUP,\n"
+        << "      HEAD_EXTRA_GROUP,\n"
         << "      " << num_of_stages << ",\n"
         << "      " << num_of_in_flight_s2g << ",\n"
         << "      " << num_of_tokens_per_chunk << ",\n"
@@ -178,6 +194,8 @@ inline ncclResult_t launch_dispatch(
         L.lsa_s2g_group_start,
         L.pad_group_warps,
         L.pad_group_start,
+        L.head_extra_group_warps,
+        L.head_extra_group_start,
         config.num_of_stages,
         config.num_of_in_flight_s2g,
         config.num_of_tokens_per_chunk,

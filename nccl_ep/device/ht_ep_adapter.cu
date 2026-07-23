@@ -1313,7 +1313,6 @@ ncclResult_t combine_impl(
     c_config.num_of_tokens_per_chunk = num_tokens_per_chunk;
     c_config.num_of_tokens_per_group = NCCL_EP_HT_COMBINE_TOK_PER_GROUP;
     c_config.num_of_blocks = num_blocks;
-    c_config.num_of_additional_in_flight_s2g = NCCL_EP_HT_COMBINE_EXTRA_IN_FLIGHT_S2G;
     c_config.backward_combine = BACKWARD_COMBINE;
     // Requested config (env-pinned values are honored exactly, never reduced).
     const bool g2s_from_env = env->combine_num_stages_g2s.is_set;

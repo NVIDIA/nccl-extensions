@@ -80,7 +80,6 @@ inline std::string combine_jit_source(
     int max_tokens_per_rank,
     int num_lsa_teams,
     int num_of_blocks,
-    int num_of_additional_in_flight_s2g,
     bool backward_combine,
     int lsa_team_size,
     ncclEpLayout_t layout,
@@ -124,7 +123,6 @@ inline std::string combine_jit_source(
         << "      " << max_tokens_per_rank << ",\n"
         << "      " << num_lsa_teams << ",\n"
         << "      " << num_of_blocks << ",\n"
-        << "      " << num_of_additional_in_flight_s2g << ",\n"
         << "      " << bool_literal(backward_combine) << ",\n"
         << "      " << hidden_dim << ",\n"
         << "      " << lsa_team_size << ",\n"
@@ -160,7 +158,7 @@ inline void launch_combine(
              << config.num_of_stages_g2s << "_s2g" << config.num_of_stages_s2g << "_pipe"
              << config.num_pipelines << "_chunk" << config.num_of_tokens_per_chunk << "_maxt"
              << max_tokens_per_rank << "_group" << config.num_of_tokens_per_group << "_blocks"
-             << config.num_of_blocks << "_extra" << config.num_of_additional_in_flight_s2g
+             << config.num_of_blocks
              << (config.backward_combine ? "_bwd" : "_fwd")
              << (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? "_em" : "_fl")
              << (token_dtype == ncclFloat32 ? "_fp32" :
@@ -177,7 +175,6 @@ inline void launch_combine(
         max_tokens_per_rank,
         num_lsa_teams,
         config.num_of_blocks,
-        config.num_of_additional_in_flight_s2g,
         config.backward_combine,
         lsa_team_size,
         layout,
@@ -202,7 +199,7 @@ inline void launch_combine(
             stderr,
             "[nccl_ep][env] HT combine kernel (%s):\n"
             "[nccl_ep][env]   nodes(lsa_teams)=%d lsa_team_size=%d hidden_dim=%d\n"
-            "[nccl_ep][env]   stages_g2s=%d stages_s2g=%d pipelines=%d extra_in_flight_s2g=%d\n"
+            "[nccl_ep][env]   stages_g2s=%d stages_s2g=%d pipelines=%d\n"
             "[nccl_ep][env]   tokens_per_chunk=%d tokens_per_group=%d max_tokens_per_rank=%d\n"
             "[nccl_ep][env]   num_blocks=%d block_dim=%d dynamic_smem_bytes=%d\n"
             "[nccl_ep][env]   backward=%s layout=%s dtype=%s\n",
@@ -213,7 +210,6 @@ inline void launch_combine(
             config.num_of_stages_g2s,
             config.num_of_stages_s2g,
             L.num_of_data_pipeline_per_block,
-            config.num_of_additional_in_flight_s2g,
             config.num_of_tokens_per_chunk,
             config.num_of_tokens_per_group,
             max_tokens_per_rank,

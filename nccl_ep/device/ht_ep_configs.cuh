@@ -46,7 +46,6 @@
 
 #define NCCL_EP_HT_COMBINE_TOK_PER_GROUP 4
 #define NCCL_EP_HT_COMBINE_BLOCKS NCCL_EP_HT_DFLT_NUM_SMS
-#define NCCL_EP_HT_COMBINE_EXTRA_IN_FLIGHT_S2G 2
 
 // Streaming overlap: tokens between drain+signal from reduction warp to RDMA warp.
 // 0 = disable streaming (fall back to chunk-level mbarrier only).

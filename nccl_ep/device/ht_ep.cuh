@@ -3948,6 +3948,7 @@ template <
     typename LSA_G2S_GROUP,
     typename LSA_S2G_GROUP,
     typename PAD_GROUP,
+    typename HEAD_EXTRA_GROUP,
     int NUM_OF_STAGES,
     int NUM_OF_IN_FLIGHT_S2G,
     int TOKENS_PER_CHUNK,
@@ -4000,9 +4001,15 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     using head_init_warp = warp_group<1, 0>;
     using head_rdma_warp = warp_group<1, 1>;
     using head_lsa_warp = warp_group<1, 2>;
+
+    // The head phase runs on warps 0, 1, 2 (mbarrier init / RDMA guard / intra-LSA
+    // barrier), so the block must always contain at least 3 warps -- even when the
+    // communication groups need fewer (flat layout + single LSA team + 1 pipeline
+    // yields only a G2S/S2G pair). HEAD_EXTRA_GROUP is the JIT-sized filler that
+    // makes up the difference; it does no communication work.
     static_assert(
-        GIN_GROUP::size() + LSA_G2S_GROUP::size() + LSA_S2G_GROUP::size() + PAD_GROUP::size() >=
-            3 * 32,
+        GIN_GROUP::size() + LSA_G2S_GROUP::size() + LSA_S2G_GROUP::size() +
+                PAD_GROUP::size() + HEAD_EXTRA_GROUP::size() >= 3 * 32,
         "dispatch head needs 3 warps");
     const int head_tid = (int)threadIdx.x;
     if (head_tid < head_init_warp::size()) {
@@ -4140,7 +4147,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     if (threadIdx.x % 32 == 0) {
         constexpr int _WT_WARPS = (GIN_GROUP::size() + LSA_G2S_GROUP::size() +
-                                   LSA_S2G_GROUP::size() + PAD_GROUP::size()) /
+                                   LSA_S2G_GROUP::size() + PAD_GROUP::size() +
+                                   HEAD_EXTRA_GROUP::size()) /
                                   32;
         int _warp_id = threadIdx.x / 32;
         int _idx = blockIdx.x * _WT_WARPS + _warp_id;

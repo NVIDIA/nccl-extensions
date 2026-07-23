@@ -41,7 +41,8 @@ namespace ht {
 // Kernel: Convert sparse topk_idx to dense routing map
 // ============================================================================
 // NCCL API uses sparse format: topk_idx[token][k] = expert_id
-// HT uses bitmap format: routing_bitmap[token][expert/8] has bit (expert%8) set
+// HT uses bitmap format, byte-padded per LSA-team: each team's experts occupy
+// their own ceil(experts_per_lsa_team/8)-byte block within the row.
 // cached_topk_idx mirrors topk_idx in its native width (int32 or int64).
 template <typename TopkIdxT>
 void convert_topk_to_routing_map(
@@ -51,7 +52,9 @@ void convert_topk_to_routing_map(
     int num_tokens,
     int max_tokens,            // tail bound; rows [num_tokens, max_tokens) are zeroed
     int num_topk,
-    int num_experts_packed,    // = ceil(num_experts / 8)
+    int experts_per_lsa_team,        // = LSA_TEAM_SIZE * experts_per_rank
+    int experts_per_lsa_team_packed, // = ceil(experts_per_lsa_team / 8)
+    int row_bytes,                   // per-token stride = experts_per_lsa_team_packed * num_lsa_teams
     cudaStream_t stream);
 
 // ============================================================================

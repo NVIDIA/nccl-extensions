@@ -36,12 +36,14 @@ namespace ht {
 template <typename TopkIdxT>
 __global__ void convert_topk_to_routing_map_kernel(
     const TopkIdxT* __restrict__ topk_idx,    // [num_tokens, num_topk]
-    uint8_t* __restrict__ routing_bitmap,     // [max_tokens, num_experts_packed]
+    uint8_t* __restrict__ routing_bitmap,     // [max_tokens, row_bytes] (byte-padded per team)
     TopkIdxT* __restrict__ cached_topk_idx,   // [num_tokens, num_topk]; nullable
     int num_tokens,
     int max_tokens,                           // tail-zero bound (>= num_tokens)
     int num_topk,
-    int num_experts_packed                    // = ceil(num_experts / 8)
+    int experts_per_lsa_team,                 // = LSA_TEAM_SIZE * experts_per_rank
+    int experts_per_lsa_team_packed,          // = ceil(experts_per_lsa_team / 8)
+    int row_bytes                             // per-token stride = experts_per_lsa_team_packed * num_lsa_teams
 ) {
     int token = blockIdx.x * blockDim.x + threadIdx.x;
     if (token >= max_tokens) return;
@@ -50,8 +52,10 @@ __global__ void convert_topk_to_routing_map_kernel(
     // Zero the row before OR-ing in bits; the caller does not pre-zero.
     // Threads for tail rows [num_tokens, max_tokens) zero and exit, so the
     // downstream ncclAllGather over max_tokens rows ships clean tail bytes.
-    uint8_t* row = routing_bitmap + token * num_experts_packed;
-    for (int b = 0; b < num_experts_packed; b++) row[b] = 0;
+    // Byte-padded per LSA-team: each team's experts occupy their own
+    // ceil(experts_per_lsa_team/8)-byte block (bit = within-team local expert id).
+    uint8_t* row = routing_bitmap + token * row_bytes;
+    for (int b = 0; b < row_bytes; b++) row[b] = 0;
     if (token >= num_tokens) return;
     const TopkIdxT* in_row = topk_idx + token * num_topk;
     TopkIdxT* out_row = cached_topk_idx ? cached_topk_idx + token * num_topk : nullptr;
@@ -59,7 +63,10 @@ __global__ void convert_topk_to_routing_map_kernel(
         TopkIdxT expert = in_row[k];
         if (out_row) out_row[k] = expert;
         if (expert >= 0) {
-            row[expert / 8] |= (1u << (expert % 8));
+            // Global expert id = team * experts_per_lsa_team + within-team local id.
+            const int team = static_cast<int>(expert) / experts_per_lsa_team;
+            const int loc  = static_cast<int>(expert) % experts_per_lsa_team;
+            row[team * experts_per_lsa_team_packed + loc / 8] |= (1u << (loc % 8));
         }
     }
 }
@@ -75,7 +82,9 @@ void convert_topk_to_routing_map(
     int num_tokens,
     int max_tokens,
     int num_topk,
-    int num_experts_packed,
+    int experts_per_lsa_team,
+    int experts_per_lsa_team_packed,
+    int row_bytes,
     cudaStream_t stream) {
     int block_size = 256;
     int grid_size = (max_tokens + block_size - 1) / block_size;
@@ -87,13 +96,15 @@ void convert_topk_to_routing_map(
         num_tokens,
         max_tokens,
         num_topk,
-        num_experts_packed);
+        experts_per_lsa_team,
+        experts_per_lsa_team_packed,
+        row_bytes);
 }
 
 template void
-convert_topk_to_routing_map<int32_t>(const int32_t*, uint8_t*, int32_t*, int, int, int, int, cudaStream_t);
+convert_topk_to_routing_map<int32_t>(const int32_t*, uint8_t*, int32_t*, int, int, int, int, int, int, cudaStream_t);
 template void
-convert_topk_to_routing_map<int64_t>(const int64_t*, uint8_t*, int64_t*, int, int, int, int, cudaStream_t);
+convert_topk_to_routing_map<int64_t>(const int64_t*, uint8_t*, int64_t*, int, int, int, int, int, int, cudaStream_t);
 
 // ============================================================================
 // Kernel: Convert sparse topk_weights to dense prob

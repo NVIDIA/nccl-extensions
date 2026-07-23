@@ -1933,9 +1933,14 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         NCCL_CHECK_RESULT(init_ht_internode(ep_group, in_config, stream));
 
         // Group-scoped routing bitmap shared by all handles on this group.
+        // Per-token row is byte-padded per LSA-team: each team gets its own
+        // ceil(experts_per_lsa_team/8)-byte block (== ceil(num_experts/8) for one team).
+        const int rm_experts_per_lsa_team = ep_group->lsa_team_size * ep_group->num_local_experts;
+        const size_t rm_row_bytes = static_cast<size_t>((rm_experts_per_lsa_team + 7) / 8)
+                                  * ep_group->rdma_team_size;
         const size_t routing_bytes = static_cast<size_t>(ep_group->nRanks) *
                                      ep_group->config.max_dispatch_tokens_per_rank *
-                                     ((ep_group->config.num_experts + 7) / 8);
+                                     rm_row_bytes;
         CUDA_CHECK(ep_group->alloc.alloc_fn(
             reinterpret_cast<void**>(&ep_group->ht_buffers.global_routing_map),
             routing_bytes,
@@ -2845,7 +2850,12 @@ ncclResult_t ncclEpUpdateHandle(
     const int n_ranks_per_node = ep_group->lsa_team_size;
     const int nNodes = ep_group->rdma_team_size;
     const int experts_per_rank = ep_group->num_local_experts;
-    const int num_experts_packed = (num_experts + 7) / 8;
+    // Routing map is byte-padded per LSA-team: row stride =
+    // ceil(experts_per_lsa_team/8) * num_lsa_teams, each team block byte-aligned.
+    const int experts_per_lsa_team = n_ranks_per_node * experts_per_rank;
+    const int experts_per_lsa_team_packed = (experts_per_lsa_team + 7) / 8;
+    const int routing_row_bytes = experts_per_lsa_team_packed * nNodes;
+    (void)num_experts;
 
     // Zero the entire preprocessing zero region (routing, r2a, a2r, ler, ntfe) in one call.
     // Buffers are allocated at max_tokens capacity, so this clears beyond the active num_tokens
@@ -2865,7 +2875,7 @@ ncclResult_t ncclEpUpdateHandle(
     }
 
     uint8_t* global_routing_map = ep_group->ht_buffers.global_routing_map;
-    uint8_t* local_routing_send_ptr = global_routing_map + (max_tokens * num_experts_packed) * ep_group->rank;
+    uint8_t* local_routing_send_ptr = global_routing_map + (max_tokens * routing_row_bytes) * ep_group->rank;
 
     // ===== Step 1: Convert sparse topk_idx to bitmap routing map =====
     // Pass max_tokens so the kernel zeroes the tail rows in the local send slot;
@@ -2880,7 +2890,9 @@ ncclResult_t ncclEpUpdateHandle(
             handle->num_tokens,
             max_tokens,
             handle->num_topk,
-            num_experts_packed,
+            experts_per_lsa_team,
+            experts_per_lsa_team_packed,
+            routing_row_bytes,
             stream);
     } else {
         nccl_ep::ht::convert_topk_to_routing_map(
@@ -2890,7 +2902,9 @@ ncclResult_t ncclEpUpdateHandle(
             handle->num_tokens,
             max_tokens,
             handle->num_topk,
-            num_experts_packed,
+            experts_per_lsa_team,
+            experts_per_lsa_team_packed,
+            routing_row_bytes,
             stream);
     }
 
@@ -2898,7 +2912,7 @@ ncclResult_t ncclEpUpdateHandle(
     NCCL_CHECK_RESULT(ncclAllGather(
         local_routing_send_ptr,
         global_routing_map,
-        static_cast<size_t>(max_tokens) * num_experts_packed,
+        static_cast<size_t>(max_tokens) * routing_row_bytes,
         ncclUint8,
         ep_group->comm,
         stream));

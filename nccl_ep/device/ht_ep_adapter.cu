@@ -736,49 +736,9 @@ int get_device_max_dynamic_smem() {
     return max_smem;
 }
 
-ncclResult_t
-check_combine_smem_limit(const ::ht_ep::combine_config_t& config, size_t smem_size, int max_smem) {
-    if (smem_size <= static_cast<size_t>(max_smem)) return ncclSuccess;
-
-    std::fprintf(
-        stderr,
-        "[nccl_ep] combine dynamic shared memory exceeds device limit: requested=%zu bytes, "
-        "limit=%d bytes. Tune combine stages/pipelines; current g2s_stages=%d, s2g_stages=%d, pipelines=%d.\n",
-        smem_size,
-        max_smem,
-        config.num_of_stages_g2s,
-        config.num_of_stages_s2g,
-        config.num_pipelines);
-    return ncclInvalidArgument;
-}
-
 static int env_or_default(const ncclEpEnvVar* var, int default_value) {
     if (var == nullptr || !var->is_set) return default_value;
     return var->value.ul <= static_cast<unsigned long>(INT_MAX) ? static_cast<int>(var->value.ul) : 0;
-}
-
-template <typename CalculateSmem>
-static size_t fit_stages_to_smem(
-    int* stages,
-    int min_stages,
-    int stages_per_step,
-    size_t max_smem,
-    CalculateSmem calculate_smem) {
-    const int requested_steps = *stages / stages_per_step;
-    int low = min_stages / stages_per_step;
-    int high = requested_steps;
-
-    *stages = min_stages;
-    if (size_t smem = calculate_smem(); smem > max_smem) return smem;
-
-    while (low < high) {
-        const int mid = low + (high - low + 1) / 2;
-        *stages = mid * stages_per_step;
-        if (calculate_smem() <= max_smem) low = mid;
-        else high = mid - 1;
-    }
-    *stages = low * stages_per_step;
-    return calculate_smem();
 }
 
 // Result of fitting the dispatch SMEM config to the device limit.
@@ -837,6 +797,78 @@ static dispatch_smem_fit_t choose_dispatch_smem_config(
         if (!best.feasible || smem > best.smem_size) {
             best = dispatch_smem_fit_t{P, stages, smem, true};
         }
+    }
+    return best;
+}
+
+// Result of fitting the combine SMEM config to the device limit.
+struct combine_smem_fit_t {
+    int num_pipelines;
+    int num_of_stages_g2s;
+    int num_of_stages_s2g;
+    size_t smem_size;
+    bool feasible;
+};
+
+// Choose (pipelines, g2s stages, s2g stages) that fit within the SMEM budget.
+//
+// Combine performs accumulation, so it prioritizes keeping the pipeline count:
+// unlike dispatch there is NO min-waste search across pipeline counts. The scan
+// starts at the requested pipeline count and the FIRST value that admits a fit
+// wins; a lower count is tried only when the current one cannot fit even at the
+// minimum stage depth. Within a pipeline count, both stage axes are capped at
+// their requested targets and reduced to fit, shaving G2S first (the deeper
+// buffer) and only then S2G. Any env-pinned value is honored exactly.
+static combine_smem_fit_t choose_combine_smem_config(
+    const ::ht_ep::comb_smem_cost_t& cost,
+    size_t budget,
+    int req_g2s, bool g2s_fixed,
+    int req_s2g, bool s2g_fixed,
+    int req_pipelines, bool pipelines_fixed,
+    int min_stages_per_pipeline,
+    int red_warps) {
+    combine_smem_fit_t best{0, 0, 0, 0, false};
+    const size_t budget_presum = budget & ~static_cast<size_t>(127);
+
+    // Largest multiple of P in [.., hi] whose axis contribution (var * unit)
+    // keeps the footprint within budget while the other axis holds `other_bytes`.
+    // May return a value below the caller's lo, signalling "does not fit".
+    auto max_multiple = [&](int hi, size_t unit, size_t other_bytes, int P) -> int {
+        if (cost.fixed + other_bytes > budget_presum) return -1;
+        if (unit == 0) return hi;  // this axis is free -> take the cap
+        const size_t room = budget_presum - cost.fixed - other_bytes;
+        const int by_budget = static_cast<int>(std::min<size_t>(static_cast<size_t>(hi), room / unit));
+        return (by_budget / P) * P;  // round down to a multiple of P
+    };
+
+    for (int P = req_pipelines; P >= 1; --P) {
+        if (pipelines_fixed && P != req_pipelines) break;
+        if (red_warps % P != 0) continue;  // pipelines must divide the reduction warps
+        // Pinned stages must be a multiple of this P to be usable.
+        if (g2s_fixed && req_g2s % P != 0) continue;
+        if (s2g_fixed && req_s2g % P != 0) continue;
+
+        const int g2s_hi = g2s_fixed ? req_g2s : (req_g2s / P) * P;
+        const int s2g_hi = s2g_fixed ? req_s2g : (req_s2g / P) * P;
+        const int g2s_lo = g2s_fixed ? req_g2s : P * min_stages_per_pipeline;
+        const int s2g_lo = s2g_fixed ? req_s2g : P * min_stages_per_pipeline;
+        if (g2s_hi < g2s_lo || s2g_hi < s2g_lo) continue;
+
+        // Reduce G2S first, holding S2G at its cap; if even the minimum G2S with
+        // full S2G overflows, pin G2S at its minimum and reduce S2G instead.
+        int g2s = max_multiple(g2s_hi, cost.per_g2s_stage,
+                               static_cast<size_t>(s2g_hi) * cost.per_s2g_stage, P);
+        int s2g = s2g_hi;
+        if (g2s < g2s_lo) {
+            g2s = g2s_lo;
+            s2g = max_multiple(s2g_hi, cost.per_s2g_stage,
+                               static_cast<size_t>(g2s_lo) * cost.per_g2s_stage, P);
+            if (s2g < s2g_lo) continue;  // infeasible for this pipeline count
+        }
+        const size_t smem = ::ht_ep::calc_comb_smem(cost, g2s, s2g);
+        if (smem > budget) continue;
+        best = combine_smem_fit_t{P, g2s, s2g, smem, true};
+        break;  // first (highest) feasible pipeline count wins
     }
     return best;
 }
@@ -1282,16 +1314,33 @@ ncclResult_t combine_impl(
     c_config.num_of_blocks = num_blocks;
     c_config.num_of_additional_in_flight_s2g = NCCL_EP_HT_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G;
     c_config.backward_combine = BACKWARD_COMBINE;
-    if (c_config.num_of_stages_g2s <= 0 || c_config.num_of_stages_s2g <= 0 ||
-        c_config.num_pipelines <= 0 || NCCL_EP_HT_COMBINE_RED_WARPS % c_config.num_pipelines != 0 ||
-        c_config.num_of_stages_g2s % c_config.num_pipelines != 0 ||
-        c_config.num_of_stages_s2g % c_config.num_pipelines != 0) {
+    // Requested config (env-pinned values are honored exactly, never reduced).
+    const bool g2s_from_env = env != nullptr && env->combine_num_stages_g2s.is_set;
+    const bool s2g_from_env = env != nullptr && env->combine_num_stages_s2g.is_set;
+    const bool pipelines_from_env = env != nullptr && env->combine_num_pipelines.is_set;
+    const int requested_g2s_stages = c_config.num_of_stages_g2s;
+    const int requested_s2g_stages = c_config.num_of_stages_s2g;
+    const int requested_pipelines = c_config.num_pipelines;
+    constexpr int kMinStagesPerPipeline = 1;  // combine needs >= 1 stage/pipeline per axis
+
+    if (requested_g2s_stages <= 0 || requested_s2g_stages <= 0 || requested_pipelines <= 0) {
+        std::fprintf(stderr, "[nccl_ep] invalid combine config: g2s_stages=%d, s2g_stages=%d, pipelines=%d\n",
+                     requested_g2s_stages, requested_s2g_stages, requested_pipelines);
+        return ncclInvalidArgument;
+    }
+    // An env-pinned pipeline count must divide the reduction warps, and any
+    // env-pinned stage count must be a multiple of it -- the fitter reshapes
+    // only non-pinned counts and cannot fix a bad pinned combination.
+    if (pipelines_from_env &&
+        (NCCL_EP_HT_COMBINE_RED_WARPS % requested_pipelines != 0 ||
+         (g2s_from_env && requested_g2s_stages % requested_pipelines != 0) ||
+         (s2g_from_env && requested_s2g_stages % requested_pipelines != 0))) {
         std::fprintf(
             stderr,
-            "[nccl_ep] invalid combine config: g2s_stages=%d, s2g_stages=%d, pipelines=%d\n",
-            c_config.num_of_stages_g2s,
-            c_config.num_of_stages_s2g,
-            c_config.num_pipelines);
+            "[nccl_ep] invalid combine config: pipelines=%d must divide reduction warps=%d and any "
+            "pinned stage count; g2s_stages=%d, s2g_stages=%d.\n",
+            requested_pipelines, NCCL_EP_HT_COMBINE_RED_WARPS,
+            requested_g2s_stages, requested_s2g_stages);
         return ncclInvalidArgument;
     }
 
@@ -1301,50 +1350,41 @@ ncclResult_t combine_impl(
     model.num_of_experts_per_rank = kp.experts_per_rank;
     model.ranks_per_lsa_team = kp.ranks_per_lsa_team;
     model.num_lsa_teams = num_lsa_teams;
-    // Pick the layout-size instantiation by wire dtype; the width is derived inside the
-    // template. Layout size depends only on element width, so FP16 and BF16 (both 2 B)
+
+    // Bilinear SMEM coefficients: size = fixed + G2S*per_g2s + S2G*per_s2g.
+    // Layout size depends only on element width, so FP16 and BF16 (both 2 B)
     // share the BF16 instantiation; only FP32 (4 B) is distinct.
-    auto combine_smem = [&]() {
-        return (params.token_dtype == ncclFloat32) ?
-                   ::ht_ep::calculate_combine_smem_layout_size<ncclFloat32>(
-                       max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model) :
-                   ::ht_ep::calculate_combine_smem_layout_size<ncclBfloat16>(
-                       max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model);
-    };
-    size_t smem_size = combine_smem();
-    const int requested_g2s_stages = c_config.num_of_stages_g2s;
-    const int requested_s2g_stages = c_config.num_of_stages_s2g;
-    const int requested_pipelines = c_config.num_pipelines;
-    const size_t requested_smem = smem_size;
+    const ::ht_ep::comb_smem_cost_t cost = (params.token_dtype == ncclFloat32) ?
+        ::ht_ep::calc_comb_smem_cost<ncclFloat32>(
+            max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model) :
+        ::ht_ep::calc_comb_smem_cost<ncclBfloat16>(
+            max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model);
+
     const int max_smem = get_device_max_dynamic_smem();
-    while (smem_size > static_cast<size_t>(max_smem)) {
-        smem_size = fit_stages_to_smem(
-            &c_config.num_of_stages_g2s,
-            c_config.num_pipelines,
-            c_config.num_pipelines,
-            static_cast<size_t>(max_smem),
-            combine_smem);
-        if (smem_size <= static_cast<size_t>(max_smem)) break;
+    const combine_smem_fit_t fit = choose_combine_smem_config(
+        cost, static_cast<size_t>(max_smem),
+        requested_g2s_stages, g2s_from_env,
+        requested_s2g_stages, s2g_from_env,
+        requested_pipelines, pipelines_from_env,
+        kMinStagesPerPipeline, NCCL_EP_HT_COMBINE_RED_WARPS);
 
-        smem_size = fit_stages_to_smem(
-            &c_config.num_of_stages_s2g,
-            c_config.num_pipelines,
-            c_config.num_pipelines,
-            static_cast<size_t>(max_smem),
-            combine_smem);
-        if (smem_size <= static_cast<size_t>(max_smem)) break;
-
-        int next_pipelines = c_config.num_pipelines - 1;
-        while (next_pipelines > 0 &&
-               (NCCL_EP_HT_COMBINE_RED_WARPS % next_pipelines != 0 ||
-                c_config.num_of_stages_g2s % next_pipelines != 0 ||
-                c_config.num_of_stages_s2g % next_pipelines != 0)) {
-            --next_pipelines;
-        }
-        if (next_pipelines == 0) break;
-        c_config.num_pipelines = next_pipelines;
+    const size_t requested_smem =
+        ::ht_ep::calc_comb_smem(cost, requested_g2s_stages, requested_s2g_stages);
+    if (!fit.feasible) {
+        std::fprintf(
+            stderr,
+            "[nccl_ep] combine shared memory cannot be fit to the device limit: requested g2s_stages=%d, "
+            "s2g_stages=%d, pipelines=%d need %zu bytes, limit=%d bytes%s.\n",
+            requested_g2s_stages, requested_s2g_stages, requested_pipelines, requested_smem, max_smem,
+            (g2s_from_env || s2g_from_env || pipelines_from_env) ? " (env-pinned values cannot be reduced)" : "");
+        return ncclInvalidArgument;
     }
-    if (ncclResult_t r = check_combine_smem_limit(c_config, smem_size, max_smem); r != ncclSuccess) return r;
+
+    c_config.num_pipelines = fit.num_pipelines;
+    c_config.num_of_stages_g2s = fit.num_of_stages_g2s;
+    c_config.num_of_stages_s2g = fit.num_of_stages_s2g;
+    const size_t smem_size = fit.smem_size;
+
     if ((c_config.num_of_stages_g2s != requested_g2s_stages ||
          c_config.num_of_stages_s2g != requested_s2g_stages ||
          c_config.num_pipelines != requested_pipelines) &&

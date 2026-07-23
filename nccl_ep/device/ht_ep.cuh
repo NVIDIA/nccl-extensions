@@ -605,7 +605,7 @@ static size_t calc_disp_per_pipeline_smem(const dispatch_config_t& config) {
 // to absorb the alignment padding the real layout inserts before the following
 // mbarriers, keeping the composed total exact for flat layouts.
 template <ncclEpLayout_t kLayout, int kTokenSize>
-static size_t calc_disp_shared_smem(const dispatch_config_t& config, const model_config_t& model) {
+static size_t calc_disp_fixed_smem(const dispatch_config_t& config, const model_config_t& model) {
     static_assert(kTokenSize > 0, "token size must be positive");
     size_t shared_size = 0;
     // attn_to_rdma_map buffer (only if multi_lsa, shared). Rounded to 8B so the
@@ -657,52 +657,16 @@ static disp_smem_cost_t calc_disp_smem_cost(
     const dispatch_config_t& config, const model_config_t& model) {
     static_assert(kTokenSize > 0, "token size must be positive");
     return disp_smem_cost_t{
-        calc_disp_shared_smem<kLayout, kTokenSize>(config, model),
+        calc_disp_fixed_smem<kLayout, kTokenSize>(config, model),
         calc_disp_per_pipeline_smem(config),
         calc_disp_per_stage_smem<kTokenSize>(config, model),
     };
 }
 
-template <ncclEpLayout_t kLayout, int kTokenSize>
-static size_t calc_disp_smem(const dispatch_config_t& config, const model_config_t& model) {
-    static_assert(kTokenSize > 0, "token size must be positive");
-    // The layout is bilinear in the pipeline and stage counts: a shared overhead
-    // plus one block replicated per pipeline plus one block replicated per stage.
-    return calc_disp_smem(
-        calc_disp_smem_cost<kLayout, kTokenSize>(config, model),
-        config.num_pipelines, config.num_of_stages);
-}
-
-// Host-side companion to the templated layout calculation above. The JIT
-// specializes the device kernel on TOKEN_DATA_TYPE; this wrapper uses that
-// same byte width for the launch-time dynamic-SMEM calculation, keeping the
-// only host template dispatch next to the template it selects.
-inline size_t calc_disp_smem(
-    ncclEpLayout_t layout,
-    unsigned int token_size,
-    const dispatch_config_t& config,
-    const model_config_t& model) {
-    if (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-        switch (token_size) {
-            case 1: return calc_disp_smem<NCCL_EP_LAYOUT_EXPERT_MAJOR, 1>(config, model);
-            case 2: return calc_disp_smem<NCCL_EP_LAYOUT_EXPERT_MAJOR, 2>(config, model);
-            case 4: return calc_disp_smem<NCCL_EP_LAYOUT_EXPERT_MAJOR, 4>(config, model);
-            default: return 0;
-        }
-    }
-    // Preserve the pre-wrapper host mapping: every non-EM layout uses the
-    // flat dispatch SMEM layout. Layout validity is enforced at the API layer.
-    switch (token_size) {
-        case 1: return calc_disp_smem<NCCL_EP_LAYOUT_FLAT, 1>(config, model);
-        case 2: return calc_disp_smem<NCCL_EP_LAYOUT_FLAT, 2>(config, model);
-        case 4: return calc_disp_smem<NCCL_EP_LAYOUT_FLAT, 4>(config, model);
-        default: return 0;
-    }
-}
-
-// Host-side companion that returns the bilinear coefficients instead of a single
-// size, mirroring the token-size/layout dispatch above. Returns {0,0,0} for an
-// unsupported token size (per_stage == 0 flags the failure).
+// Host-side companion that maps a runtime layout + token width to the bilinear
+// SMEM coefficients. The JIT specializes the device kernel on TOKEN_DATA_TYPE;
+// this wrapper uses the same byte width. Returns {0,0,0} for an unsupported
+// token size (per_stage == 0 flags the failure).
 inline disp_smem_cost_t calc_disp_smem_cost(
     ncclEpLayout_t layout,
     unsigned int token_size,
@@ -893,7 +857,7 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
 // since hidden_dim * elem_width is a multiple of 128) and over-estimates safely
 // otherwise. kTokenDtype selects the wire element width (2 B BF16/FP16, 4 B FP32).
 template <ncclDataType_t kTokenDtype = ncclBfloat16>
-static size_t calculate_combine_smem_g2s_stage_size(
+static size_t calc_comb_per_g2s_stage_smem(
     int num_lsa_teams, const combine_config_t& config, const model_config_t& model) {
     const bool multi_lsa = (num_lsa_teams > 1);
     int token_stride = model.hidden_dim * nccl_ep::size_u8<kTokenDtype>();
@@ -924,7 +888,7 @@ static size_t calculate_combine_smem_g2s_stage_size(
 // (num_lsa_teams x the per-team prob width), unlike the G2S prob buffers. Same
 // 128B/16B stride rounding as the G2S helper.
 template <ncclDataType_t kTokenDtype = ncclBfloat16>
-static size_t calculate_combine_smem_s2g_stage_size(
+static size_t calc_comb_per_s2g_stage_smem(
     int num_lsa_teams, const combine_config_t& config, const model_config_t& model) {
     const bool multi_lsa = (num_lsa_teams > 1);
     int token_stride = model.hidden_dim * nccl_ep::size_u8<kTokenDtype>();
@@ -947,7 +911,7 @@ static size_t calculate_combine_smem_s2g_stage_size(
 // Bytes of the combine SMEM layout that scale with neither stage count: the
 // LSA->RDMA mbarriers ((teams-1) x chunks), the combine region info ((teams-1)),
 // and the RDMA streaming counter. All three exist only for multi-LSA-team.
-static size_t calculate_combine_smem_fixed_size(
+static size_t calc_comb_fixed_smem(
     int max_num_of_tokens_per_rank, int num_lsa_teams, const combine_config_t& config) {
     if (num_lsa_teams <= 1) return 0;
     const int max_num_of_chunks_per_rank =
@@ -962,27 +926,43 @@ static size_t calculate_combine_smem_fixed_size(
     return fixed_size;
 }
 
-template <ncclDataType_t kTokenDtype = ncclBfloat16>
-static size_t calculate_combine_smem_layout_size(
-    int max_num_of_tokens_per_rank,
-    int num_lsa_teams,
-    const combine_config_t& config,
-    const model_config_t& model) {
-    // The layout is bilinear in the two stage counts: a stage-independent fixed
-    // overhead plus one block replicated per G2S stage and one per S2G stage.
-    size_t total_size =
-        calculate_combine_smem_fixed_size(max_num_of_tokens_per_rank, num_lsa_teams, config) +
-        static_cast<size_t>(config.num_of_stages_g2s) *
-            calculate_combine_smem_g2s_stage_size<kTokenDtype>(num_lsa_teams, config, model) +
-        static_cast<size_t>(config.num_of_stages_s2g) *
-            calculate_combine_smem_s2g_stage_size<kTokenDtype>(num_lsa_teams, config, model);
+// Bilinear coefficients of the combine SMEM layout: total bytes are
+//   fixed + num_of_stages_g2s * per_g2s_stage + num_of_stages_s2g * per_s2g_stage
+// rounded up to 128B (see calc_comb_smem). None of the three terms
+// depend on either stage count, so the host fitter can compute them once and
+// solve for (g2s, s2g) stages directly.
+struct comb_smem_cost_t {
+    size_t fixed;          // stage-independent bytes
+    size_t per_g2s_stage;  // bytes per G2S stage
+    size_t per_s2g_stage;  // bytes per S2G stage
+};
+
+// Compose the three terms into a total, matching the layout's alignment exactly.
+inline size_t calc_comb_smem(
+    const comb_smem_cost_t& cost, int num_of_stages_g2s, int num_of_stages_s2g) {
+    size_t total_size = cost.fixed +
+                        static_cast<size_t>(num_of_stages_g2s) * cost.per_g2s_stage +
+                        static_cast<size_t>(num_of_stages_s2g) * cost.per_s2g_stage;
     // Round up to 128B. Matches the per-buffer TMA alignment and absorbs the
     // small (<128B) alignment padding the fully interleaved layout inserts
     // between buffers (including the streaming counter's 4B pad); the result
     // stays an exact-or-over upper bound on the real layout.
-    total_size = (total_size + 127) & ~127;
-    return total_size;
+    return (total_size + 127) & ~127;
 }
+
+template <ncclDataType_t kTokenDtype = ncclBfloat16>
+static comb_smem_cost_t calc_comb_smem_cost(
+    int max_num_of_tokens_per_rank,
+    int num_lsa_teams,
+    const combine_config_t& config,
+    const model_config_t& model) {
+    return comb_smem_cost_t{
+        calc_comb_fixed_smem(max_num_of_tokens_per_rank, num_lsa_teams, config),
+        calc_comb_per_g2s_stage_smem<kTokenDtype>(num_lsa_teams, config, model),
+        calc_comb_per_s2g_stage_smem<kTokenDtype>(num_lsa_teams, config, model),
+    };
+}
+
 // Fixed-size part of dispatch kernel parameters. Peer pointer arrays are appended
 // by dispatch_kernel_param_t<..., LSA_TEAM_SZ> for JIT-specialized kernels.
 template <typename TOKEN_DATA_TYPE>

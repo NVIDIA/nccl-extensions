@@ -553,7 +553,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
 // stage-independent sections that follow it. kLayout is irrelevant here: no
 // per-stage buffer depends on the layout mode.
 template <int kTokenSize>
-static size_t calculate_dispatch_smem_per_stage_size(const dispatch_config_t& config, const model_config_t& model) {
+static size_t calc_disp_per_stage_smem(const dispatch_config_t& config, const model_config_t& model) {
     static_assert(kTokenSize > 0, "token size must be positive");
     size_t stage_size = 0;
     // Token buffer (aligned to 128B for TMA)
@@ -585,7 +585,7 @@ static size_t calculate_dispatch_smem_per_stage_size(const dispatch_config_t& co
 // aligned and the mbarriers are 8B multiples, so summing them here and scaling
 // by the pipeline count reproduces the per-section totals without introducing
 // alignment error.
-static size_t calculate_dispatch_smem_per_pipeline_size(const dispatch_config_t& config) {
+static size_t calc_disp_per_pipeline_smem(const dispatch_config_t& config) {
     size_t pipeline_size = 0;
     // Sparse to dense map buffer: S2D_MAP_RING_STAGES ping-pong stages (128B aligned)
     // Inner dim is mode-dependent: flat = lsa_team_size, expert-major = num_topk.
@@ -605,7 +605,7 @@ static size_t calculate_dispatch_smem_per_pipeline_size(const dispatch_config_t&
 // to absorb the alignment padding the real layout inserts before the following
 // mbarriers, keeping the composed total exact for flat layouts.
 template <ncclEpLayout_t kLayout, int kTokenSize>
-static size_t calculate_dispatch_smem_shared_size(const dispatch_config_t& config, const model_config_t& model) {
+static size_t calc_disp_shared_smem(const dispatch_config_t& config, const model_config_t& model) {
     static_assert(kTokenSize > 0, "token size must be positive");
     size_t shared_size = 0;
     // attn_to_rdma_map buffer (only if multi_lsa, shared). Rounded to 8B so the
@@ -628,48 +628,99 @@ static size_t calculate_dispatch_smem_shared_size(const dispatch_config_t& confi
     return shared_size;
 }
 
-template <ncclEpLayout_t kLayout, int kTokenSize>
-static size_t calculate_dispatch_smem_layout_size(const dispatch_config_t& config, const model_config_t& model) {
-    static_assert(kTokenSize > 0, "token size must be positive");
-    // The layout is bilinear in the pipeline and stage counts: a shared overhead
-    // plus one block replicated per pipeline plus one block replicated per stage.
-    size_t total_size =
-        calculate_dispatch_smem_shared_size<kLayout, kTokenSize>(config, model) +
-        static_cast<size_t>(config.num_pipelines) *
-            calculate_dispatch_smem_per_pipeline_size(config) +
-        static_cast<size_t>(config.num_of_stages) *
-            calculate_dispatch_smem_per_stage_size<kTokenSize>(config, model);
+// Bilinear coefficients of the dispatch SMEM layout: total bytes are
+//   fixed + num_pipelines * per_pipeline + num_of_stages * per_stage
+// rounded up to 128B (see calc_disp_smem). None of the three
+// terms depend on the pipeline or stage counts, so the host fitter can compute
+// them once and then solve for (pipelines, stages) with plain arithmetic
+// instead of re-invoking the full size calculation per candidate.
+struct disp_smem_cost_t {
+    size_t fixed;         // stage- and pipeline-independent bytes (shared)
+    size_t per_pipeline;  // bytes per pipeline
+    size_t per_stage;     // bytes per stage
+};
+
+// Compose the three terms into a total, matching the layout's alignment exactly.
+inline size_t calc_disp_smem(
+    const disp_smem_cost_t& terms, int num_pipelines, int num_of_stages) {
+    size_t total_size = terms.fixed +
+                        static_cast<size_t>(num_pipelines) * terms.per_pipeline +
+                        static_cast<size_t>(num_of_stages) * terms.per_stage;
     // Add padding for alignment. (For expert-major, folding the PAD slot's 128B
     // alignment into the shared term can add up to 127B versus the fully
     // interleaved layout; the result stays an exact-or-over upper bound.)
-    total_size = (total_size + 127) & ~127;
-    return total_size;
+    return (total_size + 127) & ~127;
+}
+
+template <ncclEpLayout_t kLayout, int kTokenSize>
+static disp_smem_cost_t calc_disp_smem_cost(
+    const dispatch_config_t& config, const model_config_t& model) {
+    static_assert(kTokenSize > 0, "token size must be positive");
+    return disp_smem_cost_t{
+        calc_disp_shared_smem<kLayout, kTokenSize>(config, model),
+        calc_disp_per_pipeline_smem(config),
+        calc_disp_per_stage_smem<kTokenSize>(config, model),
+    };
+}
+
+template <ncclEpLayout_t kLayout, int kTokenSize>
+static size_t calc_disp_smem(const dispatch_config_t& config, const model_config_t& model) {
+    static_assert(kTokenSize > 0, "token size must be positive");
+    // The layout is bilinear in the pipeline and stage counts: a shared overhead
+    // plus one block replicated per pipeline plus one block replicated per stage.
+    return calc_disp_smem(
+        calc_disp_smem_cost<kLayout, kTokenSize>(config, model),
+        config.num_pipelines, config.num_of_stages);
 }
 
 // Host-side companion to the templated layout calculation above. The JIT
 // specializes the device kernel on TOKEN_DATA_TYPE; this wrapper uses that
 // same byte width for the launch-time dynamic-SMEM calculation, keeping the
 // only host template dispatch next to the template it selects.
-inline size_t calculate_dispatch_smem_layout_size(
+inline size_t calc_disp_smem(
     ncclEpLayout_t layout,
     unsigned int token_size,
     const dispatch_config_t& config,
     const model_config_t& model) {
     if (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
         switch (token_size) {
-            case 1: return calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_EXPERT_MAJOR, 1>(config, model);
-            case 2: return calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_EXPERT_MAJOR, 2>(config, model);
-            case 4: return calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_EXPERT_MAJOR, 4>(config, model);
+            case 1: return calc_disp_smem<NCCL_EP_LAYOUT_EXPERT_MAJOR, 1>(config, model);
+            case 2: return calc_disp_smem<NCCL_EP_LAYOUT_EXPERT_MAJOR, 2>(config, model);
+            case 4: return calc_disp_smem<NCCL_EP_LAYOUT_EXPERT_MAJOR, 4>(config, model);
             default: return 0;
         }
     }
     // Preserve the pre-wrapper host mapping: every non-EM layout uses the
     // flat dispatch SMEM layout. Layout validity is enforced at the API layer.
     switch (token_size) {
-        case 1: return calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_FLAT, 1>(config, model);
-        case 2: return calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_FLAT, 2>(config, model);
-        case 4: return calculate_dispatch_smem_layout_size<NCCL_EP_LAYOUT_FLAT, 4>(config, model);
+        case 1: return calc_disp_smem<NCCL_EP_LAYOUT_FLAT, 1>(config, model);
+        case 2: return calc_disp_smem<NCCL_EP_LAYOUT_FLAT, 2>(config, model);
+        case 4: return calc_disp_smem<NCCL_EP_LAYOUT_FLAT, 4>(config, model);
         default: return 0;
+    }
+}
+
+// Host-side companion that returns the bilinear coefficients instead of a single
+// size, mirroring the token-size/layout dispatch above. Returns {0,0,0} for an
+// unsupported token size (per_stage == 0 flags the failure).
+inline disp_smem_cost_t calc_disp_smem_cost(
+    ncclEpLayout_t layout,
+    unsigned int token_size,
+    const dispatch_config_t& config,
+    const model_config_t& model) {
+    if (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+        switch (token_size) {
+            case 1: return calc_disp_smem_cost<NCCL_EP_LAYOUT_EXPERT_MAJOR, 1>(config, model);
+            case 2: return calc_disp_smem_cost<NCCL_EP_LAYOUT_EXPERT_MAJOR, 2>(config, model);
+            case 4: return calc_disp_smem_cost<NCCL_EP_LAYOUT_EXPERT_MAJOR, 4>(config, model);
+            default: return disp_smem_cost_t{0, 0, 0};
+        }
+    }
+    switch (token_size) {
+        case 1: return calc_disp_smem_cost<NCCL_EP_LAYOUT_FLAT, 1>(config, model);
+        case 2: return calc_disp_smem_cost<NCCL_EP_LAYOUT_FLAT, 2>(config, model);
+        case 4: return calc_disp_smem_cost<NCCL_EP_LAYOUT_FLAT, 4>(config, model);
+        default: return disp_smem_cost_t{0, 0, 0};
     }
 }
 

@@ -17,6 +17,7 @@
 #include "jit/ht_dispatch_jit.cuh"
 #include "jit/preprocess_jit.cuh"
 
+#include <algorithm>
 #include <cassert>
 #include <climits>
 #include <cstdio>
@@ -736,21 +737,6 @@ int get_device_max_dynamic_smem() {
 }
 
 ncclResult_t
-check_dispatch_smem_limit(const ::ht_ep::dispatch_config_t& config, size_t smem_size, int max_smem) {
-    if (smem_size <= static_cast<size_t>(max_smem)) return ncclSuccess;
-
-    std::fprintf(
-        stderr,
-        "[nccl_ep] dispatch dynamic shared memory exceeds device limit: requested=%zu bytes, "
-        "limit=%d bytes. Tune dispatch stages/pipelines; current stages=%d, pipelines=%d.\n",
-        smem_size,
-        max_smem,
-        config.num_of_stages,
-        config.num_pipelines);
-    return ncclInvalidArgument;
-}
-
-ncclResult_t
 check_combine_smem_limit(const ::ht_ep::combine_config_t& config, size_t smem_size, int max_smem) {
     if (smem_size <= static_cast<size_t>(max_smem)) return ncclSuccess;
 
@@ -793,6 +779,66 @@ static size_t fit_stages_to_smem(
     }
     *stages = low * stages_per_step;
     return calculate_smem();
+}
+
+// Result of fitting the dispatch SMEM config to the device limit.
+struct dispatch_smem_fit_t {
+    int num_pipelines;
+    int num_of_stages;  // total stages (== num_pipelines * stages_per_pipeline)
+    size_t smem_size;
+    bool feasible;
+};
+
+// Choose (pipelines, total stages) that fit within the SMEM budget.
+//
+// Uses the bilinear coefficients (size = fixed + P*per_pipeline + S*per_stage,
+// rounded to 128B) to solve for the stage count directly -- no binary search.
+//   - Any env-pinned value is honored exactly and never reduced.
+//   - Pipelines are scanned from the requested count down to 1 (skipped when
+//     env-pinned); each candidate uses the most stages that fit, capped at the
+//     requested target and floored at min_stages_per_pipeline per pipeline.
+//   - Among feasible candidates the one wasting the least SMEM wins; ties favor
+//     more pipelines (the scan starts high and only a strictly larger footprint
+//     replaces the incumbent).
+static dispatch_smem_fit_t choose_dispatch_smem_config(
+    const ::ht_ep::disp_smem_cost_t& terms,
+    size_t budget,
+    int target_stages,
+    bool stages_fixed,
+    int target_pipelines,
+    bool pipelines_fixed,
+    int min_stages_per_pipeline,
+    int max_pipelines) {
+    dispatch_smem_fit_t best{0, 0, 0, false};
+    const int hi_p = pipelines_fixed ? target_pipelines : std::min(target_pipelines, max_pipelines);
+    const int lo_p = pipelines_fixed ? target_pipelines : 1;
+
+    for (int P = hi_p; P >= lo_p && P >= 1; --P) {
+        int stages = 0;
+        if (stages_fixed) {
+            // Env-pinned stage count: use exactly, only if it is valid for this P.
+            if (target_stages % P != 0 || target_stages / P < min_stages_per_pipeline) continue;
+            stages = target_stages;
+        } else {
+            // Largest stages-per-pipeline within budget, capped at the target.
+            // smem <= budget  <=>  pre-round sum <= (budget rounded down to 128B).
+            const size_t base = terms.fixed + static_cast<size_t>(P) * terms.per_pipeline;
+            const size_t budget_presum = budget & ~static_cast<size_t>(127);
+            if (terms.per_stage == 0 || base > budget_presum) continue;
+            const size_t spp_by_budget =
+                (budget_presum - base) / (static_cast<size_t>(P) * terms.per_stage);
+            const int spp = static_cast<int>(
+                std::min<size_t>(spp_by_budget, static_cast<size_t>(target_stages / P)));
+            if (spp < min_stages_per_pipeline) continue;
+            stages = spp * P;
+        }
+        const size_t smem = ::ht_ep::calc_disp_smem(terms, P, stages);
+        if (smem > budget) continue;
+        if (!best.feasible || smem > best.smem_size) {
+            best = dispatch_smem_fit_t{P, stages, smem, true};
+        }
+    }
+    return best;
 }
 
 // ============================================================================
@@ -934,91 +980,121 @@ ncclResult_t dispatch_impl(
         d_config.forward_dispatch = forward_dispatch;
         d_config.sf_bytes_per_token = sf_bytes_per_token;
         d_config.s2d_inner_dim = kp.s2d_inner_dim;
-        if (d_config.num_of_stages <= 0 || d_config.num_pipelines <= 0 ||
-            d_config.num_of_stages % d_config.num_pipelines != 0 ||
-            d_config.num_of_stages / d_config.num_pipelines <= d_config.num_of_in_flight_s2g) {
-            std::fprintf(
-                stderr,
-                "[nccl_ep] invalid dispatch config: stages=%d, pipelines=%d, in_flight_s2g=%d\n",
-                d_config.num_of_stages,
-                d_config.num_pipelines,
-                d_config.num_of_in_flight_s2g);
-            return ncclInvalidArgument;
-        }
-        d_config.stages_per_pipeline = d_config.num_of_stages / d_config.num_pipelines;
-        const int fixed_warps =
-            (num_lsa_teams != 1 ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0) +
-            (params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? 1 : 0);
-        const int max_pipelines = (32 - fixed_warps) / 2;
-        if (d_config.num_pipelines > max_pipelines) {
-            std::fprintf(
-                stderr,
-                "[nccl_ep] dispatch pipelines=%d exceeds block limit; maximum=%d.\n",
-                d_config.num_pipelines,
-                max_pipelines);
+        if (d_config.num_of_stages <= 0 || d_config.num_pipelines <= 0) {
+            std::fprintf(stderr, "[nccl_ep] invalid dispatch config: stages=%d, pipelines=%d\n",
+                         d_config.num_of_stages, d_config.num_pipelines);
             return ncclInvalidArgument;
         }
 
-        // Compute dynamic SMEM size at host (was done inside ht_ep::dispatch).
         d_model.hidden_dim = kp.hidden_dim;
         d_model.max_num_of_tokens_per_rank = max_dispatch_tokens_per_rank;
         d_model.num_of_experts_per_rank = kp.experts_per_rank;
         d_model.ranks_per_lsa_team = kp.ranks_per_lsa_team;
         d_model.num_lsa_teams = num_lsa_teams;
 
-        auto dispatch_smem = [&]() {
-            return ::ht_ep::calculate_dispatch_smem_layout_size(
-                params.layout, kernel_spec.payload_bytes, d_config, d_model);
-        };
-        size_t smem_size = dispatch_smem();
-        if (smem_size == 0) {
+        // Requested config (env-pinned values are honored exactly, never reduced).
+        const bool stages_from_env = env != nullptr && env->dispatch_num_stages.is_set;
+        const bool pipelines_from_env = env != nullptr && env->dispatch_num_pipelines.is_set;
+        const int requested_stages = d_config.num_of_stages;
+        const int requested_pipelines = d_config.num_pipelines;
+        const int requested_in_flight = d_config.num_of_in_flight_s2g;
+        // Absolute floor: a pipeline needs at least this many stages for the FIFO
+        // to make progress. The S2G-overlap requirement (stages/pipeline strictly
+        // greater than in_flight_s2g) is layered on during fitting, but since
+        // in_flight_s2g can itself be reduced, it does not gate validity here.
+        constexpr int kMinStagesPerPipeline = 3;
+
+        // A fully env-pinned config must be internally valid on its own -- the
+        // fitter reshapes neither count, so it cannot fix a bad combination.
+        if (stages_from_env && pipelines_from_env &&
+            (requested_stages % requested_pipelines != 0 ||
+             requested_stages / requested_pipelines < kMinStagesPerPipeline)) {
+            std::fprintf(
+                stderr,
+                "[nccl_ep] invalid dispatch config: stages=%d must be a multiple of pipelines=%d "
+                "with at least %d stages per pipeline.\n",
+                requested_stages, requested_pipelines, kMinStagesPerPipeline);
+            return ncclInvalidArgument;
+        }
+
+        // Warp budget caps the pipeline count (2 warps per pipeline).
+        const int fixed_warps =
+            (num_lsa_teams != 1 ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0) +
+            (params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? 1 : 0);
+        const int max_pipelines = (32 - fixed_warps) / 2;
+        if (pipelines_from_env && requested_pipelines > max_pipelines) {
+            std::fprintf(stderr, "[nccl_ep] dispatch pipelines=%d exceeds block limit; maximum=%d.\n",
+                         requested_pipelines, max_pipelines);
+            return ncclInvalidArgument;
+        }
+
+        // Bilinear SMEM coefficients: size = fixed + P*per_pipeline + S*per_stage.
+        const ::ht_ep::disp_smem_cost_t terms = ::ht_ep::calc_disp_smem_cost(
+            params.layout, kernel_spec.payload_bytes, d_config, d_model);
+        if (terms.per_stage == 0) {
             std::fprintf(stderr, "NCCL EP warning: unsupported HT dispatch token size %u\n",
                          kernel_spec.payload_bytes);
             return ncclInvalidArgument;
         }
-        const int requested_stages = d_config.num_of_stages;
-        const int requested_pipelines = d_config.num_pipelines;
-        const size_t requested_smem = smem_size;
-        const int max_smem = get_device_max_dynamic_smem();
-        while (smem_size > static_cast<size_t>(max_smem)) {
-            const int min_stages = (d_config.num_of_in_flight_s2g + 1) * d_config.num_pipelines;
-            smem_size = fit_stages_to_smem(
-                &d_config.num_of_stages,
-                min_stages,
-                d_config.num_pipelines,
-                static_cast<size_t>(max_smem),
-                dispatch_smem);
-            if (smem_size <= static_cast<size_t>(max_smem)) break;
 
-            int next_pipelines = d_config.num_pipelines - 1;
-            while (next_pipelines > 0 &&
-                   (d_config.num_of_stages % next_pipelines != 0 ||
-                    d_config.num_of_stages / next_pipelines <= d_config.num_of_in_flight_s2g)) {
-                --next_pipelines;
+        const int max_smem = get_device_max_dynamic_smem();
+        // Fit within the SMEM budget. If the requested in_flight_s2g admits no
+        // fit (its min-stages floor is too tall), reduce it toward 1 -- lowering
+        // in_flight_s2g lowers the required stages/pipeline. in_flight_s2g is
+        // never env-pinned, so it is always free to reduce; the largest value
+        // that fits is kept, preserving as much S2G overlap as possible.
+        dispatch_smem_fit_t fit{0, 0, 0, false};
+        int chosen_in_flight = requested_in_flight;
+        for (int in_flight = requested_in_flight; in_flight >= 1; --in_flight) {
+            const int min_stages_per_pipeline = std::max(kMinStagesPerPipeline, in_flight + 1);
+            fit = choose_dispatch_smem_config(
+                terms, static_cast<size_t>(max_smem),
+                requested_stages, stages_from_env,
+                requested_pipelines, pipelines_from_env,
+                min_stages_per_pipeline, max_pipelines);
+            if (fit.feasible) {
+                chosen_in_flight = in_flight;
+                break;
             }
-            if (next_pipelines == 0) break;
-            d_config.num_pipelines = next_pipelines;
-            d_config.stages_per_pipeline = d_config.num_of_stages / d_config.num_pipelines;
         }
-        if (ncclResult_t r = check_dispatch_smem_limit(d_config, smem_size, max_smem); r != ncclSuccess) {
-            std::fprintf(stderr, "NCCL EP warning: dispatch shared-memory requirement %zu is unsupported\n",
-                         smem_size);
-            return r;
+
+        const size_t requested_smem =
+            ::ht_ep::calc_disp_smem(terms, requested_pipelines, requested_stages);
+        if (!fit.feasible) {
+            std::fprintf(
+                stderr,
+                "[nccl_ep] dispatch shared memory cannot be fit to the device limit: requested "
+                "stages=%d, pipelines=%d need %zu bytes, limit=%d bytes%s.\n",
+                requested_stages, requested_pipelines, requested_smem, max_smem,
+                (stages_from_env || pipelines_from_env) ? " (env-pinned values cannot be reduced)" : "");
+            return ncclInvalidArgument;
         }
-        if ((d_config.num_of_stages != requested_stages || d_config.num_pipelines != requested_pipelines) &&
+
+        d_config.num_of_in_flight_s2g = chosen_in_flight;
+        d_config.num_pipelines = fit.num_pipelines;
+        d_config.num_of_stages = fit.num_of_stages;
+        d_config.stages_per_pipeline = fit.num_of_stages / fit.num_pipelines;
+        const size_t smem_size = fit.smem_size;
+
+        if ((d_config.num_of_stages != requested_stages ||
+             d_config.num_pipelines != requested_pipelines ||
+             d_config.num_of_in_flight_s2g != requested_in_flight) &&
             env != nullptr && env->rank == 0) {
             std::ostringstream key;
             key << "ht_dispatch_smem_autofit:" << requested_stages << ':' << requested_pipelines << ':'
-                << d_config.num_of_stages << ':' << d_config.num_pipelines << ':' << requested_smem << ':'
-                << smem_size;
+                << requested_in_flight << ':' << d_config.num_of_stages << ':' << d_config.num_pipelines
+                << ':' << d_config.num_of_in_flight_s2g << ':' << requested_smem << ':' << smem_size;
             if (::nccl_ep::jit::announce_once(key.str())) {
                 std::fprintf(
                     stderr,
-                    "[nccl_ep] dispatch SMEM auto-fit: stages %d->%d, pipelines %d->%d, smem %zu->%zu, limit %d\n",
+                    "[nccl_ep] dispatch SMEM auto-fit: stages %d->%d, pipelines %d->%d, "
+                    "in_flight_s2g %d->%d, smem %zu->%zu, limit %d\n",
                     requested_stages,
                     d_config.num_of_stages,
                     requested_pipelines,
                     d_config.num_pipelines,
+                    requested_in_flight,
+                    d_config.num_of_in_flight_s2g,
                     requested_smem,
                     smem_size,
                     max_smem);

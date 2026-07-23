@@ -1092,12 +1092,13 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
     const int epr   = MAX_EXPERTS_PER_RANK;
     const int nrpn  = LSA_TEAM_SIZE;
     const int n_dle = nrpn * epr;
-    const int packed_row_bytes =
-        ((p.num_lsa_teams * nrpn * epr) + 7) / 8;
+    // Byte-padded per LSA-team: row stride = per-team block * team count
+    // (matches the producer and the FLAT/EM pre-scan geometry).
+    const int local_per_lsa_bytes = ((nrpn * epr) + 7) / 8;
+    const int packed_row_bytes = local_per_lsa_bytes * p.num_lsa_teams;
 
     int32_t* g_block_count = p.gscratch;
 
-    const int local_per_lsa_bytes = ((nrpn * epr) + 7) / 8;
     // Matches the combine kernels' rdma_to_attn_map row padding (16 bools/LSA-team).
     const int rdma_to_attn_per_lsa_sz = rdma_to_attn_row_stride(p.num_tokens_per_rank);
     const int tid       = threadIdx.x;

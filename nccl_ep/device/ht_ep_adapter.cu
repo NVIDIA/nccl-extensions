@@ -1108,28 +1108,25 @@ ncclResult_t dispatch_impl(
         d_config.stages_per_pipeline = fit.num_of_stages / fit.num_pipelines;
         const size_t smem_size = fit.smem_size;
 
-        if ((d_config.num_of_stages != requested_stages ||
-             d_config.num_pipelines != requested_pipelines ||
-             d_config.num_of_in_flight_s2g != requested_in_flight) &&
-            env != nullptr && env->rank == 0) {
+        // Report the resolved config (once per distinct outcome) when verbose is
+        // requested -- always, whether or not auto-fit changed anything.
+        if (env != nullptr && nccl_ep_env_verbose(*env)) {
             std::ostringstream key;
-            key << "ht_dispatch_smem_autofit:" << requested_stages << ':' << requested_pipelines << ':'
+            key << "ht_dispatch_smem_fit:" << requested_stages << ':' << requested_pipelines << ':'
                 << requested_in_flight << ':' << d_config.num_of_stages << ':' << d_config.num_pipelines
-                << ':' << d_config.num_of_in_flight_s2g << ':' << requested_smem << ':' << smem_size;
+                << ':' << d_config.num_of_in_flight_s2g << ':' << smem_size;
             if (::nccl_ep::jit::announce_once(key.str())) {
                 std::fprintf(
                     stderr,
-                    "[nccl_ep] dispatch SMEM auto-fit: stages %d->%d, pipelines %d->%d, "
-                    "in_flight_s2g %d->%d, smem %zu->%zu, limit %d\n",
-                    requested_stages,
-                    d_config.num_of_stages,
-                    requested_pipelines,
-                    d_config.num_pipelines,
-                    requested_in_flight,
-                    d_config.num_of_in_flight_s2g,
-                    requested_smem,
-                    smem_size,
-                    max_smem);
+                    "[nccl_ep][env] HT dispatch SMEM fit:\n"
+                    "[nccl_ep][env]   stages=%d (req %d), pipelines=%d (req %d), in_flight_s2g=%d (req %d)\n"
+                    "[nccl_ep][env]   smem=%zu bytes (req %zu, limit %d)\n"
+                    "[nccl_ep][env]   cost: fixed=%zu, per_pipeline=%zu, per_stage=%zu bytes\n",
+                    d_config.num_of_stages, requested_stages,
+                    d_config.num_pipelines, requested_pipelines,
+                    d_config.num_of_in_flight_s2g, requested_in_flight,
+                    smem_size, requested_smem, max_smem,
+                    terms.fixed, terms.per_pipeline, terms.per_stage);
             }
         }
 
@@ -1385,28 +1382,25 @@ ncclResult_t combine_impl(
     c_config.num_of_stages_s2g = fit.num_of_stages_s2g;
     const size_t smem_size = fit.smem_size;
 
-    if ((c_config.num_of_stages_g2s != requested_g2s_stages ||
-         c_config.num_of_stages_s2g != requested_s2g_stages ||
-         c_config.num_pipelines != requested_pipelines) &&
-        env != nullptr && env->rank == 0) {
+    // Report the resolved config (once per distinct outcome) when verbose is
+    // requested -- always, whether or not auto-fit changed anything.
+    if (env != nullptr && nccl_ep_env_verbose(*env)) {
         std::ostringstream key;
-        key << "ht_combine_smem_autofit:" << requested_g2s_stages << ':' << requested_s2g_stages << ':'
+        key << "ht_combine_smem_fit:" << requested_g2s_stages << ':' << requested_s2g_stages << ':'
             << requested_pipelines << ':' << c_config.num_of_stages_g2s << ':' << c_config.num_of_stages_s2g << ':'
-            << c_config.num_pipelines << ':' << requested_smem << ':' << smem_size;
+            << c_config.num_pipelines << ':' << smem_size;
         if (::nccl_ep::jit::announce_once(key.str())) {
             std::fprintf(
                 stderr,
-                "[nccl_ep] combine SMEM auto-fit: g2s stages %d->%d, s2g stages %d->%d, "
-                "pipelines %d->%d, smem %zu->%zu, limit %d\n",
-                requested_g2s_stages,
-                c_config.num_of_stages_g2s,
-                requested_s2g_stages,
-                c_config.num_of_stages_s2g,
-                requested_pipelines,
-                c_config.num_pipelines,
-                requested_smem,
-                smem_size,
-                max_smem);
+                "[nccl_ep][env] HT combine SMEM fit:\n"
+                "[nccl_ep][env]   g2s_stages=%d (req %d), s2g_stages=%d (req %d), pipelines=%d (req %d)\n"
+                "[nccl_ep][env]   smem=%zu bytes (req %zu, limit %d)\n"
+                "[nccl_ep][env]   cost: fixed=%zu, per_g2s_stage=%zu, per_s2g_stage=%zu bytes\n",
+                c_config.num_of_stages_g2s, requested_g2s_stages,
+                c_config.num_of_stages_s2g, requested_s2g_stages,
+                c_config.num_pipelines, requested_pipelines,
+                smem_size, requested_smem, max_smem,
+                cost.fixed, cost.per_g2s_stage, cost.per_s2g_stage);
         }
     }
 

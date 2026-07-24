@@ -298,7 +298,10 @@ __device__ __forceinline__ void write_local_routing(
     // EM-permute related params
     int32_t* flat2em_slot_map = nullptr,
     int em_top_k = 0) {
-    bool lane_participates = (token_out_of_bound == 0) && token_needed_by_local_rank;
+    
+    // Protect from writing invalid and overflowing slots
+    bool lane_participates =
+        (token_out_of_bound == 0) && token_needed_by_local_rank && (local_rank_slot >= 0);
     const uint8_t* local_rank_bitmap_row = nullptr;
     bool* local_expert_routing_map_store_base_addr = nullptr;
 
@@ -444,7 +447,12 @@ __device__ __forceinline__ void assign_recv_slots(
 
                 if (rank == local_rank) {
                     token_needed_by_local_rank = token_needed_by_this_rank;
-                    local_rank_slot = final_ex_scan;
+                    // If the slot is overflowing, clamp it to the -1 sentinel
+                    // to prevent write_local_routing() from writing to invalid memory
+                    // If policy drop is off - the token will be dropped,
+                    // otherwise - an error will be triggered later on.
+                    local_rank_slot = slot_overflows(final_ex_scan, max_recv_tokens_per_rank)
+                                          ? -1 : final_ex_scan;
                     local_rank_prefix_after_scan = previous_token_sum[j];
                 }
             }

@@ -368,6 +368,7 @@ typedef struct {
                                                 //   HT: required (must be >= max_dispatch_tokens_per_rank)
                                                 //   LL: NCCL_EP_AUTO → nRanks * max_dispatch_tokens_per_rank
     unsigned int max_token_bytes;               // Max token-row bytes; LL SCALES_FORWARD also bounds token+scale payload
+    unsigned int max_scale_bytes;               // Max quantized scale-row bytes; 0 disables quantized dispatch
     unsigned long int rdma_buffer_size;         // RDMA buffer size for LL mode.
                                                 //   NCCL_EP_AUTO  → lazy: allocate on first ncclEpInitHandle, sized to that
                                                 //                  handle's actual (layout, num_topk); collective re-grow
@@ -386,11 +387,17 @@ typedef struct {
 // Use NCCL_EP_GROUP_CONFIG_INIT to pre-fill `size` and `version` correctly.
 ```
 
-`max_token_bytes` is a physical-byte budget for an individual token or scale
-row. LL `NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD` additionally requires their
-sum to fit its shared message slot; for example, packed FP4 uses `H/2` token
-bytes plus `S * sizeof(scale_dtype)` scale bytes. HT requires the configured
-bound to be a multiple of 16 bytes.
+For quantized dispatch:
+
+- Set `max_token_bytes` to at least `hidden_dimension * bytes_per_element` for
+  the widest token precision the group uses (normally BF16).
+- Set `max_scale_bytes` to at least
+  `scales_per_token * bytes_per_scale`. Zero disables quantized dispatch.
+- LL also requires `encoded_token_row_bytes + scale_row_bytes <=
+  max_token_bytes`; HT does not. Packed FP4 uses
+  `encoded_token_row_bytes = ceil(hidden_dimension / 2)`.
+
+Token and scale rows must be 16-byte aligned.
 
 ### `ncclEpHandle_t` - Operation Handle
 

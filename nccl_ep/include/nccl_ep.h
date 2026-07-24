@@ -197,12 +197,16 @@ typedef struct {
     //   ncclEpDispatch.
     //   LL: AUTO/0 → nRanks * max_dispatch_tokens_per_rank.
     unsigned int max_recv_tokens_per_rank;
-    // Upper bound on token-row bytes per token, covering both dispatch and combine.
-    // SCALES_FORWARD scale rows have the same independent byte bound; LL requires
-    // their combined message payload to fit. Per-call sizes flow through the
-    // tensors and may be smaller; this is byte-oriented.
+    // Upper bound on token-row bytes per token, covering the widest dispatch or
+    // combine representation used by the group (normally the unquantized BF16
+    // row). LL SCALES_FORWARD additionally requires each encoded token-plus-scale
+    // message to fit this bound. Per-call rows may be smaller.
     // HT requires this configured upper bound to be a multiple of 16 bytes.
     unsigned int max_token_bytes;
+    // Upper bound on a quantized dispatch scale row, in bytes. Zero (the
+    // default) disables quantized dispatch recipes for this group. Set this to
+    // scales_per_token * bytes_per_scale; actual rows may be smaller.
+    unsigned int max_scale_bytes;
     // RDMA buffer size in bytes for LL mode. Two modes:
     //   - NCCL_EP_AUTO: the library automatically selects the internal
     //     staging buffer size. The buffer allocation/re-allocation  may be
@@ -595,13 +599,14 @@ ncclResult_t ncclEpUpdateHandle(
 // caller-provided scale-element count per token. LL outputs use the documented
 // 3D layout shapes; their token and scale outputs can independently be window-backed.
 // HT outputs are 2D and impose a both-or-neither window rule; expert-major
-// permutation may stage before writing those windows.
+// permutation may stage before writing those windows. The group must set
+// max_scale_bytes to at least the physical scale-row size.
 //
 // DS_FP8E3M4: LL-only internal quantization. The caller supplies BF16 tokens;
 // dispatch emits E4M3 token bytes and generated FP32 scales, one per 128 token
 // elements. The hidden dimension must be divisible by 512 so the quantized
 // payload is 16-byte aligned. inputs->scales must be absent and outputs->scales
-// is required.
+// is required. max_scale_bytes must cover the generated scale row.
 //
 // NONE is zero so a zero-initialized config preserves the unquantized path.
 // New recipes must document their HT and LL semantics here, including any

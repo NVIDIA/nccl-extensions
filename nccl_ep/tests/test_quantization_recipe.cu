@@ -169,7 +169,124 @@ TEST_F(QuantizationRecipeTest, HtGroupRejectsUnalignedMaxTokenBytes) {
     EXPECT_EQ(group, nullptr);
 }
 
-TEST_F(QuantizationRecipeTest, ScalesForwardDispatchCompletes) {
+TEST_F(QuantizationRecipeTest, ScalesForwardRequiresGroupScaleCapacity) {
+    ncclEpGroupConfig_t group_config = NCCL_EP_GROUP_CONFIG_INIT;
+    group_config.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+    group_config.num_experts = kNumExperts;
+    group_config.max_dispatch_tokens_per_rank = kNumTokens;
+    group_config.max_recv_tokens_per_rank = kMaxRecvSlots;
+    group_config.max_token_bytes = kHidden * sizeof(nv_bfloat16);
+    group_config.max_scale_bytes = 0;
+    group_config.rdma_buffer_size = NCCL_EP_AUTO;
+    group_config.num_qp_per_rank = NCCL_EP_AUTO;
+    group_config.num_channels = NCCL_EP_AUTO;
+
+    ncclEpGroup_t group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&group, g_comm, &group_config));
+
+    ncclEpHandle_t handle = nullptr;
+    NCCL_ASSERT(ncclEpCreateHandle(
+        &handle,
+        group,
+        NCCL_EP_LAYOUT_FLAT,
+        topk_idx_,
+        nullptr,
+        nullptr,
+        g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+
+    RecipeTensor tokens(ncclUint8, kNumTokens, 16);
+    RecipeTensor scales(ncclUint8, kNumTokens, 16);
+    RecipeTensor output_tokens(ncclUint8, kMaxRecvSlots, 16);
+    RecipeTensor output_scales(ncclUint8, kMaxRecvSlots, 16);
+    ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    inputs.tokens = &tokens.tensor;
+    inputs.scales = &scales.tensor;
+    outputs.tokens = &output_tokens.tensor;
+    outputs.scales = &output_scales.tensor;
+    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+
+    EXPECT_EQ(
+        ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream),
+        ncclInvalidArgument);
+
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
+}
+
+TEST_F(QuantizationRecipeTest, LlScalesForwardRequiresCombinedTokenBudget) {
+    ASSERT_EQ(kNumExperts % g_nranks, 0);
+    const int num_local_experts = kNumExperts / g_nranks;
+    const int recv_slots = g_nranks * kNumTokens;
+
+    ncclEpGroupConfig_t group_config = NCCL_EP_GROUP_CONFIG_INIT;
+    group_config.algorithm = NCCL_EP_ALGO_LOW_LATENCY;
+    group_config.num_experts = kNumExperts;
+    group_config.max_dispatch_tokens_per_rank = kNumTokens;
+    group_config.max_recv_tokens_per_rank = kNumTokens;
+    group_config.max_token_bytes = 32;
+    group_config.max_scale_bytes = 32;
+    group_config.rdma_buffer_size = NCCL_EP_AUTO;
+    group_config.num_qp_per_rank = num_local_experts;
+    group_config.num_channels = NCCL_EP_AUTO;
+
+    ncclEpGroup_t group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&group, g_comm, &group_config));
+
+    ncclEpHandle_t handle = nullptr;
+    NCCL_ASSERT(ncclEpCreateHandle(
+        &handle,
+        group,
+        NCCL_EP_LAYOUT_EXPERT_MAJOR,
+        topk_idx_em_,
+        nullptr,
+        nullptr,
+        g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+
+    RecipeTensor tokens(ncclUint8, kNumTokens, 16);
+    RecipeTensor scales(ncclUint8, kNumTokens, 32);
+    RecipeTensor output_tokens(
+        ncclUint8,
+        static_cast<size_t>(num_local_experts) * recv_slots,
+        16);
+    RecipeTensor output_scales(
+        ncclUint8,
+        static_cast<size_t>(num_local_experts) * recv_slots,
+        32);
+    size_t output_token_sizes[3] = {
+        static_cast<size_t>(num_local_experts),
+        static_cast<size_t>(recv_slots),
+        16};
+    size_t output_scale_sizes[3] = {
+        static_cast<size_t>(num_local_experts),
+        static_cast<size_t>(recv_slots),
+        32};
+    output_tokens.tensor.ndim = 3;
+    output_tokens.tensor.sizes = output_token_sizes;
+    output_scales.tensor.ndim = 3;
+    output_scales.tensor.sizes = output_scale_sizes;
+
+    ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    inputs.tokens = &tokens.tensor;
+    inputs.scales = &scales.tensor;
+    outputs.tokens = &output_tokens.tensor;
+    outputs.scales = &output_scales.tensor;
+    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+
+    EXPECT_EQ(
+        ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream),
+        ncclInvalidArgument);
+
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
+}
+
+TEST_F(QuantizationRecipeTest, HtScalesForwardAcceptsIndependentTokenAndScaleBounds) {
     uint8_t *d_tokens = nullptr, *d_recv_tokens = nullptr;
     float *d_scales = nullptr, *d_recv_scales = nullptr;
     float *d_topk_weights = nullptr, *d_recv_topk_weights = nullptr;
@@ -226,8 +343,29 @@ TEST_F(QuantizationRecipeTest, ScalesForwardDispatchCompletes) {
     outputs.topk_idx = recv_topk_idx;
     config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
 
-    ncclEpHandle_t handle = make_handle(nullptr);
-    ASSERT_NE(handle, nullptr);
+    ncclEpGroupConfig_t group_config = NCCL_EP_GROUP_CONFIG_INIT;
+    group_config.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+    group_config.num_experts = kNumExperts;
+    group_config.max_dispatch_tokens_per_rank = kNumTokens;
+    group_config.max_recv_tokens_per_rank = kMaxRecvSlots;
+    group_config.max_token_bytes = kHidden;
+    group_config.max_scale_bytes = kScalesPerToken * sizeof(float);
+    group_config.rdma_buffer_size = NCCL_EP_AUTO;
+    group_config.num_qp_per_rank = NCCL_EP_AUTO;
+    group_config.num_channels = NCCL_EP_AUTO;
+
+    ncclEpGroup_t group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&group, g_comm, &group_config));
+    ncclEpHandle_t handle = nullptr;
+    NCCL_ASSERT(ncclEpCreateHandle(
+        &handle,
+        group,
+        NCCL_EP_LAYOUT_FLAT,
+        topk_idx_,
+        nullptr,
+        nullptr,
+        g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
     EXPECT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclSuccess);
     EXPECT_EQ(ncclEpComplete(handle, nullptr, g_stream), ncclSuccess);
     EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
@@ -255,6 +393,7 @@ TEST_F(QuantizationRecipeTest, ScalesForwardDispatchCompletes) {
     cudaFree(d_topk_weights);
     cudaFree(d_recv_topk_weights);
     cudaFree(d_recv_topk_idx);
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
 }
 
 TEST_F(QuantizationRecipeTest, DsFp8E3M4DispatchCompletes) {
@@ -269,6 +408,7 @@ TEST_F(QuantizationRecipeTest, DsFp8E3M4DispatchCompletes) {
     group_config.num_experts = kNumExperts;
     group_config.max_dispatch_tokens_per_rank = kNumTokens;
     group_config.max_token_bytes = kDsHidden * sizeof(nv_bfloat16);
+    group_config.max_scale_bytes = kDsScalesPerToken * sizeof(float);
     group_config.rdma_buffer_size = NCCL_EP_AUTO;
     group_config.num_qp_per_rank = num_local_experts;
     group_config.num_channels = NCCL_EP_AUTO;
@@ -365,7 +505,8 @@ TEST_F(QuantizationRecipeTest, ScalesForwardDispatchPreservesPackedFp4Bytes) {
     group_config.algorithm = NCCL_EP_ALGO_LOW_LATENCY;
     group_config.num_experts = kNumExperts;
     group_config.max_dispatch_tokens_per_rank = kNumTokens;
-    group_config.max_token_bytes = kOriginalHidden * sizeof(nv_bfloat16);
+    group_config.max_token_bytes = kPackedHidden + kScalesPerToken;
+    group_config.max_scale_bytes = kScalesPerToken;
     group_config.rdma_buffer_size = NCCL_EP_AUTO;
     group_config.num_qp_per_rank = num_local_experts;
     group_config.num_channels = NCCL_EP_AUTO;
@@ -528,7 +669,8 @@ static void run_ht_expert_major_scales_forward_packed_fp4(
     group_config.num_experts = kNumExperts;
     group_config.max_dispatch_tokens_per_rank = kHtTokens;
     group_config.max_recv_tokens_per_rank = kMaxRecvRows;
-    group_config.max_token_bytes = kLogicalHidden * sizeof(nv_bfloat16);
+    group_config.max_token_bytes = kPackedHidden;
+    group_config.max_scale_bytes = kScaleBytes;
     group_config.rdma_buffer_size = NCCL_EP_AUTO;
     group_config.num_qp_per_rank = NCCL_EP_AUTO;
     group_config.num_channels = NCCL_EP_AUTO;
@@ -844,7 +986,7 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUnalignedScaleRow) {
     NCCL_ASSERT(ncclEpHandleDestroy(handle));
 }
 
-TEST_F(QuantizationRecipeTest, ScalesForwardRejectsPayloadAboveGroupByteLimit) {
+TEST_F(QuantizationRecipeTest, ScalesForwardRejectsScaleRowAboveGroupLimit) {
     RecipeTensor tokens(ncclUint8, kNumTokens, 16);
     RecipeTensor input_scales(ncclUint8, kNumTokens, 32);
     RecipeTensor output_tokens(ncclUint8, kMaxRecvSlots, 16);

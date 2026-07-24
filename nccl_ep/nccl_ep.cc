@@ -96,13 +96,6 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
             "(initialise with the corresponding NCCL_EP_*_INIT macro)"); \
     } while (0)
 
-// SCALES_FORWARD has no fixed scale block size. Reserve the complete
-// byte budget so any validated caller-provided scale row fits; this is the
-// byte-equivalent of the former FP32-element reservation.
-static inline size_t maxForwardedScaleBytesPerToken(size_t max_token_bytes) {
-    return max_token_bytes;
-}
-
 // Targeted forward-binary-compat for ncclEpLayoutInfo_t (only). The struct
 // grows by appending; older callers built against a pre-flag header report a
 // smaller `size`. Accept any size in [min-known, current-sizeof] and let
@@ -335,6 +328,7 @@ struct DispatchRecipeLaunchContext {
     int num_ranks;
     int max_tokens_per_rank;
     size_t max_token_bytes;
+    size_t max_scale_bytes;
 };
 
 // Recipe validation is deliberately centralized. Algorithm branches may rely on
@@ -354,6 +348,10 @@ static ncclResult_t validateDispatchRecipe(
                 static_cast<int>(recipe), message);
         return ncclInvalidArgument;
     };
+    if (recipe != NCCL_EP_DISPATCH_QUANT_NONE && launch.max_scale_bytes == 0) {
+        return fail(
+            "quantized dispatch is disabled; set ncclEpGroupConfig_t::max_scale_bytes");
+    }
     switch (recipe) {
         case NCCL_EP_DISPATCH_QUANT_NONE:
             if (!validate_dtype(tokens->datatype)) {
@@ -420,8 +418,11 @@ static ncclResult_t validateDispatchRecipe(
             if (scale_bytes == 0 || scale_bytes % sizeof(int4) != 0) {
                 return fail("scale bytes per token must be non-zero and 16-byte aligned");
             }
-            if (token_bytes > launch.max_token_bytes || scale_bytes > launch.max_token_bytes) {
-                return fail("token or scale bytes per token exceed the group token-byte limit");
+            if (token_bytes > launch.max_token_bytes) {
+                return fail("token bytes per token exceed max_token_bytes");
+            }
+            if (scale_bytes > launch.max_scale_bytes) {
+                return fail("scale bytes per token exceed max_scale_bytes");
             }
             if (launch.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
                 if (token_bytes + scale_bytes > launch.max_token_bytes) {
@@ -502,6 +503,9 @@ static ncclResult_t validateDispatchRecipe(
                     static_cast<size_t>(launch.max_tokens_per_rank) * launch.num_ranks ||
                 output_scales->sizes[2] != expected_scales) {
                 return fail("DS_FP8E3M4 outputs->scales must be FP32 [local_experts, recv_slots, hidden / 128]");
+            }
+            if (expected_scales * sizeof(float) > launch.max_scale_bytes) {
+                return fail("DS_FP8E3M4 scale bytes per token exceed max_scale_bytes");
             }
             if (static_cast<size_t>(launch.hidden) + expected_scales * sizeof(float) > launch.max_token_bytes) {
                 return fail("DS_FP8E3M4 token bytes plus scale bytes exceed the group token-byte limit");
@@ -984,6 +988,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     int lsa_rank = ep_group->lsa_rank;
     ncclTeam lsa_team = ncclTeamLsa(comm);
     size_t max_token_bytes = ep_group->config.max_token_bytes;
+    size_t max_scale_bytes = ep_group->config.max_scale_bytes;
     int num_local_experts = ep_group->num_local_experts;
     int max_recv_tokens = ep_group->max_recv_tokens;
 
@@ -1012,10 +1017,9 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     size_t expert_input_token_sz = token_staging_slots * max_token_bytes;
     size_t expert_input_prob_sz = max_output_slots * num_local_experts * lsa_ranks * sizeof(float);
 
-    // Output scale byte storage, sized for the largest SCALES_FORWARD row that
-    // the group's token-byte budget permits.
-    size_t expert_output_scaling_factor_sz =
-        max_output_slots * maxForwardedScaleBytesPerToken(max_token_bytes);
+    // Zero disables SCALES_FORWARD and makes this region empty. Otherwise,
+    // reserve only the caller-declared maximum scale-row bytes.
+    size_t expert_output_scaling_factor_sz = max_output_slots * max_scale_bytes;
 
     // zero_copy elides both token regions (windowed tensors required).
     const bool zero_copy = ep_group->config.zero_copy == NCCL_EP_ZERO_COPY_ON;
@@ -1319,8 +1323,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * ep_group->config.num_experts *
             sizeof(float),
         GIN_ALIGNMENT);
-    const size_t max_scale_bytes_per_token =
-        maxForwardedScaleBytesPerToken(ep_group->config.max_token_bytes);
+    const size_t max_scale_bytes_per_token = ep_group->config.max_scale_bytes;
     size_t scaling_factor_staging_sz = align_size(
         static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * max_scale_bytes_per_token,
         GIN_ALIGNMENT);
@@ -3154,6 +3157,7 @@ ncclResult_t ncclEpDispatch(
         .num_ranks = group->nRanks,
         .max_tokens_per_rank = static_cast<int>(group->config.max_dispatch_tokens_per_rank),
         .max_token_bytes = group->config.max_token_bytes,
+        .max_scale_bytes = group->config.max_scale_bytes,
     };
     NCCLCHECK(validateDispatchRecipe(inputs, outputs, config, recipe_launch));
     if (pass_direction != NCCL_EP_FWD_PASS && handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {

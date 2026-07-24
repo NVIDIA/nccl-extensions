@@ -4633,21 +4633,35 @@ int main(int argc, char* argv[]) {
     config.max_dispatch_tokens_per_rank = dynamic_tokens ? NCCL_EP_AUTO : max_tokens_per_rank;
 
     size_t max_dispatch_payload_bytes = static_cast<size_t>(hidden) * tokenElemBytes(token_dtype);
+    size_t max_scale_bytes = 0;
     if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
         const bool packed_fp4 = usesPackedFp4Shape(scales_forward_token_dtype);
         const size_t token_elements = packed_fp4 ? hidden / 2u : hidden;
         const size_t scale_elements = packed_fp4 ? hidden / PACKED_FP4_ELEMENTS_PER_SCALE
                                                  : benchmarkScalesPerToken(dispatch_quantization, hidden);
-        const size_t recipe_payload_bytes =
-            token_elements * tokenElemBytes(scales_forward_token_dtype) + scale_elements * scaleElemBytes();
-        max_dispatch_payload_bytes = std::max(max_dispatch_payload_bytes, recipe_payload_bytes);
+        const size_t recipe_token_bytes =
+            token_elements * tokenElemBytes(scales_forward_token_dtype);
+        max_scale_bytes = scale_elements * scaleElemBytes();
+        const size_t recipe_token_budget =
+            algorithm == NCCL_EP_ALGO_LOW_LATENCY
+                ? recipe_token_bytes + max_scale_bytes
+                : recipe_token_bytes;
+        // Keep the group budget large enough for its configured unquantized
+        // token dtype even though this benchmark invocation dispatches an
+        // encoded representation.
+        max_dispatch_payload_bytes =
+            std::max(max_dispatch_payload_bytes, recipe_token_budget);
+    } else if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
+        max_scale_bytes =
+            hidden / DS_FP8E3M4_ELEMENTS_PER_SCALE * sizeof(float);
     }
-    if (max_dispatch_payload_bytes > UINT_MAX) {
+    if (max_dispatch_payload_bytes > UINT_MAX || max_scale_bytes > UINT_MAX) {
         if (myRank == 0) printf("Error: dispatch payload exceeds UINT_MAX bytes/token\n");
         MPI_Finalize();
         return 1;
     }
     config.max_token_bytes = static_cast<unsigned int>(max_dispatch_payload_bytes);
+    config.max_scale_bytes = static_cast<unsigned int>(max_scale_bytes);
     // Use NCCL_EP_AUTO for buffer sizes (required for dynamic tokens with larger batches)
     // For LL mode with disable_nvlink: NCCL_P2P_DISABLE env var handles NCCL GIN P2P
     config.rdma_buffer_size = NCCL_EP_AUTO;

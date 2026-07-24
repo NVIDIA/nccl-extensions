@@ -290,8 +290,7 @@ protected:
         group_config.max_dispatch_tokens_per_rank = kNumTokens;
         group_config.max_recv_tokens_per_rank = kMaxRecvSlots;
         group_config.max_token_bytes =
-            static_cast<unsigned int>((token_bytes_per_row + 15) & ~size_t{15});
-        group_config.max_scale_bytes = static_cast<unsigned int>(scale_bytes_per_row);
+            static_cast<unsigned int>((token_bytes_per_row + scale_bytes_per_row + 15) & ~size_t{15});
         group_config.rdma_buffer_size = NCCL_EP_AUTO;
         group_config.num_qp_per_rank = NCCL_EP_AUTO;
         group_config.num_channels = NCCL_EP_AUTO;
@@ -555,9 +554,7 @@ protected:
         group_config.num_experts = kNumExperts;
         group_config.max_dispatch_tokens_per_rank = kNumTokens;
         group_config.max_recv_tokens_per_rank = recv_rows;
-        group_config.max_token_bytes =
-            static_cast<unsigned int>(token_bytes_per_row + scale_bytes_per_row);
-        group_config.max_scale_bytes = static_cast<unsigned int>(scale_bytes_per_row);
+        group_config.max_token_bytes = kFp4LogicalHidden * sizeof(nv_bfloat16);
         group_config.rdma_buffer_size = NCCL_EP_AUTO;
         group_config.num_qp_per_rank = num_local_experts;
         group_config.num_channels = NCCL_EP_AUTO;

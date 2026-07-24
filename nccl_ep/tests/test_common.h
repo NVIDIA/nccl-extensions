@@ -205,7 +205,6 @@ static bool ep_bootstrap(int argc, char* argv[], const char* uid_suffix) {
     gcfg.num_experts = kNumExperts;
     gcfg.max_dispatch_tokens_per_rank = kNumTokens;
     gcfg.max_token_bytes = kHidden * sizeof(nv_bfloat16);
-    gcfg.max_scale_bytes = 16;  // Shared SCALES_FORWARD fixtures use 16-byte scale rows.
     gcfg.rdma_buffer_size = NCCL_EP_AUTO;
     gcfg.num_qp_per_rank = NCCL_EP_AUTO;
     gcfg.num_channels = NCCL_EP_AUTO;

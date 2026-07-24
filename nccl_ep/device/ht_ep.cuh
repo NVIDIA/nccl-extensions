@@ -2251,11 +2251,13 @@ __forceinline__ __device__ void issue_local_g2s_row(
             rank_id = pending_entry_idx;
             slot = pending_s2d;
         }
+        // Avoid int32-overflow issue by casting slot to size_t
+        const size_t slot_st = static_cast<size_t>(slot);
         const uint16_t* token_src =
-            remote_expert_input_token[rank_id] + (slot * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>());
+            remote_expert_input_token[rank_id] + (slot_st * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>());
         const float* prob_src = nullptr;
         if constexpr (BACKWARD_COMBINE) {
-            prob_src = remote_expert_input_prob[rank_id] + (slot * (experts_per_rank * ranks_per_lsa_team));
+            prob_src = remote_expert_input_prob[rank_id] + (slot_st * (experts_per_rank * ranks_per_lsa_team));
         }
         issue_g2s_entry<CROSS_LSA, BACKWARD_COMBINE, /*WRITE_LAST_FLAG=*/true>(
             smem_buffer_ptr,

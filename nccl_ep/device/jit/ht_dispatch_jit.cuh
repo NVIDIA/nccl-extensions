@@ -28,13 +28,6 @@ namespace jit {
 
 constexpr const char* kDispatchJitEntryName = "nccl_ep_jit_ht_dispatch_kernel";
 
-inline const char* dispatch_recipe_literal(ncclEpDispatchQuantizationRecipe_t recipe) {
-    switch (recipe) {
-        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD: return "NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD";
-        default:                                    return "NCCL_EP_DISPATCH_QUANT_NONE";
-    }
-}
-
 struct dispatch_warp_layout_t {
     int cross_lsa_group_warps;
     int cross_lsa_group_start;
@@ -354,7 +347,7 @@ inline std::string local_dup_jit_source(
         << "      " << hidden_dim << ",\n"
         << "      " << pipe_depth << ",\n"
         << "      " << ::nccl_ep::jit::bool_literal(forward_dispatch) << ",\n"
-        << "      " << dispatch_recipe_literal(recipe) << ">(p);\n"
+        << "      " << ::nccl_ep::jit::dispatch_recipe_literal(recipe) << ">(p);\n"
         << "}\n";
     return src.str();
 }
@@ -435,7 +428,7 @@ inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec,
         << "__global__ void " << kLocalPermuteDupJitEntryName << "(\n"
         << "    const __grid_constant__ ::ht_ep::local_permute_dup_param_t p) {\n"
         << "  ::ht_ep::local_permute_dup<" << hidden_int4 << ", " << hidden_vec
-        << ", " << dispatch_recipe_literal(recipe) << ">(\n"
+        << ", " << ::nccl_ep::jit::dispatch_recipe_literal(recipe) << ">(\n"
         << "      reinterpret_cast<uint8_t*>(p.recv_x_em),\n"
         << "      p.recv_topk_weights_em,\n"
         << "      reinterpret_cast<const uint8_t*>(p.flat_staging),\n"

@@ -95,7 +95,7 @@ inline ncclResult_t launch_ll_dispatch(
              << "_scale" << kernel_spec.scale_cache_tag
              << (nvlinkOnly ? "_nvlinkonly" : "")
              << (topkIdxIsInt64 ? "_topk64" : "_topk32")
-             << ll_token_dtype_name_tag(tokenDtype);
+             << ::nccl_ep::jit::token_dtype_name_tag(tokenDtype);
         return name.str();
     }();
     const std::string source = ll_dispatch_jit_source(

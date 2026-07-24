@@ -8,6 +8,7 @@
 
 #include <nccl.h>
 #include "ep_enums.h"
+#include "nccl_ep.h"  // ncclEpDispatchQuantizationRecipe_t (host-only helper; not JIT-included)
 
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +48,27 @@ inline const char* token_dtype_literal(ncclDataType_t dt) {
     }
 }
 
+// ncclDataType_t -> short suffix folded into a JIT variant_name so distinct wire
+// dtypes get distinct cache keys (the dtype twin of layout_name_tag). Shared by
+// the LL and HT variant-name builders. FP8 tags are used by LL; HT combine only
+// ever passes BF16/FP16/FP32.
+inline const char* token_dtype_name_tag(ncclDataType_t dt) {
+    switch (dt) {
+    case ncclFloat32:
+        return "_tfp32";
+    case ncclFloat16:
+        return "_tfp16";
+    case ncclFloat8e4m3:
+        return "_te4m3";
+    case ncclFloat8e5m2:
+        return "_te5m2";
+    case ncclUint8:
+        return "_tu8";
+    default:
+        return "_tbf16";
+    }
+}
+
 // ncclEpLayout_t -> enumerator name for the kLayout template argument. A switch
 // (not a ternary) so a newly-introduced layout aborts at JIT-build time instead
 // of being silently miscompiled as another layout.
@@ -79,6 +101,17 @@ inline const char* layout_name_tag(ncclEpLayout_t layout) {
         std::fprintf(stderr, "[nccl_ep jit] unsupported ncclEpLayout_t %d in layout_name_tag\n",
                      static_cast<int>(layout));
         std::abort();
+    }
+}
+
+// ncclEpDispatchQuantizationRecipe_t -> enumerator name for the kDispatchRecipe
+// template argument emitted into the HT dispatch JIT source.
+inline const char* dispatch_recipe_literal(ncclEpDispatchQuantizationRecipe_t recipe) {
+    switch (recipe) {
+    case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
+        return "NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD";
+    default:
+        return "NCCL_EP_DISPATCH_QUANT_NONE";
     }
 }
 

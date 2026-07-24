@@ -88,7 +88,7 @@ inline void launch_ll_combine(
         name << "ll_combine"
              << "_hdim" << hidden << ::nccl_ep::jit::layout_name_tag(layout)
              << (useLogFmt ? "_logfmt" : "") << (topkIdxIsInt64 ? "_topk64" : "_topk32")
-             << ll_token_dtype_name_tag(tokenDtype);
+             << ::nccl_ep::jit::token_dtype_name_tag(tokenDtype);
         return name.str();
     }();
     const std::string source = ll_combine_jit_source(useLogFmt, hidden, layout, topkIdxIsInt64, tokenDtype);

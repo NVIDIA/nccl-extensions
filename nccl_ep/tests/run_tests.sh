@@ -91,6 +91,7 @@ SUITES=(
     "test_output_layout|EP Output Layout Tests|1"
     "test_handle_maps|EP Handle Maps Tests|1"
     "test_lifecycle|EP Lifecycle Tests|1"
+    "test_public_struct_abi|EP Public Struct ABI Tests|0"
     "test_ht_bwd|EP HT Backward Tests|1"
     "test_ht_stale_routing_map|EP HT Stale Routing Map Tests|1"
     "test_ht_overflow_drop|EP HT Overflow Drop Tests|0"

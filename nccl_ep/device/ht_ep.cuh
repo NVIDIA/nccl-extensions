@@ -1521,15 +1521,18 @@ __forceinline__ __device__ void dispatch_s2g_issue_token(
     // The scan never publishes slots at or above the bound, so this catches
     // corrupted or stale routing maps before they overrun a recv buffer.
     EP_DEVICE_ASSERT(dst.output_buffer_index < max_recv_tokens_per_rank);
-    const void* token_dst = remote_expert_output_token[dst.remote_rank_id] + (dst.output_buffer_index * HIDDEN_DIM);
+
+    // Cast slot to size_t to prevent int32 overflow in the offset multiplication.
+    const size_t slot = static_cast<size_t>(dst.output_buffer_index);
+    const void* token_dst = remote_expert_output_token[dst.remote_rank_id] + (slot * HIDDEN_DIM);
     const void* prob_dst = nullptr;
     const void* sf_dst = nullptr;
     if constexpr (FORWARD_DISPATCH) {
         prob_dst = remote_expert_output_prob[dst.remote_rank_id] +
-                   (dst.output_buffer_index * (experts_per_rank * LSA_TEAM_SIZE));
+                   (slot * (experts_per_rank * LSA_TEAM_SIZE));
     }
     if constexpr (HAS_SF) {
-        sf_dst = remote_expert_output_scaling_factor[dst.remote_rank_id] + dst.output_buffer_index * sf_bytes_per_token;
+        sf_dst = remote_expert_output_scaling_factor[dst.remote_rank_id] + slot * sf_bytes_per_token;
     }
     copy_token_bundle<TOKEN_DATA_TYPE, SMEM_TYPE, FORWARD_DISPATCH, HAS_SF, copy_dir::to_gmem>(
         smem_buffer_ptr,

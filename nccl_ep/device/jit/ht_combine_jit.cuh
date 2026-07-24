@@ -155,9 +155,7 @@ inline void launch_combine(
              << config.num_of_blocks
              << (config.backward_combine ? "_bwd" : "_fwd")
              << ::nccl_ep::jit::layout_name_tag(layout)
-             << (token_dtype == ncclFloat32 ? "_fp32" :
-                 token_dtype == ncclFloat16 ? "_fp16" :
-                                              "_bf16");
+             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype);
         return name.str();
     }();
     const std::string source = combine_jit_source(
@@ -368,7 +366,7 @@ inline void launch_local_reduce(
         std::ostringstream name;
         name << "local_reduce"
              << "_hdim" << hidden_dim << "_epr" << experts_per_rank << (backward_combine ? "_bwd" : "_fwd")
-             << (token_dtype == ncclFloat32 ? "_fp32" : token_dtype == ncclFloat16 ? "_fp16" : "_bf16");
+             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype);
         return name.str();
     }();
     const std::string source = local_reduce_jit_source(hidden_dim, backward_combine, experts_per_rank, token_dtype);
@@ -451,9 +449,7 @@ inline void launch_local_permute_reduce(
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "local_permute_reduce_topk" << top_k << "_h" << hidden_int4 << "_b" << blocks_per_sm
-             << (token_dtype == ncclFloat32 ? "_fp32" :
-                 token_dtype == ncclFloat16 ? "_fp16" :
-                                              "_bf16");
+             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype);
         return name.str();
     }();
     const std::string source = local_permute_reduce_jit_source(top_k, hidden_int4, blocks_per_sm, token_dtype);

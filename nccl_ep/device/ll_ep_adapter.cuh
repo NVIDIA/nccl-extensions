@@ -17,26 +17,6 @@
 namespace nccl_ep {
 namespace ll {
 
-// Short per-dtype suffix folded into the LL JIT variant_name so distinct wire
-// dtypes get distinct cache keys. (The ncclDataType_t -> kTokenDtype enumerator
-// literal is now the shared ::nccl_ep::jit::token_dtype_literal.)
-inline const char* ll_token_dtype_name_tag(ncclDataType_t dt) {
-    switch (dt) {
-    case ncclFloat32:
-        return "_tfp32";
-    case ncclFloat16:
-        return "_tfp16";
-    case ncclFloat8e4m3:
-        return "_te4m3";
-    case ncclFloat8e5m2:
-        return "_te5m2";
-    case ncclUint8:
-        return "_tu8";
-    default:
-        return "_tbf16";
-    }
-}
-
 // ============================================================================
 // Packed kernel parameter structs.
 //

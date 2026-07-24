@@ -68,82 +68,74 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
     } while (0)
 #endif
 
-// Size-based ABI versioning: every cross-boundary struct starts with a `size`
-// field set by the caller to sizeof(struct). The library checks that against
-// its own known size; any mismatch means caller and library are from different
-// releases. Strict equality for now — see nccl_ep.h for the planned future
-// relaxation (all-zero-trailing-bytes escape hatch).
-// Immediately after `size` there is a `magic` field pre-filled by NCCL_EP_*_INIT
-// to catch unininitialized structures.
-#define EP_REQUIRE_STRUCT(ptr) \
+// Append-only public-struct ABI. A caller may be older (the V1 prefix) or
+// newer (a larger struct); this library validates the known prefix and ignores
+// any unknown future tail. Size is the memory-safety boundary.
+static ncclResult_t epValidateStruct(
+    const void* object,
+    unsigned int size,
+    unsigned int magic,
+    unsigned int min_size,
+    unsigned int expected_magic,
+    const char* struct_name) {
+    if (object == nullptr) {
+        fprintf(stderr, "NCCL EP: required %s is NULL\n", struct_name);
+        return ncclInvalidArgument;
+    }
+    if (size < min_size) {
+        fprintf(
+            stderr,
+            "NCCL EP: %s size too small: got %u, expected at least %u\n",
+            struct_name,
+            size,
+            min_size);
+        return ncclInvalidArgument;
+    }
+    if (magic != expected_magic) {
+        fprintf(
+            stderr,
+            "NCCL EP: %s magic mismatch: got 0x%x, expected 0x%x\n",
+            struct_name,
+            magic,
+            expected_magic);
+        return ncclInvalidArgument;
+    }
+    return ncclSuccess;
+}
+
+#define EP_VALIDATE_STRUCT(ptr_, base_) \
     do { \
-        assert( \
-            (ptr) != nullptr && (ptr)->size == sizeof(*(ptr)) && \
-            "ABI struct size mismatch — caller and libnccl_ep.so must be from the same release"); \
-        assert( \
-            (ptr)->magic == NCCL_EP_MAGIC && \
-            "struct magic mismatch — pointer is uninitialised or not an NCCL EP struct " \
-            "(initialise with the corresponding NCCL_EP_*_INIT macro)"); \
+        const auto* ep_struct_ptr_ = (ptr_); \
+        const ncclResult_t ep_struct_result_ = epValidateStruct( \
+            ep_struct_ptr_, \
+            ep_struct_ptr_ != nullptr ? ep_struct_ptr_->size : 0, \
+            ep_struct_ptr_ != nullptr ? ep_struct_ptr_->magic : 0, \
+            base_ ## _V1_SIZE, \
+            NCCL_EP_MAGIC, \
+            #ptr_); \
+        if (ep_struct_result_ != ncclSuccess) return ep_struct_result_; \
     } while (0)
-#define EP_OPTIONAL_STRUCT(ptr) \
-    do { \
-        assert( \
-            ((ptr) == nullptr || (ptr)->size == sizeof(*(ptr))) && \
-            "ABI struct size mismatch -- caller and libnccl_ep.so must be from the same release"); \
-        assert( \
-            ((ptr) == nullptr || (ptr)->magic == NCCL_EP_MAGIC) && \
-            "struct magic mismatch -- pointer is uninitialised or not an NCCL EP struct " \
-            "(initialise with the corresponding NCCL_EP_*_INIT macro)"); \
-    } while (0)
+
+template <typename T>
+static T epDecodeStruct(const T* source, T defaults) {
+    // The caller must validate source against the corresponding V1 boundary
+    // before decoding it.
+    T decoded = defaults;
+    memcpy(
+        &decoded,
+        source,
+        std::min<size_t>(source->size, sizeof(decoded)));
+    // Internal code always observes the current library's normalized prefix.
+    decoded.size = defaults.size;
+    decoded.magic = defaults.magic;
+    return decoded;
+}
 
 // SCALES_FORWARD has no fixed scale block size. Reserve the complete
 // byte budget so any validated caller-provided scale row fits; this is the
 // byte-equivalent of the former FP32-element reservation.
 static inline size_t maxForwardedScaleBytesPerToken(size_t max_token_bytes) {
     return max_token_bytes;
-}
-
-// Targeted forward-binary-compat for ncclEpLayoutInfo_t (only). The struct
-// grows by appending; older callers built against a pre-flag header report a
-// smaller `size`. Accept any size in [min-known, current-sizeof] and let
-// per-field readers default to the corresponding AUTO sentinel when a field
-// falls beyond the caller's reported size. Bumps to this struct must
-// document the corresponding legacy size below.
-static constexpr size_t kNcclEpLayoutInfoMinSize =
-    offsetof(ncclEpLayoutInfo_t, recv_topk_idx_kind); // last legacy field end
-#define EP_OPTIONAL_LAYOUT_INFO(ptr) \
-    do { \
-        if ((ptr) != nullptr) { \
-            if ((ptr)->size < kNcclEpLayoutInfoMinSize || (ptr)->size > sizeof(*(ptr))) { \
-                fprintf( \
-                    stderr, \
-                    "NCCL EP: ncclEpLayoutInfo_t size out of supported range: " \
-                    "got %u, expected [%zu, %zu]\n", \
-                    (ptr)->size, \
-                    kNcclEpLayoutInfoMinSize, \
-                    sizeof(*(ptr))); \
-                return ncclInvalidArgument; \
-            } \
-            if ((ptr)->magic != NCCL_EP_MAGIC) { \
-                fprintf( \
-                    stderr, \
-                    "NCCL EP: ncclEpLayoutInfo_t magic mismatch: got 0x%x, " \
-                    "expected 0x%x (initialise with NCCL_EP_LAYOUT_INFO_INIT)\n", \
-                    (ptr)->magic, \
-                    NCCL_EP_MAGIC); \
-                return ncclInvalidArgument; \
-            } \
-        } \
-    } while (0)
-
-// Safe field reader for ncclEpLayoutInfo_t::recv_topk_idx_kind. Returns AUTO
-// when the caller's struct (size) does not cover the field, preserving the
-// pre-flag default.
-static inline ncclEpExpertIdKind_t layoutInfoRecvTopkIdxKind(const ncclEpLayoutInfo_t* lip) {
-    if (lip == nullptr) return NCCL_EP_EXPERT_ID_AUTO;
-    constexpr size_t field_end = offsetof(ncclEpLayoutInfo_t, recv_topk_idx_kind) + sizeof(ncclEpExpertIdKind_t);
-    if (lip->size < field_end) return NCCL_EP_EXPERT_ID_AUTO;
-    return lip->recv_topk_idx_kind;
 }
 
 // Resolve AUTO -- the public sentinel meaning "library default" -- to the
@@ -259,6 +251,7 @@ static const ncclEpTensorInternal_t* _getInternalTensor(const ncclEpTensor_t* te
 // descriptor's library-owned sizes array.
 static inline bool tensorIsInitialised(const ncclEpTensor_t* t) {
     if (t == nullptr) return false;
+    if (t->size < NCCL_EP_TENSOR_V1_SIZE) return false;
     if (t->magic == NCCL_EP_TENSOR_ALLOC_STATIC) return true;
     if (t->magic == NCCL_EP_TENSOR_ALLOC_DYNAMIC) {
         return _getInternalTensor(t)->sizes_shadow == t->sizes;
@@ -538,7 +531,9 @@ static ncclResult_t validateCombineRecipe(
 // of `src`'s magic. The copy shares `src`'s `sizes` pointer; the caller must
 // keep `src->sizes` alive for `dst`'s lifetime.
 static inline void tensor_temp_copy(ncclEpTensor_t* dst, const ncclEpTensor_t* src) {
-    *dst = *src;
+    *dst = NCCL_EP_TENSOR_INIT;
+    memcpy(dst, src, std::min<size_t>(src->size, sizeof(*dst)));
+    dst->size = NCCL_EP_TENSOR_SIZE;
     dst->magic = NCCL_EP_TENSOR_MAGIC;
 }
 
@@ -566,7 +561,9 @@ ncclResult_t ncclEpTensorAlloc(
     ncclDataType_t datatype,
     const size_t* sizes,
     const ncclEpTensorAllocConfig_t* config) {
-    EP_OPTIONAL_STRUCT(config);
+    if (config != nullptr) {
+        EP_VALIDATE_STRUCT(config, NCCL_EP_TENSOR_ALLOC_CONFIG);
+    }
     if (tensor == nullptr || sizes == nullptr || ndim == 0) {
         return ncclInvalidArgument;
     }
@@ -1607,21 +1604,27 @@ __attribute__((constructor)) static void nccl_ep_lib_init() {
 }
 
 ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, const ncclEpGroupConfig_t* in_config) {
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
     // Parameter validation
     assert(out_ep_group != nullptr);
     int nRanks;
     assert(comm != nullptr && ncclCommCount(comm, &nRanks) == ncclSuccess && nRanks > 0);
-    EP_REQUIRE_STRUCT(in_config); // null-checks and size-validates in_config
+    EP_VALIDATE_STRUCT(in_config, NCCL_EP_GROUP_CONFIG);
     if (in_config->version != NCCL_EP_API_VERSION) {
         fprintf(
             stderr,
             "NCCL EP WARN: ncclEpGroupConfig_t.version=%u, library API_VERSION=%u; "
             "behavior may differ across versions.\n",
             in_config->version,
-            (unsigned)NCCL_EP_API_VERSION);
+            (unsigned int)NCCL_EP_API_VERSION);
     }
+
+    // Decode the caller-owned object into current library storage. A future
+    // caller may be larger, while a future library may receive this frozen V1
+    // prefix; in both directions the copy is bounded and new library fields
+    // retain initializer defaults.
+    ncclEpGroupConfig_t parsed_config =
+        epDecodeStruct(in_config, NCCL_EP_GROUP_CONFIG_INIT);
+    in_config = &parsed_config;
     assert(
         (in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY || in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) &&
         "ncclEpCreateGroup: invalid algorithm, supported: low_latency, high_throughput");
@@ -1630,6 +1633,10 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     bool ht_mode = (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT);
     assert(in_config->num_experts > 0 && "ncclEpCreateGroup: num_experts must be greater than 0");
     assert(in_config->max_token_bytes > 0 && "ncclEpCreateGroup: max_token_bytes must be greater than 0");
+
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
     if (ht_mode && in_config->max_token_bytes % sizeof(int4) != 0) {
         fprintf(
             stderr,
@@ -2472,7 +2479,9 @@ ncclResult_t ncclEpHandleMemSize(
     size_t* size_out,
     int num_topk) {
     assert(ep_group != nullptr && size_out != nullptr);
-    EP_OPTIONAL_STRUCT(config);
+    if (config != nullptr) {
+        EP_VALIDATE_STRUCT(config, NCCL_EP_HANDLE_CONFIG);
+    }
     EP_HOST_ASSERT(layout != NCCL_EP_LAYOUT_UNSET && "ncclEpHandleMemSize: layout must be set explicitly");
     if (ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
         assert(num_topk > 0 && "HT mode requires num_topk > 0 for ncclEpHandleMemSize");
@@ -2758,7 +2767,14 @@ ncclResult_t ncclEpInitHandle(
     const ncclEpTensor_t* handle_mem) {
     assert(ep_group != nullptr && out_handle != nullptr);
     assert(ep_group->comm != nullptr);
-    EP_OPTIONAL_STRUCT(config);
+    if (config != nullptr) {
+        EP_VALIDATE_STRUCT(config, NCCL_EP_HANDLE_CONFIG);
+    }
+    ncclEpHandleConfig_t parsed_config = NCCL_EP_HANDLE_CONFIG_INIT;
+    if (config != nullptr) {
+        parsed_config = epDecodeStruct(config, NCCL_EP_HANDLE_CONFIG_INIT);
+        config = &parsed_config;
+    }
     handle_mem = tensor_ptr(handle_mem); // NULL passthrough; otherwise validates magic
     EP_HOST_ASSERT(layout != NCCL_EP_LAYOUT_UNSET && "ncclEpInitHandle: layout must be set explicitly");
     EP_HOST_ASSERT(
@@ -2804,8 +2820,15 @@ ncclResult_t ncclEpUpdateHandle(
     const ncclEpLayoutInfo_t* layout_info,
     cudaStream_t stream) {
     assert(handle != nullptr);
+    if (layout_info != nullptr) {
+        EP_VALIDATE_STRUCT(layout_info, NCCL_EP_LAYOUT_INFO);
+    }
+    ncclEpLayoutInfo_t parsed_layout_info = NCCL_EP_LAYOUT_INFO_INIT;
+    if (layout_info != nullptr) {
+        parsed_layout_info = epDecodeStruct(layout_info, NCCL_EP_LAYOUT_INFO_INIT);
+        layout_info = &parsed_layout_info;
+    }
     topk_idx = tensor_required(topk_idx);
-    EP_OPTIONAL_LAYOUT_INFO(layout_info);
     assert(topk_idx->ndim == 2);
 
     ncclEpGroup_t ep_group = handle->group;
@@ -3073,6 +3096,9 @@ ncclResult_t ncclEpCreateHandle(
     cudaStream_t stream) {
     topk_idx = tensor_required(topk_idx);
     assert(out_handle != nullptr);
+    if (layout_info != nullptr) {
+        EP_VALIDATE_STRUCT(layout_info, NCCL_EP_LAYOUT_INFO);
+    }
     // Propagate validation errors (e.g. unsupported eager-mode combinations)
     // instead of exiting the process.
     NCCLCHECK(ncclEpInitHandle(
@@ -3152,10 +3178,34 @@ ncclResult_t ncclEpDispatch(
     const ncclEpLayoutInfo_t* layout_info,
     const ncclEpDispatchConfig_t* config,
     cudaStream_t stream) {
-    EP_REQUIRE_STRUCT(inputs);
-    EP_REQUIRE_STRUCT(outputs);
-    EP_OPTIONAL_LAYOUT_INFO(layout_info);
-    EP_OPTIONAL_STRUCT(config);
+    EP_VALIDATE_STRUCT(inputs, NCCL_EP_DISPATCH_INPUTS);
+    EP_VALIDATE_STRUCT(outputs, NCCL_EP_DISPATCH_OUTPUTS);
+    if (layout_info != nullptr) {
+        EP_VALIDATE_STRUCT(layout_info, NCCL_EP_LAYOUT_INFO);
+    }
+    if (config != nullptr) {
+        EP_VALIDATE_STRUCT(config, NCCL_EP_DISPATCH_CONFIG);
+    }
+
+    ncclEpDispatchInputs_t parsed_inputs =
+        epDecodeStruct(inputs, NCCL_EP_DISPATCH_INPUTS_INIT);
+    ncclEpDispatchOutputs_t parsed_outputs =
+        epDecodeStruct(outputs, NCCL_EP_DISPATCH_OUTPUTS_INIT);
+    inputs = &parsed_inputs;
+    outputs = &parsed_outputs;
+
+    ncclEpLayoutInfo_t parsed_layout_info = NCCL_EP_LAYOUT_INFO_INIT;
+    if (layout_info != nullptr) {
+        parsed_layout_info = epDecodeStruct(layout_info, NCCL_EP_LAYOUT_INFO_INIT);
+        layout_info = &parsed_layout_info;
+    }
+
+    ncclEpDispatchConfig_t parsed_config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    if (config != nullptr) {
+        parsed_config = epDecodeStruct(config, NCCL_EP_DISPATCH_CONFIG_INIT);
+        config = &parsed_config;
+    }
+
     const unsigned int send_only = config ? config->send_only : 0;
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
     const ncclEpDispatchQuantizationRecipe_t recipe =
@@ -3340,6 +3390,12 @@ ncclResult_t ncclEpDispatch(
         const size_t recv_data_offset = zcopy_rcv_x ? static_cast<size_t>(recv_x->win_offset) : 0;
         const ncclWindow_t recv_scales_window = zcopy_rcv_scales ? scales->win_hdl : ncclWindow_t{};
         const size_t recv_scales_offset = zcopy_rcv_scales ? static_cast<size_t>(scales->win_offset) : 0;
+        const bool round_scale = config ? config->round_scales : false;
+        const ncclEpExpertIdKind_t recv_topk_idx_kind =
+            resolveRecvTopkIdxKind(
+                layout_info != nullptr
+                    ? layout_info->recv_topk_idx_kind
+                    : NCCL_EP_EXPERT_ID_AUTO);
         auto dispatch_fn = [=](int phases) -> ncclResult_t {
             char* rdma_base = static_cast<char*>(group->rdma_buffer);
             void* dispatch_send_ptr = rdma_base + buffer.dispatch_rdma_send_buffer_offset;
@@ -3358,13 +3414,6 @@ ncclResult_t ncclEpDispatch(
             auto* topk_weights_in_data = topk_weights_in ? static_cast<const float*>(topk_weights_in->data) : nullptr;
             auto* recv_topk_weights_data = recv_topk_weights ? static_cast<float*>(recv_topk_weights->data) : nullptr;
             auto* recv_topk_idx_data = recv_topk_idx ? static_cast<int32_t*>(recv_topk_idx->data) : nullptr;
-
-            const bool round_scale = config ? config->round_scales : false;
-            // recv_topk_idx numbering selector. Read in a version-safe way
-            // (older callers' smaller layout_info reports AUTO), then resolve
-            // AUTO -> LOCAL so the kernel sees only concrete kinds.
-            const ncclEpExpertIdKind_t recv_topk_idx_kind =
-                resolveRecvTopkIdxKind(layoutInfoRecvTopkIdxKind(layout_info));
 
             // LL accepts int32 or int64 topk_idx; the cached dtype picks the JIT
             // kernel specialization (TopkIdxT). The lambda packs the shared
@@ -3967,11 +4016,14 @@ ncclResult_t ncclEpDispatch(
             int num_recv_tokens = em_permute_active ? static_cast<int>(group->max_recv_tokens)
                                                     : static_cast<int>(recv_copy_rows);
             int experts_per_lsa_team = group->num_local_experts * group->lsa_team_size;
-            // recv_topk_idx numbering selector (matches LL rank-major path):
-            // version-safe read of layout_info, resolve AUTO -> LOCAL, pass the
-            // concrete kind plus the per-group GLOBAL offset to the kernel.
+            // recv_topk_idx numbering selector (matches LL rank-major path).
+            // The normalized layout_info supplies AUTO when the caller did not
+            // provide a value.
             const ncclEpExpertIdKind_t recv_topk_idx_kind =
-                resolveRecvTopkIdxKind(layoutInfoRecvTopkIdxKind(layout_info));
+                resolveRecvTopkIdxKind(
+                    layout_info != nullptr
+                        ? layout_info->recv_topk_idx_kind
+                        : NCCL_EP_EXPERT_ID_AUTO);
             const int global_expert_offset = group->rank * group->num_local_experts;
 
             // em-permute path: dense_to_sparse_prob runs in FLAT shape.
@@ -4085,9 +4137,25 @@ ncclResult_t ncclEpCombine(
     const ncclEpCombineOutputs_t* outputs,
     const ncclEpCombineConfig_t* config,
     cudaStream_t stream) {
-    EP_REQUIRE_STRUCT(inputs);
-    EP_REQUIRE_STRUCT(outputs);
-    EP_OPTIONAL_STRUCT(config);
+    EP_VALIDATE_STRUCT(inputs, NCCL_EP_COMBINE_INPUTS);
+    EP_VALIDATE_STRUCT(outputs, NCCL_EP_COMBINE_OUTPUTS);
+    if (config != nullptr) {
+        EP_VALIDATE_STRUCT(config, NCCL_EP_COMBINE_CONFIG);
+    }
+
+    ncclEpCombineInputs_t parsed_inputs =
+        epDecodeStruct(inputs, NCCL_EP_COMBINE_INPUTS_INIT);
+    ncclEpCombineOutputs_t parsed_outputs =
+        epDecodeStruct(outputs, NCCL_EP_COMBINE_OUTPUTS_INIT);
+    inputs = &parsed_inputs;
+    outputs = &parsed_outputs;
+
+    ncclEpCombineConfig_t parsed_config = NCCL_EP_COMBINE_CONFIG_INIT;
+    if (config != nullptr) {
+        parsed_config = epDecodeStruct(config, NCCL_EP_COMBINE_CONFIG_INIT);
+        config = &parsed_config;
+    }
+
     const unsigned int send_only = config ? config->send_only : 0;
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
     NCCLCHECK(validateCombineRecipe(inputs, outputs, config));
@@ -4673,7 +4741,9 @@ ncclResult_t ncclEpCombine(
 }
 
 ncclResult_t ncclEpComplete(ncclEpHandle_t handle, const ncclEpCompleteConfig_t* config, cudaStream_t stream) {
-    EP_OPTIONAL_STRUCT(config);
+    if (config != nullptr) {
+        EP_VALIDATE_STRUCT(config, NCCL_EP_COMPLETE_CONFIG);
+    }
     if (handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         if (handle->ll.continue_fn) {
                 NCCLCHECK(handle->ll.continue_fn(LOW_LATENCY_RECV_PHASE));

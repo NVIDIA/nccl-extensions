@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <stddef.h>
+#include <stdint.h>
 #include <cuda.h>
 #include <nccl.h>
 #include "nccl_ep/ep_enums.h"
@@ -28,18 +30,19 @@ extern "C" {
 // ============================================================================
 // ABI + API versioning
 //
-// Every struct that crosses the API boundary starts with `unsigned int size`,
-// which the caller MUST set to sizeof(struct). The library validates it
-// against its own sizeof and rejects mismatches (layout / ABI check).
+// Every independently passed public struct starts with the same fields:
 //
-// Immediately after `size`, every struct carries an
-// `unsigned int magic` field, which the caller MUST set to a predefined value.
-// The library rejects structs whose magic does not match — catching
-// uninitialised / zero-filled / wrong-type pointers at the API boundary.
+//   unsigned int size;
+//   unsigned int magic;
 //
 // ncclEpGroupConfig_t additionally carries `unsigned int version`
-// (= NCCL_EP_API_VERSION) for catching feature-level incompatibilities that
-// size can't detect; the library warns on mismatch.
+// (= NCCL_EP_API_VERSION) for feature-level compatibility checks.
+//
+// Structs are append-only. A library accepts any struct at least as large as
+// the frozen V1 boundary, reads only fields covered by `size`, and ignores a
+// future caller's unknown tail. Each released Vn boundary is frozen. When a
+// released layout has implicit tail padding, an explicit padding_vN member consumes
+// exactly those bytes so a future field cannot occupy them.
 //
 // Convenience macros NCCL_EP_xxx_INIT expand to compound literals that pre-fill
 // these fields. They work in declaration init, assignment, and expression
@@ -54,18 +57,62 @@ extern "C" {
 // To set additional fields inline, write the compound literal directly:
 //
 //   inputs = (ncclEpDispatchInputs_t){
-//       .size   = sizeof(ncclEpDispatchInputs_t),
-//       .magic  = NCCL_EP_MAGIC,
+//       .size = (unsigned int)sizeof(ncclEpDispatchInputs_t),
+//       .magic = NCCL_EP_MAGIC,
 //       .tokens = my_tokens,
 //   };
-//
-// FUTURE IMPROVEMENT: relax the strict size-equality check to allow forward
-// compat when the caller's struct is larger than the library's known size, by
-// scanning the trailing bytes; if all zero, accept silently (the caller didn't
-// actually fill any unknown fields).
 // ============================================================================
-#define NCCL_EP_API_VERSION 1
+#define NCCL_EP_API_VERSION 2
 #define NCCL_EP_MAGIC 0xC00FFFEEu
+
+#define NCCL_EP_STRUCT_INIT(type_, magic_) \
+    ((type_){ \
+        .size = (unsigned int)sizeof(type_), \
+        .magic = (magic_) \
+    })
+
+#define NCCL_EP_FIELD_END(type_, field_) \
+    ((unsigned int)(offsetof(type_, field_) + sizeof(((type_*)0)->field_)))
+
+#define NCCL_EP_HAS_FIELD(ptr_, type_, field_) \
+    ((ptr_) != NULL && (ptr_)->size >= NCCL_EP_FIELD_END(type_, field_))
+
+#if defined(__cplusplus)
+#define NCCL_EP_STATIC_ASSERT(cond_, msg_) static_assert((cond_), msg_)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define NCCL_EP_STATIC_ASSERT(cond_, msg_) _Static_assert((cond_), msg_)
+#else
+#define NCCL_EP_STATIC_ASSERT(cond_, msg_)
+#endif
+
+#define NCCL_EP_STATIC_ASSERT_STRUCT_ABI_IMPL_(type_, base_, current_version_) \
+    NCCL_EP_STATIC_ASSERT( \
+        offsetof(type_, size) == 0, \
+        #type_ " size must be the first member"); \
+    NCCL_EP_STATIC_ASSERT( \
+        offsetof(type_, magic) == NCCL_EP_FIELD_END(type_, size), \
+        #type_ " magic must immediately follow size"); \
+    NCCL_EP_STATIC_ASSERT( \
+        sizeof(type_) == base_ ## _V ## current_version_ ## _SIZE, \
+        #type_ " current size does not match current ABI size")
+
+#define NCCL_EP_STATIC_ASSERT_STRUCT_ABI_EXPAND_(type_, base_, current_version_) \
+    NCCL_EP_STATIC_ASSERT_STRUCT_ABI_IMPL_(type_, base_, current_version_)
+
+#define NCCL_EP_STATIC_ASSERT_STRUCT_ABI(type_, base_) \
+    NCCL_EP_STATIC_ASSERT_STRUCT_ABI_EXPAND_( \
+        type_, base_, base_ ## _CURRENT_VERSION)
+
+#define NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(type_, base_, version_) \
+    NCCL_EP_STATIC_ASSERT( \
+        (version_) <= base_ ## _CURRENT_VERSION, \
+        #type_ " boundary version exceeds current version"); \
+    NCCL_EP_STATIC_ASSERT( \
+        NCCL_EP_FIELD_END( \
+            type_, \
+            base_ ## _V ## version_ ## _LAST_FIELD) == \
+            base_ ## _V ## version_ ## _SIZE, \
+        #type_ " V" #version_ " ABI boundary changed")
 
 // Return the NCCL_EP_VERSION_CODE of the NCCL EP library in the supplied integer.
 // This integer is coded with the MAJOR, MINOR and PATCH level of the library.
@@ -124,6 +171,16 @@ typedef struct ncclEpTensor {
 #define NCCL_EP_TENSOR_INIT_INLINE .size = (unsigned int)sizeof(ncclEpTensor_t), .magic = NCCL_EP_TENSOR_MAGIC
 #define NCCL_EP_TENSOR_INIT ((ncclEpTensor_t){NCCL_EP_TENSOR_INIT_INLINE})
 
+#define NCCL_EP_TENSOR_SIZE ((unsigned int)sizeof(ncclEpTensor_t))
+
+#define NCCL_EP_TENSOR_V1_LAST_FIELD sizes
+#define NCCL_EP_TENSOR_V1_SIZE 48u
+
+#define NCCL_EP_TENSOR_CURRENT_VERSION 1
+
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpTensor_t, NCCL_EP_TENSOR);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpTensor_t, NCCL_EP_TENSOR, 1);
+
 // Allocation configuration for future extensions of ncclEpTensorAlloc.
 // Callers should either pass NULL (defaults) or initialise via
 // NCCL_EP_TENSOR_ALLOC_CONFIG_INIT.
@@ -133,7 +190,17 @@ typedef struct {
 } ncclEpTensorAllocConfig_t;
 
 #define NCCL_EP_TENSOR_ALLOC_CONFIG_INIT \
-    ((ncclEpTensorAllocConfig_t){.size = (unsigned int)sizeof(ncclEpTensorAllocConfig_t), .magic = NCCL_EP_MAGIC})
+    NCCL_EP_STRUCT_INIT(ncclEpTensorAllocConfig_t, NCCL_EP_MAGIC)
+
+#define NCCL_EP_TENSOR_ALLOC_CONFIG_SIZE ((unsigned int)sizeof(ncclEpTensorAllocConfig_t))
+
+#define NCCL_EP_TENSOR_ALLOC_CONFIG_V1_LAST_FIELD magic
+#define NCCL_EP_TENSOR_ALLOC_CONFIG_V1_SIZE 8u
+
+#define NCCL_EP_TENSOR_ALLOC_CONFIG_CURRENT_VERSION 1
+
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpTensorAllocConfig_t, NCCL_EP_TENSOR_ALLOC_CONFIG);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpTensorAllocConfig_t, NCCL_EP_TENSOR_ALLOC_CONFIG, 1);
 
 // Allocate a tensor descriptor sufficient to represent the requested shape.
 //
@@ -248,6 +315,7 @@ typedef struct {
     // where it sizes internal buffers. When set, ncclEpInitHandle validates the
     // handle's num_topk against it.
     unsigned int num_topk;
+    unsigned char padding_v2[4]; // consumes V2 tail padding; future fields append after it
 } ncclEpGroupConfig_t;
 
 #define NCCL_EP_GROUP_CONFIG_INIT \
@@ -256,6 +324,19 @@ typedef struct {
         .magic = NCCL_EP_MAGIC, \
         .version = NCCL_EP_API_VERSION \
     })
+
+#define NCCL_EP_GROUP_CONFIG_SIZE ((unsigned int)sizeof(ncclEpGroupConfig_t))
+
+#define NCCL_EP_GROUP_CONFIG_V1_LAST_FIELD timeout_ns
+#define NCCL_EP_GROUP_CONFIG_V1_SIZE 96u
+#define NCCL_EP_GROUP_CONFIG_V2_LAST_FIELD padding_v2
+#define NCCL_EP_GROUP_CONFIG_V2_SIZE 112u
+
+#define NCCL_EP_GROUP_CONFIG_CURRENT_VERSION 2
+
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 1);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 2);
 
 // Opaque type forward declaration
 typedef struct ncclEpGroup* ncclEpGroup_t;
@@ -310,10 +391,24 @@ typedef struct {
   // ignored by layouts that do not (LL/HT expert-major). AUTO preserves
   // pre-flag callers' behavior on the wire and may shift in a future
   // release without an ABI break; pin LOCAL or GLOBAL for a stable contract.
+    unsigned char padding_v2[4]; // consumes V2 tail padding; future fields append after it
 } ncclEpLayoutInfo_t;
 
 #define NCCL_EP_LAYOUT_INFO_INIT \
-    ((ncclEpLayoutInfo_t){.size = (unsigned int)sizeof(ncclEpLayoutInfo_t), .magic = NCCL_EP_MAGIC})
+    NCCL_EP_STRUCT_INIT(ncclEpLayoutInfo_t, NCCL_EP_MAGIC)
+
+#define NCCL_EP_LAYOUT_INFO_SIZE ((unsigned int)sizeof(ncclEpLayoutInfo_t))
+
+#define NCCL_EP_LAYOUT_INFO_V1_LAST_FIELD recv_total_counter
+#define NCCL_EP_LAYOUT_INFO_V1_SIZE 40u
+#define NCCL_EP_LAYOUT_INFO_V2_LAST_FIELD padding_v2
+#define NCCL_EP_LAYOUT_INFO_V2_SIZE 48u
+
+#define NCCL_EP_LAYOUT_INFO_CURRENT_VERSION 2
+
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpLayoutInfo_t, NCCL_EP_LAYOUT_INFO);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpLayoutInfo_t, NCCL_EP_LAYOUT_INFO, 1);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpLayoutInfo_t, NCCL_EP_LAYOUT_INFO, 2);
 
 // Input tensors for ncclEpDispatch.
 // All fields except tokens are optional (NULL = not provided). Each field is a
@@ -330,7 +425,17 @@ typedef struct {
 } ncclEpDispatchInputs_t;
 
 #define NCCL_EP_DISPATCH_INPUTS_INIT \
-    ((ncclEpDispatchInputs_t){.size = (unsigned int)sizeof(ncclEpDispatchInputs_t), .magic = NCCL_EP_MAGIC})
+    NCCL_EP_STRUCT_INIT(ncclEpDispatchInputs_t, NCCL_EP_MAGIC)
+
+#define NCCL_EP_DISPATCH_INPUTS_SIZE ((unsigned int)sizeof(ncclEpDispatchInputs_t))
+
+#define NCCL_EP_DISPATCH_INPUTS_V1_LAST_FIELD scales
+#define NCCL_EP_DISPATCH_INPUTS_V1_SIZE 32u
+
+#define NCCL_EP_DISPATCH_INPUTS_CURRENT_VERSION 1
+
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpDispatchInputs_t, NCCL_EP_DISPATCH_INPUTS);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchInputs_t, NCCL_EP_DISPATCH_INPUTS, 1);
 
 // Output tensors for ncclEpDispatch.
 // All fields except tokens are optional (NULL = not provided). Each field is a
@@ -349,7 +454,17 @@ typedef struct {
 } ncclEpDispatchOutputs_t;
 
 #define NCCL_EP_DISPATCH_OUTPUTS_INIT \
-    ((ncclEpDispatchOutputs_t){.size = (unsigned int)sizeof(ncclEpDispatchOutputs_t), .magic = NCCL_EP_MAGIC})
+    NCCL_EP_STRUCT_INIT(ncclEpDispatchOutputs_t, NCCL_EP_MAGIC)
+
+#define NCCL_EP_DISPATCH_OUTPUTS_SIZE ((unsigned int)sizeof(ncclEpDispatchOutputs_t))
+
+#define NCCL_EP_DISPATCH_OUTPUTS_V1_LAST_FIELD topk_idx
+#define NCCL_EP_DISPATCH_OUTPUTS_V1_SIZE 40u
+
+#define NCCL_EP_DISPATCH_OUTPUTS_CURRENT_VERSION 1
+
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpDispatchOutputs_t, NCCL_EP_DISPATCH_OUTPUTS);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchOutputs_t, NCCL_EP_DISPATCH_OUTPUTS, 1);
 
 // Input tensors for ncclEpCombine.
 // All fields except tokens are optional (NULL = not provided). Each field is a
@@ -363,7 +478,17 @@ typedef struct {
 } ncclEpCombineInputs_t;
 
 #define NCCL_EP_COMBINE_INPUTS_INIT \
-    ((ncclEpCombineInputs_t){.size = (unsigned int)sizeof(ncclEpCombineInputs_t), .magic = NCCL_EP_MAGIC})
+    NCCL_EP_STRUCT_INIT(ncclEpCombineInputs_t, NCCL_EP_MAGIC)
+
+#define NCCL_EP_COMBINE_INPUTS_SIZE ((unsigned int)sizeof(ncclEpCombineInputs_t))
+
+#define NCCL_EP_COMBINE_INPUTS_V1_LAST_FIELD topk_weights
+#define NCCL_EP_COMBINE_INPUTS_V1_SIZE 24u
+
+#define NCCL_EP_COMBINE_INPUTS_CURRENT_VERSION 1
+
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpCombineInputs_t, NCCL_EP_COMBINE_INPUTS);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpCombineInputs_t, NCCL_EP_COMBINE_INPUTS, 1);
 
 // Output tensors for ncclEpCombine.
 // All fields except tokens are optional (NULL = not provided). Each field is a
@@ -378,7 +503,17 @@ typedef struct {
 } ncclEpCombineOutputs_t;
 
 #define NCCL_EP_COMBINE_OUTPUTS_INIT \
-    ((ncclEpCombineOutputs_t){.size = (unsigned int)sizeof(ncclEpCombineOutputs_t), .magic = NCCL_EP_MAGIC})
+    NCCL_EP_STRUCT_INIT(ncclEpCombineOutputs_t, NCCL_EP_MAGIC)
+
+#define NCCL_EP_COMBINE_OUTPUTS_SIZE ((unsigned int)sizeof(ncclEpCombineOutputs_t))
+
+#define NCCL_EP_COMBINE_OUTPUTS_V1_LAST_FIELD topk_weights
+#define NCCL_EP_COMBINE_OUTPUTS_V1_SIZE 24u
+
+#define NCCL_EP_COMBINE_OUTPUTS_CURRENT_VERSION 1
+
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpCombineOutputs_t, NCCL_EP_COMBINE_OUTPUTS);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpCombineOutputs_t, NCCL_EP_COMBINE_OUTPUTS, 1);
 
 // Opaque type forward declaration
 typedef struct ncclEpHandle* ncclEpHandle_t;
@@ -391,7 +526,17 @@ typedef struct {
 } ncclEpHandleConfig_t;
 
 #define NCCL_EP_HANDLE_CONFIG_INIT \
-    ((ncclEpHandleConfig_t){.size = (unsigned int)sizeof(ncclEpHandleConfig_t), .magic = NCCL_EP_MAGIC})
+    NCCL_EP_STRUCT_INIT(ncclEpHandleConfig_t, NCCL_EP_MAGIC)
+
+#define NCCL_EP_HANDLE_CONFIG_SIZE ((unsigned int)sizeof(ncclEpHandleConfig_t))
+
+#define NCCL_EP_HANDLE_CONFIG_V1_LAST_FIELD dispatch_output_per_expert_alignment
+#define NCCL_EP_HANDLE_CONFIG_V1_SIZE 16u
+
+#define NCCL_EP_HANDLE_CONFIG_CURRENT_VERSION 1
+
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpHandleConfig_t, NCCL_EP_HANDLE_CONFIG);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpHandleConfig_t, NCCL_EP_HANDLE_CONFIG, 1);
 
 // Query the device bytes required for a handle's routing buffers.
 //
@@ -633,10 +778,20 @@ typedef struct {
 } ncclEpDispatchConfig_t;
 
 #define NCCL_EP_DISPATCH_CONFIG_INIT \
-    ((ncclEpDispatchConfig_t){ \
-        .size = (unsigned int)sizeof(ncclEpDispatchConfig_t), \
-        .magic = NCCL_EP_MAGIC \
-    })
+    NCCL_EP_STRUCT_INIT(ncclEpDispatchConfig_t, NCCL_EP_MAGIC)
+
+#define NCCL_EP_DISPATCH_CONFIG_SIZE ((unsigned int)sizeof(ncclEpDispatchConfig_t))
+
+#define NCCL_EP_DISPATCH_CONFIG_V1_LAST_FIELD pass_direction
+#define NCCL_EP_DISPATCH_CONFIG_V1_SIZE 20u
+#define NCCL_EP_DISPATCH_CONFIG_V2_LAST_FIELD quantization_recipe
+#define NCCL_EP_DISPATCH_CONFIG_V2_SIZE 24u
+
+#define NCCL_EP_DISPATCH_CONFIG_CURRENT_VERSION 2
+
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpDispatchConfig_t, NCCL_EP_DISPATCH_CONFIG);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPATCH_CONFIG, 1);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPATCH_CONFIG, 2);
 
 // Perform EP dispatch
 //   * Sends tokens and metadata to the experts according to routing decisions.
@@ -726,7 +881,20 @@ typedef struct {
 } ncclEpCombineConfig_t;
 
 #define NCCL_EP_COMBINE_CONFIG_INIT \
-    ((ncclEpCombineConfig_t){.size = (unsigned int)sizeof(ncclEpCombineConfig_t), .magic = NCCL_EP_MAGIC})
+    NCCL_EP_STRUCT_INIT(ncclEpCombineConfig_t, NCCL_EP_MAGIC)
+
+#define NCCL_EP_COMBINE_CONFIG_SIZE ((unsigned int)sizeof(ncclEpCombineConfig_t))
+
+#define NCCL_EP_COMBINE_CONFIG_V1_LAST_FIELD pass_direction
+#define NCCL_EP_COMBINE_CONFIG_V1_SIZE 16u
+#define NCCL_EP_COMBINE_CONFIG_V2_LAST_FIELD quantization_recipe
+#define NCCL_EP_COMBINE_CONFIG_V2_SIZE 20u
+
+#define NCCL_EP_COMBINE_CONFIG_CURRENT_VERSION 2
+
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpCombineConfig_t, NCCL_EP_COMBINE_CONFIG);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpCombineConfig_t, NCCL_EP_COMBINE_CONFIG, 1);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpCombineConfig_t, NCCL_EP_COMBINE_CONFIG, 2);
 
 // Perform EP combine
 //   * Gathers outputs from experts and returns them to their source in original token order.
@@ -760,8 +928,8 @@ ncclResult_t ncclEpCombine(
     cudaStream_t stream);
 
 // Reserved config struct for future options. Callers may pass NULL (defaults)
-// or initialise via NCCL_EP_COMPLETE_CONFIG_INIT. The size/magic header fields
-// follow the same ABI/initialisation rules as the other public structs and
+// or initialise via NCCL_EP_COMPLETE_CONFIG_INIT. The size/magic fields follow
+// the same ABI/initialisation rules as the other public structs and
 // also give the type complete shape (cybind / pycparser require this), so the
 // typedef stays struct-form rather than pointer-form — callers can spell
 // pointer-to-const as `const ncclEpCompleteConfig_t*` naturally.
@@ -771,7 +939,17 @@ typedef struct ncclEpCompleteConfig {
 } ncclEpCompleteConfig_t;
 
 #define NCCL_EP_COMPLETE_CONFIG_INIT \
-    ((ncclEpCompleteConfig_t){.size = (unsigned int)sizeof(ncclEpCompleteConfig_t), .magic = NCCL_EP_MAGIC})
+    NCCL_EP_STRUCT_INIT(ncclEpCompleteConfig_t, NCCL_EP_MAGIC)
+
+#define NCCL_EP_COMPLETE_CONFIG_SIZE ((unsigned int)sizeof(ncclEpCompleteConfig_t))
+
+#define NCCL_EP_COMPLETE_CONFIG_V1_LAST_FIELD magic
+#define NCCL_EP_COMPLETE_CONFIG_V1_SIZE 8u
+
+#define NCCL_EP_COMPLETE_CONFIG_CURRENT_VERSION 1
+
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpCompleteConfig_t, NCCL_EP_COMPLETE_CONFIG);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpCompleteConfig_t, NCCL_EP_COMPLETE_CONFIG, 1);
 
 // Continues a staged EP operation to completion.
 //   * This should be called after a prior `ncclEpDispatch()` or `ncclEpCombine()` call with `send_only` flag set.

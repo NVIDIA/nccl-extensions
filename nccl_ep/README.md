@@ -360,7 +360,8 @@ Created from an NCCL communicator, manages the distributed EP configuration acro
 ```c
 typedef struct {
     unsigned int size;                          // = sizeof(struct); ABI-size check
-    unsigned int version;                       // = NCCL_EP_API_VERSION; feature-set version
+    unsigned int magic;                         // = NCCL_EP_MAGIC; type/init check
+    unsigned int version;                       // = NCCL_EP_API_VERSION
     ncclEpAlgorithm_t algorithm;                // HT or LL mode
     unsigned int num_experts;                   // Total experts across all ranks
     unsigned int max_dispatch_tokens_per_rank;  // Max tokens any single rank dispatches
@@ -383,8 +384,20 @@ typedef struct {
     uint64_t timeout_ns;                        // GPU-side wait-loop timeout (0 = default)
 } ncclEpGroupConfig_t;
 
-// Use NCCL_EP_GROUP_CONFIG_INIT to pre-fill `size` and `version` correctly.
+// Use NCCL_EP_GROUP_CONFIG_INIT to pre-fill size/magic/version correctly.
 ```
+
+Independently passed public structures start with the same `size`/`magic`
+fields and are append-only. A newer library accepts a frozen older
+prefix and supplies defaults for fields introduced later; an older library
+accepts the known prefix of a larger future structure and ignores its unknown
+tail. Callers that require a newly introduced field must compare the runtime
+version returned by `ncclEpGetVersion` before relying on it. Historical
+`NCCL_EP_*_Vn_SIZE` constants freeze each released boundary, while
+`NCCL_EP_*_SIZE` describes the current struct size.
+`ncclEpGroupConfig_t::version` records the caller's
+`NCCL_EP_API_VERSION`; a mismatch is reported as a warning rather than
+rejecting an otherwise size-compatible configuration.
 
 `max_token_bytes` is a physical-byte budget for an individual token or scale
 row. LL `NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD` additionally requires their

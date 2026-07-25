@@ -247,17 +247,30 @@ else
   CUPTI_LDFLAGS :=
 endif
 
+# NCCL link flags for the standalone ep_test/ep_bench EXECUTABLES.
+# Unlike libnccl_ep.so (which deliberately bakes no RUNPATH — see above — because
+# the Python path pre-dlopens libnccl with RTLD_GLOBAL via cuda_pathfinder), these
+# are plain executables run directly (e.g. `./ep_bench --help`) with no such
+# pre-load. Bake a RUNPATH to the NCCL (and nccl_ep) libs they were built against
+# so the loader binds the intended libnccl.so.2 — not a stale system copy that may
+# lack newer device-team symbols (e.g. ncclTeamRail), which link fine but abort at
+# startup with "undefined symbol". --no-as-needed keeps libnccl in DT_NEEDED even
+# when only weak-exported (NCCL_API/PROFAPI) symbols are referenced.
+# See NVIDIA/nccl-extensions#3.
+EP_EXE_NCCL_LDFLAGS := -L$(LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -Wl,--no-as-needed -lnccl -Wl,--as-needed \
+                       -Wl,-rpath,$(abspath $(NCCL_LIBDIR)) -Wl,-rpath,$(abspath $(LIBDIR))
+
 # Build ep_test and ep_bench (require MPI)
 ifeq ($(MPI), 1)
 MPI_CFLAGS := -DMPI_SUPPORT -I$(MPI_HOME)/include
 MPI_LDFLAGS := -L$(MPI_HOME)/lib -lmpi
 
 EP_TEST_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) -I$(NCCL_INCDIR) $(MPI_CFLAGS) --compiler-options "-fPIC" -ccbin $(NVCC_CXX_COMPILER) $(CXXSTD)
-EP_TEST_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda
+EP_TEST_NVLDFLAGS := $(EP_EXE_NCCL_LDFLAGS) $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda
 
 # ep_bench: performance benchmark (NVTX for profiling, optional CUPTI for kernel timing)
 EP_BENCH_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) -I$(NCCL_INCDIR) $(MPI_CFLAGS) $(CUPTI_CFLAGS) --compiler-options "-fPIC" -ccbin $(NVCC_CXX_COMPILER) $(CXXSTD)
-EP_BENCH_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(CUPTI_LDFLAGS)
+EP_BENCH_NVLDFLAGS := $(EP_EXE_NCCL_LDFLAGS) $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(CUPTI_LDFLAGS)
 ep_test: lib $(DST_DIR)/ep_test
 ep_bench: lib $(DST_DIR)/ep_bench
 
@@ -286,9 +299,9 @@ MPI_CFLAGS := -DMPI_SUPPORT
 MPI_LDFLAGS := -lmpi_ibm
 
 EP_TEST_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) --compiler-options "-fPIC" -ccbin $(NVCC_CXX_COMPILER) $(CXXSTD)
-EP_TEST_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda
+EP_TEST_NVLDFLAGS := $(EP_EXE_NCCL_LDFLAGS) $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda
 EP_BENCH_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) $(CUPTI_CFLAGS) --compiler-options "-fPIC" -ccbin $(NVCC_CXX_COMPILER) $(CXXSTD)
-EP_BENCH_NVLDFLAGS := -L$(LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -lnccl $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(CUPTI_LDFLAGS)
+EP_BENCH_NVLDFLAGS := $(EP_EXE_NCCL_LDFLAGS) $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(CUPTI_LDFLAGS)
 ep_test: lib $(DST_DIR)/ep_test
 ep_bench: lib $(DST_DIR)/ep_bench
 

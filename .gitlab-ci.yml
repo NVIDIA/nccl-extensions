@@ -1,5 +1,11 @@
 # Root pipeline for the standalone NCCL Extensions repository.
 # Build NCCL once, then run the extension child pipelines.
+#
+# Child pipelines run selectively: on a merge request pipeline a module's child
+# pipeline is triggered only when that module's own sources changed, or when
+# shared build/CI infrastructure that affects every module changed. On branch,
+# tag and web pipelines every module runs, because `changes:` is only reliable
+# for merge requests and post-merge / manual runs should validate everything.
 
 include:
   - local: .gitlab/ci/nccl-build.yml
@@ -12,6 +18,11 @@ stages:
 workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # Avoid a redundant branch pipeline when the branch already has an open MR;
+    # the merge request pipeline (which does the per-module `changes:` filtering
+    # below) runs instead.
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
     - if: '$CI_COMMIT_BRANCH'
     - if: '$CI_COMMIT_TAG'
     - if: '$CI_PIPELINE_SOURCE == "web"'
@@ -26,6 +37,17 @@ nccl_m2n:
   needs:
     - job: build:nccl
       artifacts: false
+  rules:
+    # Non-merge-request pipelines: always run (no reliable `changes:` context).
+    - if: '$CI_PIPELINE_SOURCE != "merge_request_event"'
+    # Merge request pipelines: run only when this module or shared infra changed.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - nccl_m2n/**/*
+        - .gitlab-ci.yml
+        - .gitlab/**/*
+        - .gitmodules
+        - third_party/**/*
   variables:
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
   trigger:
@@ -41,6 +63,17 @@ nccl_ep:
   needs:
     - job: build:nccl
       artifacts: false
+  rules:
+    # Non-merge-request pipelines: always run (no reliable `changes:` context).
+    - if: '$CI_PIPELINE_SOURCE != "merge_request_event"'
+    # Merge request pipelines: run only when this module or shared infra changed.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - nccl_ep/**/*
+        - .gitlab-ci.yml
+        - .gitlab/**/*
+        - .gitmodules
+        - third_party/**/*
   variables:
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
   trigger:

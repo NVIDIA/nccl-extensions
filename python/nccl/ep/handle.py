@@ -19,12 +19,12 @@ from nccl.core.cuda import get_stream_ptr
 from nccl.core.typing import NcclInvalid, NcclStreamSpec
 
 
-from nccl_extensions._binding_helpers import binding_dataclass
-from nccl_extensions.bindings import nccl_ep as _ep_bindings
-from nccl_extensions.ep.enums import DispatchQuantizationRecipe, ExpertIdKind, PassDir
+from nccl._extensions._binding_helpers import binding_dataclass
+from nccl._extensions.bindings import nccl_ep as _ep_bindings
+from nccl.ep.enums import DispatchQuantizationRecipe, ExpertIdKind, PassDir
 
 if TYPE_CHECKING:
-    from nccl_extensions.ep.tensor import Tensor
+    from nccl.ep.tensor import Tensor
 
 
 __all__ = [

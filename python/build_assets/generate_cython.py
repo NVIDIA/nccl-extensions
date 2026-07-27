@@ -11,7 +11,7 @@ Generate Cython bindings for the nccl-extensions libraries using cybind.
 
 Ported from nccl4py's ``build_assets/generate_cython.py``, trimmed to the
 targets this repo owns (``nccl_ep`` today; ``nccl_m2n`` joins ``TARGETS``
-once its bindings land). Output goes to ``python/nccl_extensions/bindings/``
+once its bindings land). Output goes to ``python/nccl/_extensions/bindings/``
 as flat sibling modules.
 
 Unlike nccl4py, the bound headers are *not* checked in under
@@ -50,7 +50,7 @@ REPO_ROOT = PYTHON_DIR.parent
 # Shared paths: one cybind/ assets dir feeds every target; cybind emits into
 # one bindings package (flat sibling layout).
 ASSETS_DIR = SCRIPT_DIR / "cybind"
-BINDINGS_DIR = PYTHON_DIR / "nccl_extensions" / "bindings"
+BINDINGS_DIR = PYTHON_DIR / "nccl" / "_extensions" / "bindings"
 
 # Pinned copies of headers owned by other repos, laid out the way cybind's own
 # assets/headers/ does: <libname>/<version>/. Bumping NCCL_PIN means dropping
@@ -67,9 +67,9 @@ STATIC_FILES = (
     "_internal/utils.pyx",
 )
 
-# Every target emits into ``nccl_extensions.bindings.*``, so cybind looks up
+# Every target emits into ``nccl._extensions.bindings.*``, so cybind looks up
 # their templates under one shared subtree.
-_TEMPLATES_RELPATH = Path("nccl_extensions", "bindings")
+_TEMPLATES_RELPATH = Path("nccl", "_extensions", "bindings")
 
 # Global logger - will be configured in main()
 logger = logging.getLogger(__name__)
@@ -163,7 +163,7 @@ def prepare_assets(cybind_dir: Path, targets: list[Target]) -> None:
     """Stage our targets' configs, headers, and templates into cybind's
     shared ``assets/`` -- only the slots we own (one ``configs/*.cybind.yaml``
     per target, per-target ``headers/<name>/<version>/``, and the shared
-    ``templates/nccl_extensions/bindings/`` subtree). Sibling files for other
+    ``templates/nccl/_extensions/bindings/`` subtree). Sibling files for other
     libs are left untouched."""
     cybind_assets = cybind_dir / "cybind" / "assets"
 
@@ -316,7 +316,7 @@ def main() -> int:
             "Use a local cybind checkout at this path instead of cloning. "
             "Note: our targets' slots under the checkout's assets/ "
             "(configs/<name>.cybind.yaml, headers/<name>/<version>/, "
-            "templates/nccl_extensions/bindings/) are overwritten; sibling "
+            "templates/nccl/_extensions/bindings/) are overwritten; sibling "
             "files for other libs are left alone. Default: clone "
             "CYBIND_SSH_URL at the pinned CYBIND_COMMIT into a temp dir."
         ),

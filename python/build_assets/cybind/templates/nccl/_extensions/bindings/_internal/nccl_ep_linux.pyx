@@ -31,16 +31,21 @@ cdef extern from "<dlfcn.h>" nogil:
 
 # Resolved at first import via _resolve_library_path() below. Path lookup runs
 # once, then dlopen handle is cached in the lowpp ${libname} init guard.
-_PACKAGE_LIB_RELPATH = os.path.join("ep", "lib", "lib${libname}.so")
+#
+# Each library's .so ships under its own facade package -- nccl_ep -> nccl/ep/,
+# nccl_m2n -> nccl/m2n/ -- so derive that directory from the library name rather
+# than hardcoding one library's.
+_PACKAGE_LIB_RELPATH = os.path.join(
+    "${libname}".removeprefix("nccl_"), "lib", "lib${libname}.so"
+)
 
 
 def _resolve_library_path() -> str:
     # 1. nccl-extensions package path (replaces cuda.pathfinder's NVIDIA-pip-wheel
-    #    step). libnccl_ep.so is at nccl_extensions/ep/lib/; this file lives in
-    #    nccl_extensions/bindings/_internal/, so go up two dirs to reach
-    #    nccl_extensions/.
+    #    step). lib${libname}.so is at nccl/<lib>/lib/; this file lives in
+    #    nccl/_extensions/bindings/_internal/, so go up three dirs to reach nccl/.
     pkg_lib = os.path.normpath(os.path.join(
-        os.path.dirname(__file__), "..", "..", _PACKAGE_LIB_RELPATH
+        os.path.dirname(__file__), "..", "..", "..", _PACKAGE_LIB_RELPATH
     ))
     if os.path.exists(pkg_lib):
         return pkg_lib

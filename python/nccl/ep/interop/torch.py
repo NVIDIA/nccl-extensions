@@ -3,7 +3,7 @@
 #
 # See LICENSE.txt for more license information
 
-"""PyTorch interop for nccl_extensions.ep.
+"""PyTorch interop for nccl.ep.
 
 Currently exposes :func:`get_nccl_comm_from_group`, which mirrors vLLM's
 pattern: always create a fresh NCCL communicator (rather than extracting
@@ -13,7 +13,7 @@ versions).
 
 from __future__ import annotations
 
-import nccl.core as nccl
+import nccl.core as _nccl_core
 
 try:
     import torch
@@ -27,7 +27,7 @@ except ImportError:
 __all__ = ["get_nccl_comm_from_group"]
 
 
-def get_nccl_comm_from_group(group=None) -> nccl.Communicator:
+def get_nccl_comm_from_group(group=None) -> _nccl_core.Communicator:
     """Create a fresh NCCL communicator that mirrors *group*'s membership.
 
     Args:
@@ -58,7 +58,7 @@ def get_nccl_comm_from_group(group=None) -> nccl.Communicator:
         )
 
     device = torch.cuda.current_device()
-    unique_id = nccl.get_unique_id(empty=(rank != 0))
+    unique_id = _nccl_core.get_unique_id(empty=(rank != 0))
 
     try:
         backend_name = dist.get_backend(group) if group else dist.get_backend()
@@ -71,7 +71,7 @@ def get_nccl_comm_from_group(group=None) -> nccl.Communicator:
     if backend_name == "nccl":
         tensor = tensor.to(device)
     dist.broadcast(tensor, src=src, group=group)
-    unique_id = nccl.UniqueId.from_bytes(tensor.cpu().numpy().tobytes())
+    unique_id = _nccl_core.UniqueId.from_bytes(tensor.cpu().numpy().tobytes())
 
     with torch.cuda.device(device):
-        return nccl.Communicator.init(world_size, rank, unique_id)
+        return _nccl_core.Communicator.init(world_size, rank, unique_id)

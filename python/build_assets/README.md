@@ -5,7 +5,7 @@
 
 ## Purpose
 
-The Cython bindings under `python/nccl_extensions/bindings/` are **generated**,
+The Cython bindings under `python/nccl/_extensions/bindings/` are **generated**,
 not hand-written. This directory holds the tooling that generates them: the
 cybind config, the Cython templates, and the driver script.
 
@@ -44,7 +44,7 @@ python3 build_assets/generate_cython.py --verbose
 
 The script clones cybind at the pinned `CYBIND_COMMIT`, stages our config,
 headers, and templates into its `assets/`, runs it, and copies the result over
-`python/nccl_extensions/bindings/`. The existing bindings directory is backed up
+`python/nccl/_extensions/bindings/`. The existing bindings directory is backed up
 and restored if generation fails. Commit the resulting diff.
 
 See `generate_cython.py --help` for all options; `--cybind-path` reuses a local
@@ -70,7 +70,7 @@ Two different policies, on purpose:
 - `generate_cython.py` — driver: stages assets, runs cybind, installs output
 - `cybind/configs/nccl_ep.cybind.yaml` — cybind config for `nccl_ep` (which
   functions/types to bind, and the `AUTO_LOWPP_CLASS` struct overrides)
-- `cybind/templates/nccl_extensions/bindings/` — Cython templates, plus the
+- `cybind/templates/nccl/_extensions/bindings/` — Cython templates, plus the
   static files (`_internal/utils.{pxd,pyx}`, `__init__.py`) that cybind does not
   process and `generate_cython.py` copies verbatim
 - `cybind/headers/` — pinned third-party headers (see above)
@@ -79,10 +79,18 @@ Two different policies, on purpose:
 
 `nccl_m2n` bindings are not migrated yet. When they are:
 
+Bindings for every library share one package, `nccl/_extensions/bindings/`, so
+that `_internal/utils.pyx` and `_binding_helpers.py` are built and shipped once
+rather than duplicated per library. Only the public facade is per-library.
+
 1. Add `cybind/configs/nccl_m2n.cybind.yaml` with
-   `module: nccl_extensions.bindings.nccl_m2n`
+   `module: nccl._extensions.bindings.nccl_m2n`
 2. Add the per-library templates (`nccl_m2n.pyx/pxd`, `cynccl_m2n.pyx/pxd`,
    `_internal/nccl_m2n.pxd`, `_internal/nccl_m2n_linux.pyx`) under
-   `cybind/templates/nccl_extensions/bindings/`
+   `cybind/templates/nccl/_extensions/bindings/`
 3. Add a `Target` factory and list it in `TARGETS` in `generate_cython.py`
 4. Add `"nccl_m2n"` to `LIBNAMES` in `python/setup.py`
+5. Add the facade package `python/nccl/m2n/` (with `lib/libnccl_m2n.so`) and
+   list it in `packages.find` / `package-data` in `python/pyproject.toml`.
+   The `.so` loader derives its facade directory from the library name
+   (`nccl_m2n` -> `nccl/m2n/`), so no template change is needed there.

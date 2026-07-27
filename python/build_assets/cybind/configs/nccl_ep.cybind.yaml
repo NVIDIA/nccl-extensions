@@ -1,0 +1,175 @@
+nccl_ep:
+  module: nccl_extensions.bindings.nccl_ep
+  data:
+    versions:
+    - - 0.1.0
+    headers:
+    - nccl_ep.h
+    patterns:
+      function: (^ncclEp)([A-Z].*)
+      type: (^ncclEp)([A-Z][A-Za-z_]*)_t$|(^nccl)(Comm|Window)_t$
+    need_cuda: true
+    need_driver: false
+    support_win: false
+    docstrings: null
+    need_headers_at_build: false
+    include_cybind_version: false
+    status_enum: ncclResult_t
+    extern:
+      cython:
+        - module: nccl.bindings.cynccl
+          import_type: cimport
+          imports:
+            - ncclResult_t
+            - ncclDataType_t
+            - _NCCLRESULT_T_INTERNAL_LOADING_ERROR
+  functions:
+    ncclEpGetVersion:
+      return: version
+      except?: -1
+
+    # Group lifecycle.
+    # Allocator hooks live inside ncclEpGroupConfig_t::alloc (ncclEpAllocConfig_t);
+    # see the Pythonic wrapper in nccl_extensions/ep/allocator.py for how alloc_fn / free_fn
+    # / context get plumbed through.
+    ncclEpCreateGroup:
+      return: ep_group
+      except?: 0
+    ncclEpGroupDestroy: {}
+
+    # Tensor lifecycle.
+    ncclEpTensorAlloc: {}
+    ncclEpTensorDestroy: {}
+
+    # Handle lifecycle.
+    # Named-struct ABI: ncclEp*Config_t / ncclEpLayoutInfo_t are declared
+    # below as AUTO_LOWPP_CLASS so cybind exposes them as Python classes;
+    # the Pythonic facade in nccl_extensions/ep/handle.py constructs them and forwards
+    # the underlying struct pointer via .ptr.
+    ncclEpCreateHandle:
+      return: handle
+      except?: 0
+    ncclEpInitHandle:
+      return: handle
+      except?: 0
+    ncclEpHandleDestroy: {}
+    ncclEpHandleMemSize:
+      return: size_out
+      except?: -1
+    ncclEpUpdateHandle: {}
+
+    # Dispatch / Combine / Complete (named-struct ABI; see note above).
+    ncclEpDispatch: {}
+    ncclEpCombine: {}
+    ncclEpComplete: {}
+
+  types:
+    ncclEpTensor_t:
+      AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclEpTensor_t)
+              self._ptr[0].magic = 0xCAFECAFE
+    ncclEpTensorAllocConfig_t:
+      AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclEpTensorAllocConfig_t)
+              self._ptr[0].magic = 0xC00FFFEE
+    # ncclEpAllocConfig_t has C function-pointer fields; cybind can't auto-
+    # convert ncclEpAlloc/FreeFn_t to/from Python, so route through intptr_t
+    # via per-member getter/setter overrides. Users pass and read raw
+    # function addresses (e.g. from ctypes.cast(fn, ctypes.c_void_p).value).
+    ncclEpAllocConfig_t:
+      AUTO_LOWPP_CLASS:
+        alloc_fn:
+          getter: |-
+            return <intptr_t>(self._ptr[0].alloc_fn)
+          setter: |-
+            self._ptr[0].alloc_fn = <ncclEpAllocFn_t><intptr_t>val
+        free_fn:
+          getter: |-
+            return <intptr_t>(self._ptr[0].free_fn)
+          setter: |-
+            self._ptr[0].free_fn = <ncclEpFreeFn_t><intptr_t>val
+    ncclEpGroupConfig_t:
+      AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclEpGroupConfig_t)
+              self._ptr[0].magic = 0xC00FFFEE
+              self._ptr[0].version = 1
+    ncclEpLayoutInfo_t:
+      AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclEpLayoutInfo_t)
+              self._ptr[0].magic = 0xC00FFFEE
+    ncclEpDispatchInputs_t:
+      AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclEpDispatchInputs_t)
+              self._ptr[0].magic = 0xC00FFFEE
+    ncclEpDispatchOutputs_t:
+      AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclEpDispatchOutputs_t)
+              self._ptr[0].magic = 0xC00FFFEE
+    ncclEpCombineInputs_t:
+      AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclEpCombineInputs_t)
+              self._ptr[0].magic = 0xC00FFFEE
+    ncclEpCombineOutputs_t:
+      AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclEpCombineOutputs_t)
+              self._ptr[0].magic = 0xC00FFFEE
+    ncclEpHandleConfig_t:
+      AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclEpHandleConfig_t)
+              self._ptr[0].magic = 0xC00FFFEE
+    ncclEpDispatchConfig_t:
+      AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclEpDispatchConfig_t)
+              self._ptr[0].magic = 0xC00FFFEE
+    ncclEpCombineConfig_t:
+      AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclEpCombineConfig_t)
+              self._ptr[0].magic = 0xC00FFFEE
+    ncclEpCompleteConfig_t:
+      AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclEpCompleteConfig_t)
+              self._ptr[0].magic = 0xC00FFFEE
+
+  attrs: {}
+  enums:
+    ^nccl: ''
+    ^NCCL_EP_TENSOR_FLAG_: ''
+    ^ALGO_: ''
+    ^LAYOUT_: ''
+    ^TENSOR_TAG_: ''

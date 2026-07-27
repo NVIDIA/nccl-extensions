@@ -19,6 +19,10 @@ Experimental library for resharding a tensor between two disjoint groups of
 GPU processes (e.g. trainer and inference ranks) in a single, zero-copy call,
 built on NCCL's window API.
 
+### [`python/`](python/) — Python bindings
+Python package (`nccl-extensions`) providing Pythonic wrappers for `nccl_ep`.
+See [`python/README.md`](python/README.md) for details.
+
 ## Getting Started
 
 This repo vendors NCCL as a git submodule. Clone with:

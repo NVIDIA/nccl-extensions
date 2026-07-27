@@ -1,0 +1,57 @@
+[build-system]
+requires = [
+    "setuptools>=77.0.3",
+    "Cython>=3.1",
+    "nccl4py",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nccl-extensions"
+description = "Python bindings for the nccl-extensions communication libraries (nccl_ep, nccl_m2n)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dynamic = ["version"]
+dependencies = [
+    "nccl4py",
+    "packaging",
+    "numpy",
+    "cuda.core~=1.0",
+    "cuda-pathfinder>=1.5.4,<2.0.0",
+    'typing_extensions; python_version < "3.13"',
+]
+
+# CUDA-variant extras. The concrete pins (nvidia-nccl-cuXX, cuda-bindings~=XX.0,
+# nvidia-cutlass-dsl) live in nccl4py's matching extras; forward to them rather
+# than duplicating version ranges that would drift.
+[project.optional-dependencies]
+cu12 = ["nccl4py[cu12]"]
+cu13 = ["nccl4py[cu13]"]
+
+[project.urls]
+Homepage = "https://gitlab-master.nvidia.com/nccl/nccl-extensions"
+
+[tool.setuptools.dynamic]
+version = { attr = "nccl_extensions._version.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["nccl_extensions*"]
+
+[tool.setuptools.package-data]
+"nccl_extensions.bindings" = ["cynccl_ep.pxd", "nccl_ep.pxd"]
+"nccl_extensions.ep" = [
+    "lib/libnccl_ep.so",
+    "include/*.h",
+    "include/nccl_ep/*.h",
+    "include/nccl_ep/*.hpp",
+    "include/nccl_ep/device/*.cuh",
+]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cu12" },
+        { extra = "cu13" },
+    ]
+]

@@ -5,7 +5,7 @@
 
 """NCCL EP: Pythonic API for the libnccl_ep.so extension.
 
-The Cython bindings under :mod:`nccl_extensions.bindings.nccl_ep` are generated from
+The Cython bindings under :mod:`nccl._extensions.bindings.nccl_ep` are generated from
 ``nccl_ep/include/nccl_ep.h``. This package provides hand-written Pythonic
 wrappers (:class:`Group`, :class:`Handle`, :class:`Tensor`) on top of those bindings.
 """
@@ -14,10 +14,10 @@ import os as _os
 from pathlib import Path as _Path
 
 try:
-    from nccl_extensions.bindings import nccl_ep as _ep_bindings
+    from nccl._extensions.bindings import nccl_ep as _ep_bindings
 
     # Defaults for libnccl_ep.so's JIT runtime; either env var can be overridden
-    # by setting it in the environment before importing nccl_extensions.ep.
+    # by setting it in the environment before importing nccl.ep.
     _PKG_DIR = _Path(__file__).parent
     if (_PKG_DIR / "include" / "nccl_ep").is_dir():
         _os.environ.setdefault("NCCL_EP_HOME", str(_PKG_DIR))
@@ -37,8 +37,8 @@ except ImportError:
     _ep_bindings = None  # type: ignore[assignment]
     _ep_bindings_available = False
 
-from nccl_extensions.ep.allocator import AllocConfig, AllocFn, FreeFn
-from nccl_extensions.ep.enums import (
+from nccl.ep.allocator import AllocConfig, AllocFn, FreeFn
+from nccl.ep.enums import (
     Algorithm,
     CombineQuantizationRecipe,
     DispatchQuantizationRecipe,
@@ -50,8 +50,8 @@ from nccl_extensions.ep.enums import (
 )
 
 try:
-    from nccl_extensions.ep.group import Group, GroupConfig
-    from nccl_extensions.ep.handle import (
+    from nccl.ep.group import Group, GroupConfig
+    from nccl.ep.handle import (
         CombineConfig,
         CombineInputs,
         CombineOutputs,
@@ -62,7 +62,7 @@ try:
         HandleConfig,
         LayoutInfo,
     )
-    from nccl_extensions.ep.tensor import Tensor
+    from nccl.ep.tensor import Tensor
 except ImportError:
     pass
 
@@ -107,13 +107,13 @@ def _decode_version(v: int) -> _Version:
 def get_lib_version() -> _Version:
     """Release version of the loaded ``libnccl_ep.so`` (e.g. ``0.1.0``)."""
     if not _ep_bindings_available:
-        raise ImportError("nccl_extensions.bindings.nccl_ep is not available (extension not built)")
+        raise ImportError("nccl._extensions.bindings.nccl_ep is not available (extension not built)")
     return _decode_version(_ep_bindings.get_version())
 
 
 def get_lib_path() -> _Path | None:
     """Path of the loaded ``libnccl_ep.so``, or None if it cannot be determined."""
     if not _ep_bindings_available:
-        raise ImportError("nccl_extensions.bindings.nccl_ep is not available (extension not built)")
+        raise ImportError("nccl._extensions.bindings.nccl_ep is not available (extension not built)")
     raw = _ep_bindings.get_library_path()
     return _Path(raw) if raw else None

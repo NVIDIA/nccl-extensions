@@ -14,7 +14,7 @@ import numpy as np
 from nccl.core.resources import RegisteredWindowHandle
 from nccl.core.typing import NcclDataType, NcclInvalid
 
-from nccl_extensions.bindings import nccl_ep as _ep_bindings
+from nccl._extensions.bindings import nccl_ep as _ep_bindings
 
 
 __all__ = ["Tensor"]

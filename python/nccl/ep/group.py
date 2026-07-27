@@ -10,21 +10,21 @@ from __future__ import annotations
 from dataclasses import field
 from typing import TYPE_CHECKING
 
-from nccl_extensions._binding_helpers import binding_dataclass
+from nccl._extensions._binding_helpers import binding_dataclass
 
 from nccl.core.typing import NcclInvalid
 
 from nccl.core.cuda import get_stream_ptr
 from nccl.core.typing import NcclStreamSpec
 
-from nccl_extensions.bindings import nccl_ep as _ep_bindings
-from nccl_extensions.ep.allocator import AllocConfig
-from nccl_extensions.ep.enums import Algorithm, Layout, OverflowPolicy, ZeroCopyMode
-from nccl_extensions.ep.handle import Handle, HandleConfig, LayoutInfo
+from nccl._extensions.bindings import nccl_ep as _ep_bindings
+from nccl.ep.allocator import AllocConfig
+from nccl.ep.enums import Algorithm, Layout, OverflowPolicy, ZeroCopyMode
+from nccl.ep.handle import Handle, HandleConfig, LayoutInfo
 
 if TYPE_CHECKING:
     from nccl.core import Communicator
-    from nccl_extensions.ep.tensor import Tensor
+    from nccl.ep.tensor import Tensor
 
 
 __all__ = ["Group", "GroupConfig"]
@@ -122,7 +122,7 @@ class Group:
             comm: An initialized :class:`nccl.core.Communicator`.
             config: Filled-in :class:`GroupConfig` describing the
                 group. Custom allocators live in ``config.alloc``
-                (:class:`AllocConfig`) — see :mod:`nccl_extensions.ep.allocator`
+                (:class:`AllocConfig`) — see :mod:`nccl.ep.allocator`
                 for usage and lifetime requirements.
 
         See Also:

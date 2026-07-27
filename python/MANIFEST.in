@@ -1,4 +1,4 @@
 include README.md
-recursive-include nccl_extensions *.py
+recursive-include nccl *.py
 
 # Binding-generation tooling is internal; never ship it in an sdist.

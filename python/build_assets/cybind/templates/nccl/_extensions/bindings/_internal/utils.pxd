@@ -8,7 +8,10 @@ from libcpp cimport bool as cppbool
 from libcpp cimport nullptr_t, nullptr
 from libcpp.memory cimport unique_ptr
 
-from ..cynccl cimport ncclUniqueId
+# Absolute cimport into nccl4py: this distribution ships no cynccl of its own
+# (only cynccl_ep), so the relative `..cynccl` inherited from nccl4py's copy
+# of this file does not resolve here. nccl4py ships cynccl.pxd as package data.
+from nccl.bindings.cynccl cimport ncclUniqueId
 
 
 cdef extern from * nogil:

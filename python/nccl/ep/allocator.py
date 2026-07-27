@@ -22,7 +22,7 @@ trampoline, extract the integer address with
 
     import ctypes
     from cuda.bindings import runtime as cudart
-    from nccl_extensions.ep.allocator import AllocConfig, AllocFn, FreeFn
+    from nccl.ep.allocator import AllocConfig, AllocFn, FreeFn
 
     @AllocFn
     def my_alloc(out_ptr, size, context):

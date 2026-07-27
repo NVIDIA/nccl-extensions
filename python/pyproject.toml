@@ -33,14 +33,20 @@ cu13 = ["nccl4py[cu13]"]
 Homepage = "https://gitlab-master.nvidia.com/nccl/nccl-extensions"
 
 [tool.setuptools.dynamic]
-version = { attr = "nccl_extensions._version.__version__" }
+version = { attr = "nccl._extensions._version.__version__" }
 
 [tool.setuptools.packages.find]
-include = ["nccl_extensions*"]
+# This distribution owns only nccl/_extensions/ and nccl/ep/ inside the shared
+# `nccl` namespace; nccl4py owns nccl/__init__.py, nccl/_version.py, nccl/core/
+# and nccl/bindings/. Listing our subpackages explicitly (rather than "nccl*")
+# keeps a bare `nccl` package out of the wheel, so we never ship an __init__.py
+# that would collide with theirs.
+namespaces = true
+include = ["nccl._extensions*", "nccl.ep*"]
 
 [tool.setuptools.package-data]
-"nccl_extensions.bindings" = ["cynccl_ep.pxd", "nccl_ep.pxd"]
-"nccl_extensions.ep" = [
+"nccl._extensions.bindings" = ["cynccl_ep.pxd", "nccl_ep.pxd"]
+"nccl.ep" = [
     "lib/libnccl_ep.so",
     "include/*.h",
     "include/nccl_ep/*.h",

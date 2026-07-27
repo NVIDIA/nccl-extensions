@@ -1,5 +1,5 @@
 nccl_ep:
-  module: nccl_extensions.bindings.nccl_ep
+  module: nccl._extensions.bindings.nccl_ep
   data:
     versions:
     - - 0.1.0
@@ -30,7 +30,7 @@ nccl_ep:
 
     # Group lifecycle.
     # Allocator hooks live inside ncclEpGroupConfig_t::alloc (ncclEpAllocConfig_t);
-    # see the Pythonic wrapper in nccl_extensions/ep/allocator.py for how alloc_fn / free_fn
+    # see the Pythonic wrapper in nccl/ep/allocator.py for how alloc_fn / free_fn
     # / context get plumbed through.
     ncclEpCreateGroup:
       return: ep_group
@@ -44,7 +44,7 @@ nccl_ep:
     # Handle lifecycle.
     # Named-struct ABI: ncclEp*Config_t / ncclEpLayoutInfo_t are declared
     # below as AUTO_LOWPP_CLASS so cybind exposes them as Python classes;
-    # the Pythonic facade in nccl_extensions/ep/handle.py constructs them and forwards
+    # the Pythonic facade in nccl/ep/handle.py constructs them and forwards
     # the underlying struct pointer via .ptr.
     ncclEpCreateHandle:
       return: handle

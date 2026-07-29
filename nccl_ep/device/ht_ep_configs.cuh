@@ -52,6 +52,12 @@
 #define NCCL_EP_HT_COMBINE_RDMA_STREAMING_BATCH 8
 
 // ============================================================================
+// GIN context reservation
+// ============================================================================
+// Context 0 is reserved for NCCL_GIN_RESOURCE_SHARING_GPU use
+#define NCCL_EP_HT_RESERVED_GIN_GPU_CTXS 1
+
+// ============================================================================
 // Preprocessing kernel configuration
 // ============================================================================
 #define NCCL_EP_HT_NUM_THREADS_PER_BLOCK_PREPROCESSING 512

@@ -5,23 +5,22 @@ libraries.
 
 ## Package layout
 
-This distribution installs into the **`nccl` namespace**, alongside nccl4py, so
-the import path is `nccl.ep` rather than a separate top-level package:
+This package installs into the **`nccl` namespace**, so the import path is
+`nccl.ep` rather than a separate top-level package:
 
 ```python
 import nccl.ep as ep
 ```
 
-nccl4py owns `nccl/__init__.py`, `nccl/_version.py`, `nccl/core/` and
-`nccl/bindings/`. This distribution owns exactly two directories under that
-namespace and ships no `nccl/__init__.py` of its own:
+It contributes exactly two directories to that namespace, and no
+`nccl/__init__.py`:
 
 | path | contents |
 | --- | --- |
 | `nccl/ep/` | public facade for nccl_ep, plus `lib/libnccl_ep.so` and headers |
 | `nccl/_extensions/` | internals shared by every extension library — the Cython bindings, `binding_dataclass`, the distribution version |
 
-`nccl.m2n` will join as a third facade; its bindings go into the shared
+`nccl.m2n` will join as a second facade; its bindings go into the shared
 `nccl/_extensions/bindings/` rather than a second copy of the machinery.
 
 ## Status
@@ -51,9 +50,8 @@ pip install -e 'python/[cu13]'
 ```
 
 > **Do not run Python from inside `python/`.** There is no `nccl/__init__.py`
-> there, so that directory is only a namespace portion — nccl4py's regular
-> `nccl` package wins and these modules become invisible. Always go through the
-> editable install.
+> there, so that directory resolves only as a namespace portion and these
+> modules become invisible. Always go through the editable install.
 
 ## Regenerating the bindings
 

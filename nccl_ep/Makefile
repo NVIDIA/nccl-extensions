@@ -251,8 +251,8 @@ endif
 # (no RUNPATH, see above), these are run directly, so bake a RUNPATH to the libs
 # they were built against rather than risk binding a stale system libnccl.
 # --no-as-needed keeps libnccl in DT_NEEDED despite its weak-only exports.
-EP_EXE_NCCL_LDFLAGS := -L$(LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -Wl,--no-as-needed -lnccl -Wl,--as-needed \
-                       -Wl,-rpath,$(abspath $(NCCL_LIBDIR)) -Wl,-rpath,$(abspath $(LIBDIR))
+EP_EXE_NCCL_LDFLAGS := -L$(LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -Xlinker --no-as-needed -lnccl -Xlinker --as-needed \
+                       -Xlinker -rpath -Xlinker $(abspath $(NCCL_LIBDIR)) -Xlinker -rpath -Xlinker $(abspath $(LIBDIR))
 
 # Build ep_test and ep_bench (require MPI)
 ifeq ($(MPI), 1)

@@ -1583,8 +1583,8 @@ ncclResult_t call_combine(
 
 // Grid sizing for local-permute kernels: one block per SM. Latency is hidden
 // by in-flight loads in dup/reduce, so block-level oversubscription is moot.
-static inline unsigned int local_permute_grid(int sm_count, unsigned int prolog_epilog_sms) {
-    unsigned int grid = (prolog_epilog_sms != 0) ? prolog_epilog_sms : static_cast<unsigned int>(sm_count);
+static inline unsigned int local_permute_grid(int sm_count, unsigned int shuffle_sms) {
+    unsigned int grid = (shuffle_sms != 0) ? shuffle_sms : static_cast<unsigned int>(sm_count);
     if (grid == 0) grid = 1;
     return grid;
 }
@@ -1602,7 +1602,7 @@ void launch_dispatch_permute(
     int experts_per_rank,
     int row_bytes,
     int sm_count,
-    unsigned int prolog_epilog_sms,
+    unsigned int shuffle_sms,
     int caller_num_recv_tokens,
     cudaStream_t stream,
     ncclEpDispatchQuantizationRecipe_t recipe,
@@ -1618,7 +1618,7 @@ void launch_dispatch_permute(
     assert(scale_row_bytes >= 0 && (scale_row_bytes % 16) == 0);
     assert((scale_row_bytes > 0) == (recv_scales_em != nullptr && flat_scale_staging != nullptr));
 
-    const unsigned int grid = local_permute_grid(sm_count, prolog_epilog_sms);
+    const unsigned int grid = local_permute_grid(sm_count, shuffle_sms);
 
     ::ht_ep::local_permute_dup_param_t p{};
     p.recv_x_em = recv_x_em;
@@ -1650,7 +1650,7 @@ void launch_combine_reduce(
     int top_k,
     int row_bytes,
     int sm_count,
-    unsigned int prolog_epilog_sms,
+    unsigned int shuffle_sms,
     cudaStream_t stream,
     ncclDataType_t token_dtype) {
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
@@ -1658,7 +1658,7 @@ void launch_combine_reduce(
     assert(sm_count > 0);
     assert((em_weights_in == nullptr) == (flat_weights_out == nullptr));
 
-    const unsigned int grid = local_permute_grid(sm_count, prolog_epilog_sms);
+    const unsigned int grid = local_permute_grid(sm_count, shuffle_sms);
 
     ::ht_ep::local_permute_reduce_param_t p{};
     p.flat_staging = flat_staging;

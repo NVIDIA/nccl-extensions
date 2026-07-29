@@ -3970,7 +3970,7 @@ void printUsage(const char* programName, int myRank) {
             "FLAT=nRanks*tokens, Expert-major=nRanks*tokens*top_k)\n");
         printf("  --zcopy                 Use ncclMemAlloc buffers + windows for supported direct token/scale paths\n");
         printf("  --max-num-sms <N>       Maximum SMs for EP kernels (0 = auto, default: 0)\n");
-        printf("  --prolog-epilog-sms <N> SMs for the prolog/epilog kernels (0 = auto, default: 0)\n");
+        printf("  --shuffle-sms <N> SMs for the token permutation (shuffle) kernels (0 = auto, default: 0)\n");
         printf("  --preprocess-num-sms <N> SMs for the preprocessing scan kernels (0 = auto, default: 0)\n");
         printf(
             "  --ht-em-mode <mode>     HT + Expert-major only: select the dispatch/combine code path (default: "
@@ -4032,7 +4032,7 @@ int main(int argc, char* argv[]) {
     bool ht_em_local_dup = false;
     bool ht_em_mode_explicit = false;
     bool ht_em_local_permute_explicit = false;
-    unsigned int prolog_epilog_sms = NCCL_EP_AUTO;  // 0 = auto (all SMs) for local EM permute kernels
+    unsigned int shuffle_sms = NCCL_EP_AUTO;  // 0 = auto (all SMs) for local EM permute kernels
     unsigned int preprocess_num_sms = NCCL_EP_AUTO;  // 0 = auto for the preprocessing scan kernels
     bool mask_test = false;       // Simulate rank failures and test active-mask (LL only)
     bool include_uniform_less_than_max = false;
@@ -4073,7 +4073,7 @@ int main(int argc, char* argv[]) {
         {"zcopy", no_argument, 0, 'z'},
         {"max-num-sms", required_argument, 0, 'S'},
         {"ht-em-mode", required_argument, 0, 'm'},
-        {"prolog-epilog-sms", required_argument, 0, 'X'},
+        {"shuffle-sms", required_argument, 0, 'X'},
         {"preprocess-num-sms", required_argument, 0, 'P'},
         {"mask-test", no_argument, 0, 'T'},
         {"dispatch-less-than-max-tokens", required_argument, 0, 'l'},
@@ -4196,7 +4196,7 @@ int main(int argc, char* argv[]) {
             }
             break;
         case 'X':
-            prolog_epilog_sms = static_cast<unsigned int>(atoi(optarg));
+            shuffle_sms = static_cast<unsigned int>(atoi(optarg));
             break;
         case 'P':
             preprocess_num_sms = static_cast<unsigned int>(atoi(optarg));
@@ -4675,10 +4675,10 @@ int main(int argc, char* argv[]) {
     if (ht_em_local_dup) {
         setenv("NCCL_EP_HT_EM_LOCAL_DUP", "1", 1);
     }
-    if (prolog_epilog_sms != NCCL_EP_AUTO) {
+    if (shuffle_sms != NCCL_EP_AUTO) {
         char buf[16];
-        snprintf(buf, sizeof(buf), "%u", prolog_epilog_sms);
-        setenv("NCCL_EP_PROLOG_EPILOG_SMS", buf, 1);
+        snprintf(buf, sizeof(buf), "%u", shuffle_sms);
+        setenv("NCCL_EP_SHUFFLE_SMS", buf, 1);
     }
     if (preprocess_num_sms != NCCL_EP_AUTO) {
         char buf[16];

@@ -14,6 +14,7 @@ stages:
   - build_nccl
   - build_extensions
   - test
+  - downstream
 
 workflow:
   rules:
@@ -83,3 +84,33 @@ nccl_ep:
     forward:
       yaml_variables: true
       pipeline_variables: true
+
+github-sim:
+  stage: downstream
+  needs: []
+  rules:
+    - if: $GITHUB_SHA
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - "nccl_ep/**/*"
+        - "nccl_m2n/**/*"
+        - "python/**/*"
+        - "third_party/**/*"
+        - ".clang-format"
+        - ".clang-format-ignore"
+        - ".gitignore"
+        - ".gitmodules"
+        - "CONTRIBUTING.md"
+        - "LICENSE.txt"
+        - "README.md"
+        - "PUBLIC_PATHS.txt"
+  trigger:
+    include:
+      - project: gpucomms/cicd-platform
+        ref: main
+        file: pipelines/nccl-extensions/.nccl-extensions-filtered-ci.yml
+    strategy: depend
+  variables:
+    CI_INFRA_REF: main
+    MODE: sim

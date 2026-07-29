@@ -57,7 +57,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     // (no range checks here — consumers in nccl_ep.cc validate per their needs).
     parse_ulong(cfg->timeout_ms);
     parse_ulong(cfg->comm_num_sms);
-    parse_ulong(cfg->prolog_epilog_sms);
+    parse_ulong(cfg->shuffle_sms);
     parse_ulong(cfg->preprocess_num_sms);
     parse_ulong(cfg->tokens_per_chunk);
     parse_ulong(cfg->dispatch_num_stages);
@@ -78,7 +78,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.disable_guard,
         &cfg.timeout_ms,
         &cfg.comm_num_sms,
-        &cfg.prolog_epilog_sms,
+        &cfg.shuffle_sms,
         &cfg.preprocess_num_sms,
         &cfg.tokens_per_chunk,
         &cfg.dispatch_num_stages,

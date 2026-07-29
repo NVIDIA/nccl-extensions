@@ -736,7 +736,7 @@ struct ncclEpGroup {
     // SM-count configuration, all resolved once at ncclEpCreateGroup.
     unsigned int device_sm_count;   // Number of SMs on the device
     unsigned int comm_num_sms;      // Resolved SM count for EP kernels (from config.max_num_sms)
-    unsigned int prolog_epilog_sms; // Resolved SM count for the prolog/epilog kernels (local_dup, local_reduce).
+    unsigned int shuffle_sms; // Resolved SM count for the shuffle kernels (local_dup, local_reduce).
     unsigned int
         preprocess_num_sms; // Resolved SM count for the preprocessing scan kernels (NCCL_EP_PREPROCESS_NUM_SMS).
 
@@ -856,7 +856,7 @@ struct ncclEpGroup {
     ncclEpGroup()
         : comm(nullptr), nRanks(0), rank(0), nNodes(0), ep_workspace(nullptr), cuda_device_id(0), lsa_team_size(0),
           lsa_rank(0), rdma_team_size(0), rdma_rank(0), rdma_buffer(nullptr), rdma_buffer_size_alloc(0), config{},
-          num_local_experts(0), max_recv_tokens(0), device_sm_count(0), comm_num_sms(0), prolog_epilog_sms(0),
+          num_local_experts(0), max_recv_tokens(0), device_sm_count(0), comm_num_sms(0), shuffle_sms(0),
           preprocess_num_sms(0), ht_em_mode(HtEmMode::kLocalPermute), alloc{}, gpus_per_node(0), rank_in_node(0),
           node_id(0), num_nccl_comms(0), nccl_comms{}, nccl_dev_comms(nullptr), nccl_wins(nullptr),
           num_dispatch_signals(0), clean_barrier_signal_base(0), ht_buffers{}, eager_mode(false) {}
@@ -1696,7 +1696,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         } else {
             ep_group->comm_num_sms = ep_group->device_sm_count;
         }
-        ep_group->prolog_epilog_sms = ep_group->device_sm_count;
+        ep_group->shuffle_sms = ep_group->device_sm_count;
         ep_group->preprocess_num_sms = ep_group->device_sm_count;
     } else {
         if (in_config->max_num_sms > ep_group->device_sm_count) {
@@ -1717,7 +1717,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             }
         }
         ep_group->comm_num_sms = in_config->max_num_sms;
-        ep_group->prolog_epilog_sms = in_config->max_num_sms;
+        ep_group->shuffle_sms = in_config->max_num_sms;
         ep_group->preprocess_num_sms = in_config->max_num_sms;
     }
 
@@ -1736,7 +1736,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         }
     };
     apply_sms_override(ep_group->env.comm_num_sms, ep_group->comm_num_sms);
-    apply_sms_override(ep_group->env.prolog_epilog_sms, ep_group->prolog_epilog_sms);
+    apply_sms_override(ep_group->env.shuffle_sms, ep_group->shuffle_sms);
     apply_sms_override(ep_group->env.preprocess_num_sms, ep_group->preprocess_num_sms);
 
     // Determine number of nodes by gathering hostnames and counting unique ones
@@ -3845,7 +3845,7 @@ ncclResult_t ncclEpDispatch(
         params.tokens_per_lsa = group->config.max_dispatch_tokens_per_rank;
         // EM local-fanout: dispatch dedups S2G; receiver local_dup fills secondaries.
         const bool em_unfused_active = em_local_dup_active(group, handle->layout);
-        params.local_dup_num_sms = em_unfused_active ? static_cast<int>(group->prolog_epilog_sms) : 0;
+        params.local_dup_num_sms = em_unfused_active ? static_cast<int>(group->shuffle_sms) : 0;
         // Device-side backstop bound for recv slot indices: the fixed budget or
         // the derived eager bound. The scan produces slots below it (DROP masks
         // the rest), so the S2G assert only fires on corrupted or stale routing maps.
@@ -4045,7 +4045,7 @@ ncclResult_t ncclEpDispatch(
                 group->num_local_experts,
                 row_bytes,
                 static_cast<int>(group->device_sm_count),
-                group->prolog_epilog_sms,
+                group->shuffle_sms,
                 caller_num_recv_tokens,
                 stream,
                 recipe,
@@ -4457,7 +4457,7 @@ ncclResult_t ncclEpCombine(
                 handle->num_topk,
                 row_bytes,
                 static_cast<int>(group->device_sm_count),
-                group->prolog_epilog_sms,
+                group->shuffle_sms,
                 stream,
                 x->datatype);
         } else if (!combine_x_uses_external_window) {
@@ -4619,7 +4619,7 @@ ncclResult_t ncclEpCombine(
                 params.experts_per_rank,
                 params.lsa_team_size,
                 backward_combine,
-                static_cast<int>(group->prolog_epilog_sms),
+                static_cast<int>(group->shuffle_sms),
                 stream,
                 x->datatype);
         }

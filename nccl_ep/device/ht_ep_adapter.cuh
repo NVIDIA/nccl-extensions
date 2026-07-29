@@ -239,7 +239,7 @@ size_t get_em_scan_gscratch_size(int lsa_team_size, int experts_per_rank,
 
 // Scatter FLAT staging rows into EM zones using flat2em_slot_map (written by
 // em_scan_kernel during UpdateHandle); zero-fill per-expert pad rows.
-// prolog_epilog_sms=0 picks sm_count.
+// shuffle_sms=0 picks sm_count.
 void launch_dispatch_permute(
     void* recv_x_em,
     float* recv_topk_weights_em,
@@ -253,7 +253,7 @@ void launch_dispatch_permute(
     int experts_per_rank,
     int row_bytes,
     int sm_count,
-    unsigned int prolog_epilog_sms,
+    unsigned int shuffle_sms,
     int caller_num_recv_tokens,
     cudaStream_t stream,
     ncclEpDispatchQuantizationRecipe_t recipe,
@@ -275,7 +275,7 @@ void launch_combine_reduce(
     int top_k,
     int row_bytes,
     int sm_count,
-    unsigned int prolog_epilog_sms,
+    unsigned int shuffle_sms,
     cudaStream_t stream,
     ncclDataType_t token_dtype = ncclBfloat16);
 

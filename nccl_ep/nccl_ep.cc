@@ -1440,16 +1440,18 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     }
 
     int qps_per_rank = ep_group->config.num_qp_per_rank;
-    int min_required_ctx = ep_group->comm_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS;
+    int min_required_ctx = NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->comm_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
     if (qps_per_rank == 0) qps_per_rank = min_required_ctx;
     if (qps_per_rank < min_required_ctx) {
-        fprintf(stderr, "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d for dedicated N2N warp contexts\n",
+        fprintf(stderr,
+                "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d for reserved + dedicated N2N warp contexts\n",
                 qps_per_rank, min_required_ctx);
         return ncclInvalidUsage;
     }
     ep_group->gin_config.qps_per_rank = qps_per_rank;
     ep_group->gin_config.num_comms = 1;
-    ep_group->gin_config.num_ctx_per_comm = qps_per_rank;
+    // num_qp_per_rank is the total context budget; the data range is what's left after the reserved ones.
+    ep_group->gin_config.num_ctx_per_comm = qps_per_rank - NCCL_EP_HT_RESERVED_GIN_GPU_CTXS;
 
     int dispatch_signals = lsa_team_size * rdma_team_size * max_chunks_per_rank;
     int combine_signals = lsa_team_size * rdma_team_size * max_chunks_per_rank;
@@ -1480,7 +1482,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
         reqs.ginSignalCount = ep_group->gin_config.num_total_signals;
         reqs.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
-        reqs.ginContextCount = ep_group->gin_config.num_ctx_per_comm;
+        reqs.ginContextCount = ep_group->gin_config.qps_per_rank; // reserved + data contexts
         reqs.ginQueueDepth = 3 * ht_tokens_per_chunk + 1;
         // LSA barriers for the HT sync-guard: per-block dispatch [0, NUM_OF_BLOCKS) + one
         // for the elected combine-tail block [NUM_OF_BLOCKS]. NUM_OF_BLOCKS <= NCCL_EP_HT_DISPATCH_BLOCKS.
@@ -1799,7 +1801,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     }
 
     if (ep_group->config.num_qp_per_rank == NCCL_EP_AUTO) {
-        ep_group->config.num_qp_per_rank = ep_group->comm_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS;
+        ep_group->config.num_qp_per_rank =
+            NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->comm_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
     }
 
     // Resolve timeout_cycles: env var > config field > compile-time default

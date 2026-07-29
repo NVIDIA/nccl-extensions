@@ -1109,11 +1109,16 @@ __forceinline__ __device__ void arrive_and_wait(uint32_t num_threads, uint32_t b
     asm volatile("bar.sync %0, %1;" : : "r"(barrier_id), "r"(num_threads));
 }
 
+// Map a data channel onto its GIN context, skipping the reserved contexts.
+__forceinline__ __device__ int get_data_ctx(int channel, int num_ctx_per_comm) {
+    return NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (channel % num_ctx_per_comm);
+}
+
 // Helper to compute communicator index and context index from global channel
 // Used for 6-comm x 4-ctx GIN configuration (6 communicators with 4 contexts each = 24 total channels)
 __forceinline__ __device__ void get_comm_ctx(int global_channel, int num_ctx_per_comm, int& comm_idx, int& ctx_idx) {
     comm_idx = global_channel / num_ctx_per_comm;
-    ctx_idx = global_channel % num_ctx_per_comm;
+    ctx_idx = get_data_ctx(global_channel, num_ctx_per_comm);
 }
 
 // Advance a ring-buffer slot; on wrap (slot == num_slots) reset to 0 and flip phase parity.
@@ -1260,7 +1265,7 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
         constexpr int N2N_WARPS = (LSA_TEAMS == 1) ? 1 : NCCL_EP_HT_DISPATCH_N2N_WARPS;
         int signal_channel = cidx % (NBLOCKS * N2N_WARPS);
 
-        int ctx_idx = signal_channel % num_ctx_per_comm;
+        int ctx_idx = get_data_ctx(signal_channel, num_ctx_per_comm);
         ncclGin net(dcomm, ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
         net.waitSignal(ncclCoopThread(), tail_signal_id, expected_flag_value);
 
@@ -1606,7 +1611,7 @@ __forceinline__ __device__ void dispatch_N2N_warp(
 
     // GIN device side setup. Single communicator; ctx_idx spreads QP traffic.
     int global_channel = blockIdx.x * N2N_WARPS + n2n_warp_id;
-    int ctx_idx = global_channel % num_ctx_per_comm;
+    int ctx_idx = get_data_ctx(global_channel, num_ctx_per_comm);
 
     ncclGin net(dcomm, ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
     ncclTeam rail = ncclTeamRail(dcomm);
@@ -3935,6 +3940,7 @@ warp_rdma_guard_wait(const uint64_t* peer_flags, int my_lteam, int lsa_teams, ui
 }
 
 // Publish the expected round into this rank's slot (my_slot) of every rail peer's window.
+// Runs on reserved context 0, so it never shares QP state with a data channel.
 __device__ __forceinline__ void warp_rdma_guard_publish(
     ncclDevComm dcomm,
     ncclWindow_t dest_window,
@@ -3942,7 +3948,7 @@ __device__ __forceinline__ void warp_rdma_guard_publish(
     int my_lteam,
     int lsa_teams,
     uint64_t expected) {
-    ncclGin net(dcomm, /*contextIndex=*/0, NCCL_GIN_RESOURCE_SHARING_THREAD);
+    ncclGin net(dcomm, /*contextIndex=*/0);
     ncclTeam rail = ncclTeamRail(dcomm);
     for (int peer = (threadIdx.x & 31); peer < lsa_teams; peer += 32) {
         if (peer == my_lteam) continue;

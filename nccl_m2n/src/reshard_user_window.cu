@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 #include "cuda_runtime.h"
@@ -443,8 +444,9 @@ directReshardKernelUserWindow(
 // Host: ncclReshardWithWindow
 // ============================================================================
 
-ncclResult_t ncclReshardWithWindow(ncclComm_t comm, ncclWindow_t window, const ncclDistTensor_t* src,
-                                       const ncclDistTensor_t* dst, cudaStream_t stream) {
+extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm, ncclWindow_t window,
+                                               const ncclDistTensor_t* src, const ncclDistTensor_t* dst,
+                                               cudaStream_t stream) {
   /* Required handles. */
   if (comm == nullptr || window == nullptr) {
     fprintf(stderr, "[ncclReshardWithWindow] comm and window must both be "
@@ -487,10 +489,16 @@ ncclResult_t ncclReshardWithWindow(ncclComm_t comm, ncclWindow_t window, const n
   void* dstBuffer = dst->dataPtr;
   const size_t* srcTensorDims = src->localShape;
   const size_t* dstTensorDims = dst->localShape;
-  const ncclMesh_t* srcMesh = src->mesh;
-  const ncclMesh_t* dstMesh = dst->mesh;
-  if (ndims < 1 || ndims > MAX_TENSOR_DIMS) {
-    fprintf(stderr, "[ncclReshardWithWindow] ndims (%d) out of range [1, %d]\n", ndims, MAX_TENSOR_DIMS);
+  // Use mutable local descriptor copies for internal rewrites while
+  // keeping the public caller-owned descriptors unchanged.
+  ncclMesh_t srcMeshLocal = {{src->mesh->dims[0], src->mesh->dims[1]}, src->mesh->startRank};
+  ncclMesh_t dstMeshLocal = {{dst->mesh->dims[0], dst->mesh->dims[1]}, dst->mesh->startRank};
+  ncclDistTensor_t srcTensorLocal = *src;
+  ncclDistTensor_t dstTensorLocal = *dst;
+  srcTensorLocal.mesh = &srcMeshLocal;
+  dstTensorLocal.mesh = &dstMeshLocal;
+  if (ndims < 1 || ndims > NCCL_RESHARD_MAX_TENSOR_DIMS) {
+    fprintf(stderr, "[ncclReshardWithWindow] ndims (%d) out of range [1, %d]\n", ndims, NCCL_RESHARD_MAX_TENSOR_DIMS);
     return ncclInvalidArgument;
   }
   size_t elementSize = getNcclDtSize(dtype);
@@ -503,23 +511,24 @@ ncclResult_t ncclReshardWithWindow(ncclComm_t comm, ncclWindow_t window, const n
   // computeMeshGroupInfo loses track of the replication dimension.
   // Collapse dims to [total, 1] with placement[1] = SHARD(0) (a no-op
   // shard with count 1) so repMeshDim=0 is always well-defined.
-  auto fixFullyReplicated = [](ncclMesh_t* mesh) {
-    if (mesh->placement[0] == NCCL_RESHARD_REPLICATE && mesh->placement[1] == NCCL_RESHARD_REPLICATE) {
+  auto fixFullyReplicated = [](ncclMesh_t* mesh, int placements[NCCL_RESHARD_MESH_NDIMS]) {
+    if (placements[0] == NCCL_RESHARD_REPLICATE && placements[1] == NCCL_RESHARD_REPLICATE) {
       int total = mesh->dims[0] * mesh->dims[1];
       mesh->dims[0] = total;
       mesh->dims[1] = 1;
-      mesh->placement[1] = NCCL_RESHARD_SHARD(0);
+      placements[1] = NCCL_RESHARD_SHARD(0);
     }
   };
 
-  ncclMesh_t srcMeshLocal = *srcMesh;
-  ncclMesh_t dstMeshLocal = *dstMesh;
-  fixFullyReplicated(&srcMeshLocal);
-  fixFullyReplicated(&dstMeshLocal);
-  srcMesh = &srcMeshLocal;
-  dstMesh = &dstMeshLocal;
+  fixFullyReplicated(&srcMeshLocal, srcTensorLocal.placements);
+  fixFullyReplicated(&dstMeshLocal, dstTensorLocal.placements);
+  std::shared_ptr<ncclM2nHandleState> handleState;
+  NCCL_M2N_CHECK(acquireM2nHandle(handle, &handleState));
 
-  UW_NCCLCHECK(ncclM2nInit(nullptr));
+  const ncclDistTensor_t* srcTensor = &srcTensorLocal;
+  const ncclDistTensor_t* dstTensor = &dstTensorLocal;
+  const ncclMesh_t* srcMesh = srcTensor->mesh;
+  const ncclMesh_t* dstMesh = dstTensor->mesh;
 
   int worldRank, worldSize;
   UW_NCCLCHECK(ncclCommUserRank(comm, &worldRank));
@@ -694,8 +703,8 @@ ncclResult_t ncclReshardWithWindow(ncclComm_t comm, ncclWindow_t window, const n
   // Convert dims to bytes (matches ncclReshardWithWindow's contract for
   // prepareReshardParams / prepareDirectReshardParams).
   // ------------------------------------------------------------------
-  size_t srcDimsBytes[MAX_TENSOR_DIMS] = {0};
-  size_t dstDimsBytes[MAX_TENSOR_DIMS] = {0};
+  size_t srcDimsBytes[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
+  size_t dstDimsBytes[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
   for (int d = 0; d < ndims; d++) {
     srcDimsBytes[d] = srcTensorDims ? srcTensorDims[d] : 1;
     dstDimsBytes[d] = dstTensorDims ? dstTensorDims[d] : 1;
@@ -714,13 +723,13 @@ ncclResult_t ncclReshardWithWindow(ncclComm_t comm, ncclWindow_t window, const n
   // ------------------------------------------------------------------
   int srcShardTensorDim = -1, dstShardTensorDim = -1;
   int srcShardCountForXpose = 1, dstShardCountForXpose = 1;
-  for (int i = 0; i < 2; i++) {
-    if (IS_SHARD_PLACEMENT(srcMesh->placement[i])) {
-      srcShardTensorDim = GET_SHARD_TENSOR_DIM(srcMesh->placement[i]);
+  for (int i = 0; i < NCCL_RESHARD_MESH_NDIMS; i++) {
+    if (isShardPlacement(srcTensor->placements[i])) {
+      srcShardTensorDim = getShardTensorDim(srcTensor->placements[i]);
       srcShardCountForXpose = srcMesh->dims[i];
     }
-    if (IS_SHARD_PLACEMENT(dstMesh->placement[i])) {
-      dstShardTensorDim = GET_SHARD_TENSOR_DIM(dstMesh->placement[i]);
+    if (isShardPlacement(dstTensor->placements[i])) {
+      dstShardTensorDim = getShardTensorDim(dstTensor->placements[i]);
       dstShardCountForXpose = dstMesh->dims[i];
     }
   }
@@ -729,15 +738,19 @@ ncclResult_t ncclReshardWithWindow(ncclComm_t comm, ncclWindow_t window, const n
   bool doTranspose = shouldTransposeForCrossDim(srcDimsBytes, dstDimsBytes, ndims, srcShardTensorDim, dstShardTensorDim,
                                                 srcShardCountForXpose, dstShardCountForXpose, &swapA, &swapB);
 
-  // Effective dims / meshes / buffers / window — may be overwritten by
+  // Effective dims / tensors / buffers / window — may be overwritten by
   // the transpose path below, otherwise equal to the originals.
-  size_t effSrcDims[MAX_TENSOR_DIMS], effDstDims[MAX_TENSOR_DIMS];
+  size_t effSrcDims[NCCL_RESHARD_MAX_TENSOR_DIMS], effDstDims[NCCL_RESHARD_MAX_TENSOR_DIMS];
   for (int d = 0; d < ndims; d++) {
     effSrcDims[d] = srcDimsBytes[d];
     effDstDims[d] = dstDimsBytes[d];
   }
   ncclMesh_t effSrcMesh = *srcMesh;
   ncclMesh_t effDstMesh = *dstMesh;
+  ncclDistTensor_t effSrcTensor = *srcTensor;
+  ncclDistTensor_t effDstTensor = *dstTensor;
+  effSrcTensor.mesh = &effSrcMesh;
+  effDstTensor.mesh = &effDstMesh;
   void* effSrcBuffer = srcBuffer;
   void* effDstBuffer = dstBuffer;
   ncclWindow_t effWindow = window;
@@ -758,16 +771,16 @@ ncclResult_t ncclReshardWithWindow(ncclComm_t comm, ncclWindow_t window, const n
     std::swap(effDstDims[swapA], effDstDims[swapB]);
 
     // 2. Rewrite mesh placements to match swapped layout
-    for (int i = 0; i < 2; i++) {
-      if (IS_SHARD_PLACEMENT(effSrcMesh.placement[i])) {
-        int td = GET_SHARD_TENSOR_DIM(effSrcMesh.placement[i]);
-        if (td == swapA) effSrcMesh.placement[i] = NCCL_RESHARD_SHARD(swapB);
-        else if (td == swapB) effSrcMesh.placement[i] = NCCL_RESHARD_SHARD(swapA);
+    for (int i = 0; i < NCCL_RESHARD_MESH_NDIMS; i++) {
+      if (isShardPlacement(effSrcTensor.placements[i])) {
+        int td = getShardTensorDim(effSrcTensor.placements[i]);
+        if (td == swapA) effSrcTensor.placements[i] = NCCL_RESHARD_SHARD(swapB);
+        else if (td == swapB) effSrcTensor.placements[i] = NCCL_RESHARD_SHARD(swapA);
       }
-      if (IS_SHARD_PLACEMENT(effDstMesh.placement[i])) {
-        int td = GET_SHARD_TENSOR_DIM(effDstMesh.placement[i]);
-        if (td == swapA) effDstMesh.placement[i] = NCCL_RESHARD_SHARD(swapB);
-        else if (td == swapB) effDstMesh.placement[i] = NCCL_RESHARD_SHARD(swapA);
+      if (isShardPlacement(effDstTensor.placements[i])) {
+        int td = getShardTensorDim(effDstTensor.placements[i]);
+        if (td == swapA) effDstTensor.placements[i] = NCCL_RESHARD_SHARD(swapB);
+        else if (td == swapB) effDstTensor.placements[i] = NCCL_RESHARD_SHARD(swapA);
       }
     }
 
@@ -777,7 +790,7 @@ ncclResult_t ncclReshardWithWindow(ncclComm_t comm, ncclWindow_t window, const n
     //    across all ranks) then derive both local sizes so every rank
     //    requests the same buffer size regardless of src/dst role.
     //    (Same pattern as prepareReshardParams globalDims logic.)
-    size_t globalDims[MAX_TENSOR_DIMS];
+    size_t globalDims[NCCL_RESHARD_MAX_TENSOR_DIMS];
     for (int d = 0; d < ndims; d++) {
       if (isSource && srcDimsBytes[d] > 0) {
         globalDims[d] = srcDimsBytes[d];
@@ -904,17 +917,19 @@ ncclResult_t ncclReshardWithWindow(ncclComm_t comm, ncclWindow_t window, const n
   // ------------------------------------------------------------------
   const size_t kernelOffset = doTranspose ? 0 : (size_t)localOffset;
   std::vector<size_t> allWindowOffsets(worldSize, kernelOffset);
+  effSrcTensor.dataPtr = effSrcBuffer;
+  effDstTensor.dataPtr = effDstBuffer;
   if (algo == RESHARD_ALGO_DIRECT) {
     ncclReshardDirectParams directParams =
-      prepareDirectReshardParams(worldRank, effSrcDims, effDstDims, ndims, &effSrcMesh, &effDstMesh, effWindow,
+      prepareDirectReshardParams(worldRank, &effSrcTensor, effSrcDims, &effDstTensor, effDstDims, effWindow,
                                  elementsPerChunk, numCtas, allWindowOffsets.data());
     directParams.myWindowOffset = kernelOffset;
 
     directReshardKernelUserWindow<<<numCtas, threadsPerCta, 0, workStream>>>(directParams, *devCommPtr);
   } else {
-    ncclReshardParams ringParams = prepareReshardParams(
-      worldRank, effSrcBuffer, effSrcDims, ndims, &effSrcMesh, effDstBuffer, effDstDims, &effDstMesh, effWindow,
-      elementsPerChunk, numCtas, srcGpusPerDomain, dstGpusPerDomain, allWindowOffsets.data());
+    ncclReshardParams ringParams =
+      prepareReshardParams(worldRank, &effSrcTensor, effSrcDims, &effDstTensor, effDstDims, effWindow, elementsPerChunk,
+                           numCtas, srcGpusPerDomain, dstGpusPerDomain, allWindowOffsets.data());
 
     ringParams.myWindowOffset = kernelOffset;
     ringParams.ringNextWindowOffset = kernelOffset;

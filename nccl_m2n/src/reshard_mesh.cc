@@ -15,17 +15,18 @@ void computeStrides(const size_t dims[], int ndims, size_t strides[]) {
   for (int d = ndims - 2; d >= 0; d--) strides[d] = strides[d + 1] * dims[d + 1];
 }
 
-void computeMeshGroupInfo(const ncclMesh_t* mesh, int worldRank, ncclReshardMeshGroupInfo* info) {
+void computeMeshGroupInfo(const ncclDistTensor_t* tensor, int worldRank, ncclReshardMeshGroupInfo* info) {
+  const ncclMesh_t* mesh = tensor->mesh;
   memset(info, 0, sizeof(*info));
   info->shardMeshDim = -1;
   info->repMeshDim = -1;
   info->shardTensorDim = -1;
-  for (int d = 0; d < 2; d++) {
-    if (mesh->placement[d] == NCCL_RESHARD_REPLICATE) {
+  for (int d = 0; d < NCCL_RESHARD_MESH_NDIMS; d++) {
+    if (tensor->placements[d] == NCCL_RESHARD_REPLICATE) {
       info->repMeshDim = d;
-    } else if (IS_SHARD_PLACEMENT(mesh->placement[d])) {
+    } else if (isShardPlacement(tensor->placements[d])) {
       info->shardMeshDim = d;
-      info->shardTensorDim = GET_SHARD_TENSOR_DIM(mesh->placement[d]);
+      info->shardTensorDim = getShardTensorDim(tensor->placements[d]);
     }
   }
   info->shardCount = (info->shardMeshDim >= 0) ? mesh->dims[info->shardMeshDim] : 1;
@@ -53,7 +54,8 @@ void computeMeshGroupInfo(const ncclMesh_t* mesh, int worldRank, ncclReshardMesh
   }
 }
 
-int getMeshRank(const ncclMesh_t* mesh, const ncclReshardMeshGroupInfo* info, int shardIdx, int repIdx) {
+int getMeshRank(const ncclDistTensor_t* tensor, const ncclReshardMeshGroupInfo* info, int shardIdx, int repIdx) {
+  const ncclMesh_t* mesh = tensor->mesh;
   int meshPos[2] = {0, 0};
   if (info->shardMeshDim >= 0) meshPos[info->shardMeshDim] = shardIdx;
   if (info->repMeshDim >= 0) meshPos[info->repMeshDim] = repIdx;
@@ -96,12 +98,12 @@ void computeTransferPlan(const size_t srcDims[], const size_t srcStrides[], int 
                          size_t elementsPerChunk, ncclReshardTransferPlan* plan) {
   (void)elementsPerChunk;
   memset(plan, 0, sizeof(*plan));
-  if (ndims < 1 || ndims > MAX_TENSOR_DIMS) {
+  if (ndims < 1 || ndims > NCCL_RESHARD_MAX_TENSOR_DIMS) {
     plan->totalInnerTransfers = 0;
     return;
   }
-  size_t srcGlobalStart[MAX_TENSOR_DIMS], srcGlobalEnd[MAX_TENSOR_DIMS];
-  size_t dstGlobalStart[MAX_TENSOR_DIMS], dstGlobalEnd[MAX_TENSOR_DIMS];
+  size_t srcGlobalStart[NCCL_RESHARD_MAX_TENSOR_DIMS], srcGlobalEnd[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t dstGlobalStart[NCCL_RESHARD_MAX_TENSOR_DIMS], dstGlobalEnd[NCCL_RESHARD_MAX_TENSOR_DIMS];
   computeGlobalRange(srcDims, ndims, srcShardDim, srcShardIdx, srcGlobalStart, srcGlobalEnd);
   computeGlobalRange(dstDims, ndims, dstShardDim, dstShardIdx, dstGlobalStart, dstGlobalEnd);
   if (!computeOverlap(srcGlobalStart, srcGlobalEnd, dstGlobalStart, dstGlobalEnd, ndims, plan->overlapStart,
@@ -109,7 +111,7 @@ void computeTransferPlan(const size_t srcDims[], const size_t srcStrides[], int 
     plan->totalInnerTransfers = 0;
     return;
   }
-  size_t overlapSize[MAX_TENSOR_DIMS];
+  size_t overlapSize[NCCL_RESHARD_MAX_TENSOR_DIMS];
   for (int d = 0; d < ndims; d++) overlapSize[d] = plan->overlapEnd[d] - plan->overlapStart[d];
   int innerContigStart = ndims - 1;
   size_t innerSize = 1;

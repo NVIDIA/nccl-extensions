@@ -18,7 +18,12 @@
 #ifndef NCCL_RESHARD_INTERNAL_H_
 #define NCCL_RESHARD_INTERNAL_H_
 
+#include <cstdint>
+#include <limits>
+#include <memory>
+
 #include "nccl_m2n.h"
+#include "m2n_handle.h"
 #include "reshard_types.h"
 #include "m2n_log.h"
 
@@ -27,12 +32,12 @@ struct ncclDevComm;
 /* ======================================================================
  * Global configuration (inline — getters fold into a single load).
  *
- * Initial values are library defaults.  ncclM2nInit applies the
- * ncclM2nConfig_t (if non-NULL) and then env vars in
+ * Initial values are library defaults.  Runtime initialization applies the
+ * first config for a process-lifetime epoch and then env vars in
  * m2n_config.cc.  Env vars always win.
  * ====================================================================*/
 
-inline int gReshardGpusPerNode = 8;
+inline int gReshardGpusPerNode = DEFAULT_GPUS_PER_NODE;
 inline int gReshardSrcDomainSize = 0;
 inline int gReshardDstDomainSize = 0;
 inline ReshardAlgorithm gReshardAlgorithm = RESHARD_ALGO_AUTO;
@@ -41,12 +46,12 @@ inline ReshardLoadBalanceMode gReshardLbMode = RESHARD_LB_UNIFORM;
 /* Upper bound on pickNumCtas() output.  0 = unset (use DEFAULT_NUM_CTAS). */
 inline int gReshardMaxCta = 0;
 
-/* Resolved CTA count, computed once at ncclM2nInit from
- * gReshardMaxCta + DEFAULT_NUM_CTAS.  pickNumCtas reads this directly -
- * no per-call branch. */
+/* Resolved CTA count, computed once during runtime initialization from
+ * gReshardMaxCta / DEFAULT_NUM_CTAS. pickNumCtas reads this directly - no
+ * per-call branch. */
 inline int gReshardNumCtas = DEFAULT_NUM_CTAS;
 
-/* Stream pool size populated at ncclM2nInit from
+/* Stream pool size populated during runtime initialization from
  *   NCCL_RESHARD_STREAM_POOL_SIZE   (int, default 4)
  * Maximum number of distinct (ncclComm_t, cuda device) pairs the
  * pool will hold a stream+event for.  1:1 mapping — one stream and
@@ -55,12 +60,13 @@ inline int gReshardNumCtas = DEFAULT_NUM_CTAS;
  * directly).  Values > STREAM_POOL_MAX_SIZE are capped (with a
  * warning).  Applies only to default-stream callers; explicit-stream
  * callers are unaffected. */
-inline int gReshardStreamPoolSize = 4;
+inline int gReshardStreamPoolSize = DEFAULT_STREAM_POOL_SIZE;
 
 /* Byte-level chunk size used by the RING prepare path. Default is
  * CHUNK_SIZE_BYTES; overridable via NCCL_RESHARD_CHUNK_SIZE.
- * Parsed once at init-time in applyReshardEnv — keeps prepareReshardParams
- * off the getenv path on every call. 0 means "use the compile-time default". */
+ * Parsed once at first init in applyReshardEnv — keeps
+ * prepareReshardParams off the getenv path on every call. 0 means
+ * "use the compile-time default". */
 inline size_t gReshardChunkSizeBytes = 0;
 
 inline ReshardAlgorithm reshardGetAlgorithm() {
@@ -87,8 +93,14 @@ inline int reshardGetStreamPoolSize() {
  *
  * Applied in order from ncclM2nInit; env always overrides config.
  * ====================================================================*/
-ncclResult_t applyReshardConfig(const ncclM2nConfig_t* config);
+void resetReshardRuntimeConfig();
+void applyReshardConfig(const ncclM2nConfig_t* config);
+ncclResult_t validateReshardConfigHeader(const ncclM2nConfig_t* config);
 void applyReshardEnv();
+
+/* Validate an explicit handle token, or lazily create the internal default for
+ * a NULL token. The returned state keeps its runtime alive for the call. */
+ncclResult_t acquireM2nHandle(ncclM2nHandle_t token, std::shared_ptr<ncclM2nHandleState>* handle);
 
 /* Element-size lookup for the dtypes accepted by ncclReshardWithWindow.
  * Returns 0 for unsupported dtypes (the API rejects them at call time). */
@@ -171,9 +183,9 @@ void cacheFinalize();
 
 void computeStrides(const size_t dims[], int ndims, size_t strides[]);
 
-void computeMeshGroupInfo(const ncclMesh_t* mesh, int worldRank, ncclReshardMeshGroupInfo* info);
+void computeMeshGroupInfo(const ncclDistTensor_t* tensor, int worldRank, ncclReshardMeshGroupInfo* info);
 
-int getMeshRank(const ncclMesh_t* mesh, const ncclReshardMeshGroupInfo* info, int shardIdx, int repIdx);
+int getMeshRank(const ncclDistTensor_t* tensor, const ncclReshardMeshGroupInfo* info, int shardIdx, int repIdx);
 
 void computeGlobalRange(const size_t localDims[], int ndims, int shardTensorDim, int shardIdx, size_t globalStart[],
                         size_t globalEnd[]);
@@ -204,15 +216,15 @@ int getSourceRepForDest(const ncclReshardRepLoadBalancer* lb, int dstRepIdx);
  * reshard_prepare.cc — Kernel parameter builders
  * ====================================================================*/
 
-ncclReshardParams prepareReshardParams(
-  int worldRank, const void* srcBuffer, const size_t srcTensorDims[], int ndims, const ncclMesh_t* srcMesh,
-  const void* dstBuffer, const size_t dstTensorDims[], const ncclMesh_t* dstMesh, ncclWindow_t window,
-  size_t elementsPerChunk, int numCtas, int srcGpusPerDomain, int dstGpusPerDomain, const size_t* allWindowOffsets);
+ncclReshardParams prepareReshardParams(int worldRank, const ncclDistTensor_t* src, const size_t srcTensorDims[],
+                                          const ncclDistTensor_t* dst, const size_t dstTensorDims[],
+                                          ncclWindow_t window, size_t elementsPerChunk, int numCtas,
+                                          int srcGpusPerDomain, int dstGpusPerDomain, const size_t* allWindowOffsets);
 
 ncclReshardDirectParams prepareDirectReshardParams(
-  int worldRank, const size_t srcTensorDims[], const size_t dstTensorDims[], int ndims,
-  const ncclMesh_t* srcMesh, const ncclMesh_t* dstMesh, ncclWindow_t window,
-  size_t elementsPerChunk, int numCtas, const size_t* allWindowOffsets);
+  int worldRank, const ncclDistTensor_t* src, const size_t srcTensorDims[], const ncclDistTensor_t* dst,
+  const size_t dstTensorDims[], ncclWindow_t window, size_t elementsPerChunk, int numCtas,
+  const size_t* allWindowOffsets);
 
 /* ======================================================================
  * reshard_transpose.cc — Cross-dim transpose buffer

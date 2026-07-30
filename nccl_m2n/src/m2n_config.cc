@@ -8,18 +8,18 @@
 /*
  * Library configuration sources, in increasing precedence:
  *   1. Built-in defaults (the inline initializers in reshard_internal.h).
- *   2. ncclM2nConfig_t passed to ncclM2nInit (optional, may be
- *      NULL).
+ *   2. The ncclM2nConfig_t copied into the first ncclM2nHandle_t in
+ *      a process-lifetime init/finalize epoch.
  *   3. Environment variables (always win when set; honors the
  *      "env-overrides-everything" convention used elsewhere in NCCL).
  *
- * applyReshardConfig() and applyReshardEnv() are called from
- * ncclM2nInit in that order.
+ * resetReshardRuntimeConfig(), applyReshardConfig(), and applyReshardEnv() are
+ * called during the first runtime initialization in each epoch, in that order.
  */
 
+#include <climits>
 #include <cstdlib>
 #include <cstring>
-#include <climits>
 
 #include "reshard_internal.h"
 #include "m2n_log.h"
@@ -68,21 +68,43 @@ bool parsePositiveIntEnv(const char* s, int* out) {
 
 } // namespace
 
-ncclResult_t applyReshardConfig(const ncclM2nConfig_t* config) {
+void applyReshardConfig(const ncclM2nConfig_t* config) {
+  if (config == nullptr) return;
+
+  if (config->maxCta != NCCL_M2N_CONFIG_UNDEF_INT) {
+    if (config->maxCta <= 0) RESHARD_WARN(-1, "ncclM2nInit: ignoring config.maxCta=%d (must be > 0).", config->maxCta);
+    else gReshardMaxCta = config->maxCta;
+  }
+}
+
+void resetReshardRuntimeConfig() {
+  gReshardGpusPerNode = DEFAULT_GPUS_PER_NODE;
+  gReshardSrcDomainSize = 0;
+  gReshardDstDomainSize = 0;
+  gReshardAlgorithm = RESHARD_ALGO_AUTO;
+  gReshardLbMode = RESHARD_LB_UNIFORM;
+  gReshardMaxCta = 0;
+  gReshardNumCtas = DEFAULT_NUM_CTAS;
+  gReshardStreamPoolSize = DEFAULT_STREAM_POOL_SIZE;
+  gReshardChunkSizeBytes = 0;
+}
+
+ncclResult_t validateReshardConfigHeader(const ncclM2nConfig_t* config) {
   if (config == nullptr) return ncclSuccess;
 
   if (config->size != sizeof(ncclM2nConfig_t) || config->magic != NCCL_M2N_API_MAGIC) {
     RESHARD_WARN(-1,
-                 "ncclM2nInit: ignoring malformed ncclM2nConfig_t "
-                 "(size=%zu, magic=0x%x). Use NCCL_M2N_CONFIG_INITIALIZER.",
-                 config->size, config->magic);
+                 "ncclM2nInit: rejecting malformed ncclM2nConfig_t "
+                 "(size=%zu, magic=0x%x, version=%u). Use NCCL_M2N_CONFIG_INITIALIZER.",
+                 config->size, config->magic, config->version);
     return ncclInvalidArgument;
   }
 
-  if (config->maxCta != NCCL_M2N_CONFIG_UNDEF_INT) {
-    if (config->maxCta <= 0)
-      RESHARD_WARN(-1, "ncclM2nInit: ignoring config.maxCta=%d (must be > 0).", config->maxCta);
-    else gReshardMaxCta = config->maxCta;
+  if (config->version != NCCL_M2N_API_VERSION) {
+    RESHARD_WARN(-1,
+                 "ncclM2nInit: ncclM2nConfig_t.version=%u, library API_VERSION=%u; "
+                 "behavior may differ across versions.",
+                 config->version, NCCL_M2N_API_VERSION);
   }
 
   return ncclSuccess;
@@ -90,7 +112,7 @@ ncclResult_t applyReshardConfig(const ncclM2nConfig_t* config) {
 
 // `getenv` is the only POSIX path to read process env vars; there is no portable
 // thread-safe alternative (`secure_getenv` is glibc-only). Library init runs
-// once on the calling thread before ncclM2nInit returns, so concurrent
+// once on the first calling thread before ncclM2nInit returns, so concurrent
 // env mutation by user code is the caller's problem — scope the
 // concurrency-mt-unsafe suppression to just this function.
 //

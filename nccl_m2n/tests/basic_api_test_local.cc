@@ -76,6 +76,7 @@ static int gWorldSize = 0;
 static int gNumDevices = 0;
 static size_t gBufferBytes = 4096;
 static std::vector<ncclComm_t> gComms;
+static std::vector<ncclM2nHandle_t> gM2nHandles;
 #if !defined(GTEST_SKIP)
 static int gSkippedCases = 0;
 #endif
@@ -93,6 +94,7 @@ struct ThreadArg {
   int worldSize;
   int device;
   ncclComm_t comm;
+  ncclM2nHandle_t m2nHandle;
   LocalCtx* ctx;
   const TestCase* tc;
   bool verbose;
@@ -119,6 +121,7 @@ static void* threadMain(void* p) {
   env.device = a->device;
   env.comm = a->comm;
   env.stream = stream;
+  env.m2nHandle = a->m2nHandle;
   env.buffer = buffer;
   env.bufferBytes = gBufferBytes;
   env.verbose = a->verbose;
@@ -131,6 +134,8 @@ static void* threadMain(void* p) {
   a->status = res.status;
   if (res.skipReason != nullptr) snprintf(a->skipReason, sizeof(a->skipReason), "%s", res.skipReason);
   if (res.failReason != nullptr) snprintf(a->failReason, sizeof(a->failReason), "%s", res.failReason);
+
+  TEST_CUDACHECK(cudaStreamSynchronize(stream));
 
   /* Keep rank-local buffers alive until every thread has left runOneCase. */
   pthread_barrier_wait(&a->ctx->barrier);
@@ -158,6 +163,7 @@ static LocalCaseResult runLocalCase(const TestCase& tc) {
     args[r].worldSize = gWorldSize;
     args[r].device = r;
     args[r].comm = gComms[r];
+    args[r].m2nHandle = gM2nHandles[r];
     args[r].ctx = &ctx;
     args[r].tc = &tc;
     args[r].verbose = gCli.verbose;
@@ -237,10 +243,13 @@ static int initLocalRuntime() {
 
   std::vector<int> devlist(gWorldSize);
   gComms.assign(gWorldSize, nullptr);
+  gM2nHandles.assign(gWorldSize, nullptr);
   for (int i = 0; i < gWorldSize; ++i) devlist[i] = i;
 
   TEST_NCCLCHECK(ncclCommInitAll(gComms.data(), gWorldSize, devlist.data()));
-  TEST_NCCLCHECK(ncclM2nInit(NULL));
+  for (int i = 0; i < gWorldSize; ++i) {
+    TEST_NCCLCHECK(ncclM2nInit(&gM2nHandles[i], NULL));
+  }
 
   std::vector<TestCase> cases = basicApiSelectCases(gCases, gCli);
   gBufferBytes = computeMaxBufferBytes(cases, gWorldSize);
@@ -251,9 +260,17 @@ static int initLocalRuntime() {
 }
 
 static void shutdownLocalRuntime() {
-  TEST_NCCLCHECK(ncclM2nFinalize());
-  for (ncclComm_t comm : gComms)
-    if (comm != nullptr) TEST_NCCLCHECK(ncclCommDestroy(comm));
+  for (ncclM2nHandle_t m2nHandle : gM2nHandles) {
+    if (m2nHandle != nullptr) {
+      TEST_NCCLCHECK(ncclM2nFinalize(m2nHandle));
+    }
+  }
+  gM2nHandles.clear();
+  for (ncclComm_t comm : gComms) {
+    if (comm != nullptr) {
+      TEST_NCCLCHECK(ncclCommDestroy(comm));
+    }
+  }
   gComms.clear();
 }
 

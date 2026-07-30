@@ -45,8 +45,9 @@ static DevCommCacheEntry gDevcommCache[MAX_DEVCOMM_CACHE_ENTRIES];
 static int gDevcommCacheCount = 0;
 static int gDevcommCacheNextIdx = 0;
 
-/* CUDA handle lifetimes are tied to ncclM2nFinalize() (so we can
- * destroy them before the CUDA context tears down) — see cacheFinalize.
+/* CUDA handle lifetimes are tied to the last finalize call in the
+ * process-lifetime init/finalize epoch (so we can destroy them before the CUDA
+ * context tears down) — see cacheFinalize.
  * The vector itself just owns memory; handles inside it are released
  * explicitly there before the vector is cleared. */
 static std::vector<StreamPoolEntry> gStreamPool;

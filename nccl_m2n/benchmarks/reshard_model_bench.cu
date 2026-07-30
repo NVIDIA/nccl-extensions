@@ -438,9 +438,13 @@ static std::map<std::string, ParamInfo> deduplicateParamsPP(
 }
 
 // ============================================================================
-// ncclMesh_t Construction from Placements
+// ncclMesh_t / ncclDistTensor_t Construction from Placements
 //
-// The ncclReshardWithWindow API takes a 2D mesh: dims[2], startRank, placement[2].
+// The ncclReshardWithWindow API splits topology (mesh) from per-tensor placements:
+//   ncclMesh_t       :  dims[NCCL_RESHARD_MESH_NDIMS], startRank
+//   ncclDistTensor_t :  ..., placements[NCCL_RESHARD_MESH_NDIMS]
+//
+// Convention used here:
 //   dims[0] = replicated count (product of non-sharding mesh axes)
 //   dims[1] = shard count     (mesh axis that shards the tensor)
 //   placement[0] = REPLICATE
@@ -712,7 +716,8 @@ int main(int argc, char* argv[]) {
   if (verbose) benchSetEnv("NCCL_RESHARD_LOG_LEVEL", "DEBUG");
   benchSetEnv("NCCL_RESHARD_ALGORITHM", algorithm);
   benchSetEnv("NCCL_RESHARD_LB_MODE", lbMode);
-  NCCLCHECK(ncclM2nInit(NULL));
+  ncclM2nHandle_t m2nHandle = nullptr;
+  NCCLCHECK(ncclM2nInit(&m2nHandle, NULL));
 
   // ========================================================================
   // Print configuration
@@ -881,17 +886,11 @@ int main(int argc, char* argv[]) {
     srcMesh.dims[0] = td.srcMesh.repCount;
     srcMesh.dims[1] = td.srcMesh.shardCount;
     srcMesh.startRank = 0;
-    srcMesh.placement[0] = NCCL_RESHARD_REPLICATE;
-    srcMesh.placement[1] =
-      (td.srcMesh.shardTensorDim >= 0) ? NCCL_RESHARD_SHARD(td.srcMesh.shardTensorDim) : NCCL_RESHARD_REPLICATE;
 
     ncclMesh_t dstMesh;
     dstMesh.dims[0] = td.dstMesh.repCount;
     dstMesh.dims[1] = td.dstMesh.shardCount;
     dstMesh.startRank = trainStageSize;
-    dstMesh.placement[0] = NCCL_RESHARD_REPLICATE;
-    dstMesh.placement[1] =
-      (td.dstMesh.shardTensorDim >= 0) ? NCCL_RESHARD_SHARD(td.dstMesh.shardTensorDim) : NCCL_RESHARD_REPLICATE;
 
     bool rankIsTrainInComm = (commIt->second.localRank < trainStageSize);
 
@@ -900,6 +899,9 @@ int main(int argc, char* argv[]) {
     srcTensor.ndims = td.ndims;
     srcTensor.dtype = getNcclDtype(td.param.dtype);
     srcTensor.mesh = &srcMesh;
+    srcTensor.placements[0] = NCCL_RESHARD_REPLICATE;
+    srcTensor.placements[1] =
+      (td.srcMesh.shardTensorDim >= 0) ? NCCL_RESHARD_SHARD(td.srcMesh.shardTensorDim) : NCCL_RESHARD_REPLICATE;
     if (rankIsTrainInComm)
       for (int d = 0; d < td.ndims; d++) srcTensor.localShape[d] = td.srcLocalShape[d];
 
@@ -908,10 +910,13 @@ int main(int argc, char* argv[]) {
     dstTensor.ndims = td.ndims;
     dstTensor.dtype = getNcclDtype(td.param.dtype);
     dstTensor.mesh = &dstMesh;
+    dstTensor.placements[0] = NCCL_RESHARD_REPLICATE;
+    dstTensor.placements[1] =
+      (td.dstMesh.shardTensorDim >= 0) ? NCCL_RESHARD_SHARD(td.dstMesh.shardTensorDim) : NCCL_RESHARD_REPLICATE;
     if (!rankIsTrainInComm)
       for (int d = 0; d < td.ndims; d++) dstTensor.localShape[d] = td.dstLocalShape[d];
 
-    NCCLCHECK(ncclReshardWithWindow(comm, win, &srcTensor, &dstTensor, stream));
+    NCCLCHECK(ncclReshardWithWindow(m2nHandle, comm, win, &srcTensor, &dstTensor, stream));
   };
 
   auto syncAllStreams = [&]() {
@@ -1237,7 +1242,10 @@ int main(int argc, char* argv[]) {
   // ========================================================================
   // Cleanup
   // ========================================================================
-  ncclM2nFinalize();
+  for (auto& [key, entry] : ppComms) {
+    if (entry.participates) CUDACHECK(cudaStreamSynchronize(entry.stream));
+  }
+  NCCLCHECK(ncclM2nFinalize(m2nHandle));
 
   for (size_t i = 0; i < allTransfers.size(); i++) {
     auto& tbe = transferBuffers[i];

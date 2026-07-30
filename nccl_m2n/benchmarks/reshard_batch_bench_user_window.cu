@@ -244,7 +244,7 @@ static std::vector<int> benchParseIntList(const char* s) {
 // Strict mesh-dims parser — bench_common.h's benchParseMeshDims is lenient
 // (defaults to 0 on garbage); for this bench's user-facing CLI we want a
 // loud failure instead of a silent 0 that breaks downstream rank counts.
-static void parseMeshDimsStrict(const char* str, int dims[2]) {
+static void parseMeshDimsStrict(const char* str, int dims[NCCL_RESHARD_MESH_NDIMS]) {
   char* copy = strdup(str);
   char* saveptr = nullptr;
   char* token = strtok_r(copy, ",x", &saveptr);
@@ -301,8 +301,8 @@ int main(int argc, char* argv[]) {
 
   int numComms = 1;
   int numTensors = 4;
-  int srcMdims[2] = {0, 0};
-  int dstMdims[2] = {0, 0};
+  int srcMdims[NCCL_RESHARD_MESH_NDIMS] = {0, 0};
+  int dstMdims[NCCL_RESHARD_MESH_NDIMS] = {0, 0};
   int iterations = 20;
   int warmup = 4;
   bool bValidate = false;
@@ -406,7 +406,8 @@ int main(int argc, char* argv[]) {
   if (bVerbose) benchSetEnv("NCCL_RESHARD_LOG_LEVEL", "DEBUG");
   benchSetEnv("NCCL_RESHARD_ALGORITHM", algorithm);
   benchSetEnv("NCCL_RESHARD_LB_MODE", lbMode);
-  NCCLCHECK(ncclM2nInit(NULL));
+  ncclM2nHandle_t m2nHandle = nullptr;
+  NCCLCHECK(ncclM2nInit(&m2nHandle, NULL));
 
   // ------------------------------------------------------------------------
   // Create numComms independent NCCL communicators (each covers all ranks)
@@ -477,12 +478,8 @@ int main(int argc, char* argv[]) {
   // Sweep: shard pattern × tensor size
   // ------------------------------------------------------------------------
   for (auto& sc : shardCfgs) {
-    ncclMesh_t srcMesh = {.dims = {srcMdims[0], srcMdims[1]},
-                                     .startRank = 0,
-                                     .placement = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(sc.srcSd)}};
-    ncclMesh_t dstMesh = {.dims = {dstMdims[0], dstMdims[1]},
-                                     .startRank = srcTotal,
-                                     .placement = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(sc.dstSd)}};
+    ncclMesh_t srcMesh = {.dims = {srcMdims[0], srcMdims[1]}, .startRank = 0};
+    ncclMesh_t dstMesh = {.dims = {dstMdims[0], dstMdims[1]}, .startRank = srcTotal};
     const char* pattern = (sc.srcSd == sc.dstSd) ? "same-dim" : "cross-dim";
 
     for (auto& tc : tensorCfgs) {
@@ -525,6 +522,8 @@ int main(int argc, char* argv[]) {
         srcT.ndims = tc.nDims;
         srcT.dtype = ncclInt8; // bench validates byte patterns
         srcT.mesh = &srcMesh;
+        srcT.placements[0] = NCCL_RESHARD_REPLICATE;
+        srcT.placements[1] = NCCL_RESHARD_SHARD(sc.srcSd);
         srcT.dataPtr = bIsSource ? bufs[i] : nullptr;
         if (bIsSource)
           for (int d = 0; d < tc.nDims; d++) srcT.localShape[d] = srcLocal[d];
@@ -533,11 +532,13 @@ int main(int argc, char* argv[]) {
         dstT.ndims = tc.nDims;
         dstT.dtype = ncclInt8;
         dstT.mesh = &dstMesh;
+        dstT.placements[0] = NCCL_RESHARD_REPLICATE;
+        dstT.placements[1] = NCCL_RESHARD_SHARD(sc.dstSd);
         dstT.dataPtr = bIsDest ? bufs[i] : nullptr;
         if (bIsDest)
           for (int d = 0; d < tc.nDims; d++) dstT.localShape[d] = dstLocal[d];
 
-        NCCLCHECK(ncclReshardWithWindow(comms[i % numComms], windows[i], &srcT, &dstT, s));
+        NCCLCHECK(ncclReshardWithWindow(m2nHandle, comms[i % numComms], windows[i], &srcT, &dstT, s));
       };
 
       auto runSequential = [&]() {
@@ -647,10 +648,12 @@ int main(int argc, char* argv[]) {
   }
 
   // ------------------------------------------------------------------------
-  // Teardown — deregister windows BEFORE destroying comms.
+  // Teardown — complete work and deregister windows before destroying comms.
   // ------------------------------------------------------------------------
+  CUDACHECK(cudaStreamSynchronize(seqStream));
+  for (auto& s : streams) CUDACHECK(cudaStreamSynchronize(s));
   for (int i = 0; i < numTensors; i++) ncclCommWindowDeregister(comms[i % numComms], windows[i]);
-  ncclM2nFinalize();
+  NCCLCHECK(ncclM2nFinalize(m2nHandle));
   for (auto& b : bufs) NCCLCHECK(ncclMemFree(b));
   for (auto& s : streams) CUDACHECK(cudaStreamDestroy(s));
   CUDACHECK(cudaStreamDestroy(seqStream));

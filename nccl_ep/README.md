@@ -647,19 +647,13 @@ pointers, so callers can mix stack-, static-, and heap-allocated descriptors.
 //   topk_idx            - [IN]  Pointer to a caller-owned tensor descriptor holding
 //                               top-K expert indices (2D [num_tokens, top_k] int64).
 //   layout_info         - [IN/OUT, optional] Named-struct pointer carrying device-side
-//                         metadata tensor pointers. Set `expert_counters` (1D
-//                         ncclInt32/ncclInt64, size = num_local_experts) to receive
-//                         per-expert recv counts; set `recv_total_counter` (scalar)
-//                         when max_dispatch_tokens_per_rank is NCCL_EP_AUTO. NULL = no metadata.
+//                         metadata tensor pointers. See ncclEpLayoutInfo_t for the fields
+//                         populated at handle time and the layouts each applies to.
+//                         NULL = no metadata.
 //   config              - [IN]  Optional handle configuration (e.g. expert-major
 //                               alignment via dispatch_output_per_expert_alignment);
 //                               NULL = defaults.
 //   stream              - [IN]  CUDA stream
-//
-// Notes:
-//   - If max_dispatch_tokens_per_rank in ncclEpGroupConfig_t was set to NCCL_EP_AUTO,
-//     this call may block as the host allocates memory for the actual number
-//     of received tokens.
 //
 // Returns: ncclResult_t error code
 

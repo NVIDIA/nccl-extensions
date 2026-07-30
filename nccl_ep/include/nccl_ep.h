@@ -621,8 +621,8 @@ ncclResult_t ncclEpInitHandle(
 //   handle             - [IN]  Handle from ncclEpInitHandle
 //   topk_idx           - [IN]  [num_tokens, top_k]; ncclInt32 or ncclInt64
 //   layout_info        - [IN/OUT, optional] Named local tensors (NULL = none provided).
-//                         HT: layout_info->expert_counters is required when
-//                         max_dispatch_tokens_per_rank is NCCL_EP_AUTO.
+//                         See ncclEpLayoutInfo_t for the fields populated at handle time
+//                         and the layouts each applies to.
 //                         LL mode: must be NULL.
 //   stream             - [IN]  CUDA stream
 //
@@ -645,15 +645,11 @@ ncclResult_t ncclEpUpdateHandle(
 //                                HT supports FLAT / EXPERT_MAJOR; LL supports EXPERT_MAJOR / RANK_MAJOR.
 //   topk_idx            - [IN]  Tensor holding top-K expert indices (routing information)
 //   layout_info         - [IN/OUT, optional] Layout info (see ncclEpLayoutInfo_t). NULL = none.
-//                         HT: set expert_counters when max_dispatch_tokens_per_rank is NCCL_EP_AUTO.
+//                         See ncclEpLayoutInfo_t for the fields populated at handle time
+//                         and the layouts each applies to.
 //                         LL mode: must be NULL.
 //   config              - [IN]  Handle configuration (see ncclEpHandleConfig_t). NULL = defaults.
 //   stream              - [IN]  CUDA stream
-//
-// Notes:
-//   - If max_dispatch_tokens_per_rank in ncclEpGroupConfig_t was set to NCCL_EP_AUTO,
-//     this call may block as the host allocates memory for the actual number
-//     of received tokens.
 //
 // Returns: ncclResult_t error code
 
@@ -728,8 +724,8 @@ ncclResult_t ncclEpInitHandle(
 //                                                   Caller ensures expert ids fit in
 //                                                   the chosen width.
 //   layout_info      - [IN/OUT, optional] Named local tensors (NULL = none provided).
-//                         HT: layout_info->expert_counters is required when
-//                         max_dispatch_tokens_per_rank is NCCL_EP_AUTO.
+//                         See ncclEpLayoutInfo_t for the fields populated at handle time
+//                         and the layouts each applies to.
 //                         LL mode: must be NULL.
 //   stream             - [IN]  CUDA stream
 //

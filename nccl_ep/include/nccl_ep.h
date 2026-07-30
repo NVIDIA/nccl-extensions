@@ -278,7 +278,7 @@ typedef struct {
     //   the current routing (see ncclEpLayoutInfo_t::recv_total_counter). Eager
     //   mode does not support NCCL_EP_OVERFLOW_DROP or CUDA Graph capture of
     //   ncclEpDispatch.
-    //   LL: AUTO/0 → nRanks * max_dispatch_tokens_per_rank.
+    //   LL: unused. LL buffers are always sized automatically, pass NCCL_EP_AUTO.
     unsigned int max_recv_tokens_per_rank;
     // Upper bound on token-row bytes per token, covering both dispatch and combine.
     // SCALES_FORWARD scale rows have the same independent byte bound; LL requires

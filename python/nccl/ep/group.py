@@ -52,8 +52,8 @@ class GroupConfig:
         num_channels: Channels per rank. 0 selects auto. In HT each
             channel occupies 2 SMs.
         max_recv_tokens_per_rank: Total recv-slot budget per rank.
-            HT requires > 0 and ``>= max_dispatch_tokens_per_rank``; LL
-            with 0 auto-derives ``n_ranks * max_dispatch_tokens_per_rank``.
+            HT requires > 0 and ``>= max_dispatch_tokens_per_rank``. 
+            LL ignores this field.
         max_num_sms: Maximum SMs to use for EP kernels (dispatch,
             combine, preprocessing). 0 selects an algorithm-dependent
             default.

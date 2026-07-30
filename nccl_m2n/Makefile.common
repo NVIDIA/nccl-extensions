@@ -144,6 +144,7 @@ LIB_HDRS := $(SRCDIR)/nccl_m2n.h \
             $(SRCDIR)/reshard_types.h \
             $(SRCDIR)/reshard_limits.h \
             $(SRCDIR)/m2n_checks.h \
+            $(SRCDIR)/m2n_handle.h \
             $(SRCDIR)/m2n_log.h \
             $(SRCDIR)/reshard_internal.h \
             $(SRCDIR)/reshard_kernels.cuh

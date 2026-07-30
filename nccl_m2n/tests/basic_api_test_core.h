@@ -55,6 +55,7 @@ struct TestEnv {
   int device;
   ncclComm_t comm;
   cudaStream_t stream;
+  ncclM2nHandle_t m2nHandle;
   void* buffer;
   size_t bufferBytes;
   bool verbose;
@@ -630,8 +631,8 @@ static std::vector<TestCase> buildAllTestCases() {
  * ====================================================================*/
 
 struct MeshLayout {
-  int dims[2];
-  int placement[2];
+  int dims[NCCL_RESHARD_MESH_NDIMS];
+  int placement[NCCL_RESHARD_MESH_NDIMS];
   int startRank;
   int shardCount; /* 1 if PL_REPL */
   int shardDim; /* -1 if PL_REPL */
@@ -1020,14 +1021,10 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   srcMesh.dims[0] = srcLayout.dims[0];
   srcMesh.dims[1] = srcLayout.dims[1];
   srcMesh.startRank = srcLayout.startRank;
-  srcMesh.placement[0] = srcLayout.placement[0];
-  srcMesh.placement[1] = srcLayout.placement[1];
 
   dstMesh.dims[0] = dstLayout.dims[0];
   dstMesh.dims[1] = dstLayout.dims[1];
   dstMesh.startRank = dstLayout.startRank;
-  dstMesh.placement[0] = dstLayout.placement[0];
-  dstMesh.placement[1] = dstLayout.placement[1];
 
   /* The harness works at byte granularity, so pass the dtype whose
    * size matches tc.elementSize (1 / 2 / 4 / 8). */
@@ -1047,6 +1044,8 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   srcT.ndims = tc.ndims;
   srcT.dtype = dtype;
   srcT.mesh = &srcMesh;
+  srcT.placements[0] = srcLayout.placement[0];
+  srcT.placements[1] = srcLayout.placement[1];
   if (isSrc)
     for (int d = 0; d < tc.ndims; d++) srcT.localShape[d] = srcLocalDimsElems[d];
 
@@ -1055,10 +1054,12 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   dstT.ndims = tc.ndims;
   dstT.dtype = dtype;
   dstT.mesh = &dstMesh;
+  dstT.placements[0] = dstLayout.placement[0];
+  dstT.placements[1] = dstLayout.placement[1];
   if (isDst)
     for (int d = 0; d < tc.ndims; d++) dstT.localShape[d] = dstLocalDimsElems[d];
 
-  ncclResult_t r = ncclReshardWithWindow(env->comm, window, &srcT, &dstT, env->stream);
+  ncclResult_t r = ncclReshardWithWindow(env->m2nHandle, env->comm, window, &srcT, &dstT, env->stream);
 
   if (r != ncclSuccess) {
     TEST_NCCLCHECK(ncclCommWindowDeregister(env->comm, window));

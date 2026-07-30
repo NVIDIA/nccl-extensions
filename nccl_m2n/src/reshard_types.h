@@ -69,9 +69,9 @@ typedef struct {
 
 typedef struct {
   int numOuterLoops;
-  size_t outerCounts[MAX_TENSOR_DIMS];
-  size_t outerSrcStrides[MAX_TENSOR_DIMS];
-  size_t outerDstStrides[MAX_TENSOR_DIMS];
+  size_t outerCounts[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t outerSrcStrides[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t outerDstStrides[NCCL_RESHARD_MAX_TENSOR_DIMS];
 
   size_t srcBaseOffset;
   size_t dstBaseOffset;
@@ -79,8 +79,8 @@ typedef struct {
   size_t innerSize;
   size_t totalInnerTransfers;
 
-  size_t overlapStart[MAX_TENSOR_DIMS];
-  size_t overlapEnd[MAX_TENSOR_DIMS];
+  size_t overlapStart[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t overlapEnd[NCCL_RESHARD_MAX_TENSOR_DIMS];
 } ncclReshardTransferPlan;
 
 /* ======================================================================
@@ -99,8 +99,8 @@ typedef struct {
 typedef struct {
   int dstShardIdx;
   int dstWorldRank;
-  size_t overlapStart[MAX_TENSOR_DIMS];
-  size_t overlapEnd[MAX_TENSOR_DIMS];
+  size_t overlapStart[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t overlapEnd[NCCL_RESHARD_MAX_TENSOR_DIMS];
 
   ncclReshardTransferPlan plan;
 
@@ -112,10 +112,10 @@ typedef struct {
 typedef struct {
   ncclWindow_t window;
 
-  size_t srcDims[MAX_TENSOR_DIMS];
-  size_t dstDims[MAX_TENSOR_DIMS];
-  size_t srcStrides[MAX_TENSOR_DIMS];
-  size_t dstStrides[MAX_TENSOR_DIMS];
+  size_t srcDims[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t dstDims[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t srcStrides[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t dstStrides[NCCL_RESHARD_MAX_TENSOR_DIMS];
   int ndims;
 
   int srcShardTensorDim;
@@ -164,8 +164,8 @@ typedef struct {
   int dstShardIdx;
   int dstRepIdx;
   int dstWorldRank;
-  size_t overlapStart[MAX_TENSOR_DIMS];
-  size_t overlapEnd[MAX_TENSOR_DIMS];
+  size_t overlapStart[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t overlapEnd[NCCL_RESHARD_MAX_TENSOR_DIMS];
   size_t totalBytes;
   bool isContiguous;
   size_t windowOffset;
@@ -184,10 +184,10 @@ typedef struct {
 typedef struct {
   ncclWindow_t window;
 
-  size_t srcDims[MAX_TENSOR_DIMS];
-  size_t dstDims[MAX_TENSOR_DIMS];
-  size_t srcStrides[MAX_TENSOR_DIMS];
-  size_t dstStrides[MAX_TENSOR_DIMS];
+  size_t srcDims[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t dstDims[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t srcStrides[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t dstStrides[NCCL_RESHARD_MAX_TENSOR_DIMS];
   int ndims;
 
   int srcShardTensorDim;

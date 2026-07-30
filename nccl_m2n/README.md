@@ -9,7 +9,8 @@ another), with a single call that moves the data with no host involvement.
 The library is built on NCCL's user-window API (`ncclWindow_t` +
 `ncclMemAlloc`), so transfers are zero-copy and one-sided. The single public
 entry point for this release is `ncclReshardWithWindow`. The shared library is
-installed as `libnccl_m2n.so`; the public header is `nccl_m2n.h`.
+installed as `libnccl_m2n.so`; the public header is `nccl_m2n.h`, while the
+lifecycle/configuration symbols use the `ncclM2n*` library prefix.
 
 > **Status.** Experimental — see [RELEASE.md](RELEASE.md) for the full list of
 > known limitations and the supported tensor-rank / mesh-size envelope. Depends
@@ -35,23 +36,26 @@ local tile of the same logical tensor under a different layout. One call to
 `ncclReshardWithWindow` reshapes the tile on every destination rank to match
 the destination layout.
 
-**Mesh** (`ncclMesh_t`) — describes one side's rank topology. It is
-always 2-axis:
+**Mesh** (`ncclMesh_t`) — describes one side's rank topology only (no
+per-tensor placement, matching PyTorch DTensor's `DeviceMesh` / JAX's `Mesh`).
+It is always 2-axis:
 
 ```c
+#define NCCL_RESHARD_MESH_NDIMS 2
+
 typedef struct {
-    int dims[2];        // axis-0 size × axis-1 size = number of ranks on this side
+    int dims[NCCL_RESHARD_MESH_NDIMS];  // axis-0 size × axis-1 size = number of ranks on this side
     int startRank;     // first global rank that belongs to this mesh
-    int placement[2];   // per-axis role: REPLICATE or SHARD(tensor_dim)
 } ncclMesh_t;
 ```
 
-`placement[i]` is one of:
+**Placement** lives on the distributed tensor (`ncclDistTensor_t::placements[]`),
+not on the mesh. Each entry is one of:
 
 - `NCCL_RESHARD_REPLICATE` — the mesh axis replicates the tensor.
 - `NCCL_RESHARD_SHARD(d)`  — the mesh axis shards along tensor dim `d`.
 
-Exactly **one** axis per mesh should be a SHARD (the other a REPLICATE) for a
+Exactly **one** axis per side should be a SHARD (the other a REPLICATE) for a
 sharded layout. For full replication, encode it as a 1-shard layout (mesh axis
 of size 1) — both `REPLICATE` is a degenerate case not exercised by the test
 suite.
@@ -144,50 +148,58 @@ ncclWindow_t window;
 ncclCommWindowRegister(comm, buffer, max_local_bytes, &window,
                        NCCL_WIN_COLL_SYMMETRIC);
 
-// Initialize the reshard library. Optional config struct lets you set
-// maxCta; everything else is env-driven (see "Tuning" below).
+// Initialize the reshard library. Optional config struct lets you cap
+// CTA count; runtime tuning knobs are env-driven (see "Tuning" below).
+ncclM2nHandle_t m2nHandle = nullptr;
 ncclM2nConfig_t cfg = NCCL_M2N_CONFIG_INITIALIZER;
 cfg.maxCta = 8;
-ncclResult_t r = ncclM2nInit(&cfg);  // or ncclM2nInit(NULL) for defaults
+ncclResult_t r = ncclM2nInit(&m2nHandle, &cfg);
 if (r != ncclSuccess) { /* handle */ }
 
 // Describe the two layouts. Example: 8 ranks split 4 src / 4 dst, both
 // 1×4 1-D meshes that shard the outer tensor dim.
-ncclMesh_t src_mesh = {
-    .dims = {1, 4}, .startRank = 0,
-    .placement = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(0)},
-};
-ncclMesh_t dst_mesh = {
-    .dims = {1, 4}, .startRank = 4,
-    .placement = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(0)},
-};
+ncclMesh_t srcMesh = {};
+srcMesh.dims[0] = 1;
+srcMesh.dims[1] = 4;
+srcMesh.startRank = 0;
+ncclMesh_t dstMesh = {};
+dstMesh.dims[0] = 1;
+dstMesh.dims[1] = 4;
+dstMesh.startRank = 4;
 
 // Pack the per-side tensor descriptors. localShape entries are in
 // **elements** and only the first ndims slots are read.  dataPtr is
 // NULL on the side this rank doesn't participate in (mirroring PyTorch
-// DTensor's size-0 local tensor for non-participating ranks).  mesh is
-// always required.
-ncclDistTensor_t src = {
-    .dataPtr    = is_source ? buffer : NULL,
-    .localShape = {256, 1024, 0},
-    .ndims       = 2,
-    .dtype       = ncclFloat32,
-    .mesh        = &src_mesh,
-};
-ncclDistTensor_t dst = {
-    .dataPtr    = is_dest ? buffer : NULL,
-    .localShape = {256, 1024, 0},
-    .ndims       = 2,
-    .dtype       = ncclFloat32,
-    .mesh        = &dst_mesh,
-};
+// DTensor's size-0 local tensor for non-participating ranks).  mesh and
+// placements are always required.
+ncclDistTensor_t src = {};
+src.dataPtr = is_source ? buffer : nullptr;
+src.localShape[0] = 256;
+src.localShape[1] = 1024;
+src.ndims = 2;
+src.dtype = ncclFloat32;
+src.mesh = &srcMesh;
+src.placements[0] = NCCL_RESHARD_REPLICATE;
+src.placements[1] = NCCL_RESHARD_SHARD(0);
+ncclDistTensor_t dst = {};
+dst.dataPtr = is_dest ? buffer : nullptr;
+dst.localShape[0] = 256;
+dst.localShape[1] = 1024;
+dst.ndims = 2;
+dst.dtype = ncclFloat32;
+dst.mesh = &dstMesh;
+dst.placements[0] = NCCL_RESHARD_REPLICATE;
+dst.placements[1] = NCCL_RESHARD_SHARD(0);
 
-ncclReshardWithWindow(comm, window, &src, &dst, stream);
+r = ncclReshardWithWindow(m2nHandle, comm, window, &src, &dst, stream);
+if (r != ncclSuccess) { /* handle */ }
 
-// Tear down.
+// Reshard is asynchronous. Complete the work before releasing its resources.
+cudaError_t cudaResult = cudaStreamSynchronize(stream);
+if (cudaResult != cudaSuccess) { /* handle */ }
 ncclCommWindowDeregister(comm, window);
+ncclM2nFinalize(m2nHandle);
 ncclMemFree(buffer);
-ncclM2nFinalize();    // releases internal caches + transpose buffer
 ```
 
 The window must be registered on the **full** communicator regardless
@@ -218,12 +230,13 @@ mesh in one descriptor.
 
 ```c
 typedef struct {
-    void*                     dataPtr;        // local buffer; NULL if this rank
-                                               //   doesn't participate on this side
-    size_t                    localShape[NCCL_RESHARD_MAX_TENSOR_DIMS];  // elements
-    int                       ndims;           // 1..3
-    ncclDataType_t            dtype;           // element type
-    const ncclMesh_t*  mesh;            // topology + placement (caller-owned)
+    void*                  dataPtr;        // local buffer; NULL if this rank
+                                            //   doesn't participate on this side
+    size_t                 localShape[NCCL_RESHARD_MAX_TENSOR_DIMS];  // elements
+    int                    ndims;          // 1..3
+    ncclDataType_t         dtype;          // element type
+    const ncclMesh_t*  mesh;           // topology (caller-owned)
+    int                    placements[NCCL_RESHARD_MESH_NDIMS];  // per-mesh-axis placements
 } ncclDistTensor_t;
 ```
 
@@ -242,8 +255,13 @@ which-shard.
 
 ### Reshard
 
+Use `ncclReshardWithWindow` with an M2N handle and a registered symmetric NCCL
+window around the participating buffers. Pass `NULL` as the handle to lazily
+use the internal default handle.
+
 ```c
 ncclResult_t ncclReshardWithWindow(
+    ncclM2nHandle_t         m2nHandle, // returned by ncclM2nInit, or NULL for default
     ncclComm_t                comm,    // contains all ranks (src + dst)
     ncclWindow_t              window,  // registered on comm
     const ncclDistTensor_t*   src,     // source-side descriptor
@@ -288,20 +306,32 @@ communicators for concurrent transfers; the batched benchmark does this with
 ### Lifecycle
 
 ```c
-ncclResult_t ncclM2nInit(ncclM2nConfig_t* config); // idempotent; NULL = defaults
-ncclResult_t ncclM2nFinalize(void); // releases caches + transpose buffer
+ncclResult_t ncclM2nInit(ncclM2nHandle_t* m2nHandle, const ncclM2nConfig_t* config);
+ncclResult_t ncclM2nFinalize(ncclM2nHandle_t m2nHandle);
 ```
 
-`Finalize` should be called before the process exits to release the device
-caches; running without `Finalize` is not a correctness bug but may show up as
-leaked device memory at process teardown.
+Call `ncclM2nFinalize` before process exit to release the handle. Internal caches
+and env-derived runtime state are shared by handles in the same init/finalize
+epoch and released when the last handle is finalized. A finalized handle must
+not be reused. Call `ncclM2nFinalize(NULL)` to release the internal default
+handle after using a reshard API with a NULL handle.
+
+Reshard calls enqueue asynchronous CUDA work, and `ncclM2nFinalize` does not
+synchronize caller streams. Complete all work submitted with a handle before
+finalizing it. Before finalizing the last explicit or default handle in an
+epoch, complete all M2N work from that epoch. Keep the associated communicators,
+windows, streams, and buffers valid until the work completes, and finalize M2N
+before destroying those communicators.
 
 ### Library configuration
 
 Modeled after `ncclConfig_t`. Fill an `ncclM2nConfig_t` with
 `NCCL_M2N_CONFIG_INITIALIZER`, override the fields you care about,
-and pass a pointer to `ncclM2nInit()`. `NULL` means "all defaults".
-Fields left at `NCCL_M2N_CONFIG_UNDEF_INT` keep the library default.
+and pass a pointer to `ncclM2nInit()` with an output handle pointer.
+Passing `NULL` config means "all defaults". The handle stores a copy of this
+config for future extension. Fields left at `NCCL_M2N_CONFIG_UNDEF_INT` keep
+the library default, and runtime env vars still have highest precedence; for
+example, `NCCL_RESHARD_MAX_CTA` can override `config.maxCta`.
 
 | Field    | Purpose |
 |---|---|
@@ -665,8 +695,8 @@ not fail the run.
 - `NCCL_RESHARD_LB_MODE=NODE_AWARE` — bias the assignment so each NVL domain serves
   its local peers first; benefits cross-NVL fan-in.
 
-**CTA count and chunk granularity** — CTA count resolves once during
-`ncclM2nInit`: built-in default 8, then optional `config.maxCta`, then
+**CTA count and chunk granularity** — CTA count resolves once during runtime
+initialization: built-in default 8, then optional `config.maxCta`, then
 `NCCL_RESHARD_MAX_CTA` if set. `pickElementsPerChunk` currently returns the
 compile-time default (`DEFAULT_ELEMENTS_PER_CHUNK = 32`). The RING prepare path
 also uses `CHUNK_SIZE_BYTES` (256 KB) as a byte-level chunk size, overridable
@@ -681,10 +711,9 @@ large. Applies to both 2-D and 3-D tensors; transparent to callers.
 
 ## Runtime environment variables
 
-Most env vars are read once in `ncclM2nInit`. Env vars always override
-matching fields of `ncclM2nConfig_t` (matches upstream NCCL's
-`envConfigOverride` precedence). `NCCL_RESHARD_CHUNK_SIZE` is read by the RING
-prepare path for each call.
+Most env vars are read once when an M2N runtime epoch is initialized. Env vars
+always override matching fields of `ncclM2nConfig_t`; `NCCL_RESHARD_CHUNK_SIZE`
+is cached for the RING prepare path.
 
 | Variable | Effect |
 |---|---|

@@ -35,8 +35,7 @@ void getDestRepsOnNode(const ncclReshardRepLoadBalancer* lb, int targetNode, int
   }
 }
 
-void getDestRepsOnNodeRange(const ncclReshardRepLoadBalancer* lb, int firstNode, int lastNode, int* repStart,
-                            int* repEnd) {
+void getDestRepsOnNodeRange(const ncclReshardRepLoadBalancer* lb, int firstNode, int lastNode, int* repStart, int* repEnd) {
   *repStart = -1;
   *repEnd = -1;
   for (int r = 0; r < lb->dstRepCount; r++) {

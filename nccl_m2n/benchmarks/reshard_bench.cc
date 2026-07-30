@@ -153,10 +153,12 @@ int main(int argc, char* argv[]) {
   }
 
   // Configure reshard library via env vars (applied in ncclM2nInit).
-  if (verbose) benchSetEnv("NCCL_RESHARD_LOG_LEVEL", "DEBUG");
+  if (verbose) {
+    benchSetEnv("NCCL_RESHARD_LOG_LEVEL", "DEBUG");
+  }
   benchSetEnv("NCCL_RESHARD_ALGORITHM", algorithm);
   benchSetEnv("NCCL_RESHARD_LB_MODE", lbMode);
-  NCCLCHECK(ncclM2nInit(NULL));
+  ncclM2nHandle_t m2nHandle = nullptr;
 
   // Validate required parameters
   if (srcMeshDims[0] <= 0 || srcMeshDims[1] <= 0 || dstMeshDims[0] <= 0 || dstMeshDims[1] <= 0 || ndims < 2 ||
@@ -180,6 +182,8 @@ int main(int argc, char* argv[]) {
     MPI_Finalize();
     return 1;
   }
+
+  NCCLCHECK(ncclM2nInit(&m2nHandle, NULL));
 
   // Determine role
   bool isSource = (mpiRank < srcTotal);
@@ -252,14 +256,10 @@ int main(int argc, char* argv[]) {
   ncclWindow_t window = nullptr;
   NCCLCHECK(ncclCommWindowRegister(worldComm, buffer, allocSize, &window, NCCL_WIN_COLL_SYMMETRIC));
 
-  // Setup mesh structures
-  ncclMesh_t srcMesh = {.dims = {srcMeshDims[0], srcMeshDims[1]},
-                                   .startRank = 0,
-                                   .placement = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(srcShardDim)}};
-
-  ncclMesh_t dstMesh = {.dims = {dstMeshDims[0], dstMeshDims[1]},
-                                   .startRank = srcTotal,
-                                   .placement = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(dstShardDim)}};
+  // Setup mesh structures (topology only).  Per-tensor placement is
+  // set on the DistTensor below.
+  ncclMesh_t srcMesh = {.dims = {srcMeshDims[0], srcMeshDims[1]}, .startRank = 0};
+  ncclMesh_t dstMesh = {.dims = {dstMeshDims[0], dstMeshDims[1]}, .startRank = srcTotal};
 
   // Create CUDA stream
   cudaStream_t stream;
@@ -293,6 +293,8 @@ int main(int argc, char* argv[]) {
   srcTensor.ndims = ndims;
   srcTensor.dtype = ncclInt8; // bench validates byte patterns
   srcTensor.mesh = &srcMesh;
+  srcTensor.placements[0] = NCCL_RESHARD_REPLICATE;
+  srcTensor.placements[1] = NCCL_RESHARD_SHARD(srcShardDim);
   if (isSource)
     for (int d = 0; d < ndims; d++) srcTensor.localShape[d] = srcLocalDims[d];
 
@@ -301,6 +303,8 @@ int main(int argc, char* argv[]) {
   dstTensor.ndims = ndims;
   dstTensor.dtype = ncclInt8;
   dstTensor.mesh = &dstMesh;
+  dstTensor.placements[0] = NCCL_RESHARD_REPLICATE;
+  dstTensor.placements[1] = NCCL_RESHARD_SHARD(dstShardDim);
   if (isDest)
     for (int d = 0; d < ndims; d++) dstTensor.localShape[d] = dstLocalDims[d];
 
@@ -308,7 +312,7 @@ int main(int argc, char* argv[]) {
   // return so a contract violation (null window, mismatched offsets, etc.)
   // fails the bench instead of being silently dropped.
   auto runOneIteration = [&]() {
-    NCCLCHECK(ncclReshardWithWindow(worldComm, window, &srcTensor, &dstTensor, reshardStream));
+    NCCLCHECK(ncclReshardWithWindow(m2nHandle, worldComm, window, &srcTensor, &dstTensor, reshardStream));
   };
 
   // Warmup
@@ -460,10 +464,10 @@ int main(int argc, char* argv[]) {
     fflush(stdout);
   }
 
-  // Cleanup order matters: deregister window, finalize library, then free
-  // the buffer.
+  // Reshard is asynchronous. Complete the work before releasing its resources.
+  CUDACHECK(cudaStreamSynchronize(stream));
   ncclCommWindowDeregister(worldComm, window);
-  ncclM2nFinalize();
+  NCCLCHECK(ncclM2nFinalize(m2nHandle));
   NCCLCHECK(ncclMemFree(buffer));
   CUDACHECK(cudaStreamDestroy(stream));
   ncclCommDestroy(worldComm);

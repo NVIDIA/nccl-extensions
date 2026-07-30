@@ -12,7 +12,43 @@ put/signal), so transfers are zero-copy, one-sided, and have no host
 involvement on the critical path.
 
 Install artifacts are shared library `libnccl_m2n.so` and public header
-`include/nccl_m2n.h`.
+`include/nccl_m2n.h`. v0.2 keeps `ncclReshardWithWindow` for the reshard
+operation, moves generic concepts to library-scope `ncclM2n*` names, and adds
+an explicit handle for lifecycle-managed runtime state.
+
+## v0.2
+
+API-breaking cleanup for NCCL M2N naming, descriptors, and runtime ownership.
+`NCCL_M2N_API_VERSION` is bumped from `1u` to `2u` for this API transition.
+Existing binaries must be rebuilt against the updated header.
+
+- **Public C API cleanup:**
+  - `ncclMesh_t` carries topology only (`dims[]`, `startRank`).
+  - Tensor placement moves from `mesh.placement[]` to
+    `ncclDistTensor_t::placements[]`, so one mesh topology can describe
+    multiple tensor layouts.
+  - Placement helpers are `NCCL_RESHARD_REPLICATE` and
+    `NCCL_RESHARD_SHARD(d)`.
+  - `NCCL_RESHARD_MESH_NDIMS` is the mesh-axis array size, and
+    `NCCL_RESHARD_MAX_TENSOR_DIMS` is the tensor-rank cap.
+- **Configuration and lifecycle:**
+  - `ncclM2nConfig_t` is the library configuration descriptor.
+  - `NCCL_M2N_CONFIG_INITIALIZER` / `NCCL_M2N_CONFIG_UNDEF_INT` initialize
+    and mark defaulted config fields.
+  - `ncclM2nInit(&m2nHandle, config|NULL)` / `ncclM2nFinalize(m2nHandle)`
+    manage explicit handles.
+  - `ncclReshardWithWindow(m2nHandle, ...)` is the explicit-handle reshard
+    operation. Passing NULL lazily uses an internal default handle, released by
+    `ncclM2nFinalize(NULL)`.
+  - Internal runtime state is resolved by the first explicit init or lazy
+    default-handle use in an epoch and released after the last handle is
+    finalized. Finalized handles must not be reused.
+  - Reshard operations enqueue asynchronous CUDA work. Callers must complete
+    work submitted with a handle before finalizing it and must complete all M2N
+    work in an epoch before finalizing the last explicit or default handle.
+- **Documentation:**
+  - Public header comments are now Doxygen-readable and document the handle,
+    descriptor, stream, and window contracts in the installed header.
 
 ## v0.1
 
@@ -21,12 +57,16 @@ Initial preview of NCCL M2N — reshard functionality.
 - **Public C API** in `src/nccl_m2n.h`:
   - `ncclReshardWithWindow` — single-shot reshard against a caller-registered
     `ncclWindow_t`.
-  - `ncclDistTensor_t` descriptor — bundles per-rank tile, dtype, and mesh
-    in one struct, modeled after PyTorch DTensor / JAX `NamedSharding`.
-  - `ncclM2nConfig_t` with `NCCL_M2N_CONFIG_INITIALIZER`; currently
-    exposes `maxCta`.
-  - Lifecycle helpers `ncclM2nInit(config|NULL)` /
-    `ncclM2nFinalize`. Algorithm, load-balance mode, stream-pool size,
+  - `ncclMesh_t` descriptor — bundles each side's 2-D rank topology
+    and per-mesh-axis placement (`NCCL_RESHARD_REPLICATE` or
+    `NCCL_RESHARD_SHARD(d)`).
+  - `ncclDistTensor_t` descriptor — bundles per-rank tile, dtype, and a
+    pointer to the side's `ncclMesh_t`, modeled after PyTorch
+    DTensor / JAX `NamedSharding`.
+  - `ncclM2nConfig_t` with `NCCL_M2N_CONFIG_INITIALIZER`; currently exposes
+    `maxCta`.
+  - Lifecycle helpers `ncclM2nInit(config|NULL)` / `ncclM2nFinalize`.
+    Algorithm, load-balance mode, stream-pool size,
     logging, and chunk sizing are env-driven.
 - **Resharding kernels:**
   - **Ring** — hierarchical ring + intra-NVL fan-out via the user window.
@@ -77,6 +117,7 @@ This preview is experimental.
 | **Algorithm auto-select unimplemented** | `NCCL_RESHARD_ALGORITHM=AUTO` currently aliases to `RING`; no input/topology-aware algorithm picker in this build. |
 | **Single in-flight reshard per `(comm, effective stream)`** | The internal DevComm/window/transpose caches are designed for sequential use on a comm. Use separate communicators for concurrent transfers, as in `reshard_batch_bench_user_window --num-comms`. |
 | **Not thread-safe — process-wide single-thread access** | The init-time globals and the internal caches (DevComm cache, window cache, stream pool) are process-wide shared state. Caller is responsible for serializing every `ncclM2nInit` / `ncclM2nFinalize` / `ncclReshardWithWindow` call on the host side — including calls on different `ncclComm_t` handles. Device-side concurrency (issuing successive reshards on separate CUDA streams from a single host thread) is supported. |
+| **Caller-synchronized finalization** | `ncclM2nFinalize` does not synchronize caller streams. Callers must complete M2N work before finalizing the associated handle and before releasing communicators, windows, streams, or buffers used by that work. |
 | **Static mesh-size caps**         | Compile-time array bounds in `src/reshard_limits.h` cap supported mesh sizes: `MAX_SOURCES = 16`, `MAX_TARGETS = 64`, `MAX_LOCAL_FOLLOWERS = 128` (RING); `MAX_DIRECT_SOURCES = 32`, `MAX_DIRECT_TARGETS = 64` (DIRECT). Larger meshes require recompiling. |
 | **Single-shot public API**        | The public API exposes one `ncclReshardWithWindow` collective per call. Batched/concurrent behavior is built by callers with multiple descriptors/comms, not by a persistent public API. |
 

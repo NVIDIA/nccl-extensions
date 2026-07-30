@@ -87,6 +87,9 @@ extern "C" {
 
 #define NCCL_EP_STATIC_ASSERT_STRUCT_ABI_IMPL_(type_, base_, current_version_) \
     NCCL_EP_STATIC_ASSERT( \
+        (current_version_) <= NCCL_EP_API_VERSION, \
+        #base_ "_CURRENT_VERSION exceeds current ABI version. Please bump the NCCL_EP_API_VERSION to " #current_version_); \
+    NCCL_EP_STATIC_ASSERT( \
         offsetof(type_, size) == 0, \
         #type_ " size must be the first member"); \
     NCCL_EP_STATIC_ASSERT( \
@@ -105,8 +108,11 @@ extern "C" {
 
 #define NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(type_, base_, version_) \
     NCCL_EP_STATIC_ASSERT( \
+        (version_) <= NCCL_EP_API_VERSION, \
+        #type_ " boundary version exceeds current ABI version. Please bump the NCCL_EP_API_VERSION to " #version_); \
+    NCCL_EP_STATIC_ASSERT( \
         (version_) <= base_ ## _CURRENT_VERSION, \
-        #type_ " boundary version exceeds current version"); \
+        #type_ " boundary version exceeds current type version. Please bump " #base_ "_CURRENT_VERSION"); \
     NCCL_EP_STATIC_ASSERT( \
         NCCL_EP_FIELD_END( \
             type_, \

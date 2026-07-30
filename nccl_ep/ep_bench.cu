@@ -3970,8 +3970,9 @@ void printUsage(const char* programName, int myRank) {
             "  --expert-major-alignment <N>      Per-expert zone alignment in tokens (Expert-major only, power of "
             "2)\n");
         printf(
-            "  --max-recv-token-slots-per-rank <N>  Per-rank recv-slot budget (0 = auto; HT default: "
-            "FLAT=nRanks*tokens, Expert-major=nRanks*tokens*top_k)\n");
+            "  --max-recv-token-slots-per-rank <N>  Per-rank recv-slot budget\n"
+            "                             HT only (0 = auto; HT default: FLAT=nRanks*tokens, Expert-major=nRanks*tokens*top_k).\n"
+            "                             Ignored in LL mode.\n");
         printf("  --zcopy                 Use ncclMemAlloc buffers + windows for supported direct token/scale paths\n");
         printf("  --max-num-sms <N>       Maximum SMs for EP kernels (0 = auto, default: 0)\n");
         printf("  --shuffle-sms <N> SMs for the token permutation (shuffle) kernels (0 = auto, default: 0)\n");
@@ -4030,7 +4031,7 @@ int main(int argc, char* argv[]) {
     bool dispatch_only = false;  // Skip combine run and validation (use with --validate)
     bool dynamic_tokens = false;  // Enable dynamic token allocation (HT only, for random topk)
     size_t expert_major_alignment = 0;  // 0 = no padding; >1 aligns each expert zone
-    unsigned int max_recv_tokens_per_rank = UINT_MAX;  // UINT_MAX = unset -> bench auto; 0 = lib auto (worst case)
+    unsigned int max_recv_tokens_per_rank = UINT_MAX;  // HT only; UINT_MAX = unset -> bench auto; 0 = lib auto (worst case)
     bool zcopy = false;  // Use ncclMemAlloc + windows for supported direct token/scale paths
     unsigned int max_num_sms = NCCL_EP_AUTO;  // Automatic SM assignment for different EP stages
     bool ht_em_local_dup = false;
@@ -4668,18 +4669,16 @@ int main(int argc, char* argv[]) {
     config.num_channels = NCCL_EP_AUTO;
     // HT worst case: FLAT = nRanks*max_tokens_per_rank;
     //                EM (any mode) = nRanks*max_tokens_per_rank*top_k.
-    // LL uses a uniform-routing estimate.
-    if (max_recv_tokens_per_rank == UINT_MAX) {
-        if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+    // LL ignores this field entirely and sizes to the worst case.
+    if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+        if (max_recv_tokens_per_rank == UINT_MAX) {
             const bool em = (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
             max_recv_tokens_per_rank = static_cast<unsigned int>(nRanks) * max_tokens_per_rank * (em ? top_k : 1u);
-        } else {
-            const unsigned int est = std::max(
-                1u,
-                max_tokens_per_rank * top_k * std::max(1u, num_local_experts) /
-                    std::max(1u, static_cast<unsigned int>(num_experts)) * static_cast<unsigned int>(nRanks));
-            max_recv_tokens_per_rank = std::max(1u, est);
         }
+    } else if (max_recv_tokens_per_rank == UINT_MAX) {
+        // Pass NCCL_EP_AUTO, not the unset sentinel: UINT_MAX would survive
+        // ncclEpCreateGroup's AUTO check and land in max_recv_tokens as -1.
+        max_recv_tokens_per_rank = NCCL_EP_AUTO;
     }
     config.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
     config.max_num_sms = max_num_sms;
@@ -4879,24 +4878,31 @@ int main(int argc, char* argv[]) {
     printf("Rank %d: handle creation took %.2f ms\n", myRank, handle_create_ms);
 
     // max_dispatch_tokens_per_rank is the per-rank dispatch count.
-    // num_recv_tokens is the max tokens this rank can receive (nRanks * max_dispatch_tokens_per_rank).
+    // num_recv_tokens is the HT recv-tensor row count: it sizes dispatch_outputs
+    // .tokens/.topk_idx/.topk_weights/.scales and combine_inputs.tokens. LL leaves
+    // it at 0 and never reads it — setupLowLatencyTensors* derive their own shapes
+    // (rank-major [nRanks, max_tpr, hidden], expert-major
+    // [num_local_experts, nRanks*max_tpr, hidden]) straight from max_tokens_per_rank.
     unsigned int num_recv_tokens = 0;
-    if (dynamic_tokens) {
-        void* total_data = nullptr;
-        total_data = recv_total_counter_tensor->data;
-        int32_t total_host = 0;
-        CUDACHECK(cudaMemcpy(&total_host, total_data, sizeof(int32_t), cudaMemcpyDeviceToHost));
-        assert(total_host >= 0);
-        num_recv_tokens = static_cast<unsigned int>(total_host);
-        if (myRank == 0) {
-            printf("[DEBUG] Dynamic tokens: num_recv_tokens=%u\n", num_recv_tokens);
-            fflush(stdout);
+    if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+        if (dynamic_tokens) {
+            void* total_data = nullptr;
+            total_data = recv_total_counter_tensor->data;
+            int32_t total_host = 0;
+            CUDACHECK(cudaMemcpy(&total_host, total_data, sizeof(int32_t), cudaMemcpyDeviceToHost));
+            assert(total_host >= 0);
+            num_recv_tokens = static_cast<unsigned int>(total_host);
+            if (myRank == 0) {
+                printf("[DEBUG] Dynamic tokens: num_recv_tokens=%u\n", num_recv_tokens);
+                fflush(stdout);
+            }
+        } else {
+            // Per-rank slot budget as configured above. ncclEpCreateGroup takes a
+            // const config, so this is the bench-side value, not a lib-resolved one.
+            num_recv_tokens = max_recv_tokens_per_rank;
         }
-    } else {
-        // num_recv_tokens = total per-rank slot budget = config.max_recv_tokens_per_rank (resolved by lib).
-        num_recv_tokens = config.max_recv_tokens_per_rank;
+        assert(num_recv_tokens);
     }
-    assert(num_recv_tokens);
 
     // HT recv bytes are pre-computed in calculateHighThroughputBytes via routing simulation
     if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && myRank == 0) {

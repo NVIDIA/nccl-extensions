@@ -90,7 +90,7 @@ __host__ __device__ constexpr int size_u8<ncclFloat8e5m2>() {
     return sizeof(uint8_t);
 }
 template <>
-__host__ __device__ constexpr int size_u8<ncclUint8>() {
+__host__ __device__ constexpr int size_u8<ncclFloat4x2>() {
     return sizeof(uint8_t);
 }
 
@@ -136,6 +136,10 @@ struct wire_type<ncclFloat8e4m3> {
 };
 template <>
 struct wire_type<ncclFloat8e5m2> {
+    using type = uint8_t;
+};
+template <>
+struct wire_type<ncclFloat4x2> {
     using type = uint8_t;
 };
 template <ncclDataType_t kDt>

@@ -1517,7 +1517,7 @@ void call_local_dup(
     };
     if (token_dtype == ncclFloat32) run(uint32_t{});
     else if (token_dtype == ncclFloat8e4m3 || token_dtype == ncclFloat8e5m2 ||
-             token_dtype == ncclUint8) run(uint8_t{});
+             token_dtype == ncclFloat4x2) run(uint8_t{});
     else run(uint16_t{});
 }
 

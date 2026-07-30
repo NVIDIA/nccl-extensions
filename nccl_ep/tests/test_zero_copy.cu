@@ -55,7 +55,7 @@ struct ScalesForwardWireCase {
 
 constexpr int kFp4LogicalHidden = 512;
 constexpr ScalesForwardWireCase kPackedFp4Wire{
-    "packed-fp4-u8", ncclUint8, kFp4LogicalHidden / 2,
+    "packed-fp4x2", ncclFloat4x2, kFp4LogicalHidden / 2,
     ncclUint8, kFp4LogicalHidden / 16};
 constexpr ScalesForwardWireCase kBf16Fp16Wire{
     "bf16-token-fp16-scale", ncclBfloat16, 8, ncclFloat16, 8};
@@ -72,6 +72,7 @@ size_t wire_dtype_bytes(ncclDataType_t dtype) {
         case ncclFloat8e4m3:
         case ncclFloat8e5m2:
         case ncclUint8:
+        case ncclFloat4x2:
             return 1;
         default:
             return 0;

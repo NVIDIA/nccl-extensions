@@ -41,8 +41,8 @@ inline const char* token_dtype_literal(ncclDataType_t dt) {
         return "ncclFloat8e4m3";
     case ncclFloat8e5m2:
         return "ncclFloat8e5m2";
-    case ncclUint8:
-        return "ncclUint8";
+    case ncclFloat4x2:
+        return "ncclFloat4x2";
     default:
         return "ncclBfloat16";
     }
@@ -62,8 +62,8 @@ inline const char* token_dtype_name_tag(ncclDataType_t dt) {
         return "_te4m3";
     case ncclFloat8e5m2:
         return "_te5m2";
-    case ncclUint8:
-        return "_tu8";
+    case ncclFloat4x2:
+        return "_tf4x2";
     default:
         return "_tbf16";
     }

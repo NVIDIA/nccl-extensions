@@ -31,13 +31,15 @@ struct DevCommCacheEntry {
 };
 
 /* One pool entry per (comm, dev) — a non-blocking stream paired with
- * the back-edge event we record on it.  The event is reused across
- * calls so we avoid cudaEvent{Create,Destroy} on every reshard. */
+ * caller-to-work readiness and work-to-caller completion events.  The events
+ * are reused across calls so we avoid cudaEvent{Create,Destroy} on every
+ * reshard. */
 struct StreamPoolEntry {
   ncclComm_t comm;
   int dev;
   cudaStream_t stream = nullptr;
-  cudaEvent_t event = nullptr;
+  cudaEvent_t readyEvent = nullptr;
+  cudaEvent_t doneEvent = nullptr;
 };
 
 static WindowCache gInternalWindowCache = {};
@@ -141,29 +143,42 @@ void cacheFinalize() {
   gDevcommCacheCount = 0;
 
   for (StreamPoolEntry& e : gStreamPool) {
-    if (e.event != nullptr) NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(e.event));
-    if (e.stream != nullptr) NCCL_M2N_CUDACHECK_WARN(cudaStreamDestroy(e.stream));
+    if (e.doneEvent != nullptr) {
+      NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(e.doneEvent));
+    }
+    if (e.readyEvent != nullptr) {
+      NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(e.readyEvent));
+    }
+    if (e.stream != nullptr) {
+      NCCL_M2N_CUDACHECK_WARN(cudaStreamDestroy(e.stream));
+    }
   }
   gStreamPool.clear();
 }
 
-ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream, cudaEvent_t* outEvent) {
-  if (outStream == nullptr || outEvent == nullptr) return ncclInvalidArgument;
+ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream, cudaEvent_t* outReadyEvent,
+                               cudaEvent_t* outDoneEvent) {
+  if (outStream == nullptr || outReadyEvent == nullptr || outDoneEvent == nullptr) {
+    return ncclInvalidArgument;
+  }
   /* Pool disabled (NCCL_RESHARD_STREAM_POOL_SIZE <= 0) — caller
    * should have gated on reshardGetStreamPoolSize() > 0; defend
    * anyway so a forgotten gate doesn't UB. */
   const int maxEntries = reshardGetStreamPoolSize();
-  if (maxEntries <= 0) return ncclInvalidArgument;
+  if (maxEntries <= 0) {
+    return ncclInvalidArgument;
+  }
 
   /* Find existing entry for (comm, dev). */
   for (StreamPoolEntry& e : gStreamPool) {
     if (e.comm == comm && e.dev == dev) {
       *outStream = e.stream;
-      *outEvent = e.event;
+      *outReadyEvent = e.readyEvent;
+      *outDoneEvent = e.doneEvent;
       return ncclSuccess;
     }
   }
-  /* Pool full — soft fall-through.  Caller checks *outEvent ==
+  /* Pool full — soft fall-through.  Caller checks *outStream ==
    * nullptr and runs on the user's default stream for this call. */
   if ((int)gStreamPool.size() >= maxEntries) {
     RESHARD_WARN(-1,
@@ -175,21 +190,38 @@ ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream
                  "uses more distinct (comm, dev) pairs.",
                  (int)gStreamPool.size(), maxEntries);
     *outStream = nullptr;
-    *outEvent = nullptr;
+    *outReadyEvent = nullptr;
+    *outDoneEvent = nullptr;
     return ncclSuccess;
   }
-  /* Lazy-create stream + event for the new (comm, dev). */
+  /* Lazy-create stream + events for the new (comm, dev). */
   StreamPoolEntry fresh;
   fresh.comm = comm;
   fresh.dev = dev;
   if (cudaStreamCreateWithFlags(&fresh.stream, cudaStreamNonBlocking) != cudaSuccess ||
-      cudaEventCreateWithFlags(&fresh.event, cudaEventDisableTiming) != cudaSuccess) {
-    if (fresh.event != nullptr) NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(fresh.event));
-    if (fresh.stream != nullptr) NCCL_M2N_CUDACHECK_WARN(cudaStreamDestroy(fresh.stream));
+      cudaEventCreateWithFlags(&fresh.readyEvent, cudaEventDisableTiming) != cudaSuccess ||
+      cudaEventCreateWithFlags(&fresh.doneEvent, cudaEventDisableTiming) != cudaSuccess) {
+    if (fresh.doneEvent != nullptr) {
+      NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(fresh.doneEvent));
+    }
+    if (fresh.readyEvent != nullptr) {
+      NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(fresh.readyEvent));
+    }
+    if (fresh.stream != nullptr) {
+      NCCL_M2N_CUDACHECK_WARN(cudaStreamDestroy(fresh.stream));
+    }
     return ncclSystemError;
   }
-  gStreamPool.push_back(fresh);
+  try {
+    gStreamPool.push_back(fresh);
+  } catch (...) {
+    NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(fresh.doneEvent));
+    NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(fresh.readyEvent));
+    NCCL_M2N_CUDACHECK_WARN(cudaStreamDestroy(fresh.stream));
+    return ncclSystemError;
+  }
   *outStream = fresh.stream;
-  *outEvent = fresh.event;
+  *outReadyEvent = fresh.readyEvent;
+  *outDoneEvent = fresh.doneEvent;
   return ncclSuccess;
 }

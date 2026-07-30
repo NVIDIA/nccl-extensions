@@ -46,6 +46,17 @@ Existing binaries must be rebuilt against the updated header.
   - Reshard operations enqueue asynchronous CUDA work. Callers must complete
     work submitted with a handle before finalizing it and must complete all M2N
     work in an epoch before finalizing the last explicit or default handle.
+- **Runtime hardening:**
+  - Integer and size environment values require a complete in-range decimal
+    parse. Positive-only knobs reject zero and negative values; trailing
+    characters and whitespace are rejected.
+    Invalid tuning values are ignored, except invalid or non-positive stream
+    pool sizes disable the pool and oversized values are capped.
+  - The internal non-blocking stream pool preserves both readiness and
+    completion ordering with the caller's default stream, including every
+    error return after stream setup.
+  - GIN signal counts reject overflow, and signal IDs are relative to the
+    source mesh so meshes with a non-zero `startRank` use the allocated range.
 - **Documentation:**
   - Public header comments are now Doxygen-readable and document the handle,
     descriptor, stream, and window contracts in the installed header.

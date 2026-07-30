@@ -135,6 +135,7 @@ typedef struct {
   size_t elementsPerChunk;
   size_t chunkSizeBytes;
   int totalCtas;
+  unsigned int mySignalBase;
 
   ncclReshardSourceInfo sources[MAX_SOURCES];
   int numSources;
@@ -205,6 +206,7 @@ typedef struct {
 
   size_t elementsPerChunk;
   int totalCtas;
+  unsigned int mySignalBase;
 
   size_t myWindowOffset;
 

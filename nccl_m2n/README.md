@@ -285,7 +285,9 @@ noted otherwise):
 - `window` is registered on `comm` itself with `NCCL_WIN_COLL_SYMMETRIC`.
 - `stream` is either an explicit CUDA stream or a default-stream sentinel
   (`NULL`, `cudaStreamLegacy`, or `cudaStreamPerThread`). Default-stream callers
-  run on an internal non-blocking stream pool when enabled.
+  run on an internal non-blocking stream pool when enabled. Readiness and
+  completion events preserve the caller stream's ordering before and after the
+  reshard operation.
 - Per-rank `src->dataPtr` / `dst->dataPtr` is either `NULL` for an inactive
   side or lies inside the registered window. If both pointers are present on
   one rank, their window offsets must match. Window-offset checks require
@@ -702,10 +704,10 @@ compile-time default (`DEFAULT_ELEMENTS_PER_CHUNK = 32`). The RING prepare path
 also uses `CHUNK_SIZE_BYTES` (256 KB) as a byte-level chunk size, overridable
 per-process via `NCCL_RESHARD_CHUNK_SIZE` (bytes).
 
-**Cross-dim transpose** — when cross-dim sharding would produce per-rank
-inner strides below `CROSS_DIM_TRANSPOSE_THRESHOLD` (256 KB), the library
+**Cross-dim transpose** — when cross-dim sharding would produce per-rank inner
+strides below `CROSS_DIM_TRANSPOSE_THRESHOLD` (256 KB), the library
 transparently transposes dimensions into a private buffer to keep GIN puts
-large. Applies to both 2-D and 3-D tensors; transparent to callers.
+large. Applies to both 2-D and 3-D tensors and is transparent to callers.
 
 ---
 
@@ -715,14 +717,24 @@ Most env vars are read once when an M2N runtime epoch is initialized. Env vars
 always override matching fields of `ncclM2nConfig_t`; `NCCL_RESHARD_CHUNK_SIZE`
 is cached for the RING prepare path.
 
+Strict decimal parsing accepts leading ASCII whitespace and an optional `+`,
+but requires the remainder of the string to contain only digits. Empty,
+non-positive, trailing-character, and out-of-range values are invalid. Except
+for `NCCL_RESHARD_STREAM_POOL_SIZE`, an invalid value is ignored and the
+configured or built-in value remains in effect. For the stream pool, an invalid
+or non-positive value disables the pool; values above
+`STREAM_POOL_MAX_SIZE` are capped to that maximum.
+
 | Variable | Effect |
 |---|---|
 | `NCCL_RESHARD_LOG_LEVEL`        | One of `NONE`, `WARN` (default), `INFO`, `DEBUG`, `TRACE`. |
 | `NCCL_RESHARD_ALGORITHM`        | `AUTO` (default), `RING`, or `DIRECT`. |
 | `NCCL_RESHARD_LB_MODE`          | `UNIFORM` (default) or `NODE_AWARE`. |
-| `NCCL_RESHARD_MAX_CTA`          | Overrides `config.maxCta`. |
-| `NCCL_RESHARD_STREAM_POOL_SIZE` | Max distinct `(comm, dev)` entries in the internal stream pool (default 4). |
-| `NCCL_RESHARD_CHUNK_SIZE`       | Override the library's default chunk size in **bytes**. |
+| `NCCL_RESHARD_MAX_CTA`          | Positive cap overriding `config.maxCta`; invalid values are ignored. |
+| `NCCL_RESHARD_SRC_DOMAIN_SIZE`  | Positive source domain-size override; invalid values are ignored. |
+| `NCCL_RESHARD_DST_DOMAIN_SIZE`  | Positive destination domain-size override; invalid values are ignored. |
+| `NCCL_RESHARD_STREAM_POOL_SIZE` | Max distinct `(comm, dev)` pool entries (default 4); invalid or non-positive values disable it and oversized values are capped. |
+| `NCCL_RESHARD_CHUNK_SIZE`       | Positive RING byte-level chunk size; invalid values are ignored. |
 
 ---
 

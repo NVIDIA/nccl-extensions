@@ -5,7 +5,6 @@
  * See LICENSE.txt for more license information.
  ************************************************************************/
 
-#include <climits>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -17,6 +16,7 @@
 #include "nccl.h"
 #include "nccl_m2n.h"
 #include "m2n_checks.h"
+#include "m2n_env_parse.h"
 #include "reshard_types.h"
 #include "m2n_log.h"
 #include "reshard_internal.h"
@@ -42,31 +42,26 @@ static M2nExitGuard gM2nExitGuard;
 // Values <= 0 disable the pool — default-stream callers then run on
 // the user's default stream directly (legacy synchronizing behavior).
 // Values above STREAM_POOL_MAX_SIZE are capped (with a warning).
-// strtol-based parsing: unparseable values (e.g. "abc") read as 0 and
-// likewise disable the pool.
-static int parseStreamPoolSize(const char* sizeEnv) {
-  char* end = nullptr;
-  long n = strtol(sizeEnv, &end, 10);
-  if (end == sizeEnv) {
-    return 0;
-  }
-  if (n < INT_MIN) {
-    return INT_MIN;
-  }
-  if (n > INT_MAX) {
-    return INT_MAX;
-  }
-  return (int)n;
-}
+// Invalid values likewise disable the pool.
 
-static void applyStreamPoolFromEnv() {
+void applyStreamPoolFromEnv() {
   // NOLINTNEXTLINE(concurrency-mt-unsafe) — init-time, single-thread on the caller
   const char* sizeEnv = getenv("NCCL_RESHARD_STREAM_POOL_SIZE");
   if (sizeEnv == nullptr) {
     return;
   }
 
-  int n = parseStreamPoolSize(sizeEnv);
+  int n = 0;
+  if (!parseM2nEnvInt(sizeEnv, &n)) {
+    RESHARD_WARN(-1,
+                 "NCCL_RESHARD_STREAM_POOL_SIZE='%s' is not a valid integer; "
+                 "stream pool disabled — default-stream callers will run on the "
+                 "user's default stream directly.",
+                 sizeEnv);
+    gReshardStreamPoolSize = 0;
+    return;
+  }
+
   if (n <= 0) {
     RESHARD_WARN(-1,
                  "NCCL_RESHARD_STREAM_POOL_SIZE='%s' (parsed as %d) <= 0; "

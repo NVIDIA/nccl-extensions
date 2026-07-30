@@ -213,6 +213,7 @@ static void debugPrintTransferPlan(int worldRank, int srcShardIdx, int dstShardI
 ncclReshardParams prepareReshardParams(int worldRank, const ncclDistTensor_t* src, const size_t srcTensorDims[],
                                           const ncclDistTensor_t* dst, const size_t dstTensorDims[],
                                           ncclWindow_t window, size_t elementsPerChunk, int numCtas,
+                                          unsigned int mySignalBase,
                                           int srcGpusPerDomain, int dstGpusPerDomain, const size_t* allWindowOffsets) {
   ncclReshardParams params;
   memset(&params, 0, sizeof(params));
@@ -251,6 +252,7 @@ ncclReshardParams prepareReshardParams(int worldRank, const ncclDistTensor_t* sr
    * touching getenv on the per-call hot path. */
   params.chunkSizeBytes = gReshardChunkSizeBytes > 0 ? gReshardChunkSizeBytes : CHUNK_SIZE_BYTES;
   params.totalCtas = numCtas;
+  params.mySignalBase = mySignalBase;
   params.myWorldRank = worldRank;
   params.ndims = ndims;
 
@@ -702,7 +704,7 @@ ncclReshardParams prepareReshardParams(int worldRank, const ncclDistTensor_t* sr
         int srcRank = getMeshRank(src, &fullSrcInfo, srcShard, sourceRep);
 
         ncclReshardSourceInfo* source = &params.sources[params.numSources++];
-        source->signalBase = srcRank * numCtas;
+        source->signalBase = computeReshardSignalBaseUnchecked(srcMesh, srcRank, numCtas);
         source->plan = plan;
 
         source->isContiguous = (plan.totalInnerTransfers == 1);
@@ -896,7 +898,7 @@ ncclReshardParams prepareReshardParams(int worldRank, const ncclDistTensor_t* sr
 ncclReshardDirectParams prepareDirectReshardParams(
   int worldRank, const ncclDistTensor_t* src, const size_t srcTensorDims[], const ncclDistTensor_t* dst,
   const size_t dstTensorDims[], ncclWindow_t window, size_t elementsPerChunk, int numCtas,
-  const size_t* allWindowOffsets) {
+  unsigned int mySignalBase, const size_t* allWindowOffsets) {
   ncclReshardDirectParams params;
   memset(&params, 0, sizeof(params));
   const ncclMesh_t* srcMesh = src->mesh;
@@ -910,6 +912,7 @@ ncclReshardDirectParams prepareDirectReshardParams(
   params.window = window;
   params.elementsPerChunk = elementsPerChunk;
   params.totalCtas = numCtas;
+  params.mySignalBase = mySignalBase;
   params.myWorldRank = worldRank;
   params.ndims = ndims;
 
@@ -1078,7 +1081,7 @@ ncclReshardDirectParams prepareDirectReshardParams(
       int srcRank = getMeshRank(src, &fullSrcInfo, srcShard, sourceRep);
 
       ncclReshardDirectSourceInfo* source = &params.sources[params.numSources++];
-      source->signalBase = srcRank * numCtas;
+      source->signalBase = computeReshardSignalBaseUnchecked(srcMesh, srcRank, numCtas);
       source->plan = plan;
       source->isContiguous = (plan.totalInnerTransfers == 1);
       source->totalBytes = plan.totalInnerTransfers * plan.innerSize;

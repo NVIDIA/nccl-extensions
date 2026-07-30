@@ -17,10 +17,10 @@
  * called during the first runtime initialization in each epoch, in that order.
  */
 
-#include <climits>
 #include <cstdlib>
 #include <cstring>
 
+#include "m2n_env_parse.h"
 #include "reshard_internal.h"
 #include "m2n_log.h"
 #include "reshard_types.h"
@@ -55,15 +55,6 @@ bool parseLbModeEnv(const char* s, ReshardLoadBalanceMode* out) {
     return true;
   }
   return false;
-}
-
-bool parsePositiveIntEnv(const char* s, int* out) {
-  if (s == nullptr || out == nullptr) return false;
-  char* end = nullptr;
-  long n = strtol(s, &end, 10);
-  if (end == s || n <= 0 || n > INT_MAX) return false;
-  *out = (int)n;
-  return true;
 }
 
 } // namespace
@@ -128,20 +119,19 @@ void applyReshardEnv() {
   if (parseLbModeEnv(getenv("NCCL_RESHARD_LB_MODE"), &lb)) gReshardLbMode = lb;
 
   int n;
-  if (parsePositiveIntEnv(getenv("NCCL_RESHARD_MAX_CTA"), &n)) {
+  if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_MAX_CTA"), &n)) {
     if (gReshardMaxCta > 0) RESHARD_INFO(-1, "Reshard config maxCta reset to NCCL_RESHARD_MAX_CTA=%d.", n);
     gReshardMaxCta = n;
   }
 
-  if (parsePositiveIntEnv(getenv("NCCL_RESHARD_SRC_DOMAIN_SIZE"), &n)) gReshardSrcDomainSize = n;
-  if (parsePositiveIntEnv(getenv("NCCL_RESHARD_DST_DOMAIN_SIZE"), &n)) gReshardDstDomainSize = n;
+  if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_SRC_DOMAIN_SIZE"), &n)) gReshardSrcDomainSize = n;
+  if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_DST_DOMAIN_SIZE"), &n)) gReshardDstDomainSize = n;
 
+  size_t sizeValue;
   /* Cache chunk-size override so prepareReshardParams doesn't touch
    * getenv on the hot path. */
-  if (const char* env = getenv("NCCL_RESHARD_CHUNK_SIZE")) {
-    char* end = nullptr;
-    long long v = strtoll(env, &end, 10);
-    if (end != env && v > 0) gReshardChunkSizeBytes = (size_t)v;
+  if (parseM2nEnvSize(getenv("NCCL_RESHARD_CHUNK_SIZE"), &sizeValue, false)) {
+    gReshardChunkSizeBytes = sizeValue;
   }
 }
 // NOLINTEND(concurrency-mt-unsafe)

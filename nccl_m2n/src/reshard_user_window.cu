@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -41,6 +42,7 @@
 #include "reshard_types.h"
 #include "m2n_checks.h"
 #include "m2n_log.h"
+#include "reshard_call_setup.h"
 #include "reshard_internal.h"
 #include "reshard_kernels.cuh"
 
@@ -139,7 +141,7 @@ __global__ __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void reshardKernelU
 
         if (plan.totalInnerTransfers == 0) continue;
 
-        unsigned int signalIdx = params.myWorldRank * params.totalCtas + blockIdx.x;
+        unsigned int signalIdx = params.mySignalBase + blockIdx.x;
 
         if (target.isContiguous) {
           size_t totalSize = target.totalBytes;
@@ -374,7 +376,7 @@ directReshardKernelUserWindow(
             size_t srcOffset = params.myWindowOffset + target.plan.srcBaseOffset + myByteStart;
             size_t dstOffset = target.windowOffset + target.plan.dstBaseOffset + myByteStart;
 
-            unsigned int signalIdx = params.myWorldRank * params.totalCtas + blockIdx.x;
+            unsigned int signalIdx = params.mySignalBase + blockIdx.x;
 
             if (laneId == 0) {
               gin.put(world, target.dstWorldRank, params.window, dstOffset, params.window, srcOffset, myBytes,
@@ -394,7 +396,7 @@ directReshardKernelUserWindow(
               srcOffset += params.myWindowOffset;
               dstOffset += target.windowOffset;
 
-              unsigned int signalIdx = params.myWorldRank * params.totalCtas + blockIdx.x;
+              unsigned int signalIdx = params.mySignalBase + blockIdx.x;
 
               if (laneId == 0) {
                 gin.put(world, target.dstWorldRank, params.window, dstOffset, params.window, srcOffset,
@@ -511,17 +513,24 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   // computeMeshGroupInfo loses track of the replication dimension.
   // Collapse dims to [total, 1] with placement[1] = SHARD(0) (a no-op
   // shard with count 1) so repMeshDim=0 is always well-defined.
-  auto fixFullyReplicated = [](ncclMesh_t* mesh, int placements[NCCL_RESHARD_MESH_NDIMS]) {
+  auto fixFullyReplicated = [](ncclMesh_t* mesh, int placements[NCCL_RESHARD_MESH_NDIMS]) -> ncclResult_t {
     if (placements[0] == NCCL_RESHARD_REPLICATE && placements[1] == NCCL_RESHARD_REPLICATE) {
-      int total = mesh->dims[0] * mesh->dims[1];
-      mesh->dims[0] = total;
+      size_t total = 0;
+      ncclResult_t result = computeReshardMeshSize(mesh, -1, &total);
+      if (result != ncclSuccess) return result;
+      if (total > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        RESHARD_WARN(-1, "reshard: fully replicated mesh size exceeds int (%zu)", total);
+        return ncclInvalidArgument;
+      }
+      mesh->dims[0] = static_cast<int>(total);
       mesh->dims[1] = 1;
       placements[1] = NCCL_RESHARD_SHARD(0);
     }
+    return ncclSuccess;
   };
 
-  fixFullyReplicated(&srcMeshLocal, srcTensorLocal.placements);
-  fixFullyReplicated(&dstMeshLocal, dstTensorLocal.placements);
+  NCCL_M2N_CHECK(fixFullyReplicated(&srcMeshLocal, srcTensorLocal.placements));
+  NCCL_M2N_CHECK(fixFullyReplicated(&dstMeshLocal, dstTensorLocal.placements));
   std::shared_ptr<ncclM2nHandleState> handleState;
   NCCL_M2N_CHECK(acquireM2nHandle(handle, &handleState));
 
@@ -534,35 +543,24 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   UW_NCCLCHECK(ncclCommUserRank(comm, &worldRank));
   UW_NCCLCHECK(ncclCommCount(comm, &worldSize));
 
-  // Match the comm's CUDA device.
   int currentCudaDev;
-  UW_CUDACHECK(cudaGetDevice(&currentCudaDev));
   ncclCommProperties commProps = NCCL_COMM_PROPERTIES_INITIALIZER;
-  ncclResult_t propsResult = ncclCommQueryProperties(comm, &commProps);
-  if (propsResult == ncclSuccess && currentCudaDev != commProps.cudaDev) UW_CUDACHECK(cudaSetDevice(commProps.cudaDev));
-
-  // Default-stream callers run on a library-owned non-blocking
-  // stream from the pool; back-edge below makes subsequent default-
-  // stream work observe our completion.  See nccl_m2n.h for the
-  // full contract.  NCCL_RESHARD_STREAM_POOL_SIZE=0 disables this
-  // (forces legacy synchronizing-default-stream behavior).
-  const bool isDefaultStream = (stream == nullptr || stream == cudaStreamLegacy || stream == cudaStreamPerThread);
-  const bool wantPool = isDefaultStream && reshardGetStreamPoolSize() > 0;
-  cudaStream_t workStream = stream;
-  cudaEvent_t poolEvent = nullptr;
-  if (wantPool) {
-    const int dev = (propsResult == ncclSuccess) ? commProps.cudaDev : currentCudaDev;
-    UW_NCCLCHECK(streamPoolAcquire(comm, dev, &workStream, &poolEvent));
-    if (workStream == nullptr) {
-      /* Pool full — streamPoolAcquire warned.  Run on the
-       * caller's default stream directly for this call. */
-      workStream = stream;
-    }
+  ncclResult_t propsResult = ncclSuccess;
+  ncclResult_t setupResult = reshardMatchCommCudaDevice(comm, &currentCudaDev, &commProps, &propsResult);
+  if (setupResult != ncclSuccess) {
+    return setupResult;
   }
-  /* True iff we got a pool slot (stream + event).  Drives the
-   * back-edge cudaEventRecord/Wait below.  False both when the
-   * caller passed an explicit stream and when the pool was full. */
-  const bool acquiredPoolSlot = (poolEvent != nullptr);
+
+  // Default-stream callers run on a library-owned non-blocking stream from
+  // the pool. Readiness and completion events preserve the caller stream's
+  // ordering. NCCL_RESHARD_STREAM_POOL_SIZE=0 runs on the caller stream.
+  ReshardWorkStream work{};
+  setupResult = reshardSetupWorkStream(comm, stream, currentCudaDev, propsResult, &commProps, &work);
+  if (setupResult != ncclSuccess) {
+    return setupResult;
+  }
+  ReshardWorkStreamCompletion workCompletion(stream, &work);
+  cudaStream_t workStream = work.stream;
 
   // ------------------------------------------------------------------
   // Single-offset contract.  Each rank verifies that srcBuffer and
@@ -638,8 +636,16 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   int numCtas = pickNumCtas(bytesPerRank, algo);
   size_t elementsPerChunk = pickElementsPerChunk(bytesPerRank, algo);
 
-  int srcTotal = srcMesh->dims[0] * srcMesh->dims[1];
-  int ginSignalCount = srcTotal * numCtas;
+  int ginSignalCount = 0;
+  NCCL_M2N_CHECK(computeReshardGinSignalCount(srcMesh, numCtas, worldRank, &ginSignalCount));
+
+  size_t srcTotal = 0;
+  NCCL_M2N_CHECK(computeReshardMeshSize(srcMesh, worldRank, &srcTotal));
+  unsigned int mySignalBase = 0;
+  int64_t srcRankOffset = static_cast<int64_t>(worldRank) - static_cast<int64_t>(srcMesh->startRank);
+  if (srcRankOffset >= 0 && static_cast<size_t>(srcRankOffset) < srcTotal) {
+    NCCL_M2N_CHECK(computeReshardSignalBase(srcMesh, worldRank, numCtas, worldRank, &mySignalBase));
+  }
 
   // ------------------------------------------------------------------
   // Get-or-create the global devComm on this stream.  This both gives us
@@ -755,10 +761,11 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   void* effDstBuffer = dstBuffer;
   ncclWindow_t effWindow = window;
 
-  int srcMeshSize = srcMesh->dims[0] * srcMesh->dims[1];
-  int dstMeshSize = dstMesh->dims[0] * dstMesh->dims[1];
-  bool isSource = (worldRank >= srcMesh->startRank && worldRank < srcMesh->startRank + srcMeshSize);
-  bool isDest = (worldRank >= dstMesh->startRank && worldRank < dstMesh->startRank + dstMeshSize);
+  size_t dstMeshSize = 0;
+  NCCL_M2N_CHECK(computeReshardMeshSize(dstMesh, worldRank, &dstMeshSize));
+  int64_t dstRankOffset = static_cast<int64_t>(worldRank) - static_cast<int64_t>(dstMesh->startRank);
+  bool isSource = srcRankOffset >= 0 && static_cast<size_t>(srcRankOffset) < srcTotal;
+  bool isDest = dstRankOffset >= 0 && static_cast<size_t>(dstRankOffset) < dstMeshSize;
 
   if (doTranspose) {
     RESHARD_INFO(worldRank,
@@ -922,14 +929,14 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   if (algo == RESHARD_ALGO_DIRECT) {
     ncclReshardDirectParams directParams =
       prepareDirectReshardParams(worldRank, &effSrcTensor, effSrcDims, &effDstTensor, effDstDims, effWindow,
-                                 elementsPerChunk, numCtas, allWindowOffsets.data());
+                                 elementsPerChunk, numCtas, mySignalBase, allWindowOffsets.data());
     directParams.myWindowOffset = kernelOffset;
 
     directReshardKernelUserWindow<<<numCtas, threadsPerCta, 0, workStream>>>(directParams, *devCommPtr);
   } else {
     ncclReshardParams ringParams =
       prepareReshardParams(worldRank, &effSrcTensor, effSrcDims, &effDstTensor, effDstDims, effWindow, elementsPerChunk,
-                           numCtas, srcGpusPerDomain, dstGpusPerDomain, allWindowOffsets.data());
+                           numCtas, mySignalBase, srcGpusPerDomain, dstGpusPerDomain, allWindowOffsets.data());
 
     ringParams.myWindowOffset = kernelOffset;
     ringParams.ringNextWindowOffset = kernelOffset;
@@ -962,14 +969,5 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
 
   if (doTranspose) UW_NCCLCHECK(transposeBufferRecordEvent(comm, workStream));
 
-  // Pool back-edge: caller's default stream waits for our internal
-  // stream so subsequent default-stream work sees the result.  The
-  // event is pool-owned and reused across calls.  Skipped when the
-  // pool was full and we fell through to the caller's stream.
-  if (acquiredPoolSlot) {
-    UW_CUDACHECK(cudaEventRecord(poolEvent, workStream));
-    UW_CUDACHECK(cudaStreamWaitEvent(stream, poolEvent, 0));
-  }
-
-  return ncclSuccess;
+  return workCompletion.complete();
 }

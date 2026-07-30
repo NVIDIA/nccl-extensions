@@ -113,16 +113,16 @@ typedef enum {
      *
      * num_recv_slots is the recv-slot dimension chosen by the caller and must
      * be no smaller than the actual number of tokens this rank will receive.
-     *   - Static (the only mode supported in v0.1): choose a worst-case
-     *     num_recv_slots (e.g. max_recv_tokens_per_rank) to guard against
-     *     routing dynamism.
-     *   - Query-then-allocate (PLANNED, NOT YET SUPPORTED IN v0.1): supply
-     *     ncclEpLayoutInfo_t::recv_total_counter to either `ncclEpCreateHandle`
-     *     or `ncclEpUpdateHandle`;
-     *     the metadata kernel writes the actual recv count there, which the caller
-     *     reads (requires a GPU→CPU sync) before sizing tokens. This depends on
-     *     max_dispatch_tokens_per_rank = NCCL_EP_AUTO, which ncclEpCreateGroup
-     *     currently rejects for HT.
+     *   - Static: choose a worst-case num_recv_slots (e.g.
+     *     max_recv_tokens_per_rank) to guard against routing dynamism. Required
+     *     under CUDA Graph capture.
+     *   - Query-then-allocate: supply ncclEpLayoutInfo_t::recv_total_counter to
+     *     either `ncclEpCreateHandle` or `ncclEpUpdateHandle` to learn the actual
+     *     recv count. The metadata kernel writes it there; the caller copies it
+     *     device-to-host and synchronizes before allocating. The count is
+     *     available in any mode; to then size num_recv_slots to it rather than to
+     *     the worst case, the group must also be created with
+     *     ncclEpGroupConfig_t::max_recv_tokens_per_rank = NCCL_EP_AUTO.
      *
      * Tokens arrive as a single contiguous sequence with no rank-major or
      * expert-major structure.  The caller uses recv_topk_idx to route each

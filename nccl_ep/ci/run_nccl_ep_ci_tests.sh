@@ -71,6 +71,11 @@ run_ep_bench_variants() {
 run_nccl_ep_srun "$EP_TEST" "$TIME" -a ll              -t 128  -d 7168
 run_nccl_ep_srun "$EP_TEST" "$TIME" -a ht -L fl        -t 4096 -d 7168
 run_nccl_ep_srun "$EP_TEST" "$TIME" -a ht -L em        -t 4096 -d 7168
+# -q: query-then-allocate. Creates the group with max_recv_tokens_per_rank =
+# NCCL_EP_AUTO and sizes the dispatch outputs to the recv count read back from
+# ncclEpLayoutInfo_t::recv_total_counter, instead of the worst case.
+run_nccl_ep_srun "$EP_TEST" "$TIME" -a ht -L fl -q     -t 4096 -d 7168
+run_nccl_ep_srun "$EP_TEST" "$TIME" -a ht -L em -q     -t 4096 -d 7168
 
 # ep_bench: layout × batch-size × datatype cross-product (override bench wall time with NCCL_EP_BENCH_SLURM_TIME if needed)
 # LL supports {expert-major, rank-major}; HT supports {flat, expert-major}.

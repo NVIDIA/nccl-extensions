@@ -418,8 +418,8 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
 - Supports `NCCL_EP_LAYOUT_FLAT` and `NCCL_EP_LAYOUT_EXPERT_MAJOR` layouts.
 
 - **`NCCL_EP_LAYOUT_FLAT`**: dispatch output is a contiguous 2D sequence `[N(r) x hidden]` where `N(r)` is the total number of tokens targeting this rank.
-  - The output buffer must be pre-allocated with capacity for `max_recv_tokens_per_rank` tokens.
-  - The actual N(r) for a given dispatch is written by the metadata kernel into `ncclEpLayoutInfo_t.recv_total_counter` when that scalar tensor is provided.
+  - Static allocation: the output buffers are pre-allocated with capacity for `max_recv_tokens_per_rank` tokens. Required under CUDA Graph capture.
+  - Query-then-allocate: supply `ncclEpLayoutInfo_t.recv_total_counter` to `ncclEpCreateHandle` / `ncclEpUpdateHandle`; the metadata kernel writes the actual N(r) there, and the caller copies it device-to-host and synchronizes before allocating. The count is readable in any mode; to size the dispatch outputs to it rather than to the worst case, the group must also be created with `max_recv_tokens_per_rank = NCCL_EP_AUTO`.
   - `dispatch_outputs.topk_idx` and `dispatch_outputs.topk_weights` carry per-slot routing metadata alongside the received tokens.
   - The caller uses `topk_idx` to route each slot to the correct local expert(s), applies the weighted reduction using `topk_weights`, and passes the pre-reduced `[N(r) x hidden]` tensor as `combine_inputs.tokens` to `ncclEpCombine`.
 

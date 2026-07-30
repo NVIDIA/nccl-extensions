@@ -228,10 +228,9 @@ ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle);
  * @param[in] stream  Explicit CUDA stream, or the default stream (NULL /
  *                    `cudaStreamLegacy` / `cudaStreamPerThread`).  Default-
  *                    stream callers run on a library-owned non-blocking
- *                    stream from a per-(comm, device) pool; a back-edge
- *                    event makes subsequent default-stream work see the
- *                    result.  Prior default-stream work is NOT waited on —
- *                    pass an explicit stream if you need that ordering.
+ *                    stream from a per-(comm, device) pool.  Readiness and
+ *                    completion events preserve the caller stream's ordering
+ *                    before and after the reshard operation.
  *
  * @return ncclSuccess on success, ncclInvalidArgument if any precondition is
  *         violated, or ncclSystemError if default-handle creation fails.

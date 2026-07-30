@@ -135,7 +135,7 @@ bool shouldTransposeForCrossDim(const size_t* srcDimsBytes, const size_t* dstDim
   if (ndims == 2 && dstShardDim == 1 && srcShardDim != 1) {
     const size_t* dims = (dstDimsBytes[0] > 0) ? dstDimsBytes : srcDimsBytes;
     size_t innerSize = dims[1];
-    if (innerSize < CROSS_DIM_TRANSPOSE_THRESHOLD) {
+    if (innerSize < CROSS_DIM_TRANSPOSE_THRESHOLD_BYTES) {
       *swapDimA = 0;
       *swapDimB = 1;
       return true;
@@ -157,7 +157,7 @@ bool shouldTransposeForCrossDim(const size_t* srcDimsBytes, const size_t* dstDim
   if (dstShardDim == ndims - 1) innerSize = globalInner / dstShardCount;
   if (srcShardDim == ndims - 1) innerSize = globalInner / srcShardCount;
 
-  if (innerSize >= CROSS_DIM_TRANSPOSE_THRESHOLD) return false;
+  if (innerSize >= CROSS_DIM_TRANSPOSE_THRESHOLD_BYTES) return false;
 
   int freeDim = -1;
   for (int d = 0; d < ndims; d++) {

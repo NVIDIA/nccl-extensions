@@ -180,6 +180,7 @@ static size_t ncclTypeSize(ncclDataType_t nccl_type) {
     case ncclUint8:
     case ncclFloat8e4m3:
     case ncclFloat8e5m2:
+    case ncclFloat4x2:
         return 1;
     case ncclFloat16:
     case ncclBfloat16:
@@ -204,7 +205,7 @@ static bool validate_dtype(ncclDataType_t dt) {
 }
 static bool validate_scales_forward_token_dtype(ncclDataType_t dt) {
     return dt == ncclFloat32 || dt == ncclFloat16 || dt == ncclBfloat16 ||
-        dt == ncclFloat8e4m3 || dt == ncclFloat8e5m2 || dt == ncclUint8;
+        dt == ncclFloat8e4m3 || dt == ncclFloat8e5m2 || dt == ncclFloat4x2;
 }
 
 static bool validate_scales_forward_scale_dtype(ncclDataType_t dt) {

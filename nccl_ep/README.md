@@ -138,15 +138,18 @@ names the struct and the **Field** column names the field within it.
 
 `NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD` forwards the physical bytes of two 2D
 inputs: tokens `[B x H]` and scales `[B x S]`. `S` is taken directly from the
-scale tensor; the recipe does not infer a scale-block size. Tokens and scales
-may independently use FP32, FP16, BF16, FP8, or `ncclUint8`, and each physical
-row and storage base (or window offset) must be 16-byte aligned. `ncclUint8`
-is raw byte storage; packed FP4 callers conventionally use physical shape
-`[B x H/2]`, where each byte carries two logical FP4 values. Dispatch scale
-outputs have the same leading layout dimensions as token outputs and `S` as
-their final dimension. In LL rank-major mode, token and scale output descriptors
-can independently be backed by NCCL windows. See the full public API contract in
-`nccl_ep.h`.
+scale tensor; the recipe does not infer a scale-block size. Tokens may use
+FP32, FP16, BF16, FP8, or `ncclFloat4x2`; scales may use FP32, FP16, BF16,
+FP8, or `ncclUint8` raw byte storage. Each physical row and storage base (or
+window offset) must be 16-byte aligned. `ncclFloat4x2` is a packed pair of
+logical FP4 values: for logical hidden size `H`, use physical token shape
+`[B x H/2]` (so `sizes[1]` is `H/2`, not `H`). The token row alignment rule
+requires `H` to be a multiple of 32; the independently supplied scale row must
+also be 16-byte aligned. EP only byte-forwards this reserved type—NCCL
+collectives do not yet support it. Dispatch scale outputs have the same leading
+layout dimensions as token outputs and `S` as their final dimension. In LL
+rank-major mode, token and scale output descriptors can independently be backed
+by NCCL windows. See the full public API contract in `nccl_ep.h`.
 
 
 #### LL mode (same data type)

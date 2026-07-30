@@ -30,6 +30,7 @@ static size_t recipe_elem_bytes(ncclDataType_t dtype) {
         case ncclFloat8e5m2:
         case ncclInt8:
         case ncclUint8:
+        case ncclFloat4x2:
             return 1;
         case ncclInt64:
             return 8;
@@ -60,9 +61,9 @@ enum class MisalignedRecipeStorage { InputTokens, InputScales, OutputTokens, Out
 static void expect_invalid_misaligned_recipe_storage(
     ncclEpHandle_t handle,
     MisalignedRecipeStorage field) {
-    RecipeTensor tokens(ncclUint8, kNumTokens, 16);
+    RecipeTensor tokens(ncclFloat8e4m3, kNumTokens, 16);
     RecipeTensor scales(ncclUint8, kNumTokens, 16);
-    RecipeTensor output_tokens(ncclUint8, kMaxRecvSlots, 16);
+    RecipeTensor output_tokens(ncclFloat8e4m3, kMaxRecvSlots, 16);
     RecipeTensor output_scales(ncclUint8, kMaxRecvSlots, 16);
     ncclEpTensor_t* target = field == MisalignedRecipeStorage::InputTokens ? &tokens.tensor :
         field == MisalignedRecipeStorage::InputScales ? &scales.tensor :
@@ -87,7 +88,7 @@ static void expect_invalid_ht_scales_forward_output(
     size_t output_token_cols,
     size_t output_scale_rows,
     size_t output_scale_cols) {
-    RecipeTensor tokens(ncclUint8, kNumTokens, 16);
+    RecipeTensor tokens(ncclFloat8e4m3, kNumTokens, 16);
     RecipeTensor scales(ncclUint8, kNumTokens, 16);
     RecipeTensor topk_weights(ncclFloat32, kNumTokens, kTopK);
     RecipeTensor output_tokens(output_token_dtype, output_token_rows, output_token_cols);
@@ -406,9 +407,9 @@ TEST_F(QuantizationRecipeTest, ScalesForwardDispatchPreservesPackedFp4Bytes) {
 
     ncclEpTensor_t *tokens = nullptr, *scales = nullptr;
     ncclEpTensor_t *recv_tokens = nullptr, *recv_scales = nullptr, *expert_counters = nullptr;
-    NCCL_ASSERT(epTensorCreate(&tokens, 2, ncclUint8, d_tokens, kNumTokens, kPackedHidden));
+    NCCL_ASSERT(epTensorCreate(&tokens, 2, ncclFloat4x2, d_tokens, kNumTokens, kPackedHidden));
     NCCL_ASSERT(epTensorCreate(&scales, 2, ncclUint8, d_scales, kNumTokens, kScalesPerToken));
-    NCCL_ASSERT(epTensorCreate(&recv_tokens, 3, ncclUint8, d_recv_tokens,
+    NCCL_ASSERT(epTensorCreate(&recv_tokens, 3, ncclFloat4x2, d_recv_tokens,
                                num_local_experts, recv_slots, kPackedHidden));
     NCCL_ASSERT(epTensorCreate(&recv_scales, 3, ncclUint8, d_recv_scales,
                                num_local_experts, recv_slots, kScalesPerToken));
@@ -586,12 +587,12 @@ static void run_ht_expert_major_scales_forward_packed_fp4(
     NCCL_ASSERT(epTensorCreate(&topk, 2, ncclInt64, d_topk, kHtTokens, kTopK2));
     NCCL_ASSERT(epTensorCreate(&topk_weights, 2, ncclFloat32, d_topk_weights, kHtTokens, kTopK2));
     NCCL_ASSERT(epTensorCreate(&recv_topk_weights, 1, ncclFloat32, d_recv_topk_weights, kMaxRecvRows));
-    NCCL_ASSERT(epTensorCreate(&tokens, 2, ncclUint8, d_tokens, kHtTokens, kPackedHidden));
+    NCCL_ASSERT(epTensorCreate(&tokens, 2, ncclFloat4x2, d_tokens, kHtTokens, kPackedHidden));
     NCCL_ASSERT(epTensorCreate(&scales, 2, ncclUint8, d_scales, kHtTokens, kScaleBytes));
     NCCL_ASSERT(epTensorCreate(
         &recv_tokens,
         2,
-        ncclUint8,
+        ncclFloat4x2,
         windowed_outputs ? nullptr : d_recv_tokens,
         kMaxRecvRows,
         kPackedHidden));
@@ -788,6 +789,24 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRequiresInputAndOutputScales) {
     NCCL_ASSERT(ncclEpHandleDestroy(handle));
 }
 
+TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUint8TokenDtype) {
+    RecipeTensor tokens(ncclUint8, kNumTokens, 16);
+    RecipeTensor output_tokens(ncclUint8, kMaxRecvSlots, 16);
+    RecipeTensor input_scales(ncclUint8, kNumTokens, 16);
+    RecipeTensor output_scales(ncclUint8, kMaxRecvSlots, 16);
+    ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+    inputs.tokens = &tokens.tensor;
+    inputs.scales = &input_scales.tensor;
+    outputs.tokens = &output_tokens.tensor;
+    outputs.scales = &output_scales.tensor;
+    ncclEpHandle_t handle = make_handle(nullptr);
+    EXPECT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclInvalidArgument);
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+}
+
 TEST_F(QuantizationRecipeTest, ScalesForwardRejectsMismatchedScaleDtype) {
     RecipeTensor tokens(ncclFloat8e4m3);
     RecipeTensor output_tokens(ncclFloat8e4m3, kMaxRecvSlots, kHidden);
@@ -809,8 +828,8 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRejectsMismatchedScaleDtype) {
 // These are host-side contract tests: validation rejects the malformed byte
 // strides before dispatch can enqueue or launch a device kernel.
 TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUnalignedTokenRow) {
-    RecipeTensor tokens(ncclUint8, kNumTokens, 15);
-    RecipeTensor output_tokens(ncclUint8);
+    RecipeTensor tokens(ncclFloat8e4m3, kNumTokens, 15);
+    RecipeTensor output_tokens(ncclFloat8e4m3);
     RecipeTensor input_scales(ncclUint8, kNumTokens, 16);
     RecipeTensor output_scales(ncclUint8, kMaxRecvSlots, 16);
     ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
@@ -827,8 +846,8 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUnalignedTokenRow) {
 }
 
 TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUnalignedScaleRow) {
-    RecipeTensor tokens(ncclUint8);
-    RecipeTensor output_tokens(ncclUint8);
+    RecipeTensor tokens(ncclFloat8e4m3);
+    RecipeTensor output_tokens(ncclFloat8e4m3);
     RecipeTensor input_scales(ncclUint8, kNumTokens, 15);
     RecipeTensor output_scales(ncclUint8, kMaxRecvSlots, 15);
     ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
@@ -845,9 +864,9 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUnalignedScaleRow) {
 }
 
 TEST_F(QuantizationRecipeTest, ScalesForwardRejectsPayloadAboveGroupByteLimit) {
-    RecipeTensor tokens(ncclUint8, kNumTokens, 16);
+    RecipeTensor tokens(ncclFloat8e4m3, kNumTokens, 16);
     RecipeTensor input_scales(ncclUint8, kNumTokens, 32);
-    RecipeTensor output_tokens(ncclUint8, kMaxRecvSlots, 16);
+    RecipeTensor output_tokens(ncclFloat8e4m3, kMaxRecvSlots, 16);
     RecipeTensor output_scales(ncclUint8, kMaxRecvSlots, 32);
     ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
     ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
@@ -891,7 +910,7 @@ TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsMismatchedOutputTokenWidth)
     ASSERT_NE(handle, nullptr);
     expect_invalid_ht_scales_forward_output(
         handle,
-        ncclUint8,
+        ncclFloat8e4m3,
         kMaxRecvSlots,
         /*output_token_cols=*/32,
         kMaxRecvSlots,
@@ -904,7 +923,7 @@ TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsShortOutputCapacity) {
     ASSERT_NE(handle, nullptr);
     expect_invalid_ht_scales_forward_output(
         handle,
-        ncclUint8,
+        ncclFloat8e4m3,
         kMaxRecvSlots - 1,
         /*output_token_cols=*/16,
         kMaxRecvSlots - 1,
@@ -917,7 +936,7 @@ TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsMismatchedOutputRowCapaciti
     ASSERT_NE(handle, nullptr);
     expect_invalid_ht_scales_forward_output(
         handle,
-        ncclUint8,
+        ncclFloat8e4m3,
         kMaxRecvSlots + 1,
         /*output_token_cols=*/16,
         kMaxRecvSlots,
@@ -930,7 +949,7 @@ TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsMismatchedOutputScaleWidth)
     ASSERT_NE(handle, nullptr);
     expect_invalid_ht_scales_forward_output(
         handle,
-        ncclUint8,
+        ncclFloat8e4m3,
         kMaxRecvSlots,
         /*output_token_cols=*/16,
         kMaxRecvSlots,
@@ -943,7 +962,7 @@ TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsMismatchedOutputTokenDtype)
     ASSERT_NE(handle, nullptr);
     expect_invalid_ht_scales_forward_output(
         handle,
-        ncclFloat8e4m3,
+        ncclFloat8e5m2,
         kMaxRecvSlots,
         /*output_token_cols=*/16,
         kMaxRecvSlots,

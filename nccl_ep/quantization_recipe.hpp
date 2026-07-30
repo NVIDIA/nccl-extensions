@@ -51,9 +51,9 @@ inline ncclResult_t resolveDispatchKernelSpec(
                 spec->payload_cache_tag = "u8";
                 return ncclSuccess;
             case ncclFloat8e5m2:
-            case ncclUint8:
+            case ncclFloat4x2:
                 spec->wire_dtype_literal = "ncclFloat8e5m2";
-                if (token_dtype == ncclUint8) spec->wire_dtype_literal = "ncclUint8";
+                if (token_dtype == ncclFloat4x2) spec->wire_dtype_literal = "ncclFloat4x2";
                 spec->payload_bytes = sizeof(uint8_t);
                 spec->payload_type_literal = "uint8_t";
                 spec->payload_cache_tag = "u8";

@@ -120,7 +120,7 @@ struct DispatchRecipeDeviceTypes<NCCL_EP_DISPATCH_QUANT_NONE, ScaleT> {
 
 template <typename ScaleT>
 struct DispatchRecipeDeviceTypes<NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD, ScaleT> {
-    // tensor_hidden is physical width; packed FP4 uint8 tensors are already H/2.
+    // tensor_hidden is physical width; ncclFloat4x2 tensors are already H/2.
     using source_vec_t = int4;
     using transport_vec_t = int4;
     using scale_t = ScaleT;

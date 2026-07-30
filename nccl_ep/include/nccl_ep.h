@@ -12,6 +12,16 @@
 #include <nccl.h>
 #include "nccl_ep/ep_enums.h"
 
+// NCCL reserves value 12 for ncclFloat4x2: one byte containing two packed
+// 4-bit floating-point values. The NCCL version used to build this library
+// may not expose the enumerator yet, and NCCL collectives do not support it.
+// Define the matching value here so EP can use it solely for its byte-copy
+// SCALES_FORWARD recipe. This also works with a newer NCCL header, where it
+// expands to that same reserved enum value.
+#ifndef ncclFloat4x2
+#define ncclFloat4x2 ((ncclDataType_t)12)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -737,14 +747,18 @@ ncclResult_t ncclEpUpdateHandle(
 // tensors must be absent.
 //
 // SCALES_FORWARD: inputs->tokens and inputs->scales are 2D tensors of FP32,
-// FP16, BF16, FP8, or uint8 whose physical bytes are forwarded without
+// FP16, BF16, FP8, or (for tokens only) ncclFloat4x2. Scales may additionally
+// use ncclUint8 raw byte storage. Their physical bytes are forwarded without
 // conversion. Output dtypes and physical row widths must match their respective
 // inputs, round_scales must be zero, and token/scale rows plus their storage
-// base (or window offset) must be 16-byte aligned. ncclUint8 is raw byte
-// storage; packed FP4 callers conventionally use physical shape [tokens, H/2],
-// where each byte stores two logical FP4 values. inputs->scales->sizes[1] is the
-// caller-provided scale-element count per token. LL outputs use the documented
-// 3D layout shapes; their token and scale outputs can independently be window-backed.
+// base (or window offset) must be 16-byte aligned. ncclFloat4x2 is a packed
+// pair of logical FP4 values: for logical hidden size H, tokens must have shape
+// [tokens, H/2], so H must be even and sizes[1] is H/2 (not H). The 16-byte
+// row-alignment rule therefore requires H to be a multiple of 32. EP only
+// transports ncclFloat4x2; NCCL collectives still do not support this reserved
+// dtype. inputs->scales->sizes[1] is the caller-provided scale-element count
+// per token. LL outputs use the documented 3D layout shapes; their token and
+// scale outputs can independently be window-backed.
 // HT outputs are 2D and impose a both-or-neither window rule; expert-major
 // permutation may stage before writing those windows.
 //

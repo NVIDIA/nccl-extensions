@@ -222,6 +222,7 @@ static size_t epDtypeBytes(ncclDataType_t dt) {
     switch (dt) {
     case ncclInt8:
     case ncclUint8:
+    case ncclFloat4x2:
         return 1;
     case ncclFloat8e4m3:
     case ncclFloat8e5m2:
@@ -445,6 +446,7 @@ static size_t tokenElemBytes(ncclDataType_t dtype) {
         case ncclFloat8e4m3:
         case ncclFloat8e5m2:
         case ncclUint8:
+        case ncclFloat4x2:
             return 1u;
         case ncclBfloat16:
         case ncclFloat16:
@@ -493,23 +495,25 @@ static const char* wireDtypeName(ncclDataType_t dtype) {
         case ncclFloat8e4m3: return "fp8e4m3";
         case ncclFloat8e5m2: return "fp8e5m2";
         case ncclUint8: return "uint8";
+        case ncclFloat4x2: return "fp4x2";
         default: return "unsupported";
     }
 }
 
-static bool parseWireDtype(const char* value, ncclDataType_t* dtype) {
+static bool parseScalesForwardDtype(const char* value, bool token_dtype, ncclDataType_t* dtype) {
     if (strcmp(value, "fp32") == 0) *dtype = ncclFloat32;
     else if (strcmp(value, "fp16") == 0) *dtype = ncclFloat16;
     else if (strcmp(value, "bf16") == 0) *dtype = ncclBfloat16;
     else if (strcmp(value, "fp8e4m3") == 0) *dtype = ncclFloat8e4m3;
     else if (strcmp(value, "fp8e5m2") == 0) *dtype = ncclFloat8e5m2;
-    else if (strcmp(value, "uint8") == 0) *dtype = ncclUint8;
+    else if (strcmp(value, "uint8") == 0 && !token_dtype) *dtype = ncclUint8;
+    else if (strcmp(value, "fp4x2") == 0 && token_dtype) *dtype = ncclFloat4x2;
     else return false;
     return true;
 }
 
 static bool usesPackedFp4Shape(ncclDataType_t scales_forward_token_dtype) {
-    return scales_forward_token_dtype == ncclUint8;
+    return scales_forward_token_dtype == ncclFloat4x2;
 }
 
 static float tokenElemToFloat(const void* data, size_t idx, ncclDataType_t dtype) {
@@ -3992,8 +3996,8 @@ void printUsage(const char* programName, int myRank) {
         printf("  --topk-idx-int32        LL only: pass ncclInt32 topk_idx instead of ncclInt64\n");
         printf("  --dispatch-quantization <recipe>  Dispatch quantization recipe: none|scales-forward|ds-fp8e3m4.\n");
         printf("  --mxfp8                 Shorthand: FP8 E4M3 tokens with Uint8 block-32 scales.\n");
-        printf("  --scales-forward-token-dtype <t>  scales-forward wire type: fp32|fp16|bf16|fp8e4m3|fp8e5m2|uint8.\n");
-        printf("                                      uint8 is packed FP4: physical H/2 bytes, two values per byte.\n");
+        printf("  --scales-forward-token-dtype <t>  scales-forward wire type: fp32|fp16|bf16|fp8e4m3|fp8e5m2|fp4x2.\n");
+        printf("                                      fp4x2 is packed FP4: physical H/2 bytes, two values per byte (H multiple of 32).\n");
         printf("  --scales-forward-scale-dtype <t>  scales-forward scale type: fp32|fp16|bf16|fp8e4m3|fp8e5m2|uint8.\n");
         printf(
             "  --expert-id-kind <k>    Numbering for recv_topk_idx writes: auto|local|global (LL-RM/HT-FLAT only; "
@@ -4270,9 +4274,9 @@ int main(int argc, char* argv[]) {
             }
             break;
         case 1002:  // --scales-forward-token-dtype
-            if (!parseWireDtype(optarg, &scales_forward_token_dtype)) {
+            if (!parseScalesForwardDtype(optarg, /*token_dtype=*/true, &scales_forward_token_dtype)) {
                 if (myRank == 0) {
-                    printf("Error: --scales-forward-token-dtype must be fp32, fp16, bf16, fp8e4m3, fp8e5m2, or uint8, got '%s'\n", optarg);
+                    printf("Error: --scales-forward-token-dtype must be fp32, fp16, bf16, fp8e4m3, fp8e5m2, or fp4x2, got '%s'\n", optarg);
                 }
                 MPI_Finalize();
                 return 1;
@@ -4280,7 +4284,7 @@ int main(int argc, char* argv[]) {
             scales_forward_token_dtype_explicit = true;
             break;
         case 1003:  // --scales-forward-scale-dtype
-            if (!parseWireDtype(optarg, &g_scaleDtype)) {
+            if (!parseScalesForwardDtype(optarg, /*token_dtype=*/false, &g_scaleDtype)) {
                 if (myRank == 0) {
                     printf("Error: --scales-forward-scale-dtype must be fp32, fp16, bf16, fp8e4m3, fp8e5m2, or uint8, got '%s'\n", optarg);
                 }
@@ -4321,6 +4325,14 @@ int main(int argc, char* argv[]) {
 
     if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
         const bool packed_fp4 = usesPackedFp4Shape(scales_forward_token_dtype);
+        if (packed_fp4 && hidden % 32u != 0) {
+            if (myRank == 0) {
+                printf("Error: fp4x2 uses physical H/2-byte rows; logical hidden (%u) must be divisible by 32 "
+                       "so the token row is 16-byte aligned\n", hidden);
+            }
+            MPI_Finalize();
+            return 1;
+        }
         if (g_scaleBlockOverride > 0 && hidden % g_scaleBlockOverride != 0) {
             if (myRank == 0) {
                 printf("Error: scales-forward hidden (%u) must be divisible by the scale block (%u)\n",
@@ -4334,8 +4346,8 @@ int main(int argc, char* argv[]) {
                                                  : benchmarkScalesPerToken(dispatch_quantization, hidden);
         const size_t token_row_bytes = token_elements * tokenElemBytes(scales_forward_token_dtype);
         const size_t scale_row_bytes = scale_elements * scaleElemBytes();
-        if ((packed_fp4 && hidden % 2u != 0) || token_row_bytes == 0 || scale_row_bytes == 0 ||
-            token_row_bytes % 16u != 0 || scale_row_bytes % 16u != 0) {
+        if (token_row_bytes == 0 || scale_row_bytes == 0 || token_row_bytes % 16u != 0 ||
+            scale_row_bytes % 16u != 0) {
             if (myRank == 0) {
                 printf("Error: scales-forward requires non-empty 16-byte-aligned physical rows "
                        "(token=%zu bytes, scale=%zu bytes)\n", token_row_bytes, scale_row_bytes);
@@ -4541,7 +4553,7 @@ int main(int argc, char* argv[]) {
         printf("  Dispatch dtype:  %s\n", wireDtypeName(printed_token_dtype));
         if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
             if (usesPackedFp4Shape(scales_forward_token_dtype)) {
-                printf("  Packed FP4:      yes (uint8 physical H/2, two logical values/byte)\n");
+                printf("  Packed FP4:      yes (fp4x2 physical H/2, two logical values/byte)\n");
             }
             const unsigned int scale_count = usesPackedFp4Shape(scales_forward_token_dtype)
                 ? hidden / PACKED_FP4_ELEMENTS_PER_SCALE

@@ -206,7 +206,10 @@ void printUsage(const char* programName, int myRank) {
         printf("  -L <fl|em>                   Layout (HT only; default: fl)\n");
         printf("                               fl:  Flat layout (default)\n");
         printf("                               em:  Expert-major layout (recv_topk_weights is 1D)\n");
-        printf("  -m                           Disable max_dispatch_tokens_per_rank (only supported with HT mode)\n");
+        printf(
+            "  -q                           Query-then-allocate: eager mode "
+            "(max_recv_tokens_per_rank=AUTO);\n"
+            "                               size dispatch outputs to the actual recv count (HT only)\n");
         printf("  -s <none|dispatch|combine|both>  Set send_only mode (default: none)\n");
         printf("                               none:     send_only=false for both dispatch and combine\n");
         printf("                               dispatch: send_only=true for dispatch only\n");
@@ -228,7 +231,7 @@ int main(int argc, char* argv[]) {
     int myRank, nRanks, localRank = 0;
     ncclEpAlgorithm_t algorithm = NCCL_EP_ALGO_LOW_LATENCY; // Default to 'll' (low latency)
     ncclEpLayout_t ht_layout = NCCL_EP_LAYOUT_FLAT; // HT layout (overridable via -L)
-    bool disable_max_tokens = false; // Flag to disable max_dispatch_tokens_per_rank
+    bool query_allocate = false;     // eager mode: size dispatch outputs to the actual recv count
     bool dispatch_send_only = false; // send_only flag for dispatch
     bool combine_send_only = false;  // send_only flag for combine
     bool cached_mode = false;        // cached mode flag
@@ -251,7 +254,7 @@ int main(int argc, char* argv[]) {
 
   // Parse command line arguments using getopt
     int opt;
-    while ((opt = getopt(argc, argv, "a:L:ms:crgt:d:e:h")) != -1) {
+    while ((opt = getopt(argc, argv, "a:L:s:crgt:d:e:hq")) != -1) {
         switch (opt) {
         case 'a':
             if (strcmp(optarg, "ll") == 0) {
@@ -281,8 +284,8 @@ int main(int argc, char* argv[]) {
                 exit(EXIT_FAILURE);
             }
             break;
-        case 'm':
-            disable_max_tokens = true;
+        case 'q':
+            query_allocate = true;
             break;
         case 's':
             if (strcmp(optarg, "none") == 0) {
@@ -361,18 +364,26 @@ int main(int argc, char* argv[]) {
         }
     }
 
-  // -m (NCCL_EP_AUTO for max_dispatch_tokens_per_rank) is intended for HT mode only.
-  // Not yet supported in the current release; code paths are kept for future use.
-    if (disable_max_tokens) {
-        if (myRank == 0) {
-            if (algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT) printf("Error: -m is only applicable to HT mode (-a ht)\n");
-            else
-                printf(
-                    "Error: -m (NCCL_EP_AUTO for max_dispatch_tokens_per_rank) is not yet supported.\n"
-                    "       This feature will be available in a future release for HT mode.\n");
+  // -q selects eager mode (max_recv_tokens_per_rank = NCCL_EP_AUTO): the caller reads the
+  // actual recv count back from ncclEpLayoutInfo_t::recv_total_counter at handle time and
+  // sizes the dispatch outputs to it. HT only, both layouts. That readback is a GPU->CPU
+  // sync, so eager mode rejects graph capture of dispatch -- refuse -g here rather than
+  // letting ncclEpDispatch return ncclInvalidUsage mid-capture.
+    if (query_allocate) {
+        bool ok = true;
+        if (algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+            if (myRank == 0) printf("Error: -q is only applicable to HT mode (-a ht)\n");
+            ok = false;
+        } else if (use_cuda_graph) {
+            if (myRank == 0)
+                printf("Error: -q cannot be combined with -g: eager mode does not support "
+                       "CUDA Graph capture of ncclEpDispatch\n");
+            ok = false;
         }
-        MPI_Finalize();
-        exit(EXIT_FAILURE);
+        if (!ok) {
+            MPI_Finalize();
+            exit(EXIT_FAILURE);
+        }
     }
 
   // calculating localRank based on hostname which is used in selecting a GPU
@@ -432,7 +443,7 @@ int main(int argc, char* argv[]) {
     config.algorithm = algorithm;                          // Algorithm type (set by command line)
     config.num_experts = num_experts;
   // max_dispatch_tokens_per_rank is the per-rank batch size (max tokens any single rank will send).
-    config.max_dispatch_tokens_per_rank = disable_max_tokens ? NCCL_EP_AUTO : num_tokens;
+    config.max_dispatch_tokens_per_rank = num_tokens;
     config.max_token_bytes = hidden * 2;                   // bfloat16
     config.rdma_buffer_size = NCCL_EP_AUTO; // NCCL_EP_AUTO for auto configuration, internally uses the hint
     config.num_qp_per_rank = NCCL_EP_AUTO; // Default is 24, see internode_ll.cu:181 for the minimum
@@ -440,7 +451,13 @@ int main(int argc, char* argv[]) {
     if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
     // HT requires max_recv_tokens_per_rank > 0. Worst-case = nRanks * num_tokens (for top_k=1)
     // or nRanks * num_tokens * top_k for EM under heavy fan-out; use the latter for safety.
-        config.max_recv_tokens_per_rank = static_cast<unsigned int>(nRanks) * num_tokens * top_k;
+    // -q instead selects eager mode, where the library derives the bound and the caller
+    // sizes its outputs to the actual recv count.
+        config.max_recv_tokens_per_rank =
+            query_allocate ? NCCL_EP_AUTO : static_cast<unsigned int>(nRanks) * num_tokens * top_k;
+    // Eager mode derives its bound from num_topk, and requires it for the Expert-Major
+    // layout (see the ncclEpCreateGroup check for NCCL_EP_AUTO + EXPERT_MAJOR).
+        config.num_topk = top_k;
     }
     config.alloc.alloc_fn = torchMalloc;
     config.alloc.free_fn = torchFree;
@@ -448,7 +465,7 @@ int main(int argc, char* argv[]) {
 
     const char* algorithm_name = (algorithm == NCCL_EP_ALGO_LOW_LATENCY) ? "LOW_LATENCY" : "HIGH_THROUGHPUT";
     printf("Rank %d: Testing ncclEpCreateGroup with algorithm: %s%s\n", myRank, algorithm_name,
-           disable_max_tokens ? " (no max_dispatch_tokens_per_rank)" : "");
+           query_allocate ? " (eager query-then-allocate outputs)" : "");
     NCCLCHECK(ncclEpCreateGroup(&ep_group, comm, &config));
 
     ncclEpTensor_t* topk_idx = nullptr;
@@ -485,11 +502,14 @@ int main(int argc, char* argv[]) {
     topk_idx_data = topk_idx->data;
     CUDACHECK(cudaMemcpy(topk_idx_data, topk_idx_host, num_tokens * top_k * sizeof(int64_t), cudaMemcpyHostToDevice));
 
-  // Create recv-counter tensors for ncclEpCreateHandle (only when disable_max_tokens is true)
+  // Create recv-counter tensors for ncclEpCreateHandle. -q (query_allocate) needs these:
+  // the scan kernel populates them at handle time so the caller can read the actual recv
+  // count before sizing outputs. For EM the counter reports the padded total, which is
+  // exactly the slot count to allocate.
     ncclEpLayoutInfo_t handle_layout_info = NCCL_EP_LAYOUT_INFO_INIT;
     ncclEpTensor_t* handle_recv_expert_counter = nullptr;
     ncclEpTensor_t* handle_recv_total_counter = nullptr;
-    if (disable_max_tokens) {
+    if (query_allocate) {
         NCCLCHECK(epMakeTensor(&handle_recv_expert_counter, 1, ncclInt32, num_local_experts));
         handle_layout_info.expert_counters = handle_recv_expert_counter;
         NCCLCHECK(epMakeTensor(&handle_recv_total_counter, 1, ncclInt32, 1));
@@ -518,20 +538,33 @@ int main(int argc, char* argv[]) {
             ep_group,
             handle_layout,
             topk_idx,
-            disable_max_tokens ? &handle_layout_info : nullptr,
+            query_allocate ? &handle_layout_info : nullptr,
             /*config=*/nullptr,
             s));
         CUDACHECK(cudaStreamSynchronize(s));
     }
 
     unsigned int num_recv_tokens = 0;
-    if (disable_max_tokens) {
+    if (query_allocate) {
         void* total_data = nullptr;
         total_data = handle_recv_total_counter->data;
         int32_t total_host = 0;
         CUDACHECK(cudaMemcpy(&total_host, total_data, sizeof(int32_t), cudaMemcpyDeviceToHost));
         assert(total_host >= 0);
         num_recv_tokens = static_cast<unsigned int>(total_host);
+        // This is the "allocate" half of query-then-allocate: every dispatch output
+        // below is sized from num_recv_tokens, so under -q they are the actual recv
+        // count instead of the worst case. Print both so the saving is visible in the
+        // log. The worst case is the bound eager mode derives internally,
+        // nRanks * max_dispatch_tokens_per_rank * num_topk.
+        const unsigned int worst_case = static_cast<unsigned int>(nRanks) * num_tokens * top_k;
+        printf(
+            "Rank %d: query-then-allocate: recv_total_counter=%u; sizing dispatch outputs to "
+            "%u rows (worst case %u)\n",
+            myRank,
+            num_recv_tokens,
+            num_recv_tokens,
+            worst_case);
     } else if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
     // HT recv buffer is sized by max_recv_tokens_per_rank.
         num_recv_tokens = config.max_recv_tokens_per_rank;
@@ -592,7 +625,8 @@ int main(int argc, char* argv[]) {
         NCCLCHECK(epMakeTensor(&ll_recv_expert_counter, 1, ncclInt32, static_cast<unsigned int>(num_local_experts)));
         dispatch_layout_info.expert_counters = ll_recv_expert_counter;
     } else {
-    // HT mode: recv_x is [num_recv_tokens, hidden]
+    // HT mode: recv_x is [num_recv_tokens, hidden]. Under -q num_recv_tokens is the
+    // count read back from recv_total_counter above; otherwise it is the worst case.
         NCCLCHECK(epMakeTensor(
             &recv_x,
             2,
@@ -694,7 +728,8 @@ int main(int argc, char* argv[]) {
         printf("Rank %d: [CUDA Graph: begin capture]\n", myRank);
         CUDACHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed));
         printf("Rank %d: Testing ncclEpUpdateHandle\n", myRank);
-        NCCLCHECK(ncclEpUpdateHandle(ep_handle, topk_idx, disable_max_tokens ? &handle_layout_info : nullptr, s));
+        NCCLCHECK(ncclEpUpdateHandle(
+            ep_handle, topk_idx, query_allocate ? &handle_layout_info : nullptr, s));
     }
 
     printf("Rank %d: Testing ncclEpDispatch (send_only=%s)\n", myRank, dispatch_send_only ? "true" : "false");
@@ -724,8 +759,8 @@ int main(int argc, char* argv[]) {
     CUDACHECK(cudaStreamSynchronize(s));
   // Read recv_count tensor to use for validation
   // LL mode: allocated and copied from device ll_recv_expert_counter
-  // HT mode with disable_max_tokens: points to handle_recv_expert_counter (already host memory)
-  // HT mode without disable_max_tokens: nullptr (no validation available)
+  // HT mode with query_allocate: copied from device handle_recv_expert_counter
+  // HT mode without it: nullptr (no validation available)
     int* recv_count_host = nullptr;
     bool should_free_recv_count = false;
     if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
@@ -735,10 +770,14 @@ int main(int argc, char* argv[]) {
         CUDACHECK(
             cudaMemcpy(recv_count_host, local_tensor0_data, num_local_experts * sizeof(int), cudaMemcpyDeviceToHost));
         should_free_recv_count = true;
-    } else if (disable_max_tokens && handle_recv_expert_counter != nullptr) {
-        void* handle_local_tensor0_data;
-        handle_local_tensor0_data = handle_recv_expert_counter->data;
-        recv_count_host = static_cast<int*>(handle_local_tensor0_data);
+    } else if (query_allocate && handle_recv_expert_counter != nullptr) {
+        // handle_recv_expert_counter->data is device memory (cudaMalloc); copy it to the
+        // host before the validation loops dereference it.
+        recv_count_host = new int[num_local_experts];
+        CUDACHECK(cudaMemcpy(
+            recv_count_host, handle_recv_expert_counter->data, num_local_experts * sizeof(int),
+            cudaMemcpyDeviceToHost));
+        should_free_recv_count = true;
     }
 
     unsigned int recv_from_expert_start = (local_experts_start + num_experts - num_local_experts) % num_experts;
@@ -814,7 +853,7 @@ int main(int argc, char* argv[]) {
         void* output0_data;
         output0_data = recv_x->data;
         CUDACHECK(cudaMemcpy(output_host, output0_data, recv_x_elems * 2, cudaMemcpyDeviceToHost));
-        int expected_count = disable_max_tokens ? num_recv_tokens : num_tokens;
+        int expected_count = query_allocate ? num_recv_tokens : num_tokens;
         for (int i = 0; i < expected_count; ++i) {
             size_t row = static_cast<size_t>(i) * hidden;
             for (int j = 0; j < ELEMENTS_TESTED_PER_TOKEN; ++j) {
@@ -887,7 +926,13 @@ int main(int argc, char* argv[]) {
                 }
             }
         } else {
-            for (int i = 0; i < num_tokens; i++) {
+            // Static: outputs are sized to the worst case, so validate the first num_tokens
+            // rows. Query-then-allocate: outputs are sized to the actual recv count, so
+            // validate exactly num_recv_tokens rows (mirrors the recv_x expected_count above)
+            // and never index past the actual-sized host buffers.
+            const int topk_rows =
+                query_allocate ? static_cast<int>(num_recv_tokens) : static_cast<int>(num_tokens);
+            for (int i = 0; i < topk_rows; i++) {
                 for (int j = 0; j < top_k; j++) {
                     int offset = i * top_k + j;
                     if (recv_topk_weights_host[offset] != expected_weight) {
@@ -1257,8 +1302,11 @@ int main(int argc, char* argv[]) {
 
     delete[] topk_idx_host;
     epFreeTensor(&topk_idx);
-    if (disable_max_tokens && handle_recv_expert_counter != nullptr) {
+    if (query_allocate && handle_recv_expert_counter != nullptr) {
         epFreeTensor(&handle_recv_expert_counter);
+    }
+    if (query_allocate && handle_recv_total_counter != nullptr) {
+        epFreeTensor(&handle_recv_total_counter);
     }
     epFreeTensor(&input_tokens);
     epFreeTensor(&recv_x);

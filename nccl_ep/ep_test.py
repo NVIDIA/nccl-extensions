@@ -166,7 +166,6 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
 
     parser = argparse.ArgumentParser(description="EP Test (Python)")
     parser.add_argument("-a", choices=["ll", "ht"], default="ll", help="Algorithm mode")
-    parser.add_argument("-m", action="store_true", help="Disable max_dispatch_tokens_per_rank (HT only)")
     parser.add_argument("-s", choices=["none", "dispatch", "combine", "both"], default="none",
                         help="Send-only mode")
     parser.add_argument("-c", action="store_true", help="Enable cached mode (HT only)")
@@ -176,7 +175,6 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
     args = parser.parse_args()
 
     algorithm = nccl_ep.Algorithm.LOW_LATENCY if args.a == "ll" else nccl_ep.Algorithm.HIGH_THROUGHPUT
-    disable_max_tokens = args.m
     dispatch_send_only = 1 if args.s in ("dispatch", "both") else 0
     combine_send_only = 1 if args.s in ("combine", "both") else 0
     cached_mode = args.c
@@ -187,15 +185,6 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
     if n_ranks not in (2, 4) and n_ranks % 8 != 0:
         if my_rank == 0:
             print("Error: nRanks must be 2, 4 or multiple of 8 for this test")
-        sys.exit(1)
-
-    if disable_max_tokens:
-        if my_rank == 0:
-            if algorithm != nccl_ep.Algorithm.HIGH_THROUGHPUT:
-                print("Error: -m is only applicable to HT mode (-a ht)")
-            else:
-                print("Error: -m (NCCL_EP_AUTO for max_dispatch_tokens_per_rank) is not yet supported.\n"
-                      "       This feature will be available in a future release for HT mode.")
         sys.exit(1)
 
     ELEMENTS_TESTED_PER_TOKEN = 10
@@ -242,7 +231,7 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
     )
 
     algorithm_name = "LOW_LATENCY" if algorithm == nccl_ep.Algorithm.LOW_LATENCY else "HIGH_THROUGHPUT"
-    extra = " (no max_dispatch_tokens_per_rank)" if disable_max_tokens else ""
+    extra = ""
     print(f"Rank {my_rank}: Testing ncclEpCreateGroup with algorithm: {algorithm_name}{extra}")
 
     ep_group = nccl_ep.Group.create(comm, config)
@@ -269,18 +258,6 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
 
     h2d(topk_idx.data, topk_idx_host, stream)
 
-    # -- recv_expert_counter for handle (only when disable_max_tokens) ------
-    handle_recv_expert_counter: DevTensor | None = None
-    handle_recv_total_counter: DevTensor | None = None
-    handle_layout_info: nccl_ep.LayoutInfo | None = None
-    if disable_max_tokens:
-        handle_recv_expert_counter = make_tensor(1, nccl_core.INT32, num_local_experts)
-        handle_recv_total_counter = make_tensor(1, nccl_core.INT32, 1)
-        handle_layout_info = nccl_ep.LayoutInfo(
-            expert_counters=handle_recv_expert_counter.tensor,
-            recv_total_counter=handle_recv_total_counter.tensor,
-        )
-
     # -- EP handle ----------------------------------------------------------
     print(f"Rank {my_rank}: Testing ncclEpCreateHandle")
     # LL branch below builds a 3D recv tensor and only fills expert_counters
@@ -293,19 +270,13 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
     )
     ep_handle = ep_group.create_handle(
         handle_layout, topk_idx.tensor,
-        layout_info=handle_layout_info,
+        layout_info=None,
         config=nccl_ep.HandleConfig(),
         stream=stream,
     )
     stream.sync()
 
-    if disable_max_tokens:
-        total_host = np.zeros(1, dtype=np.int32)
-        d2h(total_host, handle_recv_total_counter.data, stream)
-        stream.sync()
-        num_recv_tokens = int(total_host[0])
-    else:
-        num_recv_tokens = config.max_dispatch_tokens_per_rank * num_local_experts
+    num_recv_tokens = config.max_dispatch_tokens_per_rank * num_local_experts
     assert num_recv_tokens > 0
 
     dispatch_config = nccl_ep.DispatchConfig(send_only=dispatch_send_only, round_scales=0)
@@ -380,10 +351,6 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
         recv_count_host = np.empty(num_local_experts, dtype=np.int32)
         d2h(recv_count_host, local_tensor_recv_count.data, stream)
         stream.sync()
-    elif disable_max_tokens and handle_recv_expert_counter is not None:
-        recv_count_host = np.empty(num_local_experts, dtype=np.int32)
-        d2h(recv_count_host, handle_recv_expert_counter.data, stream)
-        stream.sync()
 
     recv_from_expert_start = (local_experts_start + num_experts - num_local_experts) % num_experts
     recv_rank = recv_from_expert_start // num_local_experts
@@ -431,7 +398,7 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
         output_host = np.empty(num_recv_tokens * hidden, dtype=np.uint16)
         d2h(output_host, output_tokens.data, stream)
         stream.sync()
-        check_count = num_recv_tokens if disable_max_tokens else num_tokens
+        check_count = num_tokens
         for i in range(check_count):
             for j in range(ELEMENTS_TESTED_PER_TOKEN):
                 expected = 0x1000 + recv_rank
@@ -678,9 +645,6 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
     free_tensor(topk_weights)
     free_tensor(combined_output)
     free_tensor(topk_idx)
-    if disable_max_tokens:
-        free_tensor(handle_recv_expert_counter)
-        free_tensor(handle_recv_total_counter)
     free_tensor(input_tokens)
     free_tensor(output_tokens)
     if not is_ll:

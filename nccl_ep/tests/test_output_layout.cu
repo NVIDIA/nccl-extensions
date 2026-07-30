@@ -13,6 +13,8 @@
  *   CombineRankMajor          — dispatch + identity expert + combine recovers original values (rank-major)
  *   CombineExpertMajor       — dispatch + identity expert + combine recovers original values (expert-major)
  *   DispatchMeta             — expert_token_counts_padded and expert_token_offsets
+ *   EagerRecvSizeFromLayoutInfo — query-then-allocate through the public recv_total_counter
+ *                              readback only (FLAT and EM)
  *
  * Tests (TopK2MixedRoutingTest fixture — top-k=2, mixed same-rank and cross-rank routing):
  *   RankMajorLayout              — correct recv counts and no duplication for same-rank pairs
@@ -597,6 +599,125 @@ TEST_F(OutputLayoutTest, EagerRecvSize) {
     ncclEpHandleConfig_t hcfg = NCCL_EP_HANDLE_CONFIG_INIT;
     hcfg.dispatch_output_per_expert_alignment = 8;
     run(/*em=*/true, &hcfg);
+
+    NCCL_ASSERT(ncclEpGroupDestroy(eager_group));
+}
+
+// Query-then-allocate through the public API only. EagerRecvSize above obtains the recv
+// count from ncclEpHandle_test_getNumRecvTokens, which callers cannot reach; this exercises
+// the sequence the docs actually describe: supply ncclEpLayoutInfo_t::recv_total_counter at
+// handle time, read it back on the host, size the dispatch outputs to it, dispatch.
+// Covers FLAT and EM -- for EM the counter reports the padded total.
+TEST_F(OutputLayoutTest, EagerRecvSizeFromLayoutInfo) {
+    ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
+    gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+    gcfg.num_experts = kNumExperts;
+    gcfg.max_dispatch_tokens_per_rank = kNumTokens;
+    gcfg.max_token_bytes = kHidden * sizeof(nv_bfloat16);
+    gcfg.rdma_buffer_size = NCCL_EP_AUTO;
+    gcfg.num_qp_per_rank = NCCL_EP_AUTO;
+    gcfg.num_channels = NCCL_EP_AUTO;
+    gcfg.max_recv_tokens_per_rank = NCCL_EP_AUTO; // eager mode
+    gcfg.num_topk = kTopK;
+    ncclEpGroup_t eager_group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&eager_group, g_comm, &gcfg));
+
+    auto run = [&](bool em) {
+        int32_t* d_total = nullptr;
+        CUDA_ASSERT(cudaMalloc(&d_total, sizeof(int32_t)));
+        CUDA_ASSERT(cudaMemset(d_total, 0, sizeof(int32_t)));
+        ncclEpTensor_t* t_total = nullptr;
+        NCCL_ASSERT(epTensorCreate(&t_total, 1, ncclInt32, d_total, 1));
+
+        ncclEpLayoutInfo_t li = NCCL_EP_LAYOUT_INFO_INIT;
+        li.recv_total_counter = t_total;
+
+        ncclEpHandle_t h = nullptr;
+        NCCL_ASSERT(ncclEpCreateHandle(
+            &h,
+            eager_group,
+            em ? NCCL_EP_LAYOUT_EXPERT_MAJOR : NCCL_EP_LAYOUT_FLAT,
+            em ? topk_idx_em_ : topk_idx_,
+            &li,
+            /*config=*/nullptr,
+            g_stream));
+        ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+
+        // The public readback is the only thing that may size the buffers below.
+        int32_t h_total = 0;
+        CUDA_ASSERT(cudaMemcpy(&h_total, d_total, sizeof(int32_t), cudaMemcpyDeviceToHost));
+        ASSERT_GT(h_total, 1) << "recv_total_counter must report a usable recv count";
+        const unsigned int num_recv = static_cast<unsigned int>(h_total);
+
+        // Cross-check only: the internal accessor must agree with the public counter.
+        unsigned int num_recv_internal = 0;
+        NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv_internal));
+        EXPECT_EQ(num_recv, num_recv_internal)
+            << "Rank " << g_rank << ": recv_total_counter and the internal recv count disagree"
+            << (em ? " (EM: counter must report the padded total)" : "");
+
+        nv_bfloat16 *d_tok = nullptr, *d_recv = nullptr;
+        float *d_weights = nullptr, *d_recv_w = nullptr;
+        int64_t* d_recv_idx = nullptr;
+        CUDA_ASSERT(cudaMalloc(&d_tok, kNumTokens * kHidden * sizeof(nv_bfloat16)));
+        CUDA_ASSERT(cudaMalloc(&d_recv, num_recv * kHidden * sizeof(nv_bfloat16)));
+        CUDA_ASSERT(cudaMalloc(&d_weights, kNumTokens * kTopK * sizeof(float)));
+        CUDA_ASSERT(cudaMalloc(&d_recv_w, num_recv * (em ? 1 : kTopK) * sizeof(float)));
+        if (!em) CUDA_ASSERT(cudaMalloc(&d_recv_idx, num_recv * kTopK * sizeof(int64_t)));
+        std::vector<float> h_w(kNumTokens * kTopK, 1.0f);
+        CUDA_ASSERT(cudaMemcpy(d_weights, h_w.data(), kNumTokens * kTopK * sizeof(float), cudaMemcpyHostToDevice));
+
+        ncclEpTensor_t *t_tok = nullptr, *t_recv = nullptr, *t_w = nullptr, *t_recv_w = nullptr,
+                       *t_recv_idx = nullptr;
+        NCCL_ASSERT(epTensorCreate(&t_tok, 2, ncclBfloat16, d_tok, kNumTokens, kHidden));
+        NCCL_ASSERT(epTensorCreate(&t_recv, 2, ncclBfloat16, d_recv, num_recv, kHidden));
+        NCCL_ASSERT(epTensorCreate(&t_w, 2, ncclFloat32, d_weights, kNumTokens, kTopK));
+        if (em) {
+            NCCL_ASSERT(epTensorCreate(&t_recv_w, 1, ncclFloat32, d_recv_w, num_recv));
+        } else {
+            NCCL_ASSERT(epTensorCreate(&t_recv_w, 2, ncclFloat32, d_recv_w, num_recv, kTopK));
+            NCCL_ASSERT(epTensorCreate(&t_recv_idx, 2, ncclInt64, d_recv_idx, num_recv, kTopK));
+        }
+
+        ncclEpDispatchInputs_t d_in = NCCL_EP_DISPATCH_INPUTS_INIT;
+        ncclEpDispatchOutputs_t d_out = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+        d_in.tokens = t_tok;
+        d_in.topk_weights = t_w;
+        d_out.tokens = t_recv;
+        d_out.topk_weights = t_recv_w;
+        d_out.topk_idx = t_recv_idx;
+        ncclEpDispatchConfig_t dcfg = NCCL_EP_DISPATCH_CONFIG_INIT;
+
+        EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclSuccess)
+            << "Rank " << g_rank << ": outputs sized from recv_total_counter must be accepted";
+        EXPECT_EQ(ncclEpComplete(h, nullptr, g_stream), ncclSuccess);
+        EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+
+        // One row short of the published count must be rejected on the host.
+        ncclEpTensor_t* t_recv_small = nullptr;
+        NCCL_ASSERT(epTensorCreate(&t_recv_small, 2, ncclBfloat16, d_recv, num_recv - 1, kHidden));
+        d_out.tokens = t_recv_small;
+        EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclInvalidArgument)
+            << "Rank " << g_rank << ": a buffer below recv_total_counter must be rejected";
+        ncclEpTensorDestroy(t_recv_small);
+
+        ncclEpTensorDestroy(t_tok);
+        ncclEpTensorDestroy(t_recv);
+        ncclEpTensorDestroy(t_w);
+        ncclEpTensorDestroy(t_recv_w);
+        if (t_recv_idx) ncclEpTensorDestroy(t_recv_idx);
+        cudaFree(d_tok);
+        cudaFree(d_recv);
+        cudaFree(d_weights);
+        cudaFree(d_recv_w);
+        if (d_recv_idx) cudaFree(d_recv_idx);
+        NCCL_ASSERT(ncclEpHandleDestroy(h));
+        ncclEpTensorDestroy(t_total);
+        cudaFree(d_total);
+    };
+
+    run(/*em=*/false);
+    run(/*em=*/true);
 
     NCCL_ASSERT(ncclEpGroupDestroy(eager_group));
 }

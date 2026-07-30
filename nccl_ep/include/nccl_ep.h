@@ -828,21 +828,21 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPAT
 //                            HT mode:
 //                              The sizing of the output tensors relies on `num_recv_slots`.
 //
-//                              For static allocations that allow CUDA Graph capturing,
-//                              `num_recv_slots` is calculated as `max_recv_tokens_per_rank`
-//                              (see ncclEpGroupConfig_t::max_recv_tokens_per_rank). This is the
-//                              only allocation mode supported in v0.1.
+//                              Static allocation: `num_recv_slots` is
+//                              `max_recv_tokens_per_rank` (see
+//                              ncclEpGroupConfig_t::max_recv_tokens_per_rank). Required for
+//                              CUDA Graph capturing.
 //
-//                              PLANNED, NOT YET SUPPORTED IN v0.1: dynamic allocation, where
-//                              `num_recv_slots` is the actual number of tokens this rank will
-//                              receive (optionally padded for Expert-major layout). The actual
-//                              number of tokens is intended to be obtained through the layout_info
-//                              argument of `ncclEpCreateHandle` / `ncclEpUpdateHandle` — for
-//                              expert-major layout, the last element of the exclusive expert
-//                              offsets array (ncclEpLayoutInfo_t::expert_offsets); for flat layout,
-//                              the ncclEpLayoutInfo_t::recv_total_counter scalar tensor. This mode
-//                              requires max_dispatch_tokens_per_rank = NCCL_EP_AUTO, which
-//                              ncclEpCreateGroup currently rejects for HT.
+//                              Query-then-allocate: `num_recv_slots` is the actual number of
+//                              tokens this rank will receive (padded for Expert-major layout).
+//                              Obtain the count from the ncclEpLayoutInfo_t::recv_total_counter
+//                              scalar tensor supplied to `ncclEpCreateHandle` /
+//                              `ncclEpUpdateHandle`; the caller copies it device-to-host and
+//                              synchronizes before allocating. The counter serves both layouts:
+//                              for expert-major it reports the padded total. The count is readable
+//                              in any mode; to size the outputs to it rather than to the worst case,
+//                              the group must also be created with
+//                              max_recv_tokens_per_rank = NCCL_EP_AUTO.
 //
 //                              The outputs->tokens tensor shape is [num_recv_slots, hidden].
 //

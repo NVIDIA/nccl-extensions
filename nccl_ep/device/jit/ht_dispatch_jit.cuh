@@ -332,7 +332,7 @@ inline std::string local_dup_jit_source(
     int hidden_dim,
     int pipe_depth,
     bool forward_dispatch,
-    ncclEpDispatchQuantizationRecipe_t recipe,
+    ncclEpDispQuant_t recipe,
     const char* token_type_literal = "uint16_t") {
     std::ostringstream src;
     src << "#include \"device/ht_ep.cuh\"\n"
@@ -357,7 +357,7 @@ inline void launch_local_dup(
     int hidden_dim,
     int pipe_depth,
     bool forward_dispatch,
-    ncclEpDispatchQuantizationRecipe_t recipe,
+    ncclEpDispQuant_t recipe,
     int num_blocks,
     ::ht_ep::local_dup_kernel_param_t<T>& param,
     int dynamic_smem_bytes,
@@ -369,7 +369,7 @@ inline void launch_local_dup(
         name << "local_dup"
              << "_hdim" << hidden_dim << "_pipe" << pipe_depth << "_b" << static_cast<int>(sizeof(T))
              << (forward_dispatch ? "_fwd" : "_bwd")
-             << (recipe != NCCL_EP_DISPATCH_QUANT_NONE ? "_sf" : "");
+             << (recipe != NCCL_EP_DISP_QUANT_NONE ? "_sf" : "");
         return name.str();
     }();
     const std::string source = local_dup_jit_source(hidden_dim, pipe_depth, forward_dispatch, recipe, token_type_literal);
@@ -420,7 +420,7 @@ inline int pick_dup_blocks_per_sm(int hidden_int4) {
 }
 
 inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec, int blocks_per_sm,
-                                                ncclEpDispatchQuantizationRecipe_t recipe) {
+                                                ncclEpDispQuant_t recipe) {
     std::ostringstream src;
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
@@ -450,7 +450,7 @@ inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec,
 
 inline void
 launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& param,
-                         ncclEpDispatchQuantizationRecipe_t recipe, cudaStream_t stream) {
+                         ncclEpDispQuant_t recipe, cudaStream_t stream) {
     static const int variant_identity = 0;
     assert((param.row_bytes % 16) == 0);
     const int hidden_int4 = param.row_bytes / 16;
@@ -459,7 +459,7 @@ launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& par
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "local_permute_dup_h" << hidden_int4 << "_v" << hidden_vec << "_b" << blocks_per_sm
-             << (recipe != NCCL_EP_DISPATCH_QUANT_NONE ? "_sf" : "");
+             << (recipe != NCCL_EP_DISP_QUANT_NONE ? "_sf" : "");
         return name.str();
     }();
     const std::string source = local_permute_dup_jit_source(hidden_int4, hidden_vec, blocks_per_sm, recipe);

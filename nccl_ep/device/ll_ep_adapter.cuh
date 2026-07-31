@@ -307,7 +307,7 @@ struct CleanLowLatencyBufferParams {
 
 ncclResult_t call_dispatch(
     const DispatchParams& params,
-    ncclEpDispatchQuantizationRecipe_t quantization_recipe,
+    ncclEpDispQuant_t recipe,
     cudaStream_t stream = 0);
 
 void call_combine(const CombineParams& params, cudaStream_t stream = 0);

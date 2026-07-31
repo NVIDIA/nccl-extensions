@@ -136,7 +136,7 @@ names the struct and the **Field** column names the field within it.
 * R = number of ranks (nRanks)
 * N(r) = number of tokens targeting rank r
 
-`NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD` forwards the physical bytes of two 2D
+`NCCL_EP_DISP_QUANT_FWD` forwards the physical bytes of two 2D
 inputs: tokens `[B x H]` and scales `[B x S]`. `S` is taken directly from the
 scale tensor; the recipe does not infer a scale-block size. Tokens may use
 FP32, FP16, BF16, FP8, or `ncclFloat4x2`; scales may use FP32, FP16, BF16,
@@ -403,7 +403,7 @@ version returned by `ncclEpGetVersion` before relying on it. Historical
 rejecting an otherwise size-compatible configuration.
 
 `max_token_bytes` is a physical-byte budget for an individual token or scale
-row. LL `NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD` additionally requires their
+row. LL `NCCL_EP_DISP_QUANT_FWD` additionally requires their
 sum to fit its shared message slot; for example, packed FP4 uses `H/2` token
 bytes plus `S * sizeof(scale_dtype)` scale bytes. HT requires the configured
 bound to be a multiple of 16 bytes.

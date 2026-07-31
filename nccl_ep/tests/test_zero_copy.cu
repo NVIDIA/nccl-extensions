@@ -423,7 +423,7 @@ protected:
         outputs.scales = recv_scales;
         outputs.topk_weights = recv_weights;
         outputs.topk_idx = recv_topk_idx;
-        config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+        config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
 
         const ncclResult_t dispatch_result =
             ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream);
@@ -674,7 +674,7 @@ protected:
         outputs.topk_weights = recv_weights;
         outputs.topk_idx = recv_topk_idx;
         layout_info.src_rank_counters = src_rank_counters;
-        dispatch_config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+        dispatch_config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
 
         const ncclResult_t dispatch_result =
             ncclEpDispatch(handle, &inputs, &outputs, &layout_info, &dispatch_config, g_stream);

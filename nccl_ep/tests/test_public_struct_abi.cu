@@ -131,7 +131,7 @@ void ncclEpDispatchConfig_backwards_compat_test() {
     static_assert(offsetof(ncclEpDispatchConfig_t, round_scales) == 12);
     static_assert(offsetof(ncclEpDispatchConfig_t, pass_direction) == 16);
     static_assert(
-        offsetof(ncclEpDispatchConfig_t, quantization_recipe) == 20);
+        offsetof(ncclEpDispatchConfig_t, quant_recipe) == 20);
     static_assert(sizeof(ncclEpDispatchConfig_t) == 24);
 }
 
@@ -141,7 +141,7 @@ void ncclEpCombineConfig_backwards_compat_test() {
     static_assert(offsetof(ncclEpCombineConfig_t, send_only) == 8);
     static_assert(offsetof(ncclEpCombineConfig_t, pass_direction) == 12);
     static_assert(
-        offsetof(ncclEpCombineConfig_t, quantization_recipe) == 16);
+        offsetof(ncclEpCombineConfig_t, quant_recipe) == 16);
     static_assert(sizeof(ncclEpCombineConfig_t) == 20);
 }
 

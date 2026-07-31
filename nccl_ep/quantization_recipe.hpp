@@ -30,7 +30,7 @@ struct DispatchKernelSpec {
 };
 
 inline ncclResult_t resolveDispatchKernelSpec(
-    ncclEpDispatchQuantizationRecipe_t quantization_recipe,
+    ncclEpDispQuant_t recipe,
     ncclDataType_t token_dtype,
     ncclDataType_t scale_dtype,
     DispatchKernelSpec* spec) {
@@ -74,18 +74,18 @@ inline ncclResult_t resolveDispatchKernelSpec(
             default:
                 std::fprintf(stderr,
                              "NCCL EP warning: dispatch recipe %d cannot use token dtype %d\n",
-                             static_cast<int>(quantization_recipe), static_cast<int>(token_dtype));
+                             static_cast<int>(recipe), static_cast<int>(token_dtype));
                 return ncclInvalidArgument;
         }
     };
 
-    switch (quantization_recipe) {
-        case NCCL_EP_DISPATCH_QUANT_NONE:
-            spec->recipe_source_literal = "NCCL_EP_DISPATCH_QUANT_NONE";
+    switch (recipe) {
+        case NCCL_EP_DISP_QUANT_NONE:
+            spec->recipe_source_literal = "NCCL_EP_DISP_QUANT_NONE";
             spec->recipe_cache_tag = "none";
             return resolve_byte_copy_payload();
-        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
-            spec->recipe_source_literal = "NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD";
+        case NCCL_EP_DISP_QUANT_FWD:
+            spec->recipe_source_literal = "NCCL_EP_DISP_QUANT_FWD";
             spec->recipe_cache_tag = "scales_forward";
             switch (scale_dtype) {
                 case ncclFloat32: spec->scale_type_literal = "float"; spec->scale_cache_tag = "fp32"; break;
@@ -100,7 +100,7 @@ inline ncclResult_t resolveDispatchKernelSpec(
                     return ncclInvalidArgument;
             }
             return resolve_byte_copy_payload();
-        case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
+        case NCCL_EP_DISP_QUANT_DS_FP8E3M4:
             spec->wire_token_dtype = ncclFloat8e4m3;
             spec->wire_dtype_literal = "ncclFloat8e4m3";
             spec->payload_bytes = sizeof(uint8_t);
@@ -108,12 +108,12 @@ inline ncclResult_t resolveDispatchKernelSpec(
             spec->payload_cache_tag = "u8";
             spec->scale_type_literal = "float";
             spec->scale_cache_tag = "fp32";
-            spec->recipe_source_literal = "NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4";
+            spec->recipe_source_literal = "NCCL_EP_DISP_QUANT_DS_FP8E3M4";
             spec->recipe_cache_tag = "ds_fp8e3m4";
             return ncclSuccess;
         default:
             std::fprintf(stderr, "NCCL EP warning: unsupported dispatch quantization recipe %d\n",
-                         static_cast<int>(quantization_recipe));
+                         static_cast<int>(recipe));
             return ncclInvalidArgument;
     }
 }

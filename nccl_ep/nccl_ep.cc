@@ -338,7 +338,7 @@ static ncclResult_t validateDispatchRecipe(
     const ncclEpDispatchOutputs_t* outputs,
     const ncclEpDispatchConfig_t* config,
     const DispatchRecipeLaunchContext& launch) {
-    const auto recipe = config ? config->quantization_recipe : NCCL_EP_DISPATCH_QUANT_NONE;
+    const auto recipe = config ? config->quant_recipe : NCCL_EP_DISP_QUANT_NONE;
     const ncclEpTensor_t* tokens = tensor_required(inputs->tokens);
     const ncclEpTensor_t* output_tokens = tensor_ptr(outputs->tokens);
     const ncclEpTensor_t* input_scales = tensor_ptr(inputs->scales);
@@ -349,7 +349,7 @@ static ncclResult_t validateDispatchRecipe(
         return ncclInvalidArgument;
     };
     switch (recipe) {
-        case NCCL_EP_DISPATCH_QUANT_NONE:
+        case NCCL_EP_DISP_QUANT_NONE:
             if (!validate_dtype(tokens->datatype)) {
                 return fail("tokens has unsupported dtype");
             }
@@ -366,7 +366,7 @@ static ncclResult_t validateDispatchRecipe(
                 return fail("outputs->scales must be null for NONE");
             }
             return ncclSuccess;
-        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD: {
+        case NCCL_EP_DISP_QUANT_FWD: {
             auto storage_aligned = [](const ncclEpTensor_t* tensor) {
                 return (tensor->data == nullptr ||
                         reinterpret_cast<std::uintptr_t>(tensor->data) % sizeof(int4) == 0) &&
@@ -465,7 +465,7 @@ static ncclResult_t validateDispatchRecipe(
             }
             return ncclSuccess;
         }
-        case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4: {
+        case NCCL_EP_DISP_QUANT_DS_FP8E3M4: {
             if (launch.algorithm != NCCL_EP_ALGO_LOW_LATENCY) {
                 return fail("DS_FP8E3M4 is supported only in LL mode");
             }
@@ -512,14 +512,14 @@ static ncclResult_t validateCombineRecipe(
     const ncclEpCombineOutputs_t* outputs,
     const ncclEpCombineConfig_t* config) {
     (void)outputs;
-    const auto recipe = config ? config->quantization_recipe : NCCL_EP_COMBINE_QUANT_NONE;
+    const auto recipe = config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
     auto fail = [&](const char* message) -> ncclResult_t {
         fprintf(stderr, "NCCL EP warning: combine recipe %d: %s\n",
                 static_cast<int>(recipe), message);
         return ncclInvalidArgument;
     };
     switch (recipe) {
-        case NCCL_EP_COMBINE_QUANT_NONE:
+        case NCCL_EP_COMB_QUANT_NONE:
             return validate_dtype(tensor_required(inputs->tokens)->datatype)
                 ? ncclSuccess : fail("tokens has unsupported dtype");
         default:
@@ -3209,8 +3209,8 @@ ncclResult_t ncclEpDispatch(
 
     const unsigned int send_only = config ? config->send_only : 0;
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
-    const ncclEpDispatchQuantizationRecipe_t recipe =
-        config ? config->quantization_recipe : NCCL_EP_DISPATCH_QUANT_NONE;
+    const ncclEpDispQuant_t recipe =
+        config ? config->quant_recipe : NCCL_EP_DISP_QUANT_NONE;
     ncclEpGroup_t group = handle->group;
     const ncclEpTensor_t* recipe_tokens = tensor_required(inputs->tokens);
     if (recipe_tokens->ndim != 2) return ncclInvalidArgument;
@@ -3248,7 +3248,7 @@ ncclResult_t ncclEpDispatch(
         assert(x->sizes[0] <= group->config.max_dispatch_tokens_per_rank);
         // SCALES_FORWARD transports the physical byte row. Multi-byte wire
         // dtypes therefore need byte, rather than element-count, alignment.
-        if (recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        if (recipe == NCCL_EP_DISP_QUANT_FWD) {
             assert((x->sizes[1] * ncclTypeSize(x->datatype)) % sizeof(int4) == 0);
         } else {
             assert(x->sizes[1] % sizeof(int4) == 0);
@@ -3343,14 +3343,14 @@ ncclResult_t ncclEpDispatch(
         // LL rank-major zero-copy writes each available peer payload window directly.
         const bool nvlink_only = (group->lsa_team_size == group->nRanks);
         const bool recipe_zcopy_ok =
-            recipe == NCCL_EP_DISPATCH_QUANT_NONE || recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+            recipe == NCCL_EP_DISP_QUANT_NONE || recipe == NCCL_EP_DISP_QUANT_FWD;
         const bool zcopy_ok =
             nvlink_only &&
             handle->layout == NCCL_EP_LAYOUT_RANK_MAJOR &&
             recipe_zcopy_ok;
         const bool zcopy_rcv_x = zcopy_ok && recv_x->win_hdl != ncclWindow_t{};
         const bool zcopy_rcv_scales =
-            zcopy_ok && recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+            zcopy_ok && recipe == NCCL_EP_DISP_QUANT_FWD &&
             scales != nullptr && scales->win_hdl != ncclWindow_t{};
         const bool zcopy_any = zcopy_rcv_x || zcopy_rcv_scales;
         const char* zcopy_reason =
@@ -3421,7 +3421,7 @@ ncclResult_t ncclEpDispatch(
             // DispatchParams and threads recipe-specific state through.
             auto launch_dispatch = [&](auto* topk_idx_data, bool topk_is_int64) -> ncclResult_t {
                 auto* in_scales_data =
-                    (recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)
+                    (recipe == NCCL_EP_DISP_QUANT_FWD)
                     ? static_cast<const uint8_t*>(in_scales_outer->data) : nullptr;
                 nccl_ep::ll::DispatchParams params{};
                 params.inData = x_data;
@@ -3431,10 +3431,10 @@ ncclResult_t ncclEpDispatch(
                 // This is a launch stride derived from the validated 2D input
                 // tensor, never an independent user recipe parameter.
                 params.scalesPerToken =
-                    recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD
+                    recipe == NCCL_EP_DISP_QUANT_FWD
                     ? static_cast<int>(in_scales_outer->sizes[1])
                     : 0;
-                params.scaleDtype = (recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)
+                params.scaleDtype = (recipe == NCCL_EP_DISP_QUANT_FWD)
                     ? in_scales_outer->datatype : ncclUint8;
                 params.inTopkWeights = topk_weights_in_data;
                 params.outDataBuf = recv_x_data;
@@ -3484,15 +3484,15 @@ ncclResult_t ncclEpDispatch(
                 // Keep recipe dispatch explicit at the kernel launch boundary. The
                 // selected branch becomes the JIT kernel's quantization variant.
                 switch (recipe) {
-                    case NCCL_EP_DISPATCH_QUANT_NONE:
+                    case NCCL_EP_DISP_QUANT_NONE:
                         return nccl_ep::ll::call_dispatch(
-                            params, NCCL_EP_DISPATCH_QUANT_NONE, stream);
-                    case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
+                            params, NCCL_EP_DISP_QUANT_NONE, stream);
+                    case NCCL_EP_DISP_QUANT_FWD:
                         return nccl_ep::ll::call_dispatch(
-                            params, NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD, stream);
-                    case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
+                            params, NCCL_EP_DISP_QUANT_FWD, stream);
+                    case NCCL_EP_DISP_QUANT_DS_FP8E3M4:
                         return nccl_ep::ll::call_dispatch(
-                            params, NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4, stream);
+                            params, NCCL_EP_DISP_QUANT_DS_FP8E3M4, stream);
                     default:
                         std::fprintf(stderr,
                                      "NCCL EP warning: unsupported LL dispatch recipe %d\n",
@@ -3568,10 +3568,10 @@ ncclResult_t ncclEpDispatch(
                 stream));
             token_ptr = handle->ht.token_staging_buffer;
         }
-        const int scale_elem_bytes = (recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)
+        const int scale_elem_bytes = (recipe == NCCL_EP_DISP_QUANT_FWD)
                                          ? static_cast<int>(ncclTypeSize(scales->datatype))
                                          : static_cast<int>(sizeof(float));
-        if (recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        if (recipe == NCCL_EP_DISP_QUANT_FWD) {
             NCCLCHECK(resolveTensorWindowBinding(
                 group,
                 scales,
@@ -3581,10 +3581,10 @@ ncclResult_t ncclEpDispatch(
         }
 
         // For SCALES_FORWARD: copy user scales to the pre-registered staging buffer.
-        void* scales_ptr = recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD ? scales->data : nullptr;
+        void* scales_ptr = recipe == NCCL_EP_DISP_QUANT_FWD ? scales->data : nullptr;
         const bool scales_uses_external_window =
-            recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD && tensorUsesExternalWindow(group, scales);
-        if (recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+            recipe == NCCL_EP_DISP_QUANT_FWD && tensorUsesExternalWindow(group, scales);
+        if (recipe == NCCL_EP_DISP_QUANT_FWD &&
             !is_lsa_only && handle->ht.scaling_factor_staging_buffer != nullptr &&
             !scales_uses_external_window) {
             // Copy user scaling factors to pre-registered staging buffer (D2D copy is ~0.1ms vs ~30ms GIN registration)
@@ -3611,7 +3611,7 @@ ncclResult_t ncclEpDispatch(
             "HT dispatch requires token bytes per token to be 16B aligned for TMA");
 
         const int num_scales_per_token =
-            recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD
+            recipe == NCCL_EP_DISP_QUANT_FWD
                 ? static_cast<int>(scales->sizes[1])
                 : 0;
 
@@ -3646,7 +3646,7 @@ ncclResult_t ncclEpDispatch(
         if (!group->eager_mode && recv_x->sizes[0] < static_cast<unsigned>(group->max_recv_tokens)) {
             return ncclInvalidArgument;
         }
-        if (recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        if (recipe == NCCL_EP_DISP_QUANT_FWD) {
             recv_scales = tensor_ptr(outputs->scales);
             if (recv_scales == nullptr) {
                 return ncclInvalidArgument;
@@ -3729,7 +3729,7 @@ ncclResult_t ncclEpDispatch(
         params.attn_input_token = token_ptr;
         params.attn_input_prob = forward_dispatch ? dense_prob : nullptr;
         params.attn_input_scaling_factor =
-            recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD ? static_cast<const uint8_t*>(scales_ptr) : nullptr;
+            recipe == NCCL_EP_DISP_QUANT_FWD ? static_cast<const uint8_t*>(scales_ptr) : nullptr;
         // Use HOST pointer arrays - these get copied into the kernel param struct for fast __grid_constant__ access.
         // For external output tensors with windows, resolve full per-rank output pointers
         // (local + same-node peers) so all writers target user buffers directly.
@@ -3756,21 +3756,21 @@ ncclResult_t ncclEpDispatch(
         params.expert_output_prob_ptrs = group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs;
         std::vector<void*> dispatch_output_sf_ptrs;
         const bool rcv_scales_zcopy =
-            recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+            recipe == NCCL_EP_DISP_QUANT_FWD &&
             tensorUsesExternalWindow(group, recv_scales) && !em_permute_active;
         if (rcv_scales_zcopy) {
             NCCLCHECK(buildIntranodePtrArray<void>(group, recv_scales, dispatch_output_sf_ptrs));
             params.expert_output_scaling_factor_ptrs = dispatch_output_sf_ptrs.data();
         } else {
-            params.expert_output_scaling_factor_ptrs = recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD
+            params.expert_output_scaling_factor_ptrs = recipe == NCCL_EP_DISP_QUANT_FWD
                 ? group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs : nullptr;
         }
         if (nccl_ep_env_flag_on(group->env.debug)) {
             const bool token_direct = rcv_x_zcopy && !em_permute_active;
             const bool dispatch_direct = token_direct &&
-                (recipe != NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD || rcv_scales_zcopy);
+                (recipe != NCCL_EP_DISP_QUANT_FWD || rcv_scales_zcopy);
             const char* reason = dispatch_direct
-                ? (recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD
+                ? (recipe == NCCL_EP_DISP_QUANT_FWD
                        ? "token and scale windows selected"
                        : "token window selected")
                 : em_permute_active && rcv_x_zcopy
@@ -3792,7 +3792,7 @@ ncclResult_t ncclEpDispatch(
         }
 
         bool zcopy_only = rcv_x_zcopy;
-        if (recipe != NCCL_EP_DISPATCH_QUANT_NONE) {
+        if (recipe != NCCL_EP_DISP_QUANT_NONE) {
             zcopy_only = zcopy_only && rcv_scales_zcopy;
         }
         const bool need_recv_counts = !is_capturing && !em_permute_active && !zcopy_only;
@@ -3814,7 +3814,7 @@ ncclResult_t ncclEpDispatch(
                 return ncclInvalidArgument;
             }
         }
-        if (recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+        if (recipe == NCCL_EP_DISP_QUANT_FWD &&
             recv_scales->sizes[0] < recv_copy_rows) {
             fprintf(
                 stderr,
@@ -3860,7 +3860,7 @@ ncclResult_t ncclEpDispatch(
         params.nccl_token_window = x->win_hdl;
         params.nccl_prob_window = forward_dispatch ? group->gin_config.nccl_window : ncclWindow_t{};
         params.nccl_sf_window =
-            recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD ? scales->win_hdl : ncclWindow_t{};
+            recipe == NCCL_EP_DISP_QUANT_FWD ? scales->win_hdl : ncclWindow_t{};
         params.nccl_internal_window = group->gin_config.nccl_window;
         params.num_ctx_per_comm = is_lsa_only ? 0 : group->gin_config.num_ctx_per_comm;
         params.gin_base_ptr = is_lsa_only ? nullptr : group->gin_config.gin_base_ptr;
@@ -3870,7 +3870,7 @@ ncclResult_t ncclEpDispatch(
         size_t bytes_per_token_entry = group->config.max_token_bytes; // token data
         size_t bytes_per_prob_entry = (group->num_local_experts * group->lsa_team_size) * sizeof(float); // prob data
         size_t bytes_per_sf_entry =
-            recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD
+            recipe == NCCL_EP_DISP_QUANT_FWD
                 ? static_cast<size_t>(num_scales_per_token) * scale_elem_bytes
                 : 0;
         size_t bytes_per_entry = bytes_per_token_entry + bytes_per_prob_entry + bytes_per_sf_entry;
@@ -3879,7 +3879,7 @@ ncclResult_t ncclEpDispatch(
         params.mr_info.attn_input_prob_offset =
             (is_lsa_only || !forward_dispatch) ? 0 : group->gin_config.dense_prob_offset;
         params.mr_info.attn_input_scaling_factor_offset =
-            (is_lsa_only || recipe != NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)
+            (is_lsa_only || recipe != NCCL_EP_DISP_QUANT_FWD)
                 ? 0
                 : scales->win_offset;
         params.mr_info.gin_send_staging_offset =
@@ -3906,10 +3906,10 @@ ncclResult_t ncclEpDispatch(
 
         // Call dispatch kernel
         const int sf_bytes_per_token =
-            recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD
+            recipe == NCCL_EP_DISP_QUANT_FWD
                 ? num_scales_per_token * scale_elem_bytes
                 : 0;
-        if (recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        if (recipe == NCCL_EP_DISP_QUANT_FWD) {
             params.scale_dtype = scales->datatype;
         }
         NCCLCHECK(
@@ -3949,7 +3949,7 @@ ncclResult_t ncclEpDispatch(
                 x->datatype,
                 recipe,
                 /*expert_output_scale=*/
-                (recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)
+                (recipe == NCCL_EP_DISP_QUANT_FWD)
                     ? static_cast<uint8_t*>(params.expert_output_scaling_factor_ptrs[group->lsa_rank])
                     : nullptr,
                 /*scale_row_bytes=*/sf_bytes_per_token);
@@ -4061,7 +4061,7 @@ ncclResult_t ncclEpDispatch(
         if (em_permute_active) {
             // BWD passes recv_topk_weights == nullptr (weights are FWD-only).
             assert(forward_dispatch ? (recv_topk_weights != nullptr) : (recv_topk_weights == nullptr));
-            if (recipe == NCCL_EP_DISPATCH_QUANT_NONE) {
+            if (recipe == NCCL_EP_DISP_QUANT_NONE) {
                 if (!validate_dtype(recv_x->datatype)) {
                     // local_permute_dup is a byte-relocation kernel: any NONE-mode wire
                     // dtype (bf16/fp16/fp32) works; SCALES_FORWARD rows are 1B (fp8) or
@@ -4078,7 +4078,7 @@ ncclResult_t ncclEpDispatch(
             void* perm_recv_scales_em = nullptr;
             const void* perm_flat_scale_staging = nullptr;
             int perm_scale_row_bytes = 0;
-            if (recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+            if (recipe == NCCL_EP_DISP_QUANT_FWD) {
                 if (recv_scales->sizes[0] < static_cast<size_t>(group->max_recv_tokens)) {
                     return ncclInvalidArgument; // EM scale slots, like recv_x
                 }
@@ -4112,7 +4112,7 @@ ncclResult_t ncclEpDispatch(
 
         // SCALES_FORWARD output scales (async D2D, sized by caller). On the EM-permute
         // path the scales are already relocated into EM order by local_permute_dup above.
-        if (recipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD && !em_permute_active) {
+        if (recipe == NCCL_EP_DISP_QUANT_FWD && !em_permute_active) {
             assert(recv_scales->ndim == 2);
             if (!rcv_scales_zcopy) {
                 if (recv_scales->sizes[0] < recv_copy_rows) {

@@ -461,13 +461,13 @@ static size_t tokenElemBytes(ncclDataType_t dtype) {
 }
 
 static ncclDataType_t dispatchTokenDtype(
-    ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
+    ncclEpDispQuant_t dispatch_quantization,
     ncclDataType_t none_dtype,
     ncclDataType_t scales_forward_dtype) {
     switch (dispatch_quantization) {
-        case NCCL_EP_DISPATCH_QUANT_NONE: return none_dtype;
-        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD: return scales_forward_dtype;
-        case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4: return ncclFloat8e4m3;
+        case NCCL_EP_DISP_QUANT_NONE: return none_dtype;
+        case NCCL_EP_DISP_QUANT_FWD: return scales_forward_dtype;
+        case NCCL_EP_DISP_QUANT_DS_FP8E3M4: return ncclFloat8e4m3;
         default:
             fprintf(stderr, "NCCL EP benchmark warning: unsupported dispatch recipe %d\n",
                     static_cast<int>(dispatch_quantization));
@@ -475,11 +475,11 @@ static ncclDataType_t dispatchTokenDtype(
     }
 }
 
-static const char* dispatchRecipeName(ncclEpDispatchQuantizationRecipe_t dispatch_quantization) {
+static const char* dispatchRecipeName(ncclEpDispQuant_t dispatch_quantization) {
     switch (dispatch_quantization) {
-        case NCCL_EP_DISPATCH_QUANT_NONE: return "none";
-        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD: return "scales-forward";
-        case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4: return "ds-fp8e3m4";
+        case NCCL_EP_DISP_QUANT_NONE: return "none";
+        case NCCL_EP_DISP_QUANT_FWD: return "scales-forward";
+        case NCCL_EP_DISP_QUANT_DS_FP8E3M4: return "ds-fp8e3m4";
         default:
             fprintf(stderr, "NCCL EP benchmark warning: unsupported dispatch recipe %d\n",
                     static_cast<int>(dispatch_quantization));
@@ -907,16 +907,16 @@ static inline unsigned scaleElemBytes() {
 }
 
 static unsigned int benchmarkScalesPerToken(
-    ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
+    ncclEpDispQuant_t dispatch_quantization,
     unsigned int hidden) {
     switch (dispatch_quantization) {
-        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
+        case NCCL_EP_DISP_QUANT_FWD:
             // Keep the synthetic default scale row exactly one int4 wide.
             return g_scaleBlockOverride > 0 ? (hidden / g_scaleBlockOverride)
                                             : (16u / scaleElemBytes());
-        case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
+        case NCCL_EP_DISP_QUANT_DS_FP8E3M4:
             return hidden / DS_FP8E3M4_ELEMENTS_PER_SCALE;
-        case NCCL_EP_DISPATCH_QUANT_NONE:
+        case NCCL_EP_DISP_QUANT_NONE:
             return 0;
         default:
             fprintf(stderr, "NCCL EP benchmark warning: unsupported dispatch recipe %d\n",
@@ -1042,9 +1042,9 @@ void initializeValidationData(
     unsigned int top_k,
     int myRank,
     bool is_ht_mode,
-    ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
+    ncclEpDispQuant_t dispatch_quantization,
     ncclDataType_t token_dtype = ncclBfloat16) {
-    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+    if (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD) {
         // SCALES_FORWARD dispatch: fill every physical token byte with the
         // validation pattern; forwarding does not interpret token values.
         const unsigned int token_hidden = static_cast<unsigned int>(dispatch_inputs.tokens->sizes[1]);
@@ -1079,7 +1079,7 @@ void initializeValidationData(
             }
             delete[] scale_data_host;
         }
-    } else if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
+    } else if (dispatch_quantization == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
         // Fill every DS block by repeating a 17-element identity pattern. Its
         // first 16 values encode the XOR-whitened rank16/token16 identity in
         // 2-bit FP8 symbols, and the last value anchors amax for the scale.
@@ -2681,15 +2681,15 @@ ValidationResult validateDispatchOutput(
     bool is_ht_mode,
     bool is_expert_major,
     size_t expert_major_alignment,
-    ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
+    ncclEpDispQuant_t dispatch_quantization,
     const int64_t* meta_expert_counts_padded = nullptr,
     const int64_t* meta_expert_offsets = nullptr,
     ncclDataType_t token_dtype = ncclBfloat16) {
     (void)expert_major_alignment;
     switch (dispatch_quantization) {
-        case NCCL_EP_DISPATCH_QUANT_NONE:
+        case NCCL_EP_DISP_QUANT_NONE:
             break;
-        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
+        case NCCL_EP_DISP_QUANT_FWD:
             if (is_ht_mode) {
                 return validateDispatchOutputHTScalesForward(
                 alloc, dispatch_outputs,
@@ -2714,7 +2714,7 @@ ValidationResult validateDispatchOutput(
                 alloc, dispatch_outputs, dispatch_layout_info,
                 max_tokens_per_rank, num_tokens_per_rank,
                 hidden, top_k, num_experts, num_local_experts, myRank, nRanks);
-        case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
+        case NCCL_EP_DISP_QUANT_DS_FP8E3M4:
             if (is_ht_mode || !is_expert_major) {
                 fprintf(stderr,
                         "NCCL EP benchmark warning: DS_FP8E3M4 validation is implemented only for LL expert-major output.\n");
@@ -3207,7 +3207,7 @@ LowLatencyBytes calculateLowLatencyBytes(
     unsigned int num_experts,
     int nRanks,
     ncclEpLayout_t layout,
-    ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
+    ncclEpDispQuant_t dispatch_quantization,
     ncclDataType_t token_dtype,
     ncclDataType_t scales_forward_token_dtype) {
     LowLatencyBytes bytes = {0, 0, 0, 0, 0};
@@ -3227,26 +3227,26 @@ LowLatencyBytes calculateLowLatencyBytes(
     bytes.num_combine_messages = layout == NCCL_EP_LAYOUT_RANK_MAJOR
         ? bytes.num_dispatch_messages : bytes.num_valid_selections;
 
-    const bool packed_fp4 = dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+    const bool packed_fp4 = dispatch_quantization == NCCL_EP_DISP_QUANT_FWD &&
         usesPackedFp4Shape(scales_forward_token_dtype);
     size_t quantized_payload_bytes = 0;
-    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+    if (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD) {
         quantized_payload_bytes = packed_fp4
             ? hidden / 2 + hidden / PACKED_FP4_ELEMENTS_PER_SCALE * scaleElemBytes()
             : hidden * tokenElemBytes(scales_forward_token_dtype) +
                   benchmarkScalesPerToken(dispatch_quantization, hidden) * scaleElemBytes();
-    } else if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
+    } else if (dispatch_quantization == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
         quantized_payload_bytes = hidden + hidden / DS_FP8E3M4_ELEMENTS_PER_SCALE * sizeof(float);
     }
     const size_t none_payload_bytes = hidden * tokenElemBytes(token_dtype);
 
     // Dispatch: scales-forward or NONE-mode based on config
     switch (dispatch_quantization) {
-        case NCCL_EP_DISPATCH_QUANT_NONE:
+        case NCCL_EP_DISP_QUANT_NONE:
             bytes.dispatch_bytes = static_cast<size_t>(bytes.num_dispatch_messages) * none_payload_bytes;
             break;
-        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
-        case NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4:
+        case NCCL_EP_DISP_QUANT_FWD:
+        case NCCL_EP_DISP_QUANT_DS_FP8E3M4:
             bytes.dispatch_bytes = static_cast<size_t>(bytes.num_dispatch_messages) * quantized_payload_bytes;
             break;
         default:
@@ -3310,7 +3310,7 @@ HighThroughputBytes calculateHighThroughputBytes(
     unsigned int hidden,
     int myRank,
     int nRanks,
-    ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
+    ncclEpDispQuant_t dispatch_quantization,
     int lsa_team_size,
     ncclDataType_t token_dtype,
     ncclDataType_t scales_forward_token_dtype) {
@@ -3368,10 +3368,10 @@ HighThroughputBytes calculateHighThroughputBytes(
     const size_t none_bytes_per_token = hidden * tokenElemBytes(token_dtype);
     size_t bytes_per_token = 0;
     switch (dispatch_quantization) {
-        case NCCL_EP_DISPATCH_QUANT_NONE:
+        case NCCL_EP_DISP_QUANT_NONE:
             bytes_per_token = none_bytes_per_token;
             break;
-        case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
+        case NCCL_EP_DISP_QUANT_FWD:
             bytes_per_token = usesPackedFp4Shape(scales_forward_token_dtype)
                 ? hidden / 2 + hidden / PACKED_FP4_ELEMENTS_PER_SCALE * scaleElemBytes()
                 : hidden * tokenElemBytes(scales_forward_token_dtype) +
@@ -3643,7 +3643,7 @@ void printHighThroughputResults(
     size_t global_rdma_send,
     size_t global_total_recv,
     size_t global_rdma_recv,
-    ncclEpDispatchQuantizationRecipe_t dispatch_quantization,
+    ncclEpDispQuant_t dispatch_quantization,
     bool dispatch_only) {
     double local_dispatch_avg = dispatch_result.avg_ms;
     double local_dispatch_min = dispatch_result.min_ms;
@@ -4044,7 +4044,7 @@ int main(int argc, char* argv[]) {
     bool include_non_uniform_tokens = false;
     bool topk_idx_int32 = false;  // LL only: pass ncclInt32 topk_idx instead of ncclInt64
     bool em_nvlink_dup = false;       // HT+EM only: force nvlink_dup path (sender duplicates per-expert over NVLink)
-    ncclEpDispatchQuantizationRecipe_t dispatch_quantization = NCCL_EP_DISPATCH_QUANT_NONE;
+    ncclEpDispQuant_t dispatch_quantization = NCCL_EP_DISP_QUANT_NONE;
     // Numbering selector for recv_topk_idx writes (LL rank-major / HT FLAT only).
     // AUTO leaves the lib at its default (resolves to LOCAL today); LOCAL / GLOBAL pin
     // a stable contract end-to-end.
@@ -4226,11 +4226,11 @@ int main(int argc, char* argv[]) {
                 const char* name = long_options[option_index].name;
                 if (strcmp(name, "dispatch-quantization") == 0) {
                     if (strcmp(optarg, "none") == 0) {
-                        dispatch_quantization = NCCL_EP_DISPATCH_QUANT_NONE;
+                        dispatch_quantization = NCCL_EP_DISP_QUANT_NONE;
                     } else if (strcmp(optarg, "scales-forward") == 0) {
-                        dispatch_quantization = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+                        dispatch_quantization = NCCL_EP_DISP_QUANT_FWD;
                     } else if (strcmp(optarg, "ds-fp8e3m4") == 0) {
-                        dispatch_quantization = NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4;
+                        dispatch_quantization = NCCL_EP_DISP_QUANT_DS_FP8E3M4;
                     } else {
                         if (myRank == 0)
                             printf("Error: --dispatch-quantization must be none, scales-forward, or ds-fp8e3m4, got '%s'\n", optarg);
@@ -4239,7 +4239,7 @@ int main(int argc, char* argv[]) {
                     }
                 } else if (strcmp(name, "mxfp8") == 0) {
                     // MXFP8 scales-forward: E4M3 tokens, block 32, E8M0 (Uint8) scales.
-                    dispatch_quantization = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+                    dispatch_quantization = NCCL_EP_DISP_QUANT_FWD;
                     scales_forward_token_dtype = ncclFloat8e4m3;
                     scales_forward_token_dtype_explicit = true;
                     g_scaleBlockOverride = 32;
@@ -4310,12 +4310,12 @@ int main(int argc, char* argv[]) {
 
     // Packed FP4 uses Uint8 scales by default unless the caller
     // explicitly selects another compile-time scale type.
-    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+    if (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD &&
         usesPackedFp4Shape(scales_forward_token_dtype) && !g_scaleDtypeExplicit) {
         g_scaleDtype = ncclUint8;
     }
 
-    if (dispatch_quantization != NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+    if (dispatch_quantization != NCCL_EP_DISP_QUANT_FWD &&
         (scales_forward_token_dtype_explicit || g_scaleDtypeExplicit || g_scaleBlockOverride > 0)) {
         if (myRank == 0) {
             printf("Error: scales-forward dtype/block options require --dispatch-quantization scales-forward\n");
@@ -4324,7 +4324,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+    if (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD) {
         const bool packed_fp4 = usesPackedFp4Shape(scales_forward_token_dtype);
         if (packed_fp4 && hidden % 32u != 0) {
             if (myRank == 0) {
@@ -4384,7 +4384,7 @@ int main(int argc, char* argv[]) {
         layout = (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) ? NCCL_EP_LAYOUT_FLAT : NCCL_EP_LAYOUT_EXPERT_MAJOR;
     }
 
-    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+    if (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD) {
         if (!dispatch_only) {
             if (myRank == 0) {
                 printf("Error: --dispatch-quantization scales-forward has no combine recipe; "
@@ -4393,7 +4393,7 @@ int main(int argc, char* argv[]) {
             MPI_Finalize();
             return 1;
         }
-    } else if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
+    } else if (dispatch_quantization == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
         if (algorithm != NCCL_EP_ALGO_LOW_LATENCY) {
             if (myRank == 0) {
                 printf("Error: ds-fp8e3m4 is supported only in low-latency mode.\n");
@@ -4552,7 +4552,7 @@ int main(int argc, char* argv[]) {
         const ncclDataType_t printed_token_dtype =
             dispatchTokenDtype(dispatch_quantization, token_dtype, scales_forward_token_dtype);
         printf("  Dispatch dtype:  %s\n", wireDtypeName(printed_token_dtype));
-        if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        if (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD) {
             if (usesPackedFp4Shape(scales_forward_token_dtype)) {
                 printf("  Packed FP4:      yes (fp4x2 physical H/2, two logical values/byte)\n");
             }
@@ -4598,7 +4598,7 @@ int main(int argc, char* argv[]) {
             if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
                 zcopy_str = "enabled (ncclMemAlloc + TensorCreateFromWindow)";
             } else if (algorithm == NCCL_EP_ALGO_LOW_LATENCY && layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
-                zcopy_str = dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD
+                zcopy_str = dispatch_quantization == NCCL_EP_DISP_QUANT_FWD
                     ? "enabled (LL rank-major: token + scale windows, P2P payload writes)"
                     : "enabled (LL rank-major: recv_x window, P2P payload write)";
             }
@@ -4646,7 +4646,7 @@ int main(int argc, char* argv[]) {
     config.max_dispatch_tokens_per_rank = dynamic_tokens ? NCCL_EP_AUTO : max_tokens_per_rank;
 
     size_t max_dispatch_payload_bytes = static_cast<size_t>(hidden) * tokenElemBytes(token_dtype);
-    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+    if (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD) {
         const bool packed_fp4 = usesPackedFp4Shape(scales_forward_token_dtype);
         const size_t token_elements = packed_fp4 ? hidden / 2u : hidden;
         const size_t scale_elements = packed_fp4 ? hidden / PACKED_FP4_ELEMENTS_PER_SCALE
@@ -4933,13 +4933,13 @@ int main(int argc, char* argv[]) {
         fflush(stdout);
     }
     const ncclDataType_t dispatch_input_dtype =
-        dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4
+        dispatch_quantization == NCCL_EP_DISP_QUANT_DS_FP8E3M4
             ? ncclBfloat16
             : dispatchTokenDtype(dispatch_quantization, token_dtype, scales_forward_token_dtype);
     const ncclDataType_t dispatch_output_dtype =
         dispatchTokenDtype(dispatch_quantization, token_dtype, scales_forward_token_dtype);
     const unsigned int dispatch_hidden =
-        (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+        (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD &&
          usesPackedFp4Shape(scales_forward_token_dtype)) ? hidden / 2 : hidden;
     EpTensorAllocOptions ll_zc_opts;
     const EpTensorAllocOptions* ll_dispatch_out_opts = nullptr;
@@ -4954,8 +4954,8 @@ int main(int argc, char* argv[]) {
         ll_zc_opts.tensor_data_ptrs = &alloc.tensor_data_ptrs;
         ll_dispatch_out_opts =
             (zcopy && layout == NCCL_EP_LAYOUT_RANK_MAJOR &&
-             (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_NONE ||
-              dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)) ? &ll_zc_opts : nullptr;
+             (dispatch_quantization == NCCL_EP_DISP_QUANT_NONE ||
+              dispatch_quantization == NCCL_EP_DISP_QUANT_FWD)) ? &ll_zc_opts : nullptr;
         setupLowLatencyTensors(
             dispatch_inputs,
             dispatch_outputs,
@@ -5017,15 +5017,15 @@ int main(int argc, char* argv[]) {
         ht_sf_zc_opts.tensor_data_ptrs = &alloc.tensor_data_ptrs;
         ht_sf_window_opts = &ht_sf_zc_opts;
     }
-    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD ||
-        dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
-        const bool packed_fp4 = dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD &&
+    if (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD ||
+        dispatch_quantization == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
+        const bool packed_fp4 = dispatch_quantization == NCCL_EP_DISP_QUANT_FWD &&
             usesPackedFp4Shape(scales_forward_token_dtype);
         const unsigned int numScales = packed_fp4 ? hidden / PACKED_FP4_ELEMENTS_PER_SCALE
                                              : benchmarkScalesPerToken(dispatch_quantization, hidden);
-        const ncclDataType_t scale_dtype = dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4
+        const ncclDataType_t scale_dtype = dispatch_quantization == NCCL_EP_DISP_QUANT_DS_FP8E3M4
             ? ncclFloat32 : g_scaleDtype;
-        if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        if (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD) {
             NCCLCHECK(epMakeTensor(
                 &dispatch_inputs.scales,
                 2,
@@ -5100,7 +5100,7 @@ int main(int argc, char* argv[]) {
     // Check the benchmark identity pattern independently of the recipe's
     // current shape restrictions, so future recipe changes cannot make the
     // validator read an incomplete identity.
-    if (validate_data && dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
+    if (validate_data && dispatch_quantization == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
         const unsigned int num_scale_blocks = hidden / DS_FP8E3M4_ELEMENTS_PER_SCALE;
         if (hidden % DS_FP8E3M4_ELEMENTS_PER_SCALE != 0 ||
             num_scale_blocks < DsFp8E3M4IdentityPattern::kIdentityScaleCount) {
@@ -5153,7 +5153,7 @@ int main(int argc, char* argv[]) {
 
     ncclEpDispatchConfig_t dispatch_config = NCCL_EP_DISPATCH_CONFIG_INIT;
     dispatch_config.round_scales = 0;
-    dispatch_config.quantization_recipe = dispatch_quantization;
+    dispatch_config.quant_recipe = dispatch_quantization;
 
     // Synchronize before benchmarking
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
@@ -5284,7 +5284,7 @@ int main(int argc, char* argv[]) {
     if (myRank == 0 && algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
         printf(
             "\n=== Summary (High Throughput %s, across %d ranks) ===\n",
-            dispatch_quantization == NCCL_EP_DISPATCH_QUANT_NONE ?
+            dispatch_quantization == NCCL_EP_DISP_QUANT_NONE ?
                 (token_dtype == ncclFloat32 ? "FP32" : (token_dtype == ncclFloat16 ? "FP16" : "BF16")) :
                 dispatchRecipeName(dispatch_quantization),
             nRanks);
@@ -5729,8 +5729,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Free recipe scale tensors (cleanupBenchmarkTensors does not handle them).
-    if (dispatch_quantization == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD ||
-        dispatch_quantization == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
+    if (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD ||
+        dispatch_quantization == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
         epFreeTensor(&dispatch_inputs.scales);
         epFreeTensor(&dispatch_outputs.scales);
     }

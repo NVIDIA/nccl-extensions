@@ -22,10 +22,10 @@
 #include <limits>
 #include <memory>
 
-#include "nccl_m2n.h"
+#include "m2n_checks.h"
 #include "m2n_handle.h"
-#include "reshard_types.h"
 #include "m2n_log.h"
+#include "reshard_types.h"
 
 struct ncclDevComm;
 
@@ -190,100 +190,6 @@ struct ReshardMeshInterval {
 
 ncclResult_t computeReshardMeshInterval(const ncclMesh_t* mesh, int logRank, ReshardMeshInterval* interval);
 
-inline ncclResult_t computeReshardMeshSize(const ncclMesh_t* mesh, int logRank, size_t* outMeshSize) {
-  if (mesh == nullptr || outMeshSize == nullptr) {
-    RESHARD_WARN(logRank, "reshard: computeReshardMeshSize called with null argument");
-    return ncclInvalidArgument;
-  }
-  if (mesh->dims[0] <= 0 || mesh->dims[1] <= 0) {
-    RESHARD_WARN(logRank, "reshard: mesh dims must be positive, got [%d, %d]", mesh->dims[0], mesh->dims[1]);
-    return ncclInvalidArgument;
-  }
-
-  size_t dim0 = static_cast<size_t>(mesh->dims[0]);
-  size_t dim1 = static_cast<size_t>(mesh->dims[1]);
-  if (dim0 > std::numeric_limits<size_t>::max() / dim1) {
-    RESHARD_WARN(logRank, "reshard: mesh size overflows size_t for dims [%d, %d]", mesh->dims[0], mesh->dims[1]);
-    return ncclInvalidArgument;
-  }
-
-  *outMeshSize = dim0 * dim1;
-  return ncclSuccess;
-}
-
-/* GIN's ncclDevCommRequirements::ginSignalCount is an int, and kernel signal
- * IDs are 32-bit. Keeping source signal IDs relative to srcMesh->startRank
- * lets a non-zero source mesh start at signal slot 0. */
-inline ncclResult_t computeReshardGinSignalCount(const ncclMesh_t* srcMesh, int numCtas, int logRank,
-                                                 int* outSignalCount) {
-  if (outSignalCount == nullptr) {
-    RESHARD_WARN(logRank, "reshard: computeReshardGinSignalCount called with null output");
-    return ncclInvalidArgument;
-  }
-  if (numCtas <= 0) {
-    RESHARD_WARN(logRank, "reshard: numCtas must be positive, got %d", numCtas);
-    return ncclInvalidArgument;
-  }
-
-  size_t srcTotal = 0;
-  ncclResult_t result = computeReshardMeshSize(srcMesh, logRank, &srcTotal);
-  if (result != ncclSuccess) return result;
-
-  size_t ctas = static_cast<size_t>(numCtas);
-  if (srcTotal > static_cast<size_t>(std::numeric_limits<int>::max()) / ctas) {
-    RESHARD_WARN(logRank, "reshard: GIN signal count overflows int (srcRanks=%zu, numCtas=%d)", srcTotal, numCtas);
-    return ncclInvalidArgument;
-  }
-
-  *outSignalCount = static_cast<int>(srcTotal * ctas);
-  return ncclSuccess;
-}
-
-inline ncclResult_t computeReshardSignalBase(const ncclMesh_t* srcMesh, int srcRank, int numCtas, int logRank,
-                                             unsigned int* outSignalBase) {
-  if (outSignalBase == nullptr) {
-    RESHARD_WARN(logRank, "reshard: computeReshardSignalBase called with null output");
-    return ncclInvalidArgument;
-  }
-  if (numCtas <= 0) {
-    RESHARD_WARN(logRank, "reshard: numCtas must be positive, got %d", numCtas);
-    return ncclInvalidArgument;
-  }
-
-  size_t srcTotal = 0;
-  ncclResult_t result = computeReshardMeshSize(srcMesh, logRank, &srcTotal);
-  if (result != ncclSuccess) return result;
-
-  int64_t relativeRank = static_cast<int64_t>(srcRank) - static_cast<int64_t>(srcMesh->startRank);
-  if (relativeRank < 0 || static_cast<size_t>(relativeRank) >= srcTotal) {
-    RESHARD_WARN(logRank, "reshard: source rank %d is outside source mesh (startRank=%d, size=%zu)", srcRank,
-                 srcMesh->startRank, srcTotal);
-    return ncclInvalidArgument;
-  }
-
-  size_t relativeRankSize = static_cast<size_t>(relativeRank);
-  size_t ctas = static_cast<size_t>(numCtas);
-  size_t maxSignal = static_cast<size_t>(std::numeric_limits<unsigned int>::max());
-  if (relativeRankSize > maxSignal / ctas) {
-    RESHARD_WARN(logRank, "reshard: source signal base overflows 32-bit GIN signal id");
-    return ncclInvalidArgument;
-  }
-
-  size_t signalBase = relativeRankSize * ctas;
-  if (signalBase > maxSignal - (ctas - 1)) {
-    RESHARD_WARN(logRank, "reshard: source signal range overflows 32-bit GIN signal id");
-    return ncclInvalidArgument;
-  }
-
-  *outSignalBase = static_cast<unsigned int>(signalBase);
-  return ncclSuccess;
-}
-
-inline unsigned int computeReshardSignalBaseUnchecked(const ncclMesh_t* srcMesh, int srcRank, int numCtas) {
-  size_t relativeRank = static_cast<size_t>(static_cast<int64_t>(srcRank) - static_cast<int64_t>(srcMesh->startRank));
-  return static_cast<unsigned int>(relativeRank * static_cast<size_t>(numCtas));
-}
-
 ncclResult_t computeStridesChecked(const size_t dims[], int ndims, size_t strides[]);
 void computeStrides(const size_t dims[], int ndims, size_t strides[]);
 
@@ -305,6 +211,103 @@ inline bool reshardRankInMesh(const ncclMesh_t* mesh, int worldRank) {
 }
 
 ncclResult_t validateReshardPlacement(const ncclDistTensor_t* tensor, const char* apiName, const char* fieldName);
+
+inline ncclResult_t computeReshardMeshSize(const ncclMesh_t* mesh, int logRank, size_t* outMeshSize) {
+  if (mesh == nullptr || outMeshSize == nullptr) {
+    NCCL_M2N_FAIL(ncclInvalidArgument, logRank, "reshard: computeReshardMeshSize called with null argument");
+  }
+  if (mesh->dims[0] <= 0 || mesh->dims[1] <= 0) {
+    NCCL_M2N_FAIL(ncclInvalidArgument, logRank, "reshard: mesh dims must be positive, got [%d, %d]", mesh->dims[0],
+                  mesh->dims[1]);
+  }
+
+  size_t dim0 = static_cast<size_t>(mesh->dims[0]);
+  size_t dim1 = static_cast<size_t>(mesh->dims[1]);
+  if (dim0 > std::numeric_limits<size_t>::max() / dim1) {
+    NCCL_M2N_FAIL(ncclInvalidArgument, logRank, "reshard: mesh size overflows size_t for dims [%d, %d]",
+                  mesh->dims[0], mesh->dims[1]);
+  }
+
+  *outMeshSize = dim0 * dim1;
+  return ncclSuccess;
+}
+
+/* GIN's ncclDevCommRequirements::ginSignalCount is an int, and kernel signal
+ * IDs are 32-bit.  Keeping source signal IDs relative to srcMesh->startRank
+ * lets a non-zero source mesh start at signal slot 0 instead of silently
+ * indexing past srcMeshSize * numCtas. */
+inline ncclResult_t computeReshardGinSignalCount(const ncclMesh_t* srcMesh, int numCtas, int logRank,
+                                                 int* outSignalCount) {
+  if (outSignalCount == nullptr) {
+    NCCL_M2N_FAIL(ncclInvalidArgument, logRank, "reshard: computeReshardGinSignalCount called with null output");
+  }
+  if (numCtas <= 0) {
+    NCCL_M2N_FAIL(ncclInvalidArgument, logRank, "reshard: numCtas must be positive, got %d", numCtas);
+  }
+
+  size_t srcTotal = 0;
+  ncclResult_t result = computeReshardMeshSize(srcMesh, logRank, &srcTotal);
+  if (result != ncclSuccess) return result;
+
+  size_t ctas = static_cast<size_t>(numCtas);
+  if (srcTotal > static_cast<size_t>(std::numeric_limits<int>::max()) / ctas) {
+    NCCL_M2N_FAIL(ncclInvalidArgument, logRank,
+                  "reshard: GIN signal count overflows NCCL int field "
+                  "(srcRanks=%zu, numCtas=%d)",
+                  srcTotal, numCtas);
+  }
+
+  *outSignalCount = static_cast<int>(srcTotal * ctas);
+  return ncclSuccess;
+}
+
+inline ncclResult_t computeReshardSignalBase(const ncclMesh_t* srcMesh, int srcRank, int numCtas, int logRank,
+                                             unsigned int* outSignalBase) {
+  if (outSignalBase == nullptr) {
+    NCCL_M2N_FAIL(ncclInvalidArgument, logRank, "reshard: computeReshardSignalBase called with null output");
+  }
+  if (numCtas <= 0) {
+    NCCL_M2N_FAIL(ncclInvalidArgument, logRank, "reshard: numCtas must be positive, got %d", numCtas);
+  }
+
+  size_t srcTotal = 0;
+  ncclResult_t result = computeReshardMeshSize(srcMesh, logRank, &srcTotal);
+  if (result != ncclSuccess) return result;
+
+  int64_t relativeRank = static_cast<int64_t>(srcRank) - static_cast<int64_t>(srcMesh->startRank);
+  if (relativeRank < 0 || static_cast<size_t>(relativeRank) >= srcTotal) {
+    NCCL_M2N_FAIL(ncclInvalidArgument, logRank,
+                  "reshard: source rank %d is outside source mesh "
+                  "(startRank=%d, size=%zu)",
+                  srcRank, srcMesh->startRank, srcTotal);
+  }
+
+  size_t relativeRankSize = static_cast<size_t>(relativeRank);
+  size_t ctas = static_cast<size_t>(numCtas);
+  size_t maxSignal = static_cast<size_t>(std::numeric_limits<unsigned int>::max());
+  if (relativeRankSize > maxSignal / ctas) {
+    NCCL_M2N_FAIL(ncclInvalidArgument, logRank,
+                  "reshard: source signal base overflows 32-bit GIN signal id "
+                  "(relativeRank=%zu, numCtas=%d)",
+                  relativeRankSize, numCtas);
+  }
+
+  size_t signalBase = relativeRankSize * ctas;
+  if (signalBase > maxSignal - (ctas - 1)) {
+    NCCL_M2N_FAIL(ncclInvalidArgument, logRank,
+                  "reshard: source signal range overflows 32-bit GIN signal id "
+                  "(base=%zu, numCtas=%d)",
+                  signalBase, numCtas);
+  }
+
+  *outSignalBase = static_cast<unsigned int>(signalBase);
+  return ncclSuccess;
+}
+
+inline unsigned int computeReshardSignalBaseUnchecked(const ncclMesh_t* srcMesh, int srcRank, int numCtas) {
+  size_t relativeRank = static_cast<size_t>(static_cast<int64_t>(srcRank) - static_cast<int64_t>(srcMesh->startRank));
+  return static_cast<unsigned int>(relativeRank * static_cast<size_t>(numCtas));
+}
 
 void computeMeshGroupInfo(const ncclDistTensor_t* tensor, int worldRank, ncclReshardMeshGroupInfo* info);
 
@@ -343,16 +346,21 @@ int getSourceRepForDest(const ncclReshardRepLoadBalancer* lb, int dstRepIdx);
  * reshard_prepare.cc — Kernel parameter builders
  * ====================================================================*/
 
-ncclReshardParams prepareReshardParams(int worldRank, const ncclDistTensor_t* src, const size_t srcTensorDims[],
-                                          const ncclDistTensor_t* dst, const size_t dstTensorDims[],
-                                          ncclWindow_t window, size_t elementsPerChunk, int numCtas,
-                                          unsigned int mySignalBase,
-                                          int srcGpusPerDomain, int dstGpusPerDomain, const size_t* allWindowOffsets);
+ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, const size_t srcTensorDims[],
+                                  const ncclDistTensor_t* dst, const size_t dstTensorDims[], ncclWindow_t window,
+                                  size_t elementsPerChunk, int numCtas, unsigned int mySignalBase,
+                                  int srcGpusPerDomain, int dstGpusPerDomain, const size_t* allWindowOffsets,
+                                  ncclReshardParams* outParams);
 
-ncclReshardDirectParams prepareDirectReshardParams(
-  int worldRank, const ncclDistTensor_t* src, const size_t srcTensorDims[], const ncclDistTensor_t* dst,
-  const size_t dstTensorDims[], ncclWindow_t window, size_t elementsPerChunk, int numCtas,
-  unsigned int mySignalBase, const size_t* allWindowOffsets);
+ncclResult_t prepareDirectReshardParams(int worldRank, const ncclDistTensor_t* src, const size_t srcTensorDims[],
+                                        const ncclDistTensor_t* dst, const size_t dstTensorDims[],
+                                        ncclWindow_t window, size_t elementsPerChunk, int numCtas,
+                                        unsigned int mySignalBase, int dstGpusPerDomain,
+                                        const size_t* allWindowOffsets, ncclReshardDirectParams* outParams);
+
+ncclResult_t validateReshardPlanLimits(int worldRank, const ncclDistTensor_t* src, const size_t srcTensorDims[],
+                                       const ncclDistTensor_t* dst, const size_t dstTensorDims[],
+                                       size_t elementsPerChunk, ReshardAlgorithm algo, int dstGpusPerDomain);
 
 /* ======================================================================
  * reshard_transpose.cc — Cross-dim transpose buffer

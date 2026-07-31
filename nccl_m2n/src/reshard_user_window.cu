@@ -41,14 +41,11 @@
 #include "nccl_m2n.h"
 #include "reshard_types.h"
 #include "m2n_checks.h"
+#include "m2n_checked_math.h"
 #include "m2n_log.h"
 #include "reshard_call_setup.h"
 #include "reshard_internal.h"
 #include "reshard_kernels.cuh"
-
-/* Error macros — aliases to the unified definitions in m2n_checks.h. */
-#define UW_NCCLCHECK NCCL_M2N_CHECK
-#define UW_CUDACHECK NCCL_M2N_CUDACHECK
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 5)
 #define NCCL_RESHARD_GIN_FINAL_FENCE (ncclGinFenceLevel::Put | ncclGinFenceLevel::Get)
@@ -449,43 +446,27 @@ directReshardKernelUserWindow(
 extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm, ncclWindow_t window,
                                                const ncclDistTensor_t* src, const ncclDistTensor_t* dst,
                                                cudaStream_t stream) {
+  m2nClearLastError();
   /* Required handles. */
-  if (comm == nullptr || window == nullptr) {
-    fprintf(stderr, "[ncclReshardWithWindow] comm and window must both be "
-                    "non-null\n");
-    return ncclInvalidArgument;
-  }
+  NCCL_M2N_CHECK_ARG(comm != nullptr && window != nullptr, -1,
+                     "ncclReshardWithWindow: comm and window must both be non-null");
   /* Both descriptors required — each carries one side's mesh and the
      library reads both meshes on every rank.  A rank that does not
      have data on a given side still passes a fully-formed descriptor
      with dataPtr=NULL (the same convention PyTorch DTensor uses with
      a size-0 local tensor on non-participating ranks). */
-  if (src == nullptr || dst == nullptr) {
-    fprintf(stderr, "[ncclReshardWithWindow] src and dst tensor descriptors "
-                    "must both be non-null on every rank (use dataPtr=NULL "
-                    "on the side this rank doesn't participate in)\n");
-    return ncclInvalidArgument;
-  }
-  if (src->mesh == nullptr || dst->mesh == nullptr) {
-    fprintf(stderr, "[ncclReshardWithWindow] src->mesh and dst->mesh must "
-                    "both be non-null on every rank\n");
-    return ncclInvalidArgument;
-  }
+  NCCL_M2N_CHECK_ARG(src != nullptr && dst != nullptr, -1,
+                     "ncclReshardWithWindow: src and dst tensor descriptors must both be non-null on every rank "
+                     "(use dataPtr=NULL on the side this rank doesn't participate in)");
+  NCCL_M2N_CHECK_ARG(src->mesh != nullptr && dst->mesh != nullptr, -1,
+                     "ncclReshardWithWindow: src->mesh and dst->mesh must both be non-null on every rank");
   NCCL_M2N_CHECK(validateReshardMeshDims(src->mesh, dst->mesh));
-  if (src->ndims != dst->ndims) {
-    fprintf(stderr,
-            "[ncclReshardWithWindow] src->ndims (%d) and dst->ndims (%d) "
-            "must match\n",
-            src->ndims, dst->ndims);
-    return ncclInvalidArgument;
-  }
-  if (src->dtype != dst->dtype) {
-    fprintf(stderr,
-            "[ncclReshardWithWindow] src->dtype (%d) and dst->dtype (%d) "
-            "must match\n",
-            (int)src->dtype, (int)dst->dtype);
-    return ncclInvalidArgument;
-  }
+  NCCL_M2N_CHECK_ARG(src->ndims == dst->ndims, -1,
+                     "ncclReshardWithWindow: src->ndims (%d) and dst->ndims (%d) must match", src->ndims,
+                     dst->ndims);
+  NCCL_M2N_CHECK_ARG(src->dtype == dst->dtype, -1,
+                     "ncclReshardWithWindow: src->dtype (%d) and dst->dtype (%d) must match", (int)src->dtype,
+                     (int)dst->dtype);
   int ndims = src->ndims;
   ncclDataType_t dtype = src->dtype;
   void* srcBuffer = src->dataPtr;
@@ -500,15 +481,11 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   ncclDistTensor_t dstTensorLocal = *dst;
   srcTensorLocal.mesh = &srcMeshLocal;
   dstTensorLocal.mesh = &dstMeshLocal;
-  if (ndims < 1 || ndims > NCCL_RESHARD_MAX_TENSOR_DIMS) {
-    fprintf(stderr, "[ncclReshardWithWindow] ndims (%d) out of range [1, %d]\n", ndims, NCCL_RESHARD_MAX_TENSOR_DIMS);
-    return ncclInvalidArgument;
-  }
+  NCCL_M2N_CHECK_ARG(ndims >= 1 && ndims <= NCCL_RESHARD_MAX_TENSOR_DIMS, -1,
+                     "ncclReshardWithWindow: ndims (%d) out of range [1, %d]", ndims,
+                     NCCL_RESHARD_MAX_TENSOR_DIMS);
   size_t elementSize = getNcclDtSize(dtype);
-  if (elementSize == 0) {
-    fprintf(stderr, "[ncclReshardWithWindow] unsupported data type %d\n", (int)dtype);
-    return ncclInvalidArgument;
-  }
+  NCCL_M2N_CHECK_ARG(elementSize != 0, -1, "ncclReshardWithWindow: unsupported data type %d", (int)dtype);
 
   NCCL_M2N_CHECK(reshardFixFullyReplicated(&srcMeshLocal, srcTensorLocal.placements));
   NCCL_M2N_CHECK(reshardFixFullyReplicated(&dstMeshLocal, dstTensorLocal.placements));
@@ -523,24 +500,21 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   const ncclMesh_t* dstMesh = dstTensor->mesh;
 
   int worldRank, worldSize;
-  UW_NCCLCHECK(ncclCommUserRank(comm, &worldRank));
-  UW_NCCLCHECK(ncclCommCount(comm, &worldSize));
+  NCCL_M2N_CHECK(ncclCommUserRank(comm, &worldRank));
+  NCCL_M2N_CHECK(ncclCommCount(comm, &worldSize));
   NCCL_M2N_CHECK(validateReshardMeshBounds(srcMesh, dstMesh, worldSize, worldRank));
   NCCL_M2N_CHECK(reshardValidateActiveBuffers("ncclReshardWithWindow", worldRank, srcTensor, dstTensor));
 
-  int currentCudaDev;
+  int currentCudaDev = 0;
   ncclCommProperties commProps = NCCL_COMM_PROPERTIES_INITIALIZER;
   ncclResult_t propsResult = ncclSuccess;
-  ncclResult_t setupResult = reshardMatchCommCudaDevice(comm, &currentCudaDev, &commProps, &propsResult);
-  if (setupResult != ncclSuccess) {
-    return setupResult;
-  }
+  NCCL_M2N_CHECK(reshardMatchCommCudaDevice(comm, &currentCudaDev, &commProps, &propsResult));
 
   // Default-stream callers run on a library-owned non-blocking stream from
   // the pool. Readiness and completion events preserve the caller stream's
   // ordering. NCCL_RESHARD_STREAM_POOL_SIZE=0 runs on the caller stream.
   ReshardWorkStream work{};
-  setupResult = reshardSetupWorkStream(comm, stream, currentCudaDev, propsResult, &commProps, &work);
+  ncclResult_t setupResult = reshardSetupWorkStream(comm, stream, currentCudaDev, propsResult, &commProps, &work);
   if (setupResult != ncclSuccess) {
     return setupResult;
   }
@@ -562,38 +536,48 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 2)
   {
     void* winUserPtr = nullptr;
-    UW_NCCLCHECK(ncclWinGetUserPtr(comm, window, &winUserPtr));
-    if (winUserPtr == nullptr) {
-      RESHARD_FATAL(worldRank, "ncclWinGetUserPtr returned nullptr for the supplied window; "
-                               "ncclReshardWithWindow requires a symmetric-memory window "
-                               "(NCCL_WIN_COLL_SYMMETRIC).");
-    }
+    NCCL_M2N_CHECK(ncclWinGetUserPtr(comm, window, &winUserPtr));
+    NCCL_M2N_CHECK_ARG(winUserPtr != nullptr, worldRank,
+                       "ncclReshardWithWindow: ncclWinGetUserPtr returned null for the supplied window; "
+                       "a symmetric-memory window (NCCL_WIN_COLL_SYMMETRIC) is required. This is a collective API; "
+                       "all ranks must satisfy the window-offset contract or peers may wait indefinitely");
 
     const bool hasSrc = (srcBuffer != nullptr);
     const bool hasDst = (dstBuffer != nullptr);
-    intptr_t srcOff = hasSrc ? (intptr_t)((char*)srcBuffer - (char*)winUserPtr) : 0;
-    intptr_t dstOff = hasDst ? (intptr_t)((char*)dstBuffer - (char*)winUserPtr) : 0;
+    const uintptr_t windowAddress = reinterpret_cast<uintptr_t>(winUserPtr);
+    const uintptr_t srcAddress = reinterpret_cast<uintptr_t>(srcBuffer);
+    const uintptr_t dstAddress = reinterpret_cast<uintptr_t>(dstBuffer);
+    NCCL_M2N_CHECK_ARG(!hasSrc || srcAddress >= windowAddress, worldRank,
+                       "ncclReshardWithWindow: srcBuffer lies before the window base "
+                       "(srcBuffer=%p, window_user_ptr=%p). This is a collective API; all ranks must satisfy the "
+                       "window-offset contract or peers may wait indefinitely",
+                       srcBuffer, winUserPtr);
+    NCCL_M2N_CHECK_ARG(!hasDst || dstAddress >= windowAddress, worldRank,
+                       "ncclReshardWithWindow: dstBuffer lies before the window base "
+                       "(dstBuffer=%p, window_user_ptr=%p). This is a collective API; all ranks must satisfy the "
+                       "window-offset contract or peers may wait indefinitely",
+                       dstBuffer, winUserPtr);
 
-    if (hasSrc && hasDst && srcOff != dstOff) {
-      RESHARD_FATAL(worldRank,
-                    "srcBuffer and dstBuffer must share the same offset within "
-                    "the registered window (single-offset contract); got "
-                    "srcOff=%lld, dstOff=%lld (srcBuffer=%p, dstBuffer=%p, "
-                    "window_user_ptr=%p).",
-                    (long long)srcOff, (long long)dstOff, srcBuffer, dstBuffer, winUserPtr);
-    }
-    if (hasSrc && srcOff < 0) {
-      RESHARD_FATAL(worldRank,
-                    "srcBuffer lies before the window base (srcOff=%lld < 0); "
-                    "srcBuffer=%p, window_user_ptr=%p.",
-                    (long long)srcOff, srcBuffer, winUserPtr);
-    }
-    if (hasDst && dstOff < 0) {
-      RESHARD_FATAL(worldRank,
-                    "dstBuffer lies before the window base (dstOff=%lld < 0); "
-                    "dstBuffer=%p, window_user_ptr=%p.",
-                    (long long)dstOff, dstBuffer, winUserPtr);
-    }
+    const uintptr_t maxWindowOffset = static_cast<uintptr_t>(INTPTR_MAX);
+    NCCL_M2N_CHECK_ARG(!hasSrc || srcAddress - windowAddress <= maxWindowOffset, worldRank,
+                       "ncclReshardWithWindow: srcBuffer offset exceeds intptr_t capacity "
+                       "(srcBuffer=%p, window_user_ptr=%p). This is a collective API; all ranks must satisfy the "
+                       "window-offset contract or peers may wait indefinitely",
+                       srcBuffer, winUserPtr);
+    NCCL_M2N_CHECK_ARG(!hasDst || dstAddress - windowAddress <= maxWindowOffset, worldRank,
+                       "ncclReshardWithWindow: dstBuffer offset exceeds intptr_t capacity "
+                       "(dstBuffer=%p, window_user_ptr=%p). This is a collective API; all ranks must satisfy the "
+                       "window-offset contract or peers may wait indefinitely",
+                       dstBuffer, winUserPtr);
+
+    const intptr_t srcOff = hasSrc ? static_cast<intptr_t>(srcAddress - windowAddress) : 0;
+    const intptr_t dstOff = hasDst ? static_cast<intptr_t>(dstAddress - windowAddress) : 0;
+    NCCL_M2N_CHECK_ARG(!hasSrc || !hasDst || srcOff == dstOff, worldRank,
+                       "ncclReshardWithWindow: srcBuffer and dstBuffer must share the same offset within the "
+                       "registered window (single-offset contract); got srcOff=%lld, dstOff=%lld "
+                       "(srcBuffer=%p, dstBuffer=%p, window_user_ptr=%p). This is a collective API; all ranks must "
+                       "satisfy the window-offset contract or peers may wait indefinitely",
+                       (long long)srcOff, (long long)dstOff, srcBuffer, dstBuffer, winUserPtr);
 
     // For fully-inactive ranks (both buffers null), 0 is a safe
     // placeholder — the kernel won't read params.myWindowOffset.
@@ -611,7 +595,7 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
     size_t total = elementSize;
     for (int d = 0; d < ndims; d++) {
       NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(total, dims[d], &total), worldRank,
-                         "[ncclReshardWithWindow] %s local byte size overflow at dim %d", side, d);
+                         "ncclReshardWithWindow: %s local byte size overflow at dim %d", side, d);
     }
     *bytes = total;
     return ncclSuccess;
@@ -665,8 +649,8 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
     reqs.ginContextCount = DEFAULT_GIN_CONTEXT_COUNT;
 
     memset(&localDevComm, 0, sizeof(localDevComm));
-    UW_NCCLCHECK(ncclDevCommCreate(comm, &reqs, &localDevComm));
-    UW_NCCLCHECK(cacheDevComm(comm, numCtas, ginSignalCount, &localDevComm, workStream));
+    NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, &localDevComm));
+    NCCL_M2N_CHECK(cacheDevComm(comm, numCtas, ginSignalCount, &localDevComm, workStream));
     devCommPtr = findCachedDevComm(comm, numCtas, ginSignalCount, workStream);
     if (devCommPtr == nullptr) devCommPtr = &localDevComm;
   }
@@ -776,6 +760,9 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
       }
     }
 
+    NCCL_M2N_CHECK(validateReshardPlanLimits(worldRank, &effSrcTensor, effSrcDims, &effDstTensor, effDstDims,
+                                             elementsPerChunk, algo, dstGpusPerDomain));
+
     // 3. Allocate / grow the transpose buffer.
     //    ncclCommWindowRegister is collective — all ranks must hit or
     //    miss the cache together.  Reconstruct global dims (uniform
@@ -786,32 +773,48 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
     for (int d = 0; d < ndims; d++) {
       if (isSource && srcDimsBytes[d] > 0) {
         globalDims[d] = srcDimsBytes[d];
-        if (d == srcShardTensorDim) globalDims[d] *= srcShardCountForXpose;
+        if (d == srcShardTensorDim) {
+          NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(globalDims[d], (size_t)srcShardCountForXpose, &globalDims[d]),
+                             worldRank,
+                             "ncclReshardWithWindow: transpose source global dim overflow at dim %d: local=%zu "
+                             "shardCount=%d",
+                             d, srcDimsBytes[d], srcShardCountForXpose);
+        }
       } else if (isDest && dstDimsBytes[d] > 0) {
         globalDims[d] = dstDimsBytes[d];
-        if (d == dstShardTensorDim) globalDims[d] *= dstShardCountForXpose;
+        if (d == dstShardTensorDim) {
+          NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(globalDims[d], (size_t)dstShardCountForXpose, &globalDims[d]),
+                             worldRank,
+                             "ncclReshardWithWindow: transpose destination global dim overflow at dim %d: local=%zu "
+                             "shardCount=%d",
+                             d, dstDimsBytes[d], dstShardCountForXpose);
+        }
       } else {
         globalDims[d] = 1;
       }
     }
     size_t srcLocal = 1, dstLocal = 1;
     for (int d = 0; d < ndims; d++) {
-      srcLocal *=
-        (d == srcShardTensorDim && srcShardCountForXpose > 1) ? globalDims[d] / srcShardCountForXpose : globalDims[d];
-      dstLocal *=
-        (d == dstShardTensorDim && dstShardCountForXpose > 1) ? globalDims[d] / dstShardCountForXpose : globalDims[d];
+      size_t srcDim = (d == srcShardTensorDim && srcShardCountForXpose > 1) ? globalDims[d] / srcShardCountForXpose
+                                                                            : globalDims[d];
+      size_t dstDim = (d == dstShardTensorDim && dstShardCountForXpose > 1) ? globalDims[d] / dstShardCountForXpose
+                                                                            : globalDims[d];
+      NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(srcLocal, srcDim, &srcLocal), worldRank,
+                         "ncclReshardWithWindow: transpose source local size overflow at dim %d: current=%zu dim=%zu",
+                         d, srcLocal, srcDim);
+      NCCL_M2N_CHECK_ARG(
+        m2nCheckedMulSize(dstLocal, dstDim, &dstLocal), worldRank,
+        "ncclReshardWithWindow: transpose destination local size overflow at dim %d: current=%zu dim=%zu", d, dstLocal,
+        dstDim);
     }
     size_t myLocalSize = std::max(srcLocal, dstLocal);
-    UW_NCCLCHECK(ensureTransposeBuffer(comm, myLocalSize, workStream));
+    NCCL_M2N_CHECK(ensureTransposeBuffer(comm, myLocalSize, workStream));
 
     {
       cudaError_t err = cudaGetLastError();
       if (err != cudaSuccess) {
-        fprintf(stderr,
-                "[nccl-reshard][Rank %d] CUDA error after "
-                "ensureTransposeBuffer: %s\n",
-                worldRank, cudaGetErrorString(err));
-        return ncclSystemError;
+        NCCL_M2N_FAIL(ncclSystemError, worldRank, "CUDA error after ensureTransposeBuffer: %s",
+                      cudaGetErrorString(err));
       }
       RESHARD_DEBUG(worldRank, "ensureTransposeBuffer: size=%zu, buf=%p", myLocalSize, getTransposeBuffer(comm));
     }
@@ -828,11 +831,8 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
       {
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
-          fprintf(stderr,
-                  "[nccl-reshard][Rank %d] CUDA error after "
-                  "transpose pack: %s\n",
-                  worldRank, cudaGetErrorString(err));
-          return ncclSystemError;
+          NCCL_M2N_FAIL(ncclSystemError, worldRank, "CUDA error after transpose pack: %s",
+                        cudaGetErrorString(err));
         }
         RESHARD_DEBUG(worldRank, "transpose pack: ndims=%d, D0=%zu, D1=%zu, D2=%zu", ndims, srcDimsBytes[0],
                       srcDimsBytes[swapA], srcDimsBytes[swapB]);
@@ -853,20 +853,17 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
       effWindow = *cached;
     } else {
       ncclWindow_t xposeWin;
-      UW_NCCLCHECK(ncclCommWindowRegister(comm, getTransposeBuffer(comm), getTransposeBufferCapacity(comm), &xposeWin,
+      NCCL_M2N_CHECK(ncclCommWindowRegister(comm, getTransposeBuffer(comm), getTransposeBufferCapacity(comm), &xposeWin,
                                           NCCL_WIN_COLL_SYMMETRIC));
-      UW_NCCLCHECK(cacheInternalWindow(comm, getTransposeBuffer(comm), getTransposeBufferCapacity(comm), xposeWin));
+      NCCL_M2N_CHECK(cacheInternalWindow(comm, getTransposeBuffer(comm), getTransposeBufferCapacity(comm), xposeWin));
       effWindow = xposeWin;
     }
 
     {
       cudaError_t err = cudaGetLastError();
       if (err != cudaSuccess) {
-        fprintf(stderr,
-                "[nccl-reshard][Rank %d] CUDA error after "
-                "window register: %s\n",
-                worldRank, cudaGetErrorString(err));
-        return ncclSystemError;
+        NCCL_M2N_FAIL(ncclSystemError, worldRank, "CUDA error after window registration: %s",
+                      cudaGetErrorString(err));
       }
       RESHARD_DEBUG(worldRank, "window register: buf=%p, cap=%zu, effWindow=%p", getTransposeBuffer(comm),
                     getTransposeBufferCapacity(comm), (void*)effWindow);
@@ -877,7 +874,12 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
                   "effDstDims=[%zu,%zu,%zu]",
                   getTransposeBuffer(comm), getTransposeBufferCapacity(comm), effSrcDims[0],
                   ndims >= 2 ? effSrcDims[1] : (size_t)0, ndims >= 3 ? effSrcDims[2] : (size_t)0, effDstDims[0],
-                  ndims >= 2 ? effDstDims[1] : (size_t)0, ndims >= 3 ? effDstDims[2] : (size_t)0);
+      ndims >= 2 ? effDstDims[1] : (size_t)0, ndims >= 3 ? effDstDims[2] : (size_t)0);
+  }
+
+  if (!doTranspose) {
+    NCCL_M2N_CHECK(validateReshardPlanLimits(worldRank, &effSrcTensor, effSrcDims, &effDstTensor, effDstDims,
+                                             elementsPerChunk, algo, dstGpusPerDomain));
   }
 
   int threadsPerCta = DEFAULT_KERNEL_MAX_NTHREADS;
@@ -885,8 +887,8 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   {
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-      fprintf(stderr, "[nccl-reshard][Rank %d] CUDA error pre-launch: %s\n", worldRank, cudaGetErrorString(err));
-      return ncclSystemError;
+      NCCL_M2N_FAIL(ncclSystemError, worldRank, "CUDA error before reshard kernel launch: %s",
+                    cudaGetErrorString(err));
     }
     RESHARD_DEBUG(worldRank,
                   "pre-launch: doTranspose=%d, algo=%s, numCtas=%d, threads=%d, "
@@ -912,16 +914,18 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   effSrcTensor.dataPtr = effSrcBuffer;
   effDstTensor.dataPtr = effDstBuffer;
   if (algo == RESHARD_ALGO_DIRECT) {
-    ncclReshardDirectParams directParams =
-      prepareDirectReshardParams(worldRank, &effSrcTensor, effSrcDims, &effDstTensor, effDstDims, effWindow,
-                                 elementsPerChunk, numCtas, mySignalBase, allWindowOffsets.data());
+    ncclReshardDirectParams directParams{};
+    NCCL_M2N_CHECK(prepareDirectReshardParams(worldRank, &effSrcTensor, effSrcDims, &effDstTensor, effDstDims,
+                                              effWindow, elementsPerChunk, numCtas, mySignalBase, dstGpusPerDomain,
+                                              allWindowOffsets.data(), &directParams));
     directParams.myWindowOffset = kernelOffset;
 
     directReshardKernelUserWindow<<<numCtas, threadsPerCta, 0, workStream>>>(directParams, *devCommPtr);
   } else {
-    ncclReshardParams ringParams =
-      prepareReshardParams(worldRank, &effSrcTensor, effSrcDims, &effDstTensor, effDstDims, effWindow, elementsPerChunk,
-                           numCtas, mySignalBase, srcGpusPerDomain, dstGpusPerDomain, allWindowOffsets.data());
+    ncclReshardParams ringParams{};
+    NCCL_M2N_CHECK(prepareReshardParams(worldRank, &effSrcTensor, effSrcDims, &effDstTensor, effDstDims, effWindow,
+                                        elementsPerChunk, numCtas, mySignalBase, srcGpusPerDomain, dstGpusPerDomain,
+                                        allWindowOffsets.data(), &ringParams));
 
     ringParams.myWindowOffset = kernelOffset;
     ringParams.ringNextWindowOffset = kernelOffset;
@@ -932,11 +936,8 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
 
   cudaError_t launchErr = cudaGetLastError();
   if (launchErr != cudaSuccess) {
-    fprintf(stderr,
-            "[nccl-reshard][Rank %d] kernel launch failed: %s "
-            "[algo=%s, numCtas=%d]\n",
-            worldRank, cudaGetErrorString(launchErr), algo == RESHARD_ALGO_RING ? "RING" : "DIRECT", numCtas);
-    return ncclSystemError;
+    NCCL_M2N_FAIL(ncclSystemError, worldRank, "reshard kernel launch failed: %s [algo=%s, numCtas=%d]",
+                  cudaGetErrorString(launchErr), algo == RESHARD_ALGO_RING ? "RING" : "DIRECT", numCtas);
   }
 
   // ------------------------------------------------------------------
@@ -952,7 +953,9 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
     }
   }
 
-  if (doTranspose) UW_NCCLCHECK(transposeBufferRecordEvent(comm, workStream));
+  if (doTranspose) {
+    NCCL_M2N_CHECK(transposeBufferRecordEvent(comm, workStream));
+  }
 
   return workCompletion.complete();
 }

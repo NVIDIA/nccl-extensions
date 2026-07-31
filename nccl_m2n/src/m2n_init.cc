@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -28,7 +29,16 @@ static std::shared_ptr<ncclM2nHandleState> gM2nDefaultHandle;
 static std::mutex gM2nHandleTableMutex;
 static uintptr_t gNextM2nHandleId = 1;
 static std::unordered_map<ncclM2nHandle_t, std::shared_ptr<ncclM2nHandleState>> gM2nHandleTable;
+static thread_local char gM2nLastError[512] = {};
 static std::atomic<bool> gM2nProcessExiting{false};
+
+void m2nClearLastError() {
+  gM2nLastError[0] = '\0';
+}
+
+void m2nSetLastError(const char* message) {
+  (void)snprintf(gM2nLastError, sizeof(gM2nLastError), "%s", message);
+}
 
 struct M2nExitGuard {
   ~M2nExitGuard() {
@@ -106,7 +116,7 @@ static ncclResult_t createHandle(std::shared_ptr<ncclM2nHandleState>* handle) {
   try {
     *handle = std::shared_ptr<ncclM2nHandleState>(new ncclM2nHandleState(), deleteHandleState);
   } catch (const std::bad_alloc&) {
-    return ncclSystemError;
+    NCCL_M2N_FAIL(ncclSystemError, -1, "ncclM2nInit: failed to allocate handle state");
   }
   return ncclSuccess;
 }
@@ -115,7 +125,7 @@ static ncclResult_t createRuntime(std::shared_ptr<ncclM2nRuntime>* runtime) {
   try {
     *runtime = std::make_shared<ncclM2nRuntime>();
   } catch (const std::bad_alloc&) {
-    return ncclSystemError;
+    NCCL_M2N_FAIL(ncclSystemError, -1, "ncclM2nInit: failed to allocate runtime state");
   }
   return ncclSuccess;
 }
@@ -173,14 +183,14 @@ static ncclResult_t registerExplicitHandle(const std::shared_ptr<ncclM2nHandleSt
   try {
     std::lock_guard<std::mutex> lock(gM2nHandleTableMutex);
     if (gNextM2nHandleId == 0) {
-      return ncclSystemError;
+      NCCL_M2N_FAIL(ncclSystemError, -1, "ncclM2nInit: handle identifier space is exhausted");
     }
     newToken = reinterpret_cast<ncclM2nHandle_t>(gNextM2nHandleId++);
     if (!gM2nHandleTable.emplace(newToken, handle).second) {
-      return ncclSystemError;
+      NCCL_M2N_FAIL(ncclSystemError, -1, "ncclM2nInit: failed to register handle %p", (void*)newToken);
     }
   } catch (const std::bad_alloc&) {
-    return ncclSystemError;
+    NCCL_M2N_FAIL(ncclSystemError, -1, "ncclM2nInit: failed to allocate handle-table entry");
   }
   *token = newToken;
   return ncclSuccess;
@@ -191,9 +201,8 @@ static ncclResult_t destroyExplicitHandle(ncclM2nHandle_t handle) {
   {
     std::lock_guard<std::mutex> lock(gM2nHandleTableMutex);
     auto it = gM2nHandleTable.find(handle);
-    if (it == gM2nHandleTable.end()) {
-      return ncclInvalidArgument;
-    }
+    NCCL_M2N_CHECK_ARG(it != gM2nHandleTable.end(), -1,
+                       "ncclM2nFinalize: handle %p is unknown or already finalized", (void*)handle);
     ownedHandle = std::move(it->second);
     gM2nHandleTable.erase(it);
   }
@@ -209,9 +218,8 @@ ncclM2nRuntime::~ncclM2nRuntime() {
 
 extern "C" {
 ncclResult_t ncclM2nInit(ncclM2nHandle_t* handle, const ncclM2nConfig_t* config) {
-  if (handle == nullptr) {
-    return ncclInvalidArgument;
-  }
+  m2nClearLastError();
+  NCCL_M2N_CHECK_ARG(handle != nullptr, -1, "ncclM2nInit: handle output must be non-null");
   *handle = nullptr;
   std::shared_ptr<ncclM2nHandleState> newHandle;
   NCCL_M2N_CHECK(createInitializedHandle(&newHandle, config, true));
@@ -223,6 +231,7 @@ ncclResult_t ncclM2nInit(ncclM2nHandle_t* handle, const ncclM2nConfig_t* config)
 }
 
 ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle) {
+  m2nClearLastError();
   if (handle != nullptr) {
     return destroyExplicitHandle(handle);
   }
@@ -236,20 +245,21 @@ ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle) {
   return ncclSuccess;
 }
 
+const char* ncclM2nGetLastError(void) {
+  return gM2nLastError;
+}
+
 } // extern "C"
 
 ncclResult_t acquireM2nHandle(ncclM2nHandle_t token, std::shared_ptr<ncclM2nHandleState>* handle) {
-  if (handle == nullptr) {
-    return ncclInvalidArgument;
-  }
+  NCCL_M2N_CHECK_ARG(handle != nullptr, -1, "acquireM2nHandle: handle state output must be non-null");
   *handle = nullptr;
 
   if (token != nullptr) {
     std::lock_guard<std::mutex> lock(gM2nHandleTableMutex);
     auto it = gM2nHandleTable.find(token);
-    if (it == gM2nHandleTable.end()) {
-      return ncclInvalidArgument;
-    }
+    NCCL_M2N_CHECK_ARG(it != gM2nHandleTable.end(), -1,
+                       "NCCL M2N handle %p is unknown or already finalized", (void*)token);
     *handle = it->second;
     return ncclSuccess;
   }

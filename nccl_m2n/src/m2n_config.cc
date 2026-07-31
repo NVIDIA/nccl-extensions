@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "m2n_checks.h"
 #include "m2n_env_parse.h"
 #include "reshard_internal.h"
 #include "m2n_log.h"
@@ -84,11 +85,10 @@ ncclResult_t validateReshardConfigHeader(const ncclM2nConfig_t* config) {
   if (config == nullptr) return ncclSuccess;
 
   if (config->size != sizeof(ncclM2nConfig_t) || config->magic != NCCL_M2N_API_MAGIC) {
-    RESHARD_WARN(-1,
-                 "ncclM2nInit: rejecting malformed ncclM2nConfig_t "
-                 "(size=%zu, magic=0x%x, version=%u). Use NCCL_M2N_CONFIG_INITIALIZER.",
-                 config->size, config->magic, config->version);
-    return ncclInvalidArgument;
+    NCCL_M2N_FAIL(ncclInvalidArgument, -1,
+                  "NCCL M2N config: rejecting malformed ncclM2nConfig_t "
+                  "(size=%zu, magic=0x%x, version=%u). Use NCCL_M2N_CONFIG_INITIALIZER.",
+                  config->size, config->magic, config->version);
   }
 
   if (config->version != NCCL_M2N_API_VERSION) {

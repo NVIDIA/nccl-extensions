@@ -13,6 +13,7 @@ cimport cpython
 cimport cpython.buffer
 
 import numpy as _numpy
+from nccl.bindings.nccl import NCCLError as _NCCLError
 
 from nccl.m2n._runtime import NATIVE_CALL_LOCK as _NATIVE_CALL_LOCK
 
@@ -433,7 +434,7 @@ cdef class DistTensor:
 # Error handling
 ###############################################################################
 
-class NCCLReshardError(Exception):
+class NCCLReshardError(_NCCLError):
 
     def __init__(self, status, detail=None):
         self.status = int(status)
@@ -441,7 +442,9 @@ class NCCLReshardError(Exception):
         message = f"NCCL Reshard error code {self.status}"
         if detail:
             message += f": {detail}"
-        super().__init__(message)
+        # NCCLError's constructor performs nccl4py-specific status handling;
+        # this wrapper already owns the status and optional M2N detail.
+        Exception.__init__(self, message)
 
     def __reduce__(self):
         return (type(self), (self.status, self.detail))
@@ -450,9 +453,15 @@ class NCCLReshardError(Exception):
 @cython.profile(False)
 cpdef inline check_status(int status):
     cdef const char* detail = NULL
+    cdef bytes detail_bytes
+    cdef object detail_text = None
     if status != 0:
         detail = ncclM2nGetLastError()
-        raise NCCLReshardError(status, (<bytes>detail).decode() if detail != NULL else None)
+        if detail != NULL:
+            detail_bytes = <bytes>detail
+            if detail_bytes:
+                detail_text = detail_bytes.decode("utf-8", "replace")
+        raise NCCLReshardError(status, detail_text)
 
 
 ###############################################################################

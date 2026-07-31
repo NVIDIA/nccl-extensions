@@ -26,6 +26,7 @@
 #include "nccl_device.h"
 #include "cuda_runtime.h"
 
+#include "m2n_checks.h"
 #include "staging_types.h"
 #include "staging_primitives.cuh"
 
@@ -35,14 +36,14 @@
 // Error-check macros (host-side only)
 // ============================================================================
 
-#define SK_CUDACHECK(cmd)                                                                           \
-  do {                                                                                              \
-    cudaError_t e = cmd;                                                                            \
-    if (e != cudaSuccess) {                                                                         \
-      printf("STAGING_KERNEL: CUDA error %s:%d '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
-      return ncclInternalError;                                                                     \
-    }                                                                                               \
+#define SK_CUDACHECK_IMPL(cmd, errorVar)                                                                        \
+  do {                                                                                                          \
+    cudaError_t errorVar = (cmd);                                                                               \
+    if (errorVar != cudaSuccess) {                                                                              \
+      NCCL_M2N_FAIL(ncclInternalError, -1, "CUDA operation %s failed: %s", #cmd, cudaGetErrorString(errorVar)); \
+    }                                                                                                           \
   } while (0)
+#define SK_CUDACHECK(cmd) SK_CUDACHECK_IMPL(cmd, NCCL_M2N_UNIQUE(skCudaError_))
 
 // Named barrier for a subset of threads within a CTA.
 // __barrier_sync(id) syncs ALL CTA threads; to sync only `count` threads

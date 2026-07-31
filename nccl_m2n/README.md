@@ -754,6 +754,7 @@ for `NCCL_RESHARD_STREAM_POOL_SIZE`, an invalid value is ignored and the
 configured or built-in value remains in effect. For the stream pool, an invalid
 or non-positive value disables the pool; values above
 `STREAM_POOL_MAX_SIZE` are capped to that maximum.
+
 `NCCL_RESHARD_STAGING_NUM_CHANNELS`,
 `NCCL_RESHARD_STAGING_CHANNEL_SIZE`, and
 `NCCL_RESHARD_STAGING_CHUNK_SIZE` affect collective resource geometry and must

@@ -46,6 +46,21 @@
 #include "test_helpers.h"
 
 /* ======================================================================
+ * API path selector — both resharding APIs are exercised from the same
+ * test matrix.
+ *   ApiKind::Window -> env->buffer (ncclMemAlloc'd) + ncclCommWindowRegister
+ *                      + ncclReshardWithWindow.
+ *   ApiKind::Default -> env->copyBuffer (cudaMalloc'd) + ncclReshard
+ *                       (no symmetric-window contract — the staging path
+ *                       manages its own pool internally).
+ * ====================================================================*/
+
+enum class ApiKind {
+  Window = 0,
+  Default = 1
+};
+
+/* ======================================================================
  * Bootstrap-agnostic test environment.
  * ====================================================================*/
 
@@ -58,6 +73,9 @@ struct TestEnv {
   ncclM2nHandle_t m2nHandle;
   void* buffer;
   size_t bufferBytes;
+  void* copyBuffer;
+  size_t copyBufferBytes;
+  ApiKind apiKind;
   bool verbose;
 
   void (*barrier)(TestEnv* env);
@@ -90,6 +108,7 @@ struct TestCase {
   size_t elementSize; /* 1, 2, 4 */
 
   int worldMin; /* skip if worldSize < this */
+  int worldMax; /* skip if worldSize > this; 0 = unbounded */
   int worldDivisor; /* skip if worldSize % this != 0 */
 
   int srcRatioNum, dstRatioNum; /* (0,0) ⇒ even split */
@@ -106,6 +125,7 @@ struct BasicApiCliArgs {
   const char* filter = nullptr;
   const char* algorithm = "ring";
   const char* lbMode = "uniform";
+  const char* api = "window"; /* "window", "default", or "all" */
   int maxWorld = 0; /* 0 = unrestricted */
   int minWorld = 0; /* 0 = unrestricted */
 };
@@ -130,6 +150,9 @@ static void basicApiPrintUsage(const char* prog, const char* usageFmt, bool allo
          "rank tier)\n");
   printf("  --algorithm ring|direct%s  Reshard algorithm (default: ring%s)\n", allowAlgorithmAll ? "|all" : "   ",
          allowAlgorithmAll ? "; 'all' registers one gtest case per algorithm" : "");
+  printf("  --api  window|default|all    Reshard API surface (default: "
+         "window;\n");
+  printf("                               'all' runs both window and default)\n");
   printf("  --lb-mode  uniform|node      Load-balance mode (default: "
          "uniform)\n");
   printf("  --verbose                    Verbose / per-rank output\n");
@@ -182,6 +205,12 @@ static BasicApiCliArgs basicApiParseCli(int argc, char** argv, const char* usage
       a.algorithm = basicApiRequireValue(argc, argv, &i);
       if (!allowAlgorithmAll && strcmp(a.algorithm, "all") == 0) {
         fprintf(stderr, "--algorithm all is supported by MPI only\n");
+        _Exit(2);
+      }
+    } else if (strcmp(k, "--api") == 0) {
+      a.api = basicApiRequireValue(argc, argv, &i);
+      if (strcmp(a.api, "window") != 0 && strcmp(a.api, "default") != 0 && strcmp(a.api, "all") != 0) {
+        fprintf(stderr, "Unknown api '%s'. Use 'window', 'default', or 'all'\n", a.api);
         _Exit(2);
       }
     } else if (strcmp(k, "--lb-mode") == 0) {
@@ -450,6 +479,36 @@ static void emitNdTensors(std::vector<TestCase>& cases) {
   }
 }
 
+static void emitStagingSlotPressure(std::vector<TestCase>& cases) {
+  /* 2-node CI reproducer for the staging-buffer slot-sizing regression.
+   *
+   * Shape/placement mirrors the dsv3 expert transfer pattern at small scale:
+   * train-style Shard(0) to gen-style Shard(innermost). With the CI allocation
+   * of 2 nodes * 2 ranks/node, srcTotal=2 and dstTotal=2. Running this case
+   * with NCCL_RESHARD_STAGING_CHANNEL_SIZE=4 MiB leaves each peer slightly less than
+   * the old fixed 1 MiB chunk size after the staging-region split, reproducing
+   * the same prepare-time invalid-argument failure without a 256-rank tensor.
+   */
+  TestCase tc{};
+  tc.group = "staging_slot_pressure";
+  tc.ndims = 3;
+  tc.globalDims[0] = 64;
+  tc.globalDims[1] = 128;
+  tc.globalDims[2] = 128;
+  tc.srcDim0 = 0;
+  tc.dstDim0 = 0;
+  tc.srcShardDim = 0;
+  tc.dstShardDim = 2;
+  tc.srcPl = PL_RS;
+  tc.dstPl = PL_RS;
+  tc.elementSize = 2; /* bf16 */
+  tc.worldMin = 4;
+  tc.worldMax = 4;
+  tc.worldDivisor = 2;
+  tc.name = buildCaseName(tc);
+  cases.push_back(std::move(tc));
+}
+
 /* ======================================================================
  * 1D tensor variants — placement / sharding coverage with ndims=1 and
  * sharding_dim always 0 (only one tensor axis).
@@ -552,6 +611,8 @@ static void emit1dTensorSizeSensitivity(std::vector<TestCase>& cases) {
  *              skipped, non-transpose RING/DIRECT was broken.
  *   issue !5 — 2D, sd=0/1, mesh 2x4, rs/rs placement → 2D transpose
  *              path (enabled by bc0b99c) hangs.
+ *   staging high-fanout — 3D, train-style Shard(0) to gen-style
+ *              Shard(innermost) with >INT32_MAX global elements.
  * ====================================================================*/
 
 static void emitCrossDimRegression(std::vector<TestCase>& cases) {
@@ -606,6 +667,30 @@ static void emitCrossDimRegression(std::vector<TestCase>& cases) {
     tc.name = buildCaseName(tc);
     cases.push_back(std::move(tc));
   }
+
+  /* dsv3-style MoE expert transfer: train [DP8, EP16] Shard(0) to
+   * gen [DP4, TP32] Shard(2).  Global elements =
+   * 256 * 7168 * 2048 = 3,758,096,384, above INT32_MAX. */
+  {
+    TestCase tc{};
+    tc.group = "cross_dim_regression";
+    tc.ndims = 3;
+    tc.globalDims[0] = 256;
+    tc.globalDims[1] = 7168;
+    tc.globalDims[2] = 2048;
+    tc.srcDim0 = 8;
+    tc.dstDim0 = 4;
+    tc.srcShardDim = 0;
+    tc.dstShardDim = 2;
+    tc.srcPl = PL_RS;
+    tc.dstPl = PL_RS;
+    tc.elementSize = 2; /* bf16 */
+    tc.worldMin = 256;
+    tc.worldMax = 256;
+    tc.worldDivisor = 256;
+    tc.name = buildCaseName(tc);
+    cases.push_back(std::move(tc));
+  }
 }
 
 static std::vector<TestCase> buildAllTestCases() {
@@ -616,6 +701,7 @@ static std::vector<TestCase> buildAllTestCases() {
   emitUnevenRatio(cases);
   emitTensorSizeSensitivity(cases);
   emitNdTensors(cases);
+  emitStagingSlotPressure(cases);
   /* 1D tensor groups (extends pytest matrix). */
   emit1dFullSharding(cases);
   emit1d2dPlacement(cases);
@@ -718,33 +804,6 @@ static inline CaseResult makePass() {
 }
 
 /* ======================================================================
- * Buffer-size estimator.
- * ====================================================================*/
-
-static size_t maxLocalBytes(const TestCase& tc, int worldSize) {
-  /* Conservative upper bound: assume the tensor is unsharded along all
-   * dims (i.e. local size == global size). Multiplied by elementSize.
-   * This dominates the actual per-case need and saves us the trouble
-   * of recomputing per (src/dst) and per shard split.
-   */
-  (void)worldSize;
-  size_t total = tc.globalDims[0];
-  for (int d = 1; d < tc.ndims; d++) total *= tc.globalDims[d];
-  return total * tc.elementSize;
-}
-
-static size_t computeMaxBufferBytes(const std::vector<TestCase>& cases, int worldSize) {
-  size_t mx = 4096; /* NCCL min alloc */
-  for (auto& tc : cases) {
-    size_t need = maxLocalBytes(tc, worldSize);
-    if (need > mx) mx = need;
-  }
-  /* Round up to 4 KiB. */
-  const size_t pg = 4096;
-  return ((mx + pg - 1) / pg) * pg;
-}
-
-/* ======================================================================
  * Feasibility helpers — shared between runOneCase() and
  * computeMinWorldForCase().
  * ====================================================================*/
@@ -771,6 +830,9 @@ static bool caseFeasibleAt(const TestCase& tc, int w, CaseShape* shape = nullptr
   };
 
   if (w < tc.worldMin) return fail("worldSize below minimum");
+  if (tc.worldMax > 0 && w > tc.worldMax) {
+    return fail("worldSize above maximum");
+  }
   if (tc.worldDivisor != 0 && (w % tc.worldDivisor) != 0) return fail("worldSize not divisible by required factor");
 
   int srcTotal, dstTotal;
@@ -832,9 +894,56 @@ static int computeMinWorldForCase(const TestCase& tc, int bound = 4096) {
   /* Round start up to the next multiple of divisor. */
   if (start % divisor != 0) start += divisor - (start % divisor);
   if (start < divisor) start = divisor;
-  for (int w = start; w <= bound; w += divisor)
+  int stop = (tc.worldMax > 0 && tc.worldMax < bound) ? tc.worldMax : bound;
+  for (int w = start; w <= stop; w += divisor) {
     if (caseFeasibleAt(tc, w)) return w;
+  }
   return -1;
+}
+
+/* ======================================================================
+ * Buffer-size estimator.
+ * ====================================================================*/
+
+static size_t localBytesForShard(const TestCase& tc, int shardDim, int shardCount) {
+  size_t localDims[3] = {tc.globalDims[0], tc.globalDims[1], tc.globalDims[2]};
+  if (shardDim >= 0) {
+    if (shardCount <= 0) {
+      return 0;
+    }
+    localDims[shardDim] /= (size_t)shardCount;
+  }
+
+  int innermost = tc.ndims - 1;
+  localDims[innermost] *= tc.elementSize;
+
+  size_t total = localDims[0];
+  for (int d = 1; d < tc.ndims; d++) {
+    total *= localDims[d];
+  }
+  return total;
+}
+
+static size_t maxLocalBytes(const TestCase& tc, int worldSize) {
+  CaseShape shape = {};
+  if (!caseFeasibleAt(tc, worldSize, &shape)) {
+    return 0;
+  }
+
+  size_t srcBytes = localBytesForShard(tc, tc.srcShardDim, shape.srcShardCount);
+  size_t dstBytes = localBytesForShard(tc, tc.dstShardDim, shape.dstShardCount);
+  return std::max(srcBytes, dstBytes);
+}
+
+static size_t computeMaxBufferBytes(const std::vector<TestCase>& cases, int worldSize) {
+  size_t mx = 4096; /* NCCL min alloc */
+  for (auto& tc : cases) {
+    size_t need = maxLocalBytes(tc, worldSize);
+    if (need > mx) mx = need;
+  }
+  /* Round up to 4 KiB. */
+  const size_t pg = 4096;
+  return ((mx + pg - 1) / pg) * pg;
 }
 
 static bool caseMatchesSelection(const TestCase& tc, const char* filter, int minWorld, int maxWorld) {
@@ -913,6 +1022,17 @@ static bool basicApiRunAllAlgorithms(const BasicApiCliArgs& cli) {
   return strcmp(cli.algorithm, "all") == 0;
 }
 
+static bool basicApiRunAllApis(const BasicApiCliArgs& cli) {
+  return strcmp(cli.api, "all") == 0;
+}
+
+static ApiKind basicApiRequestedApi(const BasicApiCliArgs& cli) {
+  if (strcmp(cli.api, "default") == 0) {
+    return ApiKind::Default;
+  }
+  return ApiKind::Window;
+}
+
 static const char* basicApiRequestedAlgorithmEnv(const BasicApiCliArgs& cli, bool shouldPrintUnknown) {
   if (strcmp(cli.algorithm, "direct") == 0) return "DIRECT";
   if (strcmp(cli.algorithm, "ring") == 0 || basicApiRunAllAlgorithms(cli)) return "RING";
@@ -932,7 +1052,8 @@ static void basicApiPrintRuntimeSummary(const char* title, int worldSize, int de
   if (!shouldPrint) return;
 
   printf("=== %s ===\n", title);
-  printf("worldSize=%d, devices=%d, algo=%s, lb=%s\n", worldSize, deviceCount, cli.algorithm, cli.lbMode);
+  printf("worldSize=%d, devices=%d, algo=%s, lb=%s, api=%s\n", worldSize, deviceCount, cli.algorithm, cli.lbMode,
+         cli.api);
   printf("bufferBytes=%zu, %s=%zu\n", bufferBytes, countLabel, count);
   if (cli.filter != nullptr) printf("filter='%s'\n", cli.filter);
   if (cli.maxWorld > 0) printf("maxWorld=%d\n", cli.maxWorld);
@@ -998,19 +1119,38 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
 
   size_t myBytes = isSrc ? srcLocalBytesDims[0] * srcLocalBytesDims[1] * (tc.ndims == 3 ? srcLocalBytesDims[2] : 1) :
                            dstLocalBytesDims[0] * dstLocalBytesDims[1] * (tc.ndims == 3 ? dstLocalBytesDims[2] : 1);
-  if (myBytes > env->bufferBytes) return makeSkip("local buffer exceeds preallocated max");
 
-  /* ----- 6. window registration ----- */
+  /* ----- 5b. select active buffer ----- */
+  void* activeBuffer;
+  size_t activeBufferBytes;
+  if (env->apiKind == ApiKind::Default) {
+    activeBuffer = env->copyBuffer;
+    activeBufferBytes = env->copyBufferBytes;
+    if (activeBuffer == nullptr) {
+      return makeSkip("Default API selected but copyBuffer not allocated");
+    }
+  } else {
+    activeBuffer = env->buffer;
+    activeBufferBytes = env->bufferBytes;
+  }
+  if (myBytes > activeBufferBytes) {
+    return makeSkip("local buffer exceeds preallocated max");
+  }
+
+  /* ----- 6. window registration (window path only) ----- */
   ncclWindow_t window = nullptr;
-  TEST_NCCLCHECK(ncclCommWindowRegister(env->comm, env->buffer, env->bufferBytes, &window, NCCL_WIN_COLL_SYMMETRIC));
-  TEST_CUDACHECK(cudaMemsetAsync(env->buffer, 0xDE, env->bufferBytes, env->stream));
+  if (env->apiKind == ApiKind::Window) {
+    TEST_NCCLCHECK(ncclCommWindowRegister(env->comm, activeBuffer, activeBufferBytes, &window,
+                                          NCCL_WIN_COLL_SYMMETRIC));
+  }
+  TEST_CUDACHECK(cudaMemsetAsync(activeBuffer, 0xDE, activeBufferBytes, env->stream));
 
   /* ----- 7. init source data ----- */
   if (isSrc) {
     int srcShardIdx = shardIdxForRank(srcLayout, tc.srcPl, env->rank);
     int sd = (tc.srcShardDim >= 0) ? tc.srcShardDim : -1;
     int sc = (tc.srcShardDim >= 0) ? srcShardCount : 1;
-    testInitSourceData((char*)env->buffer, srcLocalBytesDims, tc.ndims, sd, srcShardIdx, sc, env->stream);
+    testInitSourceData((char*)activeBuffer, srcLocalBytesDims, tc.ndims, sd, srcShardIdx, sc, env->stream);
   }
   TEST_CUDACHECK(cudaStreamSynchronize(env->stream));
   env->barrier(env);
@@ -1040,30 +1180,35 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   ncclDataType_t dtype = (tc.elementSize <= 8) ? dtype_for_size[tc.elementSize] : ncclBfloat16;
 
   ncclDistTensor_t srcT = {};
-  srcT.dataPtr = isSrc ? env->buffer : nullptr;
+  srcT.dataPtr = isSrc ? activeBuffer : nullptr;
   srcT.ndims = tc.ndims;
   srcT.dtype = dtype;
   srcT.mesh = &srcMesh;
   srcT.placements[0] = srcLayout.placement[0];
   srcT.placements[1] = srcLayout.placement[1];
-  if (isSrc)
-    for (int d = 0; d < tc.ndims; d++) srcT.localShape[d] = srcLocalDimsElems[d];
+  for (int d = 0; d < tc.ndims; d++) srcT.localShape[d] = srcLocalDimsElems[d];
 
   ncclDistTensor_t dstT = {};
-  dstT.dataPtr = isDst ? env->buffer : nullptr;
+  dstT.dataPtr = isDst ? activeBuffer : nullptr;
   dstT.ndims = tc.ndims;
   dstT.dtype = dtype;
   dstT.mesh = &dstMesh;
   dstT.placements[0] = dstLayout.placement[0];
   dstT.placements[1] = dstLayout.placement[1];
-  if (isDst)
-    for (int d = 0; d < tc.ndims; d++) dstT.localShape[d] = dstLocalDimsElems[d];
+  for (int d = 0; d < tc.ndims; d++) dstT.localShape[d] = dstLocalDimsElems[d];
 
-  ncclResult_t r = ncclReshardWithWindow(env->m2nHandle, env->comm, window, &srcT, &dstT, env->stream);
+  ncclResult_t r;
+  if (env->apiKind == ApiKind::Default) {
+    r = ncclReshard(env->m2nHandle, env->comm, &srcT, &dstT, env->stream);
+  } else {
+    r = ncclReshardWithWindow(env->m2nHandle, env->comm, window, &srcT, &dstT, env->stream);
+  }
 
   if (r != ncclSuccess) {
-    TEST_NCCLCHECK(ncclCommWindowDeregister(env->comm, window));
-    return makeFail("ncclReshardWithWindow returned error");
+    if (window != nullptr) {
+      TEST_NCCLCHECK(ncclCommWindowDeregister(env->comm, window));
+    }
+    return makeFail("reshard call returned error");
   }
 
   TEST_CUDACHECK(cudaStreamSynchronize(env->stream));
@@ -1075,13 +1220,15 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     int dstShardIdx = shardIdxForRank(dstLayout, tc.dstPl, env->rank);
     int sd = (tc.dstShardDim >= 0) ? tc.dstShardDim : -1;
     int sc = (tc.dstShardDim >= 0) ? dstShardCount : 1;
-    bool ok = testValidateDestData((const char*)env->buffer, dstLocalBytesDims, tc.ndims, sd, dstShardIdx, sc,
+    bool ok = testValidateDestData((const char*)activeBuffer, dstLocalBytesDims, tc.ndims, sd, dstShardIdx, sc,
                                    env->rank, env->stream, nullptr);
     localOk = ok ? 1 : 0;
   }
   int globalOk = env->allreduceMinInt(env, localOk);
 
-  TEST_NCCLCHECK(ncclCommWindowDeregister(env->comm, window));
+  if (window != nullptr) {
+    TEST_NCCLCHECK(ncclCommWindowDeregister(env->comm, window));
+  }
 
   if (env->verbose && env->isRank0Printer(env))
     printf("    [rank %d] localOk=%d, globalOk=%d, myBytes=%zu\n", env->rank, localOk, globalOk, myBytes);

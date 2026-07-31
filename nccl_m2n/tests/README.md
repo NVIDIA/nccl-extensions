@@ -43,6 +43,7 @@ make tests GTEST_DIR=/path/to/googletest
 | `uneven_ratio`             | `world ≥ 4`, `world % 4 == 0` | (240, 240) | bf16 | ratio ∈ {(3,1),(1,3)}, n_shards (2,2) |
 | `tensor_size_sensitivity`  | `world ≥ 4`, even           | 576², 3072², 3072×6144 | bf16 | n_shards (4,4) |
 | `nd_tensors`               | `world ≥ 4`, even           | (64,128,128), (128,64,64) | bf16 | 3D only; the `(64,128,128), sd=(0,1)` historical case lives in `cross_dim_regression` |
+| `staging_slot_pressure`    | `world = 4`                 | (64,128,128) | bf16 | 3D Shard(0) → Shard(2) default-API reproducer for CI when run with a 4 MiB staging channel |
 | `1d_full_sharding`            | `world ≥ 4`, even           | (8192,)            | fp32 / bf16 / uint8 | 1D mesh, sd=(0,0) (only one tensor axis) |
 | `1d_2d_placement`             | `world ≥ 4`, even           | (8192,)            | bf16 | n_shards ∈ {(2,4),(4,2),(2,2)}, placement ∈ {sr/sr, rs/rs, sr/rs, rs/sr} |
 | `1d_uneven_ratio`             | `world ≥ 4`, `world % 4 == 0` | (16384,)         | bf16 | ratio ∈ {(3,1),(1,3)}, n_shards (2,2) |

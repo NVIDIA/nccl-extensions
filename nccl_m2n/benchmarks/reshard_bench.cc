@@ -6,9 +6,10 @@
  ************************************************************************/
 
 /*************************************************************************
- * Tensor Reshard Benchmark (User Window API)
+ * Tensor Reshard Benchmark
  *
- * Uses ncclReshardWithWindow with caller-registered ncclWindow_t.
+ * Benchmarks either ncclReshardWithWindow with caller-registered
+ * ncclWindow_t, or ncclReshard with staging buffers.
  *
  * Usage:
  *   mpirun -np <N> reshard_bench [options]
@@ -42,12 +43,14 @@ static void printUsage(const char* prog) {
   printf("  --validate                       Validate data correctness\n");
   printf("  --algorithm <algo>               Algorithm: 'ring' (default) or "
          "'direct'\n");
+  printf("  --api <window|default>           API to benchmark (default: "
+         "window)\n");
   printf("  --lb-mode <uniform|node>         Load balancing: 'uniform' "
          "(default) or 'node'\n");
   printf("  --verbose                        Enable debug output\n");
   printf("  --print-all-ranks                Print per-rank timing\n");
-  printf("  --use-default-stream             Pass nullptr to "
-         "ncclReshardWithWindow so the\n");
+  printf("  --use-default-stream             Pass nullptr to the selected "
+         "reshard API so the\n");
   printf("                                   library substitutes a stream from "
          "its internal\n");
   printf("                                   pool — exercises the "
@@ -88,6 +91,7 @@ int main(int argc, char* argv[]) {
   bool verbose = false;
   bool printAllRanks = false;
   bool useDefaultStream = false;
+  bool useDefaultApi = false;
   const char* algorithm = "RING";
   const char* lbMode = "UNIFORM";
 
@@ -126,6 +130,19 @@ int main(int argc, char* argv[]) {
           printf("ERROR: Unknown algorithm '%s'. Use 'ring' or "
                  "'direct'\n",
                  argv[i]);
+        }
+        MPI_Finalize();
+        return 1;
+      }
+    } else if (strcmp(argv[i], "--api") == 0) {
+      ++i;
+      if (strcmp(argv[i], "default") == 0) {
+        useDefaultApi = true;
+      } else if (strcmp(argv[i], "window") == 0) {
+        useDefaultApi = false;
+      } else {
+        if (mpiRank == 0) {
+          printf("ERROR: Unknown api '%s'. Use 'window' or 'default'\n", argv[i]);
         }
         MPI_Finalize();
         return 1;
@@ -205,7 +222,11 @@ int main(int argc, char* argv[]) {
   // Print configuration
   if (mpiRank == 0) {
     printf("=== Tensor Reshard Benchmark ===\n");
-    printf("Using: ncclReshardWithWindow (user window API)\n");
+    if (useDefaultApi) {
+      printf("Using: ncclReshard (default API, DIRECT staging path)\n");
+    } else {
+      printf("Using: ncclReshardWithWindow (user window API)\n");
+    }
     printf("Global tensor: [%zu", globalTensorDims[0]);
     for (int d = 1; d < ndims; d++) printf(", %zu", globalTensorDims[d]);
     printf("] (%dD)\n", ndims);
@@ -219,8 +240,10 @@ int main(int argc, char* argv[]) {
            dstLocalDims[0]);
     for (int d = 1; d < ndims; d++) printf(", %zu", dstLocalDims[d]);
     printf("]\n");
-    printf("Algorithm: %s\n", algorithm);
-    if (strcmp(algorithm, "RING") == 0) printf("Load Balance Mode: %s\n", lbMode);
+    if (!useDefaultApi) {
+      printf("Algorithm: %s\n", algorithm);
+      if (strcmp(algorithm, "RING") == 0) printf("Load Balance Mode: %s\n", lbMode);
+    }
     printf("Iterations: %d (warmup: %d), Validate: %s\n", iterations, warmup, validate ? "yes" : "no");
     fflush(stdout);
   }
@@ -238,7 +261,9 @@ int main(int argc, char* argv[]) {
   ncclComm_t worldComm;
   NCCLCHECK(ncclCommInitRank(&worldComm, mpiSize, worldId, mpiRank));
 
-  // Allocate buffer (symmetric memory required for one-sided ops)
+  // Allocate buffer. The window API requires NCCL symmetric memory; the default
+  // API intentionally uses plain cudaMalloc so the benchmark measures the
+  // staging path without the user-window allocation requirement.
   size_t srcBufferSize = 1, dstBufferSize = 1;
   for (int d = 0; d < ndims; d++) {
     srcBufferSize *= srcLocalDims[d];
@@ -248,13 +273,19 @@ int main(int argc, char* argv[]) {
   const size_t NCCL_MIN_ALLOC = 4096;
   if (allocSize < NCCL_MIN_ALLOC) allocSize = NCCL_MIN_ALLOC;
 
-  void* buffer;
-  NCCLCHECK(ncclMemAlloc(&buffer, allocSize));
+  void* buffer = nullptr;
+  if (useDefaultApi) {
+    CUDACHECK(cudaMalloc(&buffer, allocSize));
+  } else {
+    NCCLCHECK(ncclMemAlloc(&buffer, allocSize));
+  }
   CUDACHECK(cudaMemset(buffer, 0xDE, allocSize)); // Initialize with pattern
 
   // Register window for user-window API
   ncclWindow_t window = nullptr;
-  NCCLCHECK(ncclCommWindowRegister(worldComm, buffer, allocSize, &window, NCCL_WIN_COLL_SYMMETRIC));
+  if (!useDefaultApi) {
+    NCCLCHECK(ncclCommWindowRegister(worldComm, buffer, allocSize, &window, NCCL_WIN_COLL_SYMMETRIC));
+  }
 
   // Setup mesh structures (topology only).  Per-tensor placement is
   // set on the DistTensor below.
@@ -287,7 +318,7 @@ int main(int argc, char* argv[]) {
   MPICHECK(MPI_Barrier(benchMpiWorld()));
 
   // Build src/dst descriptors once. dataPtr=NULL is the role signal;
-  // localShape entries are zeroed on the side this rank doesn't own.
+  // localShape metadata is still required on inactive sides.
   ncclDistTensor_t srcTensor = {};
   srcTensor.dataPtr = isSource ? buffer : nullptr;
   srcTensor.ndims = ndims;
@@ -295,8 +326,9 @@ int main(int argc, char* argv[]) {
   srcTensor.mesh = &srcMesh;
   srcTensor.placements[0] = NCCL_RESHARD_REPLICATE;
   srcTensor.placements[1] = NCCL_RESHARD_SHARD(srcShardDim);
-  if (isSource)
-    for (int d = 0; d < ndims; d++) srcTensor.localShape[d] = srcLocalDims[d];
+  for (int d = 0; d < ndims; d++) {
+    srcTensor.localShape[d] = srcLocalDims[d];
+  }
 
   ncclDistTensor_t dstTensor = {};
   dstTensor.dataPtr = isDest ? buffer : nullptr;
@@ -305,14 +337,19 @@ int main(int argc, char* argv[]) {
   dstTensor.mesh = &dstMesh;
   dstTensor.placements[0] = NCCL_RESHARD_REPLICATE;
   dstTensor.placements[1] = NCCL_RESHARD_SHARD(dstShardDim);
-  if (isDest)
-    for (int d = 0; d < ndims; d++) dstTensor.localShape[d] = dstLocalDims[d];
+  for (int d = 0; d < ndims; d++) {
+    dstTensor.localShape[d] = dstLocalDims[d];
+  }
 
   // Lambda for running one iteration. NCCLCHECK aborts on any non-success
   // return so a contract violation (null window, mismatched offsets, etc.)
   // fails the bench instead of being silently dropped.
   auto runOneIteration = [&]() {
-    NCCLCHECK(ncclReshardWithWindow(m2nHandle, worldComm, window, &srcTensor, &dstTensor, reshardStream));
+    if (useDefaultApi) {
+      NCCLCHECK(ncclReshard(m2nHandle, worldComm, &srcTensor, &dstTensor, reshardStream));
+    } else {
+      NCCLCHECK(ncclReshardWithWindow(m2nHandle, worldComm, window, &srcTensor, &dstTensor, reshardStream));
+    }
   };
 
   // Warmup
@@ -466,9 +503,15 @@ int main(int argc, char* argv[]) {
 
   // Reshard is asynchronous. Complete the work before releasing its resources.
   CUDACHECK(cudaStreamSynchronize(stream));
-  ncclCommWindowDeregister(worldComm, window);
+  if (window != nullptr) {
+    ncclCommWindowDeregister(worldComm, window);
+  }
   NCCLCHECK(ncclM2nFinalize(m2nHandle));
-  NCCLCHECK(ncclMemFree(buffer));
+  if (useDefaultApi) {
+    CUDACHECK(cudaFree(buffer));
+  } else {
+    NCCLCHECK(ncclMemFree(buffer));
+  }
   CUDACHECK(cudaStreamDestroy(stream));
   ncclCommDestroy(worldComm);
 

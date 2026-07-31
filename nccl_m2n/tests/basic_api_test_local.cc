@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ostream>
 #include <string>
 #include <vector>
 #include <pthread.h>
@@ -70,6 +71,15 @@ static bool localIsRank0Printer(TestEnv* env) {
  * gtest parameter registry state.
  * ====================================================================*/
 
+struct LocalParam {
+  TestCase tc;
+  ApiKind api = ApiKind::Window;
+};
+
+[[maybe_unused]] static void printTo(const LocalParam& param, std::ostream* os) {
+  *os << (param.api == ApiKind::Default ? "default" : "window") << ":" << param.tc.name;
+}
+
 static BasicApiCliArgs gCli;
 static std::vector<TestCase> gCases;
 static int gWorldSize = 0;
@@ -81,8 +91,46 @@ static std::vector<ncclM2nHandle_t> gM2nHandles;
 static int gSkippedCases = 0;
 #endif
 
-static std::string gtestCaseName(const ::testing::TestParamInfo<TestCase>& info) {
-  return basicApiGtestCaseName(info.param.name, info.index, nullptr);
+static void* callInvalidReshard(void* resultPtr) {
+  ncclResult_t* result = static_cast<ncclResult_t*>(resultPtr);
+  *result = ncclReshard(nullptr, nullptr, nullptr, nullptr, nullptr);
+  return nullptr;
+}
+
+TEST(NcclReshardStackTest, RejectsInvalidCallOnTwoMiBThread) {
+  pthread_attr_t attr;
+  ASSERT_EQ(0, pthread_attr_init(&attr));
+  ASSERT_EQ(0, pthread_attr_setstacksize(&attr, 2 * 1024 * 1024));
+
+  ncclResult_t result = ncclSuccess;
+  pthread_t thread;
+  ASSERT_EQ(0, pthread_create(&thread, &attr, callInvalidReshard, &result));
+  ASSERT_EQ(0, pthread_attr_destroy(&attr));
+
+  ASSERT_EQ(0, pthread_join(thread, nullptr));
+  EXPECT_EQ(ncclInvalidArgument, result);
+}
+
+static std::vector<LocalParam> selectedLocalParams() {
+  std::vector<LocalParam> params;
+  std::vector<TestCase> cases = basicApiSelectCases(gCases, gCli);
+  std::vector<ApiKind> apis;
+  if (basicApiRunAllApis(gCli)) {
+    apis = {ApiKind::Window, ApiKind::Default};
+  } else {
+    apis = {basicApiRequestedApi(gCli)};
+  }
+  for (ApiKind api : apis) {
+    for (const TestCase& tc : cases) {
+      params.push_back(LocalParam{tc, api});
+    }
+  }
+  return params;
+}
+
+static std::string gtestCaseName(const ::testing::TestParamInfo<LocalParam>& info) {
+  std::string prefix = (info.param.api == ApiKind::Default) ? "default" : "window";
+  return basicApiGtestCaseName(info.param.tc.name, info.index, prefix.c_str());
 }
 
 /* ======================================================================
@@ -97,6 +145,7 @@ struct ThreadArg {
   ncclM2nHandle_t m2nHandle;
   LocalCtx* ctx;
   const TestCase* tc;
+  ApiKind api;
   bool verbose;
 
   CaseStatus status;
@@ -115,6 +164,11 @@ static void* threadMain(void* p) {
   void* buffer = nullptr;
   TEST_NCCLCHECK(ncclMemAlloc(&buffer, gBufferBytes));
 
+  void* copyBuffer = nullptr;
+  if (a->api == ApiKind::Default) {
+    TEST_CUDACHECK(cudaMalloc(&copyBuffer, gBufferBytes));
+  }
+
   TestEnv env{};
   env.rank = a->rank;
   env.worldSize = a->worldSize;
@@ -124,6 +178,9 @@ static void* threadMain(void* p) {
   env.m2nHandle = a->m2nHandle;
   env.buffer = buffer;
   env.bufferBytes = gBufferBytes;
+  env.copyBuffer = copyBuffer;
+  env.copyBufferBytes = (copyBuffer != nullptr) ? gBufferBytes : 0;
+  env.apiKind = a->api;
   env.verbose = a->verbose;
   env.barrier = localBarrier;
   env.allreduceMinInt = localAllreduceMinInt;
@@ -140,6 +197,9 @@ static void* threadMain(void* p) {
   /* Keep rank-local buffers alive until every thread has left runOneCase. */
   pthread_barrier_wait(&a->ctx->barrier);
 
+  if (copyBuffer != nullptr) {
+    TEST_CUDACHECK(cudaFree(copyBuffer));
+  }
   TEST_NCCLCHECK(ncclMemFree(buffer));
   TEST_CUDACHECK(cudaStreamDestroy(stream));
   return nullptr;
@@ -150,7 +210,7 @@ struct LocalCaseResult {
   std::string reason;
 };
 
-static LocalCaseResult runLocalCase(const TestCase& tc) {
+static LocalCaseResult runLocalCase(const TestCase& tc, ApiKind api) {
   LocalCtx ctx{};
   ctx.aggBuf.assign(gWorldSize, 0);
   pthread_mutex_init(&ctx.printMu, nullptr);
@@ -166,6 +226,7 @@ static LocalCaseResult runLocalCase(const TestCase& tc) {
     args[r].m2nHandle = gM2nHandles[r];
     args[r].ctx = &ctx;
     args[r].tc = &tc;
+    args[r].api = api;
     args[r].verbose = gCli.verbose;
     args[r].status = CASE_FAIL;
     args[r].skipReason[0] = '\0';
@@ -200,13 +261,13 @@ static LocalCaseResult runLocalCase(const TestCase& tc) {
   return LocalCaseResult{CASE_PASS, ""};
 }
 
-class BasicApiLocalTest : public ::testing::TestWithParam<TestCase> {};
+class BasicApiLocalTest : public ::testing::TestWithParam<LocalParam> {};
 
 TEST_P(BasicApiLocalTest, Reshard) {
-  const TestCase& tc = GetParam();
-  SCOPED_TRACE(tc.name);
+  const LocalParam& param = GetParam();
+  SCOPED_TRACE(param.tc.name);
 
-  LocalCaseResult res = runLocalCase(tc);
+  LocalCaseResult res = runLocalCase(param.tc, param.api);
   if (res.status == CASE_SKIP) {
 #if defined(GTEST_SKIP)
     GTEST_SKIP() << res.reason;
@@ -220,8 +281,7 @@ TEST_P(BasicApiLocalTest, Reshard) {
   EXPECT_EQ(CASE_PASS, res.status) << res.reason;
 }
 
-INSTANTIATE_TEST_CASE_P(Matrix, BasicApiLocalTest, ::testing::ValuesIn(basicApiSelectCases(gCases, gCli)),
-                        gtestCaseName);
+INSTANTIATE_TEST_CASE_P(Matrix, BasicApiLocalTest, ::testing::ValuesIn(selectedLocalParams()), gtestCaseName);
 
 static int initLocalRuntime() {
   TEST_CUDACHECK(cudaGetDeviceCount(&gNumDevices));
@@ -254,8 +314,9 @@ static int initLocalRuntime() {
   std::vector<TestCase> cases = basicApiSelectCases(gCases, gCli);
   gBufferBytes = computeMaxBufferBytes(cases, gWorldSize);
 
+  std::vector<LocalParam> localParams = selectedLocalParams();
   basicApiPrintRuntimeSummary("basic_api_test_local (gtest, no MPI)", gWorldSize, gNumDevices, gCli, gBufferBytes,
-                              "num_cases", cases.size(), true);
+                              "num_tests", localParams.size(), true);
   return 0;
 }
 

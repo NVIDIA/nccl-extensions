@@ -471,6 +471,7 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
                     "both be non-null on every rank\n");
     return ncclInvalidArgument;
   }
+  NCCL_M2N_CHECK(validateReshardMeshDims(src->mesh, dst->mesh));
   if (src->ndims != dst->ndims) {
     fprintf(stderr,
             "[ncclReshardWithWindow] src->ndims (%d) and dst->ndims (%d) "
@@ -509,28 +510,10 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
     return ncclInvalidArgument;
   }
 
-  // Workaround: when both mesh dims have REPLICATE placement,
-  // computeMeshGroupInfo loses track of the replication dimension.
-  // Collapse dims to [total, 1] with placement[1] = SHARD(0) (a no-op
-  // shard with count 1) so repMeshDim=0 is always well-defined.
-  auto fixFullyReplicated = [](ncclMesh_t* mesh, int placements[NCCL_RESHARD_MESH_NDIMS]) -> ncclResult_t {
-    if (placements[0] == NCCL_RESHARD_REPLICATE && placements[1] == NCCL_RESHARD_REPLICATE) {
-      size_t total = 0;
-      ncclResult_t result = computeReshardMeshSize(mesh, -1, &total);
-      if (result != ncclSuccess) return result;
-      if (total > static_cast<size_t>(std::numeric_limits<int>::max())) {
-        RESHARD_WARN(-1, "reshard: fully replicated mesh size exceeds int (%zu)", total);
-        return ncclInvalidArgument;
-      }
-      mesh->dims[0] = static_cast<int>(total);
-      mesh->dims[1] = 1;
-      placements[1] = NCCL_RESHARD_SHARD(0);
-    }
-    return ncclSuccess;
-  };
-
-  NCCL_M2N_CHECK(fixFullyReplicated(&srcMeshLocal, srcTensorLocal.placements));
-  NCCL_M2N_CHECK(fixFullyReplicated(&dstMeshLocal, dstTensorLocal.placements));
+  NCCL_M2N_CHECK(reshardFixFullyReplicated(&srcMeshLocal, srcTensorLocal.placements));
+  NCCL_M2N_CHECK(reshardFixFullyReplicated(&dstMeshLocal, dstTensorLocal.placements));
+  NCCL_M2N_CHECK(validateReshardPlacement(&srcTensorLocal, "ncclReshardWithWindow", "src"));
+  NCCL_M2N_CHECK(validateReshardPlacement(&dstTensorLocal, "ncclReshardWithWindow", "dst"));
   std::shared_ptr<ncclM2nHandleState> handleState;
   NCCL_M2N_CHECK(acquireM2nHandle(handle, &handleState));
 
@@ -542,6 +525,8 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   int worldRank, worldSize;
   UW_NCCLCHECK(ncclCommUserRank(comm, &worldRank));
   UW_NCCLCHECK(ncclCommCount(comm, &worldSize));
+  NCCL_M2N_CHECK(validateReshardMeshBounds(srcMesh, dstMesh, worldSize, worldRank));
+  NCCL_M2N_CHECK(reshardValidateActiveBuffers("ncclReshardWithWindow", worldRank, srcTensor, dstTensor));
 
   int currentCudaDev;
   ncclCommProperties commProps = NCCL_COMM_PROPERTIES_INITIALIZER;
@@ -620,17 +605,21 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   ReshardAlgorithm algo = reshardGetAlgorithm();
   if (algo == RESHARD_ALGO_AUTO) algo = RESHARD_ALGO_RING;
 
-  // Per-rank byte volume for the picker — max of src/dst local shapes
-  // (whichever side this rank participates in; both zero on inactive
-  // ranks, which the picker handles by falling through to its default).
-  auto localBytes = [&](void* buf, const size_t* dims) -> size_t {
-    if (buf == nullptr) return 0;
-    size_t b = elementSize;
-    for (int d = 0; d < ndims; d++) b *= dims[d];
-    return b;
+  // Derive the picker input from descriptor metadata on every rank so all
+  // participants select the same collective geometry.
+  auto localBytes = [&](const size_t* dims, const char* side, size_t* bytes) -> ncclResult_t {
+    size_t total = elementSize;
+    for (int d = 0; d < ndims; d++) {
+      NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(total, dims[d], &total), worldRank,
+                         "[ncclReshardWithWindow] %s local byte size overflow at dim %d", side, d);
+    }
+    *bytes = total;
+    return ncclSuccess;
   };
-  size_t srcBytes = localBytes(srcBuffer, srcTensorDims);
-  size_t dstBytes = localBytes(dstBuffer, dstTensorDims);
+  size_t srcBytes = 0;
+  size_t dstBytes = 0;
+  NCCL_M2N_CHECK(localBytes(srcTensorDims, "source", &srcBytes));
+  NCCL_M2N_CHECK(localBytes(dstTensorDims, "destination", &dstBytes));
   size_t bytesPerRank = (srcBytes > dstBytes) ? srcBytes : dstBytes;
 
   int numCtas = pickNumCtas(bytesPerRank, algo);
@@ -711,12 +700,8 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   // ------------------------------------------------------------------
   size_t srcDimsBytes[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
   size_t dstDimsBytes[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
-  for (int d = 0; d < ndims; d++) {
-    srcDimsBytes[d] = srcTensorDims ? srcTensorDims[d] : 1;
-    dstDimsBytes[d] = dstTensorDims ? dstTensorDims[d] : 1;
-  }
-  srcDimsBytes[ndims - 1] *= elementSize;
-  dstDimsBytes[ndims - 1] *= elementSize;
+  NCCL_M2N_CHECK(reshardDimsToBytes(worldRank, "ncclReshardWithWindow:", ndims, elementSize, srcTensorDims,
+                                    dstTensorDims, srcDimsBytes, dstDimsBytes));
 
   // ------------------------------------------------------------------
   // Cross-dim transpose optimisation (3D only).

@@ -7,6 +7,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <vector>
 #include "nccl.h"
 
@@ -20,6 +22,7 @@
 #include "m2n_log.h"
 #include "m2n_checks.h"
 #include "reshard_internal.h"
+#include "staging_buffer.h"
 
 struct DevCommCacheEntry {
   ncclComm_t comm;
@@ -122,6 +125,96 @@ ncclResult_t cacheDevComm(ncclComm_t comm, int numCtas, int signalCount, const n
   return ncclSuccess;
 }
 
+/* ======================================================================
+ * Staging buffer pool -- per-comm entries, mirroring TransposeBufferEntry.
+ * ====================================================================*/
+
+static StagingBufferPoolEntry gStagingPool[MAX_STAGING_BUFFER_ENTRIES];
+static int gStagingPoolCount = 0;
+
+static StagingBufferPoolEntry* findStagingPoolEntry(ncclComm_t comm) {
+  for (int i = 0; i < gStagingPoolCount; i++) {
+    if (gStagingPool[i].comm == comm && gStagingPool[i].allocated) {
+      return &gStagingPool[i];
+    }
+  }
+  return nullptr;
+}
+
+ncclResult_t ensureStagingBufferPool(ncclComm_t comm, cudaStream_t stream, StagingBufferState** outState) {
+  NCCL_M2N_CHECK_ARG(outState != nullptr, -1, "ensureStagingBufferPool called with null outState");
+  *outState = nullptr;
+
+  StagingBufferPoolEntry* entry = findStagingPoolEntry(comm);
+  if (entry != nullptr) {
+    if (entry->stream != stream) {
+      NCCL_M2N_CHECK_ARG(entry->event != nullptr, -1, "Staging buffer pool entry has no ordering event");
+      NCCL_M2N_CUDACHECK(cudaStreamWaitEvent(stream, entry->event, 0));
+      entry->stream = stream;
+    }
+    *outState = entry->state;
+    return ncclSuccess;
+  }
+  if (gStagingPoolCount >= MAX_STAGING_BUFFER_ENTRIES) {
+    RESHARD_WARN(-1, "Staging buffer pool full (%d entries)", MAX_STAGING_BUFFER_ENTRIES);
+    return ncclSystemError;
+  }
+
+  cudaEvent_t event = nullptr;
+  NCCL_M2N_CUDACHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+
+  std::unique_ptr<StagingBufferState> state(new (std::nothrow) StagingBufferState());
+  if (state == nullptr) {
+    NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(event));
+    RESHARD_WARN(-1, "Failed to allocate staging buffer state");
+    return ncclSystemError;
+  }
+
+  ncclResult_t r = stagingBufferInit(state.get());
+  if (r != ncclSuccess) {
+    stagingBufferFinalize(state.get()); // reclaim anything init allocated before failing
+    NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(event));
+    return r;
+  }
+
+  StagingBufferPoolEntry& e = gStagingPool[gStagingPoolCount++];
+  e.comm = comm;
+  e.stream = stream;
+  e.event = event;
+  e.state = state.release();
+  e.allocated = true;
+  RESHARD_DEBUG(-1, "Staging buffer pool: allocated for comm %p (%zu bytes) [slot %d]", (void*)comm,
+                e.state->totalSize, gStagingPoolCount - 1);
+  *outState = e.state;
+  return ncclSuccess;
+}
+
+ncclResult_t stagingBufferPoolRecordEvent(ncclComm_t comm, cudaStream_t stream) {
+  StagingBufferPoolEntry* e = findStagingPoolEntry(comm);
+  if (e != nullptr) {
+    NCCL_M2N_CUDACHECK(cudaEventRecord(e->event, stream));
+  }
+  return ncclSuccess;
+}
+
+void stagingBufferPoolFinalize() {
+  for (int i = 0; i < gStagingPoolCount; i++) {
+    if (gStagingPool[i].event != nullptr) {
+      // Sync before destroy/free: a finalize racing an in-flight staging kernel
+      // would otherwise free the buffer under a running kernel (use-after-free).
+      // Warn-only: teardown must not abort.
+      NCCL_M2N_CUDACHECK_WARN(cudaEventSynchronize(gStagingPool[i].event));
+      NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(gStagingPool[i].event));
+    }
+    if (gStagingPool[i].state != nullptr) {
+      stagingBufferFinalize(gStagingPool[i].state);
+      delete gStagingPool[i].state;
+    }
+    gStagingPool[i] = {};
+  }
+  gStagingPoolCount = 0;
+}
+
 void cacheFinalize() {
   for (int i = 0; i < gInternalWindowCache.count; i++) {
     WindowCacheEntry& e = gInternalWindowCache.entries[i];
@@ -154,6 +247,8 @@ void cacheFinalize() {
     }
   }
   gStreamPool.clear();
+
+  stagingBufferPoolFinalize();
 }
 
 ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream, cudaEvent_t* outReadyEvent,

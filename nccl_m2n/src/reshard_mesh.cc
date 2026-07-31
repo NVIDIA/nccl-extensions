@@ -7,12 +7,111 @@
 
 #include <cstring>
 #include <algorithm>
+#include <limits>
+#include "m2n_checked_math.h"
 #include "reshard_types.h"
 #include "reshard_internal.h"
+#include "m2n_checks.h"
+
+/* Reject non-positive mesh dimensions before any mesh-group math divides by
+ * them (computeMeshGroupInfo / getMeshRank divide and mod by dims[1], and the
+ * load balancer divides by the per-side rep/shard counts derived from these
+ * dims).  A caller-supplied mesh with a zero dim would otherwise be an
+ * integer-divide fault on the host.  Host-only — safe to call before any CUDA
+ * setup and from unit tests. */
+ncclResult_t computeReshardMeshInterval(const ncclMesh_t* mesh, int logRank, ReshardMeshInterval* interval) {
+  NCCL_M2N_CHECK_ARG(mesh != nullptr && interval != nullptr, logRank,
+                     "reshard: mesh and output interval must be non-null");
+  NCCL_M2N_CHECK_ARG(mesh->dims[0] > 0 && mesh->dims[1] > 0, logRank,
+                     "reshard: mesh dims must be positive, got [%d, %d]", mesh->dims[0], mesh->dims[1]);
+  NCCL_M2N_CHECK_ARG(mesh->startRank >= 0, logRank, "reshard: mesh startRank=%d must be non-negative",
+                     mesh->startRank);
+
+  size_t meshSize = 0;
+  NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(static_cast<size_t>(mesh->dims[0]), static_cast<size_t>(mesh->dims[1]),
+                                      &meshSize),
+                     logRank, "reshard: mesh size overflows for dims [%d, %d]", mesh->dims[0], mesh->dims[1]);
+  NCCL_M2N_CHECK_ARG(meshSize <= static_cast<size_t>(std::numeric_limits<int>::max()), logRank,
+                     "reshard: mesh size %zu exceeds the supported rank range", meshSize);
+  NCCL_M2N_CHECK_ARG(mesh->startRank <= std::numeric_limits<int>::max() - static_cast<int>(meshSize), logRank,
+                     "reshard: mesh interval overflows rank range: startRank=%d size=%zu", mesh->startRank,
+                     meshSize);
+
+  interval->startRank = mesh->startRank;
+  interval->size = static_cast<int>(meshSize);
+  interval->endRank = mesh->startRank + interval->size;
+  return ncclSuccess;
+}
+
+ncclResult_t validateReshardMeshDims(const ncclMesh_t* srcMesh, const ncclMesh_t* dstMesh) {
+  ReshardMeshInterval srcInterval{};
+  ReshardMeshInterval dstInterval{};
+  NCCL_M2N_CHECK(computeReshardMeshInterval(srcMesh, -1, &srcInterval));
+  NCCL_M2N_CHECK(computeReshardMeshInterval(dstMesh, -1, &dstInterval));
+  return ncclSuccess;
+}
+
+ncclResult_t validateReshardMeshBounds(const ncclMesh_t* srcMesh, const ncclMesh_t* dstMesh, int commSize,
+                                      int logRank) {
+  NCCL_M2N_CHECK_ARG(commSize > 0, logRank, "reshard: communicator size=%d must be positive", commSize);
+  ReshardMeshInterval srcInterval{};
+  ReshardMeshInterval dstInterval{};
+  NCCL_M2N_CHECK(computeReshardMeshInterval(srcMesh, logRank, &srcInterval));
+  NCCL_M2N_CHECK(computeReshardMeshInterval(dstMesh, logRank, &dstInterval));
+  NCCL_M2N_CHECK_ARG(srcInterval.endRank <= commSize, logRank,
+                     "reshard: src mesh interval [%d, %d) exceeds communicator size %d", srcInterval.startRank,
+                     srcInterval.endRank, commSize);
+  NCCL_M2N_CHECK_ARG(dstInterval.endRank <= commSize, logRank,
+                     "reshard: dst mesh interval [%d, %d) exceeds communicator size %d", dstInterval.startRank,
+                     dstInterval.endRank, commSize);
+  return ncclSuccess;
+}
+
+ncclResult_t computeStridesChecked(const size_t dims[], int ndims, size_t strides[]) {
+  if (dims == nullptr || strides == nullptr || ndims < 1 || ndims > NCCL_RESHARD_MAX_TENSOR_DIMS) {
+    return ncclInvalidArgument;
+  }
+  strides[ndims - 1] = 1;
+  for (int d = ndims - 2; d >= 0; d--) {
+    if (!m2nCheckedMulSize(strides[d + 1], dims[d + 1], &strides[d])) {
+      return ncclInvalidArgument;
+    }
+  }
+  return ncclSuccess;
+}
 
 void computeStrides(const size_t dims[], int ndims, size_t strides[]) {
   strides[ndims - 1] = 1;
   for (int d = ndims - 2; d >= 0; d--) strides[d] = strides[d + 1] * dims[d + 1];
+}
+
+ncclResult_t validateReshardPlacement(const ncclDistTensor_t* tensor, const char* apiName, const char* fieldName) {
+  int shardCount = 0;
+  for (int meshDim = 0; meshDim < NCCL_RESHARD_MESH_NDIMS; meshDim++) {
+    const int placement = tensor->placements[meshDim];
+    if (placement == NCCL_RESHARD_REPLICATE) {
+      continue;
+    }
+    if (!isShardPlacement(placement)) {
+      RESHARD_WARN(-1, "[%s] %s->placements[%d]=%d is invalid.", apiName, fieldName, meshDim, placement);
+      return ncclInvalidArgument;
+    }
+
+    const int shardDim = getShardTensorDim(placement);
+    if (shardDim < 0 || shardDim >= tensor->ndims) {
+      RESHARD_WARN(-1, "[%s] %s->placements[%d]=SHARD(%d) is outside tensor rank %d.", apiName, fieldName, meshDim,
+                   shardDim, tensor->ndims);
+      return ncclInvalidArgument;
+    }
+    shardCount++;
+  }
+
+  if (shardCount != 1) {
+    RESHARD_WARN(-1, "[%s] %s must have exactly one SHARD placement after normalization; got %d.", apiName, fieldName,
+                 shardCount);
+    return ncclInvalidArgument;
+  }
+  return ncclSuccess;
 }
 
 void computeMeshGroupInfo(const ncclDistTensor_t* tensor, int worldRank, ncclReshardMeshGroupInfo* info) {
@@ -83,6 +182,26 @@ void computeGlobalRange(const size_t localDims[], int ndims, int shardTensorDim,
   }
 }
 
+static ncclResult_t computeGlobalRangeChecked(const size_t localDims[], int ndims, int shardTensorDim, int shardIdx,
+                                              size_t globalStart[], size_t globalEnd[]) {
+  if (localDims == nullptr || globalStart == nullptr || globalEnd == nullptr || ndims < 1 ||
+      ndims > NCCL_RESHARD_MAX_TENSOR_DIMS) {
+    return ncclInvalidArgument;
+  }
+  for (int d = 0; d < ndims; d++) {
+    if (d == shardTensorDim) {
+      if (!m2nCheckedMulSize((size_t)shardIdx, localDims[d], &globalStart[d]) ||
+          !m2nCheckedAddSize(globalStart[d], localDims[d], &globalEnd[d])) {
+        return ncclInvalidArgument;
+      }
+    } else {
+      globalStart[d] = 0;
+      globalEnd[d] = localDims[d];
+    }
+  }
+  return ncclSuccess;
+}
+
 bool computeOverlap(const size_t srcStart[], const size_t srcEnd[], const size_t dstStart[], const size_t dstEnd[],
                     int ndims, size_t overlapStart[], size_t overlapEnd[]) {
   for (int d = 0; d < ndims; d++) {
@@ -142,4 +261,75 @@ void computeTransferPlan(const size_t srcDims[], const size_t srcStrides[], int 
     plan->srcBaseOffset += srcLocalStart * srcStrides[d];
     plan->dstBaseOffset += dstLocalStart * dstStrides[d];
   }
+}
+
+ncclResult_t computeTransferPlanChecked(const size_t srcDims[], const size_t srcStrides[], int srcShardDim,
+                                        int srcShardIdx, const size_t dstDims[], const size_t dstStrides[],
+                                        int dstShardDim, int dstShardIdx, int ndims, size_t elementsPerChunk,
+                                        ncclReshardTransferPlan* plan) {
+  (void)elementsPerChunk;
+  if (plan == nullptr) {
+    return ncclInvalidArgument;
+  }
+  memset(plan, 0, sizeof(*plan));
+  if (ndims < 1 || ndims > NCCL_RESHARD_MAX_TENSOR_DIMS) {
+    return ncclInvalidArgument;
+  }
+  size_t srcGlobalStart[NCCL_RESHARD_MAX_TENSOR_DIMS], srcGlobalEnd[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t dstGlobalStart[NCCL_RESHARD_MAX_TENSOR_DIMS], dstGlobalEnd[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  if (computeGlobalRangeChecked(srcDims, ndims, srcShardDim, srcShardIdx, srcGlobalStart, srcGlobalEnd) !=
+        ncclSuccess ||
+      computeGlobalRangeChecked(dstDims, ndims, dstShardDim, dstShardIdx, dstGlobalStart, dstGlobalEnd) !=
+        ncclSuccess) {
+    return ncclInvalidArgument;
+  }
+  if (!computeOverlap(srcGlobalStart, srcGlobalEnd, dstGlobalStart, dstGlobalEnd, ndims, plan->overlapStart,
+                      plan->overlapEnd)) {
+    plan->totalInnerTransfers = 0;
+    return ncclSuccess;
+  }
+  size_t overlapSize[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  for (int d = 0; d < ndims; d++) overlapSize[d] = plan->overlapEnd[d] - plan->overlapStart[d];
+  int innerContigStart = ndims - 1;
+  size_t innerSize = 1;
+  for (int d = ndims - 1; d >= 0; d--) {
+    if (d != srcShardDim && d != dstShardDim && overlapSize[d] == srcDims[d] && overlapSize[d] == dstDims[d]) {
+      if (!m2nCheckedMulSize(innerSize, overlapSize[d], &innerSize)) {
+        return ncclInvalidArgument;
+      }
+      innerContigStart = d;
+    } else {
+      if (!m2nCheckedMulSize(innerSize, overlapSize[d], &innerSize)) {
+        return ncclInvalidArgument;
+      }
+      innerContigStart = d;
+      break;
+    }
+  }
+  plan->innerSize = innerSize;
+  plan->numOuterLoops = innerContigStart;
+  plan->totalInnerTransfers = 1;
+  for (int d = 0; d < innerContigStart; d++) {
+    plan->outerCounts[d] = overlapSize[d];
+    plan->outerSrcStrides[d] = srcStrides[d];
+    plan->outerDstStrides[d] = dstStrides[d];
+    if (!m2nCheckedMulSize(plan->totalInnerTransfers, overlapSize[d], &plan->totalInnerTransfers)) {
+      return ncclInvalidArgument;
+    }
+  }
+  plan->srcBaseOffset = 0;
+  plan->dstBaseOffset = 0;
+  for (int d = 0; d < ndims; d++) {
+    size_t srcLocalStart = plan->overlapStart[d] - srcGlobalStart[d];
+    size_t dstLocalStart = plan->overlapStart[d] - dstGlobalStart[d];
+    size_t srcTerm = 0;
+    size_t dstTerm = 0;
+    if (!m2nCheckedMulSize(srcLocalStart, srcStrides[d], &srcTerm) ||
+        !m2nCheckedAddSize(plan->srcBaseOffset, srcTerm, &plan->srcBaseOffset) ||
+        !m2nCheckedMulSize(dstLocalStart, dstStrides[d], &dstTerm) ||
+        !m2nCheckedAddSize(plan->dstBaseOffset, dstTerm, &plan->dstBaseOffset)) {
+      return ncclInvalidArgument;
+    }
+  }
+  return ncclSuccess;
 }

@@ -72,6 +72,26 @@ inline constexpr int MAX_WINDOW_CACHE_ENTRIES = 128;
 inline constexpr int MAX_DEVCOMM_CACHE_ENTRIES = 64;
 inline constexpr int MAX_TRANSPOSE_BUFFER_ENTRIES = 16;
 
+/* Staging (copy-based) algorithm sizes. */
+inline constexpr int STAGING_MAX_CHANNELS = 32;
+inline constexpr int STAGING_DEFAULT_NUM_CHANNELS = 4;
+inline constexpr size_t STAGING_DEFAULT_CHANNEL_SIZE = 64ULL * 1024ULL * 1024ULL;
+inline constexpr size_t STAGING_DEFAULT_CHUNK_SIZE = 1ULL * 1024ULL * 1024ULL;
+
+inline constexpr size_t STAGING_CTRL_ENTRY_SIZE = 128;
+inline constexpr int STAGING_MAX_REMOTES = 32;
+inline constexpr int STAGING_LOCAL_FC_BASE = STAGING_MAX_REMOTES;
+inline constexpr int STAGING_CTRL_ENTRIES = STAGING_MAX_REMOTES + MAX_TARGETS;
+inline constexpr size_t STAGING_CTRL_REGION_SIZE = (size_t)STAGING_CTRL_ENTRIES * STAGING_CTRL_ENTRY_SIZE;
+inline constexpr int STAGING_LSA_FANOUT_MAX_FOLLOWERS = 32;
+
+inline constexpr size_t CTRL_FIELD_RDMA_TAIL = 0;
+inline constexpr size_t CTRL_FIELD_RDMA_HEAD = 8;
+inline constexpr size_t CTRL_FIELD_LSA_TAIL = 16;
+inline constexpr size_t CTRL_FIELD_LSA_HEAD = 24;
+
+inline constexpr int MAX_STAGING_BUFFER_ENTRIES = 16;
+
 /* Stream pool — used when callers pass the default stream
  * (nullptr / cudaStreamLegacy / cudaStreamPerThread).  Caps how many
  * distinct (ncclComm_t, cuda device) entries the pool will track,

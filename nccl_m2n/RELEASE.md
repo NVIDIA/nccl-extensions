@@ -12,9 +12,10 @@ put/signal), so transfers are zero-copy, one-sided, and have no host
 involvement on the critical path.
 
 Install artifacts are shared library `libnccl_m2n.so` and public header
-`include/nccl_m2n.h`. v0.2 keeps `ncclReshardWithWindow` for the reshard
-operation, moves generic concepts to library-scope `ncclM2n*` names, and adds
-an explicit handle for lifecycle-managed runtime state.
+`include/nccl_m2n.h`. v0.2 keeps `ncclReshardWithWindow` for the user-window
+operation, adds `ncclReshard` for copy/staging transfers, moves generic
+concepts to library-scope `ncclM2n*` names, and adds an explicit handle for
+lifecycle-managed runtime state.
 
 ## v0.2
 
@@ -36,9 +37,12 @@ Existing binaries must be rebuilt against the updated header.
   - `NCCL_M2N_CONFIG_INITIALIZER` / `NCCL_M2N_CONFIG_UNDEF_INT` initialize
     and mark defaulted config fields.
   - `ncclM2nInit(&m2nHandle, config|NULL)` / `ncclM2nFinalize(m2nHandle)`
-    manage explicit handles.
-  - `ncclReshardWithWindow(m2nHandle, ...)` is the explicit-handle reshard
-    operation. Passing NULL lazily uses an internal default handle, released by
+    manage explicit handles. The compatibility-only `ncclM2nHandleCreate` /
+    `ncclM2nHandleDestroy` symbols are removed.
+  - `ncclReshardWithWindow(m2nHandle, ...)` and
+    `ncclReshard(m2nHandle, ...)` are the explicit-handle reshard operations.
+    The window operation replaces the legacy explicit-handle entry point.
+    Passing NULL lazily uses an internal default handle, released by
     `ncclM2nFinalize(NULL)`.
   - Internal runtime state is resolved by the first explicit init or lazy
     default-handle use in an epoch and released after the last handle is
@@ -46,6 +50,21 @@ Existing binaries must be rebuilt against the updated header.
   - Reshard operations enqueue asynchronous CUDA work. Callers must complete
     work submitted with a handle before finalizing it and must complete all M2N
     work in an epoch before finalizing the last explicit or default handle.
+- **Copy/staging API:**
+  - `ncclReshard` adds internally managed copy/staging transfers alongside the
+    caller-provided user-window path, initially using the DIRECT algorithm.
+  - Every communicator rank participates and provides both descriptors. Active
+    source/destination ranks require non-NULL buffers; inactive sides still
+    provide local-shape metadata.
+  - Both mesh intervals are checked against the communicator before rank
+    planning, and descriptor/rank/count arithmetic rejects overflow.
+  - Staging channel count, channel size, and chunk size are environment-tunable
+    but must be rank-uniform. The default cached pool is 256 MiB per
+    communicator (4 channels times 64 MiB); the configured 1 MiB chunk is kept
+    when safe and otherwise reduced uniformly from shared geometry.
+  - Kernel launch is asynchronous. Callers complete the stream before
+    finalizing M2N or releasing communicators, buffers, and streams used by the
+    operation.
 - **Runtime hardening:**
   - Integer and size environment values require a complete in-range decimal
     parse. Positive-only knobs reject zero and negative values; trailing
@@ -127,10 +146,11 @@ This preview is experimental.
 | **Cross-rank offset symmetry trusted** | The API validates local offset consistency but does not currently perform a cross-rank collective check that every rank uses the same offset. |
 | **Algorithm auto-select unimplemented** | `NCCL_RESHARD_ALGORITHM=AUTO` currently aliases to `RING`; no input/topology-aware algorithm picker in this build. |
 | **Single in-flight reshard per `(comm, effective stream)`** | The internal DevComm/window/transpose caches are designed for sequential use on a comm. Use separate communicators for concurrent transfers, as in `reshard_batch_bench_user_window --num-comms`. |
-| **Not thread-safe — process-wide single-thread access** | The init-time globals and the internal caches (DevComm cache, window cache, stream pool) are process-wide shared state. Caller is responsible for serializing every `ncclM2nInit` / `ncclM2nFinalize` / `ncclReshardWithWindow` call on the host side — including calls on different `ncclComm_t` handles. Device-side concurrency (issuing successive reshards on separate CUDA streams from a single host thread) is supported. |
+| **Not thread-safe — process-wide single-thread access** | The init-time globals and the internal caches (DevComm cache, window cache, stream pool) are process-wide shared state. Caller is responsible for serializing every lifecycle call and every `ncclReshardWithWindow` / `ncclReshard` call on the host side — including calls on different `ncclComm_t` handles. Device-side concurrency (issuing successive reshards on separate CUDA streams from a single host thread) is supported. |
 | **Caller-synchronized finalization** | `ncclM2nFinalize` does not synchronize caller streams. Callers must complete M2N work before finalizing the associated handle and before releasing communicators, windows, streams, or buffers used by that work. |
 | **Static mesh-size caps**         | Compile-time array bounds in `src/reshard_limits.h` cap supported mesh sizes: `MAX_SOURCES = 16`, `MAX_TARGETS = 64`, `MAX_LOCAL_FOLLOWERS = 128` (RING); `MAX_DIRECT_SOURCES = 32`, `MAX_DIRECT_TARGETS = 64` (DIRECT). Larger meshes require recompiling. |
-| **Single-shot public API**        | The public API exposes one `ncclReshardWithWindow` collective per call. Batched/concurrent behavior is built by callers with multiple descriptors/comms, not by a persistent public API. |
+| **Copy/staging peer caps** | The initial DIRECT copy/staging path uses `MAX_SOURCES = 16`, `MAX_TARGETS = 64`, and at most `STAGING_MAX_CHANNELS = 32`. The rank-uniform preflight rejects plans that exceed these static arrays. |
+| **Single-shot public API**        | The public API exposes one window or staging collective per call (`ncclReshardWithWindow` / `ncclReshard`). Batched/concurrent behavior is built by callers with multiple descriptors/comms, not by a persistent public API. |
 
 ## References
 

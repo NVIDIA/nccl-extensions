@@ -270,4 +270,18 @@ struct TransposeBufferEntry {
   bool allocated;
 };
 
+/* ======================================================================
+ * Per-comm staging buffer pool (used by reshard_cache.cc)
+ * ====================================================================*/
+
+struct StagingBufferState;
+
+struct StagingBufferPoolEntry {
+  ncclComm_t comm;
+  StagingBufferState* state;
+  cudaStream_t stream;
+  cudaEvent_t event;
+  bool allocated;
+};
+
 #endif /* NCCL_RESHARD_TYPES_H_ */

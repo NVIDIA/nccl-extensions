@@ -134,9 +134,13 @@ LIB_CC_SRCS := $(SRCDIR)/m2n_config.cc \
                $(SRCDIR)/reshard_loadbalance.cc \
                $(SRCDIR)/reshard_prepare.cc \
                $(SRCDIR)/reshard_transpose.cc \
-               $(SRCDIR)/m2n_init.cc
+               $(SRCDIR)/m2n_init.cc \
+               $(SRCDIR)/staging_buffer.cc \
+               $(SRCDIR)/staging_prepare.cc
 
-LIB_CU_SRCS := $(SRCDIR)/reshard_user_window.cu
+LIB_CU_SRCS := $(SRCDIR)/reshard_user_window.cu \
+               $(SRCDIR)/reshard_staging.cu \
+               $(SRCDIR)/staging_kernel.cu
 
 LIB_SRCS := $(LIB_CC_SRCS) $(LIB_CU_SRCS)
 
@@ -145,8 +149,12 @@ LIB_HDRS := $(SRCDIR)/nccl_m2n.h \
             $(SRCDIR)/reshard_limits.h \
             $(SRCDIR)/m2n_checks.h \
             $(SRCDIR)/m2n_env_parse.h \
+            $(SRCDIR)/m2n_checked_math.h \
             $(SRCDIR)/m2n_handle.h \
             $(SRCDIR)/m2n_log.h \
-            $(SRCDIR)/reshard_internal.h \
             $(SRCDIR)/reshard_call_setup.h \
+            $(SRCDIR)/staging_buffer.h \
+            $(SRCDIR)/staging_primitives.cuh \
+            $(SRCDIR)/staging_types.h \
+            $(SRCDIR)/reshard_internal.h \
             $(SRCDIR)/reshard_kernels.cuh

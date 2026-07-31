@@ -525,8 +525,9 @@ int main(int argc, char* argv[]) {
         srcT.placements[0] = NCCL_RESHARD_REPLICATE;
         srcT.placements[1] = NCCL_RESHARD_SHARD(sc.srcSd);
         srcT.dataPtr = bIsSource ? bufs[i] : nullptr;
-        if (bIsSource)
-          for (int d = 0; d < tc.nDims; d++) srcT.localShape[d] = srcLocal[d];
+        for (int d = 0; d < tc.nDims; d++) {
+          srcT.localShape[d] = srcLocal[d];
+        }
 
         ncclDistTensor_t dstT = {};
         dstT.ndims = tc.nDims;
@@ -535,8 +536,9 @@ int main(int argc, char* argv[]) {
         dstT.placements[0] = NCCL_RESHARD_REPLICATE;
         dstT.placements[1] = NCCL_RESHARD_SHARD(sc.dstSd);
         dstT.dataPtr = bIsDest ? bufs[i] : nullptr;
-        if (bIsDest)
-          for (int d = 0; d < tc.nDims; d++) dstT.localShape[d] = dstLocal[d];
+        for (int d = 0; d < tc.nDims; d++) {
+          dstT.localShape[d] = dstLocal[d];
+        }
 
         NCCLCHECK(ncclReshardWithWindow(m2nHandle, comms[i % numComms], windows[i], &srcT, &dstT, s));
       };

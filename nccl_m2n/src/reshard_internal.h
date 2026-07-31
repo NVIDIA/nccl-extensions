@@ -182,6 +182,14 @@ void cacheFinalize();
  * reshard_mesh.cc — Mesh analysis helpers
  * ====================================================================*/
 
+struct ReshardMeshInterval {
+  int startRank;
+  int endRank;
+  int size;
+};
+
+ncclResult_t computeReshardMeshInterval(const ncclMesh_t* mesh, int logRank, ReshardMeshInterval* interval);
+
 inline ncclResult_t computeReshardMeshSize(const ncclMesh_t* mesh, int logRank, size_t* outMeshSize) {
   if (mesh == nullptr || outMeshSize == nullptr) {
     RESHARD_WARN(logRank, "reshard: computeReshardMeshSize called with null argument");
@@ -276,7 +284,27 @@ inline unsigned int computeReshardSignalBaseUnchecked(const ncclMesh_t* srcMesh,
   return static_cast<unsigned int>(relativeRank * static_cast<size_t>(numCtas));
 }
 
+ncclResult_t computeStridesChecked(const size_t dims[], int ndims, size_t strides[]);
 void computeStrides(const size_t dims[], int ndims, size_t strides[]);
+
+/* Validate that both meshes have positive dimensions before any mesh-group
+ * math divides by them.  Host-only; returns ncclInvalidArgument on a null
+ * mesh or a non-positive dim. */
+ncclResult_t validateReshardMeshDims(const ncclMesh_t* srcMesh, const ncclMesh_t* dstMesh);
+ncclResult_t validateReshardMeshBounds(const ncclMesh_t* srcMesh, const ncclMesh_t* dstMesh, int commSize,
+                                      int logRank);
+
+inline bool reshardRankInMesh(const ncclMesh_t* mesh, int worldRank) {
+  if (mesh == nullptr || mesh->dims[0] <= 0 || mesh->dims[1] <= 0 || mesh->startRank < 0 || worldRank < 0) {
+    return false;
+  }
+  const int64_t meshSize = static_cast<int64_t>(mesh->dims[0]) * static_cast<int64_t>(mesh->dims[1]);
+  const int64_t meshEnd = static_cast<int64_t>(mesh->startRank) + meshSize;
+  return static_cast<int64_t>(worldRank) >= static_cast<int64_t>(mesh->startRank) &&
+         static_cast<int64_t>(worldRank) < meshEnd;
+}
+
+ncclResult_t validateReshardPlacement(const ncclDistTensor_t* tensor, const char* apiName, const char* fieldName);
 
 void computeMeshGroupInfo(const ncclDistTensor_t* tensor, int worldRank, ncclReshardMeshGroupInfo* info);
 
@@ -291,6 +319,10 @@ bool computeOverlap(const size_t srcStart[], const size_t srcEnd[], const size_t
 void computeTransferPlan(const size_t srcDims[], const size_t srcStrides[], int srcShardDim, int srcShardIdx,
                          const size_t dstDims[], const size_t dstStrides[], int dstShardDim, int dstShardIdx, int ndims,
                          size_t elementsPerChunk, ncclReshardTransferPlan* plan);
+ncclResult_t computeTransferPlanChecked(const size_t srcDims[], const size_t srcStrides[], int srcShardDim,
+                                        int srcShardIdx, const size_t dstDims[], const size_t dstStrides[],
+                                        int dstShardDim, int dstShardIdx, int ndims, size_t elementsPerChunk,
+                                        ncclReshardTransferPlan* plan);
 
 /* ======================================================================
  * reshard_loadbalance.cc — Replication load balancer
@@ -334,5 +366,38 @@ void* getTransposeBuffer(ncclComm_t comm);
 size_t getTransposeBufferCapacity(ncclComm_t comm);
 void transposeBufferFinalize();
 ncclResult_t transposeBufferRecordEvent(ncclComm_t comm, cudaStream_t stream);
+
+/* ======================================================================
+ * staging_prepare.cc -- host-side descriptor builders for ncclReshard.
+ * ====================================================================*/
+
+struct StagingTransferDescriptor;
+struct StagingKernelParams;
+
+ncclResult_t launchStagingReshardDirect(const StagingKernelParams* hostParams, StagingKernelParams* devParams,
+                                        ncclDevComm* devComm, int numCtas, cudaStream_t stream, bool verbose);
+
+ncclResult_t validateStagingPlanLimits(int worldRank, const ncclDistTensor_t* srcTensor,
+                                       const size_t* srcTensorDims, const ncclDistTensor_t* dstTensor,
+                                       const size_t* dstTensorDims, int gpusPerDomain,
+                                       size_t* maxPeerGroupSize = nullptr);
+
+ncclResult_t buildStagingDirectTransferDescriptor(ncclComm_t globalComm, void* srcBuffer, const size_t* srcTensorDims,
+                                                  int ndims, const ncclDistTensor_t* srcTensor, void* dstBuffer,
+                                                  const size_t* dstTensorDims, const ncclDistTensor_t* dstTensor,
+                                                  int gpusPerDomain, int nodeLocalRank,
+                                                  StagingTransferDescriptor* desc);
+
+/* ======================================================================
+ * reshard_cache.cc -- staging buffer pool
+ * ====================================================================*/
+
+struct StagingBufferState;
+
+ncclResult_t ensureStagingBufferPool(ncclComm_t comm, cudaStream_t stream, StagingBufferState** outState);
+
+ncclResult_t stagingBufferPoolRecordEvent(ncclComm_t comm, cudaStream_t stream);
+
+void stagingBufferPoolFinalize();
 
 #endif /* NCCL_RESHARD_INTERNAL_H_ */

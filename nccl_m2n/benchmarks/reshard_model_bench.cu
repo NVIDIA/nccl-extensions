@@ -440,7 +440,7 @@ static std::map<std::string, ParamInfo> deduplicateParamsPP(
 // ============================================================================
 // ncclMesh_t / ncclDistTensor_t Construction from Placements
 //
-// The ncclReshardWithWindow API splits topology (mesh) from per-tensor placements:
+// The ncclReshard API splits topology (mesh) from per-tensor placements:
 //   ncclMesh_t       :  dims[NCCL_RESHARD_MESH_NDIMS], startRank
 //   ncclDistTensor_t :  ..., placements[NCCL_RESHARD_MESH_NDIMS]
 //
@@ -520,6 +520,12 @@ static void printUsage(const char* prog) {
   printf("  --gpus-per-node <N>     GPUs per node (default: 8)\n");
   printf("  --algorithm <auto|ring|direct>  Reshard algorithm (default: "
          "auto)\n");
+  printf("  --api <window|default>             Public API to drive (default: "
+         "window).\n");
+  printf("                                  'default' uses ncclReshard with "
+         "cudaMalloc'd\n");
+  printf("                                  buffers; window registration is "
+         "skipped.\n");
   printf("  --lb-mode <uniform|node>        Load balance mode (default: "
          "uniform)\n");
   printf("  --no-dedup              Disable param deduplication\n");
@@ -548,6 +554,7 @@ int main(int argc, char* argv[]) {
   bool verbose = false;
   const char* algorithm = "AUTO";
   const char* lbMode = "UNIFORM";
+  bool useDefaultApi = false;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--model-config") == 0) {
@@ -573,6 +580,19 @@ int main(int argc, char* argv[]) {
       if (strcmp(argv[i], "direct") == 0) algorithm = "DIRECT";
       else if (strcmp(argv[i], "ring") == 0) algorithm = "RING";
       else algorithm = "AUTO";
+    } else if (strcmp(argv[i], "--api") == 0) {
+      ++i;
+      if (strcmp(argv[i], "default") == 0) {
+        useDefaultApi = true;
+      } else if (strcmp(argv[i], "window") == 0) {
+        useDefaultApi = false;
+      } else {
+        if (mpiRank == 0) {
+          printf("ERROR: unknown --api value '%s' (use 'window' or 'default')\n", argv[i]);
+        }
+        MPI_Finalize();
+        return 1;
+      }
     } else if (strcmp(argv[i], "--lb-mode") == 0) {
       ++i;
       if (strcmp(argv[i], "node") == 0) lbMode = "NODE_AWARE";
@@ -742,7 +762,12 @@ int main(int argc, char* argv[]) {
            genCfg.tp, genCfg.cp, genCfg.ep, genCfg.dp, genCfg.pp, genNumGpus, genStageSize);
     printf("Layers: %d, Params (after grouping+dedup): %zu (%d skipped)\n", numLayers, allTransfers.size(), skipped);
     printf("PP comm pairs: %zu\n", ppCommPairs.size());
-    printf("Algorithm: %s, LB Mode: %s\n", algorithm, lbMode);
+    if (useDefaultApi) {
+      printf("API: default (ncclReshard, DIRECT staging path)\n");
+    } else {
+      printf("API: window (ncclReshardWithWindow)\n");
+      printf("Algorithm: %s, LB Mode: %s\n", algorithm, lbMode);
+    }
     printf("Iterations: %d (warmup: %d), Validate: %s (iters: %d), Dedup: "
            "%s\n",
            iterations, warmup, validate ? "yes" : "no", validateIterations, deduplicate ? "yes" : "no");
@@ -840,9 +865,14 @@ int main(int argc, char* argv[]) {
 
     TransferBufferEntry& tbe = transferBuffers[i];
     tbe.allocSize = bufSize;
-    NCCLCHECK(ncclMemAlloc(&tbe.buffer, bufSize));
-    CUDACHECK(cudaMemset(tbe.buffer, 0, bufSize));
-    NCCLCHECK(ncclCommWindowRegister(commEntry.comm, tbe.buffer, bufSize, &tbe.window, NCCL_WIN_COLL_SYMMETRIC));
+    if (useDefaultApi) {
+      CUDACHECK(cudaMalloc(&tbe.buffer, bufSize));
+      CUDACHECK(cudaMemset(tbe.buffer, 0, bufSize));
+    } else {
+      NCCLCHECK(ncclMemAlloc(&tbe.buffer, bufSize));
+      CUDACHECK(cudaMemset(tbe.buffer, 0, bufSize));
+      NCCLCHECK(ncclCommWindowRegister(commEntry.comm, tbe.buffer, bufSize, &tbe.window, NCCL_WIN_COLL_SYMMETRIC));
+    }
 
     if (verbose) {
       printf("[Rank %d] buffer registered: param=%s comm=(%d,%d) size=%zu\n", mpiRank, td.paramName.c_str(), key.first,
@@ -902,8 +932,7 @@ int main(int argc, char* argv[]) {
     srcTensor.placements[0] = NCCL_RESHARD_REPLICATE;
     srcTensor.placements[1] =
       (td.srcMesh.shardTensorDim >= 0) ? NCCL_RESHARD_SHARD(td.srcMesh.shardTensorDim) : NCCL_RESHARD_REPLICATE;
-    if (rankIsTrainInComm)
-      for (int d = 0; d < td.ndims; d++) srcTensor.localShape[d] = td.srcLocalShape[d];
+    for (int d = 0; d < td.ndims; d++) srcTensor.localShape[d] = td.srcLocalShape[d];
 
     ncclDistTensor_t dstTensor = {};
     dstTensor.dataPtr = rankIsTrainInComm ? nullptr : buffer;
@@ -913,10 +942,13 @@ int main(int argc, char* argv[]) {
     dstTensor.placements[0] = NCCL_RESHARD_REPLICATE;
     dstTensor.placements[1] =
       (td.dstMesh.shardTensorDim >= 0) ? NCCL_RESHARD_SHARD(td.dstMesh.shardTensorDim) : NCCL_RESHARD_REPLICATE;
-    if (!rankIsTrainInComm)
-      for (int d = 0; d < td.ndims; d++) dstTensor.localShape[d] = td.dstLocalShape[d];
+    for (int d = 0; d < td.ndims; d++) dstTensor.localShape[d] = td.dstLocalShape[d];
 
-    NCCLCHECK(ncclReshardWithWindow(m2nHandle, comm, win, &srcTensor, &dstTensor, stream));
+    if (useDefaultApi) {
+      NCCLCHECK(ncclReshard(m2nHandle, comm, &srcTensor, &dstTensor, stream));
+    } else {
+      NCCLCHECK(ncclReshardWithWindow(m2nHandle, comm, win, &srcTensor, &dstTensor, stream));
+    }
   };
 
   auto syncAllStreams = [&]() {
@@ -1250,10 +1282,14 @@ int main(int argc, char* argv[]) {
   for (size_t i = 0; i < allTransfers.size(); i++) {
     auto& tbe = transferBuffers[i];
     if (!tbe.buffer) continue;
-    auto key = std::make_pair(allTransfers[i].trainStage, allTransfers[i].genStage);
-    auto commIt = ppComms.find(key);
-    if (commIt != ppComms.end() && commIt->second.comm) ncclCommWindowDeregister(commIt->second.comm, tbe.window);
-    NCCLCHECK(ncclMemFree(tbe.buffer));
+    if (useDefaultApi) {
+      CUDACHECK(cudaFree(tbe.buffer));
+    } else {
+      auto key = std::make_pair(allTransfers[i].trainStage, allTransfers[i].genStage);
+      auto commIt = ppComms.find(key);
+      if (commIt != ppComms.end() && commIt->second.comm) ncclCommWindowDeregister(commIt->second.comm, tbe.window);
+      NCCLCHECK(ncclMemFree(tbe.buffer));
+    }
   }
 
   for (auto& [key, entry] : ppComms) {

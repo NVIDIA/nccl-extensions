@@ -9,7 +9,6 @@
  * NCCL M2N — Public C API (reshard release)
  *
  * This header exposes the complete public API for the NCCL M2N library.
- * The sole resharding entry point is ncclReshardWithWindow.
  *
  * Callers include this one header; internal implementation details are
  * in src/reshard_*.h (not installed).
@@ -45,9 +44,10 @@ extern "C" {
  */
 typedef struct ncclMesh_v2 {
   /** 2-D mesh dimensions.  Each entry must be positive.  The product is the
-   * number of ranks on this side. */
+   * number of ranks on this side and must fit in the communicator rank range. */
   int dims[NCCL_RESHARD_MESH_NDIMS];
-  /** First world rank in this side's contiguous rank interval. */
+  /** First world rank in this side's contiguous rank interval.  Must be
+   * non-negative, and the interval end must not exceed the communicator. */
   int startRank;
 } ncclMesh_t;
 
@@ -61,7 +61,7 @@ typedef struct ncclMesh_v2 {
  * Distributed Tensor Descriptor
  * ====================================================================*/
 
-/** Maximum tensor rank handled by ncclReshardWithWindow. */
+/** Maximum tensor rank handled by ncclReshardWithWindow and ncclReshard. */
 #define NCCL_RESHARD_MAX_TENSOR_DIMS 3
 
 /**
@@ -72,12 +72,14 @@ typedef struct ncclMesh_v2 {
  * placements[] describes how the global tensor maps onto mesh axes.
  */
 typedef struct ncclDistTensor_v2 {
-  /** Local buffer for this rank, or NULL if this rank does not participate as
-   * this side.  The window passed to ncclReshardWithWindow must be
-   * registered with this buffer as its base (zero-offset contract). */
+  /** Local buffer for this rank.  Must be non-NULL when this rank belongs to
+   * this side's mesh; may be NULL when it does not participate as this side.
+   * The window passed to ncclReshardWithWindow must cover this buffer, and
+   * participating ranks must use the same offset within their local window. */
   void* dataPtr;
   /** Per-axis element count on this rank.  Only the first `ndims` entries are
-   * read.  Ignored when dataPtr is NULL. */
+   * read.  Inactive ranks must still provide the side's local shape metadata
+   * so every rank derives identical transfer geometry. */
   size_t localShape[NCCL_RESHARD_MAX_TENSOR_DIMS];
   /** Number of tensor dimensions (1, 2, or 3). */
   int ndims;
@@ -198,7 +200,7 @@ ncclResult_t ncclM2nInit(ncclM2nHandle_t* handle, const ncclM2nConfig_t* config)
 ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle);
 
 /* ======================================================================
- * Resharding Entry Point
+ * Resharding Entry Points
  * ====================================================================*/
 
 /**
@@ -210,8 +212,8 @@ ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle);
  * side's mesh, and the library reads both meshes everywhere to compute
  * which ranks own source data and which receive it.  A rank that does
  * not participate on a given side passes a fully-formed descriptor
- * with `dataPtr = NULL` on that side (mirroring PyTorch DTensor's
- * size-0 local tensor on non-participating ranks).
+ * with `dataPtr = NULL` on that side, while still providing shape
+ * metadata for that side so all ranks validate the same plan.
  *
  * @param[in] handle  NCCL M2N handle returned by ncclM2nInit, or NULL for the
  *                    internal default handle.
@@ -237,6 +239,19 @@ ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle);
  */
 ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm, ncclWindow_t window,
                                    const ncclDistTensor_t* src, const ncclDistTensor_t* dst, cudaStream_t stream);
+
+/**
+ * Copy/staging-based resharding (no caller-registered window needed).
+ *
+ * @param[in] handle  NCCL M2N handle returned by ncclM2nInit, or NULL for the
+ *                    internal default handle.
+ * @param[in] comm    NCCL communicator containing all ranks (src + dst).
+ * @param[in] src     Source-side tensor descriptor (non-NULL on every rank).
+ * @param[in] dst     Destination-side tensor descriptor (non-NULL on every rank).
+ * @param[in] stream  CUDA stream (explicit or default).
+ */
+ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src,
+                         const ncclDistTensor_t* dst, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

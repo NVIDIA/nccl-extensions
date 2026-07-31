@@ -7,10 +7,11 @@ holds one sharding / replication layout, the destination group holds
 another), with a single call that moves the data with no host involvement.
 
 The library is built on NCCL's user-window API (`ncclWindow_t` +
-`ncclMemAlloc`), so transfers are zero-copy and one-sided. The single public
-entry point for this release is `ncclReshardWithWindow`. The shared library is
-installed as `libnccl_m2n.so`; the public header is `nccl_m2n.h`, while the
-lifecycle/configuration symbols use the `ncclM2n*` library prefix.
+`ncclMemAlloc`) for zero-copy, one-sided transfers, and also exposes a
+copy/staging reshard path for callers that do not manage a window. The public
+reshard entry points are `ncclReshardWithWindow` and `ncclReshard`. The shared
+library is installed as `libnccl_m2n.so`; the
+public header is `nccl_m2n.h`.
 
 > **Status.** Experimental — see [RELEASE.md](RELEASE.md) for the full list of
 > known limitations and the supported tensor-rank / mesh-size envelope. Depends
@@ -33,8 +34,8 @@ lifecycle/configuration symbols use the `ncclM2n*` library prefix.
 A typical caller has two disjoint sets of ranks (e.g. trainer ranks and
 inference / generator ranks) inside one NCCL communicator. Each side owns a
 local tile of the same logical tensor under a different layout. One call to
-`ncclReshardWithWindow` reshapes the tile on every destination rank to match
-the destination layout.
+`ncclReshardWithWindow` or `ncclReshard` reshapes
+the tile on every destination rank to match the destination layout.
 
 **Mesh** (`ncclMesh_t`) — describes one side's rank topology only (no
 per-tensor placement, matching PyTorch DTensor's `DeviceMesh` / JAX's `Mesh`).
@@ -246,10 +247,10 @@ typedef struct {
 `ncclFloat64`.
 
 A rank that doesn't participate on a given side passes a fully-formed
-descriptor with `dataPtr = NULL` (mirroring DTensor's size-0 local
-tensor for non-participating ranks).  `mesh` is required on every
-rank — the library reads both meshes everywhere to compute who-holds-
-which-shard.
+descriptor with `dataPtr = NULL` and the same side-local `localShape` metadata
+used by participating ranks. A rank inside a side's mesh must provide a
+non-NULL buffer for that side. `mesh` is required on every rank because the
+library reads both meshes everywhere to derive the transfer geometry.
 
 [torch.distributed.tensor]: https://pytorch.org/docs/stable/distributed.tensor.html
 
@@ -258,12 +259,22 @@ which-shard.
 Use `ncclReshardWithWindow` with an M2N handle and a registered symmetric NCCL
 window around the participating buffers. Pass `NULL` as the handle to lazily
 use the internal default handle.
+Use `ncclReshard` for the copy/staging path when no caller-managed window is
+available.
 
 ```c
 ncclResult_t ncclReshardWithWindow(
     ncclM2nHandle_t         m2nHandle, // returned by ncclM2nInit, or NULL for default
     ncclComm_t                comm,    // contains all ranks (src + dst)
     ncclWindow_t              window,  // registered on comm
+    const ncclDistTensor_t*   src,     // source-side descriptor
+    const ncclDistTensor_t*   dst,     // destination-side descriptor
+    cudaStream_t              stream   // explicit stream, or default-stream sentinel
+);
+
+ncclResult_t ncclReshard(
+    ncclM2nHandle_t         m2nHandle, // returned by ncclM2nInit, or NULL for default
+    ncclComm_t                comm,    // contains all ranks (src + dst)
     const ncclDistTensor_t*   src,     // source-side descriptor
     const ncclDistTensor_t*   dst,     // destination-side descriptor
     cudaStream_t              stream   // explicit stream, or default-stream sentinel
@@ -275,33 +286,52 @@ CTA count defaults to `DEFAULT_NUM_CTAS = 8` and can be capped with
 `DEFAULT_ELEMENTS_PER_CHUNK = 32`; the RING path also honors
 `NCCL_RESHARD_CHUNK_SIZE` as a byte-level chunk override.
 
+The copy/staging API allocates one staging pool per cached communicator. Its
+device-memory footprint is
+`NCCL_RESHARD_STAGING_NUM_CHANNELS * NCCL_RESHARD_STAGING_CHANNEL_SIZE` plus a
+small kernel-parameter block: 4 channels times 64 MiB, or 256 MiB per
+communicator, by default. The pool remains cached until the M2N runtime is
+finalized. The configured staging chunk is preserved when it fits; otherwise
+all ranks derive the same smaller effective chunk from the shared descriptors
+and topology. Staging environment values must therefore be identical on every
+rank. Changing the chunk does not change the pool allocation size.
+
 **Preconditions** (return `ncclInvalidArgument` if violated, except where
 noted otherwise):
 
-- `comm`, `window`, `src`, `dst`, `src->mesh`, `dst->mesh` are non-NULL.
+- `comm`, `src`, `dst`, `src->mesh`, `dst->mesh` are non-NULL.
+- Mesh starts are non-negative, dimensions and interval arithmetic are valid,
+  and both half-open mesh intervals fit within `comm`.
 - `src->ndims == dst->ndims`, both in `1..NCCL_RESHARD_MAX_TENSOR_DIMS`
   (currently 3; 4-D is not supported).
 - `src->dtype == dst->dtype` and is a supported dtype (see list above).
-- `window` is registered on `comm` itself with `NCCL_WIN_COLL_SYMMETRIC`.
+- For `ncclReshardWithWindow`, `window` is non-NULL and registered on `comm`
+  itself with `NCCL_WIN_COLL_SYMMETRIC`.
 - `stream` is either an explicit CUDA stream or a default-stream sentinel
   (`NULL`, `cudaStreamLegacy`, or `cudaStreamPerThread`). Default-stream callers
   run on an internal non-blocking stream pool when enabled. Readiness and
   completion events preserve the caller stream's ordering before and after the
   reshard operation.
-- Per-rank `src->dataPtr` / `dst->dataPtr` is either `NULL` for an inactive
-  side or lies inside the registered window. If both pointers are present on
-  one rank, their window offsets must match. Window-offset checks require
+- `src->dataPtr` and `dst->dataPtr` are non-NULL on ranks that belong to the
+  corresponding mesh. A pointer may be NULL only on an inactive side. For the
+  window API, active pointers lie inside the registered window; if both are
+  present on one rank, their window offsets must match. Window-offset checks require
   NCCL ≥ 2.29.2 (`ncclWinGetUserPtr`); on older NCCL the offset symmetry is
   trusted. Violations of the single-offset contract abort the process via
   `RESHARD_FATAL` rather than returning `ncclInvalidArgument`.
+- `localShape` remains required metadata for inactive sides in both APIs;
+  ranks that are outside both meshes must still pass source and destination
+  shapes that derive the same global tensor shape as active ranks.
 - Each `localShape[shard_dim]` × shard count divides cleanly into the
   global tensor dim.
 
 **Returns** `ncclSuccess` on success, otherwise an `ncclResult_t` from NCCL or
 `ncclInvalidArgument` from the preconditions above.
 
-**Threading** — the call is collective and follows CUDA stream semantics.
-Issue a single reshard at a time per `(comm, effective stream)`. Use separate
+**Participation and threading** — every rank in `comm`, including ranks outside
+both meshes, must call the same reshard operation in the same collective order
+and provide both descriptors. The call follows CUDA stream semantics. Issue a
+single reshard at a time per `(comm, effective stream)`. Use separate
 communicators for concurrent transfers; the batched benchmark does this with
 `--num-comms`.
 
@@ -724,6 +754,10 @@ for `NCCL_RESHARD_STREAM_POOL_SIZE`, an invalid value is ignored and the
 configured or built-in value remains in effect. For the stream pool, an invalid
 or non-positive value disables the pool; values above
 `STREAM_POOL_MAX_SIZE` are capped to that maximum.
+`NCCL_RESHARD_STAGING_NUM_CHANNELS`,
+`NCCL_RESHARD_STAGING_CHANNEL_SIZE`, and
+`NCCL_RESHARD_STAGING_CHUNK_SIZE` affect collective resource geometry and must
+have identical effective values on every rank in the communicator.
 
 | Variable | Effect |
 |---|---|
@@ -735,6 +769,9 @@ or non-positive value disables the pool; values above
 | `NCCL_RESHARD_DST_DOMAIN_SIZE`  | Positive destination domain-size override; invalid values are ignored. |
 | `NCCL_RESHARD_STREAM_POOL_SIZE` | Max distinct `(comm, dev)` pool entries (default 4); invalid or non-positive values disable it and oversized values are capped. |
 | `NCCL_RESHARD_CHUNK_SIZE`       | Positive RING byte-level chunk size; invalid values are ignored. |
+| `NCCL_RESHARD_STAGING_NUM_CHANNELS` | Positive staging channel count used by `ncclReshard`. |
+| `NCCL_RESHARD_STAGING_CHANNEL_SIZE` | Positive per-channel staging allocation in bytes. |
+| `NCCL_RESHARD_STAGING_CHUNK_SIZE` | Positive staging transfer chunk size in bytes. |
 
 ---
 
@@ -757,7 +794,13 @@ or non-positive value disables the pool; values above
 │   ├── reshard_loadbalance.cc            # Replication load balancer           (host)
 │   ├── reshard_prepare.cc                # Kernel-parameter builders           (host)
 │   ├── reshard_transpose.cc              # Cross-dim transpose buffer mgmt     (host)
-│   └── reshard_user_window.cu            # ncclReshardWithWindow + CUDA kernels
+│   ├── reshard_user_window.cu            # Window API entries + CUDA kernels
+│   ├── reshard_staging.cu                # ncclReshard staging-path entry + dispatch
+│   ├── staging_prepare.cc                # Staging transfer-descriptor builders (host)
+│   ├── staging_buffer.{cc,h}             # Staging-buffer lifecycle             (host)
+│   ├── staging_kernel.cu                 # Staging CUDA kernels
+│   ├── staging_primitives.cuh            # Header-only staging device helpers
+│   └── staging_types.h                   # Staging struct definitions
 ├── benchmarks/
 │   ├── Makefile                          # Bench build rules (delegated to from root)
 │   ├── bench_common.h                    # Host-only macros + arg parsing
@@ -791,7 +834,7 @@ or non-positive value disables the pool; values above
 
 | Symptom | Likely cause |
 |---|---|
-| `ncclInvalidArgument` from `ncclReshardWithWindow` | One of the preconditions failed: NULL comm/window/descriptor/mesh, mismatched `ndims`/dtype, `ndims` outside 1..3, or an unsupported dtype. |
+| `ncclInvalidArgument` from `ncclReshardWithWindow` / `ncclReshard` | One of the preconditions failed: NULL comm/window/descriptor/mesh, mismatched `ndims`/dtype, `ndims` outside 1..3, or an unsupported dtype. |
 | Validation fails with destination still containing the pre-call bytes | The kernel did not write to dest. Re-run with `NCCL_RESHARD_LOG_LEVEL=DEBUG` to see the prepared plan, then file an issue with the `reshard_bench` command line that reproduces the failure. |
 | `nccl_device.h: No such file or directory` at compile time | `NCCL_HOME` points at a binary install rather than a from-source build. Build NCCL from source or point at one, or build the vendored default: `git submodule update --init third_party/nccl && make -C third_party/nccl -j src.build`. |
 | Fast-but-wrong: `make` succeeds yet runtime crashes with "illegal instruction" | Often a downstream symptom of a kernel that completed with corrupt state on the previous reshard call. Re-run with `NCCL_RESHARD_LOG_LEVEL=DEBUG` to see the prepared plan. |

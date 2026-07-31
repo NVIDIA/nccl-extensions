@@ -85,13 +85,14 @@ static bool mpiIsRank0Printer(TestEnv* env) {
 struct MpiParam {
   TestCase tc;
   std::string algorithmEnv; /* RING or DIRECT */
+  ApiKind api = ApiKind::Window;
 };
 
 /* gtest pretty-printer hook for MpiParam — found via ADL by
  * INSTANTIATE_TEST_SUITE_P's value-printer. The lookup is template-driven,
  * so plain `-Wunused-function` cannot see the use; mark it accordingly. */
 [[maybe_unused]] static void printTo(const MpiParam& param, std::ostream* os) {
-  *os << param.algorithmEnv << ":" << param.tc.name;
+  *os << param.algorithmEnv << ":" << (param.api == ApiKind::Default ? "default" : "window") << ":" << param.tc.name;
 }
 
 static BasicApiCliArgs gCli;
@@ -105,6 +106,8 @@ static cudaStream_t gStream = nullptr;
 static ncclM2nHandle_t gM2nHandle = nullptr;
 static void* gBuffer = nullptr;
 static size_t gBufferBytes = 4096;
+static void* gCopyBuffer = nullptr;
+static size_t gCopyBufferBytes = 0;
 static std::string gActiveAlgorithm;
 #if !defined(GTEST_SKIP)
 static int gSkippedCases = 0;
@@ -122,19 +125,37 @@ static std::vector<MpiParam> selectedParams() {
   std::vector<MpiParam> params;
   std::vector<TestCase> cases = basicApiSelectCases(gCases, gCli);
 
+  std::vector<ApiKind> apis;
+  if (basicApiRunAllApis(gCli)) {
+    apis = {ApiKind::Window, ApiKind::Default};
+  } else {
+    apis = {basicApiRequestedApi(gCli)};
+  }
+
   if (runAllAlgorithms()) {
     const char* algos[] = {"RING", "DIRECT"};
-    for (const char* algo : algos)
-      for (const TestCase& tc : cases) params.push_back(MpiParam{tc, algo});
+    for (const char* algo : algos) {
+      for (ApiKind api : apis) {
+        for (const TestCase& tc : cases) {
+          params.push_back(MpiParam{tc, algo, api});
+        }
+      }
+    }
   } else {
     const char* algo = requestedAlgorithmEnv();
-    for (const TestCase& tc : cases) params.push_back(MpiParam{tc, algo});
+    for (ApiKind api : apis) {
+      for (const TestCase& tc : cases) {
+        params.push_back(MpiParam{tc, algo, api});
+      }
+    }
   }
   return params;
 }
 
 static std::string gtestCaseName(const ::testing::TestParamInfo<MpiParam>& info) {
-  return basicApiGtestCaseName(info.param.tc.name, info.index, info.param.algorithmEnv.c_str());
+  std::string prefix = info.param.algorithmEnv;
+  prefix += (info.param.api == ApiKind::Default) ? "_default" : "_window";
+  return basicApiGtestCaseName(info.param.tc.name, info.index, prefix.c_str());
 }
 
 #if !defined(GTEST_SKIP)
@@ -171,6 +192,9 @@ TEST_P(BasicApiMpiTest, Reshard) {
   env.m2nHandle = gM2nHandle;
   env.buffer = gBuffer;
   env.bufferBytes = gBufferBytes;
+  env.copyBuffer = gCopyBuffer;
+  env.copyBufferBytes = gCopyBufferBytes;
+  env.apiKind = param.api;
   env.verbose = gCli.verbose;
   env.barrier = mpiBarrier;
   env.allreduceMinInt = mpiAllreduceMinInt;
@@ -218,6 +242,11 @@ static int initMpiRuntime() {
   TEST_CUDACHECK(cudaStreamCreate(&gStream));
   TEST_NCCLCHECK(ncclMemAlloc(&gBuffer, gBufferBytes));
 
+  if (basicApiRunAllApis(gCli) || basicApiRequestedApi(gCli) == ApiKind::Default) {
+    gCopyBufferBytes = gBufferBytes;
+    TEST_CUDACHECK(cudaMalloc(&gCopyBuffer, gCopyBufferBytes));
+  }
+
   if (gWorldRank == 0) {
     std::vector<MpiParam> params = selectedParams();
     basicApiPrintRuntimeSummary("basic_api_test_mpi (gtest)", gWorldSize, gNumDevices, gCli, gBufferBytes, "num_tests",
@@ -230,6 +259,10 @@ static void shutdownMpiRuntime() {
   if (gStream != nullptr) TEST_CUDACHECK(cudaStreamSynchronize(gStream));
   TEST_NCCLCHECK(ncclM2nFinalize(gM2nHandle));
   gM2nHandle = nullptr;
+  if (gCopyBuffer != nullptr) {
+    TEST_CUDACHECK(cudaFree(gCopyBuffer));
+  }
+  gCopyBuffer = nullptr;
   if (gBuffer != nullptr) TEST_NCCLCHECK(ncclMemFree(gBuffer));
   if (gStream != nullptr) TEST_CUDACHECK(cudaStreamDestroy(gStream));
   if (gComm != nullptr) TEST_NCCLCHECK(ncclCommDestroy(gComm));

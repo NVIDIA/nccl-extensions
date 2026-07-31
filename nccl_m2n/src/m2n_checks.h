@@ -13,6 +13,7 @@
 
 #include "cuda_runtime.h"
 #include "nccl.h"
+#include "m2n_log.h"
 
 /*
  * Library-safe macros: return an error code instead of calling exit().
@@ -34,6 +35,14 @@
       fprintf(stderr, "[nccl-m2n] CUDA error %s:%d '%s'\n", __FILE__, __LINE__, cudaGetErrorString(err));     \
       return ncclSystemError;                                                                                 \
     }                                                                                                         \
+  } while (0)
+
+#define NCCL_M2N_CHECK_ARG(cond, rank, ...) \
+  do {                                          \
+    if (!(cond)) {                              \
+      RESHARD_WARN((rank), __VA_ARGS__);        \
+      return ncclInvalidArgument;               \
+    }                                           \
   } while (0)
 
 /*

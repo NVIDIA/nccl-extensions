@@ -141,6 +141,7 @@ ncclResult_t stagingBufferInit(StagingBufferState* state) {
    * stagingBufferFinalize would early-out without reclaiming `buffer`.
    * Free it explicitly on any failure between here and `initialized=true`. */
   if (cudaError_t e = cudaMemset(buffer, 0, totalSize); e != cudaSuccess) {
+    NCCL_M2N_SET_ERROR("CUDA operation cudaMemset(staging buffer) failed: %s", cudaGetErrorString(e));
     fprintf(stderr, "[STAGING] CUDA error %s:%d '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e));
     ncclMemFree(buffer);
     return ncclInternalError;
@@ -153,6 +154,7 @@ ncclResult_t stagingBufferInit(StagingBufferState* state) {
   state->chunkSize = chunkSize;
   state->devParams = nullptr;
   if (cudaError_t e = cudaMalloc(&state->devParams, sizeof(StagingKernelParams)); e != cudaSuccess) {
+    NCCL_M2N_SET_ERROR("CUDA operation cudaMalloc(staging kernel parameters) failed: %s", cudaGetErrorString(e));
     fprintf(stderr, "[STAGING] CUDA error %s:%d '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e));
     ncclMemFree(buffer);
     state->buffer = nullptr;

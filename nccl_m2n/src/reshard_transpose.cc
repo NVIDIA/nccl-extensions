@@ -5,7 +5,6 @@
  * See LICENSE.txt for more license information.
  ************************************************************************/
 
-#include <cstdio>
 #include "cuda_runtime.h"
 #include "nccl.h"
 #include "reshard_types.h"
@@ -49,48 +48,57 @@ ncclResult_t ensureTransposeBuffer(ncclComm_t comm, size_t requiredBytes, cudaSt
 
     if (entry->capacity >= requiredBytes) return ncclSuccess;
 
-    /* Growth: retire the old buffer and allocate a larger one. */
+    /* Growth: allocate the larger buffer first and retire the old one only
+     * after the allocation succeeds, so a failed ncclMemAlloc leaves the
+     * entry intact (a partially grown entry would expose a null buffer
+     * through getTransposeBuffer). */
     if (gRetiredCount >= MAX_RETIRED_BUFFERS) {
-      fprintf(stderr,
-              "[nccl-reshard] Transpose retired-buffer list full (%d); "
-              "too many buffer growths.\n",
-              MAX_RETIRED_BUFFERS);
-      return ncclInternalError;
+      NCCL_M2N_FAIL(ncclInternalError, -1,
+                    "Transpose retired-buffer list full (%d); process the largest tensor first",
+                    MAX_RETIRED_BUFFERS);
     }
-    RESHARD_DEBUG(-1,
-                  "Transpose buffer growing for comm %p: %zu -> %zu bytes "
-                  "(retiring %p)",
-                  (void*)comm, entry->capacity, requiredBytes, entry->buffer);
+    void* grown = nullptr;
+    ncclResult_t growResult = ncclMemAlloc(&grown, requiredBytes);
+    if (growResult != ncclSuccess) {
+      NCCL_M2N_FAIL(growResult, -1, "Failed to grow transpose buffer to %zu bytes: %s", requiredBytes,
+                    ncclGetErrorString(growResult));
+    }
+    RESHARD_DEBUG(-1, "Transpose buffer growing for comm %p: %zu -> %zu bytes (retiring %p)", (void*)comm,
+                  entry->capacity, requiredBytes, entry->buffer);
     gRetired[gRetiredCount++] = entry->buffer;
-    entry->buffer = nullptr;
-    entry->capacity = 0;
-
-    NCCL_M2N_CHECK(ncclMemAlloc(&entry->buffer, requiredBytes));
+    entry->buffer = grown;
     entry->capacity = requiredBytes;
     return ncclSuccess;
   }
 
-  /* New comm — allocate a fresh slot. */
+  /* New comm — allocate the event and buffer into locals, then commit the
+   * pool slot only after both succeed.  Committing first (incrementing
+   * gPoolCount / setting allocated=true) would leave a half-initialized
+   * entry on any allocation failure, which getTransposeBuffer would later
+   * surface as a null buffer. */
   if (gPoolCount >= MAX_TRANSPOSE_BUFFER_ENTRIES) {
-    fprintf(stderr,
-            "[nccl-reshard] Transpose buffer pool full (%d entries); "
-            "increase MAX_TRANSPOSE_BUFFER_ENTRIES.\n",
-            MAX_TRANSPOSE_BUFFER_ENTRIES);
-    return ncclInvalidArgument;
+    NCCL_M2N_FAIL(ncclInvalidArgument, -1,
+                  "Transpose buffer pool full (%d entries); increase MAX_TRANSPOSE_BUFFER_ENTRIES",
+                  MAX_TRANSPOSE_BUFFER_ENTRIES);
+  }
+
+  cudaEvent_t event = nullptr;
+  NCCL_M2N_CUDACHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+
+  void* buffer = nullptr;
+  ncclResult_t r = ncclMemAlloc(&buffer, requiredBytes);
+  if (r != ncclSuccess) {
+    NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(event));
+    NCCL_M2N_FAIL(r, -1, "Failed to allocate %zu-byte transpose buffer: %s", requiredBytes, ncclGetErrorString(r));
   }
 
   TransposeBufferEntry& e = gPool[gPoolCount++];
   e.comm = comm;
   e.stream = stream;
-  e.event = nullptr;
-  e.buffer = nullptr;
-  e.capacity = 0;
-  e.allocated = true;
-
-  NCCL_M2N_CUDACHECK(cudaEventCreateWithFlags(&e.event, cudaEventDisableTiming));
-
-  NCCL_M2N_CHECK(ncclMemAlloc(&e.buffer, requiredBytes));
+  e.event = event;
+  e.buffer = buffer;
   e.capacity = requiredBytes;
+  e.allocated = true;
   RESHARD_DEBUG(-1, "Transpose buffer allocated for comm %p: %zu bytes (%p) [slot %d]", (void*)comm, requiredBytes,
                 e.buffer, gPoolCount - 1);
   return ncclSuccess;

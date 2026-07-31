@@ -199,6 +199,15 @@ ncclResult_t ncclM2nInit(ncclM2nHandle_t* handle, const ncclM2nConfig_t* config)
  */
 ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle);
 
+/**
+ * Return detail for the most recent NCCL M2N error on the calling host thread.
+ *
+ * The returned string is owned by the library and remains valid until the next
+ * NCCL M2N API call on the same thread.  Returns an empty string when no detail
+ * is available.  The numeric ncclResult_t remains the authoritative status.
+ */
+const char* ncclM2nGetLastError(void);
+
 /* ======================================================================
  * Resharding Entry Points
  * ====================================================================*/

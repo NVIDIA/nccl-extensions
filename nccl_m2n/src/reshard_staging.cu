@@ -53,16 +53,17 @@ static void CUDART_CB releaseStagingKernelParams(void* data) {
 
 extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src,
                                     const ncclDistTensor_t* dst, cudaStream_t stream) {
-  NCCL_M2N_CHECK_ARG(comm != nullptr, -1, "[ncclReshard] comm must be non-null");
+  m2nClearLastError();
+  NCCL_M2N_CHECK_ARG(comm != nullptr, -1, "ncclReshard: comm must be non-null");
   NCCL_M2N_CHECK_ARG(src != nullptr && dst != nullptr, -1,
-                     "[ncclReshard] src and dst tensor descriptors must both be non-null on every rank");
+                     "ncclReshard: src and dst tensor descriptors must both be non-null on every rank");
   NCCL_M2N_CHECK_ARG(src->mesh != nullptr && dst->mesh != nullptr, -1,
-                     "[ncclReshard] src->mesh and dst->mesh must both be non-null on every rank");
+                     "ncclReshard: src->mesh and dst->mesh must both be non-null on every rank");
   NCCL_M2N_CHECK(validateReshardMeshDims(src->mesh, dst->mesh));
 
-  NCCL_M2N_CHECK_ARG(src->ndims == dst->ndims, -1, "[ncclReshard] src->ndims (%d) and dst->ndims (%d) must match",
+  NCCL_M2N_CHECK_ARG(src->ndims == dst->ndims, -1, "ncclReshard: src->ndims (%d) and dst->ndims (%d) must match",
                      src->ndims, dst->ndims);
-  NCCL_M2N_CHECK_ARG(src->dtype == dst->dtype, -1, "[ncclReshard] src->dtype (%d) and dst->dtype (%d) must match",
+  NCCL_M2N_CHECK_ARG(src->dtype == dst->dtype, -1, "ncclReshard: src->dtype (%d) and dst->dtype (%d) must match",
                      (int)src->dtype, (int)dst->dtype);
 
   int ndims = src->ndims;
@@ -75,9 +76,9 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   const ncclMesh_t* dst_mesh = dst->mesh;
 
   NCCL_M2N_CHECK_ARG(ndims >= 1 && ndims <= NCCL_RESHARD_MAX_TENSOR_DIMS, -1,
-                     "[ncclReshard] ndims (%d) out of range [1, %d]", ndims, NCCL_RESHARD_MAX_TENSOR_DIMS);
+                     "ncclReshard: ndims (%d) out of range [1, %d]", ndims, NCCL_RESHARD_MAX_TENSOR_DIMS);
   size_t element_size = getNcclDtSize(dtype);
-  NCCL_M2N_CHECK_ARG(element_size != 0, -1, "[ncclReshard] unsupported data type %d", (int)dtype);
+  NCCL_M2N_CHECK_ARG(element_size != 0, -1, "ncclReshard: unsupported data type %d", (int)dtype);
 
   ncclMesh_t src_mesh_local = *src_mesh;
   ncclMesh_t dst_mesh_local = *dst_mesh;
@@ -109,7 +110,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
     }
     size_t global_dim = 0;
     NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(dims[info.shardTensorDim], (size_t)info.shardCount, &global_dim), world_rank,
-                       "[ncclReshard] %s shard dimension overflows global extent: dim=%d local=%zu shardCount=%d", side,
+                       "ncclReshard: %s shard dimension overflows global extent: dim=%d local=%zu shardCount=%d", side,
                        info.shardTensorDim, dims[info.shardTensorDim], info.shardCount);
     return ncclSuccess;
   };
@@ -120,7 +121,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
     size_t total = element_size;
     for (int d = 0; d < ndims; d++) {
       NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(total, dims[d], &total), world_rank,
-                         "[ncclReshard] %s local byte size overflow at dim %d: current=%zu dim=%zu", side, d, total,
+                         "ncclReshard: %s local byte size overflow at dim %d: current=%zu dim=%zu", side, d, total,
                          dims[d]);
     }
     return ncclSuccess;
@@ -131,14 +132,11 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   int currentCudaDev = 0;
   ncclCommProperties commProps = NCCL_COMM_PROPERTIES_INITIALIZER;
   ncclResult_t propsResult = ncclSuccess;
-  ncclResult_t setupResult = reshardMatchCommCudaDevice(comm, &currentCudaDev, &commProps, &propsResult);
-  if (setupResult != ncclSuccess) {
-    return setupResult;
-  }
+  NCCL_M2N_CHECK(reshardMatchCommCudaDevice(comm, &currentCudaDev, &commProps, &propsResult));
 
   /* Stream pool for default-stream callers. */
   ReshardWorkStream work{};
-  setupResult = reshardSetupWorkStream(comm, stream, currentCudaDev, propsResult, &commProps, &work);
+  ncclResult_t setupResult = reshardSetupWorkStream(comm, stream, currentCudaDev, propsResult, &commProps, &work);
   if (setupResult != ncclSuccess) {
     return setupResult;
   }
@@ -150,7 +148,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   /* Convert dims to bytes (last dim absorbs element size). */
   size_t src_dims_bytes[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
   size_t dst_dims_bytes[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
-  NCCL_M2N_CHECK(reshardDimsToBytes(world_rank, "[ncclReshard]", ndims, element_size, src_tensor_dims, dst_tensor_dims,
+  NCCL_M2N_CHECK(reshardDimsToBytes(world_rank, "ncclReshard:", ndims, element_size, src_tensor_dims, dst_tensor_dims,
                                     src_dims_bytes, dst_dims_bytes));
 
   StagingBufferState* staging = nullptr;
@@ -253,8 +251,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
    * ---------------------------------------------------------------- */
   std::unique_ptr<StagingKernelParams> paramsOwner(new (std::nothrow) StagingKernelParams);
   if (paramsOwner == nullptr) {
-    RESHARD_WARN(world_rank, "Failed to allocate staging kernel parameters");
-    return ncclSystemError;
+    NCCL_M2N_FAIL(ncclSystemError, world_rank, "Failed to allocate host memory for staging kernel parameters");
   }
   StagingKernelParams& params = *paramsOwner;
   {

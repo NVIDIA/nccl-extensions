@@ -68,13 +68,15 @@ ncclResult_t validateReshardMeshBounds(const ncclMesh_t* srcMesh, const ncclMesh
 }
 
 ncclResult_t computeStridesChecked(const size_t dims[], int ndims, size_t strides[]) {
-  if (dims == nullptr || strides == nullptr || ndims < 1 || ndims > NCCL_RESHARD_MAX_TENSOR_DIMS) {
-    return ncclInvalidArgument;
-  }
+  NCCL_M2N_CHECK_ARG(dims != nullptr && strides != nullptr && ndims >= 1 && ndims <= NCCL_RESHARD_MAX_TENSOR_DIMS,
+                     -1, "computeStridesChecked: dims/strides must be non-null and ndims=%d must be in [1, %d]", ndims,
+                     NCCL_RESHARD_MAX_TENSOR_DIMS);
   strides[ndims - 1] = 1;
   for (int d = ndims - 2; d >= 0; d--) {
     if (!m2nCheckedMulSize(strides[d + 1], dims[d + 1], &strides[d])) {
-      return ncclInvalidArgument;
+      NCCL_M2N_FAIL(ncclInvalidArgument, -1,
+                    "computeStridesChecked: stride overflow at dim %d (nextStride=%zu, nextDim=%zu)", d,
+                    strides[d + 1], dims[d + 1]);
     }
   }
   return ncclSuccess;
@@ -93,23 +95,22 @@ ncclResult_t validateReshardPlacement(const ncclDistTensor_t* tensor, const char
       continue;
     }
     if (!isShardPlacement(placement)) {
-      RESHARD_WARN(-1, "[%s] %s->placements[%d]=%d is invalid.", apiName, fieldName, meshDim, placement);
-      return ncclInvalidArgument;
+      NCCL_M2N_FAIL(ncclInvalidArgument, -1, "%s: %s->placements[%d]=%d is invalid", apiName, fieldName, meshDim,
+                    placement);
     }
 
     const int shardDim = getShardTensorDim(placement);
     if (shardDim < 0 || shardDim >= tensor->ndims) {
-      RESHARD_WARN(-1, "[%s] %s->placements[%d]=SHARD(%d) is outside tensor rank %d.", apiName, fieldName, meshDim,
-                   shardDim, tensor->ndims);
-      return ncclInvalidArgument;
+      NCCL_M2N_FAIL(ncclInvalidArgument, -1, "%s: %s->placements[%d]=SHARD(%d) is outside tensor rank %d", apiName,
+                    fieldName, meshDim, shardDim, tensor->ndims);
     }
     shardCount++;
   }
 
   if (shardCount != 1) {
-    RESHARD_WARN(-1, "[%s] %s must have exactly one SHARD placement after normalization; got %d.", apiName, fieldName,
-                 shardCount);
-    return ncclInvalidArgument;
+    NCCL_M2N_FAIL(ncclInvalidArgument, -1,
+                  "%s: %s must have exactly one SHARD placement after normalization; got %d", apiName, fieldName,
+                  shardCount);
   }
   return ncclSuccess;
 }
@@ -186,13 +187,17 @@ static ncclResult_t computeGlobalRangeChecked(const size_t localDims[], int ndim
                                               size_t globalStart[], size_t globalEnd[]) {
   if (localDims == nullptr || globalStart == nullptr || globalEnd == nullptr || ndims < 1 ||
       ndims > NCCL_RESHARD_MAX_TENSOR_DIMS) {
-    return ncclInvalidArgument;
+    NCCL_M2N_FAIL(ncclInvalidArgument, -1,
+                  "computeGlobalRangeChecked: dimensions and outputs must be non-null and ndims=%d must be in [1, %d]",
+                  ndims, NCCL_RESHARD_MAX_TENSOR_DIMS);
   }
   for (int d = 0; d < ndims; d++) {
     if (d == shardTensorDim) {
       if (!m2nCheckedMulSize((size_t)shardIdx, localDims[d], &globalStart[d]) ||
           !m2nCheckedAddSize(globalStart[d], localDims[d], &globalEnd[d])) {
-        return ncclInvalidArgument;
+        NCCL_M2N_FAIL(ncclInvalidArgument, -1,
+                      "computeGlobalRangeChecked: global range overflow at dim %d (shardIdx=%d, localDim=%zu)", d,
+                      shardIdx, localDims[d]);
       }
     } else {
       globalStart[d] = 0;
@@ -268,13 +273,11 @@ ncclResult_t computeTransferPlanChecked(const size_t srcDims[], const size_t src
                                         int dstShardDim, int dstShardIdx, int ndims, size_t elementsPerChunk,
                                         ncclReshardTransferPlan* plan) {
   (void)elementsPerChunk;
-  if (plan == nullptr) {
-    return ncclInvalidArgument;
-  }
+  NCCL_M2N_CHECK_ARG(plan != nullptr, -1, "computeTransferPlanChecked: output plan must be non-null");
   memset(plan, 0, sizeof(*plan));
-  if (ndims < 1 || ndims > NCCL_RESHARD_MAX_TENSOR_DIMS) {
-    return ncclInvalidArgument;
-  }
+  NCCL_M2N_CHECK_ARG(ndims >= 1 && ndims <= NCCL_RESHARD_MAX_TENSOR_DIMS, -1,
+                     "computeTransferPlanChecked: ndims=%d must be in [1, %d]", ndims,
+                     NCCL_RESHARD_MAX_TENSOR_DIMS);
   size_t srcGlobalStart[NCCL_RESHARD_MAX_TENSOR_DIMS], srcGlobalEnd[NCCL_RESHARD_MAX_TENSOR_DIMS];
   size_t dstGlobalStart[NCCL_RESHARD_MAX_TENSOR_DIMS], dstGlobalEnd[NCCL_RESHARD_MAX_TENSOR_DIMS];
   if (computeGlobalRangeChecked(srcDims, ndims, srcShardDim, srcShardIdx, srcGlobalStart, srcGlobalEnd) !=
@@ -295,12 +298,16 @@ ncclResult_t computeTransferPlanChecked(const size_t srcDims[], const size_t src
   for (int d = ndims - 1; d >= 0; d--) {
     if (d != srcShardDim && d != dstShardDim && overlapSize[d] == srcDims[d] && overlapSize[d] == dstDims[d]) {
       if (!m2nCheckedMulSize(innerSize, overlapSize[d], &innerSize)) {
-        return ncclInvalidArgument;
+        NCCL_M2N_FAIL(ncclInvalidArgument, -1,
+                      "computeTransferPlanChecked: inner size overflow at dim %d (current=%zu, overlap=%zu)", d,
+                      innerSize, overlapSize[d]);
       }
       innerContigStart = d;
     } else {
       if (!m2nCheckedMulSize(innerSize, overlapSize[d], &innerSize)) {
-        return ncclInvalidArgument;
+        NCCL_M2N_FAIL(ncclInvalidArgument, -1,
+                      "computeTransferPlanChecked: inner size overflow at dim %d (current=%zu, overlap=%zu)", d,
+                      innerSize, overlapSize[d]);
       }
       innerContigStart = d;
       break;
@@ -314,7 +321,9 @@ ncclResult_t computeTransferPlanChecked(const size_t srcDims[], const size_t src
     plan->outerSrcStrides[d] = srcStrides[d];
     plan->outerDstStrides[d] = dstStrides[d];
     if (!m2nCheckedMulSize(plan->totalInnerTransfers, overlapSize[d], &plan->totalInnerTransfers)) {
-      return ncclInvalidArgument;
+      NCCL_M2N_FAIL(ncclInvalidArgument, -1,
+                    "computeTransferPlanChecked: transfer count overflow at dim %d (current=%zu, overlap=%zu)", d,
+                    plan->totalInnerTransfers, overlapSize[d]);
     }
   }
   plan->srcBaseOffset = 0;
@@ -328,7 +337,9 @@ ncclResult_t computeTransferPlanChecked(const size_t srcDims[], const size_t src
         !m2nCheckedAddSize(plan->srcBaseOffset, srcTerm, &plan->srcBaseOffset) ||
         !m2nCheckedMulSize(dstLocalStart, dstStrides[d], &dstTerm) ||
         !m2nCheckedAddSize(plan->dstBaseOffset, dstTerm, &plan->dstBaseOffset)) {
-      return ncclInvalidArgument;
+      NCCL_M2N_FAIL(ncclInvalidArgument, -1,
+                    "computeTransferPlanChecked: base-offset overflow at dim %d (srcStart=%zu, dstStart=%zu)", d,
+                    srcLocalStart, dstLocalStart);
     }
   }
   return ncclSuccess;

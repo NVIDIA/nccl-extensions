@@ -156,8 +156,9 @@ ncclResult_t ensureStagingBufferPool(ncclComm_t comm, cudaStream_t stream, Stagi
     return ncclSuccess;
   }
   if (gStagingPoolCount >= MAX_STAGING_BUFFER_ENTRIES) {
-    RESHARD_WARN(-1, "Staging buffer pool full (%d entries)", MAX_STAGING_BUFFER_ENTRIES);
-    return ncclSystemError;
+    NCCL_M2N_FAIL(ncclSystemError, -1,
+                  "Staging buffer pool full (%d entries); increase MAX_STAGING_BUFFER_ENTRIES",
+                  MAX_STAGING_BUFFER_ENTRIES);
   }
 
   cudaEvent_t event = nullptr;
@@ -166,8 +167,7 @@ ncclResult_t ensureStagingBufferPool(ncclComm_t comm, cudaStream_t stream, Stagi
   std::unique_ptr<StagingBufferState> state(new (std::nothrow) StagingBufferState());
   if (state == nullptr) {
     NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(event));
-    RESHARD_WARN(-1, "Failed to allocate staging buffer state");
-    return ncclSystemError;
+    NCCL_M2N_FAIL(ncclSystemError, -1, "Failed to allocate host memory for staging buffer state");
   }
 
   ncclResult_t r = stagingBufferInit(state.get());
@@ -253,16 +253,15 @@ void cacheFinalize() {
 
 ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream, cudaEvent_t* outReadyEvent,
                                cudaEvent_t* outDoneEvent) {
-  if (outStream == nullptr || outReadyEvent == nullptr || outDoneEvent == nullptr) {
-    return ncclInvalidArgument;
-  }
+  NCCL_M2N_CHECK_ARG(outStream != nullptr && outReadyEvent != nullptr && outDoneEvent != nullptr, -1,
+                     "streamPoolAcquire: output stream and events must be non-null");
   /* Pool disabled (NCCL_RESHARD_STREAM_POOL_SIZE <= 0) — caller
    * should have gated on reshardGetStreamPoolSize() > 0; defend
    * anyway so a forgotten gate doesn't UB. */
   const int maxEntries = reshardGetStreamPoolSize();
-  if (maxEntries <= 0) {
-    return ncclInvalidArgument;
-  }
+  NCCL_M2N_CHECK_ARG(maxEntries > 0, -1,
+                     "streamPoolAcquire called while NCCL_RESHARD_STREAM_POOL_SIZE=%d; caller must bypass the pool",
+                     maxEntries);
 
   /* Find existing entry for (comm, dev). */
   for (StreamPoolEntry& e : gStreamPool) {
@@ -305,7 +304,7 @@ ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream
     if (fresh.stream != nullptr) {
       NCCL_M2N_CUDACHECK_WARN(cudaStreamDestroy(fresh.stream));
     }
-    return ncclSystemError;
+    NCCL_M2N_FAIL(ncclSystemError, -1, "Failed to create CUDA stream-pool resources for device %d", dev);
   }
   try {
     gStreamPool.push_back(fresh);
@@ -313,7 +312,7 @@ ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream
     NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(fresh.doneEvent));
     NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(fresh.readyEvent));
     NCCL_M2N_CUDACHECK_WARN(cudaStreamDestroy(fresh.stream));
-    return ncclSystemError;
+    NCCL_M2N_FAIL(ncclSystemError, -1, "Failed to allocate stream-pool entry for device %d", dev);
   }
   *outStream = fresh.stream;
   *outReadyEvent = fresh.readyEvent;

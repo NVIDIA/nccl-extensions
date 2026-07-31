@@ -27,7 +27,6 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
-#include <limits>
 #include "nccl.h"
 
 /* ======================================================================
@@ -112,11 +111,9 @@ static ncclResult_t deriveGlobalDimsFromLocal(int worldRank, const char* side, c
                        "ranks",
                        side, d, localDims[d]);
     if (d == shardTensorDim) {
-      NCCL_M2N_CHECK_ARG(localDims[d] <= std::numeric_limits<size_t>::max() / static_cast<size_t>(shardCount),
-                         worldRank,
+      NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(localDims[d], static_cast<size_t>(shardCount), &globalDims[d]), worldRank,
                          "validateStagingPlanLimits: %s localShape[%d]=%zu overflows global shape with shard count %d",
                          side, d, localDims[d], shardCount);
-      globalDims[d] = localDims[d] * static_cast<size_t>(shardCount);
     } else {
       globalDims[d] = localDims[d];
     }
@@ -173,8 +170,8 @@ static ncclResult_t resolvePreflightDims(int worldRank, const size_t* srcTensorD
 
   NCCL_M2N_CHECK(deriveLocalDimsFromGlobal(worldRank, "src", globalDims, ndims, srcShardDim, srcShardCount, srcDims));
   NCCL_M2N_CHECK(deriveLocalDimsFromGlobal(worldRank, "dst", globalDims, ndims, dstShardDim, dstShardCount, dstDims));
-  computeStrides(srcDims, ndims, srcStrides);
-  computeStrides(dstDims, ndims, dstStrides);
+  NCCL_M2N_CHECK(computeStridesChecked(srcDims, ndims, srcStrides));
+  NCCL_M2N_CHECK(computeStridesChecked(dstDims, ndims, dstStrides));
   return ncclSuccess;
 }
 
@@ -258,20 +255,16 @@ static ncclResult_t validateRankStagingCounts(
   }
 
   if (numTargets > static_cast<size_t>(MAX_TARGETS)) {
-    RESHARD_WARN(worldRank,
-                 "validateStagingPlanLimits: target list would exceed "
-                 "capacity for rank %d (targets=%zu > MAX_TARGETS=%d). "
-                 "Fix: increase MAX_TARGETS in reshard_limits.h.",
-                 rank, numTargets, MAX_TARGETS);
-    return ncclInvalidArgument;
+    NCCL_M2N_FAIL(ncclInvalidArgument, worldRank,
+                  "validateStagingPlanLimits: target list would exceed capacity for rank %d "
+                  "(targets=%zu > MAX_TARGETS=%d). Fix: increase MAX_TARGETS in reshard_limits.h.",
+                  rank, numTargets, MAX_TARGETS);
   }
   if (numSources > MAX_SOURCES) {
-    RESHARD_WARN(worldRank,
-                 "validateStagingPlanLimits: source list would exceed "
-                 "capacity for rank %d (sources=%d > MAX_SOURCES=%d). "
-                 "Fix: increase MAX_SOURCES in reshard_limits.h.",
-                 rank, numSources, MAX_SOURCES);
-    return ncclInvalidArgument;
+    NCCL_M2N_FAIL(ncclInvalidArgument, worldRank,
+                  "validateStagingPlanLimits: source list would exceed capacity for rank %d "
+                  "(sources=%d > MAX_SOURCES=%d). Fix: increase MAX_SOURCES in reshard_limits.h.",
+                  rank, numSources, MAX_SOURCES);
   }
   if (maxPeerGroupSize != nullptr) {
     *maxPeerGroupSize = std::max(*maxPeerGroupSize, std::max(numTargets, static_cast<size_t>(numSources)));
@@ -344,7 +337,7 @@ ncclResult_t buildStagingDirectTransferDescriptor(ncclComm_t globalComm, void* s
                                                   int gpusPerDomain, int nodeLocalRank,
                                                   StagingTransferDescriptor* desc) {
   if (!desc) {
-    return ncclInvalidArgument;
+    NCCL_M2N_FAIL(ncclInvalidArgument, -1, "buildStagingDirectTransferDescriptor: output descriptor must be non-null");
   }
   memset(desc, 0, sizeof(*desc));
 
@@ -463,11 +456,10 @@ ncclResult_t buildStagingDirectTransferDescriptor(ncclComm_t globalComm, void* s
     }
 
     if (targetsTruncated) {
-      RESHARD_WARN(worldRank,
-                   "buildStagingDirectTransferDescriptor: target list truncated "
-                   "(%d / MAX_TARGETS=%d)",
-                   desc->numTargets, MAX_TARGETS);
-      return ncclInvalidArgument;
+      NCCL_M2N_FAIL(ncclInvalidArgument, worldRank,
+                    "buildStagingDirectTransferDescriptor: target list truncated (%d / MAX_TARGETS=%d); increase "
+                    "MAX_TARGETS",
+                    desc->numTargets, MAX_TARGETS);
     }
   }
 
@@ -488,11 +480,10 @@ ncclResult_t buildStagingDirectTransferDescriptor(ncclComm_t globalComm, void* s
         continue;
       }
       if (desc->numSources >= MAX_SOURCES) {
-        RESHARD_WARN(worldRank,
-                     "buildStagingDirectTransferDescriptor: source list truncated "
-                     "(%d / MAX_SOURCES=%d)",
-                     desc->numSources, MAX_SOURCES);
-        return ncclInvalidArgument;
+        NCCL_M2N_FAIL(ncclInvalidArgument, worldRank,
+                      "buildStagingDirectTransferDescriptor: source list truncated (%d / MAX_SOURCES=%d); increase "
+                      "MAX_SOURCES",
+                      desc->numSources, MAX_SOURCES);
       }
 
       int srcRank = getMeshRank(srcTensor, &fullSrcInfo, ss, sourceRep);

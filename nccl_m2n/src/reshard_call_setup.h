@@ -44,11 +44,11 @@ static inline ncclResult_t reshardFixFullyReplicated(ncclMesh_t* mesh,
 static inline ncclResult_t reshardValidateActiveBuffers(const char* apiName, int worldRank,
                                                         const ncclDistTensor_t* src, const ncclDistTensor_t* dst) {
   NCCL_M2N_CHECK_ARG(src != nullptr && dst != nullptr && src->mesh != nullptr && dst->mesh != nullptr, worldRank,
-                     "[%s] tensor descriptors and meshes must be non-null", apiName);
+                     "%s: tensor descriptors and meshes must be non-null", apiName);
   NCCL_M2N_CHECK_ARG(!reshardRankInMesh(src->mesh, worldRank) || src->dataPtr != nullptr, worldRank,
-                     "[%s] src->dataPtr must be non-null on active source rank %d", apiName, worldRank);
+                     "%s: src->dataPtr must be non-null on active source rank %d", apiName, worldRank);
   NCCL_M2N_CHECK_ARG(!reshardRankInMesh(dst->mesh, worldRank) || dst->dataPtr != nullptr, worldRank,
-                     "[%s] dst->dataPtr must be non-null on active destination rank %d", apiName, worldRank);
+                     "%s: dst->dataPtr must be non-null on active destination rank %d", apiName, worldRank);
   return ncclSuccess;
 }
 

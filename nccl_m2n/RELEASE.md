@@ -76,6 +76,9 @@ Existing binaries must be rebuilt against the updated header.
     error return after stream setup.
   - GIN signal counts reject overflow, and signal IDs are relative to the
     source mesh so meshes with a non-zero `startRank` use the allocated range.
+- **Error reporting:**
+  - `ncclM2nGetLastError()` exposes thread-local detail for the most recent M2N
+    failure, and Python exceptions include that detail when available.
 - **Documentation:**
   - Public header comments are now Doxygen-readable and document the handle,
     descriptor, stream, and window contracts in the installed header.

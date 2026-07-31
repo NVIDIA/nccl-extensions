@@ -3967,7 +3967,7 @@ __device__ __forceinline__ bool elect_last_block(const int* counter, int num_blo
 template <
     typename TOKEN_DATA_TYPE,
     typename SCALE_DATA_TYPE,
-    ncclEpDispatchQuantizationRecipe_t kQuantizationRecipe,
+    ncclEpDispQuant_t kRecipe,
     typename GIN_GROUP,
     typename LSA_G2S_GROUP,
     typename LSA_S2G_GROUP,
@@ -3988,8 +3988,7 @@ template <
 __device__ __forceinline__ void dispatch_kernel_impl(
     const dispatch_kernel_param_t<TOKEN_DATA_TYPE, LSA_TEAM_SZ>& param,
     uint8_t* smem_bytes) {
-    static_assert(kQuantizationRecipe == NCCL_EP_DISPATCH_QUANT_NONE ||
-                      kQuantizationRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD,
+    static_assert(kRecipe == NCCL_EP_DISP_QUANT_NONE || kRecipe == NCCL_EP_DISP_QUANT_FWD,
                   "unsupported dispatch quantization recipe");
     // The JIT-selected ScaleT validates the caller's scale element packing.
     static_assert(SF_BYTES_PER_TOKEN == 0 || SF_BYTES_PER_TOKEN % sizeof(SCALE_DATA_TYPE) == 0,
@@ -4085,7 +4084,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     long long _wt_start = 0;
     if (threadIdx.x % 32 == 0) _wt_start = clock64();
 #endif
-    constexpr bool HAS_SF = (kQuantizationRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD);
+    constexpr bool HAS_SF = (kRecipe == NCCL_EP_DISP_QUANT_FWD);
     int threadIdx_x_int = (int)threadIdx.x;
     if (threadIdx_x_int < GIN_GROUP::size()) {
         if constexpr (LSA_TEAMS != 1) {
@@ -4608,7 +4607,7 @@ inline int local_dup_dynamic_smem_bytes(
 }
 
 template <typename T, int HIDDEN_DIM, int PIPE_DEPTH, bool FORWARD_DISPATCH,
-          ncclEpDispatchQuantizationRecipe_t kRecipe = NCCL_EP_DISPATCH_QUANT_NONE>
+          ncclEpDispQuant_t kRecipe = NCCL_EP_DISP_QUANT_NONE>
 __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_param_t<T>& p) {
     // Wait until all peers have signaled S2G completion on this rank's recv buffer.
     // Use >= rather than == so a future code path that overshoots the counter
@@ -4643,7 +4642,7 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
             smem_ptr += prob_bytes;
         }
     }
-    if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+    if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
         for (int s = 0; s < PIPE_DEPTH; ++s) {
             smem_scale[s] = smem_ptr;
             smem_ptr += p.scale_row_bytes;
@@ -4721,7 +4720,7 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
                         prob_bytes,
                         &prod_mbar[stage]);
                 }
-                if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+                if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
                     const uint8_t* src_scale =
                         static_cast<const uint8_t*>(p.expert_output_scale) + static_cast<size_t>(primary_em) * p.scale_row_bytes;
                     cuda::ptx::cp_async_bulk(
@@ -4777,7 +4776,7 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
                             smem_prob[stage],
                             prob_bytes);
                     }
-                    if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+                    if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
                         uint8_t* dst_scale = static_cast<uint8_t*>(p.expert_output_scale) + static_cast<size_t>(sec) * p.scale_row_bytes;
                         cuda::ptx::cp_async_bulk(
                             cuda::ptx::space_global,
@@ -5133,7 +5132,7 @@ struct local_permute_dup_param_t {
 };
 
 template <int HiddenInt4, int HiddenVec,
-          ncclEpDispatchQuantizationRecipe_t kRecipe = NCCL_EP_DISPATCH_QUANT_NONE>
+          ncclEpDispQuant_t kRecipe = NCCL_EP_DISP_QUANT_NONE>
 __device__ __forceinline__ void local_permute_dup(
     uint8_t* __restrict__ recv_x_em,
     float* __restrict__ recv_topk_weights_em,
@@ -5210,7 +5209,7 @@ __device__ __forceinline__ void local_permute_dup(
                     dst_g,
                     reinterpret_cast<uint8_t*>(s_zero),
                     row_bytes);
-                if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+                if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
                     cuda::ptx::cp_async_bulk(
                         cuda::ptx::space_global,
                         cuda::ptx::space_shared,
@@ -5282,7 +5281,7 @@ __device__ __forceinline__ void local_permute_dup(
                 }
             }
 
-            if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+            if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
                 const int scale_row_int4 = scale_row_bytes >> 4;
                 const int4* ssrc =
                     reinterpret_cast<const int4*>(scale_src + static_cast<size_t>(token) * scale_row_bytes);

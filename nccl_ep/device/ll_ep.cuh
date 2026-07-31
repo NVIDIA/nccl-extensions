@@ -103,11 +103,11 @@ __forceinline__ __device__ uint64_t ncclGetP2pPtr(
 // source vector, transport vector, and scale element type together: recipes
 // that use another scale encoding or do value-aware transport must define
 // their own specialization rather than inheriting an unrelated default.
-template <ncclEpDispatchQuantizationRecipe_t kRecipe, typename ScaleT>
+template <ncclEpDispQuant_t kRecipe, typename ScaleT>
 struct DispatchRecipeDeviceTypes;
 
 template <typename ScaleT>
-struct DispatchRecipeDeviceTypes<NCCL_EP_DISPATCH_QUANT_NONE, ScaleT> {
+struct DispatchRecipeDeviceTypes<NCCL_EP_DISP_QUANT_NONE, ScaleT> {
     using source_vec_t = int4;
     using transport_vec_t = int4;
     using scale_t = float;  // Unused: NONE has no scale payload.
@@ -119,7 +119,7 @@ struct DispatchRecipeDeviceTypes<NCCL_EP_DISPATCH_QUANT_NONE, ScaleT> {
 };
 
 template <typename ScaleT>
-struct DispatchRecipeDeviceTypes<NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD, ScaleT> {
+struct DispatchRecipeDeviceTypes<NCCL_EP_DISP_QUANT_FWD, ScaleT> {
     // tensor_hidden is physical width; ncclFloat4x2 tensors are already H/2.
     using source_vec_t = int4;
     using transport_vec_t = int4;
@@ -132,7 +132,7 @@ struct DispatchRecipeDeviceTypes<NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD, ScaleT> 
 };
 
 template <typename ScaleT>
-struct DispatchRecipeDeviceTypes<NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4, ScaleT> {
+struct DispatchRecipeDeviceTypes<NCCL_EP_DISP_QUANT_DS_FP8E3M4, ScaleT> {
     static_assert(std::is_same_v<ScaleT, float>,
                   "DS_FP8E3M4 always generates FP32 inverse scales");
     using source_vec_t = int4;
@@ -146,7 +146,7 @@ struct DispatchRecipeDeviceTypes<NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4, ScaleT> {
     }
 };
 
-template <ncclEpDispatchQuantizationRecipe_t kRecipe, typename ScaleT>
+template <ncclEpDispQuant_t kRecipe, typename ScaleT>
 __forceinline__ __device__ void castAndWriteToSendBuf(
     const typename DispatchRecipeDeviceTypes<kRecipe, ScaleT>::source_vec_t* srcData,
     typename DispatchRecipeDeviceTypes<kRecipe, ScaleT>::transport_vec_t* sendBufVec,
@@ -160,14 +160,14 @@ __forceinline__ __device__ void castAndWriteToSendBuf(
     int scaleBytes = 0) {               // SCALES_FORWARD: total bytes to copy
 
     // Generated and unquantized paths retain their full-warp vector contract.
-    if constexpr (kRecipe != NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+    if constexpr (kRecipe != NCCL_EP_DISP_QUANT_FWD) {
         EP_DEVICE_ASSERT(hiddenBf16Int4 % 32 == 0);
     }
 #pragma unroll
     for (int i = threadId; i < hiddenBf16Int4; i += numThreads) {
-        if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
             sendBufVec[i] = __ldg(srcData + i);
-        } else if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
+        } else if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
             constexpr int kElementsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
             auto dataInt4 = __ldg(srcData + i);
             auto bf16Data = reinterpret_cast<nv_bfloat16*>(&dataInt4);
@@ -202,7 +202,7 @@ __forceinline__ __device__ void castAndWriteToSendBuf(
             sendBufVec[i] = *reinterpret_cast<int4*>(&dataInt4);
         }
     }
-    if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+    if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
         auto* dstBytes = reinterpret_cast<uint8_t*>(sendBufScales);
         for (int i = threadId; i < scaleBytes; i += numThreads) dstBytes[i] = inScales[i];
     }
@@ -224,7 +224,7 @@ __forceinline__ __device__ void castAndWriteToSendBuf(
 //
 // Recipe-defined copies are shared by RDMA and the NVLink direct path.
 // kNvlinkOnly redirects token (and SCALES_FORWARD scale) payloads to peer windows.
-template <ncclEpDispatchQuantizationRecipe_t kRecipe, bool kNvlinkOnly, typename ScaleT>
+template <ncclEpDispQuant_t kRecipe, bool kNvlinkOnly, typename ScaleT>
 __forceinline__ __device__ void sendToken(
     // Local sources.
     const int4* sendDataInt4, // local staging slot base (header + RDMA-path payload).
@@ -286,8 +286,8 @@ __forceinline__ __device__ void sendToken(
         void* payloadDst = dstPayloadSlot;
         void* scalesDst = static_cast<uint8_t*>(dstPayloadSlot) + hiddenBytes;
         if constexpr (kNvlinkOnly &&
-                      (kRecipe == NCCL_EP_DISPATCH_QUANT_NONE ||
-                       kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)) {
+                      (kRecipe == NCCL_EP_DISP_QUANT_NONE ||
+                       kRecipe == NCCL_EP_DISP_QUANT_FWD)) {
             if (recvDataWindow != ncclWindow_t{}) {
                 const size_t recvSlot = static_cast<size_t>(currRank) * maxTokensPerRank + slotIdx;
                 payloadDst = ncclGetPeerPointer(recvDataWindow, recvDataOffset + recvSlot * hiddenBytes, dstRank);
@@ -295,7 +295,7 @@ __forceinline__ __device__ void sendToken(
         }
         auto* dstDataVec = reinterpret_cast<vec_t*>(payloadDst);
         auto* dstScales = reinterpret_cast<typename recipe_types::scale_t*>(scalesDst);
-        if constexpr (kNvlinkOnly && kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        if constexpr (kNvlinkOnly && kRecipe == NCCL_EP_DISP_QUANT_FWD) {
             if (rcvScalesWin != ncclWindow_t{}) {
                 const size_t recvSlot = static_cast<size_t>(currRank) * maxTokensPerRank + slotIdx;
                 dstScales = static_cast<typename recipe_types::scale_t*>(ncclGetPeerPointer(
@@ -306,7 +306,7 @@ __forceinline__ __device__ void sendToken(
         }
         using src_t = const typename recipe_types::source_vec_t*;
         int scaleBytes = 0;
-        if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
             scaleBytes = scalesPerToken * static_cast<int>(sizeof(typename recipe_types::scale_t));
         }
         castAndWriteToSendBuf<kRecipe, ScaleT>(
@@ -540,7 +540,7 @@ __forceinline__ __device__ int waitForRecvTokensRelaxed(
 // per-srcRank region followed by all per-slot payloads. When false, the sender
 // (a cross-LSA RDMA peer) used the legacy interleaved layout where each
 // per-slot message is [hdr | data | scales].
-template <ncclEpDispatchQuantizationRecipe_t kRecipe, typename ScaleT>
+template <ncclEpDispQuant_t kRecipe, typename ScaleT>
 __forceinline__ __device__ void copyRecvTokenData(
     const uint8_t* recvBufUint8,
     int recvIdx,
@@ -576,7 +576,7 @@ __forceinline__ __device__ void copyRecvTokenData(
         UNROLLED_WARP_COPY(7, laneId, hiddenInt4, outDataInt4Ptr, recvDataInt4, ld_nc_global, st_na_global);
     }
 
-    if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+    if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
         if (!copyScales) return;
         // Forward user-provided scales as opaque aligned bytes.
         const int scaleInt4 = scaleBytes / sizeof(int4);
@@ -586,7 +586,7 @@ __forceinline__ __device__ void copyRecvTokenData(
         for (int scaleIdx = laneId; scaleIdx < scaleInt4; scaleIdx += 32) {
             st_na_global(outScalesInt4 + scaleIdx, ld_nc_global(recvScalesInt4 + scaleIdx));
         }
-    } else if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
+    } else if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
         if (!copyScales) return;
         using scale_t = typename DispatchRecipeDeviceTypes<kRecipe, ScaleT>::scale_t;
         const int numScales = scaleBytes / sizeof(scale_t);
@@ -602,7 +602,7 @@ __forceinline__ __device__ void copyRecvTokenData(
 // Templated on the wire dtype (kTokenDtype) like combine/HT. All element widths come
 // from size_u8<kTokenDtype>(); the read stride is the input element width whether or
 // not the output is FP8 (so FP32-input quantization reads the correct stride too).
-template <ncclEpDispatchQuantizationRecipe_t kRecipe, int kHidden, ncclEpLayout_t kLayout, bool kNvlinkOnly,
+template <ncclEpDispQuant_t kRecipe, int kHidden, ncclEpLayout_t kLayout, bool kNvlinkOnly,
           typename TopkIdxT, ncclDataType_t kTokenDtype, typename ScaleT>
 __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
   const void* inData,
@@ -636,9 +636,9 @@ __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
 
     using recipe_types = DispatchRecipeDeviceTypes<kRecipe, ScaleT>;
     using scale_t = typename recipe_types::scale_t;
-    const int numScales = kRecipe == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4
+    const int numScales = kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4
         ? kHidden / kDsFp8E3M4ElementsPerScale
-        : (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) ? scalesPerToken : 0;
+        : (kRecipe == NCCL_EP_DISP_QUANT_FWD) ? scalesPerToken : 0;
     const size_t hiddenBytes = recipe_types::template token_payload_bytes<kTokenDtype>(kHidden);
     const size_t hiddenInt4 = hiddenBytes / sizeof(int4);
 
@@ -647,8 +647,8 @@ __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
     using vec_t = typename recipe_types::transport_vec_t;
     const size_t dispatch_hdr_sz = get_dispatch_hdr_sz<kLayout>(numTopk);
     constexpr bool kHasScalePayload =
-        kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD ||
-        kRecipe == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4;
+        kRecipe == NCCL_EP_DISP_QUANT_FWD ||
+        kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
     const int scaleBytes = kHasScalePayload ? static_cast<int>(numScales * sizeof(scale_t)) : 0;
     const size_t payloadBytes = hiddenBytes + scaleBytes;
     const size_t numBytesPerMsg = dispatch_hdr_sz + payloadBytes;
@@ -668,10 +668,10 @@ __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
     if (warpId < numWarps - 1) {
         // SCALES_FORWARD reads raw wire payloads as aligned int4 vectors.
         constexpr int kNumElemsPerRead = sizeof(int4) / size_u8<kTokenDtype>();
-        if constexpr (kRecipe != NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD) {
+        if constexpr (kRecipe != NCCL_EP_DISP_QUANT_FWD) {
             EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerRead) == 0, "Invalid hidden");
         }
-        if constexpr (kRecipe == NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4) {
+        if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
             EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kDsFp8E3M4ElementsPerScale == 0,
                              "Invalid DS_FP8E3M4 vectorization");
         }
@@ -689,7 +689,7 @@ __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
             // The JIT-selected dtype determines the physical int4 row stride.
             const auto srcDataInt4 = static_cast<const int4*>(inData) + tokenIdx * hiddenBf16Int4;
             const uint8_t* inScalesTok =
-                (kRecipe == NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD)
+                (kRecipe == NCCL_EP_DISP_QUANT_FWD)
                                              ? inScalesBuf +
                                                    static_cast<size_t>(tokenIdx) * scalesPerToken * sizeof(scale_t)
                                              : nullptr;
@@ -1112,7 +1112,7 @@ LOW_LATENCY_DISPATCH_RECV:
                 const bool scalesDirect = kNvlinkOnly && rcvScalesWin != ncclWindow_t{};
                 const bool copyData = !tokenDirect;
                 const bool copyScales =
-                    kRecipe != NCCL_EP_DISPATCH_QUANT_NONE && !scalesDirect;
+                    kRecipe != NCCL_EP_DISP_QUANT_NONE && !scalesDirect;
                 if (copyData || copyScales) {
                     copyRecvTokenData<kRecipe, ScaleT>(
                         recvBufUint8,

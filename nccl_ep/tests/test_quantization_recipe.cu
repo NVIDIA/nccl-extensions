@@ -77,7 +77,7 @@ static void expect_invalid_misaligned_recipe_storage(
     inputs.scales = &scales.tensor;
     outputs.tokens = &output_tokens.tensor;
     outputs.scales = &output_scales.tensor;
-    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
     EXPECT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclInvalidArgument);
 }
 
@@ -106,7 +106,7 @@ static void expect_invalid_ht_scales_forward_output(
     outputs.scales = &output_scales.tensor;
     outputs.topk_weights = &output_topk_weights.tensor;
     outputs.topk_idx = &output_topk_idx.tensor;
-    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
     EXPECT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclInvalidArgument);
 }
 
@@ -147,7 +147,7 @@ TEST_F(QuantizationRecipeTest, ScalesForwardResolverAcceptsBf16TokenWire) {
     nccl_ep::DispatchKernelSpec spec{};
     EXPECT_EQ(
         nccl_ep::resolveDispatchKernelSpec(
-            NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD, ncclBfloat16, ncclFloat32, &spec),
+            NCCL_EP_DISP_QUANT_FWD, ncclBfloat16, ncclFloat32, &spec),
         ncclSuccess);
     EXPECT_EQ(spec.wire_token_dtype, ncclBfloat16);
     EXPECT_EQ(spec.payload_bytes, sizeof(uint16_t));
@@ -225,7 +225,7 @@ TEST_F(QuantizationRecipeTest, ScalesForwardDispatchCompletes) {
     outputs.scales = recv_scales;
     outputs.topk_weights = recv_topk_weights;
     outputs.topk_idx = recv_topk_idx;
-    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
 
     ncclEpHandle_t handle = make_handle(nullptr);
     ASSERT_NE(handle, nullptr);
@@ -325,7 +325,7 @@ TEST_F(QuantizationRecipeTest, DsFp8E3M4DispatchCompletes) {
     outputs.tokens = recv_tokens;
     outputs.scales = recv_scales;
     layout_info.expert_counters = expert_counters;
-    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_DS_FP8E3M4;
 
     EXPECT_EQ(ncclEpDispatch(handle, &inputs, &outputs, &layout_info, &config, g_stream), ncclSuccess);
     EXPECT_EQ(ncclEpComplete(handle, nullptr, g_stream), ncclSuccess);
@@ -430,7 +430,7 @@ TEST_F(QuantizationRecipeTest, ScalesForwardDispatchPreservesPackedFp4Bytes) {
     outputs.tokens = recv_tokens;
     outputs.scales = recv_scales;
     layout_info.expert_counters = expert_counters;
-    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
 
     EXPECT_EQ(ncclEpDispatch(handle, &inputs, &outputs, &layout_info, &config, g_stream), ncclSuccess);
     EXPECT_EQ(ncclEpComplete(handle, nullptr, g_stream), ncclSuccess);
@@ -635,7 +635,7 @@ static void run_ht_expert_major_scales_forward_packed_fp4(
     outputs.tokens = recv_tokens;
     outputs.scales = recv_scales;
     outputs.topk_weights = recv_topk_weights;
-    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
 
     std::vector<uint8_t> h_recv_tokens(static_cast<size_t>(kOutputRows) * kPackedHidden);
     std::vector<uint8_t> h_recv_scales(static_cast<size_t>(kOutputRows) * kScaleBytes);
@@ -782,7 +782,7 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRequiresInputAndOutputScales) {
     ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
     ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
     ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
-    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
     inputs.tokens = &tokens.tensor;
     ncclEpHandle_t handle = make_handle(nullptr);
     EXPECT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclInvalidArgument);
@@ -797,7 +797,7 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUint8TokenDtype) {
     ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
     ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
     ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
-    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
     inputs.tokens = &tokens.tensor;
     inputs.scales = &input_scales.tensor;
     outputs.tokens = &output_tokens.tensor;
@@ -815,7 +815,7 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRejectsMismatchedScaleDtype) {
     ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
     ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
     ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
-    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
     inputs.tokens = &tokens.tensor;
     inputs.scales = &input_scales.tensor;
     outputs.tokens = &output_tokens.tensor;
@@ -835,7 +835,7 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUnalignedTokenRow) {
     ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
     ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
     ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
-    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
     inputs.tokens = &tokens.tensor;
     inputs.scales = &input_scales.tensor;
     outputs.tokens = &output_tokens.tensor;
@@ -853,7 +853,7 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUnalignedScaleRow) {
     ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
     ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
     ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
-    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
     inputs.tokens = &tokens.tensor;
     inputs.scales = &input_scales.tensor;
     outputs.tokens = &output_tokens.tensor;
@@ -875,7 +875,7 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRejectsPayloadAboveGroupByteLimit) {
     inputs.scales = &input_scales.tensor;
     outputs.tokens = &output_tokens.tensor;
     outputs.scales = &output_scales.tensor;
-    config.quantization_recipe = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
     ncclEpHandle_t handle = make_handle(nullptr);
     EXPECT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclInvalidArgument);
     NCCL_ASSERT(ncclEpHandleDestroy(handle));

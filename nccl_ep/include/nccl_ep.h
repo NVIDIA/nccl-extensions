@@ -768,16 +768,16 @@ ncclResult_t ncclEpUpdateHandle(
 // New recipes must document their HT and LL semantics here, including any
 // algorithm-specific support restrictions.
 typedef enum {
-    NCCL_EP_DISPATCH_QUANT_NONE = 0,
-    NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD = 1,
-    NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4 = 2,
-} ncclEpDispatchQuantizationRecipe_t;
+    NCCL_EP_DISP_QUANT_NONE = 0,
+    NCCL_EP_DISP_QUANT_FWD = 1,
+    NCCL_EP_DISP_QUANT_DS_FP8E3M4 = 2,
+} ncclEpDispQuant_t;
 
 typedef enum {
     // Combine currently supports only unquantized token transport. Future
     // recipes must document their HT and LL semantics alongside dispatch.
-    NCCL_EP_COMBINE_QUANT_NONE = 0,
-} ncclEpCombineQuantizationRecipe_t;
+    NCCL_EP_COMB_QUANT_NONE = 0,
+} ncclEpCombQuant_t;
 
 // EP dispatch configuration structure
 typedef struct {
@@ -790,7 +790,7 @@ typedef struct {
   //   FWD requires inputs->topk_weights; BWD forbids it and forbids
   //   outputs->topk_weights / outputs->topk_idx.
     // New fields must be appended here to keep existing field offsets stable for ABI compatibility.
-    ncclEpDispatchQuantizationRecipe_t quantization_recipe; // NONE by default; selects the required scale tensors
+    ncclEpDispQuant_t quant_recipe; // NONE by default; selects the required scale tensors
 } ncclEpDispatchConfig_t;
 
 #define NCCL_EP_DISPATCH_CONFIG_INIT \
@@ -800,7 +800,7 @@ typedef struct {
 
 #define NCCL_EP_DISPATCH_CONFIG_V1_LAST_FIELD pass_direction
 #define NCCL_EP_DISPATCH_CONFIG_V1_SIZE 20u
-#define NCCL_EP_DISPATCH_CONFIG_V2_LAST_FIELD quantization_recipe
+#define NCCL_EP_DISPATCH_CONFIG_V2_LAST_FIELD quant_recipe
 #define NCCL_EP_DISPATCH_CONFIG_V2_SIZE 24u
 
 #define NCCL_EP_DISPATCH_CONFIG_CURRENT_VERSION 2
@@ -893,7 +893,7 @@ typedef struct {
     //   FWD forbids inputs->topk_weights; BWD requires inputs->topk_weights
     //   and outputs->topk_weights.
     // New fields must be appended here to keep existing field offsets stable for ABI compatibility.
-    ncclEpCombineQuantizationRecipe_t quantization_recipe; // NONE by default; reserved recipes validate future combine support
+    ncclEpCombQuant_t quant_recipe; // NONE by default; reserved recipes validate future combine support
 } ncclEpCombineConfig_t;
 
 #define NCCL_EP_COMBINE_CONFIG_INIT \
@@ -903,7 +903,7 @@ typedef struct {
 
 #define NCCL_EP_COMBINE_CONFIG_V1_LAST_FIELD pass_direction
 #define NCCL_EP_COMBINE_CONFIG_V1_SIZE 16u
-#define NCCL_EP_COMBINE_CONFIG_V2_LAST_FIELD quantization_recipe
+#define NCCL_EP_COMBINE_CONFIG_V2_LAST_FIELD quant_recipe
 #define NCCL_EP_COMBINE_CONFIG_V2_SIZE 20u
 
 #define NCCL_EP_COMBINE_CONFIG_CURRENT_VERSION 2

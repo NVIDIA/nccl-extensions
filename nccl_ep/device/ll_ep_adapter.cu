@@ -32,7 +32,7 @@ using ::nccl_ep::ceil_div;
 // ============================================================================
 ncclResult_t call_dispatch(
     const DispatchParams& params,
-    ncclEpDispatchQuantizationRecipe_t quantization_recipe,
+    ncclEpDispQuant_t recipe,
     cudaStream_t stream) {
     constexpr int kNumMaxTopK = 9;
     const int numWarpGroups = ceil_div(params.numExperts, params.numDeviceSms);
@@ -100,7 +100,7 @@ ncclResult_t call_dispatch(
 
     DispatchKernelSpec kernel_spec;
     ncclResult_t r = resolveDispatchKernelSpec(
-        quantization_recipe, params.tokenDtype, params.scaleDtype, &kernel_spec);
+        recipe, params.tokenDtype, params.scaleDtype, &kernel_spec);
     if (r != ncclSuccess) {
         return r;
     }

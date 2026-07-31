@@ -1187,7 +1187,7 @@ ncclResult_t call_dispatch(
     int max_dispatch_tokens_per_rank,
     int num_tokens_per_chunk,
     int num_lsa_teams,
-    ncclEpDispatchQuantizationRecipe_t quantization_recipe,
+    ncclEpDispQuant_t recipe,
     ncclEpPassDir_t pass_direction,
     int num_blocks,
     int sf_bytes_per_token,
@@ -1195,7 +1195,7 @@ ncclResult_t call_dispatch(
     cudaStream_t stream,
     ncclDataType_t token_dtype) {
     DispatchKernelSpec kernel_spec;
-    if (ncclResult_t r = resolveDispatchKernelSpec(quantization_recipe, token_dtype, params.scale_dtype, &kernel_spec);
+    if (ncclResult_t r = resolveDispatchKernelSpec(recipe, token_dtype, params.scale_dtype, &kernel_spec);
         r != ncclSuccess) {
         return r;
     }
@@ -1474,7 +1474,7 @@ void call_local_dup(
     int num_blocks,
     cudaStream_t stream,
     ncclDataType_t token_dtype,
-    ncclEpDispatchQuantizationRecipe_t recipe,
+    ncclEpDispQuant_t recipe,
     void* expert_output_scale,
     int scale_row_bytes) {
     constexpr int kPipeDepth = NCCL_EP_HT_LOCAL_DUP_PIPE_DEPTH;
@@ -1605,7 +1605,7 @@ void launch_dispatch_permute(
     unsigned int shuffle_sms,
     int caller_num_recv_tokens,
     cudaStream_t stream,
-    ncclEpDispatchQuantizationRecipe_t recipe,
+    ncclEpDispQuant_t recipe,
     void* recv_scales_em,
     const void* flat_scale_staging,
     int scale_row_bytes) {

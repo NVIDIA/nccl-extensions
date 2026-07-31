@@ -8,7 +8,7 @@
 
 #include <nccl.h>
 #include "ep_enums.h"
-#include "nccl_ep.h"  // ncclEpDispatchQuantizationRecipe_t (host-only helper; not JIT-included)
+#include "nccl_ep.h"  // ncclEpDispQuant_t (host-only helper; not JIT-included)
 
 #include <cstdio>
 #include <cstdlib>
@@ -104,14 +104,14 @@ inline const char* layout_name_tag(ncclEpLayout_t layout) {
     }
 }
 
-// ncclEpDispatchQuantizationRecipe_t -> enumerator name for the kDispatchRecipe
+// ncclEpDispQuant_t -> enumerator name for the kDispatchRecipe
 // template argument emitted into the HT dispatch JIT source.
-inline const char* dispatch_recipe_literal(ncclEpDispatchQuantizationRecipe_t recipe) {
+inline const char* dispatch_recipe_literal(ncclEpDispQuant_t recipe) {
     switch (recipe) {
-    case NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD:
-        return "NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD";
+    case NCCL_EP_DISP_QUANT_FWD:
+        return "NCCL_EP_DISP_QUANT_FWD";
     default:
-        return "NCCL_EP_DISPATCH_QUANT_NONE";
+        return "NCCL_EP_DISP_QUANT_NONE";
     }
 }
 

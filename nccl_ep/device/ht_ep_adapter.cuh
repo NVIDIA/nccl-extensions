@@ -256,7 +256,7 @@ void launch_dispatch_permute(
     unsigned int shuffle_sms,
     int caller_num_recv_tokens,
     cudaStream_t stream,
-    ncclEpDispatchQuantizationRecipe_t recipe,
+    ncclEpDispQuant_t recipe,
     void* recv_scales_em,
     const void* flat_scale_staging,
     int scale_row_bytes);
@@ -385,7 +385,7 @@ ncclResult_t call_dispatch(
     int max_dispatch_tokens_per_rank, // Max tokens for buffer sizing (chunk-aligned)
     int num_tokens_per_chunk, // Dispatch/combine tokens per chunk (resolved per group)
     int num_lsa_teams, // Number of LSA teams (RDMA domain size)
-    ncclEpDispatchQuantizationRecipe_t quantization_recipe,
+    ncclEpDispQuant_t recipe,
     ncclEpPassDir_t pass_direction,
     int num_blocks, // Number of SMs/blocks for the kernel grid
     int sf_bytes_per_token, // Total scale bytes per token (pre-computed on host)
@@ -490,7 +490,7 @@ void call_local_dup(
     int num_blocks,
     cudaStream_t stream,
     ncclDataType_t token_dtype,
-    ncclEpDispatchQuantizationRecipe_t recipe,
+    ncclEpDispQuant_t recipe,
     void* expert_output_scale,
     int scale_row_bytes);
 

@@ -16,7 +16,7 @@
 // 4-bit floating-point values. The NCCL version used to build this library
 // may not expose the enumerator yet, and NCCL collectives do not support it.
 // Define the matching value here so EP can use it solely for its byte-copy
-// SCALES_FORWARD recipe. This also works with a newer NCCL header, where it
+// QUANT_FWD recipe. This also works with a newer NCCL header, where it
 // expands to that same reserved enum value.
 #ifndef ncclFloat4x2
 #define ncclFloat4x2 ((ncclDataType_t)12)
@@ -281,7 +281,7 @@ typedef struct {
     //   LL: unused. LL buffers are always sized automatically, pass NCCL_EP_AUTO.
     unsigned int max_recv_tokens_per_rank;
     // Upper bound on token-row bytes per token, covering both dispatch and combine.
-    // SCALES_FORWARD scale rows have the same independent byte bound; LL requires
+    // QUANT_FWD scale rows have the same independent byte bound; LL requires
     // their combined message payload to fit. Per-call sizes flow through the
     // tensors and may be smaller; this is byte-oriented.
     // HT requires this configured upper bound to be a multiple of 16 bytes.
@@ -321,7 +321,7 @@ typedef struct {
     // AUTO and OFF keep staging available, while compatible window-backed
     // tensors may still use direct paths. ON requires HT dispatch-output and
     // combine-input token windows. LL supports direct dispatch output and,
-    // for SCALES_FORWARD, can directly write either or both output payloads.
+    // for QUANT_FWD, can directly write either or both output payloads.
     ncclEpZeroCopyMode_t zero_copy;
     // Policy on recv overflow (HT only). Zero-init default = NCCL_EP_OVERFLOW_AUTO
     // (resolves to TRAP). NCCL_EP_OVERFLOW_DROP drops overflowing tokens and continues.
@@ -436,7 +436,7 @@ typedef struct {
     ncclEpTensor_t* topk_weights; // optional; 2D [num_tokens, top_k], ncclFloat32
   //   LL rank-major: per-token routing weights
   //   HT forward: routing weights (topk_idx taken from handle)
-    ncclEpTensor_t* scales;       // required by SCALES_FORWARD; caller-provided scales are forwarded
+    ncclEpTensor_t* scales;       // required by QUANT_FWD; caller-provided scales are forwarded
                                   // without conversion (see the recipe contract below)
 } ncclEpDispatchInputs_t;
 
@@ -742,8 +742,10 @@ ncclResult_t ncclEpUpdateHandle(
 // NONE: the token tensor is transported in its declared dtype. Both scales
 // tensors must be absent.
 //
-// SCALES_FORWARD: inputs->tokens and inputs->scales are 2D tensors of FP32,
-// FP16, BF16, FP8, or (for tokens only) ncclFloat4x2. Scales may additionally
+// QUANT_FWD ("FWD" = the scales are forwarded, i.e. transported as-is rather
+// than generated; it is unrelated to the config's FWD/BWD pass_direction, and
+// applies to both passes): inputs->tokens and inputs->scales are 2D tensors of
+// FP32, FP16, BF16, FP8, or (for tokens only) ncclFloat4x2. Scales may additionally
 // use ncclUint8 raw byte storage. Their physical bytes are forwarded without
 // conversion. Output dtypes and physical row widths must match their respective
 // inputs, round_scales must be zero, and token/scale rows plus their storage
@@ -758,7 +760,8 @@ ncclResult_t ncclEpUpdateHandle(
 // HT outputs are 2D and impose a both-or-neither window rule; expert-major
 // permutation may stage before writing those windows.
 //
-// DS_FP8E3M4: LL-only internal quantization. The caller supplies BF16 tokens;
+// DS_FP8E3M4 ("DS" = DeepSeek, whose FP8 recipe this reproduces): LL-only
+// internal quantization. The caller supplies BF16 tokens;
 // dispatch emits E4M3 token bytes and generated FP32 scales, one per 128 token
 // elements. The hidden dimension must be divisible by 512 so the quantized
 // payload is 16-byte aligned. inputs->scales must be absent and outputs->scales

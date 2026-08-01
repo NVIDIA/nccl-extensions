@@ -118,7 +118,7 @@ run_ep_bench_layout_size_sweep low-latency em rm
 # not the size axis — already swept above).
 run_ep_bench_variants low-latency 128
 
-# SCALES_FORWARD preserves both tensor dtypes. Smoke the one-byte, packed-FP4,
+# QUANT_FWD preserves both tensor dtypes. Smoke the one-byte, packed-FP4,
 # multi-byte, and LL rank-major zero-copy paths; unit tests carry a broader dtype matrix.
 run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
   --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 \

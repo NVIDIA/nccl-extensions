@@ -158,7 +158,7 @@ typedef enum {
 //   AUTO -- keep staging available and use compatible tensor windows opportunistically.
 //   OFF  -- keep staging available; compatible tensor windows may still be used directly.
 //   ON   -- require windows for supported direct paths and elide their staging; LL combine
-//           remains staged. SCALES_FORWARD dispatch requires paired token and scale windows.
+//           remains staged. QUANT_FWD dispatch requires paired token and scale windows.
 typedef enum {
     NCCL_EP_ZERO_COPY_AUTO = NCCL_EP_AUTO,
     NCCL_EP_ZERO_COPY_OFF,

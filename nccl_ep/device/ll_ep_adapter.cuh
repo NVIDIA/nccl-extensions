@@ -34,7 +34,7 @@ namespace ll {
 struct dispatch_kernel_args_t {
     // INPUT
     const void* inData;
-    const void* inScalesBuf;      // non-null for SCALES_FORWARD; runtime-typed storage
+    const void* inScalesBuf;      // non-null for QUANT_FWD; runtime-typed storage
     const void* inTopkIdx;        // cast to const TopkIdxT* by the JIT entry
     const float* inTopkWeights;
     int* rankMask;
@@ -154,12 +154,12 @@ struct clean_low_latency_buffer_kernel_args_t {
 struct DispatchParams {
     // User inputs
     const void* inData;
-    const void* inScalesBuf = nullptr;     // non-null for SCALES_FORWARD; runtime-typed storage
+    const void* inScalesBuf = nullptr;     // non-null for QUANT_FWD; runtime-typed storage
     const void* inTopkIdx;                  // int32_t* or int64_t*; see topkIdxIsInt64
     bool topkIdxIsInt64 = true;             // selects the TopkIdxT kernel specialization
     // Derived from inputs->scales->sizes[1] by ncclEpDispatch.
     int scalesPerToken = 0;
-    ncclDataType_t scaleDtype;              // SCALES_FORWARD tensor dtype; selects ScaleT in JIT
+    ncclDataType_t scaleDtype;              // QUANT_FWD tensor dtype; selects ScaleT in JIT
     const float* inTopkWeights;
 
     // User / pre-allocated output buffers
@@ -216,7 +216,7 @@ struct DispatchParams {
     int phases = 0;
 
     // Zero-copy dispatch output (rank-major + nvlinkOnly). Each supplied
-    // token or SCALES_FORWARD scale window is written directly to its peer output.
+    // token or QUANT_FWD scale window is written directly to its peer output.
     ncclWindow_t recvDataWindow = ncclWindow_t{};
     size_t recvDataOffset = 0;
     ncclWindow_t rcvScalesWin = ncclWindow_t{};

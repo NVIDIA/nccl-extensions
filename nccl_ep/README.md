@@ -371,7 +371,7 @@ typedef struct {
     unsigned int max_recv_tokens_per_rank;      // Max tokens any single rank receives
                                                 //   HT: required (must be >= max_dispatch_tokens_per_rank)
                                                 //   LL: unused (buffers always sized automatically); pass NCCL_EP_AUTO
-    unsigned int max_token_bytes;               // Max token-row bytes; LL SCALES_FORWARD also bounds token+scale payload
+    unsigned int max_token_bytes;               // Max token-row bytes; LL QUANT_FWD also bounds token+scale payload
     unsigned long int rdma_buffer_size;         // RDMA buffer size for LL mode.
                                                 //   NCCL_EP_AUTO  → lazy: allocate on first ncclEpInitHandle, sized to that
                                                 //                  handle's actual (layout, num_topk); collective re-grow

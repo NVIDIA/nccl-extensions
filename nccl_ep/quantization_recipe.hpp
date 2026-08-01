@@ -95,7 +95,7 @@ inline ncclResult_t resolveDispatchKernelSpec(
                 case ncclFloat8e5m2: spec->scale_type_literal = "__nv_fp8_e5m2"; spec->scale_cache_tag = "e5m2"; break;
                 case ncclUint8: spec->scale_type_literal = "uint8_t"; spec->scale_cache_tag = "u8"; break;
                 default:
-                    std::fprintf(stderr, "NCCL EP warning: SCALES_FORWARD cannot use scale dtype %d\n",
+                    std::fprintf(stderr, "NCCL EP warning: QUANT_FWD cannot use scale dtype %d\n",
                                  static_cast<int>(scale_dtype));
                     return ncclInvalidArgument;
             }

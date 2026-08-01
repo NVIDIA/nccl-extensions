@@ -323,14 +323,14 @@ struct DispatchParams {
     int lsa_team_size; // Ranks per LSA (NVLink) team
     const void* attn_input_token;
     const float* attn_input_prob; // Forward dispatch only
-    const void* attn_input_scaling_factor;     // SCALES_FORWARD input; runtime-typed storage
-    ncclDataType_t scale_dtype;                // SCALES_FORWARD tensor dtype; selects ScaleT in JIT
+    const void* attn_input_scaling_factor;     // QUANT_FWD input; runtime-typed storage
+    ncclDataType_t scale_dtype;                // QUANT_FWD tensor dtype; selects ScaleT in JIT
 
     // IPC-mapped output buffers (from ep_group)
     // Pointer tables are expected to be device-resident (d_* arrays).
     void* const* expert_output_token_ptrs; // Array[lsa_team_size]
     float* const* expert_output_prob_ptrs; // Forward only
-    void* const* expert_output_scaling_factor_ptrs;    // SCALES_FORWARD outputs; runtime-typed storage
+    void* const* expert_output_scaling_factor_ptrs;    // QUANT_FWD outputs; runtime-typed storage
 
     // Metadata (from handle->ht preprocessing outputs)
     const bool* rdma_to_attn_map;

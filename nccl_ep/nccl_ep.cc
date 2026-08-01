@@ -131,7 +131,7 @@ static T epDecodeStruct(const T* source, T defaults) {
     return decoded;
 }
 
-// SCALES_FORWARD has no fixed scale block size. Reserve the complete
+// QUANT_FWD has no fixed scale block size. Reserve the complete
 // byte budget so any validated caller-provided scale row fits; this is the
 // byte-equivalent of the former FP32-element reservation.
 static inline size_t maxForwardedScaleBytesPerToken(size_t max_token_bytes) {
@@ -199,7 +199,7 @@ static size_t ncclTypeSize(ncclDataType_t nccl_type) {
     }
 }
 
-// SCALES_FORWARD accepts byte-preserving raw wire dtypes.
+// QUANT_FWD accepts byte-preserving raw wire dtypes.
 static bool validate_dtype(ncclDataType_t dt) {
     return dt == ncclBfloat16 || dt == ncclFloat16 || dt == ncclFloat32;
 }
@@ -383,7 +383,7 @@ static ncclResult_t validateDispatchRecipe(
             }
             const size_t token_bytes = tokens->sizes[1] * ncclTypeSize(tokens->datatype);
             if (token_bytes == 0 || token_bytes % sizeof(int4) != 0) {
-                return fail("SCALES_FORWARD token rows must be 16-byte aligned for int4 transport");
+                return fail("QUANT_FWD token rows must be 16-byte aligned for int4 transport");
             }
             if (input_scales == nullptr) {
                 return fail("inputs->scales is required");
@@ -818,7 +818,7 @@ struct ncclEpGroup {
     // These are pre-registered with GIN to avoid ~60ms registration overhead during dispatch
         void* token_staging_buffer; // Pre-registered staging buffer for user tokens
         float* dense_prob_buffer; // Pre-registered buffer for sparse→dense prob conversion
-        void* scaling_factor_staging_buffer; // Pre-registered SCALES_FORWARD storage
+        void* scaling_factor_staging_buffer; // Pre-registered QUANT_FWD storage
 
     // Group-scoped routing bitmap; shared by all handles on this group.
         uint8_t* global_routing_map = nullptr;
@@ -830,7 +830,7 @@ struct ncclEpGroup {
         ncclWindow_t intranode_mega_window = {};
         size_t ipc_dispatch_token_offset = 0;
         size_t ipc_dispatch_prob_offset = 0;
-        size_t ipc_dispatch_scaling_factor_offset = 0;  // SCALES_FORWARD per-block output-scales region in the mega buffer
+        size_t ipc_dispatch_scaling_factor_offset = 0;  // QUANT_FWD per-block output-scales region in the mega buffer
         size_t ipc_combine_token_offset = 0;
         size_t ipc_combine_prob_offset = 0;
 
@@ -1010,7 +1010,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     size_t expert_input_token_sz = token_staging_slots * max_token_bytes;
     size_t expert_input_prob_sz = max_output_slots * num_local_experts * lsa_ranks * sizeof(float);
 
-    // Output scale byte storage, sized for the largest SCALES_FORWARD row that
+    // Output scale byte storage, sized for the largest QUANT_FWD row that
     // the group's token-byte budget permits.
     size_t expert_output_scaling_factor_sz =
         max_output_slots * maxForwardedScaleBytesPerToken(max_token_bytes);
@@ -1035,7 +1035,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     ep_group->ht_buffers.ipc_dispatch_prob_offset = dispatch_token_aligned;
     ep_group->ht_buffers.expert_output_prob = reinterpret_cast<float*>(mega_base + dispatch_token_aligned);
 
-    // SCALES_FORWARD output-scales region (after token+prob; shifts combine offsets by dispatch_sf_aligned).
+    // QUANT_FWD output-scales region (after token+prob; shifts combine offsets by dispatch_sf_aligned).
     ep_group->ht_buffers.ipc_dispatch_scaling_factor_offset = dispatch_token_aligned + dispatch_prob_aligned;
     ep_group->ht_buffers.expert_output_scaling_factor =
         mega_base + dispatch_token_aligned + dispatch_prob_aligned;
@@ -3246,7 +3246,7 @@ ncclResult_t ncclEpDispatch(
         assert(x->ndim == 2);
         assert(x->sizes[0] == handle->num_tokens);
         assert(x->sizes[0] <= group->config.max_dispatch_tokens_per_rank);
-        // SCALES_FORWARD transports the physical byte row. Multi-byte wire
+        // QUANT_FWD transports the physical byte row. Multi-byte wire
         // dtypes therefore need byte, rather than element-count, alignment.
         if (recipe == NCCL_EP_DISP_QUANT_FWD) {
             assert((x->sizes[1] * ncclTypeSize(x->datatype)) % sizeof(int4) == 0);
@@ -3580,7 +3580,7 @@ ncclResult_t ncclEpDispatch(
                 &scales));
         }
 
-        // For SCALES_FORWARD: copy user scales to the pre-registered staging buffer.
+        // For QUANT_FWD: copy user scales to the pre-registered staging buffer.
         void* scales_ptr = recipe == NCCL_EP_DISP_QUANT_FWD ? scales->data : nullptr;
         const bool scales_uses_external_window =
             recipe == NCCL_EP_DISP_QUANT_FWD && tensorUsesExternalWindow(group, scales);
@@ -4064,7 +4064,7 @@ ncclResult_t ncclEpDispatch(
             if (recipe == NCCL_EP_DISP_QUANT_NONE) {
                 if (!validate_dtype(recv_x->datatype)) {
                     // local_permute_dup is a byte-relocation kernel: any NONE-mode wire
-                    // dtype (bf16/fp16/fp32) works; SCALES_FORWARD rows are 1B (fp8) or
+                    // dtype (bf16/fp16/fp32) works; QUANT_FWD rows are 1B (fp8) or
                     // 4B (fp32) and relocate the same way via row_bytes.
                     return ncclInvalidArgument;
                 }
@@ -4073,7 +4073,7 @@ ncclResult_t ncclEpDispatch(
             if (row_bytes <= 0 || (row_bytes % 16) != 0) {
                 return ncclInvalidArgument; // int4-vectorized row copy requires 16B-aligned row
             }
-            // SCALES_FORWARD: relocate the FLAT scale rows into EM order alongside the
+            // QUANT_FWD: relocate the FLAT scale rows into EM order alongside the
             // tokens (replaces the straight FLAT->caller scale copy below).
             void* perm_recv_scales_em = nullptr;
             const void* perm_flat_scale_staging = nullptr;
@@ -4110,7 +4110,7 @@ ncclResult_t ncclEpDispatch(
                 perm_scale_row_bytes);
         }
 
-        // SCALES_FORWARD output scales (async D2D, sized by caller). On the EM-permute
+        // QUANT_FWD output scales (async D2D, sized by caller). On the EM-permute
         // path the scales are already relocated into EM order by local_permute_dup above.
         if (recipe == NCCL_EP_DISP_QUANT_FWD && !em_permute_active) {
             assert(recv_scales->ndim == 2);

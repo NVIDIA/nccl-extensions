@@ -620,7 +620,7 @@ static void setupLowLatencyTensorsRankMajLayout(
 
     // Optionally window-back the dispatch output tokens to exercise the LL
     // rank-major zero-copy dispatch path (sender writes payload directly to
-    // peer's recv_x via P2P; SCALES_FORWARD also windows output scales).
+    // peer's recv_x via P2P; QUANT_FWD also windows output scales).
     NCCLCHECK(epMakeTensor(
         &dispatch_outputs.tokens,
         3,
@@ -897,7 +897,7 @@ static const int TOKEN_ID_COLS = 128;
 static constexpr unsigned DS_FP8E3M4_ELEMENTS_PER_SCALE = 128;
 static const unsigned PACKED_FP4_ELEMENTS_PER_SCALE = 16;
 
-// --mxfp8 overrides the SCALES_FORWARD test shape to MXFP8: scale block 32 (numScales =
+// --mxfp8 overrides the QUANT_FWD test shape to MXFP8: scale block 32 (numScales =
 // hidden/32) and Uint8 (E8M0) scales. g_scaleBlockOverride == 0 keeps the recipe default.
 static unsigned g_scaleBlockOverride = 0;
 static ncclDataType_t g_scaleDtype = ncclFloat32;
@@ -932,7 +932,7 @@ static inline uint8_t scalesForwardTokenByte(int rank, unsigned int t, size_t h)
     return static_cast<uint8_t>((static_cast<unsigned>(rank) * 131u + t * 17u + h) & 0xFFu);
 }
 
-// SCALES_FORWARD validation uses an opaque byte pattern.
+// QUANT_FWD validation uses an opaque byte pattern.
 static inline uint8_t scalesForwardScaleByte(int rank, unsigned int t, size_t byte) {
     return static_cast<uint8_t>((rank * 73 + t * 29 + byte * 11 + 7) & 0xff);
 }
@@ -1045,7 +1045,7 @@ void initializeValidationData(
     ncclEpDispQuant_t dispatch_quantization,
     ncclDataType_t token_dtype = ncclBfloat16) {
     if (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD) {
-        // SCALES_FORWARD dispatch: fill every physical token byte with the
+        // QUANT_FWD dispatch: fill every physical token byte with the
         // validation pattern; forwarding does not interpret token values.
         const unsigned int token_hidden = static_cast<unsigned int>(dispatch_inputs.tokens->sizes[1]);
         const size_t token_bytes = tokenElemBytes(dispatch_inputs.tokens->datatype);
@@ -1155,7 +1155,7 @@ void initializeValidationData(
     delete[] topk_weights_host;
 }  // initializeValidationData
 
-// SCALES_FORWARD dispatch validation — simple byte-transport check.
+// QUANT_FWD dispatch validation — simple byte-transport check.
 // Token row: byte[0]=rank, byte[1]=t/256, byte[2]=t%256, rest=(rank*131+t*17+h)&0xFF.
 // Identity is read from bytes 0-2; scales use a deterministic raw-byte pattern.
 // Dispatch is pure byte transport — we just verify the bytes arrive unchanged.
@@ -1427,7 +1427,7 @@ static ValidationResult validateDispatchOutputLLExpertMaj(
     return result;
 }
 
-// ==================== LL expert-major SCALES_FORWARD validation ====================
+// ==================== LL expert-major QUANT_FWD validation ====================
 // Output tokens/scales are [local_expert, recv_slot, hidden/scales]. Verify
 // every populated expert slot carries the exact token bytes and opaque scale row
 // from its routed source token.
@@ -1489,7 +1489,7 @@ static ValidationResult validateDispatchOutputLLExpertMajScalesForward(
     for (unsigned int expert = 0; expert < num_local_experts; ++expert) {
         const int count = received_per_expert[expert];
         if (count < 0 || count > static_cast<int>(slots_per_expert)) {
-            rep.error("[Rank %d] LL SCALES_FORWARD: expert %u has invalid count %d (max %u)\n",
+            rep.error("[Rank %d] LL QUANT_FWD: expert %u has invalid count %d (max %u)\n",
                       myRank, expert, count, slots_per_expert);
             continue;
         }
@@ -1502,32 +1502,32 @@ static ValidationResult validateDispatchOutputLLExpertMajScalesForward(
             const int source_token = static_cast<int>(token_row[1]) * 256 + token_row[2];
             if (source_rank < 0 || source_rank >= nRanks || source_token < 0 ||
                 source_token >= static_cast<int>(max_tokens_per_rank)) {
-                rep.error("[Rank %d] LL SCALES_FORWARD: expert %u slot %d has invalid identity (%d, %d)\n",
+                rep.error("[Rank %d] LL QUANT_FWD: expert %u slot %d has invalid identity (%d, %d)\n",
                           myRank, expert, slot, source_rank, source_token);
                 continue;
             }
             const auto key = std::make_pair(source_rank, source_token);
             if (expected[expert].find(key) == expected[expert].end()) {
-                rep.error("[Rank %d] LL SCALES_FORWARD: expert %u slot %d has unexpected token (%d, %d)\n",
+                rep.error("[Rank %d] LL QUANT_FWD: expert %u slot %d has unexpected token (%d, %d)\n",
                           myRank, expert, slot, source_rank, source_token);
             }
             found.insert(key);
             for (size_t byte = 0; byte < token_row_bytes; ++byte)
                 expected_token[byte] = scalesForwardTokenByte(source_rank, source_token, byte);
             if (memcmp(token_row, expected_token.data(), token_row_bytes) != 0) {
-                rep.error("[Rank %d] LL SCALES_FORWARD: expert %u slot %d token bytes differ\n",
+                rep.error("[Rank %d] LL QUANT_FWD: expert %u slot %d token bytes differ\n",
                           myRank, expert, slot);
             }
             for (size_t scale = 0; scale < expected_scale.size(); ++scale)
                 expected_scale[scale] = scalesForwardScaleByte(source_rank, source_token, scale);
             if (memcmp(scale_row, expected_scale.data(), expected_scale.size()) != 0) {
-                rep.error("[Rank %d] LL SCALES_FORWARD: expert %u slot %d scale row differs\n",
+                rep.error("[Rank %d] LL QUANT_FWD: expert %u slot %d scale row differs\n",
                           myRank, expert, slot);
             }
         }
         for (const auto& key : expected[expert]) {
             if (found.find(key) == found.end()) {
-                rep.error("[Rank %d] LL SCALES_FORWARD: expert %u is missing token (%d, %d)\n",
+                rep.error("[Rank %d] LL QUANT_FWD: expert %u is missing token (%d, %d)\n",
                           myRank, expert, key.first, key.second);
             }
         }
@@ -1537,7 +1537,7 @@ static ValidationResult validateDispatchOutputLLExpertMajScalesForward(
     result.passed = result.errors == 0;
     if (!result.passed) {
         char message[256];
-        snprintf(message, sizeof(message), "LL SCALES_FORWARD dispatch validation: %d errors", result.errors);
+        snprintf(message, sizeof(message), "LL QUANT_FWD dispatch validation: %d errors", result.errors);
         result.message = message;
     }
     return result;
@@ -1748,7 +1748,7 @@ static ValidationResult validateDispatchOutputLLExpertMajDsFp8E3M4(
     return result;
 }
 
-// ==================== LL rank-major SCALES_FORWARD validation ====================
+// ==================== LL rank-major QUANT_FWD validation ====================
 // Rank-major stores received rows contiguously by source rank.  The recipe is
 // pure byte forwarding, so validate both the packed token row and opaque scale
 // row without interpreting either quantized format.
@@ -1800,7 +1800,7 @@ static ValidationResult validateDispatchOutputLLRankMajScalesForward(
             }
         }
         if (recv_counts[source_rank] != static_cast<int32_t>(expected.size())) {
-            rep.error("[Rank %d] LL RM SCALES_FORWARD: source rank %d count=%d expected=%zu\n",
+            rep.error("[Rank %d] LL RM QUANT_FWD: source rank %d count=%d expected=%zu\n",
                       myRank, source_rank, recv_counts[source_rank], expected.size());
         }
         if (recv_counts[source_rank] < 0 || static_cast<size_t>(recv_counts[source_rank]) > max_tpr) continue;
@@ -1813,7 +1813,7 @@ static ValidationResult validateDispatchOutputLLRankMajScalesForward(
             const int decoded_token = static_cast<int>(token_row[1]) * 256 + token_row[2];
             if (decoded_rank != source_rank || decoded_token < 0 ||
                 decoded_token >= static_cast<int>(num_tokens_per_rank[source_rank])) {
-                rep.error("[Rank %d] LL RM SCALES_FORWARD: rank %d slot %d invalid identity (%d, %d)\n",
+                rep.error("[Rank %d] LL RM QUANT_FWD: rank %d slot %d invalid identity (%d, %d)\n",
                           myRank, source_rank, slot, decoded_rank, decoded_token);
                 continue;
             }
@@ -1823,14 +1823,14 @@ static ValidationResult validateDispatchOutputLLRankMajScalesForward(
             for (size_t b = 0; b < expected_scale.size(); ++b)
                 expected_scale[b] = scalesForwardScaleByte(source_rank, decoded_token, b);
             if (memcmp(token_row, expected_token.data(), token_row_bytes) != 0)
-                rep.error("[Rank %d] LL RM SCALES_FORWARD: rank %d slot %d token bytes differ\n",
+                rep.error("[Rank %d] LL RM QUANT_FWD: rank %d slot %d token bytes differ\n",
                           myRank, source_rank, slot);
             if (memcmp(scale_row, expected_scale.data(), expected_scale.size()) != 0)
-                rep.error("[Rank %d] LL RM SCALES_FORWARD: rank %d slot %d scale bytes differ\n",
+                rep.error("[Rank %d] LL RM QUANT_FWD: rank %d slot %d scale bytes differ\n",
                           myRank, source_rank, slot);
         }
         if (found != expected)
-            rep.error("[Rank %d] LL RM SCALES_FORWARD: source rank %d received token set differs\n",
+            rep.error("[Rank %d] LL RM QUANT_FWD: source rank %d received token set differs\n",
                       myRank, source_rank);
     }
     result.errors = rep.errors;
@@ -2108,7 +2108,7 @@ static void preReduceRankMajor(
     delete[] recv_wgt;
 }
 
-// ==================== HT SCALES_FORWARD dispatch byte-equality validation ====================
+// ==================== HT QUANT_FWD dispatch byte-equality validation ====================
 // Tokens and scales are opaque physical rows. For each valid recv slot we recover the
 // source (rank, token) from the first three token bytes, then memcmp the full token byte row and the
 // full scale row against the deterministic byte recompute. Routing replay
@@ -2225,7 +2225,7 @@ static ValidationResult validateDispatchOutputHTScalesForward(
 
         if (src_rank < 0 || src_rank >= nRanks || token_id < 0 || token_id >= static_cast<int>(max_tokens_per_rank)) {
             rep.error(
-                "[Rank %d] SCALES_FORWARD dispatch: slot %u: invalid identity (rank=%d, token=%d)\n",
+                "[Rank %d] QUANT_FWD dispatch: slot %u: invalid identity (rank=%d, token=%d)\n",
                 myRank,
                 j,
                 src_rank,
@@ -2236,7 +2236,7 @@ static ValidationResult validateDispatchOutputHTScalesForward(
         auto key = std::make_pair(src_rank, token_id);
         if (expected.find(key) == expected.end()) {
             rep.error(
-                "[Rank %d] SCALES_FORWARD dispatch: slot %u: unexpected token (rank=%d, token=%d)\n",
+                "[Rank %d] QUANT_FWD dispatch: slot %u: unexpected token (rank=%d, token=%d)\n",
                 myRank,
                 j,
                 src_rank,
@@ -2252,7 +2252,7 @@ static ValidationResult validateDispatchOutputHTScalesForward(
             for (; bad < token_row_bytes; bad++)
                 if (tok_row[bad] != exp_tok[bad]) break;
             rep.error(
-                "[Rank %d] SCALES_FORWARD dispatch: slot %u (rank=%d, token=%d): token mismatch "
+                "[Rank %d] QUANT_FWD dispatch: slot %u (rank=%d, token=%d): token mismatch "
                 "at byte=%zu (got 0x%02x exp 0x%02x)\n",
                 myRank,
                 j,
@@ -2270,7 +2270,7 @@ static ValidationResult validateDispatchOutputHTScalesForward(
             for (; bad < exp_sf.size(); bad++)
                 if (sf_row[bad] != exp_sf[bad]) break;
             rep.error(
-                "[Rank %d] SCALES_FORWARD dispatch: slot %u (rank=%d, token=%d): scale mismatch "
+                "[Rank %d] QUANT_FWD dispatch: slot %u (rank=%d, token=%d): scale mismatch "
                 "at byte=%u (got 0x%02x exp 0x%02x)\n",
                 myRank,
                 j,
@@ -2284,7 +2284,7 @@ static ValidationResult validateDispatchOutputHTScalesForward(
 
     for (const auto& key : expected) {
         if (found.find(key) == found.end()) {
-            rep.error("[Rank %d] HT SCALES_FORWARD dispatch: missing token (rank=%d, token=%d)\n",
+            rep.error("[Rank %d] HT QUANT_FWD dispatch: missing token (rank=%d, token=%d)\n",
                       myRank, key.first, key.second);
         }
     }
@@ -5004,7 +5004,7 @@ int main(int argc, char* argv[]) {
             dispatch_input_dtype);
     }
 
-    // SCALES_FORWARD receives its input scales from the caller; DS_FP8E3M4
+    // QUANT_FWD receives its input scales from the caller; DS_FP8E3M4
     // generates output scales during LL dispatch.
     EpTensorAllocOptions ht_sf_zc_opts;
     const EpTensorAllocOptions* ht_sf_window_opts = nullptr;

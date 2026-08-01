@@ -1479,7 +1479,7 @@ void call_local_dup(
     int scale_row_bytes) {
     constexpr int kPipeDepth = NCCL_EP_HT_LOCAL_DUP_PIPE_DEPTH;
     // local_dup is a byte-relocation fan-out: the wire type only sets the per-token
-    // width (fp8 -> uint8_t, FP16/BF16 -> uint16_t, FP32 -> uint32_t). SCALES_FORWARD
+    // width (fp8 -> uint8_t, FP16/BF16 -> uint16_t, FP32 -> uint32_t). QUANT_FWD
     // fans a per-token scale row (scale_row_bytes) out alongside the token.
     auto run = [&](auto tag) {
         using TOKEN_DATA_TYPE = decltype(tag);
@@ -1614,7 +1614,7 @@ void launch_dispatch_permute(
     assert(top_k > 0);
     assert(sm_count > 0);
     assert((recv_topk_weights_em == nullptr) == (recv_topk_weights_flat == nullptr));
-    // SCALES_FORWARD: scale rows relocate alongside tokens; 16B-aligned like tokens.
+    // QUANT_FWD: scale rows relocate alongside tokens; 16B-aligned like tokens.
     assert(scale_row_bytes >= 0 && (scale_row_bytes % 16) == 0);
     assert((scale_row_bytes > 0) == (recv_scales_em != nullptr && flat_scale_staging != nullptr));
 

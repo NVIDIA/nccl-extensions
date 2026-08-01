@@ -974,7 +974,7 @@ struct dispatch_kernel_param_base_t {
     // Input buffers. These buffers are local buffers.
     const TOKEN_DATA_TYPE* attn_input_token;
     const float* attn_input_prob; // Needed by expert layer, so only valid in forward dispatch.
-    const uint8_t* attn_input_token_scaling_factor; // SCALES_FORWARD input bytes.
+    const uint8_t* attn_input_token_scaling_factor; // QUANT_FWD input bytes.
     // Internal temp buffers. These buffers are local buffers.
     uint64_t* gin_G2S_flags; // For RDMA Atomic flags.
     uint32_t* lsa_S2G_flags; // For intra-LSA S2G write completion notification.
@@ -1031,7 +1031,7 @@ struct dispatch_kernel_param_t : dispatch_kernel_param_base_t<TOKEN_DATA_TYPE> {
     // Keep embedded arrays here to avoid device-side pointer-table indirection.
     TOKEN_DATA_TYPE* expert_output_token[LSA_TEAM_SZ];
     float* expert_output_prob[LSA_TEAM_SZ]; // Only valid in forward dispatch.
-    uint8_t* expert_output_scaling_factor[LSA_TEAM_SZ]; // Only valid for SCALES_FORWARD.
+    uint8_t* expert_output_scaling_factor[LSA_TEAM_SZ]; // Only valid for QUANT_FWD.
 };
 
 // Fixed-size part of combine kernel parameters. Peer pointer arrays are appended
@@ -4584,7 +4584,7 @@ struct local_dup_kernel_param_t {
     uint32_t* grid_barrier_counter;
     int experts_per_rank;
     int ranks_per_lsa_team;
-    void* expert_output_scale; // SCALES_FORWARD: per-token scale row; void* (dtype varies by recipe)
+    void* expert_output_scale; // QUANT_FWD: per-token scale row; void* (dtype varies by recipe)
     int scale_row_bytes;
 };
 
@@ -5123,7 +5123,7 @@ struct local_permute_dup_param_t {
     int experts_per_rank;
     int row_bytes;
     int caller_num_recv_tokens;   // caller recv buffer row capacity
-    // SCALES_FORWARD: per-token scale rows relocated with the same slot map as
+    // QUANT_FWD: per-token scale rows relocated with the same slot map as
     // the tokens. recv_scales_em/flat_scale_staging are null and scale_row_bytes
     // is 0 for NONE mode. scale_row_bytes is 16B-aligned (host-validated).
     void* recv_scales_em;
@@ -5146,7 +5146,7 @@ __device__ __forceinline__ void local_permute_dup(
     int experts_per_rank,
     int /*row_bytes*/,
     int caller_num_recv_tokens,
-    // SCALES_FORWARD: relocate a per-token scale row alongside the token row.
+    // QUANT_FWD: relocate a per-token scale row alongside the token row.
     // scale_dst/scale_src null and scale_row_bytes==0 for NONE (scale copy skipped).
     uint8_t* __restrict__ scale_dst,
     const uint8_t* __restrict__ scale_src,

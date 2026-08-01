@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * zero_copy config coverage. Each test creates its own ep_group with the
- * mode under test. HT covers BF16 round trips, all SCALES_FORWARD scale dtypes,
+ * mode under test. HT covers BF16 round trips, all QUANT_FWD scale dtypes,
  * and packed-FP4 zero-copy dispatch;
  * LL checks staged and windowed token/scale payloads as exact bytes.
  */

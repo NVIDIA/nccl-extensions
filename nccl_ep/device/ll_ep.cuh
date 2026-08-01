@@ -156,8 +156,8 @@ __forceinline__ __device__ void castAndWriteToSendBuf(
     int laneId,
     int hiddenBf16Int4,
     bool roundScale,
-    const uint8_t* inScales = nullptr,  // SCALES_FORWARD: raw scale bytes for this token
-    int scaleBytes = 0) {               // SCALES_FORWARD: total bytes to copy
+    const uint8_t* inScales = nullptr,  // QUANT_FWD: raw scale bytes for this token
+    int scaleBytes = 0) {               // QUANT_FWD: total bytes to copy
 
     // Generated and unquantized paths retain their full-warp vector contract.
     if constexpr (kRecipe != NCCL_EP_DISP_QUANT_FWD) {
@@ -223,7 +223,7 @@ __forceinline__ __device__ void castAndWriteToSendBuf(
 //     peer's recvBuf at the corresponding per-slot offset.
 //
 // Recipe-defined copies are shared by RDMA and the NVLink direct path.
-// kNvlinkOnly redirects token (and SCALES_FORWARD scale) payloads to peer windows.
+// kNvlinkOnly redirects token (and QUANT_FWD scale) payloads to peer windows.
 template <ncclEpDispQuant_t kRecipe, bool kNvlinkOnly, typename ScaleT>
 __forceinline__ __device__ void sendToken(
     // Local sources.
@@ -257,7 +257,7 @@ __forceinline__ __device__ void sendToken(
     size_t recvDataOffset,
     ncclWindow_t rcvScalesWin,
     size_t rcvScalesOffs,
-    // SCALES_FORWARD scale bytes for this token; null for other recipes.
+    // QUANT_FWD scale bytes for this token; null for other recipes.
     const uint8_t* inScales,
     int laneId) {
     using recipe_types = DispatchRecipeDeviceTypes<kRecipe, ScaleT>;
@@ -558,7 +558,7 @@ __forceinline__ __device__ void copyRecvTokenData(
     bool isNvlinkSrc,
     bool copyData,
     bool copyScales) {
-    // Locate the payload (data plus SCALES_FORWARD scales, when selected) for this slot.
+    // Locate the payload (data plus QUANT_FWD scales, when selected) for this slot.
     const int payloadBytes = numBytesPerMsg - dispatch_hdr_sz;
     const uint8_t* recvPayloadPtr;
     if (isNvlinkSrc) {
@@ -606,7 +606,7 @@ template <ncclEpDispQuant_t kRecipe, int kHidden, ncclEpLayout_t kLayout, bool k
           typename TopkIdxT, ncclDataType_t kTokenDtype, typename ScaleT>
 __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
   const void* inData,
-  const uint8_t* inScalesBuf, // non-null for SCALES_FORWARD
+  const uint8_t* inScalesBuf, // non-null for QUANT_FWD
   const TopkIdxT* inTopkIdx, const float* inTopkWeights, int* rankMask, int* asyncErrorFlag,
   // OUTPUT
   void* outDataBuf, void* outScalesBuf, int* outSrcInfo, int* outRecvRankCounter, int64_t* outLayout, int* outCnt,
@@ -619,7 +619,7 @@ __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
   int numWarpGroups, int numWarpsPerGroup, bool roundScale, ncclEpExpertIdKind_t recvTopkIdxKind, int phases,
   int numComms, ncclDevComm* devComms, const ncclWindow_t* windows, unsigned signalsBase, uint64_t timeoutCycles,
   // Zero-copy dispatch output (rank-major + nvlinkOnly): each available token
-  // or SCALES_FORWARD scale window is written directly to its peer output.
+  // or QUANT_FWD scale window is written directly to its peer output.
   ncclWindow_t recvDataWindow, size_t recvDataOffset, ncclWindow_t rcvScalesWin, size_t rcvScalesOffs) {
     const auto smId = static_cast<int>(blockIdx.x);
     const auto threadId = static_cast<int>(threadIdx.x);
@@ -666,7 +666,7 @@ __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
     // 1. The first-kind warps for forwarding top-k tokens
     // 2. The last warp for reading `topk_idx` and count for per-expert information
     if (warpId < numWarps - 1) {
-        // SCALES_FORWARD reads raw wire payloads as aligned int4 vectors.
+        // QUANT_FWD reads raw wire payloads as aligned int4 vectors.
         constexpr int kNumElemsPerRead = sizeof(int4) / size_u8<kTokenDtype>();
         if constexpr (kRecipe != NCCL_EP_DISP_QUANT_FWD) {
             EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerRead) == 0, "Invalid hidden");

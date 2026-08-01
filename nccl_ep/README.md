@@ -371,7 +371,8 @@ typedef struct {
     unsigned int max_recv_tokens_per_rank;      // Max tokens any single rank receives
                                                 //   HT: required (must be >= max_dispatch_tokens_per_rank)
                                                 //   LL: unused (buffers always sized automatically); pass NCCL_EP_AUTO
-    unsigned int max_token_bytes;               // Max token-row bytes; LL QUANT_FWD also bounds token+scale payload
+    unsigned int max_token_bytes;               // Max token-row bytes. For quantized transmission, quantized
+                                                //   token data and scales must fit within this budget.
     unsigned long int rdma_buffer_size;         // RDMA buffer size for LL mode.
                                                 //   NCCL_EP_AUTO  → lazy: allocate on first ncclEpInitHandle, sized to that
                                                 //                  handle's actual (layout, num_topk); collective re-grow
@@ -402,11 +403,10 @@ version returned by `ncclEpGetVersion` before relying on it. Historical
 `NCCL_EP_API_VERSION`; a mismatch is reported as a warning rather than
 rejecting an otherwise size-compatible configuration.
 
-`max_token_bytes` is a physical-byte budget for an individual token or scale
-row. LL `NCCL_EP_DISP_QUANT_FWD` additionally requires their
-sum to fit its shared message slot; for example, packed FP4 uses `H/2` token
-bytes plus `S * sizeof(scale_dtype)` scale bytes. HT requires the configured
-bound to be a multiple of 16 bytes.
+`max_token_bytes` is a per-token physical-byte budget. For quantized
+transmission, quantized token data and scales must fit within it; for example,
+packed FP4 uses `H/2` token bytes plus `S * sizeof(scale_dtype)` scale bytes. HT
+requires the configured bound to be a multiple of 16 bytes.
 
 ### `ncclEpHandle_t` - Operation Handle
 

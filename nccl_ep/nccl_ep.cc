@@ -131,13 +131,6 @@ static T epDecodeStruct(const T* source, T defaults) {
     return decoded;
 }
 
-// QUANT_FWD has no fixed scale block size. Reserve the complete
-// byte budget so any validated caller-provided scale row fits; this is the
-// byte-equivalent of the former FP32-element reservation.
-static inline size_t maxForwardedScaleBytesPerToken(size_t max_token_bytes) {
-    return max_token_bytes;
-}
-
 // Resolve AUTO -- the public sentinel meaning "library default" -- to the
 // concrete numbering the kernels need. AUTO maps to LOCAL today; pinning a
 // non-AUTO value passes straight through.
@@ -414,13 +407,10 @@ static ncclResult_t validateDispatchRecipe(
             if (scale_bytes == 0 || scale_bytes % sizeof(int4) != 0) {
                 return fail("scale bytes per token must be non-zero and 16-byte aligned");
             }
-            if (token_bytes > launch.max_token_bytes || scale_bytes > launch.max_token_bytes) {
-                return fail("token or scale bytes per token exceed the group token-byte limit");
+            if (token_bytes + scale_bytes > launch.max_token_bytes) {
+                return fail("token bytes plus scale bytes exceed the group token-byte limit");
             }
             if (launch.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-                if (token_bytes + scale_bytes > launch.max_token_bytes) {
-                    return fail("LL token bytes plus scale bytes exceed the group token-byte limit");
-                }
                 size_t expected_rows = 0;
                 size_t expected_slots = 0;
                 if (launch.layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
@@ -712,10 +702,9 @@ struct ncclEpGroup {
         size_t combine_g2s_prob_offset = 0;
         size_t token_staging_offset = 0;
         size_t dense_prob_offset = 0;
-        size_t scaling_factor_staging_offset = 0;
 
         // Layout: [NUM_LSA_TEAMS-1][BATCH_SIZE * bytes_per_entry]
-        // bytes_per_entry = hidden * sizeof(TOKEN_DATA_TYPE) + prob_size + sf_size
+        // bytes_per_entry = max_token_bytes (token + optional scales) + prob_size
         size_t gin_send_staging_offset = 0;
         size_t gin_recv_staging_offset = 0;  // Packed receive buffer (token+prob+sf)
 
@@ -818,7 +807,6 @@ struct ncclEpGroup {
     // These are pre-registered with GIN to avoid ~60ms registration overhead during dispatch
         void* token_staging_buffer; // Pre-registered staging buffer for user tokens
         float* dense_prob_buffer; // Pre-registered buffer for sparse→dense prob conversion
-        void* scaling_factor_staging_buffer; // Pre-registered QUANT_FWD storage
 
     // Group-scoped routing bitmap; shared by all handles on this group.
         uint8_t* global_routing_map = nullptr;
@@ -1012,8 +1000,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
 
     // Output scale byte storage, sized for the largest QUANT_FWD row that
     // the group's token-byte budget permits.
-    size_t expert_output_scaling_factor_sz =
-        max_output_slots * maxForwardedScaleBytesPerToken(max_token_bytes);
+    size_t expert_output_scaling_factor_sz = max_output_slots * max_token_bytes;
 
     // zero_copy elides both token regions (windowed tensors required).
     const bool zero_copy = ep_group->config.zero_copy == NCCL_EP_ZERO_COPY_ON;
@@ -1317,16 +1304,9 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * ep_group->config.num_experts *
             sizeof(float),
         GIN_ALIGNMENT);
-    const size_t max_scale_bytes_per_token =
-        maxForwardedScaleBytesPerToken(ep_group->config.max_token_bytes);
-    size_t scaling_factor_staging_sz = align_size(
-        static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * max_scale_bytes_per_token,
-        GIN_ALIGNMENT);
-
     size_t bytes_per_token_entry = ep_group->config.max_token_bytes;
     size_t bytes_per_prob_entry = (ep_group->num_local_experts * lsa_team_size) * sizeof(float);
-    size_t bytes_per_sf_entry = max_scale_bytes_per_token;
-    size_t bytes_per_entry = bytes_per_token_entry + bytes_per_prob_entry + bytes_per_sf_entry;
+    size_t bytes_per_entry = bytes_per_token_entry + bytes_per_prob_entry;
     size_t rdma_send_staging_sz = align_size(
         static_cast<size_t>(rdma_team_size - 1) * ep_group->config.max_dispatch_tokens_per_rank * bytes_per_entry,
         GIN_ALIGNMENT);
@@ -1343,7 +1323,6 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     total_gin_buffer_size += guard_sz * 2;
     total_gin_buffer_size += token_staging_sz;
     total_gin_buffer_size += dense_prob_sz;
-    total_gin_buffer_size += scaling_factor_staging_sz;
     total_gin_buffer_size += rdma_send_staging_sz;
     total_gin_buffer_size += rdma_recv_packed_sz;
 
@@ -1385,9 +1364,6 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     ep_group->ht_buffers.dense_prob_buffer = reinterpret_cast<float*>(ptr + offset);
     offset += dense_prob_sz;
 
-    ep_group->ht_buffers.scaling_factor_staging_buffer = ptr + offset;
-    offset += scaling_factor_staging_sz;
-
     offset += rdma_send_staging_sz;
 
     // Calculate offsets for kernel mr_info
@@ -1416,9 +1392,6 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
 
     ep_group->gin_config.dense_prob_offset = cur_offset;
     cur_offset += dense_prob_sz;
-
-    ep_group->gin_config.scaling_factor_staging_offset = cur_offset;
-    cur_offset += scaling_factor_staging_sz;
 
     ep_group->gin_config.gin_send_staging_offset = cur_offset;
     cur_offset += rdma_send_staging_sz;
@@ -1554,7 +1527,6 @@ static ncclResult_t destroy_ht_internode(ncclEpGroup_t ep_group) {
         ep_group->ht_buffers.combine_gin_G2S_flags = nullptr;
         ep_group->ht_buffers.token_staging_buffer = nullptr;
         ep_group->ht_buffers.dense_prob_buffer = nullptr;
-        ep_group->ht_buffers.scaling_factor_staging_buffer = nullptr;
     }
 
     ep_group->gin_config.num_comms = 0;
@@ -2270,13 +2242,6 @@ struct ncclEpHandle {
             // lifetime: group-owned (allocated in Group Create, freed in Group Destroy)
             void* token_staging_buffer; // Pointer to group-level buffer (not handle-owned)
 
-            // Scaling factor staging buffer: pre-registered buffer for forwarded scales
-            // User scaling factors are copied here during dispatch, then this buffer is used for RDMA
-            // dtype/layout: opaque bytes, [max_dispatch_tokens_per_rank, scale_row_bytes]
-            // usage: copy user scaling factors → use for cross-LSA-team RDMA
-            // lifetime: group-owned (allocated in Group Create, freed in Group Destroy)
-            void* scaling_factor_staging_buffer; // Pointer to group-level buffer (not handle-owned)
-
             // RDMA inter-node group flags: atomic completion flags for each remote LSA team.
             // Remote ranks increment via RDMA atomic fetch-add to signal chunk completion.
             // Only allocated when num_lsa_teams > 1.
@@ -2748,10 +2713,8 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     if (is_internode_available(ep_group)) {
         handle->ht.dense_prob_buffer = ep_group->ht_buffers.dense_prob_buffer;
         handle->ht.token_staging_buffer = ep_group->ht_buffers.token_staging_buffer;
-        handle->ht.scaling_factor_staging_buffer = ep_group->ht_buffers.scaling_factor_staging_buffer;
     } else {
         handle->ht.token_staging_buffer = nullptr;
-        handle->ht.scaling_factor_staging_buffer = nullptr;
     }
     return ncclSuccess;
 }
@@ -3545,6 +3508,10 @@ ncclResult_t ncclEpDispatch(
             x->sizes[1] * ncclTypeSize(x->datatype) <= group->config.max_token_bytes &&
             "HT dispatch token bytes must not exceed group's max_token_bytes");
         const int hidden = static_cast<int>(x->sizes[1]);
+        const size_t token_bytes = static_cast<size_t>(hidden) * ncclTypeSize(x->datatype);
+        const bool scales_forward = recipe == NCCL_EP_DISP_QUANT_FWD;
+        const size_t token_staging_region_bytes =
+            static_cast<size_t>(group->config.max_dispatch_tokens_per_rank) * token_bytes;
         NCCLCHECK(resolveTensorWindowBinding(
             group,
             x,
@@ -3556,8 +3523,12 @@ ncclResult_t ncclEpDispatch(
         // The staging buffers were allocated and GIN-registered during Group Create
         // This avoids ~60ms GIN registration overhead on the dispatch hot path
         void* token_ptr = x->data; // Default: use user buffer directly
-        const bool x_uses_external_window = tensorUsesExternalWindow(group, x);
-        if (!is_lsa_only && handle->ht.token_staging_buffer != nullptr && !x_uses_external_window) {
+        const bool token_uses_external_window = tensorUsesExternalWindow(group, x);
+        const bool staging_available =
+            !is_lsa_only && handle->ht.token_staging_buffer != nullptr;
+        const bool stage_regular_tokens =
+            staging_available && !scales_forward && !token_uses_external_window;
+        if (stage_regular_tokens) {
             // Copy user tokens to pre-registered staging buffer (D2D copy is ~0.1ms vs ~30ms GIN registration)
             size_t token_size = x->sizes[0] * x->sizes[1] * ncclTypeSize(x->datatype);
             CUDA_CHECK(cudaMemcpyAsync(
@@ -3568,36 +3539,23 @@ ncclResult_t ncclEpDispatch(
                 stream));
             token_ptr = handle->ht.token_staging_buffer;
         }
-        const int scale_elem_bytes = (recipe == NCCL_EP_DISP_QUANT_FWD)
-                                         ? static_cast<int>(ncclTypeSize(scales->datatype))
-                                         : static_cast<int>(sizeof(float));
-        if (recipe == NCCL_EP_DISP_QUANT_FWD) {
+        int scale_elem_bytes = 0;
+        bool scales_use_external_window = false;
+        if (scales_forward) {
+            scale_elem_bytes = static_cast<int>(ncclTypeSize(scales->datatype));
             NCCLCHECK(resolveTensorWindowBinding(
                 group,
                 scales,
                 &scales_local,
-                static_cast<uint64_t>(group->gin_config.scaling_factor_staging_offset),
+                group->gin_config.token_staging_offset + token_staging_region_bytes,
                 &scales));
+            scales_use_external_window = tensorUsesExternalWindow(group, scales);
         }
 
-        // For QUANT_FWD: copy user scales to the pre-registered staging buffer.
-        void* scales_ptr = recipe == NCCL_EP_DISP_QUANT_FWD ? scales->data : nullptr;
-        const bool scales_uses_external_window =
-            recipe == NCCL_EP_DISP_QUANT_FWD && tensorUsesExternalWindow(group, scales);
-        if (recipe == NCCL_EP_DISP_QUANT_FWD &&
-            !is_lsa_only && handle->ht.scaling_factor_staging_buffer != nullptr &&
-            !scales_uses_external_window) {
-            // Copy user scaling factors to pre-registered staging buffer (D2D copy is ~0.1ms vs ~30ms GIN registration)
-            size_t scales_size = scales->sizes[0] * scales->sizes[1] * ncclTypeSize(scales->datatype);
-            CUDA_CHECK(cudaMemcpyAsync(
-                handle->ht.scaling_factor_staging_buffer,
-                scales->data,
-                scales_size,
-                cudaMemcpyDeviceToDevice,
-                stream));
-            scales_ptr = handle->ht.scaling_factor_staging_buffer;
+        void* scales_ptr = nullptr;
+        if (scales_forward) {
+            scales_ptr = scales->data;
         }
-
         // HT dispatch kernel uses TMA for token/prob/scaling-factor payloads.
         // Keep these constraints at API-entry to fail fast on unsupported shapes.
         const int experts_per_lsa_team = group->num_local_experts * group->lsa_team_size;
@@ -3605,15 +3563,41 @@ ncclResult_t ncclEpDispatch(
             (experts_per_lsa_team * static_cast<int>(sizeof(float))) % 16 == 0 &&
             "HT dispatch requires experts_per_lsa_team to be multiple of 4 (16B prob TMA alignment)");
 
-        const size_t token_bytes_per_token = static_cast<size_t>(hidden) * ncclTypeSize(x->datatype);
         assert(
-            (token_bytes_per_token % 16) == 0 &&
+            (token_bytes % 16) == 0 &&
             "HT dispatch requires token bytes per token to be 16B aligned for TMA");
 
-        const int num_scales_per_token =
-            recipe == NCCL_EP_DISP_QUANT_FWD
-                ? static_cast<int>(scales->sizes[1])
-                : 0;
+        int num_scales_per_token = 0;
+        size_t forwarded_scale_bytes_per_token = 0;
+        if (scales_forward) {
+            num_scales_per_token = static_cast<int>(scales->sizes[1]);
+            forwarded_scale_bytes_per_token =
+                static_cast<size_t>(num_scales_per_token) * scale_elem_bytes;
+        }
+
+        const bool stage_forward_tokens =
+            staging_available && scales_forward && !token_uses_external_window;
+        const bool stage_forward_scales =
+            staging_available && scales_forward && !scales_use_external_window;
+        if (stage_forward_tokens || stage_forward_scales) {
+            uint8_t* staging = static_cast<uint8_t*>(handle->ht.token_staging_buffer);
+            uint8_t* scale_staging = staging + token_staging_region_bytes;
+
+            if (stage_forward_tokens) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    staging, x->data, x->sizes[0] * token_bytes, cudaMemcpyDeviceToDevice, stream));
+                token_ptr = staging;
+            }
+            if (stage_forward_scales) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    scale_staging,
+                    scales->data,
+                    x->sizes[0] * forwarded_scale_bytes_per_token,
+                    cudaMemcpyDeviceToDevice,
+                    stream));
+                scales_ptr = scale_staging;
+            }
+        }
 
         // Output tensors
         const ncclEpTensor_t* recv_x = tensor_required(outputs->tokens);
@@ -3859,8 +3843,10 @@ ncclResult_t ncclEpDispatch(
         params.dcomm = group->gin_config.dcomms[0];
         params.nccl_token_window = x->win_hdl;
         params.nccl_prob_window = forward_dispatch ? group->gin_config.nccl_window : ncclWindow_t{};
-        params.nccl_sf_window =
-            recipe == NCCL_EP_DISP_QUANT_FWD ? scales->win_hdl : ncclWindow_t{};
+        params.nccl_sf_window = ncclWindow_t{};
+        if (scales_forward) {
+            params.nccl_sf_window = scales->win_hdl;
+        }
         params.nccl_internal_window = group->gin_config.nccl_window;
         params.num_ctx_per_comm = is_lsa_only ? 0 : group->gin_config.num_ctx_per_comm;
         params.gin_base_ptr = is_lsa_only ? nullptr : group->gin_config.gin_base_ptr;
@@ -3869,19 +3855,18 @@ ncclResult_t ncclEpDispatch(
         // Calculate bytes_per_entry for batched staging
         size_t bytes_per_token_entry = group->config.max_token_bytes; // token data
         size_t bytes_per_prob_entry = (group->num_local_experts * group->lsa_team_size) * sizeof(float); // prob data
-        size_t bytes_per_sf_entry =
-            recipe == NCCL_EP_DISP_QUANT_FWD
-                ? static_cast<size_t>(num_scales_per_token) * scale_elem_bytes
-                : 0;
-        size_t bytes_per_entry = bytes_per_token_entry + bytes_per_prob_entry + bytes_per_sf_entry;
+        size_t bytes_per_entry = bytes_per_token_entry + bytes_per_prob_entry;
 
-        params.mr_info.attn_input_token_offset = is_lsa_only ? 0 : x->win_offset;
+        params.mr_info.attn_input_token_offset = 0;
+        if (!is_lsa_only) {
+            params.mr_info.attn_input_token_offset = x->win_offset;
+        }
         params.mr_info.attn_input_prob_offset =
             (is_lsa_only || !forward_dispatch) ? 0 : group->gin_config.dense_prob_offset;
-        params.mr_info.attn_input_scaling_factor_offset =
-            (is_lsa_only || recipe != NCCL_EP_DISP_QUANT_FWD)
-                ? 0
-                : scales->win_offset;
+        params.mr_info.attn_input_scaling_factor_offset = 0;
+        if (!is_lsa_only && scales_forward) {
+            params.mr_info.attn_input_scaling_factor_offset = scales->win_offset;
+        }
         params.mr_info.gin_send_staging_offset =
             is_lsa_only ? 0 : group->gin_config.gin_send_staging_offset;
         params.mr_info.gin_recv_staging_offset =
@@ -3905,11 +3890,9 @@ ncclResult_t ncclEpDispatch(
         params.max_recv_tokens_per_rank = group->max_recv_tokens;
 
         // Call dispatch kernel
-        const int sf_bytes_per_token =
-            recipe == NCCL_EP_DISP_QUANT_FWD
-                ? num_scales_per_token * scale_elem_bytes
-                : 0;
-        if (recipe == NCCL_EP_DISP_QUANT_FWD) {
+        int sf_bytes_per_token = 0;
+        if (scales_forward) {
+            sf_bytes_per_token = num_scales_per_token * scale_elem_bytes;
             params.scale_dtype = scales->datatype;
         }
         NCCLCHECK(

@@ -280,10 +280,9 @@ typedef struct {
     //   ncclEpDispatch.
     //   LL: unused. LL buffers are always sized automatically, pass NCCL_EP_AUTO.
     unsigned int max_recv_tokens_per_rank;
-    // Upper bound on token-row bytes per token, covering both dispatch and combine.
-    // QUANT_FWD scale rows have the same independent byte bound; LL requires
-    // their combined message payload to fit. Per-call sizes flow through the
-    // tensors and may be smaller; this is byte-oriented.
+    // Upper bound on token-row bytes per token, covering dispatch and combine.
+    // For quantized transmission, quantized token data and scales must fit within this budget.
+    // Per-call sizes may be smaller; this is byte-oriented.
     // HT requires this configured upper bound to be a multiple of 16 bytes.
     unsigned int max_token_bytes;
     // RDMA buffer size in bytes for LL mode. Two modes:

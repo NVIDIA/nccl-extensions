@@ -68,7 +68,7 @@ inline std::string ll_dispatch_jit_source(
         << "      p.currRank, p.numRanks,\n"
         << "      p.numWarpGroups, p.numWarpsPerGroup,\n"
         << "      p.roundScale, p.recvTopkIdxKind, p.phases, p.numComms,\n"
-        << "      p.devComms, p.windows, p.signalsBase, p.timeoutCycles,\n"
+        << "      p.devComms, p.windows, p.signalsBase, p.signalGen, p.timeoutCycles,\n"
         << "      p.recvDataWindow, p.recvDataOffset, p.rcvScalesWin, p.rcvScalesOffs);\n"
         << "}\n";
     return src.str();

@@ -13,9 +13,37 @@
 #include "quantization_recipe.hpp"
 
 #include <algorithm>
+#include <atomic>
 
 namespace nccl_ep {
 namespace ll {
+
+// ----------------------------------------------------------------------------
+// LL P2P signal generations.
+//
+// The LL count/flag slots are addressed by offsets into the group's rdma_buffer,
+// but the parity that selects them (`handle->ll.buffer_idx`) is per-handle. Two
+// handles on one group therefore alias the same slots while advancing parity
+// independently, so a poll can observe a sibling handle's value -- and because the
+// values are workload-determined (finish flags are the constant 1) it is
+// indistinguishable from the one being waited for.
+//
+// Stamping every launch with a monotonically increasing generation, and accepting a
+// signal only when its generation matches, makes any foreign or leftover value inert.
+// Ranks run the same LL call sequence, so a per-process counter stays consistent
+// across them; a SEND-phase launch advances it and a RECV-only launch reuses it.
+// ----------------------------------------------------------------------------
+namespace {
+std::atomic<unsigned> gLlDispatchGen{0};
+std::atomic<unsigned> gLlCombineGen{0};
+// Never 0, so an all-zero (freshly cleaned) slot can never look like a valid signal.
+inline unsigned llNextGen(std::atomic<unsigned>& ctr, int phases) {
+    unsigned c = (phases & LOW_LATENCY_SEND_PHASE)
+                     ? ctr.fetch_add(1, std::memory_order_relaxed) + 1
+                     : ctr.load(std::memory_order_relaxed);
+    return (c - 1u) % 0x7fffu + 1u;
+}
+}  // namespace
 
 // Forward-declare the host-side `ceil_div` helper used here. `common.hpp`
 // provides templated ceil_div in namespace nccl_ep; we reuse it via ADL.
@@ -92,6 +120,7 @@ ncclResult_t call_dispatch(
     args.devComms = params.devComms;
     args.windows = params.windows;
     args.signalsBase = params.signalsBase;
+    args.signalGen = llNextGen(gLlDispatchGen, params.phases);
     args.timeoutCycles = params.timeoutCycles;
     args.recvDataWindow = params.recvDataWindow;
     args.recvDataOffset = params.recvDataOffset;
@@ -196,6 +225,7 @@ void call_combine(const CombineParams& params, cudaStream_t stream) {
     args.devComms = params.devComms;
     args.windows = params.windows;
     args.signalsBase = params.signalsBase;
+    args.signalGen = llNextGen(gLlCombineGen, params.phases);
     args.timeoutCycles = params.timeoutCycles;
 
     jit::launch_ll_combine(

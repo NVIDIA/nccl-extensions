@@ -5,6 +5,7 @@
 
 #include "test_common.h"
 #include "quantization_recipe.hpp"
+#include "../nccl_ep_test_internal.h"
 
 #include <algorithm>
 #include <numeric>
@@ -759,6 +760,134 @@ TEST_F(QuantizationRecipeTest, HtExpertMajorScalesForwardWindowedAutoPreservesPa
     run_ht_expert_major_scales_forward_packed_fp4(
         /*windowed_outputs=*/true,
         NCCL_EP_ZERO_COPY_AUTO);
+}
+
+// Eager (max_recv_tokens_per_rank = NCCL_EP_AUTO) expert-major scales-forward dispatch
+// must accept recv token and scale buffers sized to the per-step recv count, which is
+// below the worst-case max_recv_tokens budget.
+static void run_ht_em_scales_forward_eager_below_budget() {
+    if (g_nranks != 4) GTEST_SKIP() << "requires exactly four ranks";
+
+    constexpr int kHtTokens = 16;
+    constexpr int kTopK2 = 2;
+    constexpr int kLogicalHidden = 256;
+    constexpr int kPackedHidden = kLogicalHidden / 2;
+    constexpr int kScaleBytes = kLogicalHidden / 16;
+    constexpr int kExpertsPerRank = 2;
+    constexpr int kAlignment = 32;
+    // Worst-case per-rank recv budget the eager mode derives internally.
+    constexpr int kBudget = 4 * kHtTokens * kTopK2;
+
+    ncclEpGroupConfig_t group_config = NCCL_EP_GROUP_CONFIG_INIT;
+    group_config.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+    group_config.num_experts = kNumExperts;
+    group_config.max_dispatch_tokens_per_rank = kHtTokens;
+    group_config.max_recv_tokens_per_rank = NCCL_EP_AUTO;  // eager
+    group_config.max_token_bytes = kLogicalHidden * sizeof(nv_bfloat16);
+    group_config.rdma_buffer_size = NCCL_EP_AUTO;
+    group_config.num_qp_per_rank = NCCL_EP_AUTO;
+    group_config.num_channels = NCCL_EP_AUTO;
+    group_config.num_topk = kTopK2;
+    group_config.zero_copy = NCCL_EP_ZERO_COPY_AUTO;
+
+    ncclEpGroup_t group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&group, g_comm, &group_config));
+
+    // Balanced routing: every token targets its dst_rank's two local experts, so
+    // each rank's padded recv total stays well below the budget.
+    std::vector<int64_t> h_topk(static_cast<size_t>(kHtTokens) * kTopK2);
+    std::vector<float> h_topk_weights(static_cast<size_t>(kHtTokens) * kTopK2, 1.0f);
+    std::vector<uint8_t> h_tokens(static_cast<size_t>(kHtTokens) * kPackedHidden);
+    std::vector<uint8_t> h_scales(static_cast<size_t>(kHtTokens) * kScaleBytes);
+    for (int token = 0; token < kHtTokens; ++token) {
+        const int dst_rank = token % 4;
+        h_topk[token * kTopK2] = dst_rank * kExpertsPerRank;
+        h_topk[token * kTopK2 + 1] = dst_rank * kExpertsPerRank + 1;
+        for (int byte = 0; byte < kPackedHidden; ++byte)
+            h_tokens[token * kPackedHidden + byte] = ht_em_token_byte(g_rank, token, byte);
+        for (int byte = 0; byte < kScaleBytes; ++byte)
+            h_scales[token * kScaleBytes + byte] = ht_em_scale_byte(g_rank, token, byte);
+    }
+
+    int64_t* d_topk = nullptr;
+    float* d_topk_weights = nullptr;
+    uint8_t *d_tokens = nullptr, *d_scales = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_topk, h_topk.size() * sizeof(int64_t)));
+    CUDA_ASSERT(cudaMalloc(&d_topk_weights, h_topk_weights.size() * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_tokens, h_tokens.size()));
+    CUDA_ASSERT(cudaMalloc(&d_scales, h_scales.size()));
+    CUDA_ASSERT(cudaMemcpy(d_topk, h_topk.data(), h_topk.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(
+        d_topk_weights, h_topk_weights.data(), h_topk_weights.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_tokens, h_tokens.data(), h_tokens.size(), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_scales, h_scales.data(), h_scales.size(), cudaMemcpyHostToDevice));
+
+    ncclEpTensor_t *topk = nullptr, *topk_weights = nullptr, *tokens = nullptr, *scales = nullptr;
+    NCCL_ASSERT(epTensorCreate(&topk, 2, ncclInt64, d_topk, kHtTokens, kTopK2));
+    NCCL_ASSERT(epTensorCreate(&topk_weights, 2, ncclFloat32, d_topk_weights, kHtTokens, kTopK2));
+    NCCL_ASSERT(epTensorCreate(&tokens, 2, ncclUint8, d_tokens, kHtTokens, kPackedHidden));
+    NCCL_ASSERT(epTensorCreate(&scales, 2, ncclUint8, d_scales, kHtTokens, kScaleBytes));
+
+    ncclEpHandleConfig_t handle_config = NCCL_EP_HANDLE_CONFIG_INIT;
+    handle_config.dispatch_output_per_expert_alignment = kAlignment;
+    ncclEpHandle_t handle = nullptr;
+    NCCL_ASSERT(ncclEpCreateHandle(
+        &handle, group, NCCL_EP_LAYOUT_EXPERT_MAJOR, topk, nullptr, &handle_config, g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+
+    // Per-step recv count the eager caller sizes its recv buffers from.
+    unsigned int recv_rows = 0;
+    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(handle, &recv_rows));
+    ASSERT_GT(recv_rows, 0u);
+    ASSERT_LT(recv_rows, static_cast<unsigned int>(kBudget))
+        << "routing must leave the per-step recv count below the budget for this regression";
+
+    uint8_t *d_recv_tokens = nullptr, *d_recv_scales = nullptr;
+    float* d_recv_topk_weights = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_recv_tokens, static_cast<size_t>(recv_rows) * kPackedHidden));
+    CUDA_ASSERT(cudaMalloc(&d_recv_scales, static_cast<size_t>(recv_rows) * kScaleBytes));
+    CUDA_ASSERT(cudaMalloc(&d_recv_topk_weights, static_cast<size_t>(recv_rows) * sizeof(float)));
+
+    ncclEpTensor_t *recv_tokens = nullptr, *recv_scales = nullptr, *recv_topk_weights = nullptr;
+    NCCL_ASSERT(epTensorCreate(&recv_tokens, 2, ncclUint8, d_recv_tokens, recv_rows, kPackedHidden));
+    NCCL_ASSERT(epTensorCreate(&recv_scales, 2, ncclUint8, d_recv_scales, recv_rows, kScaleBytes));
+    NCCL_ASSERT(epTensorCreate(&recv_topk_weights, 1, ncclFloat32, d_recv_topk_weights, recv_rows));
+
+    ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    inputs.tokens = tokens;
+    inputs.scales = scales;
+    inputs.topk_weights = topk_weights;
+    outputs.tokens = recv_tokens;
+    outputs.scales = recv_scales;
+    outputs.topk_weights = recv_topk_weights;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
+
+    ASSERT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclSuccess);
+    ASSERT_EQ(ncclEpComplete(handle, nullptr, g_stream), ncclSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+    ncclEpTensorDestroy(topk);
+    ncclEpTensorDestroy(topk_weights);
+    ncclEpTensorDestroy(tokens);
+    ncclEpTensorDestroy(scales);
+    ncclEpTensorDestroy(recv_tokens);
+    ncclEpTensorDestroy(recv_scales);
+    ncclEpTensorDestroy(recv_topk_weights);
+    cudaFree(d_topk);
+    cudaFree(d_topk_weights);
+    cudaFree(d_tokens);
+    cudaFree(d_scales);
+    cudaFree(d_recv_tokens);
+    cudaFree(d_recv_scales);
+    cudaFree(d_recv_topk_weights);
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
+}
+
+TEST_F(QuantizationRecipeTest, HtExpertMajorScalesForwardEagerAcceptsBelowBudgetRecvScales) {
+    run_ht_em_scales_forward_eager_below_budget();
 }
 
 TEST_F(QuantizationRecipeTest, DispatchNoneRejectsScaleTensors) {

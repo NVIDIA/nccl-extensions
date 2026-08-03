@@ -4062,7 +4062,7 @@ ncclResult_t ncclEpDispatch(
             const void* perm_flat_scale_staging = nullptr;
             int perm_scale_row_bytes = 0;
             if (recipe == NCCL_EP_DISP_QUANT_FWD) {
-                if (recv_scales->sizes[0] < static_cast<size_t>(group->max_recv_tokens)) {
+                if (recv_scales->sizes[0] < recv_copy_rows) {
                     return ncclInvalidArgument; // EM scale slots, like recv_x
                 }
                 perm_recv_scales_em = recv_scales->data;

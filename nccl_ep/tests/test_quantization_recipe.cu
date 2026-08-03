@@ -825,7 +825,7 @@ static void run_ht_em_scales_forward_eager_below_budget() {
     ncclEpTensor_t *topk = nullptr, *topk_weights = nullptr, *tokens = nullptr, *scales = nullptr;
     NCCL_ASSERT(epTensorCreate(&topk, 2, ncclInt64, d_topk, kHtTokens, kTopK2));
     NCCL_ASSERT(epTensorCreate(&topk_weights, 2, ncclFloat32, d_topk_weights, kHtTokens, kTopK2));
-    NCCL_ASSERT(epTensorCreate(&tokens, 2, ncclUint8, d_tokens, kHtTokens, kPackedHidden));
+    NCCL_ASSERT(epTensorCreate(&tokens, 2, ncclFloat4x2, d_tokens, kHtTokens, kPackedHidden));
     NCCL_ASSERT(epTensorCreate(&scales, 2, ncclUint8, d_scales, kHtTokens, kScaleBytes));
 
     ncclEpHandleConfig_t handle_config = NCCL_EP_HANDLE_CONFIG_INIT;
@@ -849,7 +849,7 @@ static void run_ht_em_scales_forward_eager_below_budget() {
     CUDA_ASSERT(cudaMalloc(&d_recv_topk_weights, static_cast<size_t>(recv_rows) * sizeof(float)));
 
     ncclEpTensor_t *recv_tokens = nullptr, *recv_scales = nullptr, *recv_topk_weights = nullptr;
-    NCCL_ASSERT(epTensorCreate(&recv_tokens, 2, ncclUint8, d_recv_tokens, recv_rows, kPackedHidden));
+    NCCL_ASSERT(epTensorCreate(&recv_tokens, 2, ncclFloat4x2, d_recv_tokens, recv_rows, kPackedHidden));
     NCCL_ASSERT(epTensorCreate(&recv_scales, 2, ncclUint8, d_recv_scales, recv_rows, kScaleBytes));
     NCCL_ASSERT(epTensorCreate(&recv_topk_weights, 1, ncclFloat32, d_recv_topk_weights, recv_rows));
 

@@ -5241,6 +5241,10 @@ __device__ __forceinline__ void local_permute_dup(
                 for (int k = 0; k < top_k; ++k) {
                     const int32_t es = __ldg(slot_row + k);
                     if (es < 0) continue;
+                    // Per-slot capacity backstop: a map entry past the caller buffer
+                    // means the scan's drop guard failed — trap instead of an OOB
+                    // write (the aggregate offsets check above cannot see this).
+                    EP_DEVICE_ASSERT(es < caller_num_recv_tokens);
                     if (c < kMaxActivePerToken) s_active[warp_id][c] = es;
                     if (copy_weights) {
                         recv_topk_weights_em[es] = recv_topk_weights_flat[static_cast<size_t>(token) * top_k + k];
@@ -5313,6 +5317,7 @@ struct local_permute_reduce_param_t {
     float* flat_weights_out;
     int top_k;
     int row_bytes;
+    int caller_num_recv_tokens;   // caller EM buffer row capacity (slot backstop)
 };
 
 // Direct-load reduce: each slot's row is reduced by a 128-thread sub-warp;
@@ -5330,7 +5335,8 @@ __device__ __forceinline__ void local_permute_reduce(
     const float* __restrict__ em_weights_in,
     float* __restrict__ flat_weights_out,
     int top_k,
-    int /*row_bytes*/) {
+    int /*row_bytes*/,
+    int caller_num_recv_tokens) {
     constexpr int kRowBytes = HiddenInt4 * 16;
 
     constexpr int kThreadsPerSlot = 128;
@@ -5362,6 +5368,9 @@ __device__ __forceinline__ void local_permute_reduce(
         if (slot_valid && lane < 32) {
             const int32_t* slot_row_global = flat2em_slot_map + static_cast<size_t>(slot) * top_k;
             const int32_t s = (lane < top_k) ? __ldg(slot_row_global + lane) : -1;
+            // Per-slot capacity backstop (mirror of local_permute_dup): a map entry
+            // past the caller EM buffer means the scan's drop guard failed.
+            EP_DEVICE_ASSERT(s < caller_num_recv_tokens);
             if (em_weights_in != nullptr && lane < top_k) {
                 flat_weights_out[static_cast<size_t>(slot) * top_k + lane] = (s >= 0) ? em_weights_in[s] : 0.0f;
             }

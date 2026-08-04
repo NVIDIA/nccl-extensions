@@ -430,7 +430,8 @@ inline std::string local_permute_reduce_jit_source(
         << "      p.em_weights_in,\n"
         << "      p.flat_weights_out,\n"
         << "      p.top_k,\n"
-        << "      p.row_bytes);\n"
+        << "      p.row_bytes,\n"
+        << "      p.caller_num_recv_tokens);\n"
         << "}\n";
     return src.str();
 }

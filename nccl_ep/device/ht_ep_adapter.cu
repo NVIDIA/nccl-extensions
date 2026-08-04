@@ -1649,6 +1649,7 @@ void launch_combine_reduce(
     float* flat_weights_out,
     int top_k,
     int row_bytes,
+    int caller_num_recv_tokens,
     int sm_count,
     unsigned int shuffle_sms,
     cudaStream_t stream,
@@ -1669,6 +1670,7 @@ void launch_combine_reduce(
     p.flat_weights_out = flat_weights_out;
     p.top_k = top_k;
     p.row_bytes = row_bytes;
+    p.caller_num_recv_tokens = caller_num_recv_tokens;
 
     ::nccl_ep::ht::jit::launch_local_permute_reduce(
         top_k,

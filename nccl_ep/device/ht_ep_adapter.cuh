@@ -274,6 +274,7 @@ void launch_combine_reduce(
     float* flat_weights_out,
     int top_k,
     int row_bytes,
+    int caller_num_recv_tokens,
     int sm_count,
     unsigned int shuffle_sms,
     cudaStream_t stream,

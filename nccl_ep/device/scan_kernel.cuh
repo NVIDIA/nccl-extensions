@@ -297,7 +297,9 @@ __device__ __forceinline__ void write_local_routing(
     int experts_per_rank,
     // EM-permute related params
     int32_t* flat2em_slot_map = nullptr,
-    int em_top_k = 0) {
+    int em_top_k = 0,
+    bool allow_overflow_drop = false,
+    int max_recv_tokens_per_rank = 0) {
     
     // Protect from writing invalid and overflowing slots
     bool lane_participates =
@@ -336,7 +338,14 @@ __device__ __forceinline__ void write_local_routing(
                 const int within = __popc(expert_mask & ((1u << g.lane_id) - 1u));
                 const int em_slot = smem.expert_base[k] + pref_k + within;
                 if (em_k < em_top_k) {
-                    flat2em_slot_map[static_cast<size_t>(local_rank_slot) * em_top_k + em_k] = em_slot;
+                    // Drop policy: a slot at/above capacity would OOB the recv buffer
+                    // (expert_base stays the unclamped padded prefix); emit the -1
+                    // sentinel AT POSITION so the entry keeps pairing with the k-th
+                    // LERM hit / FLAT-scratch weight. Mirrors build_em_tables_impl.
+                    const bool dropped =
+                        allow_overflow_drop && slot_overflows(em_slot, max_recv_tokens_per_rank);
+                    flat2em_slot_map[static_cast<size_t>(local_rank_slot) * em_top_k + em_k] =
+                        dropped ? -1 : em_slot;
                 }
                 em_k++;
             }
@@ -486,7 +495,9 @@ __device__ __forceinline__ void assign_recv_slots(
             local_rank,
             experts_per_rank,
             flat2em_slot_map,
-            em_top_k);
+            em_top_k,
+            allow_overflow_drop,
+            max_recv_tokens_per_rank);
 
         // EM-permute updates warp_expert_prefix in smem; keep the warp converged
         // before the next tile re-reads it.

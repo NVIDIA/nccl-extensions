@@ -3807,6 +3807,13 @@ ncclResult_t ncclEpDispatch(
                 recv_copy_rows);
             return ncclInvalidArgument;
         }
+        // Zero-recv FWD (eager): recv outputs may be legally empty (data == nullptr),
+        // but token and weight outputs must agree on emptiness — they are rows of the
+        // same recv set.
+        if (forward_dispatch && recv_topk_weights != nullptr &&
+            tensorIsEmpty(recv_topk_weights) != tensorIsEmpty(recv_x)) {
+            return ncclInvalidArgument;
+        }
 
         // EM-permute path runs the dispatch kernel in FLAT layout and reshuffles
         // FLAT staging into EM zones via the local permute kernel below. BWD
@@ -4044,6 +4051,11 @@ ncclResult_t ncclEpDispatch(
         if (em_permute_active) {
             // BWD passes recv_topk_weights == nullptr (weights are FWD-only).
             assert(forward_dispatch ? (recv_topk_weights != nullptr) : (recv_topk_weights == nullptr));
+            // Zero-recv FWD (eager): the caller's outputs are legally empty
+            // (data == nullptr; emptiness consistency validated pre-kernel above).
+            // There are no weights to deliver, so drop BOTH halves of the
+            // FLAT->EM weight pair.
+            const bool deliver_weights = forward_dispatch && !tensorIsEmpty(recv_x);
             if (recipe == NCCL_EP_DISP_QUANT_NONE) {
                 if (!validate_dtype(recv_x->datatype)) {
                     // local_permute_dup is a byte-relocation kernel: any NONE-mode wire
@@ -4061,7 +4073,12 @@ ncclResult_t ncclEpDispatch(
             void* perm_recv_scales_em = nullptr;
             const void* perm_flat_scale_staging = nullptr;
             int perm_scale_row_bytes = 0;
-            if (recipe == NCCL_EP_DISP_QUANT_FWD) {
+            // Zero-recv FWD (eager): recv_scales is legally empty (data == nullptr)
+            // whenever recv_x is — the recipe validation ties their row counts — so
+            // there are no scale rows to relocate.
+            const bool deliver_scales =
+                recipe == NCCL_EP_DISP_QUANT_FWD && !tensorIsEmpty(recv_x);
+            if (deliver_scales) {
                 if (recv_scales->sizes[0] < recv_copy_rows) {
                     return ncclInvalidArgument; // EM scale slots, like recv_x
                 }
@@ -4100,9 +4117,9 @@ ncclResult_t ncclEpDispatch(
             }
             nccl_ep::ht::launch_dispatch_permute(
                 recv_x->data,
-                recv_topk_weights ? static_cast<float*>(recv_topk_weights->data) : nullptr,
+                deliver_weights ? static_cast<float*>(recv_topk_weights->data) : nullptr,
                 group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->lsa_rank],
-                forward_dispatch ? handle->ht.recv_topk_weights_flat : nullptr,
+                deliver_weights ? handle->ht.recv_topk_weights_flat : nullptr,
                 handle->ht.flat2em_slot_map,
                 handle->ht.num_tokens_for_experts,
                 handle->ht.expert_token_offsets,
@@ -4444,6 +4461,12 @@ ncclResult_t ncclEpCombine(
             num_topk = static_cast<int>(combined_topk_weights->sizes[1]);
             // Input shape validation by layout — must match FWD recv_topk_weights.
             assert(topk_weights->datatype == ncclFloat32);
+            // Zero-recv BWD (eager): grad rows and their weight grads are rows of
+            // the same recv set, so their emptiness must agree; a mismatch is a
+            // malformed call, not a zero-work one.
+            if (tensorIsEmpty(topk_weights) != tensorIsEmpty(x)) {
+                return ncclInvalidArgument;
+            }
             if (expert_major_in) {
                 assert(topk_weights->ndim == 1 && "HT EM BWD combine: input topk_weights must be 1D [num_recv_tokens]");
                 input_topk_stride = 1;
@@ -4518,7 +4541,12 @@ ncclResult_t ncclEpCombine(
                 static_cast<int>(combine_x_uses_external_window),
                 static_cast<int>(em_permute_combine));
         }
-        const bool em_permute_bwd_weights = em_permute_combine && backward_combine && expert_major_in;
+        // Zero-recv BWD: no weight grads to gather — drop BOTH halves of the
+        // EM->FLAT pair so the launcher's null-pairing assert keeps guarding
+        // half-pairs on nonempty calls. The FLAT scratch's only consumer is the
+        // dense-prob scatter below, which is a no-op at num_tokens == 0.
+        const bool em_permute_bwd_weights =
+            em_permute_combine && backward_combine && expert_major_in && !tensorIsEmpty(x);
         // em-permute combine always runs the local_permute_reduce gather
         // (caller EM x -> FLAT staging), regardless of external-window — x->data
         // is the resolved device pointer either way.

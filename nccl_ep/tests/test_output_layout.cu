@@ -722,6 +722,322 @@ TEST_F(OutputLayoutTest, EagerRecvSizeFromLayoutInfo) {
     NCCL_ASSERT(ncclEpGroupDestroy(eager_group));
 }
 
+// Eager zero-recv: a rank that receives ZERO tokens is a legal routing outcome
+// (skewed router), and eager mode then sizes its recv outputs to 0 rows — empty
+// descriptors with data == nullptr. Every leg of the fwd/bwd round trip must
+// accept them: the rank still participates in the collectives, its kernels are
+// count-bounded no-ops. Also verifies the emptiness-consistency rejects: token
+// and weight tensors of the same recv set must agree on emptiness, and the
+// reject fires on the host BEFORE any collective kernel launches (uniform
+// ncclInvalidArgument on every rank, no wedged group).
+//
+// Routing: every token on every rank → expert 0 (hosted on rank 0), top-k 1.
+// Rank 0 receives g_nranks * kNumTokens tokens; all other ranks receive zero.
+TEST_F(OutputLayoutTest, EagerZeroRecv) {
+    ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
+    gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+    gcfg.num_experts = kNumExperts;
+    gcfg.max_dispatch_tokens_per_rank = kNumTokens;
+    gcfg.max_token_bytes = kHidden * sizeof(nv_bfloat16);
+    gcfg.rdma_buffer_size = NCCL_EP_AUTO;
+    gcfg.num_qp_per_rank = NCCL_EP_AUTO;
+    gcfg.num_channels = NCCL_EP_AUTO;
+    gcfg.max_recv_tokens_per_rank = NCCL_EP_AUTO; // eager mode
+    gcfg.num_topk = kTopK;
+    ncclEpGroup_t eager_group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&eager_group, g_comm, &gcfg));
+
+    // Skewed routing: all tokens → expert 0.
+    int64_t h_idx[kNumTokens];
+    for (int i = 0; i < kNumTokens; ++i) h_idx[i] = 0;
+    int64_t* d_idx = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_idx, sizeof(h_idx)));
+    CUDA_ASSERT(cudaMemcpy(d_idx, h_idx, sizeof(h_idx), cudaMemcpyHostToDevice));
+    ncclEpTensor_t* t_idx = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_idx, 2, ncclInt64, d_idx, kNumTokens, kTopK));
+
+    // Distinct, exactly-representable per-token payloads and weights:
+    // token (r, i): value = r*kNumTokens + i + 1, weight = r*kNumTokens + i + 0.5.
+    std::vector<nv_bfloat16> h_tok(kNumTokens * kHidden);
+    std::vector<float> h_w(kNumTokens * kTopK);
+    for (int i = 0; i < kNumTokens; ++i) {
+        const float v = static_cast<float>(g_rank * kNumTokens + i + 1);
+        for (int hh = 0; hh < kHidden; ++hh) h_tok[i * kHidden + hh] = __float2bfloat16(v);
+        h_w[i] = static_cast<float>(g_rank * kNumTokens + i) + 0.5f;
+    }
+    nv_bfloat16* d_tok = nullptr;
+    float* d_w = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_tok, kNumTokens * kHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_w, kNumTokens * kTopK * sizeof(float)));
+    CUDA_ASSERT(cudaMemcpy(d_tok, h_tok.data(), kNumTokens * kHidden * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_w, h_w.data(), kNumTokens * kTopK * sizeof(float), cudaMemcpyHostToDevice));
+    ncclEpTensor_t *t_tok = nullptr, *t_w = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_tok, 2, ncclBfloat16, d_tok, kNumTokens, kHidden));
+    NCCL_ASSERT(epTensorCreate(&t_w, 2, ncclFloat32, d_w, kNumTokens, kTopK));
+
+    // Expected multisets on rank 0 (every rank's tokens land there).
+    std::multiset<float> expected_vals, expected_ws;
+    for (int r = 0; r < g_nranks; ++r)
+        for (int i = 0; i < kNumTokens; ++i) {
+            expected_vals.insert(static_cast<float>(r * kNumTokens + i + 1));
+            expected_ws.insert(static_cast<float>(r * kNumTokens + i) + 0.5f);
+        }
+
+    // ── EM (expert-major local-permute — the path with the zero-recv gaps) ──
+    ncclEpHandle_t h = nullptr;
+    NCCL_ASSERT(ncclEpCreateHandle(
+        &h, eager_group, NCCL_EP_LAYOUT_EXPERT_MAJOR, t_idx, nullptr, nullptr, g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+    unsigned int num_recv = ~0u;
+    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+    const unsigned int want_recv = (g_rank == 0) ? static_cast<unsigned int>(g_nranks * kNumTokens) : 0u;
+    EXPECT_EQ(num_recv, want_recv) << "Rank " << g_rank << ": skewed-routing recv count";
+    const bool zero_recv = (num_recv == 0);
+
+    // Recv outputs sized to the actual recv total: real buffers on rank 0,
+    // present-but-EMPTY descriptors (0 rows, data == nullptr — what a 0-byte
+    // torch allocation hands the library) on the zero-recv ranks.
+    nv_bfloat16* d_recv = nullptr;
+    float* d_recv_w = nullptr;
+    if (!zero_recv) {
+        CUDA_ASSERT(cudaMalloc(&d_recv, num_recv * kHidden * sizeof(nv_bfloat16)));
+        CUDA_ASSERT(cudaMalloc(&d_recv_w, num_recv * sizeof(float)));
+        CUDA_ASSERT(cudaMemset(d_recv, 0, num_recv * kHidden * sizeof(nv_bfloat16)));
+        CUDA_ASSERT(cudaMemset(d_recv_w, 0, num_recv * sizeof(float)));
+    }
+    ncclEpTensor_t *t_recv = nullptr, *t_recv_w = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_recv, 2, ncclBfloat16, d_recv, num_recv, kHidden));
+    NCCL_ASSERT(epTensorCreate(&t_recv_w, 1, ncclFloat32, d_recv_w, num_recv));
+
+    // 1) FWD dispatch with empty recv descriptors on the zero-recv ranks.
+    {
+        ncclEpDispatchInputs_t d_in = NCCL_EP_DISPATCH_INPUTS_INIT;
+        ncclEpDispatchOutputs_t d_out = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+        d_in.tokens = t_tok;
+        d_in.topk_weights = t_w;
+        d_out.tokens = t_recv;
+        d_out.topk_weights = t_recv_w;
+        ncclEpDispatchConfig_t dcfg = NCCL_EP_DISPATCH_CONFIG_INIT;
+        EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclSuccess)
+            << "Rank " << g_rank << ": zero-recv FWD dispatch must accept empty recv outputs";
+        EXPECT_EQ(ncclEpComplete(h, nullptr, g_stream), ncclSuccess);
+        EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+
+        if (!zero_recv) {
+            std::vector<nv_bfloat16> h_recv(num_recv * kHidden);
+            std::vector<float> h_recv_w(num_recv);
+            CUDA_ASSERT(cudaMemcpy(
+                h_recv.data(), d_recv, num_recv * kHidden * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+            CUDA_ASSERT(cudaMemcpy(h_recv_w.data(), d_recv_w, num_recv * sizeof(float), cudaMemcpyDeviceToHost));
+            std::multiset<float> got_vals, got_ws;
+            for (unsigned int s = 0; s < num_recv; ++s) {
+                got_vals.insert(__bfloat162float(h_recv[s * kHidden]));
+                got_ws.insert(h_recv_w[s]);
+            }
+            EXPECT_EQ(got_vals, expected_vals) << "Rank 0: recv payload must be every sender's tokens";
+            EXPECT_EQ(got_ws, expected_ws) << "Rank 0: recv weights must be every sender's weights";
+        }
+    }
+
+    // 2) FWD emptiness-mismatch → uniform host-side reject BEFORE any kernel:
+    //    rank 0 pairs its real recv_x with an EMPTY weights descriptor; the
+    //    zero-recv ranks pair their empty recv_x with a 1-row weights buffer.
+    {
+        float* d_w1 = nullptr;
+        CUDA_ASSERT(cudaMalloc(&d_w1, sizeof(float)));
+        ncclEpTensor_t *t_w_bad = nullptr;
+        if (zero_recv) {
+            NCCL_ASSERT(epTensorCreate(&t_w_bad, 1, ncclFloat32, d_w1, 1));
+        } else {
+            NCCL_ASSERT(epTensorCreate(&t_w_bad, 1, ncclFloat32, nullptr, 0));
+        }
+        ncclEpDispatchInputs_t d_in = NCCL_EP_DISPATCH_INPUTS_INIT;
+        ncclEpDispatchOutputs_t d_out = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+        d_in.tokens = t_tok;
+        d_in.topk_weights = t_w;
+        d_out.tokens = t_recv;
+        d_out.topk_weights = t_w_bad;
+        ncclEpDispatchConfig_t dcfg = NCCL_EP_DISPATCH_CONFIG_INIT;
+        EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclInvalidArgument)
+            << "Rank " << g_rank << ": recv token/weight emptiness mismatch must be rejected";
+        ncclEpTensorDestroy(t_w_bad);
+        cudaFree(d_w1);
+    }
+
+    // 3) BWD combine (= dispatch backward): grads flow expert-side → token
+    //    owners. Zero-recv ranks contribute EMPTY inputs yet receive their own
+    //    tokens' grads back (participate-as-receiver). Identity grads: feed the
+    //    FWD recv outputs straight back in.
+    nv_bfloat16* d_comb_x = nullptr;
+    float* d_comb_w = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_comb_x, kNumTokens * kHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_comb_w, kNumTokens * kTopK * sizeof(float)));
+    CUDA_ASSERT(cudaMemset(d_comb_w, 0, kNumTokens * kTopK * sizeof(float)));
+    ncclEpTensor_t *t_comb_x = nullptr, *t_comb_w = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_comb_x, 2, ncclBfloat16, d_comb_x, kNumTokens, kHidden));
+    NCCL_ASSERT(epTensorCreate(&t_comb_w, 2, ncclFloat32, d_comb_w, kNumTokens, kTopK));
+    {
+        ncclEpCombineInputs_t c_in = NCCL_EP_COMBINE_INPUTS_INIT;
+        ncclEpCombineOutputs_t c_out = NCCL_EP_COMBINE_OUTPUTS_INIT;
+        c_in.tokens = t_recv;
+        c_in.topk_weights = t_recv_w; // 1D for EM
+        c_out.tokens = t_comb_x;
+        c_out.topk_weights = t_comb_w;
+        ncclEpCombineConfig_t ccfg = NCCL_EP_COMBINE_CONFIG_INIT;
+        ccfg.pass_direction = NCCL_EP_BWD_PASS;
+        EXPECT_EQ(ncclEpCombine(h, &c_in, &c_out, &ccfg, g_stream), ncclSuccess)
+            << "Rank " << g_rank << ": zero-recv BWD combine must accept empty grad inputs";
+        EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+
+        std::vector<float> h_comb_w(kNumTokens * kTopK);
+        CUDA_ASSERT(cudaMemcpy(
+            h_comb_w.data(), d_comb_w, kNumTokens * kTopK * sizeof(float), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < kNumTokens; ++i) {
+            EXPECT_NEAR(h_comb_w[i], h_w[i], 1e-4f)
+                << "Rank " << g_rank << " token " << i << ": weight grad must round-trip";
+        }
+    }
+
+    // 4) BWD emptiness-mismatch → uniform host-side reject (pre-kernel).
+    {
+        float* d_w1 = nullptr;
+        CUDA_ASSERT(cudaMalloc(&d_w1, sizeof(float)));
+        ncclEpTensor_t* t_w_bad = nullptr;
+        if (zero_recv) {
+            NCCL_ASSERT(epTensorCreate(&t_w_bad, 1, ncclFloat32, d_w1, 1));
+        } else {
+            NCCL_ASSERT(epTensorCreate(&t_w_bad, 1, ncclFloat32, nullptr, 0));
+        }
+        ncclEpCombineInputs_t c_in = NCCL_EP_COMBINE_INPUTS_INIT;
+        ncclEpCombineOutputs_t c_out = NCCL_EP_COMBINE_OUTPUTS_INIT;
+        c_in.tokens = t_recv;
+        c_in.topk_weights = t_w_bad;
+        c_out.tokens = t_comb_x;
+        c_out.topk_weights = t_comb_w;
+        ncclEpCombineConfig_t ccfg = NCCL_EP_COMBINE_CONFIG_INIT;
+        ccfg.pass_direction = NCCL_EP_BWD_PASS;
+        EXPECT_EQ(ncclEpCombine(h, &c_in, &c_out, &ccfg, g_stream), ncclInvalidArgument)
+            << "Rank " << g_rank << ": grad token/weight emptiness mismatch must be rejected";
+        ncclEpTensorDestroy(t_w_bad);
+        cudaFree(d_w1);
+    }
+
+    // 5) BWD dispatch (= combine backward): full grad input on every rank,
+    //    EMPTY grad_expert_out output on the zero-recv ranks. Already-safe leg;
+    //    pinned here so a refactor breaking the both-null convention fails a test.
+    {
+        std::vector<nv_bfloat16> h_tok2(kNumTokens * kHidden);
+        for (int i = 0; i < kNumTokens; ++i) {
+            const float v = 100.0f + static_cast<float>(g_rank * kNumTokens + i);
+            for (int hh = 0; hh < kHidden; ++hh) h_tok2[i * kHidden + hh] = __float2bfloat16(v);
+        }
+        nv_bfloat16* d_tok2 = nullptr;
+        CUDA_ASSERT(cudaMalloc(&d_tok2, kNumTokens * kHidden * sizeof(nv_bfloat16)));
+        CUDA_ASSERT(cudaMemcpy(
+            d_tok2, h_tok2.data(), kNumTokens * kHidden * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+        ncclEpTensor_t *t_tok2 = nullptr, *t_recv2 = nullptr;
+        NCCL_ASSERT(epTensorCreate(&t_tok2, 2, ncclBfloat16, d_tok2, kNumTokens, kHidden));
+        NCCL_ASSERT(epTensorCreate(&t_recv2, 2, ncclBfloat16, d_recv, num_recv, kHidden));
+
+        ncclEpDispatchInputs_t d_in = NCCL_EP_DISPATCH_INPUTS_INIT;
+        ncclEpDispatchOutputs_t d_out = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+        d_in.tokens = t_tok2;
+        d_out.tokens = t_recv2;
+        ncclEpDispatchConfig_t dcfg = NCCL_EP_DISPATCH_CONFIG_INIT;
+        dcfg.pass_direction = NCCL_EP_BWD_PASS;
+        EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclSuccess)
+            << "Rank " << g_rank << ": zero-recv BWD dispatch must accept an empty grad output";
+        EXPECT_EQ(ncclEpComplete(h, nullptr, g_stream), ncclSuccess);
+        EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+
+        if (!zero_recv) {
+            std::vector<nv_bfloat16> h_recv2(num_recv * kHidden);
+            CUDA_ASSERT(cudaMemcpy(
+                h_recv2.data(), d_recv, num_recv * kHidden * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+            std::multiset<float> got, want;
+            for (unsigned int s = 0; s < num_recv; ++s) got.insert(__bfloat162float(h_recv2[s * kHidden]));
+            for (int r = 0; r < g_nranks; ++r)
+                for (int i = 0; i < kNumTokens; ++i) want.insert(100.0f + static_cast<float>(r * kNumTokens + i));
+            EXPECT_EQ(got, want) << "Rank 0: BWD dispatch payload must be every sender's grads";
+        }
+        ncclEpTensorDestroy(t_tok2);
+        ncclEpTensorDestroy(t_recv2);
+        cudaFree(d_tok2);
+    }
+    NCCL_ASSERT(ncclEpHandleDestroy(h));
+
+    // ── FLAT layout: same zero-recv round trip through the non-permute path
+    //    (covers the dense_to_sparse_prob zero-grid guard: recv_copy_rows == 0).
+    {
+        ncclEpHandle_t hf = nullptr;
+        NCCL_ASSERT(ncclEpCreateHandle(
+            &hf, eager_group, NCCL_EP_LAYOUT_FLAT, t_idx, nullptr, nullptr, g_stream));
+        CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+        unsigned int num_recv_f = ~0u;
+        NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(hf, &num_recv_f));
+        EXPECT_EQ(num_recv_f, want_recv) << "Rank " << g_rank << ": FLAT skewed-routing recv count";
+
+        nv_bfloat16* d_recv_f = nullptr;
+        float* d_recv_wf = nullptr;
+        int64_t* d_recv_if = nullptr;
+        if (num_recv_f > 0) {
+            CUDA_ASSERT(cudaMalloc(&d_recv_f, num_recv_f * kHidden * sizeof(nv_bfloat16)));
+            CUDA_ASSERT(cudaMalloc(&d_recv_wf, num_recv_f * kTopK * sizeof(float)));
+            CUDA_ASSERT(cudaMalloc(&d_recv_if, num_recv_f * kTopK * sizeof(int64_t)));
+        }
+        ncclEpTensor_t *t_recv_f = nullptr, *t_recv_wf = nullptr, *t_recv_if = nullptr;
+        NCCL_ASSERT(epTensorCreate(&t_recv_f, 2, ncclBfloat16, d_recv_f, num_recv_f, kHidden));
+        NCCL_ASSERT(epTensorCreate(&t_recv_wf, 2, ncclFloat32, d_recv_wf, num_recv_f, kTopK));
+        NCCL_ASSERT(epTensorCreate(&t_recv_if, 2, ncclInt64, d_recv_if, num_recv_f, kTopK));
+
+        ncclEpDispatchInputs_t d_in = NCCL_EP_DISPATCH_INPUTS_INIT;
+        ncclEpDispatchOutputs_t d_out = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+        d_in.tokens = t_tok;
+        d_in.topk_weights = t_w;
+        d_out.tokens = t_recv_f;
+        d_out.topk_weights = t_recv_wf;
+        d_out.topk_idx = t_recv_if;
+        ncclEpDispatchConfig_t dcfg = NCCL_EP_DISPATCH_CONFIG_INIT;
+        EXPECT_EQ(ncclEpDispatch(hf, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclSuccess)
+            << "Rank " << g_rank << ": FLAT zero-recv FWD dispatch must accept empty recv outputs";
+        EXPECT_EQ(ncclEpComplete(hf, nullptr, g_stream), ncclSuccess);
+        EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+
+        if (num_recv_f > 0) {
+            std::vector<nv_bfloat16> h_recv_f(num_recv_f * kHidden);
+            CUDA_ASSERT(cudaMemcpy(
+                h_recv_f.data(), d_recv_f, num_recv_f * kHidden * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+            std::multiset<float> got;
+            for (unsigned int s = 0; s < num_recv_f; ++s) got.insert(__bfloat162float(h_recv_f[s * kHidden]));
+            EXPECT_EQ(got, expected_vals) << "Rank 0: FLAT recv payload must be every sender's tokens";
+        }
+
+        ncclEpTensorDestroy(t_recv_f);
+        ncclEpTensorDestroy(t_recv_wf);
+        ncclEpTensorDestroy(t_recv_if);
+        if (d_recv_f) cudaFree(d_recv_f);
+        if (d_recv_wf) cudaFree(d_recv_wf);
+        if (d_recv_if) cudaFree(d_recv_if);
+        NCCL_ASSERT(ncclEpHandleDestroy(hf));
+    }
+
+    ncclEpTensorDestroy(t_comb_x);
+    ncclEpTensorDestroy(t_comb_w);
+    cudaFree(d_comb_x);
+    cudaFree(d_comb_w);
+    ncclEpTensorDestroy(t_recv);
+    ncclEpTensorDestroy(t_recv_w);
+    if (d_recv) cudaFree(d_recv);
+    if (d_recv_w) cudaFree(d_recv_w);
+    ncclEpTensorDestroy(t_tok);
+    ncclEpTensorDestroy(t_w);
+    cudaFree(d_tok);
+    cudaFree(d_w);
+    ncclEpTensorDestroy(t_idx);
+    cudaFree(d_idx);
+    NCCL_ASSERT(ncclEpGroupDestroy(eager_group));
+}
+
 // ── TopK2MixedRoutingTest fixture ─────────────────────────────────────────────
 // top-k=2 with a fixed routing mixing same-rank pairs (T0/T1) and cross-rank
 // pairs (T2/T3):

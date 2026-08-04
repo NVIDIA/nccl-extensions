@@ -144,6 +144,7 @@ void sparse_to_dense_prob(
     int num_topk,
     int num_experts,
     cudaStream_t stream) {
+    if (num_tokens <= 0) return; // zero work; grid_size == 0 is an invalid launch config
     int total_elements = num_tokens * num_topk;
     int block_size = 256;
     int grid_size = (total_elements + block_size - 1) / block_size;
@@ -208,6 +209,7 @@ void sparse_to_dense_prob_combine(
     int experts_per_lsa_team,
     int local_rank,
     cudaStream_t stream) {
+    if (num_tokens <= 0) return; // zero work; grid_size == 0 is an invalid launch config
     int block_size = 256;
     int grid_size = (num_tokens + block_size - 1) / block_size;
 
@@ -329,6 +331,7 @@ void dense_to_sparse_prob_combine(
     int topk,
     int num_experts,
     cudaStream_t stream) {
+    if (num_tokens <= 0) return; // zero work; grid_size == 0 is an invalid launch config
     int block_size = 256;
     int grid_size = (num_tokens + block_size - 1) / block_size;
 
@@ -361,6 +364,7 @@ void dense_to_sparse_prob(
     ncclEpExpertIdKind_t recv_topk_idx_kind,
     bool expert_major,
     cudaStream_t stream) {
+    if (num_recv_tokens <= 0) return; // zero work; grid_size == 0 is an invalid launch config
     int block_size = 256;
     int grid_size = (num_recv_tokens + block_size - 1) / block_size;
 

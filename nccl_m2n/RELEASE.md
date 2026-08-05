@@ -17,12 +17,21 @@ operation, adds `ncclReshard` for copy/staging transfers, moves generic
 concepts to library-scope `ncclM2n*` names, and adds an explicit handle for
 lifecycle-managed runtime state.
 
+This is the first official release of NCCL M2N. The earlier v0.1 and v0.2 drops
+were experimental and are not supported upgrade sources.
+
 ## v0.2
 
 API-breaking cleanup for NCCL M2N naming, descriptors, and runtime ownership.
 `NCCL_M2N_API_VERSION` is bumped from `1u` to `2u` for this API transition.
 Existing binaries must be rebuilt against the updated header.
 
+- **NCCL compatibility:** NCCL 2.30.5 or newer is required to build and use
+  this release.
+- **Exported symbols:** the five public entry points carry default-visibility
+  annotations, so a build that compiles hidden-by-default exports exactly those
+  five. The Make build does not enable `-fvisibility=hidden`, so it additionally
+  exports internal symbols.
 - **Public C API cleanup:**
   - `ncclMesh_t` carries topology only (`dims[]`, `startRank`).
   - Tensor placement moves from `mesh.placement[]` to

@@ -23,6 +23,19 @@
 #include "cuda_runtime.h"
 #include "nccl.h"
 
+/** Oldest NCCL release supported by this NCCL M2N API and implementation. */
+#define NCCL_M2N_MIN_NCCL_VERSION_CODE NCCL_VERSION(2, 30, 5)
+
+#if NCCL_VERSION_CODE < NCCL_M2N_MIN_NCCL_VERSION_CODE
+#error "NCCL M2N requires NCCL 2.30.5 or newer"
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define NCCL_M2N_API __attribute__((visibility("default")))
+#else
+#define NCCL_M2N_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -171,7 +184,7 @@ typedef struct ncclM2nHandle* ncclM2nHandle_t;
  *         or malformed config, and ncclSystemError if the handle allocation
  *         fails.
  */
-ncclResult_t ncclM2nInit(ncclM2nHandle_t* handle, const ncclM2nConfig_t* config);
+NCCL_M2N_API ncclResult_t ncclM2nInit(ncclM2nHandle_t* handle, const ncclM2nConfig_t* config);
 
 /**
  * Finalize a handle returned by ncclM2nInit.
@@ -197,7 +210,7 @@ ncclResult_t ncclM2nInit(ncclM2nHandle_t* handle, const ncclM2nConfig_t* config)
  * @return ncclSuccess on success, or ncclInvalidArgument for an unknown or
  *         already-finalized non-NULL handle.
  */
-ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle);
+NCCL_M2N_API ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle);
 
 /**
  * Return detail for the most recent NCCL M2N error on the calling host thread.
@@ -206,7 +219,7 @@ ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle);
  * NCCL M2N API call on the same thread.  Returns an empty string when no detail
  * is available.  The numeric ncclResult_t remains the authoritative status.
  */
-const char* ncclM2nGetLastError(void);
+NCCL_M2N_API const char* ncclM2nGetLastError(void);
 
 /* ======================================================================
  * Resharding Entry Points
@@ -246,8 +259,11 @@ const char* ncclM2nGetLastError(void);
  * @return ncclSuccess on success, ncclInvalidArgument if any precondition is
  *         violated, or ncclSystemError if default-handle creation fails.
  */
-ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm, ncclWindow_t window,
-                                   const ncclDistTensor_t* src, const ncclDistTensor_t* dst, cudaStream_t stream);
+NCCL_M2N_API ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm,
+                                                ncclWindow_t window,
+                                                const ncclDistTensor_t* src,
+                                                const ncclDistTensor_t* dst,
+                                                cudaStream_t stream);
 
 /**
  * Copy/staging-based resharding (no caller-registered window needed).
@@ -259,8 +275,9 @@ ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm, nccl
  * @param[in] dst     Destination-side tensor descriptor (non-NULL on every rank).
  * @param[in] stream  CUDA stream (explicit or default).
  */
-ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src,
-                         const ncclDistTensor_t* dst, cudaStream_t stream);
+NCCL_M2N_API ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm,
+                                      const ncclDistTensor_t* src, const ncclDistTensor_t* dst,
+                                      cudaStream_t stream);
 
 #ifdef __cplusplus
 }

@@ -636,6 +636,10 @@ ncclResult_t reshardTestBroadcastMaxInt(ncclComm_t comm, cudaStream_t stream, in
  * ====================================================================*/
 ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTensor_t* src,
                                              const ncclDistTensor_t* dst, cudaStream_t workStream);
+#ifdef NCCL_M2N_TESTING
+void reshardResetFusedSubmissionCountForTest();
+size_t reshardGetFusedSubmissionCountForTest();
+#endif
 
 /* ======================================================================
  * staging_prepare.cc -- host-side descriptor builders for ncclReshard.

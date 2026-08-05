@@ -86,6 +86,18 @@ class M2nApiUnlock {
   bool unlocked_ = false;
 };
 
+class ScopedCrossNicRailOverride {
+ public:
+  explicit ScopedCrossNicRailOverride(bool enabled);
+  ~ScopedCrossNicRailOverride();
+
+  ScopedCrossNicRailOverride(const ScopedCrossNicRailOverride&) = delete;
+  ScopedCrossNicRailOverride& operator=(const ScopedCrossNicRailOverride&) = delete;
+
+ private:
+  bool active_;
+};
+
 /* ======================================================================
  * Global configuration (inline — getters fold into a single load).
  *
@@ -100,6 +112,30 @@ inline int gReshardDstDomainSize = 0;
 inline ReshardAlgorithm gReshardAlgorithm = RESHARD_ALGO_AUTO;
 inline ReshardLoadBalanceMode gReshardLbMode = RESHARD_LB_UNIFORM;
 inline ReshardCopyAlgorithm gReshardCopyAlgorithm = RESHARD_COPY_ALGO_DIRECT;
+
+/* When set (default), a transfer whose src AND dst are both fully replicated
+ * (a pure broadcast, no Shard dim on either side) is auto-routed to UNIFORM
+ * load balancing even when the global mode is NODE_AWARE.  Direct fan-in beats
+ * the NODE_AWARE 2-phase ring for broadcasts.  Disable via
+ * NCCL_RESHARD_AUTO_UNIFORM_BCAST=0 for ablation. */
+inline bool gReshardAutoUniformBcast = true;
+
+/* Adaptive defaults are resolved from the parent communicator size at each
+ * reshard. Explicit environment settings always win. */
+inline bool gReshardAutoUniformBcastSet = false;
+inline bool gReshardSplitSingleRepInjectSet = false;
+inline bool gReshardSplitCommSet = false;
+inline bool gReshardLbModeSet = false;
+inline int gReshardSplitAutoParentThreshold = 200;
+
+struct ReshardAdaptiveCallConfig {
+  ReshardLoadBalanceMode lbMode;
+  bool autoUniformBcast;
+  bool splitComm;
+  bool splitSingleRepInject;
+};
+inline thread_local ReshardAdaptiveCallConfig gReshardAdaptiveCallConfig = {};
+inline thread_local bool gReshardAdaptiveCallConfigValid = false;
 
 /* Upper bound on pickNumCtas() output.  0 = unset (use DEFAULT_NUM_CTAS). */
 inline int gReshardMaxCta = 0;
@@ -129,6 +165,12 @@ inline size_t gReshardChunkSizeBytes = 0;
  * NCCL_RESHARD_STAGING_WATERMARK_BYTES at first init. */
 inline size_t gReshardStagingWatermarkBytes = 256ULL * 1024ULL * 1024ULL;
 
+/* Enables the split-comm (commA FULL + commB RAIL) RING path for QP
+ * scalability. Only takes effect for ncclReshard PACKWINDOW with RING +
+ * NODE_AWARE. Parsed once from NCCL_RESHARD_SPLIT_COMM at first init. Default
+ * on for that path. */
+inline bool gReshardSplitComm = true;
+
 /* Optional bucketed staging-buffer pool (env NCCL_RESHARD_STAGING_BUCKETS =
  * "size:slots,size:slots,..."; size in bytes). When set, it replaces the
  * per-comm staging buffer with fixed best-fit buckets. Unset keeps the
@@ -148,6 +190,20 @@ inline int reshardStagingTotalSlots() {
   for (int i = 0; i < gReshardStagingBucketCount; i++) total += gReshardStagingBuckets[i].numSlots;
   return total;
 }
+inline int reshardGetSplitSlotCount() {
+  return reshardStagingBucketsEnabled() ? gReshardStagingBucketCount : 1;
+}
+
+/* When true AND a dst replica spans >1 NVL domain (domainsPerRep > 1,
+ * reps/NVLD < 1), the split path reduces commA's GENERATOR-side block to a
+ * single injected replica's worth of domains (K = domainsPerRep) regardless
+ * of srcRepCount; the commB RAIL ring replicates to the remaining gen
+ * replicas. Default off. */
+inline bool gReshardSplitSingleRepInject = false;
+
+/* Force commB's split-time topology to RAIL by temporarily setting
+ * NCCL_CROSS_NIC=0. Requires NCCL_NO_CACHE=NCCL_CROSS_NIC. Default off. */
+inline bool gReshardCommBForceRail = false;
 
 inline ReshardAlgorithm reshardGetAlgorithm() {
   return gReshardAlgorithm;
@@ -168,10 +224,61 @@ inline int reshardGetDstDomainSize() {
 ncclResult_t resolveReshardDomainSizes(int worldRank, ReshardAlgorithm algo, int srcLsaSize, int dstLsaSize,
                                        int* srcGpusPerDomain, int* dstGpusPerDomain);
 inline ReshardLoadBalanceMode reshardGetLoadBalanceMode() {
-  return gReshardLbMode;
+  return gReshardAdaptiveCallConfigValid ? gReshardAdaptiveCallConfig.lbMode : gReshardLbMode;
+}
+inline bool reshardGetAutoUniformBcastEnabled() {
+  return gReshardAdaptiveCallConfigValid ? gReshardAdaptiveCallConfig.autoUniformBcast
+                                         : gReshardAutoUniformBcast;
+}
+inline bool reshardTensorFullyReplicated(const ncclDistTensor_t* tensor) {
+  for (int i = 0; i < NCCL_RESHARD_MESH_NDIMS; i++) {
+    if (tensor->placements[i] != NCCL_RESHARD_REPLICATE && tensor->mesh->dims[i] > 1) {
+      return false;
+    }
+  }
+  return true;
+}
+inline ReshardLoadBalanceMode reshardEffectiveLbMode(const ncclDistTensor_t* src,
+                                                     const ncclDistTensor_t* dst) {
+  const ReshardLoadBalanceMode lbMode = reshardGetLoadBalanceMode();
+  const bool autoUniformBcast = reshardGetAutoUniformBcastEnabled();
+  if (autoUniformBcast && lbMode == RESHARD_LB_NODE_AWARE && reshardTensorFullyReplicated(src) &&
+      reshardTensorFullyReplicated(dst)) {
+    return RESHARD_LB_UNIFORM;
+  }
+  return lbMode;
 }
 inline ReshardCopyAlgorithm reshardGetCopyAlgorithm() {
   return gReshardCopyAlgorithm;
+}
+inline int reshardGetGinContextCount() {
+  return DEFAULT_GIN_CONTEXT_COUNT;
+}
+inline bool reshardGetSplitCommEnabled() {
+  return gReshardAdaptiveCallConfigValid ? gReshardAdaptiveCallConfig.splitComm : gReshardSplitComm;
+}
+inline bool reshardGetSplitSingleRepInject() {
+  return gReshardAdaptiveCallConfigValid ? gReshardAdaptiveCallConfig.splitSingleRepInject
+                                         : gReshardSplitSingleRepInject;
+}
+inline bool reshardGetCommBForceRail() {
+  return gReshardCommBForceRail;
+}
+inline int reshardGetSplitAutoParentThreshold() {
+  return gReshardSplitAutoParentThreshold;
+}
+inline void reshardResolveAdaptiveScaleConfig(int parentCommSize, bool splitCapable) {
+  const bool large = parentCommSize > gReshardSplitAutoParentThreshold;
+  gReshardAdaptiveCallConfig.splitComm = gReshardSplitCommSet ? gReshardSplitComm : splitCapable;
+  gReshardAdaptiveCallConfig.lbMode =
+      gReshardLbModeSet
+        ? gReshardLbMode
+        : ((splitCapable && gReshardAdaptiveCallConfig.splitComm) || large ? RESHARD_LB_NODE_AWARE
+                                                                          : RESHARD_LB_UNIFORM);
+  gReshardAdaptiveCallConfig.splitSingleRepInject =
+      gReshardSplitSingleRepInjectSet ? gReshardSplitSingleRepInject : large;
+  gReshardAdaptiveCallConfig.autoUniformBcast = gReshardAutoUniformBcastSet ? gReshardAutoUniformBcast : !large;
+  gReshardAdaptiveCallConfigValid = true;
 }
 #ifdef NCCL_M2N_TESTING
 ReshardCopyAlgorithm reshardGetLastCompletedCopyAlgorithmForTest();
@@ -288,6 +395,10 @@ ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream
                                cudaEvent_t* outDoneEvent);
 
 void cacheFinalize();
+
+/* reshard_split_comm.cu — tear down all cached split sub-comms / probe
+ * DevComms. */
+void reshardSplitCommFinalize();
 
 /* ======================================================================
  * reshard_mesh.cc — Mesh analysis helpers
@@ -461,7 +572,13 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
                                   const ncclDistTensor_t* dst, const size_t dstTensorDims[], ncclWindow_t window,
                                   size_t elementsPerChunk, int numCtas, unsigned int mySignalBase,
                                   int srcGpusPerDomain, int dstGpusPerDomain, const size_t* allWindowOffsets,
-                                  ncclReshardParams* outParams);
+                                  ncclReshardParams* outParams, bool splitStrided = false,
+                                  bool nodeAnchorAtMeshStart = false, int splitNumInjectionDomains = -1,
+                                  int splitDomainsPerRep = 1);
+
+bool reshardPlanHasCrossRailRingHop(const ncclDistTensor_t* src, const ncclDistTensor_t* dst, int dstGpusPerDomain,
+                                    int dstNodeAnchor, bool splitStrided, int splitNumInjectionDomains,
+                                    int splitDomainsPerRep);
 
 ncclResult_t prepareDirectReshardParams(int worldRank, const ncclDistTensor_t* src, const size_t srcTensorDims[],
                                         const ncclDistTensor_t* dst, const size_t dstTensorDims[],
@@ -483,12 +600,20 @@ bool shouldTransposeForCrossDim(const size_t* srcDimsBytes, const size_t* dstDim
 ncclResult_t ensureTransposeBuffer(ncclComm_t comm, size_t requiredBytes, cudaStream_t stream);
 void* getTransposeBuffer(ncclComm_t comm);
 size_t getTransposeBufferCapacity(ncclComm_t comm);
+/* Rank-stable staging bucket index for a communicator, or -1 when the
+ * bucketed pool is disabled. Derived from the configured bucket set, not from
+ * the physical slot assignment, so every rank of a communicator agrees. */
+int getStagingBucketIndex(ncclComm_t comm);
 ncclResult_t getTransposeBufferPackWindowState(ncclComm_t comm, bool* rmaWarmed, int* previousPeerCount,
                                                int previousPeers[MAX_DIRECT_TARGETS]);
 ncclResult_t setTransposeBufferPackWindowState(ncclComm_t comm, bool rmaWarmed, int previousPeerCount,
                                                const int previousPeers[MAX_DIRECT_TARGETS]);
+void transposeBufferSynchronize();
 void transposeBufferFinalize();
 ncclResult_t transposeBufferRecordEvent(ncclComm_t comm, cudaStream_t stream);
+#ifdef NCCL_M2N_TESTING
+ncclResult_t reshardTestBroadcastMaxInt(ncclComm_t comm, cudaStream_t stream, int localValue, int* out);
+#endif
 
 /* ======================================================================
  * reshard_user_window.cu -- PACKWINDOW copy mode entry.

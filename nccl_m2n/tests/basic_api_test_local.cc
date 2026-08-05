@@ -16,12 +16,14 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ostream>
 #include <string>
+#include <thread>
 #include <vector>
 #include <pthread.h>
 
@@ -30,6 +32,7 @@
 
 #include "nccl_m2n.h"
 #include "basic_api_test_core.h"
+#include "reshard_internal.h"
 
 namespace {
 
@@ -263,6 +266,68 @@ static LocalCaseResult runLocalCase(const TestCase& tc, ApiKind api) {
 }
 
 class BasicApiLocalTest : public ::testing::TestWithParam<LocalParam> {};
+
+/* Exercises cross-rank agreement on the split decision: the two ranks supply
+ * deliberately different local values and must receive the same reduced
+ * result. The helper it drives is test-only instrumentation, so the whole
+ * case compiles away in a build without it. */
+#ifdef NCCL_M2N_TESTING
+TEST(LocalRankProgressTest, CollectiveSectionsAdmitPeerRanks) {
+  if (gCli.filter == nullptr || strcmp(gCli.filter, "local_collective_progress") != 0) {
+#if defined(GTEST_SKIP)
+    GTEST_SKIP() << "run with --filter local_collective_progress";
+#else
+    return;
+#endif
+  }
+  if (gWorldSize != 2) {
+#if defined(GTEST_SKIP)
+    GTEST_SKIP() << "requires exactly two local ranks";
+#else
+    return;
+#endif
+  }
+
+  std::atomic<int> ready{0};
+  std::atomic<bool> start{false};
+  ncclResult_t results[2] = {};
+  int reduced[2] = {};
+  cudaError_t cudaResults[2] = {};
+  std::thread threads[2];
+  for (int rank = 0; rank < 2; rank++) {
+    threads[rank] = std::thread([&, rank] {
+      cudaResults[rank] = cudaSetDevice(rank);
+      cudaStream_t stream = nullptr;
+      if (cudaResults[rank] == cudaSuccess) {
+        cudaResults[rank] = cudaStreamCreate(&stream);
+      }
+      ready.fetch_add(1, std::memory_order_release);
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      if (cudaResults[rank] == cudaSuccess) {
+        M2nApiLock apiLock;
+        results[rank] = reshardTestBroadcastMaxInt(gComms[rank], stream, rank, &reduced[rank]);
+        cudaResults[rank] = cudaStreamDestroy(stream);
+      }
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != 2) {
+    std::this_thread::yield();
+  }
+  start.store(true, std::memory_order_release);
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  EXPECT_EQ(ncclSuccess, results[0]);
+  EXPECT_EQ(ncclSuccess, results[1]);
+  EXPECT_EQ(1, reduced[0]);
+  EXPECT_EQ(1, reduced[1]);
+  EXPECT_EQ(cudaSuccess, cudaResults[0]);
+  EXPECT_EQ(cudaSuccess, cudaResults[1]);
+}
+#endif  /* NCCL_M2N_TESTING */
 
 TEST_P(BasicApiLocalTest, Reshard) {
   const LocalParam& param = GetParam();

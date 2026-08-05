@@ -164,6 +164,11 @@ typedef struct {
   int numLocalReps;
   bool isLeaderForSources;
 
+  /* Split-comm classification: this dest rank is the head of its ring chain
+   * (a source injects it directly), so it receives over commA.  Downstream
+   * ring-recipient leaders have this false and must wait on the commB ring. */
+  bool destInjectedDirectly;
+
   size_t myWindowOffset;
   size_t ringNextWindowOffset;
   size_t localFollowerWindowOffsets[MAX_LOCAL_FOLLOWERS];
@@ -240,6 +245,29 @@ typedef struct {
   int dstRepStartRank;
   int dstRepStride;
   ReshardLoadBalanceMode mode;
+  /* Origin subtracted before dividing a parent-comm rank by dstGpusPerDomain
+   * to obtain its NVL-domain index.  0 reproduces the absolute mapping used by
+   * the non-split path (unchanged).  The split path sets this to the dst mesh
+   * start rank so a gen domain whose origin is not a multiple of the domain
+   * size (asymmetric-PP: dstStart=16, domain=32) is not split into phantom
+   * nodes. */
+  int dstNodeAnchor;
+  /* Split-comm RING (QP-scalability) only.  When `strided` is true the
+   * NODE_AWARE mapping funnels each source rep's injection into the first
+   * `numInjectionDomains` (= K = numInjectionReps * domainsPerRep) NVL
+   * domains: source rep i injects the first domain of injection-rep i and
+   * rings to rep i+numInjectionReps, i+2*numInjectionReps, ...  Default
+   * false => the contiguous baseline mapping is used unchanged (non-split
+   * path is unaffected). */
+  int numInjectionDomains;
+  /* Split-comm strided injection only.  Number of NVL domains a single
+   * destination replica spans (= numGenDomains / dstRepCount, clamped to
+   * >= 1).  1 in the common reps/domain >= 1 regime; > 1 when a replica
+   * straddles multiple domains.  Used to recover numInjectionReps
+   * (= numInjectionDomains / domainsPerRep) and to map source reps to the
+   * first domain of their owned replica.  0 is treated as 1. */
+  int domainsPerRep;
+  bool strided;
 } ncclReshardRepLoadBalancer;
 
 /* ======================================================================

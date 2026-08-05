@@ -111,6 +111,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   int world_rank = 0, world_size = 0;
   NCCL_M2N_CHECK(ncclCommUserRank(comm, &world_rank));
   NCCL_M2N_CHECK(ncclCommCount(comm, &world_size));
+  reshardResolveAdaptiveScaleConfig(world_size, reshardGetCopyAlgorithm() == RESHARD_COPY_ALGO_PACKWINDOW);
   NCCL_M2N_CHECK(validateReshardMeshBounds(src_mesh, dst_mesh, world_size, world_rank));
   NCCL_M2N_CHECK(reshardValidateActiveBuffers("ncclReshard", world_rank, &src_local, &dst_local));
 

@@ -333,7 +333,7 @@ ncclResult_t validateReshardPlanLimits(int worldRank, const ncclDistTensor_t* sr
                                    .dstGpusPerDomain = dstGpusPerDomain,
                                    .dstRepStartRank = dst->mesh->startRank,
                                    .dstRepStride = (fullDstInfo.repMeshDim == 0) ? dst->mesh->dims[1] : 1,
-                                   .mode = reshardGetLoadBalanceMode()};
+                                   .mode = reshardEffectiveLbMode(src, dst)};
 
   if (algo == RESHARD_ALGO_DIRECT) {
     for (int srcShard = 0; srcShard < fullSrcInfo.shardCount; srcShard++) {
@@ -406,6 +406,141 @@ ncclResult_t validateReshardPlanLimits(int worldRank, const ncclDistTensor_t* sr
 }
 
 // ============================================================================
+// Split-comm cross-rail ring-hop detector (host, communication-free)
+//
+// The split-comm RING path forwards each cross-NVL ring hop over commB, which
+// is a RAIL comm: it can only service a put between two ranks that share the
+// same rail (local-GPU index) across nodes.  A few uneven-ratio layouts wire a
+// ring hop between leaders on DIFFERENT rails (e.g. a shard occupying the upper
+// rails of one NVL domain and the lower rails of the next); commB has no QP for
+// such a hop and the recipient hangs forever waiting on the signal.
+//
+// This predicate detects that condition so the caller can fall back to the
+// (rail-agnostic) non-split path for the offending reshard.  It is a pure
+// function of the mesh geometry + load-balancer parameters — identical inputs
+// on every rank — so all ranks reach the same decision with NO collective (an
+// allreduce here would serialize every reshard at scale).
+//
+// A ring hop connects the leader at localRepIdx i on one NVL domain to the
+// leader at the same localRepIdx on the next domain in the chain.  Leaders on a
+// domain are the shard's reps that land there, in rep order (== localRepIdx
+// order).  So a hop is cross-rail iff, for some chain-adjacent domain pair, the
+// rail of the i-th rep differs.  The chain construction (getTargetRepRange, the
+// per-domain grouping via getMeshRank, and the nodeWalkStep stepping) mirrors
+// prepareReshardParams so the detector and the ring builder never diverge.
+// ============================================================================
+bool reshardPlanHasCrossRailRingHop(const ncclDistTensor_t* src, const ncclDistTensor_t* dst, int dstGpusPerDomain,
+                                    int dstNodeAnchor, bool splitStrided, int splitNumInjectionDomains,
+                                    int splitDomainsPerRep) {
+  if (dstGpusPerDomain <= 0) {
+    return false;
+  }
+
+  ncclReshardMeshGroupInfo fullSrcInfo, fullDstInfo;
+  computeMeshGroupInfo(src, src->mesh->startRank, &fullSrcInfo);
+  computeMeshGroupInfo(dst, dst->mesh->startRank, &fullDstInfo);
+
+  ncclReshardRepLoadBalancer lb = {.srcRepCount = fullSrcInfo.repCount,
+                                   .dstRepCount = fullDstInfo.repCount,
+                                   .dstGpusPerDomain = dstGpusPerDomain,
+                                   .dstRepStartRank = dst->mesh->startRank,
+                                   .dstRepStride = (fullDstInfo.repMeshDim == 0) ? dst->mesh->dims[1] : 1,
+                                   .mode = reshardEffectiveLbMode(src, dst),
+                                   .dstNodeAnchor = dstNodeAnchor};
+  if (splitStrided && lb.mode == RESHARD_LB_NODE_AWARE && splitNumInjectionDomains > 0) {
+    lb.numInjectionDomains = splitNumInjectionDomains;
+    lb.domainsPerRep = (splitDomainsPerRep > 0) ? splitDomainsPerRep : 1;
+    lb.strided = true;
+  }
+
+  const int nodeWalkStep = (lb.strided && lb.numInjectionDomains > 0) ? lb.numInjectionDomains : 1;
+  const bool strided = (lb.strided && lb.numInjectionDomains > 0);
+
+  /* Rail of every rep on one NVL domain, in rep order (== localRepIdx order).
+   * Sized like prepareReshardParams' per-domain rep arrays; a domain that
+   * would exceed this is treated as cross-rail (conservative fall back). */
+  int railsA[MAX_LOCAL_FOLLOWERS + 1];
+  int railsB[MAX_LOCAL_FOLLOWERS + 1];
+
+  for (int shard = 0; shard < fullDstInfo.shardCount; shard++) {
+    for (int srcRep = 0; srcRep < lb.srcRepCount; srcRep++) {
+      int repStart = 0, repEnd = 0;
+      getTargetRepRange(&lb, srcRep, &repStart, &repEnd);
+      if (repStart >= repEnd) {
+        continue;
+      }
+
+      /* Visit each NVL domain of this chain once (at its first rep in range)
+       * and compare its leaders' rails against the ring-successor domain's, at
+       * matching localRepIdx.  Fixed stack arrays only — no heap. */
+      for (int rep = repStart; rep < repEnd; rep++) {
+        const int node = (getMeshRank(dst, &fullDstInfo, shard, rep) - dstNodeAnchor) / dstGpusPerDomain;
+
+        bool firstRepOfNode = true;
+        for (int r = repStart; r < rep; r++) {
+          if ((getMeshRank(dst, &fullDstInfo, shard, r) - dstNodeAnchor) / dstGpusPerDomain == node) {
+            firstRepOfNode = false;
+            break;
+          }
+        }
+        if (!firstRepOfNode) {
+          continue;
+        }
+
+        /* Ring-successor domain: strided chains step by K domains, the
+         * contiguous baseline rings to the next domain present in the chain
+         * (matches the ringNextNode scan in prepareReshardParams). */
+        int succNode = -1;
+        for (int r = repStart; r < repEnd; r++) {
+          const int rNode = (getMeshRank(dst, &fullDstInfo, shard, r) - dstNodeAnchor) / dstGpusPerDomain;
+          if (strided) {
+            if (rNode == node + nodeWalkStep) {
+              succNode = rNode;
+              break;
+            }
+          } else if (rNode > node && (succNode < 0 || rNode < succNode)) {
+            succNode = rNode;
+          }
+        }
+        if (succNode < 0) {
+          continue;
+        }
+
+        int cntA = 0, cntB = 0;
+        for (int r = repStart; r < repEnd; r++) {
+          const int rank = getMeshRank(dst, &fullDstInfo, shard, r);
+          const int rNode = (rank - dstNodeAnchor) / dstGpusPerDomain;
+          const int rail = (rank - dstNodeAnchor) % dstGpusPerDomain;
+          if (rNode == node) {
+            if (cntA >= MAX_LOCAL_FOLLOWERS + 1) {
+              return true;
+            }
+            railsA[cntA++] = rail;
+          } else if (rNode == succNode) {
+            if (cntB >= MAX_LOCAL_FOLLOWERS + 1) {
+              return true;
+            }
+            railsB[cntB++] = rail;
+          }
+        }
+
+        /* A shorter successor domain collapses the tail localRepIdx slots onto
+         * its last leader; clamp the successor index so a rail mismatch in the
+         * collapsed tail is not missed. */
+        for (int i = 0; i < cntA && cntB > 0; i++) {
+          const int j = (i < cntB) ? i : (cntB - 1);
+          if (railsA[i] != railsB[j]) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+
+// ============================================================================
 // Prepare Kernel Parameters (Ring / Hierarchical)
 // ============================================================================
 
@@ -413,13 +548,20 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
                                   const ncclDistTensor_t* dst, const size_t dstTensorDims[], ncclWindow_t window,
                                   size_t elementsPerChunk, int numCtas, unsigned int mySignalBase,
                                   int srcGpusPerDomain, int dstGpusPerDomain, const size_t* allWindowOffsets,
-                                  ncclReshardParams* outParams) {
+                                  ncclReshardParams* outParams, bool splitStrided, bool nodeAnchorAtMeshStart,
+                                  int splitNumInjectionDomains, int splitDomainsPerRep) {
   NCCL_M2N_CHECK_ARG(outParams != nullptr, worldRank, "prepareReshardParams: outParams must be non-null");
   ncclReshardParams params;
   memset(&params, 0, sizeof(params));
   const ncclMesh_t* srcMesh = src->mesh;
   const ncclMesh_t* dstMesh = dst->mesh;
   int ndims = src->ndims;
+
+  /* Origin for dst NVL-domain indexing.  Non-split callers pass false =>
+   * dstNodeAnchor=0 => absolute mapping (byte-identical to the shipping path).
+   * The split path passes true => anchor at the dst mesh start so an
+   * asymmetric-PP gen domain is not split into phantom nodes. */
+  const int dstNodeAnchor = nodeAnchorAtMeshStart ? dstMesh->startRank : 0;
 
   {
     char sd[128], dd[128];
@@ -588,7 +730,17 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
                                .dstGpusPerDomain = dstGpusPerDomain,
                                .dstRepStartRank = dstMesh->startRank,
                                .dstRepStride = (fullDstInfo.repMeshDim == 0) ? dstMesh->dims[1] : 1,
-                               .mode = reshardGetLoadBalanceMode()};
+                               .mode = reshardEffectiveLbMode(src, dst),
+                               .dstNodeAnchor = dstNodeAnchor};
+
+  /* Split-comm strided injection: K is decided once by split-comm formation
+   * when it sizes commA, then passed into the load balancer so ring stride and
+   * leader selection cannot diverge from commA membership. */
+  if (splitStrided && lb.mode == RESHARD_LB_NODE_AWARE && splitNumInjectionDomains > 0) {
+    lb.numInjectionDomains = splitNumInjectionDomains;
+    lb.domainsPerRep = (splitDomainsPerRep > 0) ? splitDomainsPerRep : 1;
+    lb.strided = true;
+  }
 
   debugPrintLoadBalancer(worldRank, &lb);
 
@@ -640,14 +792,14 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
         }
 
         int firstRepRank = getMeshRank(dst, &fullDstInfo, dstShard, targetRepStart);
-        int firstRepNode = firstRepRank / dstGpusPerDomain;
+        int firstRepNode = (firstRepRank - dstNodeAnchor) / dstGpusPerDomain;
 
         int localRepsOnTargetNode[MAX_LOCAL_FOLLOWERS + 1];
         int numLocalRepsOnTargetNode = 0;
 
         for (int rep = targetRepStart; rep < targetRepEnd; rep++) {
           int repRank = getMeshRank(dst, &fullDstInfo, dstShard, rep);
-          int repNode = repRank / dstGpusPerDomain;
+          int repNode = (repRank - dstNodeAnchor) / dstGpusPerDomain;
 
           if (repNode == firstRepNode) {
             if (numLocalRepsOnTargetNode < MAX_LOCAL_FOLLOWERS + 1) {
@@ -728,7 +880,7 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
     int targetRepStart, targetRepEnd;
     getTargetRepRange(&lb, sourceRep, &targetRepStart, &targetRepEnd);
 
-    int myNode = worldRank / dstGpusPerDomain;
+    int myNode = (worldRank - dstNodeAnchor) / dstGpusPerDomain;
 
     RESHARD_TRACE(worldRank, "=== DEST: Computing Sources (Hierarchical) ===");
     RESHARD_TRACE(worldRank, "  myDstShardIdx=%d, myDstRepIdx=%d", params.myDstShardIdx, params.myDstRepIdx);
@@ -742,7 +894,7 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
 
     for (int rep = targetRepStart; rep < targetRepEnd; rep++) {
       int repRank = getMeshRank(dst, &fullDstInfo, params.myDstShardIdx, rep);
-      int repNode = repRank / dstGpusPerDomain;
+      int repNode = (repRank - dstNodeAnchor) / dstGpusPerDomain;
 
       if (repNode == myNode) {
         if (numLocalReps >= MAX_LOCAL_FOLLOWERS + 1) {
@@ -775,10 +927,10 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
     int firstRepNode = -1;
     if (targetRepStart < targetRepEnd) {
       int firstRepRank = getMeshRank(dst, &fullDstInfo, params.myDstShardIdx, targetRepStart);
-      firstRepNode = firstRepRank / dstGpusPerDomain;
+      firstRepNode = (firstRepRank - dstNodeAnchor) / dstGpusPerDomain;
       for (int rep = targetRepStart; rep < targetRepEnd; rep++) {
         int repRank = getMeshRank(dst, &fullDstInfo, params.myDstShardIdx, rep);
-        int repNode = repRank / dstGpusPerDomain;
+        int repNode = (repRank - dstNodeAnchor) / dstGpusPerDomain;
         if (repNode == firstRepNode) firstNodeLocalReps++;
       }
     }
@@ -818,11 +970,12 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
        Once a later node has fewer reps, the collapsed source slots stay
        collapsed for downstream nodes because each rank has only one ring
        successor. */
-    for (int node = firstRepNode; node >= 0 && node <= myNode; node++) {
+    const int nodeWalkStep = (lb.strided && lb.numInjectionDomains > 0) ? lb.numInjectionDomains : 1;
+    for (int node = firstRepNode; node >= 0 && node <= myNode; node += nodeWalkStep) {
       int nodeLocalReps = 0;
       for (int rep = targetRepStart; rep < targetRepEnd; rep++) {
         int repRank = getMeshRank(dst, &fullDstInfo, params.myDstShardIdx, rep);
-        int repNode = repRank / dstGpusPerDomain;
+        int repNode = (repRank - dstNodeAnchor) / dstGpusPerDomain;
         if (repNode == node) nodeLocalReps++;
       }
       if (nodeLocalReps > 0 && nodeLocalReps < activeSourceSlots) activeSourceSlots = nodeLocalReps;
@@ -846,6 +999,9 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
     }
 
     params.isLeaderForSources = (mySourceEnd > mySourceStart);
+    /* Only the head of a ring chain is injected directly over commA.
+     * Downstream leaders receive through commB. */
+    params.destInjectedDirectly = params.isLeaderForSources && (myNode == firstRepNode);
 
     RESHARD_TRACE(worldRank,
                   "  Source distribution: firstNodeLocalReps=%d, "
@@ -956,7 +1112,10 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
     int ringNextNode = -1;
     for (int rep = targetRepStart; rep < targetRepEnd; rep++) {
       int repRank = getMeshRank(dst, &fullDstInfo, params.myDstShardIdx, rep);
-      int repNode = repRank / dstGpusPerDomain;
+      int repNode = (repRank - dstNodeAnchor) / dstGpusPerDomain;
+      if (lb.strided && lb.numInjectionDomains > 0 && ((repNode - myNode) % lb.numInjectionDomains != 0)) {
+        continue;
+      }
       if (repNode > myNode && (ringNextNode == -1 || repNode < ringNextNode)) ringNextNode = repNode;
     }
     RESHARD_TRACE(worldRank, "  ringNextNode=%d", ringNextNode);
@@ -964,7 +1123,7 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
     for (int rep = targetRepStart; rep < targetRepEnd; rep++) {
       int repRank = getMeshRank(dst, &fullDstInfo, params.myDstShardIdx, rep);
       int repRankInMesh = repRank - dstMesh->startRank;
-      int repNode = repRank / dstGpusPerDomain;
+      int repNode = (repRank - dstNodeAnchor) / dstGpusPerDomain;
 
       if (repRank == worldRank) {
         RESHARD_TRACE(worldRank,
@@ -993,7 +1152,7 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
           int ringNodeLocalReps = 0;
           for (int r = targetRepStart; r < targetRepEnd; r++) {
             int rRank = getMeshRank(dst, &fullDstInfo, params.myDstShardIdx, r);
-            int rNode = rRank / dstGpusPerDomain;
+            int rNode = (rRank - dstNodeAnchor) / dstGpusPerDomain;
             if (rNode == repNode) ringNodeLocalReps++;
           }
           int targetRingLocalRepIdx = params.localRepIdx;
@@ -1006,7 +1165,7 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
           int nextLocalRepIdx = 0;
           for (int r = targetRepStart; r <= rep; r++) {
             int rRank = getMeshRank(dst, &fullDstInfo, params.myDstShardIdx, r);
-            int rNode = rRank / dstGpusPerDomain;
+            int rNode = (rRank - dstNodeAnchor) / dstGpusPerDomain;
             if (rNode == repNode) {
               if (r == rep) break;
               nextLocalRepIdx++;
@@ -1193,7 +1352,8 @@ ncclResult_t prepareDirectReshardParams(int worldRank, const ncclDistTensor_t* s
                                    .dstGpusPerDomain = dstGpusPerDomain,
                                .dstRepStartRank = dstMesh->startRank,
                                .dstRepStride = (fullDstInfo.repMeshDim == 0) ? dstMesh->dims[1] : 1,
-                               .mode = reshardGetLoadBalanceMode()};
+                               .mode = reshardEffectiveLbMode(src, dst),
+                               .domainsPerRep = 1};
 
   RESHARD_DEBUG(worldRank, "  isSource=%d, isDest=%d", params.isSource, params.isDest);
   RESHARD_DEBUG(worldRank, "  srcShardCount=%d, dstShardCount=%d", params.srcShardCount, params.dstShardCount);

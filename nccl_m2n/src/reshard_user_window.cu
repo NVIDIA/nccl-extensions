@@ -46,6 +46,7 @@
 #include "reshard_call_setup.h"
 #include "reshard_internal.h"
 #include "reshard_kernels.cuh"
+#include "reshard_split.h"
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 5)
 #define NCCL_RESHARD_GIN_FINAL_FENCE (ncclGinFenceLevel::Put | ncclGinFenceLevel::Get)
@@ -527,6 +528,7 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   int worldRank, worldSize;
   NCCL_M2N_CHECK(ncclCommUserRank(comm, &worldRank));
   NCCL_M2N_CHECK(ncclCommCount(comm, &worldSize));
+  reshardResolveAdaptiveScaleConfig(worldSize, /*splitCapable=*/false);
   NCCL_M2N_CHECK(validateReshardMeshBounds(srcMesh, dstMesh, worldSize, worldRank));
   NCCL_M2N_CHECK(reshardValidateActiveBuffers("ncclReshardWithWindow", worldRank, srcTensor, dstTensor));
 
@@ -1369,15 +1371,57 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
                  worldSize, srcShardCount, dstShardCount);
   }
 
+  ReshardSplitComms splitComms;
+  memset(&splitComms, 0, sizeof(splitComms));
+  bool splitActive = false;
+  if (reshardGetSplitCommEnabled() && reshardEffectiveLbMode(src, dst) == RESHARD_LB_NODE_AWARE) {
+    int srcRepCount = 1;
+    int dstRepCount = 1;
+    for (int i = 0; i < NCCL_RESHARD_MESH_NDIMS; i++) {
+      if (src->placements[i] == NCCL_RESHARD_REPLICATE) srcRepCount = srcMesh->dims[i];
+      if (dst->placements[i] == NCCL_RESHARD_REPLICATE) dstRepCount = dstMesh->dims[i];
+    }
+    const bool dstRepStrided =
+      dst->placements[1] == NCCL_RESHARD_REPLICATE && dstMesh->dims[0] > 1 && dstMesh->dims[1] > 1;
+    NCCL_M2N_CHECK(reshardGetOrCreateSplitComms(comm, srcMesh, dstMesh, srcRepCount, dstRepCount, dstRepStrided,
+                                                numCtas, workStream, &splitComms));
+    splitActive = splitComms.active;
+    const int configuredDstDomain = reshardGetDstDomainSize();
+    if (splitActive && configuredDstDomain > 0 && configuredDstDomain != splitComms.lsaSize) {
+      RESHARD_INFO(worldRank,
+                   "split-comm: NCCL_RESHARD_DST_DOMAIN_SIZE=%d differs from probed commB lsaSize=%d -> fallback",
+                   configuredDstDomain, splitComms.lsaSize);
+      splitActive = false;
+    }
+    if (splitActive && reshardPlanHasCrossRailRingHop(src, dst, splitComms.lsaSize, dstMesh->startRank,
+                                                      splitComms.strided, splitComms.numInjectionDomains,
+                                                      splitComms.domainsPerRep)) {
+      RESHARD_INFO(worldRank,
+                   "split-comm: rail-incompatible ring hop for this layout (commB is RAIL-only) -> fallback to "
+                   "non-split path");
+      splitActive = false;
+    }
+  }
+
   ncclWindow_t stagingWindow = nullptr;
-  NCCL_M2N_CHECK(pwGetOrRegisterStagingWindow(comm, staging, stagingCapacity, &stagingWindow));
+  if (!splitActive) {
+    NCCL_M2N_CHECK(pwGetOrRegisterStagingWindow(comm, staging, stagingCapacity, &stagingWindow));
+  }
 
   const ReshardDevCommCacheKey devCommKey = {
     comm, numCtas, ginSignalCount, 0, DEFAULT_GIN_CONTEXT_COUNT, RESHARD_DEVCOMM_BARRIER_HYBRID
   };
-  ncclDevComm* devComm = findCachedDevComm(devCommKey);
+  ncclDevComm* devComm = nullptr;
   ncclDevComm localDevComm;
-  if (devComm == nullptr) {
+  int srcLsaSize = 0;
+  int dstLsaSize = 0;
+  if (splitActive) {
+    srcLsaSize = splitComms.srcLsaSize;
+    dstLsaSize = splitComms.lsaSize;
+  } else {
+    devComm = findCachedDevComm(devCommKey);
+  }
+  if (!splitActive && devComm == nullptr) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
     ncclDevCommRequirements requirements = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
 #else
@@ -1407,19 +1451,27 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
     if (devComm == nullptr) devComm = &localDevComm;
   }
 
-  const int lsaSize = devComm->lsaSize > 0 ? devComm->lsaSize : 0;
+  if (!splitActive) {
+    srcLsaSize = devComm->lsaSize > 0 ? devComm->lsaSize : 0;
+    dstLsaSize = srcLsaSize;
+  }
   int srcGpusPerDomain = 0;
   int dstGpusPerDomain = 0;
-  NCCL_M2N_CHECK(resolveReshardDomainSizes(worldRank, RESHARD_ALGO_RING, lsaSize, lsaSize, &srcGpusPerDomain,
+  NCCL_M2N_CHECK(resolveReshardDomainSizes(worldRank, RESHARD_ALGO_RING, srcLsaSize, dstLsaSize, &srcGpusPerDomain,
                                            &dstGpusPerDomain));
 
   std::vector<size_t> allWindowOffsets(worldSize, 0);
+  const bool splitStrided = splitActive && splitComms.strided;
+  const int splitNumInjectionDomains = splitActive ? splitComms.numInjectionDomains : -1;
+  const int splitDomainsPerRep = splitActive ? splitComms.domainsPerRep : 1;
   ncclReshardParams params{};
   NCCL_M2N_CHECK(validateReshardPlanLimits(worldRank, src, srcDimsBytes, dst, dstDimsBytes, elementsPerChunk,
                                            RESHARD_ALGO_RING, dstGpusPerDomain));
   NCCL_M2N_CHECK(prepareReshardParams(worldRank, src, srcDimsBytes, dst, dstDimsBytes, stagingWindow,
                                       elementsPerChunk, numCtas, mySignalBase, srcGpusPerDomain, dstGpusPerDomain,
-                                      allWindowOffsets.data(), &params));
+                                      allWindowOffsets.data(), &params, splitStrided,
+                                      /*nodeAnchorAtMeshStart=*/splitActive, splitNumInjectionDomains,
+                                      splitDomainsPerRep));
   params.window = stagingWindow;
   params.myWindowOffset = 0;
   params.ringNextWindowOffset = 0;
@@ -1431,7 +1483,7 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
                "reshardCopyPackWindow: isSource=%d isDest=%d numTargets=%d numSources=%d numCtas=%d "
                "ginSignal=%d areaBytes=%zu staging=%p lsa=%d",
                (int)params.isSource, (int)params.isDest, params.numTargets, params.numSources, numCtas, ginSignalCount,
-               areaBytes, staging, lsaSize);
+               areaBytes, staging, dstLsaSize);
 
   ncclReshardTransferPlan originalTargetPlans[MAX_TARGETS];
   size_t txOffset[MAX_TARGETS] = {0};
@@ -1509,11 +1561,15 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
   }
 
   const int threadsPerCta = DEFAULT_KERNEL_MAX_NTHREADS;
-  reshardKernelUserWindow<<<numCtas, threadsPerCta, 0, workStream>>>(params, *devComm);
-  cudaError_t launchError = cudaGetLastError();
-  if (launchError != cudaSuccess) {
-    NCCL_M2N_FAIL(ncclSystemError, worldRank, "reshardCopyPackWindow kernel launch failed: %s [numCtas=%d]",
-                  cudaGetErrorString(launchError), numCtas);
+  if (splitActive) {
+    NCCL_M2N_CHECK(reshardLaunchPackWindowSplit(&splitComms, staging, stagingCapacity, &params, numCtas, workStream));
+  } else {
+    reshardKernelUserWindow<<<numCtas, threadsPerCta, 0, workStream>>>(params, *devComm);
+    cudaError_t launchError = cudaGetLastError();
+    if (launchError != cudaSuccess) {
+      NCCL_M2N_FAIL(ncclSystemError, worldRank, "reshardCopyPackWindow kernel launch failed: %s [numCtas=%d]",
+                    cudaGetErrorString(launchError), numCtas);
+    }
   }
 
   if (params.isDest && dstBuffer != nullptr) {

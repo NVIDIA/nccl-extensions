@@ -50,6 +50,16 @@ Existing binaries must be rebuilt against the updated header.
 - **Qwen3-32B benchmark configs:** Adds the Qwen3-32B model configuration and
   DP1/TP1-to-DP1/TP1, DP1/TP2-to-DP1/TP2, and DP1/TP4-to-DP1/TP4 system
   configurations.
+- **Exported symbols:** the eight public entry points carry default-visibility
+  annotations. The Make build does not enable `-fvisibility=hidden`, so it
+  additionally exports internal symbols; the CMake build compiles
+  hidden-by-default and therefore exports the public API and nothing else.
+- **Grouped reshard submission:** `ncclM2nGroupStart()` records
+  `ncclReshard` and `ncclReshardWithWindow` calls on the calling host thread,
+  and the outermost `ncclM2nGroupEnd()` submits them by execution context while
+  preserving original entry indices in deferred errors. Nested groups flatten
+  into the outer group; `ncclM2nGroupAbort()` discards all active nested levels
+  without submitting their recorded calls.
 - **Public C API cleanup:**
   - `ncclMesh_t` carries topology only (`dims[]`, `startRank`).
   - Tensor placement moves from `mesh.placement[]` to

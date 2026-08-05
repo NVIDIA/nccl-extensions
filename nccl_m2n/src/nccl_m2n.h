@@ -202,7 +202,8 @@ NCCL_M2N_API ncclResult_t ncclM2nInit(ncclM2nHandle_t* handle, const ncclM2nConf
  * callers must complete all M2N work submitted in that epoch.  Communicators,
  * windows, streams, and buffers used by that work must remain valid until it
  * completes.  Callers must also not race finalization with a host reshard call
- * using the same handle or the internal default handle.
+ * using the same handle or the internal default handle. Finalization while a
+ * group is active on the calling host thread returns ncclInvalidArgument.
  *
  * @param[in] handle Handle returned by ncclM2nInit, or NULL for the internal
  *                   default handle.
@@ -220,6 +221,87 @@ NCCL_M2N_API ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle);
  * is available.  The numeric ncclResult_t remains the authoritative status.
  */
 NCCL_M2N_API const char* ncclM2nGetLastError(void);
+
+/* ======================================================================
+ * Group Submission
+ * ====================================================================*/
+
+/**
+ * Begin recording reshard calls on the calling host thread.
+ *
+ * Calls to ncclReshard or ncclReshardWithWindow made before the matching
+ * ncclM2nGroupEnd are recorded instead of issued immediately.  One group may
+ * span handles, communicators, streams, reshard entry points, and windows.
+ * `NULL` and `cudaStreamLegacy` identify the same execution context;
+ * `cudaStreamPerThread` remains distinct.  Buckets are submitted sequentially
+ * in first-occurrence order.  Entries outside documented fused paths retain
+ * submission order; fused paths may partition independent entries by topology.
+ * Nested groups are flattened into the outer group; only the outermost
+ * ncclM2nGroupEnd issues the recorded calls.
+ *
+ * The library copies tensor descriptors and their meshes while recording.
+ * Tensor storage remains caller-owned and must remain valid and unmodified
+ * until ncclM2nGroupEnd has issued the group and the normal stream-ordered
+ * completion contract has been satisfied.  Grouped calls must describe
+ * independent, non-overlapping tensor storage and have no ordering dependency.
+ *
+ * Each context bucket is a collective contract: every rank in its communicator
+ * must record the same bucket entries in the same order, with identical
+ * descriptor metadata.  Within each connected component of context buckets
+ * whose communicator memberships overlap, callers must define one common total
+ * order; each rank records its participating buckets in that order.  This
+ * includes distinct contexts on the same communicator.  Consistent ordering
+ * across ranks avoids cyclic collective-order deadlock; the library cannot
+ * detect or prevent a mismatch.  Inactive ranks still provide the same meshes,
+ * placements, local shapes, tensor ranks, and dtypes as active ranks.  A group
+ * must start and end on the same host thread and must not span other M2N
+ * lifecycle operations.  Callers must serialize concurrent ncclM2nGroupEnd
+ * calls that target the same communicator; use separate communicators for
+ * independently concurrent groups.
+ *
+ * @return ncclSuccess.
+ */
+NCCL_M2N_API ncclResult_t ncclM2nGroupStart(void);
+
+/**
+ * Close one group level and, at the outermost level, issue and clear the
+ * reshard group recorded by ncclM2nGroupStart.
+ *
+ * Calls are partitioned by handle, communicator, normalized stream, reshard API,
+ * and window.  Buckets are submitted sequentially on the calling host thread in
+ * first-occurrence order; buckets on distinct streams may execute concurrently
+ * on the device.  Within each bucket, compatible ncclReshard calls are
+ * partitioned by normalized topology and packed into staging-bounded PACKWINDOW
+ * submissions.  Recorded calls must therefore describe independent,
+ * non-overlapping storage and have no ordering dependency.  Calls outside the
+ * PACKWINDOW staging path retain submission order within their bucket.  Storage
+ * must not overlap across buckets because cross-bucket ranges are not checked.
+ * Validation and execution errors that cannot be detected while recording are
+ * returned here with the original group entry index.  Remaining entries in that
+ * bucket and all later buckets are not issued.  An empty group succeeds.
+ *
+ * @return ncclSuccess when all recorded calls are issued, ncclInvalidUsage
+ *         when no group is active, ncclInvalidArgument for incompatible calls,
+ *         any deferred recorded group error (for example ncclSystemError), or
+ *         the first error returned while issuing a recorded reshard call.
+ */
+NCCL_M2N_API ncclResult_t ncclM2nGroupEnd(void);
+
+/* ======================================================================
+ * Group Abort
+ * ====================================================================*/
+
+/**
+ * Discard an active M2N group on the calling host thread.
+ *
+ * Clears all nested levels of a group begun by ncclM2nGroupStart without
+ * issuing its recorded reshard calls.  The operation is idempotent when no
+ * group is active.  It does not destroy M2N handles, abort an NCCL
+ * communicator, or cancel CUDA/NCCL work that has already been submitted.
+ *
+ * @return ncclSuccess.
+ */
+NCCL_M2N_API ncclResult_t ncclM2nGroupAbort(void);
 
 /* ======================================================================
  * Resharding Entry Points

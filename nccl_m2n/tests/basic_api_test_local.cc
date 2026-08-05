@@ -100,6 +100,47 @@ static void* callInvalidReshard(void* resultPtr) {
   return nullptr;
 }
 
+TEST(M2nGroupTest, DeeplyNestedGroupDefersSubmissionToOutermostEnd) {
+  EXPECT_EQ(ncclSuccess, ncclM2nGroupStart());
+  EXPECT_EQ(ncclSuccess, ncclReshard(nullptr, nullptr, nullptr, nullptr, nullptr));
+  EXPECT_EQ(ncclSuccess, ncclM2nGroupStart());
+  EXPECT_EQ(ncclSuccess, ncclReshard(nullptr, nullptr, nullptr, nullptr, nullptr));
+  EXPECT_EQ(ncclSuccess, ncclM2nGroupStart());
+  EXPECT_EQ(ncclSuccess, ncclReshard(nullptr, nullptr, nullptr, nullptr, nullptr));
+  EXPECT_EQ(ncclSuccess, ncclM2nGroupEnd());
+  EXPECT_EQ(ncclSuccess, ncclM2nGroupEnd());
+  EXPECT_EQ(ncclInvalidArgument, ncclM2nGroupEnd());
+  EXPECT_NE(std::string::npos, std::string(ncclM2nGetLastError()).find("entry 0 of 3 failed"));
+}
+
+TEST(M2nGroupTest, DeferredValidationReportsOriginalEntryIndex) {
+  EXPECT_EQ(ncclSuccess, ncclM2nGroupStart());
+  EXPECT_EQ(ncclSuccess, ncclReshard(nullptr, nullptr, nullptr, nullptr, nullptr));
+  EXPECT_EQ(ncclInvalidArgument, ncclM2nGroupEnd());
+  EXPECT_NE(std::string::npos, std::string(ncclM2nGetLastError()).find("entry 0 of 1 failed"));
+  EXPECT_NE(std::string::npos, std::string(ncclM2nGetLastError()).find("comm must be non-null"));
+}
+
+TEST(M2nGroupTest, MixedContextsCanBeRecordedAndAborted) {
+  ncclMesh_t mesh{};
+  ncclDistTensor_t src{};
+  ncclDistTensor_t dst{};
+  src.mesh = &mesh;
+  dst.mesh = &mesh;
+
+  EXPECT_EQ(ncclSuccess, ncclM2nGroupStart());
+  EXPECT_EQ(ncclSuccess,
+            ncclReshard(nullptr, reinterpret_cast<ncclComm_t>(1), &src, &dst, nullptr));
+  EXPECT_EQ(ncclSuccess,
+            ncclReshard(nullptr, reinterpret_cast<ncclComm_t>(2), &src, &dst, cudaStreamPerThread));
+  EXPECT_EQ(ncclSuccess,
+            ncclReshardWithWindow(reinterpret_cast<ncclM2nHandle_t>(3),
+                                  reinterpret_cast<ncclComm_t>(1),
+                                  reinterpret_cast<ncclWindow_t>(4), &src, &dst,
+                                  cudaStreamLegacy));
+  EXPECT_EQ(ncclSuccess, ncclM2nGroupAbort());
+}
+
 TEST(NcclReshardStackTest, RejectsInvalidCallOnTwoMiBThread) {
   pthread_attr_t attr;
   ASSERT_EQ(0, pthread_attr_init(&attr));

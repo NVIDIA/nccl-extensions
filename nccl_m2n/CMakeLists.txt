@@ -21,12 +21,9 @@ set(NCCL_M2N_STANDALONE OFF)
 # parent's architecture selection.
 if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
   set(NCCL_M2N_STANDALONE ON)
-  if(NOT CMAKE_CUDA_ARCHITECTURES)
-    # FORCE, because an existing-but-empty cache entry (-DCMAKE_CUDA_ARCHITECTURES=)
-    # is not overwritten by a plain cached set(), which would leave the default
-    # unapplied and fail compiler detection.
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
     set(CMAKE_CUDA_ARCHITECTURES "80;90;100" CACHE STRING
-        "CUDA architectures (sm_100 requires CUDA 12.8 or newer)" FORCE)
+        "CUDA architectures (sm_100 requires CUDA 12.4 or newer)")
   endif()
   project(nccl_m2n VERSION ${NCCL_M2N_VERSION} LANGUAGES CXX CUDA)
 endif()
@@ -171,11 +168,11 @@ endif()
 list(APPEND _NCCL_M2N_NCCL_INCLUDES "${_NCCL_M2N_CCCL_INCLUDE_DIR}")
 list(REMOVE_DUPLICATES _NCCL_M2N_NCCL_INCLUDES)
 
-# Library source manifest. These lists must stay in sync with
-# Makefile.common's LIB_CC_SRCS and LIB_CU_SRCS: the two builds compile the
-# same sources, and a file added to one and not the other fails at link time
-# in whichever build was missed.
+# Library source manifest. The private CI check mechanically compares these
+# lists with Makefile.common's LIB_CC_SRCS and LIB_CU_SRCS.
 set(NCCL_M2N_HOST_SRC
+    src/m2n_group.cc
+    src/reshard_call_setup.cc
     src/reshard_cache.cc
     src/m2n_config.cc
     src/m2n_init.cc

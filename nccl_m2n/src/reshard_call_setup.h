@@ -8,10 +8,9 @@
 #ifndef NCCL_M2N_RESHARD_CALL_SETUP_H_
 #define NCCL_M2N_RESHARD_CALL_SETUP_H_
 
-#include <limits>
-
 #include "cuda_runtime.h"
 #include "nccl.h"
+#include "nccl_device.h"
 
 #include "m2n_checks.h"
 #include "m2n_checked_math.h"
@@ -25,9 +24,42 @@ struct ReshardWorkStream {
   cudaEvent_t doneEvent;
 };
 
+/* Owns the mesh storage referenced by srcTensor and dstTensor. Initialize in
+ * place with reshardPrepareTensorSetup and keep it alive for the whole call. */
+struct ReshardTensorSetup {
+  ReshardTensorSetup() = default;
+  ReshardTensorSetup(const ReshardTensorSetup&) = delete;
+  ReshardTensorSetup& operator=(const ReshardTensorSetup&) = delete;
+  ReshardTensorSetup(ReshardTensorSetup&&) = delete;
+  ReshardTensorSetup& operator=(ReshardTensorSetup&&) = delete;
+
+  ncclMesh_t srcMesh;
+  ncclMesh_t dstMesh;
+  ncclDistTensor_t srcTensor;
+  ncclDistTensor_t dstTensor;
+  int ndims;
+  size_t elementSize;
+};
+
 static inline bool reshardAcquiredPoolSlot(const ReshardWorkStream* work) {
   return work->doneEvent != nullptr;
 }
+
+ncclResult_t reshardPrepareTensorSetup(const char* apiName, const ncclDistTensor_t* src, const ncclDistTensor_t* dst,
+                                       ReshardTensorSetup* setup);
+
+ncclResult_t reshardValidateActiveBuffers(const char* apiName, int worldRank, const ncclDistTensor_t* src,
+                                          const ncclDistTensor_t* dst);
+
+ncclResult_t reshardComputeLocalBytes(int logRank, const char* apiPrefix, const char* side, const void* buffer,
+                                      const size_t* dims, int ndims, size_t elementSize, size_t* bytes);
+
+ncclResult_t reshardComputeStagingGinCounts(int logRank, int numCtas, size_t maxPeers, int* signalCount,
+                                            int* counterCount);
+
+ncclResult_t reshardGetOrCreateDevComm(ncclComm_t comm, int numCtas, int ginSignalCount, int ginCounterCount,
+                                       ReshardDevCommBarrierKind barrierKind, int ginContextCount, cudaStream_t stream,
+                                       ncclDevComm* activeDevComm);
 
 static inline ncclResult_t reshardRejectGraphCapture(const char* apiName, cudaStream_t stream) {
   cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
@@ -35,29 +67,6 @@ static inline ncclResult_t reshardRejectGraphCapture(const char* apiName, cudaSt
   if (captureStatus != cudaStreamCaptureStatusNone) {
     NCCL_M2N_FAIL(ncclInvalidUsage, -1, "%s does not support CUDA graph capture", apiName);
   }
-  return ncclSuccess;
-}
-
-static inline ncclResult_t reshardFixFullyReplicated(ncclMesh_t* mesh,
-                                                     int placements[NCCL_RESHARD_MESH_NDIMS]) {
-  if (placements[0] == NCCL_RESHARD_REPLICATE && placements[1] == NCCL_RESHARD_REPLICATE) {
-    ReshardMeshInterval interval{};
-    NCCL_M2N_CHECK(computeReshardMeshInterval(mesh, -1, &interval));
-    mesh->dims[0] = interval.size;
-    mesh->dims[1] = 1;
-    placements[1] = NCCL_RESHARD_SHARD(0);
-  }
-  return ncclSuccess;
-}
-
-static inline ncclResult_t reshardValidateActiveBuffers(const char* apiName, int worldRank,
-                                                        const ncclDistTensor_t* src, const ncclDistTensor_t* dst) {
-  NCCL_M2N_CHECK_ARG(src != nullptr && dst != nullptr && src->mesh != nullptr && dst->mesh != nullptr, worldRank,
-                     "%s: tensor descriptors and meshes must be non-null", apiName);
-  NCCL_M2N_CHECK_ARG(!reshardRankInMesh(src->mesh, worldRank) || src->dataPtr != nullptr, worldRank,
-                     "%s: src->dataPtr must be non-null on active source rank %d", apiName, worldRank);
-  NCCL_M2N_CHECK_ARG(!reshardRankInMesh(dst->mesh, worldRank) || dst->dataPtr != nullptr, worldRank,
-                     "%s: dst->dataPtr must be non-null on active destination rank %d", apiName, worldRank);
   return ncclSuccess;
 }
 
@@ -72,9 +81,9 @@ static inline ncclResult_t reshardMatchCommCudaDevice(ncclComm_t comm, int* curr
   return ncclSuccess;
 }
 
-static inline ncclResult_t reshardSetupWorkStream(ncclComm_t comm, cudaStream_t callerStream, int currentCudaDev,
-                                                  ncclResult_t propsResult, const ncclCommProperties* commProps,
-                                                  ReshardWorkStream* work) {
+static inline ncclResult_t reshardAcquireWorkStream(ncclComm_t comm, cudaStream_t callerStream, int currentCudaDev,
+                                                    ncclResult_t propsResult, const ncclCommProperties* commProps,
+                                                    ReshardWorkStream* work) {
   work->stream = callerStream;
   work->readyEvent = nullptr;
   work->doneEvent = nullptr;
@@ -82,10 +91,23 @@ static inline ncclResult_t reshardSetupWorkStream(ncclComm_t comm, cudaStream_t 
   if (reshardUseInternalStreams()) {
     const int dev = (propsResult == ncclSuccess) ? commProps->cudaDev : currentCudaDev;
     NCCL_M2N_CHECK(streamPoolAcquire(comm, dev, &work->stream, &work->readyEvent, &work->doneEvent));
+  }
+  return ncclSuccess;
+}
+
+static inline ncclResult_t reshardStartWorkStream(cudaStream_t callerStream, const ReshardWorkStream* work) {
+  if (reshardAcquiredPoolSlot(work)) {
     NCCL_M2N_CUDACHECK(cudaEventRecord(work->readyEvent, callerStream));
     NCCL_M2N_CUDACHECK(cudaStreamWaitEvent(work->stream, work->readyEvent, 0));
   }
   return ncclSuccess;
+}
+
+static inline ncclResult_t reshardSetupWorkStream(ncclComm_t comm, cudaStream_t callerStream, int currentCudaDev,
+                                                  ncclResult_t propsResult, const ncclCommProperties* commProps,
+                                                  ReshardWorkStream* work) {
+  NCCL_M2N_CHECK(reshardAcquireWorkStream(comm, callerStream, currentCudaDev, propsResult, commProps, work));
+  return reshardStartWorkStream(callerStream, work);
 }
 
 static inline ncclResult_t reshardCompleteWorkStream(cudaStream_t callerStream, const ReshardWorkStream* work) {
@@ -143,33 +165,6 @@ static inline ncclResult_t reshardDimsToBytes(int logRank, const char* apiName, 
   NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(dstDimsBytes[ndims - 1], elementSize, &dstDimsBytes[ndims - 1]), logRank,
                      "%s destination last dimension byte-size overflow: dim=%zu elementSize=%zu", apiName,
                      dstDims[ndims - 1], elementSize);
-  return ncclSuccess;
-}
-
-static inline ncclResult_t reshardComputeStagingGinCounts(int logRank, int numCtas, size_t maxPeers,
-                                                          int* signalCount, int* counterCount) {
-  NCCL_M2N_CHECK_ARG(signalCount != nullptr && counterCount != nullptr, logRank,
-                     "reshard: staging GIN count outputs must be non-null");
-  NCCL_M2N_CHECK_ARG(numCtas > 0 && maxPeers > 0, logRank,
-                     "reshard: staging GIN counts require positive numCtas and maxPeers "
-                     "(numCtas=%d, maxPeers=%zu)",
-                     numCtas, maxPeers);
-
-  size_t counters = 0;
-  NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(static_cast<size_t>(numCtas), maxPeers, &counters) &&
-                       counters <= static_cast<size_t>(std::numeric_limits<int>::max()),
-                     logRank, "reshard: staging GIN counter count overflows NCCL int field "
-                              "(numCtas=%d, maxPeers=%zu)",
-                     numCtas, maxPeers);
-  size_t signals = 0;
-  NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(counters, static_cast<size_t>(2), &signals) &&
-                       signals <= static_cast<size_t>(std::numeric_limits<int>::max()),
-                     logRank, "reshard: staging GIN signal count overflows NCCL int field "
-                              "(numCtas=%d, maxPeers=%zu)",
-                     numCtas, maxPeers);
-
-  *signalCount = static_cast<int>(signals);
-  *counterCount = static_cast<int>(counters);
   return ncclSuccess;
 }
 

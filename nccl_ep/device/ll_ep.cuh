@@ -435,6 +435,7 @@ __forceinline__ __device__ void sendExpertCount(
     int* recvCntBuf,
     int* rankMask,
     unsigned signalsBase,
+    unsigned signalGen,
     const ncclWindow_t* windows,
     ncclDevComm* devComms) {
     const auto dstP2pPtr = ncclGetP2pPtr(recvCntPtr, recvCntOffset, currRank, dstRank, windows, devComms);
@@ -459,7 +460,11 @@ __forceinline__ __device__ void sendExpertCount(
                 ncclGin_None{}, // no counter
                 ncclCoopThread());
         } else {
-            st_release_sys_global(reinterpret_cast<int*>(dstP2pPtr), -numTokensSent - 1);
+            // (gen << 16) | (count + 1): a sibling handle's or an older call's value
+            // carries a different generation and is ignored by the poll below.
+            st_release_sys_global(reinterpret_cast<int*>(dstP2pPtr),
+                                  (int)(((signalGen & 0x7fffu) << 16) |
+                                        ((unsigned)(numTokensSent + 1) & 0xffffu)));
         }
     }
 }
@@ -476,6 +481,7 @@ __forceinline__ __device__ int waitForRecvTokensRelaxed(
     int* rankMask,
     int* asyncErrorFlag,
     unsigned signalsBase,
+    unsigned signalGen,
     const ncclWindow_t* windows,
     ncclDevComm* devComms,
     int* recvStats,
@@ -506,10 +512,14 @@ __forceinline__ __device__ int waitForRecvTokensRelaxed(
         } else {
             // TODO: Double check that we can rely on this + __threadfence_system() in dispatch?
             // to ensure consistency on "another" SM that's going to access the data buffer protected by this atomic
-            while ((numRecvTokens = ld_acquire_sys_global((recvCntBuf + rankLaneIdx * numRanks + srcRank))) ==
-                       0 // data not arrived
+            int rawCnt;
+            while (((unsigned)(rawCnt = ld_acquire_sys_global(
+                        (recvCntBuf + rankLaneIdx * numRanks + srcRank))) >> 16) !=
+                       (signalGen & 0x7fffu) // this generation's count has not arrived
                    && (waitRecvCost = clock64() - startTime) <= timeoutCycles // not timeout
             );
+            if (((unsigned)rawCnt >> 16) == (signalGen & 0x7fffu))
+                numRecvTokens = -((rawCnt & 0xffff) - 1) - 1;
         }
     }
 
@@ -617,7 +627,8 @@ __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
   // CONFIG
   int numTokens, int scalesPerToken, int maxTokensPerRank, int numTopk, int numExperts, int currRank, int numRanks,
   int numWarpGroups, int numWarpsPerGroup, bool roundScale, ncclEpExpertIdKind_t recvTopkIdxKind, int phases,
-  int numComms, ncclDevComm* devComms, const ncclWindow_t* windows, unsigned signalsBase, uint64_t timeoutCycles,
+  int numComms, ncclDevComm* devComms, const ncclWindow_t* windows, unsigned signalsBase,
+  unsigned signalGen, uint64_t timeoutCycles,
   // Zero-copy dispatch output (rank-major + nvlinkOnly): each available token
   // or QUANT_FWD scale window is written directly to its peer output.
   ncclWindow_t recvDataWindow, size_t recvDataOffset, ncclWindow_t rcvScalesWin, size_t rcvScalesOffs) {
@@ -892,6 +903,7 @@ __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
             recvCntBuf,
             rankMask,
             signalsBase,
+            signalGen,
             windows,
             devComms);
 
@@ -949,6 +961,7 @@ LOW_LATENCY_DISPATCH_RECV:
                 rankMask,
                 asyncErrorFlag,
                 signalsBase,
+                signalGen,
                 windows,
                 devComms,
                 recvStats,
@@ -1350,6 +1363,7 @@ __forceinline__ __device__ void sendFinishFlag(
     int* recvFlagBuf,
     int* rankMask,
     unsigned signalsBase,
+    unsigned signalGen,
     const ncclWindow_t* windows,
     ncclDevComm* devComms) {
     auto dstP2pPtr = ncclGetP2pPtr(recvFlagPtr, recvFlagOffset, currRank, dstRank, windows, devComms);
@@ -1376,7 +1390,9 @@ __forceinline__ __device__ void sendFinishFlag(
                 ncclGin_None{}, // no counter
                 ncclCoopThread());
         } else {
-            st_release_sys_global(reinterpret_cast<int*>(dstP2pPtr), 1);
+            // (gen << 16) | 1 -- see the count send above.
+            st_release_sys_global(reinterpret_cast<int*>(dstP2pPtr),
+                                  (int)(((signalGen & 0x7fffu) << 16) | 1u));
         }
     }
 }
@@ -1392,6 +1408,7 @@ __forceinline__ __device__ void waitForRecvFlag(
     int* rankMask,
     int* asyncErrorFlag,
     unsigned signalsBase,
+    unsigned signalGen,
     const ncclWindow_t* windows,
     ncclDevComm* devComms,
     int64_t* waitStats,
@@ -1415,7 +1432,8 @@ __forceinline__ __device__ void waitForRecvFlag(
             );
             net.resetSignal(signalsBase + responsibleExpertIdx);
         } else {
-            while (ld_acquire_sys_global(recvFlagBuf + responsibleExpertIdx) == 0 // recv not ready
+            while (((unsigned)ld_acquire_sys_global(recvFlagBuf + responsibleExpertIdx) >> 16) !=
+                       (signalGen & 0x7fffu) // this generation's flag has not arrived
                    && (waitRecvCost = clock64() - startTime) <= timeoutCycles // not timeout
             );
         }
@@ -1603,7 +1621,7 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
   // CONFIG
   int numCombinedTokens, int hidden, int numTopk, int maxTokensPerRank, int numExperts, int currRank, int numRanks,
   int numWarpGroups, int numWarpsPerGroup, int phases, bool zeroCopy, int numComms, ncclDevComm* devComms,
-  const ncclWindow_t* windows, unsigned signalsBase, uint64_t timeoutCycles) {
+  const ncclWindow_t* windows, unsigned signalsBase, unsigned signalGen, uint64_t timeoutCycles) {
     // Token dtype derivations
     constexpr int kElemBytes = (kTokenDtype == ncclFloat32) ? 4 : 2;
 
@@ -1845,6 +1863,7 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
                 recvFlagBuf,
                 rankMask,
                 signalsBase,
+                signalGen,
                 windows,
                 devComms);
             atomic_add_release_global(atomicCleanFlag, -1);
@@ -1878,6 +1897,7 @@ LOW_LATENCY_COMBINE_RECV:
                 rankMask,
                 asyncErrorFlag,
                 signalsBase,
+                signalGen,
                 windows,
                 devComms,
                 waitStats,

@@ -80,6 +80,8 @@ struct dispatch_kernel_args_t {
     ncclDevComm* devComms;
     const ncclWindow_t* windows;
     unsigned signalsBase;
+    // Per-launch generation stamped into every P2P count/flag signal value.
+    unsigned signalGen;
     uint64_t timeoutCycles;
     // Non-null windows enable peer payload writes.
     ncclWindow_t recvDataWindow;
@@ -126,6 +128,8 @@ struct combine_kernel_args_t {
     ncclDevComm* devComms;
     const ncclWindow_t* windows;
     unsigned signalsBase;
+    // Per-launch generation stamped into every P2P count/flag signal value.
+    unsigned signalGen;
     uint64_t timeoutCycles;
 };
 

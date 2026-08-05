@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 import nccl.core.typing as nccl_typing
-from nccl.m2n.bindings import nccl_m2n as _m2n_bindings
+from nccl._extensions.bindings import nccl_m2n as _m2n_bindings
 from nccl.core.typing import NcclDataType, NcclInvalid
 from nccl.m2n.constants import MAX_TENSOR_DIMS, MESH_NDIMS
 from nccl.m2n.mesh import Mesh

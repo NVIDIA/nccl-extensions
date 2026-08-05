@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# See LICENSE.txt for more license information.
+
+# This code was automatically generated with version 0.2.0. Do not modify it directly.
 
 from ._internal cimport nccl_m2n as _nccl_m2n
 
@@ -18,13 +18,13 @@ cdef ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle) except?_NCCLRESULT_T_I
     return _nccl_m2n._ncclM2nFinalize(handle)
 
 
-cdef const char* ncclM2nGetLastError() noexcept nogil:
-    return _nccl_m2n._ncclM2nGetLastError()
-
-
 cdef ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm, ncclWindow_t window, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
     return _nccl_m2n._ncclReshardWithWindow(handle, comm, window, src, dst, stream)
 
 
 cdef ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
     return _nccl_m2n._ncclReshard(handle, comm, src, dst, stream)
+
+
+cdef const char* ncclM2nGetLastError() noexcept nogil:
+    return _nccl_m2n._ncclM2nGetLastError()

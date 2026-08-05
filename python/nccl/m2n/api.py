@@ -11,11 +11,15 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from nccl.core.typing import NcclInvalid, NcclStreamSpec
-from nccl.m2n._runtime import NATIVE_CALL_LOCK
-from nccl.m2n.bindings import nccl_m2n as _m2n_bindings
+from nccl._extensions.bindings import nccl_m2n as _m2n_bindings
+from nccl._extensions._runtime import NATIVE_CALL_LOCK
 from nccl.m2n.config import Config
 from nccl.m2n.constants import MESH_NDIMS, REPLICATE, shard
-from nccl.m2n.handle import Handle, _reshard as _reshard_with_handle
+from nccl.m2n.handle import (
+    Handle,
+    _reshard as _reshard_with_handle,
+    _reshard_with_window as _reshard_with_window_with_handle,
+)
 from nccl.m2n.mesh import Mesh
 from nccl.m2n.placement import Replicate, Shard
 from nccl.m2n.tensor import DistTensor, normalize_dtype
@@ -424,6 +428,7 @@ def _reshard(
     dst_local_shape: Sequence[int] | None = None,
     dst_dtype: object | None = None,
     handle: Handle | None = None,
+    window: object | None = None,
     allow_dtensor: bool = False,
     api: str,
 ) -> None:
@@ -584,10 +589,17 @@ def _reshard(
     )
 
     if handle is None:
-        with NATIVE_CALL_LOCK:
-            _reshard_with_handle(0, comm, src_desc, dst_desc, stream)
-    else:
+        if window is None:
+            with NATIVE_CALL_LOCK:
+                _reshard_with_handle(0, comm, src_desc, dst_desc, stream)
+        else:
+            _reshard_with_window_with_handle(
+                0, comm, window, src_desc, dst_desc, stream
+            )
+    elif window is None:
         handle.reshard(comm, src_desc, dst_desc, stream=stream)
+    else:
+        handle.reshard_with_window(comm, window, src_desc, dst_desc, stream=stream)
 
 
 def reshard(
@@ -629,6 +641,50 @@ def reshard(
     )
 
 
+def reshard_with_window(
+    src: object | None,
+    dst: object | None,
+    comm: Any,
+    window: object,
+    stream: NcclStreamSpec | None = None,
+    *,
+    src_mesh: object | None = None,
+    src_placements: Sequence[object] | None = None,
+    src_local_shape: Sequence[int] | None = None,
+    src_dtype: object | None = None,
+    dst_mesh: object | None = None,
+    dst_placements: Sequence[object] | None = None,
+    dst_local_shape: Sequence[int] | None = None,
+    dst_dtype: object | None = None,
+    handle: Handle | None = None,
+) -> None:
+    """Reshard through a caller-registered NCCL window.
+
+    See :meth:`Handle.reshard_with_window` for the buffer-lifetime contract.
+    """
+
+    if window is None:
+        raise TypeError("window must be a registered NCCL window")
+
+    return _reshard(
+        src,
+        dst,
+        comm,
+        stream,
+        src_mesh=src_mesh,
+        src_placements=src_placements,
+        src_local_shape=src_local_shape,
+        src_dtype=src_dtype,
+        dst_mesh=dst_mesh,
+        dst_placements=dst_placements,
+        dst_local_shape=dst_local_shape,
+        dst_dtype=dst_dtype,
+        handle=handle,
+        window=window,
+        api="reshard_with_window",
+    )
+
+
 def xdtensor_reshard(
     src: torch.Tensor | dtensor.DTensor | None,
     dst: torch.Tensor | dtensor.DTensor | None,
@@ -665,5 +721,6 @@ __all__ = [
     "finalize",
     "init",
     "reshard",
+    "reshard_with_window",
     "xdtensor_reshard",
 ]

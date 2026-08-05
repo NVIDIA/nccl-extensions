@@ -3,7 +3,7 @@
 #
 # See LICENSE.txt for more license information.
 
-"""Process-wide runtime state shared by the Python and Cython layers."""
+"""Process-wide runtime state shared by extension facades and bindings."""
 
 from __future__ import annotations
 
@@ -11,3 +11,5 @@ import threading
 
 
 NATIVE_CALL_LOCK = threading.RLock()
+
+__all__ = ["NATIVE_CALL_LOCK"]

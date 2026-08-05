@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import threading
 
-from nccl.m2n.bindings import nccl_m2n as _m2n_bindings
+from nccl._extensions.bindings import nccl_m2n as _m2n_bindings
+from nccl._extensions._runtime import NATIVE_CALL_LOCK
 from nccl.core.typing import NcclInvalid, NcclStreamSpec
-from nccl.m2n._runtime import NATIVE_CALL_LOCK
 from nccl.m2n.config import Config
 from nccl.m2n.tensor import DistTensor
 
@@ -73,6 +73,28 @@ def _reshard(
         _m2n_bindings.reshard(
             handle,
             _extract_ptr(comm, attr="ptr", name="comm"),
+            int(src_prepared.struct.ptr),
+            int(dst_prepared.struct.ptr),
+            _stream_ptr(stream),
+        )
+
+
+def _reshard_with_window(
+    handle: int,
+    comm: object,
+    window: object,
+    src: DistTensor,
+    dst: DistTensor,
+    stream: NcclStreamSpec | None = None,
+) -> None:
+    with NATIVE_CALL_LOCK:
+        _validate_tensors(src, dst)
+        src_prepared = src.as_binding()
+        dst_prepared = dst.as_binding()
+        _m2n_bindings.reshard_with_window(
+            handle,
+            _extract_ptr(comm, attr="ptr", name="comm"),
+            _extract_ptr(window, attr="handle", name="window"),
             int(src_prepared.struct.ptr),
             int(dst_prepared.struct.ptr),
             _stream_ptr(stream),
@@ -146,17 +168,7 @@ class Handle:
 
         with NATIVE_CALL_LOCK, self._lock:
             self._check_valid("reshard_with_window")
-            _validate_tensors(src, dst)
-            src_prepared = src.as_binding()
-            dst_prepared = dst.as_binding()
-            _m2n_bindings.reshard_with_window(
-                self._ptr,
-                _extract_ptr(comm, attr="ptr", name="comm"),
-                _extract_ptr(window, attr="handle", name="window"),
-                int(src_prepared.struct.ptr),
-                int(dst_prepared.struct.ptr),
-                _stream_ptr(stream),
-            )
+            _reshard_with_window(self._ptr, comm, window, src, dst, stream)
 
     def reshard(
         self,

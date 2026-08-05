@@ -38,7 +38,11 @@ def _candidate_library_paths() -> list[str]:
     if explicit:
         return [explicit]
 
-    candidates: list[str] = []
+    # With no explicit override, prefer the native library bundled with this
+    # facade before environment and SONAME fallbacks.
+    candidates = [os.path.normpath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "m2n", "lib", "libnccl_m2n.so"
+    ))]
 
     home = os.environ.get("NCCL_M2N_HOME")
     if home:
@@ -69,6 +73,7 @@ cdef void* load_library() except* with gil:
 
     for path in _candidate_library_paths():
         if path != "libnccl_m2n.so" and not os.path.exists(path):
+            errors.append(f"{path}: not found")
             continue
         path_bytes = path.encode()
         handle = dlopen(path_bytes, RTLD_NOW | RTLD_GLOBAL)
@@ -136,6 +141,8 @@ cdef int _check_or_init_nccl_m2n() except -1 nogil:
             missing.append("ncclM2nInit")
         if finalize_fn == NULL:
             missing.append("ncclM2nFinalize")
+        if get_last_error_fn == NULL:
+            missing.append("ncclM2nGetLastError")
         if reshard_with_window_fn == NULL:
             missing.append("ncclReshardWithWindow")
         if reshard_fn == NULL:

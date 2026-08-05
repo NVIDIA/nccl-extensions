@@ -1,48 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# See LICENSE.txt for more license information.
+
+# This code was automatically generated $version_span. Do not modify it directly.
 
 from libc.stdint cimport intptr_t
 
-from .cynccl_m2n cimport *
+from .cy${libname} cimport *
 
 
 ###############################################################################
 # Types
 ###############################################################################
 
+$type_decls
+
 ctypedef ncclComm_t Comm
 ctypedef ncclWindow_t Window
-ctypedef ncclM2nHandle_t Handle
 ctypedef cudaStream_t Stream
-
-
-cdef class Config:
-    cdef:
-        ncclM2nConfig_t *_ptr
-        object _owner
-        bint _owned
-        bint _readonly
-    cdef intptr_t _get_ptr(self)
-
-
-cdef class Mesh:
-    cdef:
-        ncclMesh_t *_ptr
-        object _owner
-        bint _owned
-        bint _readonly
-    cdef intptr_t _get_ptr(self)
-
-
-cdef class DistTensor:
-    cdef:
-        ncclDistTensor_t *_ptr
-        object _owner
-        bint _owned
-        bint _readonly
-    cdef intptr_t _get_ptr(self)
 
 
 ###############################################################################

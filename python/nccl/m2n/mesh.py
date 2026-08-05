@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from nccl.m2n.bindings import nccl_m2n as _m2n_bindings
+from nccl._extensions.bindings import nccl_m2n as _m2n_bindings
 from nccl.m2n.constants import MESH_NDIMS
 
 

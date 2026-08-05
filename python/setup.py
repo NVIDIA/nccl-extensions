@@ -11,15 +11,25 @@ from Cython.Build import cythonize
 from setuptools import setup, Extension
 
 
-_NCCL_EP_SO = Path(__file__).parent / "nccl" / "ep" / "lib" / "libnccl_ep.so"
-if not _NCCL_EP_SO.exists():
+ROOT = Path(__file__).resolve().parent
+EP_PACKAGE = ROOT / "nccl" / "ep"
+M2N_PACKAGE = ROOT / "nccl" / "m2n"
+
+
+def _warn_missing_staged_library(library: Path, package: str) -> None:
+    if library.exists():
+        return
     print(
-        f"WARNING: {_NCCL_EP_SO} not found. The built wheel will not "
-        "include the NCCL EP shared library, and `import nccl.ep` will fail at "
-        "runtime. Drop a build of libnccl_ep.so at that path before "
-        "building the wheel.",
+        f"WARNING: {library} not found. The built wheel will not include the "
+        f"{package} shared library and will require a compatible external library "
+        f"at runtime. Stage the library at that path before building the wheel "
+        f"to make it self-contained.",
         file=sys.stderr,
     )
+
+
+_warn_missing_staged_library(EP_PACKAGE / "lib" / "libnccl_ep.so", "nccl.ep")
+_warn_missing_staged_library(M2N_PACKAGE / "lib" / "libnccl_m2n.so", "nccl.m2n")
 
 
 CUDA_HOME = os.environ.get("CUDA_HOME")
@@ -31,16 +41,16 @@ if not cuda_path.exists() or not cuda_path.is_dir():
     raise SystemExit(f"Error: CUDA_HOME does not exist or is not a directory: {CUDA_HOME}")
 CUDA_INC = str(cuda_path / "include")
 
+
 PACKAGE = "nccl._extensions.bindings"
-# One entry per bound library; nccl_m2n joins here once its bindings land.
-LIBNAMES = ["nccl_ep"]
+LIBNAMES = ["nccl_ep", "nccl_m2n"]
 
 
-def _ext(module: str, source: str) -> Extension:
+def _ext(module: str, source: str, *, include_dirs: list[str] | None = None) -> Extension:
     return Extension(
         module,
         sources=[source],
-        include_dirs=[CUDA_INC],
+        include_dirs=[CUDA_INC, *(include_dirs or [])],
         language="c++",
         extra_compile_args=["-std=c++14"],
         libraries=["dl"],
@@ -72,7 +82,6 @@ ext_modules = [
 ]
 for libname in LIBNAMES:
     ext_modules.extend(libname_extensions(libname))
-
 compiler_directives = {
     "embedsignature": True,
     "show_performance_hints": True,

@@ -29,6 +29,15 @@ static inline bool reshardAcquiredPoolSlot(const ReshardWorkStream* work) {
   return work->doneEvent != nullptr;
 }
 
+static inline ncclResult_t reshardRejectGraphCapture(const char* apiName, cudaStream_t stream) {
+  cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+  NCCL_M2N_CUDACHECK(cudaStreamIsCapturing(stream, &captureStatus));
+  if (captureStatus != cudaStreamCaptureStatusNone) {
+    NCCL_M2N_FAIL(ncclInvalidUsage, -1, "%s does not support CUDA graph capture", apiName);
+  }
+  return ncclSuccess;
+}
+
 static inline ncclResult_t reshardFixFullyReplicated(ncclMesh_t* mesh,
                                                      int placements[NCCL_RESHARD_MESH_NDIMS]) {
   if (placements[0] == NCCL_RESHARD_REPLICATE && placements[1] == NCCL_RESHARD_REPLICATE) {

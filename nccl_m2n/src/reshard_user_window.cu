@@ -510,6 +510,7 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   ncclCommProperties commProps = NCCL_COMM_PROPERTIES_INITIALIZER;
   ncclResult_t propsResult = ncclSuccess;
   NCCL_M2N_CHECK(reshardMatchCommCudaDevice(comm, &currentCudaDev, &commProps, &propsResult));
+  NCCL_M2N_CHECK(reshardRejectGraphCapture("ncclReshardWithWindow", stream));
 
   // Internal-stream mode routes every caller through a library-owned
   // non-blocking stream. Readiness and completion events preserve the caller

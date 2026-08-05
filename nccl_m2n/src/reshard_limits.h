@@ -70,6 +70,8 @@ inline constexpr size_t CROSS_DIM_TRANSPOSE_THRESHOLD_BYTES = CROSS_DIM_TRANSPOS
 inline constexpr int MAX_WINDOW_CACHE_ENTRIES = 128;
 inline constexpr int MAX_DEVCOMM_CACHE_ENTRIES = 64;
 inline constexpr int MAX_TRANSPOSE_BUFFER_ENTRIES = 16;
+/* Hard upper bound on staging slots across all configured buckets. */
+inline constexpr int MAX_SPLIT_CONCURRENCY = 64;
 
 /* Staging (copy-based) algorithm sizes. */
 inline constexpr int STAGING_MAX_CHANNELS = 32;

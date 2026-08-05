@@ -48,6 +48,18 @@
 #include "reshard_kernels.cuh"
 #include "reshard_split.h"
 
+#ifdef NCCL_M2N_TESTING
+static thread_local size_t gFusedSubmissionCount = 0;
+
+void reshardResetFusedSubmissionCountForTest() {
+  gFusedSubmissionCount = 0;
+}
+
+size_t reshardGetFusedSubmissionCountForTest() {
+  return gFusedSubmissionCount;
+}
+#endif
+
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 5)
 #define NCCL_RESHARD_GIN_FINAL_FENCE (ncclGinFenceLevel::Put | ncclGinFenceLevel::Get)
 #else
@@ -2144,6 +2156,9 @@ ncclResult_t reshardTryExecuteStagingGroup(ncclM2nHandle_t handle, ncclComm_t co
     NCCL_M2N_CHECK(reshardCopyPackWindowGroupNormalized(comm, setups.get(), bin.entries.data(), originalIndices,
                                                         bin.entries.size(), work.stream, failedOriginalIndex));
     fusedBins++;
+#ifdef NCCL_M2N_TESTING
+    gFusedSubmissionCount++;
+#endif
   }
   RESHARD_INFO(worldRank, "ncclM2nGroupEnd: entries=%zu bins=%zu fusedBins=%zu maxBinEntries=%zu budget=%zu", count,
                bins.size(), fusedBins, maxBinEntries, stagingBudget);

@@ -246,6 +246,9 @@ extern "C" ncclResult_t ncclM2nGroupEnd(void) {
 
   const size_t groupSize = entries.size();
   std::vector<std::vector<M2nGroupEntry>> buckets;
+#ifdef NCCL_M2N_TESTING
+  reshardResetFusedSubmissionCountForTest();
+#endif
   NCCL_M2N_CHECK(partitionGroupEntries(std::move(entries), &buckets));
   for (const std::vector<M2nGroupEntry>& bucket : buckets) {
     NCCL_M2N_CHECK(executeGroupBucket(bucket, groupSize));
@@ -259,4 +262,3 @@ extern "C" ncclResult_t ncclM2nGroupAbort(void) {
   std::vector<M2nGroupEntry>().swap(gM2nGroupState.entries);
   return ncclSuccess;
 }
-

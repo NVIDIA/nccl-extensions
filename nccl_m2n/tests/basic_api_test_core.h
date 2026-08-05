@@ -980,6 +980,10 @@ static size_t computeMaxBufferBytes(const std::vector<TestCase>& cases, int worl
     size_t need = maxLocalBytes(tc, worldSize);
     if (need > mx) mx = need;
   }
+#ifdef NCCL_M2N_TESTING
+  /* Keep two disjoint tensor regions for the PACKWINDOW fusion assertion. */
+  mx *= 2;
+#endif
   /* Round up to 4 KiB. */
   const size_t pg = 4096;
   return ((mx + pg - 1) / pg) * pg;
@@ -1174,7 +1178,13 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     activeBuffer = env->buffer;
     activeBufferBytes = env->bufferBytes;
   }
-  if (myBytes > activeBufferBytes) {
+#ifdef NCCL_M2N_TESTING
+  const bool testPackWindowFusion = env->apiKind == ApiKind::Default && env->expectPackWindow;
+#else
+  const bool testPackWindowFusion = false;
+#endif
+  const size_t tensorRegionBytes = testPackWindowFusion ? activeBufferBytes / 2 : activeBufferBytes;
+  if (myBytes > tensorRegionBytes) {
     return makeSkip("local buffer exceeds preallocated max");
   }
 
@@ -1192,6 +1202,12 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     int sd = (tc.srcShardDim >= 0) ? tc.srcShardDim : -1;
     int sc = (tc.srcShardDim >= 0) ? srcShardCount : 1;
     testInitSourceData((char*)activeBuffer, srcLocalBytesDims, tc.ndims, sd, srcShardIdx, sc, env->stream);
+#ifdef NCCL_M2N_TESTING
+    if (testPackWindowFusion) {
+      testInitSourceData((char*)activeBuffer + tensorRegionBytes, srcLocalBytesDims, tc.ndims, sd, srcShardIdx, sc,
+                         env->stream);
+    }
+#endif
   }
   TEST_CUDACHECK(cudaStreamSynchronize(env->stream));
   env->barrier(env);
@@ -1268,6 +1284,24 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     }
     const bool bActionableError = strstr(ncclM2nGetLastError(), "does not support CUDA graph capture") != nullptr;
     return (r == ncclInvalidUsage && bActionableError) ? makePass() : makeFail("graph capture was not rejected");
+  } else if (env->apiKind == ApiKind::Default) {
+#ifdef NCCL_M2N_TESTING
+    if (testPackWindowFusion) {
+      ncclDistTensor_t srcT2 = srcT;
+      ncclDistTensor_t dstT2 = dstT;
+      if (srcT2.dataPtr != nullptr) srcT2.dataPtr = (char*)srcT2.dataPtr + tensorRegionBytes;
+      if (dstT2.dataPtr != nullptr) dstT2.dataPtr = (char*)dstT2.dataPtr + tensorRegionBytes;
+      r = ncclM2nGroupStart();
+      if (r == ncclSuccess) r = ncclReshard(env->m2nHandle, env->comm, &srcT, &dstT, env->stream);
+      if (r == ncclSuccess) r = ncclReshard(env->m2nHandle, env->comm, &srcT2, &dstT2, env->stream);
+      if (r == ncclSuccess) r = ncclM2nGroupEnd();
+      if (r != ncclSuccess) (void)ncclM2nGroupAbort();
+    } else {
+      r = ncclReshard(env->m2nHandle, env->comm, &srcT, &dstT, env->stream);
+    }
+#else
+    r = ncclReshard(env->m2nHandle, env->comm, &srcT, &dstT, env->stream);
+#endif
   } else {
     r = reshard(env->stream);
   }
@@ -1280,10 +1314,18 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   }
 
   TEST_CUDACHECK(cudaStreamSynchronize(env->stream));
+  /* These observations are rank-local, so a rank must not return on them before
+   * the barrier below -- its peers would still enter, and the harness would
+   * deadlock rather than report the failure. Record and report after. */
+  const char* instrumentationFailure = nullptr;
 #ifdef NCCL_M2N_TESTING
-  if (env->apiKind == ApiKind::Default && env->expectPackWindow &&
-      reshardGetLastCompletedCopyAlgorithmForTest() != RESHARD_COPY_ALGO_PACKWINDOW) {
-    return makeFail("default API did not execute the selected PACKWINDOW path");
+  if (testPackWindowFusion) {
+    if (reshardGetFusedSubmissionCountForTest() != 1) {
+      instrumentationFailure = "compatible grouped tensors did not produce exactly one fused PACKWINDOW submission";
+    }
+  } else if (env->apiKind == ApiKind::Default && env->expectPackWindow &&
+             reshardGetLastCompletedCopyAlgorithmForTest() != RESHARD_COPY_ALGO_PACKWINDOW) {
+    instrumentationFailure = "default API did not execute the selected PACKWINDOW path";
   }
 #endif
   env->barrier(env);
@@ -1296,12 +1338,28 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     int sc = (tc.dstShardDim >= 0) ? dstShardCount : 1;
     bool ok = testValidateDestData((const char*)activeBuffer, dstLocalBytesDims, tc.ndims, sd, dstShardIdx, sc,
                                    env->rank, env->stream, nullptr);
+#ifdef NCCL_M2N_TESTING
+    if (testPackWindowFusion) {
+      ok = ok && testValidateDestData((const char*)activeBuffer + tensorRegionBytes, dstLocalBytesDims, tc.ndims, sd,
+                                      dstShardIdx, sc, env->rank, env->stream, nullptr);
+    }
+#endif
     localOk = ok ? 1 : 0;
+  }
+  /* Fold the rank-local instrumentation result into the same reduction as data
+   * validation. Returning on it separately would leave a failing rank out of
+   * the allreduce its peers still enter. */
+  if (instrumentationFailure != nullptr) {
+    localOk = 0;
   }
   int globalOk = env->allreduceMinInt(env, localOk);
 
   if (window != nullptr) {
     TEST_NCCLCHECK(ncclCommWindowDeregister(env->comm, window));
+  }
+
+  if (instrumentationFailure != nullptr) {
+    return makeFail(instrumentationFailure);
   }
 
   if (env->verbose && env->isRank0Printer(env))

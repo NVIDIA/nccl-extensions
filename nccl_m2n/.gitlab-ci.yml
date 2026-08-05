@@ -39,7 +39,46 @@ build:nccl_m2n:
         lib
       test -s nccl_m2n/build/lib/libnccl_m2n.so
       test -s nccl_m2n/build/include/nccl_m2n.h
+      # Every function declared in the public header must (a) carry
+      # NCCL_M2N_API and (b) be an exported, defined text symbol. The CMake
+      # build compiles hidden-by-default, so a missing annotation links here
+      # under Make and fails to link there.
+      #
+      # (a) is derived from the UNANNOTATED declaration list on purpose. Deriving
+      # the expected set from annotated declarations only would let the check
+      # shrink silently: remove an annotation and the entry point drops out of
+      # the expected set too, so the check passes while the hidden-by-default
+      # CMake build stops exporting it.
+      hdr=nccl_m2n/src/nccl_m2n.h
+      lib=nccl_m2n/build/lib/libnccl_m2n.so
+      work=$(mktemp -d)
+      trap 'rm -rf "$work"' EXIT
+      # Leading whitespace is allowed on purpose: deleting just the
+      # NCCL_M2N_API token leaves the declaration indented, and a pattern
+      # anchored hard to column 0 would stop matching the line entirely --
+      # the declaration would vanish from BOTH sets and the check would pass.
+      grep -oE '^[[:space:]]*(NCCL_M2N_API[[:space:]]+)?(const char\*|ncclResult_t)[[:space:]]+nccl[A-Za-z0-9_]+\(' "$hdr" \
+        | sed -E 's/.*[^A-Za-z0-9_](nccl[A-Za-z0-9_]+)\($/\1/' | sort -u > "$work/declared"
+      grep -oE '^[[:space:]]*NCCL_M2N_API[[:space:]]+(const char\*|ncclResult_t)[[:space:]]+nccl[A-Za-z0-9_]+\(' "$hdr" \
+        | sed -E 's/.*[^A-Za-z0-9_](nccl[A-Za-z0-9_]+)\($/\1/' | sort -u > "$work/annotated"
+      test -s "$work/declared"
+      if ! comm -23 "$work/declared" "$work/annotated" > "$work/unannotated"; then exit 1; fi
+      if [ -s "$work/unannotated" ]; then
+        echo "ERROR: public header declarations missing the NCCL_M2N_API annotation:" >&2
+        cat "$work/unannotated" >&2
+        echo "These link under Make and fail to link under the hidden-by-default CMake build." >&2
+        exit 1
+      fi
+      nm -D --defined-only "$lib" | awk '$2 == "T" { print $3 }' | sort -u > "$work/actual"
+      if ! comm -23 "$work/declared" "$work/actual" > "$work/missing"; then exit 1; fi
+      if [ -s "$work/missing" ]; then
+        echo "ERROR: public entry points declared in the header but not exported by $lib:" >&2
+        cat "$work/missing" >&2
+        exit 1
+      fi
+      echo "All $(wc -l < "$work/declared") public entry points are annotated and exported."
   artifacts:
+    when: always
     name: "nccl-m2n-${CI_COMMIT_SHORT_SHA}"
     expire_in: 24 hours
     paths:

@@ -53,6 +53,7 @@ static void CUDART_CB releaseStagingKernelParams(void* data) {
 
 extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src,
                                     const ncclDistTensor_t* dst, cudaStream_t stream) {
+  M2nApiLock apiLock;
   m2nClearLastError();
   NCCL_M2N_CHECK_ARG(comm != nullptr, -1, "ncclReshard: comm must be non-null");
   NCCL_M2N_CHECK_ARG(src != nullptr && dst != nullptr, -1,
@@ -167,8 +168,11 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
     if (cached_win != nullptr) {
       staging_window = *cached_win;
     } else {
-      NCCL_M2N_CHECK(ncclCommWindowRegister(comm, staging->buffer, staging->totalSize, &staging_window,
-                                            NCCL_WIN_COLL_SYMMETRIC));
+      {
+        M2nApiUnlock apiUnlock;
+        NCCL_M2N_CHECK(ncclCommWindowRegister(comm, staging->buffer, staging->totalSize, &staging_window,
+                                              NCCL_WIN_COLL_SYMMETRIC));
+      }
       NCCL_M2N_CHECK(cacheInternalWindow(comm, staging->buffer, staging->totalSize, staging_window));
     }
   }
@@ -210,7 +214,10 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
       probeReqs.ginContextCount = staging_num_ctas;
 
       memset(&probeLocalDevComm, 0, sizeof(probeLocalDevComm));
-      NCCL_M2N_CHECK(ncclDevCommCreate(comm, &probeReqs, &probeLocalDevComm));
+      {
+        M2nApiUnlock apiUnlock;
+        NCCL_M2N_CHECK(ncclDevCommCreate(comm, &probeReqs, &probeLocalDevComm));
+      }
       NCCL_M2N_CHECK(cacheDevComm(comm, staging_num_ctas, 0, &probeLocalDevComm, workStream));
       probeDevComm = findCachedDevComm(comm, staging_num_ctas, 0, workStream);
       if (probeDevComm == nullptr) {
@@ -316,7 +323,10 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
       reqs.ginContextCount = staging_num_ctas;
 
       memset(&localDevComm, 0, sizeof(localDevComm));
-      NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, &localDevComm));
+      {
+        M2nApiUnlock apiUnlock;
+        NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, &localDevComm));
+      }
       NCCL_M2N_CHECK(cacheDevComm(comm, staging_num_ctas, params.ginSignalCount, &localDevComm, workStream));
       devCommPtr = findCachedDevComm(comm, staging_num_ctas, params.ginSignalCount, workStream);
       if (devCommPtr == nullptr) {

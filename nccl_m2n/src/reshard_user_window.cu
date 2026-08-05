@@ -446,6 +446,7 @@ directReshardKernelUserWindow(
 extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm, ncclWindow_t window,
                                                const ncclDistTensor_t* src, const ncclDistTensor_t* dst,
                                                cudaStream_t stream) {
+  M2nApiLock apiLock;
   m2nClearLastError();
   /* Required handles. */
   NCCL_M2N_CHECK_ARG(comm != nullptr && window != nullptr, -1,
@@ -649,7 +650,10 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
     reqs.ginContextCount = DEFAULT_GIN_CONTEXT_COUNT;
 
     memset(&localDevComm, 0, sizeof(localDevComm));
-    NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, &localDevComm));
+{
+      M2nApiUnlock apiUnlock;
+      NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, &localDevComm));
+    }
     NCCL_M2N_CHECK(cacheDevComm(comm, numCtas, ginSignalCount, &localDevComm, workStream));
     devCommPtr = findCachedDevComm(comm, numCtas, ginSignalCount, workStream);
     if (devCommPtr == nullptr) devCommPtr = &localDevComm;
@@ -853,8 +857,11 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
       effWindow = *cached;
     } else {
       ncclWindow_t xposeWin;
-      NCCL_M2N_CHECK(ncclCommWindowRegister(comm, getTransposeBuffer(comm), getTransposeBufferCapacity(comm), &xposeWin,
-                                          NCCL_WIN_COLL_SYMMETRIC));
+      {
+        M2nApiUnlock apiUnlock;
+        NCCL_M2N_CHECK(ncclCommWindowRegister(comm, getTransposeBuffer(comm), getTransposeBufferCapacity(comm), &xposeWin,
+                                            NCCL_WIN_COLL_SYMMETRIC));
+      }
       NCCL_M2N_CHECK(cacheInternalWindow(comm, getTransposeBuffer(comm), getTransposeBufferCapacity(comm), xposeWin));
       effWindow = xposeWin;
     }

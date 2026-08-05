@@ -25,10 +25,7 @@
 #include "staging_buffer.h"
 
 struct DevCommCacheEntry {
-  ncclComm_t comm;
-  int numCtas;
-  int ginSignalCount;
-  cudaStream_t stream;
+  ReshardDevCommCacheKey key;
   bool valid;
   ncclDevComm devComm;
 };
@@ -99,7 +96,7 @@ static ncclResult_t reclaimRetiredDevCommEntriesIfIdle() {
     M2nApiUnlock apiUnlock;
     for (DevCommCacheEntry& entry : retired) {
       if (entry.valid) {
-        NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(entry.comm, &entry.devComm));
+        NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(entry.key.comm, &entry.devComm));
       }
     }
   }
@@ -146,17 +143,15 @@ ncclResult_t cacheInternalWindow(ncclComm_t comm, void* buffer, size_t size, ncc
   return cacheWindow(&gInternalWindowCache, comm, buffer, size, window);
 }
 
-ncclDevComm* findCachedDevComm(ncclComm_t comm, int numCtas, int signalCount, cudaStream_t stream) {
+ncclDevComm* findCachedDevComm(const ReshardDevCommCacheKey& key) {
   for (int i = 0; i < gDevcommCacheCount; i++) {
     DevCommCacheEntry& e = gDevcommCache[i];
-    if (e.valid && e.comm == comm && e.numCtas == numCtas && e.ginSignalCount == signalCount && e.stream == stream)
-      return &e.devComm;
+    if (e.valid && e.key == key) return &e.devComm;
   }
   return nullptr;
 }
 
-ncclResult_t cacheDevComm(ncclComm_t comm, int numCtas, int signalCount, const ncclDevComm* devComm,
-                          cudaStream_t stream) {
+ncclResult_t cacheDevComm(const ReshardDevCommCacheKey& key, const ncclDevComm* devComm) {
   int idx;
   if (gDevcommCacheCount >= MAX_DEVCOMM_CACHE_ENTRIES) {
     idx = gDevcommCacheNextIdx;
@@ -171,7 +166,7 @@ ncclResult_t cacheDevComm(ncclComm_t comm, int numCtas, int signalCount, const n
         }
       } else {
         M2nApiUnlock apiUnlock;
-        NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(old.comm, &old.devComm));
+        NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(old.key.comm, &old.devComm));
       }
     }
     gDevcommCacheNextIdx = (gDevcommCacheNextIdx + 1) % MAX_DEVCOMM_CACHE_ENTRIES;
@@ -179,10 +174,7 @@ ncclResult_t cacheDevComm(ncclComm_t comm, int numCtas, int signalCount, const n
     idx = gDevcommCacheCount++;
   }
   DevCommCacheEntry& e = gDevcommCache[idx];
-  e.comm = comm;
-  e.numCtas = numCtas;
-  e.ginSignalCount = signalCount;
-  e.stream = stream;
+  e.key = key;
   e.devComm = *devComm;
   e.valid = true;
   return ncclSuccess;
@@ -301,7 +293,7 @@ void cacheFinalize() {
     for (int i = 0; i < gDevcommCacheCount; i++) {
       DevCommCacheEntry& e = gDevcommCache[i];
       if (e.valid) {
-        NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(e.comm, &e.devComm));
+        NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(e.key.comm, &e.devComm));
         e.valid = false;
       }
     }

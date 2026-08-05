@@ -191,7 +191,10 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   {
     staging_num_ctas = staging->numChannels;
 
-    probeDevComm = findCachedDevComm(comm, staging_num_ctas, 0, workStream);
+    const ReshardDevCommCacheKey probeKey = {
+      comm, staging_num_ctas, 0, 0, staging_num_ctas, RESHARD_DEVCOMM_BARRIER_WORLD
+    };
+    probeDevComm = findCachedDevComm(probeKey);
     if (probeDevComm == nullptr) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
       ncclDevCommRequirements probeReqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
@@ -218,8 +221,8 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
         M2nApiUnlock apiUnlock;
         NCCL_M2N_CHECK(ncclDevCommCreate(comm, &probeReqs, &probeLocalDevComm));
       }
-      NCCL_M2N_CHECK(cacheDevComm(comm, staging_num_ctas, 0, &probeLocalDevComm, workStream));
-      probeDevComm = findCachedDevComm(comm, staging_num_ctas, 0, workStream);
+      NCCL_M2N_CHECK(cacheDevComm(probeKey, &probeLocalDevComm));
+      probeDevComm = findCachedDevComm(probeKey);
       if (probeDevComm == nullptr) {
         probeDevComm = &probeLocalDevComm;
       }
@@ -300,7 +303,11 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   ncclDevComm* devCommPtr = nullptr;
   ncclDevComm localDevComm;
   {
-    devCommPtr = findCachedDevComm(comm, staging_num_ctas, params.ginSignalCount, workStream);
+    const ReshardDevCommCacheKey devCommKey = {
+      comm, staging_num_ctas, params.ginSignalCount, params.ginCounterCount, staging_num_ctas,
+      RESHARD_DEVCOMM_BARRIER_WORLD
+    };
+    devCommPtr = findCachedDevComm(devCommKey);
     if (devCommPtr == nullptr) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
       ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
@@ -327,8 +334,8 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
         M2nApiUnlock apiUnlock;
         NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, &localDevComm));
       }
-      NCCL_M2N_CHECK(cacheDevComm(comm, staging_num_ctas, params.ginSignalCount, &localDevComm, workStream));
-      devCommPtr = findCachedDevComm(comm, staging_num_ctas, params.ginSignalCount, workStream);
+      NCCL_M2N_CHECK(cacheDevComm(devCommKey, &localDevComm));
+      devCommPtr = findCachedDevComm(devCommKey);
       if (devCommPtr == nullptr) {
         devCommPtr = &localDevComm;
       }

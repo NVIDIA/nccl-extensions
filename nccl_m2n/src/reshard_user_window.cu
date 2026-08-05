@@ -622,11 +622,16 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   }
 
   // ------------------------------------------------------------------
-  // Get-or-create the global devComm on this stream.  This both gives us
+  // Get-or-create the global devComm. This both gives us
   // the LSA team size (used as gpusPerDomain below) and is what gets
   // passed to the kernel launch.
   // ------------------------------------------------------------------
-  ncclDevComm* devCommPtr = findCachedDevComm(comm, numCtas, ginSignalCount, workStream);
+  const ReshardDevCommBarrierKind barrierKind =
+    (algo == RESHARD_ALGO_DIRECT) ? RESHARD_DEVCOMM_BARRIER_WORLD : RESHARD_DEVCOMM_BARRIER_HYBRID;
+  const ReshardDevCommCacheKey devCommKey = {
+    comm, numCtas, ginSignalCount, 0, DEFAULT_GIN_CONTEXT_COUNT, barrierKind
+  };
+  ncclDevComm* devCommPtr = findCachedDevComm(devCommKey);
   ncclDevComm localDevComm;
   if (devCommPtr == nullptr) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
@@ -654,8 +659,8 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
       M2nApiUnlock apiUnlock;
       NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, &localDevComm));
     }
-    NCCL_M2N_CHECK(cacheDevComm(comm, numCtas, ginSignalCount, &localDevComm, workStream));
-    devCommPtr = findCachedDevComm(comm, numCtas, ginSignalCount, workStream);
+    NCCL_M2N_CHECK(cacheDevComm(devCommKey, &localDevComm));
+    devCommPtr = findCachedDevComm(devCommKey);
     if (devCommPtr == nullptr) devCommPtr = &localDevComm;
   }
 

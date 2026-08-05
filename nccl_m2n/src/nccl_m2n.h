@@ -131,7 +131,7 @@ typedef struct ncclDistTensor_v2 {
  * a pointer to ncclM2nInit() along with an output handle pointer.  The handle
  * stores a copy of the config for future API growth.  Process-global runtime
  * state is resolved on the first init call in an init/finalize epoch; runtime
- * env vars have highest precedence, so NCCL_RESHARD_MAX_CTA can override
+ * env vars have highest precedence, so NCCL_RESHARD_NUM_CTAS can override
  * config.maxCta.  Passing NULL config is equivalent to passing an
  * all-default-initialized config.  Fields left at
  * NCCL_M2N_CONFIG_UNDEF_INT keep the library default.

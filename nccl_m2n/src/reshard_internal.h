@@ -46,21 +46,19 @@ inline ReshardLoadBalanceMode gReshardLbMode = RESHARD_LB_UNIFORM;
 /* Upper bound on pickNumCtas() output.  0 = unset (use DEFAULT_NUM_CTAS). */
 inline int gReshardMaxCta = 0;
 
+/* Direct CTA-count override from NCCL_RESHARD_NUM_CTAS. 0 = unset; when set,
+ * this wins over config.maxCta. */
+inline int gReshardNumCtasOverride = 0;
+
 /* Resolved CTA count, computed once during runtime initialization from
- * gReshardMaxCta / DEFAULT_NUM_CTAS. pickNumCtas reads this directly - no
+ * gReshardNumCtasOverride / gReshardMaxCta / DEFAULT_NUM_CTAS. pickNumCtas reads this directly - no
  * per-call branch. */
 inline int gReshardNumCtas = DEFAULT_NUM_CTAS;
 
-/* Stream pool size populated during runtime initialization from
- *   NCCL_RESHARD_STREAM_POOL_SIZE   (int, default 4)
- * Maximum number of distinct (ncclComm_t, cuda device) pairs the
- * pool will hold a stream+event for.  1:1 mapping — one stream and
- * one back-edge event per entry.  Values <= 0 disable the pool
- * entirely (default-stream callers run on the user's default stream
- * directly).  Values > STREAM_POOL_MAX_SIZE are capped (with a
- * warning).  Applies only to default-stream callers; explicit-stream
- * callers are unaffected. */
-inline int gReshardStreamPoolSize = DEFAULT_STREAM_POOL_SIZE;
+/* Stream execution mode populated at first ncclM2nInit from
+ * NCCL_RESHARD_USE_INTERNAL_STREAMS. Internal streams are the default; false
+ * keeps work on caller streams with ordered DevComm reuse. */
+inline bool gReshardUseInternalStreams = true;
 
 /* Byte-level chunk size used by the RING prepare path. Default is
  * CHUNK_SIZE_BYTES; overridable via NCCL_RESHARD_CHUNK_SIZE.
@@ -84,8 +82,8 @@ inline int reshardGetDstDomainSize() {
 inline ReshardLoadBalanceMode reshardGetLoadBalanceMode() {
   return gReshardLbMode;
 }
-inline int reshardGetStreamPoolSize() {
-  return gReshardStreamPoolSize;
+inline bool reshardUseInternalStreams() {
+  return gReshardUseInternalStreams;
 }
 /* ======================================================================
  * m2n_config.cc — configuration appliers
@@ -96,7 +94,6 @@ void resetReshardRuntimeConfig();
 void applyReshardConfig(const ncclM2nConfig_t* config);
 ncclResult_t validateReshardConfigHeader(const ncclM2nConfig_t* config);
 void applyReshardEnv();
-void applyStreamPoolFromEnv();
 
 /* Validate an explicit handle token, or lazily create the internal default for
  * a NULL token. The returned state keeps its runtime alive for the call. */
@@ -169,10 +166,8 @@ ncclResult_t cacheInternalWindow(ncclComm_t comm, void* buffer, size_t size, ncc
  * are reused across calls so we don't pay cudaEvent{Create,
  * Destroy} per reshard.
  *
- * Pool-full fall-through: if a new (comm, dev) entry would exceed
- * NCCL_RESHARD_STREAM_POOL_SIZE, returns ncclSuccess with all outputs
- * set to nullptr (warns once).  Callers should
- * check that and run on the caller's default stream directly. */
+ * Resource creation fails loudly; there is no unordered fallback to the
+ * caller stream. */
 ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream, cudaEvent_t* outReadyEvent,
                                cudaEvent_t* outDoneEvent);
 

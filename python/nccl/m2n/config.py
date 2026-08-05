@@ -20,7 +20,7 @@ class Config:
     C ABI wrapper.  This high-level dataclass intentionally exposes Python
     naming and ``None`` defaults while converting to the binding object at the
     call site. ``max_cta=None`` forwards ``NCCL_M2N_CONFIG_UNDEF_INT`` so the
-    library default or ``NCCL_RESHARD_MAX_CTA`` environment cap applies.
+    library default or ``NCCL_RESHARD_NUM_CTAS`` environment override applies.
     """
 
     max_cta: int | None = None

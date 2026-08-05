@@ -148,11 +148,26 @@ Initial preview of NCCL M2N — reshard functionality.
   - `NCCL_RESHARD_LOG_LEVEL` — `NONE` / `WARN` / `INFO` / `DEBUG` / `TRACE`.
   - `NCCL_RESHARD_ALGORITHM` — `AUTO`, `RING`, or `DIRECT`.
   - `NCCL_RESHARD_LB_MODE` — `UNIFORM` or `NODE_AWARE`.
-  - `NCCL_RESHARD_MAX_CTA` — overrides `config.maxCta`.
-  - `NCCL_RESHARD_STREAM_POOL_SIZE` — caps internal default-stream pool
-    entries; `0` disables the pool.
+  - `NCCL_RESHARD_NUM_CTAS` — directly overrides the CTA count resolved from
+    `config.maxCta`.
+  - `NCCL_RESHARD_USE_INTERNAL_STREAMS` — boolean; unset or `1` caches one
+    internal stream per observed `(comm, device)` pair until runtime
+    finalization, `0` keeps work on caller streams with ordered DevComm reuse.
   - `NCCL_RESHARD_CHUNK_SIZE` — override the default 256 KB byte-level
     chunk size in the RING prepare path.
+
+## Breaking Changes
+
+This is the first official release; the previous experimental drops are not
+supported upgrade sources. Two runtime tuning variables changed with no
+compatibility shim:
+
+- `NCCL_RESHARD_MAX_CTA` is replaced by `NCCL_RESHARD_NUM_CTAS`, which directly
+  overrides the CTA count resolved from `config.maxCta`.
+- `NCCL_RESHARD_STREAM_POOL_SIZE` is removed and no longer parsed; setting it
+  has no effect. Use the boolean `NCCL_RESHARD_USE_INTERNAL_STREAMS` instead:
+  `0` maps the former `=0` behavior to ordered caller-stream execution, while
+  unset or `1` uses internal streams. There is no internal-stream count cap.
 
 ## Known Limitations
 

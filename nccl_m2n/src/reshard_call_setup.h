@@ -70,18 +70,11 @@ static inline ncclResult_t reshardSetupWorkStream(ncclComm_t comm, cudaStream_t 
   work->readyEvent = nullptr;
   work->doneEvent = nullptr;
 
-  const bool isDefaultStream =
-    (callerStream == nullptr || callerStream == cudaStreamLegacy || callerStream == cudaStreamPerThread);
-  const bool wantPool = isDefaultStream && reshardGetStreamPoolSize() > 0;
-  if (wantPool) {
+  if (reshardUseInternalStreams()) {
     const int dev = (propsResult == ncclSuccess) ? commProps->cudaDev : currentCudaDev;
     NCCL_M2N_CHECK(streamPoolAcquire(comm, dev, &work->stream, &work->readyEvent, &work->doneEvent));
-    if (work->stream == nullptr) {
-      work->stream = callerStream;
-    } else {
-      NCCL_M2N_CUDACHECK(cudaEventRecord(work->readyEvent, callerStream));
-      NCCL_M2N_CUDACHECK(cudaStreamWaitEvent(work->stream, work->readyEvent, 0));
-    }
+    NCCL_M2N_CUDACHECK(cudaEventRecord(work->readyEvent, callerStream));
+    NCCL_M2N_CUDACHECK(cudaStreamWaitEvent(work->stream, work->readyEvent, 0));
   }
   return ncclSuccess;
 }

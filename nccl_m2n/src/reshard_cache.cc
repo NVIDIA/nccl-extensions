@@ -255,13 +255,9 @@ ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream
                                cudaEvent_t* outDoneEvent) {
   NCCL_M2N_CHECK_ARG(outStream != nullptr && outReadyEvent != nullptr && outDoneEvent != nullptr, -1,
                      "streamPoolAcquire: output stream and events must be non-null");
-  /* Pool disabled (NCCL_RESHARD_STREAM_POOL_SIZE <= 0) — caller
-   * should have gated on reshardGetStreamPoolSize() > 0; defend
-   * anyway so a forgotten gate doesn't UB. */
-  const int maxEntries = reshardGetStreamPoolSize();
-  NCCL_M2N_CHECK_ARG(maxEntries > 0, -1,
-                     "streamPoolAcquire called while NCCL_RESHARD_STREAM_POOL_SIZE=%d; caller must bypass the pool",
-                     maxEntries);
+  NCCL_M2N_CHECK_ARG(reshardUseInternalStreams(), -1,
+                     "streamPoolAcquire called while NCCL_RESHARD_USE_INTERNAL_STREAMS=0; caller must bypass the "
+                     "pool");
 
   /* Find existing entry for (comm, dev). */
   for (StreamPoolEntry& e : gStreamPool) {
@@ -271,22 +267,6 @@ ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream
       *outDoneEvent = e.doneEvent;
       return ncclSuccess;
     }
-  }
-  /* Pool full — soft fall-through.  Caller checks *outStream ==
-   * nullptr and runs on the user's default stream for this call. */
-  if ((int)gStreamPool.size() >= maxEntries) {
-    RESHARD_WARN(-1,
-                 "Stream pool full (%d entries, "
-                 "NCCL_RESHARD_STREAM_POOL_SIZE=%d); "
-                 "falling through to the caller's default stream for this (comm, "
-                 "dev) pair.  Bump NCCL_RESHARD_STREAM_POOL_SIZE if your "
-                 "workload "
-                 "uses more distinct (comm, dev) pairs.",
-                 (int)gStreamPool.size(), maxEntries);
-    *outStream = nullptr;
-    *outReadyEvent = nullptr;
-    *outDoneEvent = nullptr;
-    return ncclSuccess;
   }
   /* Lazy-create stream + events for the new (comm, dev). */
   StreamPoolEntry fresh;

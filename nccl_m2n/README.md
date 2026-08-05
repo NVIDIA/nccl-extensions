@@ -281,8 +281,9 @@ ncclResult_t ncclReshard(
 );
 ```
 
-CTA count defaults to `DEFAULT_NUM_CTAS = 8` and can be capped with
-`config.maxCta` / `NCCL_RESHARD_MAX_CTA`. Chunking defaults to
+CTA count defaults to `DEFAULT_NUM_CTAS = 8`, can be capped with
+`config.maxCta`, and can be directly overridden with `NCCL_RESHARD_NUM_CTAS`.
+Chunking defaults to
 `DEFAULT_ELEMENTS_PER_CHUNK = 32`; the RING path also honors
 `NCCL_RESHARD_CHUNK_SIZE` as a byte-level chunk override.
 
@@ -308,10 +309,11 @@ noted otherwise):
 - For `ncclReshardWithWindow`, `window` is non-NULL and registered on `comm`
   itself with `NCCL_WIN_COLL_SYMMETRIC`.
 - `stream` is either an explicit CUDA stream or a default-stream sentinel
-  (`NULL`, `cudaStreamLegacy`, or `cudaStreamPerThread`). Default-stream callers
-  run on an internal non-blocking stream pool when enabled. Readiness and
-  completion events preserve the caller stream's ordering before and after the
-  reshard operation.
+  (`NULL`, `cudaStreamLegacy`, or `cudaStreamPerThread`). By default every call
+  runs on a library-owned non-blocking stream cached for its `(comm, device)`
+  pair until runtime finalization; ready/done events preserve ordering with the
+  caller stream. Setting `NCCL_RESHARD_USE_INTERNAL_STREAMS=0` keeps work on the
+  caller stream and preserves ordering for reused DevComm entries.
 - `src->dataPtr` and `dst->dataPtr` are non-NULL on ranks that belong to the
   corresponding mesh. A pointer may be NULL only on an inactive side. For the
   window API, active pointers lie inside the registered window; if both are
@@ -363,7 +365,7 @@ and pass a pointer to `ncclM2nInit()` with an output handle pointer.
 Passing `NULL` config means "all defaults". The handle stores a copy of this
 config for future extension. Fields left at `NCCL_M2N_CONFIG_UNDEF_INT` keep
 the library default, and runtime env vars still have highest precedence; for
-example, `NCCL_RESHARD_MAX_CTA` can override `config.maxCta`.
+example, `NCCL_RESHARD_NUM_CTAS` can override `config.maxCta`.
 
 | Field    | Purpose |
 |---|---|
@@ -727,7 +729,7 @@ not fail the run.
 
 **CTA count and chunk granularity** — CTA count resolves once during runtime
 initialization: built-in default 8, then optional `config.maxCta`, then
-`NCCL_RESHARD_MAX_CTA` if set. `pickElementsPerChunk` currently returns the
+`NCCL_RESHARD_NUM_CTAS` as a direct override if set. `pickElementsPerChunk` currently returns the
 compile-time default (`DEFAULT_ELEMENTS_PER_CHUNK = 32`). The RING prepare path
 also uses `CHUNK_SIZE_BYTES` (256 KB) as a byte-level chunk size, overridable
 per-process via `NCCL_RESHARD_CHUNK_SIZE` (bytes).
@@ -747,11 +749,11 @@ is cached for the RING prepare path.
 
 Strict decimal parsing accepts leading ASCII whitespace and an optional `+`,
 but requires the remainder of the string to contain only digits. Empty,
-non-positive, trailing-character, and out-of-range values are invalid. Except
-for `NCCL_RESHARD_STREAM_POOL_SIZE`, an invalid value is ignored and the
-configured or built-in value remains in effect. For the stream pool, an invalid
-or non-positive value disables the pool; values above
-`STREAM_POOL_MAX_SIZE` are capped to that maximum.
+non-positive, trailing-character, and out-of-range values are invalid and
+ignored, leaving the configured or built-in value in effect. Boolean values
+accept `1`, `true`, `yes`, or `on` for enabled and `0`, `false`, `no`, or `off`
+for disabled, case-insensitively; invalid boolean values are ignored and leave
+the default enabled behavior in effect.
 
 `NCCL_RESHARD_STAGING_NUM_CHANNELS`,
 `NCCL_RESHARD_STAGING_CHANNEL_SIZE`, and
@@ -763,10 +765,10 @@ have identical effective values on every rank in the communicator.
 | `NCCL_RESHARD_LOG_LEVEL`        | One of `NONE`, `WARN` (default), `INFO`, `DEBUG`, `TRACE`. |
 | `NCCL_RESHARD_ALGORITHM`        | `AUTO` (default), `RING`, or `DIRECT`. |
 | `NCCL_RESHARD_LB_MODE`          | `UNIFORM` (default) or `NODE_AWARE`. |
-| `NCCL_RESHARD_MAX_CTA`          | Positive cap overriding `config.maxCta`; invalid values are ignored. |
+| `NCCL_RESHARD_NUM_CTAS`         | Directly overrides the resolved CTA count; invalid values are ignored. |
 | `NCCL_RESHARD_SRC_DOMAIN_SIZE`  | Positive source domain-size override; invalid values are ignored. |
 | `NCCL_RESHARD_DST_DOMAIN_SIZE`  | Positive destination domain-size override; invalid values are ignored. |
-| `NCCL_RESHARD_STREAM_POOL_SIZE` | Max distinct `(comm, dev)` pool entries (default 4); invalid or non-positive values disable it and oversized values are capped. |
+| `NCCL_RESHARD_USE_INTERNAL_STREAMS` | Cache one internal stream per observed `(comm, device)` pair until runtime finalization (default `1`); `0` keeps work on caller streams with ordered DevComm reuse. |
 | `NCCL_RESHARD_CHUNK_SIZE`       | Positive RING byte-level chunk size; invalid values are ignored. |
 | `NCCL_RESHARD_STAGING_NUM_CHANNELS` | Positive staging channel count used by `ncclReshard`. |
 | `NCCL_RESHARD_STAGING_CHANNEL_SIZE` | Positive per-channel staging allocation in bytes. |

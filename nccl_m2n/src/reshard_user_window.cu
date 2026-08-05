@@ -510,9 +510,9 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   ncclResult_t propsResult = ncclSuccess;
   NCCL_M2N_CHECK(reshardMatchCommCudaDevice(comm, &currentCudaDev, &commProps, &propsResult));
 
-  // Default-stream callers run on a library-owned non-blocking stream from
-  // the pool. Readiness and completion events preserve the caller stream's
-  // ordering. NCCL_RESHARD_STREAM_POOL_SIZE=0 runs on the caller stream.
+  // Internal-stream mode routes every caller through a library-owned
+  // non-blocking stream. Readiness and completion events preserve the caller
+  // stream's ordering; NCCL_RESHARD_USE_INTERNAL_STREAMS=0 uses the caller stream.
   ReshardWorkStream work{};
   ncclResult_t setupResult = reshardSetupWorkStream(comm, stream, currentCudaDev, propsResult, &commProps, &work);
   if (setupResult != ncclSuccess) {

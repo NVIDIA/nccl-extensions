@@ -1582,14 +1582,6 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     int nRanks;
     assert(comm != nullptr && ncclCommCount(comm, &nRanks) == ncclSuccess && nRanks > 0);
     EP_VALIDATE_STRUCT(in_config, NCCL_EP_GROUP_CONFIG);
-    if (in_config->version != NCCL_EP_API_VERSION) {
-        fprintf(
-            stderr,
-            "NCCL EP WARN: ncclEpGroupConfig_t.version=%u, library API_VERSION=%u; "
-            "behavior may differ across versions.\n",
-            in_config->version,
-            (unsigned int)NCCL_EP_API_VERSION);
-    }
 
     // Decode the caller-owned object into current library storage. A future
     // caller may be larger, while a future library may receive this frozen V1
@@ -1662,6 +1654,16 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
 
     // Stamp this process's rank into the env config
     nccl_ep_env_set_rank(&ep_group->env, ep_group->rank);
+
+    if (in_config->version > NCCL_EP_API_VERSION && nccl_ep_env_verbose(ep_group->env)) {
+        fprintf(
+            stderr,
+            "NCCL EP WARN: the application uses API version %u, but the loaded "
+            "libnccl_ep.so supports version %u; features introduced by newer API "
+            "versions are unsupported and will be ignored.\n",
+            in_config->version,
+            (unsigned int)NCCL_EP_API_VERSION);
+    }
 
     // Dump the resolved environment configuration once if requested
     if (nccl_ep_env_verbose(ep_group->env)) nccl_ep_env_print(ep_group->env);

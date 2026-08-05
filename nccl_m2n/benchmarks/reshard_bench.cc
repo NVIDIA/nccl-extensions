@@ -25,8 +25,11 @@
 
 #include "bench_common.h"
 #include "bench_common_kernels.h"
+#include "bench_metrics.h"
 
 #include "nccl_m2n.h"
+
+#include <exception>
 
 static void printUsage(const char* prog) {
   printf("Usage: %s [options]\n", prog);
@@ -49,6 +52,7 @@ static void printUsage(const char* prog) {
          "(default) or 'node'\n");
   printf("  --verbose                        Enable debug output\n");
   printf("  --print-all-ranks                Print per-rank timing\n");
+  printf("  --metrics-output <path>          Write structured rank-max latency samples\n");
   printf("  --use-default-stream             Pass nullptr to the selected "
          "reshard API so the\n");
   printf("                                   library substitutes a stream from "
@@ -91,82 +95,45 @@ int main(int argc, char* argv[]) {
   bool verbose = false;
   bool printAllRanks = false;
   bool useDefaultStream = false;
-  bool useDefaultApi = false;
+  ReshardApiMode apiMode = ReshardApiMode::Window;
   const char* algorithm = "RING";
   const char* lbMode = "UNIFORM";
+  const char* pMetricsOutput = nullptr;
 
-  // Parse arguments
-  for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--src-mesh-dims") == 0) {
-      benchParseMeshDims(argv[++i], srcMeshDims);
-    } else if (strcmp(argv[i], "--dst-mesh-dims") == 0) {
-      benchParseMeshDims(argv[++i], dstMeshDims);
-    } else if (strcmp(argv[i], "--tensor-dims") == 0) {
-      ndims = benchParseTensorDims(argv[++i], globalTensorDims);
-    } else if (strcmp(argv[i], "--src-shard-dim") == 0) {
-      srcShardDim = benchParseInt(argv[++i]);
-    } else if (strcmp(argv[i], "--dst-shard-dim") == 0) {
-      dstShardDim = benchParseInt(argv[++i]);
-    } else if (strcmp(argv[i], "--iterations") == 0) {
-      iterations = benchParseInt(argv[++i]);
-    } else if (strcmp(argv[i], "--warmup") == 0) {
-      warmup = benchParseInt(argv[++i]);
-    } else if (strcmp(argv[i], "--validate") == 0) {
-      validate = true;
-    } else if (strcmp(argv[i], "--verbose") == 0) {
-      verbose = true;
-    } else if (strcmp(argv[i], "--print-all-ranks") == 0) {
-      printAllRanks = true;
-    } else if (strcmp(argv[i], "--use-default-stream") == 0) {
-      useDefaultStream = true;
-    } else if (strcmp(argv[i], "--algorithm") == 0) {
-      ++i;
-      if (strcmp(argv[i], "direct") == 0) {
-        algorithm = "DIRECT";
-      } else if (strcmp(argv[i], "ring") == 0) {
-        algorithm = "RING";
-      } else {
-        if (mpiRank == 0) {
-          printf("ERROR: Unknown algorithm '%s'. Use 'ring' or "
-                 "'direct'\n",
-                 argv[i]);
-        }
-        MPI_Finalize();
-        return 1;
-      }
-    } else if (strcmp(argv[i], "--api") == 0) {
-      ++i;
-      if (strcmp(argv[i], "default") == 0) {
-        useDefaultApi = true;
-      } else if (strcmp(argv[i], "window") == 0) {
-        useDefaultApi = false;
-      } else {
-        if (mpiRank == 0) {
-          printf("ERROR: Unknown api '%s'. Use 'window' or 'default'\n", argv[i]);
-        }
-        MPI_Finalize();
-        return 1;
-      }
-    } else if (strcmp(argv[i], "--lb-mode") == 0) {
-      ++i;
-      if (strcmp(argv[i], "node") == 0) {
-        lbMode = "NODE_AWARE";
-      } else if (strcmp(argv[i], "uniform") == 0) {
-        lbMode = "UNIFORM";
-      } else {
-        if (mpiRank == 0) {
-          printf("ERROR: Unknown lb-mode '%s'. Use 'uniform' or "
-                 "'node'\n",
-                 argv[i]);
-        }
-        MPI_Finalize();
-        return 1;
-      }
-    } else if (strcmp(argv[i], "--help") == 0) {
-      if (mpiRank == 0) printUsage(argv[0]);
-      MPI_Finalize();
-      return 0;
+  BenchArgParser parser(argc, argv, mpiRank);
+  parser.meshDims("--src-mesh-dims", srcMeshDims)
+      .meshDims("--dst-mesh-dims", dstMeshDims)
+      .tensorDims("--tensor-dims", globalTensorDims, &ndims)
+      .integer("--src-shard-dim", &srcShardDim)
+      .integer("--dst-shard-dim", &dstShardDim)
+      .integer("--iterations", &iterations)
+      .integer("--warmup", &warmup)
+      .flag("--validate", [&] { validate = true; })
+      .flag("--verbose", [&] { verbose = true; })
+      .flag("--print-all-ranks", [&] { printAllRanks = true; })
+      .value("--metrics-output", [&](const char* value) {
+        pMetricsOutput = value;
+        return BenchParseResult::Success;
+      })
+      .flag("--use-default-stream", [&] { useDefaultStream = true; })
+      .enumValue("--algorithm", &algorithm, {{"direct", "DIRECT"}, {"ring", "RING"}},
+          "ERROR: Unknown algorithm '%s'. Use 'ring' or 'direct'\n")
+      .apiMode("--api", &apiMode)
+      .enumValue("--lb-mode", &lbMode, {{"node", "NODE_AWARE"}, {"uniform", "UNIFORM"}},
+          "ERROR: Unknown lb-mode '%s'. Use 'uniform' or 'node'\n")
+      .help(printUsage);
+
+  int parseExit = benchParseExitCode(parser.parse());
+  if (parseExit >= 0) {
+    return parseExit;
+  }
+
+  if (iterations <= 0 || warmup < 0) {
+    if (mpiRank == 0) {
+      printf("ERROR: --iterations must be > 0 and --warmup must be >= 0\n");
     }
+    MPI_Finalize();
+    return 1;
   }
 
   // Configure reshard library via env vars (applied in ncclM2nInit).
@@ -194,8 +161,9 @@ int main(int argc, char* argv[]) {
   int totalExpected = srcTotal + dstTotal;
 
   if (mpiSize != totalExpected) {
-    if (mpiRank == 0)
+    if (mpiRank == 0) {
       printf("ERROR: Expected %d processes (src=%d + dst=%d), got %d\n", totalExpected, srcTotal, dstTotal, mpiSize);
+    }
     MPI_Finalize();
     return 1;
   }
@@ -213,36 +181,48 @@ int main(int argc, char* argv[]) {
   // Compute local tensor dimensions
   size_t srcLocalDims[3], dstLocalDims[3];
   for (int d = 0; d < ndims; d++) {
-    if (d == srcShardDim) srcLocalDims[d] = globalTensorDims[d] / srcShardCount;
-    else srcLocalDims[d] = globalTensorDims[d];
-    if (d == dstShardDim) dstLocalDims[d] = globalTensorDims[d] / dstShardCount;
-    else dstLocalDims[d] = globalTensorDims[d];
+    if (d == srcShardDim) {
+      srcLocalDims[d] = globalTensorDims[d] / srcShardCount;
+    } else {
+      srcLocalDims[d] = globalTensorDims[d];
+    }
+    if (d == dstShardDim) {
+      dstLocalDims[d] = globalTensorDims[d] / dstShardCount;
+    } else {
+      dstLocalDims[d] = globalTensorDims[d];
+    }
   }
 
   // Print configuration
   if (mpiRank == 0) {
     printf("=== Tensor Reshard Benchmark ===\n");
-    if (useDefaultApi) {
-      printf("Using: ncclReshard (default API, DIRECT staging path)\n");
+    if (apiMode == ReshardApiMode::Default) {
+      printf("Using: ncclReshard (default API)\n");
     } else {
       printf("Using: ncclReshardWithWindow (user window API)\n");
     }
     printf("Global tensor: [%zu", globalTensorDims[0]);
-    for (int d = 1; d < ndims; d++) printf(", %zu", globalTensorDims[d]);
+    for (int d = 1; d < ndims; d++) {
+      printf(", %zu", globalTensorDims[d]);
+    }
     printf("] (%dD)\n", ndims);
     printf("Source shard dim: %d, Dest shard dim: %d%s\n", srcShardDim, dstShardDim,
            srcShardDim == dstShardDim ? " (same-dim)" : " (CROSS-DIM!)");
     printf("Source: %d ranks = %d reps x %d shards, local=[%zu", srcTotal, srcMeshDims[0], srcMeshDims[1],
            srcLocalDims[0]);
-    for (int d = 1; d < ndims; d++) printf(", %zu", srcLocalDims[d]);
+    for (int d = 1; d < ndims; d++) {
+      printf(", %zu", srcLocalDims[d]);
+    }
     printf("]\n");
     printf("Dest: %d ranks = %d reps x %d shards, local=[%zu", dstTotal, dstMeshDims[0], dstMeshDims[1],
            dstLocalDims[0]);
-    for (int d = 1; d < ndims; d++) printf(", %zu", dstLocalDims[d]);
+    for (int d = 1; d < ndims; d++) {
+      printf(", %zu", dstLocalDims[d]);
+    }
     printf("]\n");
-    if (!useDefaultApi) {
-      printf("Algorithm: %s\n", algorithm);
-      if (strcmp(algorithm, "RING") == 0) printf("Load Balance Mode: %s\n", lbMode);
+    printf("Algorithm: %s\n", algorithm);
+    if (strcmp(algorithm, "RING") == 0) {
+      printf("Load Balance Mode: %s\n", lbMode);
     }
     printf("Iterations: %d (warmup: %d), Validate: %s\n", iterations, warmup, validate ? "yes" : "no");
     fflush(stdout);
@@ -255,7 +235,9 @@ int main(int argc, char* argv[]) {
 
   // Create NCCL communicator
   ncclUniqueId worldId;
-  if (mpiRank == 0) NCCLCHECK(ncclGetUniqueId(&worldId));
+  if (mpiRank == 0) {
+    NCCLCHECK(ncclGetUniqueId(&worldId));
+  }
   MPICHECK(MPI_Bcast(&worldId, sizeof(worldId), benchMpiByte(), 0, benchMpiWorld()));
 
   ncclComm_t worldComm;
@@ -271,10 +253,12 @@ int main(int argc, char* argv[]) {
   }
   size_t allocSize = std::max(srcBufferSize, dstBufferSize);
   const size_t NCCL_MIN_ALLOC = 4096;
-  if (allocSize < NCCL_MIN_ALLOC) allocSize = NCCL_MIN_ALLOC;
+  if (allocSize < NCCL_MIN_ALLOC) {
+    allocSize = NCCL_MIN_ALLOC;
+  }
 
   void* buffer = nullptr;
-  if (useDefaultApi) {
+  if (apiMode == ReshardApiMode::Default) {
     CUDACHECK(cudaMalloc(&buffer, allocSize));
   } else {
     NCCLCHECK(ncclMemAlloc(&buffer, allocSize));
@@ -283,7 +267,7 @@ int main(int argc, char* argv[]) {
 
   // Register window for user-window API
   ncclWindow_t window = nullptr;
-  if (!useDefaultApi) {
+  if (apiMode == ReshardApiMode::Window) {
     NCCLCHECK(ncclCommWindowRegister(worldComm, buffer, allocSize, &window, NCCL_WIN_COLL_SYMMETRIC));
   }
 
@@ -345,7 +329,7 @@ int main(int argc, char* argv[]) {
   // return so a contract violation (null window, mismatched offsets, etc.)
   // fails the bench instead of being silently dropped.
   auto runOneIteration = [&]() {
-    if (useDefaultApi) {
+    if (apiMode == ReshardApiMode::Default) {
       NCCLCHECK(ncclReshard(m2nHandle, worldComm, &srcTensor, &dstTensor, reshardStream));
     } else {
       NCCLCHECK(ncclReshardWithWindow(m2nHandle, worldComm, window, &srcTensor, &dstTensor, reshardStream));
@@ -353,7 +337,9 @@ int main(int argc, char* argv[]) {
   };
 
   // Warmup
-  if (mpiRank == 0) printf("\nRunning %d warmup iterations...\n", warmup);
+  if (mpiRank == 0) {
+    printf("\nRunning %d warmup iterations...\n", warmup);
+  }
 
   for (int i = 0; i < warmup; i++) {
     runOneIteration();
@@ -361,7 +347,9 @@ int main(int argc, char* argv[]) {
     MPICHECK(MPI_Barrier(benchMpiWorld()));
   }
 
-  if (mpiRank == 0) printf("Warmup complete.\n");
+  if (mpiRank == 0) {
+    printf("Warmup complete.\n");
+  }
 
   // Validation (after warmup). Result is propagated to the process exit
   // code so a corrupted reshard fails the bench instead of silently
@@ -376,7 +364,9 @@ int main(int argc, char* argv[]) {
 
       localValid = benchValidateDestData((const char*)buffer, dstLocalDims, ndims, dstShardDim, shardIdx, dstShardCount,
                                          mpiRank, stream);
-      if (localValid) printf("[Rank %d] VALIDATION PASSED: %zu bytes correct\n", mpiRank, dstBufferSize);
+      if (localValid) {
+        printf("[Rank %d] VALIDATION PASSED: %zu bytes correct\n", mpiRank, dstBufferSize);
+      }
     }
 
     int localResult = localValid ? 1 : 0;
@@ -384,26 +374,60 @@ int main(int argc, char* argv[]) {
     MPICHECK(MPI_Allreduce(&localResult, &globalResult, 1, benchMpiInt(), benchMpiMin(), benchMpiWorld()));
 
     if (globalResult == 0) {
-      if (mpiRank == 0) printf("\n*** VALIDATION FAILED ***\n\n");
+      if (mpiRank == 0) {
+        printf("\n*** VALIDATION FAILED ***\n\n");
+      }
       validationRc = 1;
     } else {
-      if (mpiRank == 0) printf("\n*** VALIDATION PASSED ***\n\n");
+      if (mpiRank == 0) {
+        printf("\n*** VALIDATION PASSED ***\n\n");
+      }
     }
 
     // Reset dest buffer for timing runs
-    if (isDest) CUDACHECK(cudaMemset(buffer, 0xDE, dstBufferSize));
+    if (isDest) {
+      CUDACHECK(cudaMemset(buffer, 0xDE, dstBufferSize));
+    }
     MPICHECK(MPI_Barrier(benchMpiWorld()));
   }
 
   // Timed iterations
-  if (mpiRank == 0) printf("\nRunning %d timed iterations...\n", iterations);
+  if (mpiRank == 0) {
+    printf("\nRunning %d timed iterations...\n", iterations);
+  }
+
+  const bool bCollectMetrics = pMetricsOutput != nullptr;
+  std::vector<double> localIterationMs;
+  int metricsWriteRc = 0;
+  if (bCollectMetrics) {
+    int localMetricsSetupRc = 0;
+    try {
+      localIterationMs.resize(iterations);
+    } catch (const std::exception& error) {
+      fprintf(stderr, "[Rank %d] ERROR: unable to allocate local metrics samples: %s\n", mpiRank, error.what());
+      localMetricsSetupRc = 1;
+    } catch (...) {
+      fprintf(stderr, "[Rank %d] ERROR: unable to allocate local metrics samples: unknown exception\n", mpiRank);
+      localMetricsSetupRc = 1;
+    }
+    MPICHECK(MPI_Allreduce(&localMetricsSetupRc, &metricsWriteRc, 1, benchMpiInt(), benchMpiMax(),
+                           benchMpiWorld()));
+  }
 
   MPICHECK(MPI_Barrier(benchMpiWorld()));
   auto start = std::chrono::high_resolution_clock::now();
 
   for (int iter = 0; iter < iterations; iter++) {
+    std::chrono::steady_clock::time_point iterationStart;
+    if (bCollectMetrics && metricsWriteRc == 0) {
+      iterationStart = std::chrono::steady_clock::now();
+    }
     runOneIteration();
     CUDACHECK(cudaStreamSynchronize(reshardStream));
+    if (bCollectMetrics && metricsWriteRc == 0) {
+      const auto iterationEnd = std::chrono::steady_clock::now();
+      localIterationMs[iter] = std::chrono::duration<double, std::milli>(iterationEnd - iterationStart).count();
+    }
     MPICHECK(MPI_Barrier(benchMpiWorld()));
   }
 
@@ -413,7 +437,9 @@ int main(int argc, char* argv[]) {
 
   // Compute bandwidth statistics
   size_t totalData = 1;
-  for (int d = 0; d < ndims; d++) totalData *= globalTensorDims[d];
+  for (int d = 0; d < ndims; d++) {
+    totalData *= globalTensorDims[d];
+  }
   double bandwidthGbps = ((double)totalData / (avgTimeMs / 1000.0)) / (1024.0 * 1024.0 * 1024.0);
 
   size_t myData = isSource ? srcBufferSize : dstBufferSize;
@@ -428,6 +454,56 @@ int main(int argc, char* argv[]) {
   double timeMin, timeMax;
   MPICHECK(MPI_Reduce(&avgTimeMs, &timeMin, 1, benchMpiDouble(), benchMpiMin(), 0, benchMpiWorld()));
   MPICHECK(MPI_Reduce(&avgTimeMs, &timeMax, 1, benchMpiDouble(), benchMpiMax(), 0, benchMpiWorld()));
+
+  // Reduce after the timed loop so structured metrics add no collective to
+  // the measured region. Each sample is the slowest rank's local interval
+  // from immediately before API enqueue through CUDA stream completion; the
+  // existing per-iteration MPI barrier is excluded. The clock reads themselves
+  // remain inside the legacy elapsed-time region when collection is enabled.
+  std::vector<double> rankMaxIterationMs;
+  if (bCollectMetrics) {
+    if (mpiRank == 0 && metricsWriteRc == 0) {
+      try {
+        rankMaxIterationMs.resize(iterations);
+      } catch (const std::exception& error) {
+        fprintf(stderr, "ERROR: unable to allocate metrics samples: %s\n", error.what());
+        metricsWriteRc = 1;
+      } catch (...) {
+        fprintf(stderr, "ERROR: unable to allocate metrics samples: unknown exception\n");
+        metricsWriteRc = 1;
+      }
+    }
+    // Coordinate root-only allocation failure before peers enter the reduce.
+    MPICHECK(MPI_Bcast(&metricsWriteRc, 1, benchMpiInt(), 0, benchMpiWorld()));
+    if (metricsWriteRc == 0) {
+      MPICHECK(MPI_Reduce(localIterationMs.data(), mpiRank == 0 ? rankMaxIterationMs.data() : nullptr, iterations,
+                          benchMpiDouble(), benchMpiMax(), 0, benchMpiWorld()));
+    }
+  }
+
+  if (mpiRank == 0 && bCollectMetrics && metricsWriteRc == 0) {
+    try {
+      BenchMetrics("reshard_bench", mpiSize, iterations)
+          .addSamples("rank_max_enqueue_to_cuda_completion", "milliseconds", rankMaxIterationMs,
+              {
+                  {"interval_start", "immediately_before_reshard_api_call"},
+                  {"interval_stop", "after_cuda_stream_synchronize"},
+                  {"rank_reduction", "max"},
+                  {"mpi_barrier_included", false},
+              })
+          .write(pMetricsOutput);
+    } catch (const std::exception& error) {
+      fprintf(stderr, "ERROR: unable to write metrics output '%s': %s\n", pMetricsOutput, error.what());
+      metricsWriteRc = 1;
+    } catch (...) {
+      fprintf(stderr, "ERROR: unable to write metrics output '%s': unknown exception\n", pMetricsOutput);
+      metricsWriteRc = 1;
+    }
+  }
+  if (bCollectMetrics) {
+    // Propagate root-only JSON/allocation/stream failures before continuing.
+    MPICHECK(MPI_Bcast(&metricsWriteRc, 1, benchMpiInt(), 0, benchMpiWorld()));
+  }
 
   // Source-only stats
   double trainerBwForMin = isSource ? myBwGbps : 1e20;
@@ -502,12 +578,12 @@ int main(int argc, char* argv[]) {
   }
 
   // Reshard is asynchronous. Complete the work before releasing its resources.
-  CUDACHECK(cudaStreamSynchronize(stream));
+  CUDACHECK(cudaStreamSynchronize(reshardStream));
   if (window != nullptr) {
     ncclCommWindowDeregister(worldComm, window);
   }
   NCCLCHECK(ncclM2nFinalize(m2nHandle));
-  if (useDefaultApi) {
+  if (apiMode == ReshardApiMode::Default) {
     CUDACHECK(cudaFree(buffer));
   } else {
     NCCLCHECK(ncclMemFree(buffer));
@@ -518,9 +594,14 @@ int main(int argc, char* argv[]) {
   MPICHECK(MPI_Finalize());
 
   if (mpiRank == 0) {
-    if (validationRc == 0) printf("\nBenchmark completed successfully!\n");
-    else printf("\nBenchmark completed with VALIDATION FAILURES.\n");
+    if (validationRc == 0 && metricsWriteRc == 0) {
+      printf("\nBenchmark completed successfully!\n");
+    } else if (validationRc != 0) {
+      printf("\nBenchmark completed with VALIDATION FAILURES.\n");
+    } else {
+      printf("\nBenchmark completed with METRICS OUTPUT FAILURE.\n");
+    }
   }
 
-  return validationRc;
+  return validationRc != 0 ? validationRc : metricsWriteRc;
 }

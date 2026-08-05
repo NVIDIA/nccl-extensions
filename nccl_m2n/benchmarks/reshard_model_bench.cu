@@ -554,53 +554,47 @@ int main(int argc, char* argv[]) {
   bool verbose = false;
   const char* algorithm = "AUTO";
   const char* lbMode = "UNIFORM";
-  bool useDefaultApi = false;
+  ReshardApiMode apiMode = ReshardApiMode::Window;
 
-  for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--model-config") == 0) {
-      modelConfigPath = argv[++i];
-    } else if (strcmp(argv[i], "--system-config") == 0) {
-      systemConfigPath = argv[++i];
-    } else if (strcmp(argv[i], "--iterations") == 0) {
-      iterations = benchParseInt(argv[++i], "--iterations");
-    } else if (strcmp(argv[i], "--warmup") == 0) {
-      warmup = benchParseInt(argv[++i], "--warmup");
-    } else if (strcmp(argv[i], "--gpus-per-node") == 0) {
-      gpusPerNode = benchParseInt(argv[++i], "--gpus-per-node");
-    } else if (strcmp(argv[i], "--no-dedup") == 0) {
-      deduplicate = false;
-    } else if (strcmp(argv[i], "--validate") == 0) {
-      validate = true;
-    } else if (strcmp(argv[i], "--validate-iterations") == 0) {
-      validateIterations = benchParseInt(argv[++i], "--validate-iterations");
-    } else if (strcmp(argv[i], "--verbose") == 0) {
-      verbose = true;
-    } else if (strcmp(argv[i], "--algorithm") == 0) {
-      ++i;
-      if (strcmp(argv[i], "direct") == 0) algorithm = "DIRECT";
-      else if (strcmp(argv[i], "ring") == 0) algorithm = "RING";
-      else algorithm = "AUTO";
-    } else if (strcmp(argv[i], "--api") == 0) {
-      ++i;
-      if (strcmp(argv[i], "default") == 0) {
-        useDefaultApi = true;
-      } else if (strcmp(argv[i], "window") == 0) {
-        useDefaultApi = false;
-      } else {
-        if (mpiRank == 0) {
-          printf("ERROR: unknown --api value '%s' (use 'window' or 'default')\n", argv[i]);
-        }
-        MPI_Finalize();
-        return 1;
-      }
-    } else if (strcmp(argv[i], "--lb-mode") == 0) {
-      ++i;
-      if (strcmp(argv[i], "node") == 0) lbMode = "NODE_AWARE";
-    } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-      if (mpiRank == 0) printUsage(argv[0]);
-      MPI_Finalize();
-      return 0;
+  auto parseModelConfig = [&](const char* value) {
+    modelConfigPath = value;
+    return BenchParseResult::Success;
+  };
+
+  auto parseSystemConfig = [&](const char* value) {
+    systemConfigPath = value;
+    return BenchParseResult::Success;
+  };
+
+  BenchArgParser parser(argc, argv, mpiRank);
+  parser.value("--model-config", parseModelConfig)
+      .value("--system-config", parseSystemConfig)
+      .integer("--iterations", "--iterations", &iterations)
+      .integer("--warmup", "--warmup", &warmup)
+      .integer("--gpus-per-node", "--gpus-per-node", &gpusPerNode)
+      .flag("--no-dedup", [&] { deduplicate = false; })
+      .flag("--validate", [&] { validate = true; })
+      .integer("--validate-iterations", "--validate-iterations", &validateIterations)
+      .flag("--verbose", [&] { verbose = true; })
+      .enumValue("--algorithm", &algorithm, {{"auto", "AUTO"}, {"direct", "DIRECT"}, {"ring", "RING"}},
+          "ERROR: unknown --algorithm '%s' (use 'auto', 'ring', or 'direct')\n")
+      .apiMode("--api", &apiMode)
+      .enumValue("--lb-mode", &lbMode, {{"node", "NODE_AWARE"}, {"uniform", "UNIFORM"}},
+          "ERROR: unknown --lb-mode '%s' (use 'uniform' or 'node')\n")
+      .help(printUsage);
+
+  int parseExit = benchParseExitCode(parser.parse());
+  if (parseExit >= 0) {
+    return parseExit;
+  }
+
+  if (iterations <= 0 || warmup < 0 || gpusPerNode <= 0 || validateIterations <= 0) {
+    if (mpiRank == 0) {
+      printf("ERROR: --iterations > 0, --warmup >= 0, --gpus-per-node > 0, "
+             "--validate-iterations > 0 are required\n");
     }
+    MPI_Finalize();
+    return 1;
   }
 
   if (modelConfigPath.empty() || systemConfigPath.empty()) {
@@ -762,12 +756,12 @@ int main(int argc, char* argv[]) {
            genCfg.tp, genCfg.cp, genCfg.ep, genCfg.dp, genCfg.pp, genNumGpus, genStageSize);
     printf("Layers: %d, Params (after grouping+dedup): %zu (%d skipped)\n", numLayers, allTransfers.size(), skipped);
     printf("PP comm pairs: %zu\n", ppCommPairs.size());
-    if (useDefaultApi) {
-      printf("API: default (ncclReshard, DIRECT staging path)\n");
+    if (apiMode == ReshardApiMode::Default) {
+      printf("API: default (ncclReshard)\n");
     } else {
       printf("API: window (ncclReshardWithWindow)\n");
-      printf("Algorithm: %s, LB Mode: %s\n", algorithm, lbMode);
     }
+    printf("Algorithm: %s, LB Mode: %s\n", algorithm, lbMode);
     printf("Iterations: %d (warmup: %d), Validate: %s (iters: %d), Dedup: "
            "%s\n",
            iterations, warmup, validate ? "yes" : "no", validateIterations, deduplicate ? "yes" : "no");
@@ -865,7 +859,7 @@ int main(int argc, char* argv[]) {
 
     TransferBufferEntry& tbe = transferBuffers[i];
     tbe.allocSize = bufSize;
-    if (useDefaultApi) {
+    if (apiMode == ReshardApiMode::Default) {
       CUDACHECK(cudaMalloc(&tbe.buffer, bufSize));
       CUDACHECK(cudaMemset(tbe.buffer, 0, bufSize));
     } else {
@@ -944,7 +938,7 @@ int main(int argc, char* argv[]) {
       (td.dstMesh.shardTensorDim >= 0) ? NCCL_RESHARD_SHARD(td.dstMesh.shardTensorDim) : NCCL_RESHARD_REPLICATE;
     for (int d = 0; d < td.ndims; d++) dstTensor.localShape[d] = td.dstLocalShape[d];
 
-    if (useDefaultApi) {
+    if (apiMode == ReshardApiMode::Default) {
       NCCLCHECK(ncclReshard(m2nHandle, comm, &srcTensor, &dstTensor, stream));
     } else {
       NCCLCHECK(ncclReshardWithWindow(m2nHandle, comm, win, &srcTensor, &dstTensor, stream));
@@ -1282,7 +1276,7 @@ int main(int argc, char* argv[]) {
   for (size_t i = 0; i < allTransfers.size(); i++) {
     auto& tbe = transferBuffers[i];
     if (!tbe.buffer) continue;
-    if (useDefaultApi) {
+    if (apiMode == ReshardApiMode::Default) {
       CUDACHECK(cudaFree(tbe.buffer));
     } else {
       auto key = std::make_pair(allTransfers[i].trainStage, allTransfers[i].genStage);

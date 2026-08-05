@@ -38,8 +38,8 @@
  *       --num-comms 2 --num-tensors 4 --iterations 20 --warmup 4
  ************************************************************************/
 
-#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "bench_common.h"
@@ -213,45 +213,32 @@ struct ShardCfg {
   int dstSd;
 };
 
-static TensorCfg benchParseSingleTensorDims(const char* s) {
-  TensorCfg cfg = {};
-  std::istringstream ss(s);
-  std::string tok;
-  while (std::getline(ss, tok, ',') && cfg.nDims < 3) cfg.dims[cfg.nDims++] = (size_t)std::stoull(tok);
-  return cfg;
+static bool benchParseSingleTensorDims(const char* value, TensorCfg* out) {
+  TensorCfg parsed = {};
+  if (!benchParseTensorDims(value, parsed.dims, &parsed.nDims)) return false;
+  *out = parsed;
+  return true;
 }
 
 // "d0,d1:d0,d1:..." → list of TensorCfg
-static std::vector<TensorCfg> benchParseTensorDimsList(const char* s) {
-  std::vector<TensorCfg> out;
-  std::istringstream ss(s);
-  std::string tok;
-  // NOLINTNEXTLINE(bugprone-infinite-loop) — getline mutates `ss` internally
-  while (std::getline(ss, tok, ':')) out.push_back(benchParseSingleTensorDims(tok.c_str()));
-  return out;
-}
-
-// "0,1,0" → {0,1,0}
-static std::vector<int> benchParseIntList(const char* s) {
-  std::vector<int> out;
-  std::istringstream ss(s);
-  std::string tok;
-  // NOLINTNEXTLINE(bugprone-infinite-loop) — getline mutates `ss` internally
-  while (std::getline(ss, tok, ',')) out.push_back(std::stoi(tok));
-  return out;
-}
-
-// Strict mesh-dims parser — bench_common.h's benchParseMeshDims is lenient
-// (defaults to 0 on garbage); for this bench's user-facing CLI we want a
-// loud failure instead of a silent 0 that breaks downstream rank counts.
-static void parseMeshDimsStrict(const char* str, int dims[NCCL_RESHARD_MESH_NDIMS]) {
-  char* copy = strdup(str);
-  char* saveptr = nullptr;
-  char* token = strtok_r(copy, ",x", &saveptr);
-  dims[0] = benchParseInt(token, "--*-mesh-dims dim0");
-  token = strtok_r(nullptr, ",x", &saveptr);
-  dims[1] = benchParseInt(token, "--*-mesh-dims dim1");
-  free(copy);
+static bool benchParseTensorDimsList(const char* value, std::vector<TensorCfg>* out) {
+  if (value == nullptr || out == nullptr || *value == '\0') return false;
+  std::vector<TensorCfg> parsed;
+  const std::string input(value);
+  size_t begin = 0;
+  while (begin < input.size()) {
+    const size_t end = input.find(':', begin);
+    const std::string item = input.substr(begin, end - begin);
+    TensorCfg cfg = {};
+    if (item.empty() || !benchParseSingleTensorDims(item.c_str(), &cfg)) return false;
+    parsed.push_back(cfg);
+    if (end == std::string::npos) {
+      *out = std::move(parsed);
+      return true;
+    }
+    begin = end + 1;
+  }
+  return false;
 }
 
 static void benchPrintUsage(const char* prog) {
@@ -315,51 +302,60 @@ int main(int argc, char* argv[]) {
   std::vector<int> srcSdRaw;
   std::vector<int> dstSdRaw;
 
-  for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--num-comms") == 0) {
-      numComms = benchParseInt(argv[++i], "--num-comms");
-    } else if (strcmp(argv[i], "--num-tensors") == 0) {
-      numTensors = benchParseInt(argv[++i], "--num-tensors");
-    } else if (strcmp(argv[i], "--tensor-dims") == 0) {
-      tensorCfgs = benchParseTensorDimsList(argv[++i]);
-    } else if (strcmp(argv[i], "--src-mesh-dims") == 0) {
-      parseMeshDimsStrict(argv[++i], srcMdims);
-    } else if (strcmp(argv[i], "--dst-mesh-dims") == 0) {
-      parseMeshDimsStrict(argv[++i], dstMdims);
-    } else if (strcmp(argv[i], "--src-shard-dims") == 0 || strcmp(argv[i], "--src-shard-dim") == 0) {
-      srcSdRaw = benchParseIntList(argv[++i]);
-    } else if (strcmp(argv[i], "--dst-shard-dims") == 0 || strcmp(argv[i], "--dst-shard-dim") == 0) {
-      dstSdRaw = benchParseIntList(argv[++i]);
-    } else if (strcmp(argv[i], "--iterations") == 0) {
-      iterations = benchParseInt(argv[++i], "--iterations");
-    } else if (strcmp(argv[i], "--warmup") == 0) {
-      warmup = benchParseInt(argv[++i], "--warmup");
-    } else if (strcmp(argv[i], "--validate") == 0) {
-      bValidate = true;
-    } else if (strcmp(argv[i], "--verbose") == 0) {
-      bVerbose = true;
-    } else if (strcmp(argv[i], "--print-all-ranks") == 0) {
-      bPrintAllRanks = true;
-    } else if (strcmp(argv[i], "--algorithm") == 0) {
-      ++i;
-      if (strcmp(argv[i], "direct") == 0) {
-        algorithm = "DIRECT";
-      } else if (strcmp(argv[i], "ring") == 0) {
-        algorithm = "RING";
-      } else {
-        if (mpiRank == 0) printf("ERROR: unknown algorithm '%s'\n", argv[i]);
-        MPI_Finalize();
-        return 1;
+  auto parseTensorCfgs = [&](const char* value) {
+    if (!benchParseTensorDimsList(value, &tensorCfgs)) {
+      if (mpiRank == 0) {
+        printf("ERROR: invalid --tensor-dims value '%s'\n", value);
       }
-    } else if (strcmp(argv[i], "--lb-mode") == 0) {
-      ++i;
-      if (strcmp(argv[i], "node") == 0) lbMode = "NODE_AWARE";
-      else lbMode = "UNIFORM";
-    } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-      if (mpiRank == 0) benchPrintUsage(argv[0]);
-      MPI_Finalize();
-      return 0;
+      return BenchParseResult::Error;
     }
+    return BenchParseResult::Success;
+  };
+
+  auto parseShardDims = [&](const char* name, std::vector<int>* out) {
+    return [name, out, mpiRank](const char* value) {
+      if (!benchParseNonNegativeIntList(value, out)) {
+        if (mpiRank == 0) {
+          printf("ERROR: invalid %s value '%s'\n", name, value);
+        }
+        return BenchParseResult::Error;
+      }
+      return BenchParseResult::Success;
+    };
+  };
+
+  BenchArgParser parser(argc, argv, mpiRank);
+  parser.integer("--num-comms", "--num-comms", &numComms)
+      .integer("--num-tensors", "--num-tensors", &numTensors)
+      .value("--tensor-dims", parseTensorCfgs)
+      .meshDims("--src-mesh-dims", srcMdims)
+      .meshDims("--dst-mesh-dims", dstMdims)
+      .value("--src-shard-dims", parseShardDims("--src-shard-dims", &srcSdRaw))
+      .value("--src-shard-dim", parseShardDims("--src-shard-dim", &srcSdRaw))
+      .value("--dst-shard-dims", parseShardDims("--dst-shard-dims", &dstSdRaw))
+      .value("--dst-shard-dim", parseShardDims("--dst-shard-dim", &dstSdRaw))
+      .integer("--iterations", "--iterations", &iterations)
+      .integer("--warmup", "--warmup", &warmup)
+      .flag("--validate", [&] { bValidate = true; })
+      .flag("--verbose", [&] { bVerbose = true; })
+      .flag("--print-all-ranks", [&] { bPrintAllRanks = true; })
+      .enumValue("--algorithm", &algorithm, {{"direct", "DIRECT"}, {"ring", "RING"}},
+          "ERROR: unknown algorithm '%s' (use 'ring' or 'direct')\n")
+      .enumValue("--lb-mode", &lbMode, {{"node", "NODE_AWARE"}, {"uniform", "UNIFORM"}},
+          "ERROR: unknown --lb-mode '%s' (use 'uniform' or 'node')\n")
+      .help(benchPrintUsage);
+
+  int parseExit = benchParseExitCode(parser.parse());
+  if (parseExit >= 0) {
+    return parseExit;
+  }
+
+  if (iterations <= 0 || warmup < 0) {
+    if (mpiRank == 0) {
+      printf("ERROR: --iterations must be > 0 and --warmup must be >= 0\n");
+    }
+    MPI_Finalize();
+    return 1;
   }
 
   if (srcMdims[0] <= 0 || srcMdims[1] <= 0 || dstMdims[0] <= 0 || dstMdims[1] <= 0 || tensorCfgs.empty() ||

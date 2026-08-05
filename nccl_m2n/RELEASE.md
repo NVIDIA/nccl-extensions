@@ -31,7 +31,16 @@ Existing binaries must be rebuilt against the updated header.
 - **Exported symbols:** the five public entry points carry default-visibility
   annotations, so a build that compiles hidden-by-default exports exactly those
   five. The Make build does not enable `-fvisibility=hidden`, so it additionally
-  exports internal symbols.
+  exports internal symbols; the CMake build compiles hidden-by-default and
+  therefore exports the public API and nothing else.
+- **Standalone CMake build:** from `nccl_m2n/`, configure with
+  `cmake -B build -DNCCL_HOME=/path/to/nccl/build`. `NCCL_HOME` is required and
+  validated at configure time. The build produces shared and static libraries
+  and an installable package configuration, so consumers can use
+  `find_package(NCCLM2N)` and link `NCCL::m2n` or `NCCL::m2n_static`.
+  `NCCL_M2N_BUILD_BENCH` and `NCCL_M2N_BUILD_TESTS` enable the optional
+  benchmark and test builds. There is deliberately no repository-root
+  `CMakeLists.txt`.
 - **Public C API cleanup:**
   - `ncclMesh_t` carries topology only (`dims[]`, `startRank`).
   - Tensor placement moves from `mesh.placement[]` to

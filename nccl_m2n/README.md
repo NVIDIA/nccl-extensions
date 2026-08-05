@@ -97,19 +97,19 @@ cd nccl-m2n
 git submodule update --init third_party/nccl
 make -C nccl_m2n nccl-submodule
 
-# 1. Optional: point at a different NCCL build (else defaults to the
-#    submodule's build output above)
-# export NCCL_HOME=/path/to/nccl/build
+# 1. Point at the NCCL build. Make defaults to the submodule's build output
+#    above, so this is optional for Make and required for CMake.
+export NCCL_HOME=$PWD/third_party/nccl/build
 ```
 
 ### Option A — Make
 
 ```bash
 # 2a. Build the shared library
-make                                       # → build/lib/libnccl_m2n.so
+make -C nccl_m2n                           # → build/lib/libnccl_m2n.so
 
 # 3a. Build the canonical single-layer benchmark (also a worked example)
-make reshard                               # → build/bin/reshard_bench
+make -C nccl_m2n reshard                   # → build/bin/reshard_bench
 ```
 
 `make help` lists all targets. `make` (no target) builds only the library.
@@ -118,13 +118,13 @@ make reshard                               # → build/bin/reshard_bench
 
 ```bash
 # 2b. Configure + build everything (library + bench + tests)
-cmake -B build -DNCCL_HOME="$NCCL_HOME" \
+cmake -S nccl_m2n -B build -DNCCL_HOME="$NCCL_HOME" \
       -DNCCL_M2N_BUILD_BENCH=ON \
       -DNCCL_M2N_BUILD_TESTS=ON
 cmake --build build -j
 
 # Library only (faster):
-# cmake -B build -DNCCL_HOME="$NCCL_HOME" && cmake --build build -j
+# cmake -S nccl_m2n -B build -DNCCL_HOME="$NCCL_HOME" && cmake --build build -j
 ```
 
 Use `ctest --test-dir build` to run the host-only test subset.
@@ -392,7 +392,7 @@ Both Make and CMake are supported; pick the one that fits your toolchain.
 ### CMake targets
 
 ```bash
-cmake -B build -DNCCL_HOME="$NCCL_HOME" \
+cmake -S nccl_m2n -B build -DNCCL_HOME="$NCCL_HOME" \
       [-DNCCL_M2N_BUILD_BENCH=ON] [-DNCCL_M2N_BUILD_TESTS=ON]
 cmake --build build -j [--target <name>]
 ```
@@ -404,23 +404,21 @@ cmake --build build -j [--target <name>]
 | `nccl_m2n_static`    | `build/lib/libnccl_m2n.a`                 | Static archive. |
 | `reshard_bench` *etc.* | `build/bin/<name>`                        | Requires `-DNCCL_M2N_BUILD_BENCH=ON`. |
 | `basic_api_test_*`    | `build/bin/<name>`                         | Requires `-DNCCL_M2N_BUILD_TESTS=ON`. |
-| `unit_tests`          | `build/bin/unit_tests`                     | Private CI gtest suite; links library SRCs directly. |
 | `install`             | Copies `lib` + headers to `CMAKE_INSTALL_PREFIX` | Defaults `/usr/local`. |
 
-`ctest --test-dir build` runs the host-only subset of `unit_tests` +
-`basic_api_test_local`.
+`ctest --test-dir build` runs the host-only `basic_api_test_local` test.
 
 ### Required environment
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `NCCL_HOME` | `third_party/nccl/build` (vendored submodule) | Path to a from-source NCCL build (`$NCCL_HOME/include/nccl_device.h` must exist). Make reads the env var directly; pass `-DNCCL_HOME=...` to `cmake`. Override to point at your own build. |
+| `NCCL_HOME` | Make: `third_party/nccl/build` (vendored submodule); CMake: required at configure time (no default) | Path to a from-source NCCL build (`$NCCL_HOME/include/nccl_device.h` must exist). Make reads the env var directly; CMake configure fails when `NCCL_HOME` is unset. Pass `-DNCCL_HOME=...` or set the environment variable. Override to point at your own build. |
 
 ### Optional environment / cache vars
 
 | Make var | CMake equivalent | Default | Purpose |
 |---|---|---|---|
-| `CUDA_HOME` | auto-detected by `find_package(CUDAToolkit)` | `/usr/local/cuda` | CUDA install. CUDA ≥ 12.4 is needed for the default `sm_100` arch. |
+| `CUDA_HOME` | auto-detected by `find_package(CUDAToolkit)` | `/usr/local/cuda` | CUDA install. CUDA ≥ 12.8 is needed for the default `sm_100` arch. |
 | `MPI_HOME` | auto-detected by `find_package(MPI)` | system MPI | Used by benchmarks only (the library does not link MPI). |
 | `PREFIX` | `CMAKE_INSTALL_PREFIX` | `/usr/local` | `install` destination. |
 | `NVCC_GENCODE` | `CMAKE_CUDA_ARCHITECTURES` | `sm_80, sm_90, sm_100` (Make) / `80;90;100` (CMake) | Target GPU arch. |

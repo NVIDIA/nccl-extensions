@@ -1,0 +1,93 @@
+nccl_m2n:
+  module: nccl._extensions.bindings.nccl_m2n
+  data:
+    versions:
+    - - 0.2.0
+    headers:
+    - nccl_m2n.h
+    patterns:
+      function: (^nccl)(M2n.*|Reshard.*)
+      type: (^ncclM2n)([A-Z].*)_t$|(^nccl)(Mesh|DistTensor)_t$
+    need_cuda: true
+    need_driver: false
+    support_win: false
+    docstrings: null
+    # The generated declarations encode this public ABI. Wheel builds must not
+    # need a separately installed M2N development header.
+    need_headers_at_build: false
+    include_cybind_version: false
+    status_enum: ncclResult_t
+    extern:
+      cython:
+        - module: nccl.bindings.cynccl
+          import_type: cimport
+          imports:
+            - ncclResult_t
+            - ncclDataType_t
+            - ncclComm_t
+            - ncclWindow_t
+            - _NCCLRESULT_T_INTERNAL_LOADING_ERROR
+  functions:
+    ncclM2nInit:
+      return: handle
+      except?: 0
+    ncclM2nFinalize: {}
+    ncclReshardWithWindow: {}
+    ncclReshard: {}
+  types:
+    ncclM2nConfig_t:
+      AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclM2nConfig_t)
+              self._ptr[0].magic = NCCL_M2N_API_MAGIC
+              self._ptr[0].version = NCCL_M2N_API_VERSION
+              self._ptr[0].maxCta = NCCL_M2N_CONFIG_UNDEF_INT
+      member_aliases:
+        maxCta: maxCta
+    ncclMesh_t:
+      AUTO_LOWPP_CLASS:
+        dims:
+          getter: |-
+            return (self._ptr[0].dims[0], self._ptr[0].dims[1])
+          setter: |-
+            if len(val) != NCCL_RESHARD_MESH_NDIMS:
+              raise ValueError(f"dims must have length {NCCL_RESHARD_MESH_NDIMS}")
+            self._ptr[0].dims[0] = val[0]
+            self._ptr[0].dims[1] = val[1]
+      member_aliases:
+        startRank: startRank
+    ncclDistTensor_t:
+      AUTO_LOWPP_CLASS:
+        localShape:
+          getter: |-
+            return (self._ptr[0].localShape[0], self._ptr[0].localShape[1], self._ptr[0].localShape[2])
+          setter: |-
+            if len(val) != NCCL_RESHARD_MAX_TENSOR_DIMS:
+              raise ValueError(f"localShape must have length {NCCL_RESHARD_MAX_TENSOR_DIMS}")
+            self._ptr[0].localShape[0] = val[0]
+            self._ptr[0].localShape[1] = val[1]
+            self._ptr[0].localShape[2] = val[2]
+        mesh:
+          getter: |-
+            return <intptr_t>(self._ptr[0].mesh)
+          setter: |-
+            self._ptr[0].mesh = <ncclMesh_t*><intptr_t>val
+        placements:
+          getter: |-
+            return (self._ptr[0].placements[0], self._ptr[0].placements[1])
+          setter: |-
+            if len(val) != NCCL_RESHARD_MESH_NDIMS:
+              raise ValueError(f"placements must have length {NCCL_RESHARD_MESH_NDIMS}")
+            self._ptr[0].placements[0] = val[0]
+            self._ptr[0].placements[1] = val[1]
+      member_aliases:
+        dataPtr: dataPtr
+        localShape: localShape
+        dtype: dtype
+  attrs: {}
+  enums:
+    ^nccl: ''
+    ^NCCL_RESHARD_: ''
+    ^NCCL_M2N_: ''

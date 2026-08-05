@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from nccl.m2n.bindings import nccl_m2n as _m2n_bindings
+from nccl._extensions.bindings import nccl_m2n as _m2n_bindings
 
 MAX_TENSOR_DIMS = _m2n_bindings.MAX_TENSOR_DIMS
 MESH_NDIMS = _m2n_bindings.MESH_NDIMS

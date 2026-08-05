@@ -7,7 +7,9 @@
 
 The Cython bindings under `python/nccl/_extensions/bindings/` are **generated**,
 not hand-written. This directory holds the tooling that generates them: the
-cybind config, the Cython templates, and the driver script.
+cybind config, the Cython templates, and the driver script. The M2N low-level
+surface is generated into the shared `nccl._extensions.bindings` package while
+its public facade remains under `python/nccl/m2n/`.
 
 The generated `.pyx`/`.pxd` files are checked into the repository so users can
 build the package without internal tooling; the generation tooling here stays
@@ -35,17 +37,17 @@ API headers) has no nccl-extensions equivalent and was not ported.
 
 ## Usage
 
-Re-run whenever `nccl_ep/include/nccl_ep.h` (or `ep_enums.h`) changes, or when a
-template or the cybind config here changes:
+Re-run whenever `nccl_ep/include/nccl_ep.h`, `nccl_m2n/src/nccl_m2n.h`, their
+templates/configs, or the pinned NCCL header changes:
 
 ```bash
 python3 build_assets/generate_cython.py --verbose
 ```
 
-The script clones cybind at the pinned `CYBIND_COMMIT`, stages our config,
-headers, and templates into its `assets/`, runs it, and copies the result over
-`python/nccl/_extensions/bindings/`. The existing bindings directory is backed up
-and restored if generation fails. Commit the resulting diff.
+The script clones cybind at the pinned `CYBIND_COMMIT`, stages our configs,
+headers and templates into its `assets/`, then regenerates the
+complete shared `python/nccl/_extensions/bindings/` package transactionally.
+Commit the resulting diff.
 
 See `generate_cython.py --help` for all options; `--cybind-path` reuses a local
 cybind checkout instead of cloning.
@@ -68,29 +70,29 @@ Two different policies, on purpose:
 ## Contents
 
 - `generate_cython.py` — driver: stages assets, runs cybind, installs output
-- `cybind/configs/nccl_ep.cybind.yaml` — cybind config for `nccl_ep` (which
-  functions/types to bind, and the `AUTO_LOWPP_CLASS` struct overrides)
+- `cybind/configs/{nccl_ep,nccl_m2n}.cybind.yaml` — cybind configs for the
+  bound libraries (including `AUTO_LOWPP_CLASS` struct overrides)
 - `cybind/templates/nccl/_extensions/bindings/` — Cython templates, plus the
   static files (`_internal/utils.{pxd,pyx}`, `__init__.py`) that cybind does not
   process and `generate_cython.py` copies verbatim
 - `cybind/headers/` — pinned third-party headers (see above)
 
-## Adding a library
+## Generated binding conventions
 
-`nccl_m2n` bindings are not migrated yet. When they are:
+All bound libraries share `nccl/_extensions/bindings/`, so common generated
+support such as `_internal/utils.pyx` and `_binding_helpers.py` is built and
+shipped once.
 
-Bindings for every library share one package, `nccl/_extensions/bindings/`, so
-that `_internal/utils.pyx` and `_binding_helpers.py` are built and shipped once
-rather than duplicated per library. Only the public facade is per-library.
+A library may provide dedicated templates when its ABI or native-loader
+contract differs from the common case. Keep those differences inside the
+generated binding layer:
 
-1. Add `cybind/configs/nccl_m2n.cybind.yaml` with
-   `module: nccl._extensions.bindings.nccl_m2n`
-2. Add the per-library templates (`nccl_m2n.pyx/pxd`, `cynccl_m2n.pyx/pxd`,
-   `_internal/nccl_m2n.pxd`, `_internal/nccl_m2n_linux.pyx`) under
-   `cybind/templates/nccl/_extensions/bindings/`
-3. Add a `Target` factory and list it in `TARGETS` in `generate_cython.py`
-4. Add `"nccl_m2n"` to `LIBNAMES` in `python/setup.py`
-5. Add the facade package `python/nccl/m2n/` (with `lib/libnccl_m2n.so`) and
-   list it in `packages.find` / `package-data` in `python/pyproject.toml`.
-   The `.so` loader derives its facade directory from the library name
-   (`nccl_m2n` -> `nccl/m2n/`), so no template change is needed there.
+- add the library configuration under `cybind/configs/`;
+- add any library-specific templates under
+  `cybind/templates/nccl/_extensions/bindings/`;
+- keep public, framework-facing APIs in that library's facade package;
+- preserve actionable loader errors and ensure native symbols resolve from the
+  intended library handle.
+
+After changing a bound header, configuration, or template, regenerate the
+complete bindings package and commit the generated diff.

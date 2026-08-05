@@ -11,6 +11,7 @@ name = "nccl-extensions"
 description = "Python bindings for the nccl-extensions communication libraries (nccl_ep, nccl_m2n)"
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE.txt"]
 requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
@@ -26,6 +27,8 @@ dependencies = [
 # nvidia-cutlass-dsl) live in nccl4py's matching extras; forward to them rather
 # than duplicating version ranges that would drift.
 [project.optional-dependencies]
+# M2N's packaged Python benchmark uses mpi4py for multi-rank coordination.
+bench = ["mpi4py"]
 cu12 = ["nccl4py[cu12]"]
 cu13 = ["nccl4py[cu13]"]
 
@@ -36,22 +39,26 @@ Homepage = "https://gitlab-master.nvidia.com/nccl/nccl-extensions"
 version = { attr = "nccl._extensions._version.__version__" }
 
 [tool.setuptools.packages.find]
-# This distribution owns only nccl/_extensions/ and nccl/ep/ inside the shared
+# This distribution owns only nccl/_extensions/, nccl/ep/, and nccl/m2n/ inside the shared
 # `nccl` namespace; nccl4py owns nccl/__init__.py, nccl/_version.py, nccl/core/
 # and nccl/bindings/. Listing our subpackages explicitly (rather than "nccl*")
 # keeps a bare `nccl` package out of the wheel, so we never ship an __init__.py
 # that would collide with theirs.
 namespaces = true
-include = ["nccl._extensions*", "nccl.ep*"]
+include = ["nccl._extensions*", "nccl.ep*", "nccl.m2n*"]
 
 [tool.setuptools.package-data]
-"nccl._extensions.bindings" = ["cynccl_ep.pxd", "nccl_ep.pxd"]
+"nccl._extensions.bindings" = ["cynccl_*.pxd", "nccl_*.pxd"]
 "nccl.ep" = [
     "lib/libnccl_ep.so",
     "include/*.h",
     "include/nccl_ep/*.h",
     "include/nccl_ep/*.hpp",
     "include/nccl_ep/device/*.cuh",
+]
+"nccl.m2n" = [
+    "lib/libnccl_m2n.so",
+    "include/nccl_m2n.h",
 ]
 
 [tool.uv]

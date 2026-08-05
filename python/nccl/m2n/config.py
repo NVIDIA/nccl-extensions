@@ -9,14 +9,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from nccl.m2n.bindings import nccl_m2n as _m2n_bindings
+from nccl._extensions.bindings import nccl_m2n as _m2n_bindings
 
 
 @dataclass(frozen=True)
 class Config:
     """Pythonic configuration for :meth:`nccl.m2n.Handle.create`.
 
-    The low-level ``nccl.m2n.bindings.nccl_m2n.Config`` class remains the raw
+    The low-level ``nccl._extensions.bindings.nccl_m2n.Config`` class remains the raw
     C ABI wrapper.  This high-level dataclass intentionally exposes Python
     naming and ``None`` defaults while converting to the binding object at the
     call site. ``max_cta=None`` forwards ``NCCL_M2N_CONFIG_UNDEF_INT`` so the

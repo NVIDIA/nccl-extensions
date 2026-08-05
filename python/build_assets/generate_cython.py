@@ -10,9 +10,8 @@
 Generate Cython bindings for the nccl-extensions libraries using cybind.
 
 Ported from nccl4py's ``build_assets/generate_cython.py``, trimmed to the
-targets this repo owns (``nccl_ep`` today; ``nccl_m2n`` joins ``TARGETS``
-once its bindings land). Output goes to ``python/nccl/_extensions/bindings/``
-as flat sibling modules.
+generated targets this repo owns (``nccl_ep`` and ``nccl_m2n``). Output goes
+to ``python/nccl/_extensions/bindings/`` as flat sibling modules.
 
 Unlike nccl4py, the bound headers are *not* checked in under
 ``cybind/headers/<libname>/``: nccl_ep's public header lives in this repo, so
@@ -122,6 +121,38 @@ def _nccl_ep_target() -> Target:
     )
 
 
+def _nccl_m2n_target() -> Target:
+    """Bind nccl_m2n against its public header.
+
+    The generated declarations encode the public ABI, so downstream wheel
+    builds do not need a separate M2N header installation.  ``nccl.h`` stays
+    pinned with the other third-party headers because M2N imports its NCCL
+    result and datatype definitions.
+    """
+    public_header = REPO_ROOT / "nccl_m2n" / "src" / "nccl_m2n.h"
+    if not public_header.is_file():
+        raise RuntimeError(f"nccl_m2n public header not found: {public_header}")
+    return Target(
+        name="nccl_m2n",
+        # Unlike nccl_ep, M2N does not publish semantic-version macros in its
+        # C header. The cybind configuration owns its generation version.
+        version=_read_asset_version(ASSETS_DIR / "configs" / "nccl_m2n.cybind.yaml"),
+        headers={
+            "nccl_m2n.h": public_header,
+            "nccl.h": HEADERS_DIR / "nccl" / str(NCCL_PIN) / "nccl.h",
+        },
+    )
+
+
+def _read_asset_version(yaml_path: Path) -> Version:
+    """Read the sole ``data.versions`` entry from a cybind asset config."""
+    text = yaml_path.read_text()
+    match = re.search(r"versions:\n\s*- - (\S+)", text)
+    if match is None:
+        raise RuntimeError(f"No data.versions entry found in {yaml_path}")
+    return Version(match.group(1))
+
+
 def _stamp_asset_yaml(yaml_path: Path, version: Version) -> None:
     """Stamp ``data.versions: - - X.Y.Z`` in the asset YAML in place.
 
@@ -163,8 +194,8 @@ def prepare_assets(cybind_dir: Path, targets: list[Target]) -> None:
     """Stage our targets' configs, headers, and templates into cybind's
     shared ``assets/`` -- only the slots we own (one ``configs/*.cybind.yaml``
     per target, per-target ``headers/<name>/<version>/``, and the shared
-    ``templates/nccl/_extensions/bindings/`` subtree). Sibling files for other
-    libs are left untouched."""
+    ``templates/nccl/_extensions/bindings/`` subtree). Sibling files for
+    other libs are left untouched."""
     cybind_assets = cybind_dir / "cybind" / "assets"
 
     for target in targets:
@@ -198,7 +229,6 @@ def prepare_assets(cybind_dir: Path, targets: list[Target]) -> None:
     templates_dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(templates_src, templates_dst)
     logger.debug(f"Staged templates/{_TEMPLATES_RELPATH}/")
-
 
 def run_cybind(cybind_dir: Path, libnames: list[str], output_dir: Path) -> None:
     """Run cybind once for all libraries in libnames.
@@ -264,14 +294,7 @@ def run_cybind(cybind_dir: Path, libnames: list[str], output_dir: Path) -> None:
 
 @contextmanager
 def backup_and_restore_on_failure(path: Path):
-    """Rename ``path`` to ``path.bak`` for the duration of the with-block.
-
-    On clean exit, the backup is removed. On any exception (or KeyboardInterrupt),
-    the partially-written ``path`` is removed and ``path.bak`` is restored.
-
-    If ``path`` doesn't exist on entry, the block runs without a backup and
-    the directory is removed on failure.
-    """
+    """Restore the prior binding package if generation does not complete."""
     backup = path.with_name(path.name + ".bak")
     if backup.exists():
         shutil.rmtree(backup)
@@ -293,9 +316,35 @@ def backup_and_restore_on_failure(path: Path):
             shutil.rmtree(backup)
 
 
+def verify_generated_m2n_loader_contract() -> None:
+    """Check the generated M2N loader's atomic loading diagnostics contract."""
+    loader = BINDINGS_DIR / "_internal" / "nccl_m2n_linux.pyx"
+    text = loader.read_text()
+    required = (
+        'errors.append(f"{path}: not found")',
+        'missing.append("ncclM2nGetLastError")',
+    )
+    missing = [snippet for snippet in required if snippet not in text]
+    if missing:
+        raise RuntimeError(
+            f"Generated {loader} does not preserve the M2N loader contract: {missing}"
+        )
+
+
+def verify_generated_m2n_import_layering() -> None:
+    """Keep low-level bindings independent from the public M2N facade."""
+    binding = BINDINGS_DIR / "nccl_m2n.pyx"
+    text = binding.read_text()
+    required = "from nccl._extensions._runtime import NATIVE_CALL_LOCK as _NATIVE_CALL_LOCK"
+    if required not in text or "nccl.m2n" in text:
+        raise RuntimeError(
+            f"Generated {binding} imports public nccl.m2n state and can create an import cycle"
+        )
+
+
 # One entry per bound library. Each is a zero-arg factory so a missing header
 # for one target raises with that target's own error message.
-TARGETS = (_nccl_ep_target,)
+TARGETS = (_nccl_ep_target, _nccl_m2n_target)
 
 
 def main() -> int:
@@ -399,6 +448,9 @@ def main() -> int:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 logger.debug(f"  {rel}")
                 shutil.copy2(src, dst)
+
+            verify_generated_m2n_loader_contract()
+            verify_generated_m2n_import_layering()
 
     logger.info("=" * 60)
     logger.info(f"Bindings location: {BINDINGS_DIR}")

@@ -96,6 +96,11 @@ Existing binaries must be rebuilt against the updated header.
   - `NCCL_RESHARD_STAGING_BUCKETS` enables a bounded best-fit staging-buffer
     pool, and `NCCL_RESHARD_STAGING_WATERMARK_BYTES` sets the minimum per-comm
     staging allocation.
+  - `ncclReshard` supports split communicators on the `PACKWINDOW`, `RING`,
+    `NODE_AWARE` path. The library collectively forms a FULL communicator for
+    source injection and a RAIL communicator for destination forwarding; the
+    caller still invokes the operation collectively on the parent communicator
+    with the same tensor descriptors.
   - Kernel launch is asynchronous. Callers complete the stream before
     finalizing M2N or releasing communicators, buffers, and streams used by the
     operation.
@@ -178,6 +183,15 @@ Initial preview of NCCL M2N — reshard functionality.
     finalization, `0` keeps work on caller streams with ordered DevComm reuse.
   - `NCCL_RESHARD_CHUNK_SIZE` — override the default 256 KB byte-level
     chunk size in the RING prepare path.
+  - `NCCL_RESHARD_SPLIT_COMM` — boolean override for split-communicator
+    dispatch on the supported `ncclReshard` path; the adaptive default enables
+    it whenever the selected copy path supports it.
+  - `NCCL_RESHARD_SPLIT_AUTO_PARENT_THRESHOLD` — parent-communicator size
+    threshold for adaptive single-replica injection; the default is `200`
+    ranks.
+  - `NCCL_RESHARD_SPLIT_SINGLE_REP_INJECT` — boolean override for adaptive
+    single-replica injection; unset selects it above the adaptive threshold.
+  - `NCCL_RESHARD_SPLIT_KERNEL_TRACE` — enables per-CTA split-kernel tracing.
 
 ## Breaking Changes
 

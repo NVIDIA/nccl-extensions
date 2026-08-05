@@ -105,6 +105,17 @@ void resetReshardRuntimeConfig() {
   gReshardAlgorithm = RESHARD_ALGO_AUTO;
   gReshardLbMode = RESHARD_LB_UNIFORM;
   gReshardCopyAlgorithm = RESHARD_COPY_ALGO_DIRECT;
+  gReshardAutoUniformBcast = true;
+  gReshardAutoUniformBcastSet = false;
+  gReshardSplitComm = true;
+  gReshardSplitCommSet = false;
+  gReshardSplitSingleRepInject = false;
+  gReshardSplitSingleRepInjectSet = false;
+  gReshardSplitAutoParentThreshold = 200;
+  gReshardCommBForceRail = false;
+  gReshardLbModeSet = false;
+  gReshardAdaptiveCallConfig = {};
+  gReshardAdaptiveCallConfigValid = false;
   gReshardMaxCta = 0;
   gReshardNumCtasOverride = 0;
   gReshardNumCtas = DEFAULT_NUM_CTAS;
@@ -182,7 +193,10 @@ void applyReshardEnv() {
   }
 
   ReshardLoadBalanceMode lb;
-  if (parseLbModeEnv(getenv("NCCL_RESHARD_LB_MODE"), &lb)) gReshardLbMode = lb;
+  if (parseLbModeEnv(getenv("NCCL_RESHARD_LB_MODE"), &lb)) {
+    gReshardLbMode = lb;
+    gReshardLbModeSet = true;
+  }
 
   int n;
   if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_NUM_CTAS"), &n)) {
@@ -207,6 +221,33 @@ void applyReshardEnv() {
   bool useInternalStreams;
   if (parseBoolEnv(getenv("NCCL_RESHARD_USE_INTERNAL_STREAMS"), &useInternalStreams)) {
     gReshardUseInternalStreams = useInternalStreams;
+  }
+
+  bool splitComm;
+  if (parseBoolEnv(getenv("NCCL_RESHARD_SPLIT_COMM"), &splitComm)) {
+    gReshardSplitComm = splitComm;
+    gReshardSplitCommSet = true;
+  }
+
+  bool singleRepInject;
+  if (parseBoolEnv(getenv("NCCL_RESHARD_SPLIT_SINGLE_REP_INJECT"), &singleRepInject)) {
+    gReshardSplitSingleRepInject = singleRepInject;
+    gReshardSplitSingleRepInjectSet = true;
+  }
+
+  if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_SPLIT_AUTO_PARENT_THRESHOLD"), &n)) {
+    gReshardSplitAutoParentThreshold = n;
+  }
+
+  bool commBForceRail;
+  if (parseBoolEnv(getenv("NCCL_RESHARD_COMMB_FORCE_RAIL"), &commBForceRail)) {
+    gReshardCommBForceRail = commBForceRail;
+  }
+
+  bool autoUniformBcast;
+  if (parseBoolEnv(getenv("NCCL_RESHARD_AUTO_UNIFORM_BCAST"), &autoUniformBcast)) {
+    gReshardAutoUniformBcast = autoUniformBcast;
+    gReshardAutoUniformBcastSet = true;
   }
 
   /* Optional bucketed staging pool: "size:slots,size:slots,..." (size in bytes).

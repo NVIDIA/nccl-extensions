@@ -418,6 +418,13 @@ ncclResult_t setTransposeBufferPackWindowState(ncclComm_t comm, bool rmaWarmed, 
   return ncclSuccess;
 }
 
+int getStagingBucketIndex(ncclComm_t comm) {
+  if (!reshardStagingBucketsEnabled()) return 0;
+  std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+  StagingSlot* slot = (comm == gCurrentStagingComm) ? gCurrentStagingSlot : nullptr;
+  return (slot != nullptr) ? slot->bucketIdx : -1;
+}
+
 ncclResult_t transposeBufferRecordEvent(ncclComm_t comm, cudaStream_t stream) {
   if (reshardStagingBucketsEnabled()) {
     std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
@@ -452,6 +459,29 @@ ncclResult_t transposeBufferRecordEvent(ncclComm_t comm, cudaStream_t stream) {
     NCCL_M2N_CUDACHECK(err);
   }
   return ncclSuccess;
+}
+
+void transposeBufferSynchronize() {
+  std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+  int currentDevice = -1;
+  NCCL_M2N_CUDACHECK_WARN(cudaGetDevice(&currentDevice));
+  for (int device = 0; device < gStagingDevicePoolCount; device++) {
+    StagingDevicePool& pool = gStagingDevicePools[device];
+    NCCL_M2N_CUDACHECK_WARN(cudaSetDevice(pool.cudaDev));
+    for (int entryIdx = 0; entryIdx < pool.transposeEntryCount; entryIdx++) {
+      TransposeBufferEntry& entry = pool.transposeEntries[entryIdx];
+      if (entry.eventRecorded) NCCL_M2N_CUDACHECK_WARN(cudaEventSynchronize(entry.event));
+    }
+    for (int bucketIdx = 0; bucketIdx < pool.bucketCount; bucketIdx++) {
+      StagingBucketRT& bucket = pool.buckets[bucketIdx];
+      if (!bucket.allocated) continue;
+      for (int slotIdx = 0; slotIdx < bucket.numSlots; slotIdx++) {
+        StagingSlot& slot = bucket.slots[slotIdx];
+        if (slot.eventRecorded) NCCL_M2N_CUDACHECK_WARN(cudaEventSynchronize(slot.doneEvent));
+      }
+    }
+  }
+  if (currentDevice >= 0) NCCL_M2N_CUDACHECK_WARN(cudaSetDevice(currentDevice));
 }
 
 void transposeBufferFinalize() {

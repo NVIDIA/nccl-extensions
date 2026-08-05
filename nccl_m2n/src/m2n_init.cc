@@ -29,7 +29,7 @@ static std::shared_ptr<ncclM2nHandleState> gM2nDefaultHandle;
 static std::mutex gM2nHandleTableMutex;
 static uintptr_t gNextM2nHandleId = 1;
 static std::unordered_map<ncclM2nHandle_t, std::shared_ptr<ncclM2nHandleState>> gM2nHandleTable;
-static thread_local char gM2nLastError[512] = {};
+static thread_local char gM2nLastError[M2N_LAST_ERROR_BYTES] = {};
 static std::atomic<bool> gM2nProcessExiting{false};
 static thread_local std::unique_lock<std::mutex>* gCurrentM2nApiLock = nullptr;
 static int gM2nApiInFlightCalls = 0;
@@ -228,6 +228,8 @@ ncclResult_t ncclM2nInit(ncclM2nHandle_t* handle, const ncclM2nConfig_t* config)
 ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle) {
   M2nApiLock apiLock;
   m2nClearLastError();
+  NCCL_M2N_CHECK_ARG(!m2nGroupIsActive(), -1,
+                     "ncclM2nFinalize: cannot finalize while a group is active on this host thread");
   if (handle != nullptr) {
     return destroyExplicitHandle(handle);
   }

@@ -137,6 +137,8 @@ BENCH_LDFLAGS := $(LIB_LDFLAGS) $(MPI_LDFLAGS)
 #   LIB_CU_SRCS — CUDA TUs. Contain device code (kernels, launches) and
 #                 require the full nvcc compilation pipeline.
 LIB_CC_SRCS := $(SRCDIR)/m2n_config.cc \
+               $(SRCDIR)/m2n_group.cc \
+               $(SRCDIR)/reshard_call_setup.cc \
                $(SRCDIR)/reshard_cache.cc \
                $(SRCDIR)/reshard_mesh.cc \
                $(SRCDIR)/reshard_loadbalance.cc \

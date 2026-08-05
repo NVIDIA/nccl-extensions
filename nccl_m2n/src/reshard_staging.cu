@@ -65,49 +65,28 @@ ReshardCopyAlgorithm reshardGetLastCompletedCopyAlgorithmForTest() {
 
 extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src,
                                     const ncclDistTensor_t* dst, cudaStream_t stream) {
+  if (m2nGroupIsActive()) {
+    return m2nGroupEnqueueReshard(M2nGroupReshardKind::Staging, handle, comm, nullptr, src, dst, stream);
+  }
   M2nApiLock apiLock;
   m2nClearLastError();
   NCCL_M2N_CHECK_ARG(comm != nullptr, -1, "ncclReshard: comm must be non-null");
   NCCL_M2N_CHECK_ARG(src != nullptr && dst != nullptr, -1,
                      "ncclReshard: src and dst tensor descriptors must both be non-null on every rank");
-  NCCL_M2N_CHECK_ARG(src->mesh != nullptr && dst->mesh != nullptr, -1,
-                     "ncclReshard: src->mesh and dst->mesh must both be non-null on every rank");
-  NCCL_M2N_CHECK(validateReshardMeshDims(src->mesh, dst->mesh));
-
-  NCCL_M2N_CHECK_ARG(src->ndims == dst->ndims, -1, "ncclReshard: src->ndims (%d) and dst->ndims (%d) must match",
-                     src->ndims, dst->ndims);
-  NCCL_M2N_CHECK_ARG(src->dtype == dst->dtype, -1, "ncclReshard: src->dtype (%d) and dst->dtype (%d) must match",
-                     (int)src->dtype, (int)dst->dtype);
-
-  int ndims = src->ndims;
-  ncclDataType_t dtype = src->dtype;
-  void* srcBuffer = src->dataPtr;
-  void* dstBuffer = dst->dataPtr;
-  const size_t* src_tensor_dims = src->localShape;
-  const size_t* dst_tensor_dims = dst->localShape;
-  const ncclMesh_t* src_mesh = src->mesh;
-  const ncclMesh_t* dst_mesh = dst->mesh;
-
-  NCCL_M2N_CHECK_ARG(ndims >= 1 && ndims <= NCCL_RESHARD_MAX_TENSOR_DIMS, -1,
-                     "ncclReshard: ndims (%d) out of range [1, %d]", ndims, NCCL_RESHARD_MAX_TENSOR_DIMS);
-  size_t element_size = getNcclDtSize(dtype);
-  NCCL_M2N_CHECK_ARG(element_size != 0, -1, "ncclReshard: unsupported data type %d", (int)dtype);
-
-  ncclMesh_t src_mesh_local = *src_mesh;
-  ncclMesh_t dst_mesh_local = *dst_mesh;
-  ncclDistTensor_t src_local = *src;
-  ncclDistTensor_t dst_local = *dst;
-  src_local.mesh = &src_mesh_local;
-  dst_local.mesh = &dst_mesh_local;
-  NCCL_M2N_CHECK(reshardFixFullyReplicated(&src_mesh_local, src_local.placements));
-  NCCL_M2N_CHECK(reshardFixFullyReplicated(&dst_mesh_local, dst_local.placements));
-  NCCL_M2N_CHECK(validateReshardPlacement(&src_local, "ncclReshard", "src"));
-  NCCL_M2N_CHECK(validateReshardPlacement(&dst_local, "ncclReshard", "dst"));
+  ReshardTensorSetup tensorSetup;
+  NCCL_M2N_CHECK(reshardPrepareTensorSetup("ncclReshard", src, dst, &tensorSetup));
+  const int ndims = tensorSetup.ndims;
+  const size_t element_size = tensorSetup.elementSize;
+  void* const srcBuffer = tensorSetup.srcTensor.dataPtr;
+  void* const dstBuffer = tensorSetup.dstTensor.dataPtr;
+  const size_t* const src_tensor_dims = tensorSetup.srcTensor.localShape;
+  const size_t* const dst_tensor_dims = tensorSetup.dstTensor.localShape;
+  ncclDistTensor_t& src_local = tensorSetup.srcTensor;
+  ncclDistTensor_t& dst_local = tensorSetup.dstTensor;
+  const ncclMesh_t* const src_mesh = &tensorSetup.srcMesh;
+  const ncclMesh_t* const dst_mesh = &tensorSetup.dstMesh;
   std::shared_ptr<ncclM2nHandleState> handleState;
   NCCL_M2N_CHECK(acquireM2nHandle(handle, &handleState));
-  src_mesh = &src_mesh_local;
-  dst_mesh = &dst_mesh_local;
-
   int world_rank = 0, world_size = 0;
   NCCL_M2N_CHECK(ncclCommUserRank(comm, &world_rank));
   NCCL_M2N_CHECK(ncclCommCount(comm, &world_size));

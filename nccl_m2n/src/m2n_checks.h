@@ -18,13 +18,26 @@
 void m2nClearLastError();
 void m2nSetLastError(const char* message);
 
+// Keep this large enough for actionable details after ncclM2nGroupEnd adds its indexed prefix.
+// Grouped errors may truncate the underlying detail to fit.
+constexpr size_t M2N_LAST_ERROR_BYTES = 640;
+
+static inline bool m2nSameMesh(const ncclMesh_t& a, const ncclMesh_t& b) {
+  return a.startRank == b.startRank && a.dims[0] == b.dims[0] && a.dims[1] == b.dims[1];
+}
+
+static inline bool m2nSameTensorTopology(const ncclDistTensor_t& a, const ncclDistTensor_t& b) {
+  return a.mesh != nullptr && b.mesh != nullptr && m2nSameMesh(*a.mesh, *b.mesh) &&
+         a.placements[0] == b.placements[0] && a.placements[1] == b.placements[1];
+}
+
 #define NCCL_M2N_CONCAT_INNER(a, b) a##b
 #define NCCL_M2N_CONCAT(a, b) NCCL_M2N_CONCAT_INNER(a, b)
 #define NCCL_M2N_UNIQUE(name) NCCL_M2N_CONCAT(name, __COUNTER__)
 
 #define NCCL_M2N_SET_ERROR_IMPL(detailVar, ...)            \
   do {                                                     \
-    char detailVar[512];                                   \
+    char detailVar[M2N_LAST_ERROR_BYTES];                  \
     (void)snprintf(detailVar, sizeof(detailVar), __VA_ARGS__); \
     m2nSetLastError(detailVar);                            \
   } while (0)

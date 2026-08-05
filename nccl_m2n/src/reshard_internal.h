@@ -86,6 +86,22 @@ class M2nApiUnlock {
   bool unlocked_ = false;
 };
 
+enum class M2nGroupReshardKind {
+  Staging,
+  Window,
+};
+
+constexpr size_t kM2nGroupMaxFusionEntries = 4096;
+
+bool m2nGroupIsActive();
+ncclResult_t m2nGroupEnqueueReshard(M2nGroupReshardKind kind, ncclM2nHandle_t handle, ncclComm_t comm,
+                                    ncclWindow_t window, const ncclDistTensor_t* src,
+                                    const ncclDistTensor_t* dst, cudaStream_t stream);
+ncclResult_t reshardTryExecuteStagingGroup(ncclM2nHandle_t handle, ncclComm_t comm,
+                                           const ncclDistTensor_t* srcs, const ncclDistTensor_t* dsts,
+                                           const size_t* originalIndices, size_t count, cudaStream_t stream,
+                                           bool* handled, size_t* failedOriginalIndex);
+
 class ScopedCrossNicRailOverride {
  public:
   explicit ScopedCrossNicRailOverride(bool enabled);

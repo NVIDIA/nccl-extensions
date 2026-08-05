@@ -25,9 +25,66 @@
 #include "m2n_checks.h"
 #include "m2n_handle.h"
 #include "m2n_log.h"
+#include <mutex>
+
 #include "reshard_types.h"
 
 struct ncclDevComm;
+
+/* ======================================================================
+ * Public host-API serialization
+ *
+ * Mutable process-global M2N host state (the handle table, the runtime epoch,
+ * and the DevComm/window caches) is serialized by one process-wide mutex.
+ * Device work stays asynchronous: the lock covers host bookkeeping only, and
+ * is released before a public call returns.
+ *
+ * Blocking NCCL collectives must NOT run while the lock is held. Calls such as
+ * ncclCommWindowRegister and ncclDevCommCreate only complete once every rank in
+ * the communicator has entered them, so a process hosting two ranks of the same
+ * communicator would deadlock: the first rank would hold the lock inside the
+ * collective while the second waited for the lock to enter it. Wrap each such
+ * call in an M2nApiUnlock scope, which drops the lock for the duration and
+ * retakes it on scope exit.
+ * ====================================================================== */
+
+std::mutex& getM2nApiMutex();
+
+/* True when more than one public M2N call is in flight in this process. Used to
+ * decide whether a cache eviction may run its collective teardown now or must
+ * be deferred: eviction is data-dependent per rank, so releasing the lock to
+ * deregister a window that only one rank is evicting would turn a deadlock into
+ * an unmatched collective. */
+bool m2nApiHasConcurrentCalls();
+
+/* Takes the API lock for the duration of one public entry point and publishes
+ * it so a nested M2nApiUnlock can find it. Not reentrant: one per call. */
+class M2nApiLock {
+ public:
+  M2nApiLock();
+  ~M2nApiLock();
+
+  M2nApiLock(const M2nApiLock&) = delete;
+  M2nApiLock& operator=(const M2nApiLock&) = delete;
+
+ private:
+  std::unique_lock<std::mutex> lock_;
+};
+
+/* Temporarily releases the API lock held by the enclosing M2nApiLock so peer
+ * ranks in this process can enter their own public calls and join the
+ * collective. A no-op when no lock is held on this thread. */
+class M2nApiUnlock {
+ public:
+  M2nApiUnlock();
+  ~M2nApiUnlock();
+
+  M2nApiUnlock(const M2nApiUnlock&) = delete;
+  M2nApiUnlock& operator=(const M2nApiUnlock&) = delete;
+
+ private:
+  bool unlocked_ = false;
+};
 
 /* ======================================================================
  * Global configuration (inline — getters fold into a single load).

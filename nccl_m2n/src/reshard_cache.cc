@@ -65,6 +65,47 @@ static ncclWindow_t* findCachedWindowByPtr(WindowCache* cache, ncclComm_t comm, 
   return nullptr;
 }
 
+/* Entries evicted while another public call was in flight. Their teardown is
+ * collective, and eviction is data-dependent per rank, so it cannot simply run
+ * with the lock released - a rank that is not evicting would never join. Defer
+ * instead, and drain once this process has no other public call in flight. */
+static std::vector<WindowCacheEntry> gRetiredWindowCacheEntries;
+static std::vector<DevCommCacheEntry> gRetiredDevcommCacheEntries;
+
+static ncclResult_t reclaimRetiredWindowEntriesIfIdle() {
+  if (m2nApiHasConcurrentCalls() || gRetiredWindowCacheEntries.empty()) {
+    return ncclSuccess;
+  }
+  std::vector<WindowCacheEntry> retired;
+  retired.swap(gRetiredWindowCacheEntries);
+  {
+    M2nApiUnlock apiUnlock;
+    for (WindowCacheEntry& entry : retired) {
+      if (entry.valid) {
+        NCCL_M2N_CHECK_WARN(ncclCommWindowDeregister(entry.comm, entry.window));
+      }
+    }
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t reclaimRetiredDevCommEntriesIfIdle() {
+  if (m2nApiHasConcurrentCalls() || gRetiredDevcommCacheEntries.empty()) {
+    return ncclSuccess;
+  }
+  std::vector<DevCommCacheEntry> retired;
+  retired.swap(gRetiredDevcommCacheEntries);
+  {
+    M2nApiUnlock apiUnlock;
+    for (DevCommCacheEntry& entry : retired) {
+      if (entry.valid) {
+        NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(entry.comm, &entry.devComm));
+      }
+    }
+  }
+  return ncclSuccess;
+}
+
 static ncclResult_t cacheWindow(WindowCache* cache, ncclComm_t comm, void* windowBuffer, size_t windowSize,
                                 ncclWindow_t window) {
   int idx;
@@ -72,7 +113,18 @@ static ncclResult_t cacheWindow(WindowCache* cache, ncclComm_t comm, void* windo
     idx = cache->nextIdx;
     WindowCacheEntry& old = cache->entries[idx];
     RESHARD_WARN(-1, "Window cache full (%d entries), replacing entry at index %d", MAX_WINDOW_CACHE_ENTRIES, idx);
-    if (old.valid) NCCL_M2N_CHECK_WARN(ncclCommWindowDeregister(old.comm, old.window));
+    if (old.valid) {
+      if (m2nApiHasConcurrentCalls()) {
+        try {
+          gRetiredWindowCacheEntries.push_back(old);
+        } catch (const std::bad_alloc&) {
+          NCCL_M2N_FAIL(ncclSystemError, -1, "failed to retain an in-use window cache entry");
+        }
+      } else {
+        M2nApiUnlock apiUnlock;
+        NCCL_M2N_CHECK_WARN(ncclCommWindowDeregister(old.comm, old.window));
+      }
+    }
     cache->nextIdx = (cache->nextIdx + 1) % MAX_WINDOW_CACHE_ENTRIES;
   } else {
     idx = cache->count++;
@@ -110,7 +162,18 @@ ncclResult_t cacheDevComm(ncclComm_t comm, int numCtas, int signalCount, const n
     idx = gDevcommCacheNextIdx;
     DevCommCacheEntry& old = gDevcommCache[idx];
     RESHARD_WARN(-1, "DevComm cache full (%d entries), replacing entry at index %d", MAX_DEVCOMM_CACHE_ENTRIES, idx);
-    if (old.valid) NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(old.comm, &old.devComm));
+    if (old.valid) {
+      if (m2nApiHasConcurrentCalls()) {
+        try {
+          gRetiredDevcommCacheEntries.push_back(old);
+        } catch (const std::bad_alloc&) {
+          NCCL_M2N_FAIL(ncclSystemError, -1, "failed to retain an in-use DevComm cache entry");
+        }
+      } else {
+        M2nApiUnlock apiUnlock;
+        NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(old.comm, &old.devComm));
+      }
+    }
     gDevcommCacheNextIdx = (gDevcommCacheNextIdx + 1) % MAX_DEVCOMM_CACHE_ENTRIES;
   } else {
     idx = gDevcommCacheCount++;
@@ -216,24 +279,34 @@ void stagingBufferPoolFinalize() {
 }
 
 void cacheFinalize() {
-  for (int i = 0; i < gInternalWindowCache.count; i++) {
-    WindowCacheEntry& e = gInternalWindowCache.entries[i];
-    if (e.valid) {
-      NCCL_M2N_CHECK_WARN(ncclCommWindowDeregister(e.comm, e.window));
-      e.valid = false;
-    }
-  }
-  gInternalWindowCache.count = 0;
-  gInternalWindowCache.nextIdx = 0;
+  /* Drain anything deferred by an eviction that raced a concurrent call. */
+  (void)reclaimRetiredWindowEntriesIfIdle();
+  (void)reclaimRetiredDevCommEntriesIfIdle();
 
-  for (int i = 0; i < gDevcommCacheCount; i++) {
-    DevCommCacheEntry& e = gDevcommCache[i];
-    if (e.valid) {
-      NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(e.comm, &e.devComm));
-      e.valid = false;
+  /* Only the window/DevComm teardown below is collective. The stream pool and
+   * staging teardown that follow touch process-local state and must stay under
+   * the lock, or a concurrent public call could observe them mid-destruction. */
+  {
+    M2nApiUnlock apiUnlock;
+    for (int i = 0; i < gInternalWindowCache.count; i++) {
+      WindowCacheEntry& e = gInternalWindowCache.entries[i];
+      if (e.valid) {
+        NCCL_M2N_CHECK_WARN(ncclCommWindowDeregister(e.comm, e.window));
+        e.valid = false;
+      }
     }
+    gInternalWindowCache.count = 0;
+    gInternalWindowCache.nextIdx = 0;
+
+    for (int i = 0; i < gDevcommCacheCount; i++) {
+      DevCommCacheEntry& e = gDevcommCache[i];
+      if (e.valid) {
+        NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(e.comm, &e.devComm));
+        e.valid = false;
+      }
+    }
+    gDevcommCacheCount = 0;
   }
-  gDevcommCacheCount = 0;
 
   for (StreamPoolEntry& e : gStreamPool) {
     if (e.doneEvent != nullptr) {

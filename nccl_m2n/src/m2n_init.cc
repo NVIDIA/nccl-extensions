@@ -21,6 +21,7 @@
 #include "m2n_log.h"
 #include "reshard_internal.h"
 
+static std::mutex gM2nApiMutex;
 static std::mutex gM2nRuntimeMutex;
 static std::weak_ptr<ncclM2nRuntime> gM2nRuntime;
 static std::mutex gM2nDefaultHandleMutex;
@@ -30,6 +31,8 @@ static uintptr_t gNextM2nHandleId = 1;
 static std::unordered_map<ncclM2nHandle_t, std::shared_ptr<ncclM2nHandleState>> gM2nHandleTable;
 static thread_local char gM2nLastError[512] = {};
 static std::atomic<bool> gM2nProcessExiting{false};
+static thread_local std::unique_lock<std::mutex>* gCurrentM2nApiLock = nullptr;
+static int gM2nApiInFlightCalls = 0;
 
 void m2nClearLastError() {
   gM2nLastError[0] = '\0';
@@ -174,8 +177,40 @@ ncclM2nRuntime::~ncclM2nRuntime() {
   resetReshardRuntimeConfig();
 }
 
+std::mutex& getM2nApiMutex() {
+  return gM2nApiMutex;
+}
+
+bool m2nApiHasConcurrentCalls() {
+  return gM2nApiInFlightCalls > 1;
+}
+
 extern "C" {
+M2nApiLock::M2nApiLock() : lock_(gM2nApiMutex) {
+  gM2nApiInFlightCalls++;
+  gCurrentM2nApiLock = &lock_;
+}
+
+M2nApiLock::~M2nApiLock() {
+  gCurrentM2nApiLock = nullptr;
+  gM2nApiInFlightCalls--;
+}
+
+M2nApiUnlock::M2nApiUnlock() {
+  if (gCurrentM2nApiLock != nullptr && gCurrentM2nApiLock->owns_lock()) {
+    gCurrentM2nApiLock->unlock();
+    unlocked_ = true;
+  }
+}
+
+M2nApiUnlock::~M2nApiUnlock() {
+  if (unlocked_) {
+    gCurrentM2nApiLock->lock();
+  }
+}
+
 ncclResult_t ncclM2nInit(ncclM2nHandle_t* handle, const ncclM2nConfig_t* config) {
+  M2nApiLock apiLock;
   m2nClearLastError();
   NCCL_M2N_CHECK_ARG(handle != nullptr, -1, "ncclM2nInit: handle output must be non-null");
   *handle = nullptr;
@@ -189,6 +224,7 @@ ncclResult_t ncclM2nInit(ncclM2nHandle_t* handle, const ncclM2nConfig_t* config)
 }
 
 ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle) {
+  M2nApiLock apiLock;
   m2nClearLastError();
   if (handle != nullptr) {
     return destroyExplicitHandle(handle);

@@ -136,6 +136,12 @@ inline int reshardGetSrcDomainSize() {
 inline int reshardGetDstDomainSize() {
   return gReshardDstDomainSize;
 }
+/* Resolve per-side domain sizes after topology discovery. RING treats
+ * destination-domain peers as LSA-local, so its destination override must not
+ * exceed dstLsaSize. An LSA size of 0 retains the legacy gpus-per-node
+ * fallback. */
+ncclResult_t resolveReshardDomainSizes(int worldRank, ReshardAlgorithm algo, int srcLsaSize, int dstLsaSize,
+                                       int* srcGpusPerDomain, int* dstGpusPerDomain);
 inline ReshardLoadBalanceMode reshardGetLoadBalanceMode() {
   return gReshardLbMode;
 }

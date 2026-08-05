@@ -115,6 +115,27 @@ ncclResult_t validateReshardConfigHeader(const ncclM2nConfig_t* config) {
   return ncclSuccess;
 }
 
+ncclResult_t resolveReshardDomainSizes(int worldRank, ReshardAlgorithm algo, int srcLsaSize, int dstLsaSize,
+                                       int* srcGpusPerDomain, int* dstGpusPerDomain) {
+  NCCL_M2N_CHECK_ARG(srcGpusPerDomain != nullptr && dstGpusPerDomain != nullptr, worldRank,
+                     "resolveReshardDomainSizes: output pointers must be non-null");
+
+  const int srcOverride = reshardGetSrcDomainSize();
+  const int dstOverride = reshardGetDstDomainSize();
+  if (algo == RESHARD_ALGO_RING) {
+    NCCL_M2N_CHECK_ARG(dstOverride <= 0 || dstLsaSize <= 0 || dstOverride <= dstLsaSize, worldRank,
+                       "NCCL_RESHARD_DST_DOMAIN_SIZE=%d exceeds the NCCL DevComm LSA team size %d", dstOverride,
+                       dstLsaSize);
+  }
+
+  const int gpusPerNode = reshardGetGpusPerNode();
+  *srcGpusPerDomain =
+    srcOverride > 0 ? srcOverride : (srcLsaSize > 0 ? srcLsaSize : (gpusPerNode > 0 ? gpusPerNode : 1));
+  *dstGpusPerDomain =
+    dstOverride > 0 ? dstOverride : (dstLsaSize > 0 ? dstLsaSize : (gpusPerNode > 0 ? gpusPerNode : 1));
+  return ncclSuccess;
+}
+
 // `getenv` is the only POSIX path to read process env vars; there is no portable
 // thread-safe alternative (`secure_getenv` is glibc-only). Library init runs
 // once on the first calling thread before ncclM2nInit returns, so concurrent

@@ -98,6 +98,11 @@ Existing binaries must be rebuilt against the updated header.
     characters and whitespace are rejected.
     Invalid tuning values are ignored, except invalid or non-positive stream
     pool sizes disable the pool and oversized values are capped.
+  - On the RING path, `NCCL_RESHARD_DST_DOMAIN_SIZE` values larger than the
+    NCCL DevComm LSA team size are rejected with `ncclInvalidArgument`; the
+    diagnostic names both values. This rejects only configurations that could
+    not previously have worked correctly, not valid setups. Non-RING paths and
+    values within the LSA team size are unaffected.
   - The internal non-blocking stream pool preserves both readiness and
     completion ordering with the caller's default stream, including every
     error return after stream setup.

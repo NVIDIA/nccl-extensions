@@ -124,6 +124,30 @@ inline bool gReshardUseInternalStreams = true;
  * "use the compile-time default". */
 inline size_t gReshardChunkSizeBytes = 0;
 
+/* Minimum per-communicator staging allocation. Parsed once from
+ * NCCL_RESHARD_STAGING_WATERMARK_BYTES at first init. */
+inline size_t gReshardStagingWatermarkBytes = 256ULL * 1024ULL * 1024ULL;
+
+/* Optional bucketed staging-buffer pool (env NCCL_RESHARD_STAGING_BUCKETS =
+ * "size:slots,size:slots,..."; size in bytes). When set, it replaces the
+ * per-comm staging buffer with fixed best-fit buckets. Unset keeps the
+ * per-comm path. */
+struct ReshardStagingBucketCfg {
+  size_t size;
+  int numSlots;
+};
+inline constexpr int kMaxStagingBuckets = 8;
+inline ReshardStagingBucketCfg gReshardStagingBuckets[kMaxStagingBuckets] = {};
+inline int gReshardStagingBucketCount = 0;
+inline bool reshardStagingBucketsEnabled() {
+  return gReshardStagingBucketCount > 0;
+}
+inline int reshardStagingTotalSlots() {
+  int total = 0;
+  for (int i = 0; i < gReshardStagingBucketCount; i++) total += gReshardStagingBuckets[i].numSlots;
+  return total;
+}
+
 inline ReshardAlgorithm reshardGetAlgorithm() {
   return gReshardAlgorithm;
 }

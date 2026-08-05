@@ -41,6 +41,7 @@
 #include "m2n_log.h"
 #include "reshard_types.h"
 #include "staging_buffer.h"
+#include "staging_profile.h"
 #include "staging_types.h"
 
 static void CUDART_CB releaseStagingKernelParams(void* data) {
@@ -146,6 +147,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   cudaStream_t workStream = work.stream;
 
   const bool debugLogging = reshardGetLogLevel() >= RESHARD_LOG_DEBUG;
+  auto profile = debugLogging ? stagingProfileCreate() : std::unique_ptr<StagingProfile>{};
 
   /* Convert dims to bytes (last dim absorbs element size). */
   size_t src_dims_bytes[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
@@ -155,6 +157,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
 
   StagingBufferState* staging = nullptr;
   {
+    StagingProfileScope profileScope(profile.get(), STAGING_PROFILE_ENSURE_BUFFER);
     NCCL_M2N_CHECK(ensureStagingBufferPool(comm, workStream, &staging));
   }
 
@@ -165,6 +168,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
    * ---------------------------------------------------------------- */
   ncclWindow_t staging_window = nullptr;
   {
+    StagingProfileScope profileScope(profile.get(), STAGING_PROFILE_REGISTER_WINDOW);
     ncclWindow_t* cached_win = findCachedInternalWindowByPtr(comm, staging->buffer, staging->totalSize);
     if (cached_win != nullptr) {
       staging_window = *cached_win;
@@ -190,6 +194,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   ncclDevComm* probeDevComm = nullptr;
   ncclDevComm probeLocalDevComm;
   {
+    StagingProfileScope profileScope(profile.get(), STAGING_PROFILE_PROBE_DEV_COMM);
     staging_num_ctas = staging->numChannels;
 
     const ReshardDevCommCacheKey probeKey = {
@@ -244,6 +249,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   StagingTransferDescriptor desc;
   size_t maxPeerGroupSize = 1;
   {
+    StagingProfileScope profileScope(profile.get(), STAGING_PROFILE_BUILD_DESCRIPTOR);
     NCCL_M2N_CHECK(validateStagingPlanLimits(world_rank, &src_local, src_dims_bytes, &dst_local, dst_dims_bytes,
                                              gpus_per_domain, &maxPeerGroupSize));
     memset(&desc, 0, sizeof(desc));
@@ -266,6 +272,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   }
   StagingKernelParams& params = *paramsOwner;
   {
+    StagingProfileScope profileScope(profile.get(), STAGING_PROFILE_PREPARE_PARAMS);
     NCCL_M2N_CHECK(
       stagingPrepareTransfer(staging, &desc, staging_window, staging_window, effectiveChunkSize, &params));
 
@@ -283,6 +290,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
    * This is now O(1).
   * ---------------------------------------------------------------- */
   {
+    StagingProfileScope profileScope(profile.get(), STAGING_PROFILE_RESOLVE_GIN_COUNTS);
     ReshardMeshInterval srcInterval{};
     ReshardMeshInterval dstInterval{};
     NCCL_M2N_CHECK(computeReshardMeshInterval(src_mesh, world_rank, &srcInterval));
@@ -304,6 +312,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   ncclDevComm* devCommPtr = nullptr;
   ncclDevComm localDevComm;
   {
+    StagingProfileScope profileScope(profile.get(), STAGING_PROFILE_GET_DEV_COMM);
     const ReshardDevCommCacheKey devCommKey = {
       comm, staging_num_ctas, params.ginSignalCount, params.ginCounterCount, staging_num_ctas,
       RESHARD_DEVCOMM_BARRIER_WORLD
@@ -352,6 +361,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   /* Launch the staging kernel. */
   ncclResult_t launchResult = ncclSuccess;
   {
+    StagingProfileScope profileScope(profile.get(), STAGING_PROFILE_LAUNCH_KERNEL);
     const bool verbose = debugLogging;
     launchResult =
       launchStagingReshardDirect(&params, staging->devParams, devCommPtr, staging_num_ctas, workStream, verbose);
@@ -372,6 +382,10 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
     NCCL_M2N_CHECK_WARN(stagingBufferPoolRecordEvent(comm, workStream));
     NCCL_M2N_CHECK_WARN(workCompletion.complete());
     return launchResult;
+  }
+
+  if (profile != nullptr) {
+    profile->log(world_rank);
   }
 
   /* Record event on the staging buffer for cross-stream ordering

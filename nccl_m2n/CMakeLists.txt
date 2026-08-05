@@ -184,6 +184,7 @@ set(NCCL_M2N_HOST_SRC
     src/reshard_prepare.cc
     src/reshard_transpose.cc
     src/staging_buffer.cc
+    src/staging_profile.cc
     src/staging_prepare.cc
 )
 

@@ -6,11 +6,69 @@
  ************************************************************************/
 
 #include "cuda_runtime.h"
+#include <algorithm>
+#include <mutex>
 #include "nccl.h"
 #include "reshard_types.h"
 #include "m2n_checks.h"
 #include "m2n_log.h"
 #include "reshard_internal.h"
+
+/* ======================================================================
+ * Optional bucketed staging pool.
+ *
+ * Buffers are fixed-size best-fit buckets. A communicator keeps one stable
+ * slot per bucket so window registration remains rank-uniform across calls.
+ * ====================================================================*/
+
+/* The slot memo is intentionally stable for the lifetime of a communicator.
+ * Every rank must register its symmetric staging window in lockstep. If a
+ * communicator changed slots between reshard sequences, ranks taking
+ * different sequences could enter ncclCommWindowRegister for different
+ * windows and desynchronize the collective. The slot index itself need not
+ * be the same on every rank. */
+struct StagingSlot {
+  void* buffer;
+  size_t size;
+  cudaEvent_t doneEvent;
+  cudaStream_t lastStream;
+  int bucketIdx;
+  bool eventRecorded;
+  bool reserved;
+  bool poisoned;
+};
+
+struct StagingBucketRT {
+  size_t size;
+  int numSlots;
+  int numAssigned;
+  StagingSlot slots[MAX_SPLIT_CONCURRENCY];
+  bool allocated;
+};
+
+struct CommBucketSlot {
+  ncclComm_t comm;
+  int bucketIdx;
+  int slotIdx;
+};
+
+struct StagingDevicePool {
+  int cudaDev;
+  StagingBucketRT buckets[kMaxStagingBuckets];
+  int bucketCount;
+  bool built;
+  CommBucketSlot commSlots[MAX_SPLIT_CONCURRENCY * kMaxStagingBuckets];
+  int commSlotCount;
+  TransposeBufferEntry transposeEntries[MAX_TRANSPOSE_BUFFER_ENTRIES];
+  int transposeEntryCount;
+};
+
+static StagingDevicePool gStagingDevicePools[MAX_TRANSPOSE_BUFFER_ENTRIES];
+static int gStagingDevicePoolCount = 0;
+static std::mutex gStagingPoolMutex;
+static thread_local ncclComm_t gCurrentStagingComm = nullptr;
+static thread_local StagingSlot* gCurrentStagingSlot = nullptr;
+static thread_local TransposeBufferEntry* gCurrentTransposeEntry = nullptr;
 
 /* ======================================================================
  * Per-comm symmetric transpose buffer pool.
@@ -19,64 +77,221 @@
  * When a different stream reuses the same comm's buffer, a per-entry
  * cudaEvent_t + cudaStreamWaitEvent serializes access.
  *
- * Growth (high-water-mark): the old buffer is parked in gRetired and
- * freed only at finalization.  This avoids any cudaDeviceSynchronize
- * or cudaStreamSynchronize on the hot path.
+ * The fallback allocation is fixed at the first allocation, with a minimum
+ * configured watermark, so cached window registrations never change size.
  * ====================================================================*/
 
-static TransposeBufferEntry gPool[MAX_TRANSPOSE_BUFFER_ENTRIES];
-static int gPoolCount = 0;
-
-#define MAX_RETIRED_BUFFERS (MAX_TRANSPOSE_BUFFER_ENTRIES * 2)
-static void* gRetired[MAX_RETIRED_BUFFERS];
-static int gRetiredCount = 0;
-
-static TransposeBufferEntry* findPoolEntry(ncclComm_t comm) {
-  for (int i = 0; i < gPoolCount; i++)
-    if (gPool[i].comm == comm && gPool[i].allocated) return &gPool[i];
+static TransposeBufferEntry* findPoolEntry(StagingDevicePool& pool, ncclComm_t comm) {
+  for (int i = 0; i < pool.transposeEntryCount; i++)
+    if (pool.transposeEntries[i].comm == comm && pool.transposeEntries[i].allocated) return &pool.transposeEntries[i];
   return nullptr;
 }
 
+static StagingDevicePool* findStagingDevicePool(int cudaDev) {
+  for (int i = 0; i < gStagingDevicePoolCount; i++) {
+    if (gStagingDevicePools[i].cudaDev == cudaDev) return &gStagingDevicePools[i];
+  }
+  return nullptr;
+}
+
+static ncclResult_t acquireStagingDevicePool(StagingDevicePool** outPool) {
+  int cudaDev = -1;
+  NCCL_M2N_CUDACHECK(cudaGetDevice(&cudaDev));
+  *outPool = findStagingDevicePool(cudaDev);
+  if (*outPool != nullptr) return ncclSuccess;
+  NCCL_M2N_CHECK_ARG(gStagingDevicePoolCount < MAX_TRANSPOSE_BUFFER_ENTRIES, -1,
+                     "Staging device pool table full (%d entries); increase MAX_TRANSPOSE_BUFFER_ENTRIES",
+                     MAX_TRANSPOSE_BUFFER_ENTRIES);
+  *outPool = &gStagingDevicePools[gStagingDevicePoolCount++];
+  (*outPool)->cudaDev = cudaDev;
+  return ncclSuccess;
+}
+
+static int lookupCommBucketSlot(const StagingDevicePool& pool, ncclComm_t comm, int bucketIdx) {
+  for (int i = 0; i < pool.commSlotCount; i++) {
+    if (pool.commSlots[i].comm == comm && pool.commSlots[i].bucketIdx == bucketIdx) {
+      return pool.commSlots[i].slotIdx;
+    }
+  }
+  return -1;
+}
+
+static bool recordCommBucketSlot(StagingDevicePool* pool, ncclComm_t comm, int bucketIdx, int slotIdx) {
+  if (pool->commSlotCount >= (int)(sizeof(pool->commSlots) / sizeof(pool->commSlots[0]))) return false;
+  pool->commSlots[pool->commSlotCount++] = {comm, bucketIdx, slotIdx};
+  return true;
+}
+
+static void buildStagingPoolMeta(StagingDevicePool* pool) {
+  if (pool->built) return;
+  pool->bucketCount = gReshardStagingBucketCount;
+  for (int i = 0; i < pool->bucketCount; i++) {
+    StagingBucketRT& bucket = pool->buckets[i];
+    bucket.size = gReshardStagingBuckets[i].size;
+    bucket.numSlots = gReshardStagingBuckets[i].numSlots;
+    bucket.numAssigned = 0;
+    bucket.allocated = false;
+    for (int slot = 0; slot < bucket.numSlots; slot++) {
+      bucket.slots[slot] = {nullptr, bucket.size, nullptr, nullptr, i, false, false, false};
+    }
+  }
+  pool->built = true;
+}
+
+static ncclResult_t ensureBucketAllocated(StagingBucketRT* bucket) {
+  if (bucket->allocated) return ncclSuccess;
+  for (int slot = 0; slot < bucket->numSlots; slot++) {
+    NCCL_M2N_CUDACHECK(cudaEventCreateWithFlags(&bucket->slots[slot].doneEvent, cudaEventDisableTiming));
+    ncclResult_t result = ncclMemAlloc(&bucket->slots[slot].buffer, bucket->size);
+    if (result != ncclSuccess) {
+      for (int cleanup = 0; cleanup <= slot; cleanup++) {
+        if (bucket->slots[cleanup].buffer != nullptr) ncclMemFree(bucket->slots[cleanup].buffer);
+        if (bucket->slots[cleanup].doneEvent != nullptr) cudaEventDestroy(bucket->slots[cleanup].doneEvent);
+        bucket->slots[cleanup] = {};
+      }
+      return result;
+    }
+  }
+  bucket->allocated = true;
+  RESHARD_DEBUG(-1, "staging bucket allocated: %d slots x %zu B", bucket->numSlots, bucket->size);
+  return ncclSuccess;
+}
+
+/* A reservation is abandoned when it outlived the call that took it.
+ *
+ * A slot is reserved by ensureTransposeBuffer and released by
+ * transposeBufferRecordEvent. Any error between the two returns early and would
+ * otherwise leave the slot reserved for good -- and a reserved slot is never
+ * reacquired, so the communicator fails every later call with a spurious
+ * concurrency error and stops entering collectives its peers still enter.
+ *
+ * Ownership is deliberately NOT thread-local: the public API lock serializes
+ * reshard calls but does not pin them to a thread, so a retry after a failure
+ * can arrive on a different thread than the one that abandoned the slot. What
+ * does hold is that a reservation with no M2N call in flight besides this one
+ * cannot belong to a live call -- so treat it as abandoned.
+ *
+ * Poison it rather than reusing it: the completion event was never recorded, so
+ * neither the buffer contents nor any in-flight device work are known. */
+static bool stagingReservationIsAbandoned() {
+  return !m2nApiHasConcurrentCalls();
+}
+
+static void reclaimAbandonedSlot(StagingSlot* slot) {
+  slot->reserved = false;
+  slot->eventRecorded = false;
+  slot->poisoned = true;
+}
+
+static void reclaimAbandonedEntry(TransposeBufferEntry* entry) {
+  entry->reserved = false;
+  entry->eventRecorded = false;
+  entry->poisoned = true;
+}
+
+
+static ncclResult_t acquireStagingSlot(ncclComm_t comm, size_t requiredBytes, cudaStream_t stream,
+                                       StagingSlot** outSlot) {
+  std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+  StagingDevicePool* pool = nullptr;
+  NCCL_M2N_CHECK(acquireStagingDevicePool(&pool));
+  buildStagingPoolMeta(pool);
+  StagingBucketRT* bucket = nullptr;
+  int bucketIdx = -1;
+  for (int i = 0; i < pool->bucketCount; i++) {
+    if (pool->buckets[i].size >= requiredBytes) {
+      bucket = &pool->buckets[i];
+      bucketIdx = i;
+      break;
+    }
+  }
+  if (bucket == nullptr) {
+    const size_t largest = pool->bucketCount > 0 ? pool->buckets[pool->bucketCount - 1].size : 0;
+    NCCL_M2N_FAIL(ncclInvalidArgument, -1,
+                  "staging request %zu B exceeds the largest configured bucket %zu B; add or enlarge a bucket in "
+                  "NCCL_RESHARD_STAGING_BUCKETS or raise NCCL_RESHARD_STAGING_WATERMARK_BYTES",
+                  requiredBytes, largest);
+  }
+  NCCL_M2N_CHECK(ensureBucketAllocated(bucket));
+
+  int slotIdx = lookupCommBucketSlot(*pool, comm, bucketIdx);
+  if (slotIdx < 0) {
+    NCCL_M2N_CHECK_ARG(bucket->numAssigned < bucket->numSlots, -1,
+                       "staging bucket %d has no free communicator slots (%d configured)", bucketIdx,
+                       bucket->numSlots);
+    slotIdx = bucket->numAssigned++;
+    NCCL_M2N_CHECK_ARG(recordCommBucketSlot(pool, comm, bucketIdx, slotIdx), -1,
+                       "staging bucket communicator memo is full");
+  }
+  StagingSlot* slot = &bucket->slots[slotIdx];
+  /* Reclaim before the poison check, not after: reclaiming marks the slot
+   * poisoned, and a check that already ran would let this very call reuse a
+   * slot it just declared unusable. */
+  if (slot->reserved && stagingReservationIsAbandoned()) {
+    reclaimAbandonedSlot(slot);
+  }
+  if (slot->poisoned) {
+    NCCL_M2N_FAIL(ncclUnhandledCudaError, -1, "Staging bucket %d slot %d is unavailable", bucketIdx, slotIdx);
+  }
+  NCCL_M2N_CHECK_ARG(!slot->reserved, -1,
+                     "Concurrent reshard operations on communicator %p are unsupported; serialize calls at the caller",
+                     (void*)comm);
+  if (slot->eventRecorded && slot->lastStream != stream) {
+    NCCL_M2N_CUDACHECK(cudaStreamWaitEvent(stream, slot->doneEvent, 0));
+  }
+  slot->reserved = true;
+  gCurrentStagingComm = comm;
+  gCurrentStagingSlot = slot;
+  *outSlot = slot;
+  return ncclSuccess;
+}
+
 ncclResult_t ensureTransposeBuffer(ncclComm_t comm, size_t requiredBytes, cudaStream_t stream) {
-  TransposeBufferEntry* entry = findPoolEntry(comm);
+  if (reshardStagingBucketsEnabled()) {
+    StagingSlot* slot = nullptr;
+    return acquireStagingSlot(comm, requiredBytes, stream, &slot);
+  }
+
+  std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+  StagingDevicePool* pool = nullptr;
+  NCCL_M2N_CHECK(acquireStagingDevicePool(&pool));
+  TransposeBufferEntry* entry = findPoolEntry(*pool, comm);
 
   if (entry != nullptr) {
-    if (entry->stream != stream) {
+    /* Reclaim first, so the poison it sets is honoured by the check below. */
+    if (entry->reserved && stagingReservationIsAbandoned()) {
+      reclaimAbandonedEntry(entry);
+    }
+    if (entry->reserved) {
+      NCCL_M2N_FAIL(ncclInvalidUsage, -1,
+                    "Concurrent reshard operations on communicator %p are unsupported; serialize calls at the caller",
+                    (void*)comm);
+    }
+    if (entry->poisoned) {
+      NCCL_M2N_FAIL(ncclUnhandledCudaError, -1, "Transpose buffer for comm %p is unavailable", (void*)comm);
+    }
+    if (entry->eventRecorded && entry->stream != stream) {
       NCCL_M2N_CUDACHECK(cudaStreamWaitEvent(stream, entry->event, 0));
       entry->stream = stream;
     }
 
-    if (entry->capacity >= requiredBytes) return ncclSuccess;
-
-    /* Growth: allocate the larger buffer first and retire the old one only
-     * after the allocation succeeds, so a failed ncclMemAlloc leaves the
-     * entry intact (a partially grown entry would expose a null buffer
-     * through getTransposeBuffer). */
-    if (gRetiredCount >= MAX_RETIRED_BUFFERS) {
-      NCCL_M2N_FAIL(ncclInternalError, -1,
-                    "Transpose retired-buffer list full (%d); process the largest tensor first",
-                    MAX_RETIRED_BUFFERS);
+    if (entry->capacity < requiredBytes) {
+      NCCL_M2N_FAIL(ncclInvalidArgument, -1,
+                    "staging request %zu B exceeds comm %p's fixed capacity %zu B; process the comm's largest "
+                    "tensor first or raise NCCL_RESHARD_STAGING_WATERMARK_BYTES",
+                    requiredBytes, (void*)comm, entry->capacity);
     }
-    void* grown = nullptr;
-    ncclResult_t growResult = ncclMemAlloc(&grown, requiredBytes);
-    if (growResult != ncclSuccess) {
-      NCCL_M2N_FAIL(growResult, -1, "Failed to grow transpose buffer to %zu bytes: %s", requiredBytes,
-                    ncclGetErrorString(growResult));
-    }
-    RESHARD_DEBUG(-1, "Transpose buffer growing for comm %p: %zu -> %zu bytes (retiring %p)", (void*)comm,
-                  entry->capacity, requiredBytes, entry->buffer);
-    gRetired[gRetiredCount++] = entry->buffer;
-    entry->buffer = grown;
-    entry->capacity = requiredBytes;
+    entry->reserved = true;
+    gCurrentTransposeEntry = entry;
     return ncclSuccess;
   }
 
   /* New comm — allocate the event and buffer into locals, then commit the
    * pool slot only after both succeed.  Committing first (incrementing
-   * gPoolCount / setting allocated=true) would leave a half-initialized
+   * transposeEntryCount / setting allocated=true) would leave a half-initialized
    * entry on any allocation failure, which getTransposeBuffer would later
    * surface as a null buffer. */
-  if (gPoolCount >= MAX_TRANSPOSE_BUFFER_ENTRIES) {
+  if (pool->transposeEntryCount >= MAX_TRANSPOSE_BUFFER_ENTRIES) {
     NCCL_M2N_FAIL(ncclInvalidArgument, -1,
                   "Transpose buffer pool full (%d entries); increase MAX_TRANSPOSE_BUFFER_ENTRIES",
                   MAX_TRANSPOSE_BUFFER_ENTRIES);
@@ -86,55 +301,129 @@ ncclResult_t ensureTransposeBuffer(ncclComm_t comm, size_t requiredBytes, cudaSt
   NCCL_M2N_CUDACHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
 
   void* buffer = nullptr;
-  ncclResult_t r = ncclMemAlloc(&buffer, requiredBytes);
+  const size_t allocBytes = std::max(requiredBytes, gReshardStagingWatermarkBytes);
+  ncclResult_t r = ncclMemAlloc(&buffer, allocBytes);
   if (r != ncclSuccess) {
     NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(event));
-    NCCL_M2N_FAIL(r, -1, "Failed to allocate %zu-byte transpose buffer: %s", requiredBytes, ncclGetErrorString(r));
+    NCCL_M2N_FAIL(r, -1, "Failed to allocate %zu-byte transpose buffer: %s", allocBytes, ncclGetErrorString(r));
   }
 
-  TransposeBufferEntry& e = gPool[gPoolCount++];
+  TransposeBufferEntry& e = pool->transposeEntries[pool->transposeEntryCount++];
   e.comm = comm;
   e.stream = stream;
   e.event = event;
   e.buffer = buffer;
-  e.capacity = requiredBytes;
+  e.capacity = allocBytes;
+  e.eventRecorded = false;
+  e.reserved = true;
+  e.poisoned = false;
   e.allocated = true;
-  RESHARD_DEBUG(-1, "Transpose buffer allocated for comm %p: %zu bytes (%p) [slot %d]", (void*)comm, requiredBytes,
-                e.buffer, gPoolCount - 1);
+  /* Track it like the reuse path above, so an error before the completion
+   * event is recorded releases this reservation on the next call instead of
+   * wedging the communicator on its very first reshard. */
+  gCurrentTransposeEntry = &e;
+  RESHARD_DEBUG(-1, "Transpose buffer allocated for comm %p: %zu bytes (req=%zu floor=%zu, %p) [slot %d]", (void*)comm,
+                allocBytes, requiredBytes, gReshardStagingWatermarkBytes,
+                e.buffer, pool->transposeEntryCount - 1);
   return ncclSuccess;
 }
 
 void* getTransposeBuffer(ncclComm_t comm) {
-  TransposeBufferEntry* e = findPoolEntry(comm);
+  if (reshardStagingBucketsEnabled()) {
+    return (comm == gCurrentStagingComm && gCurrentStagingSlot != nullptr) ? gCurrentStagingSlot->buffer : nullptr;
+  }
+  std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+  StagingDevicePool* pool = nullptr;
+  if (acquireStagingDevicePool(&pool) != ncclSuccess) return nullptr;
+  TransposeBufferEntry* e = findPoolEntry(*pool, comm);
   return (e != nullptr) ? e->buffer : nullptr;
 }
 
 size_t getTransposeBufferCapacity(ncclComm_t comm) {
-  TransposeBufferEntry* e = findPoolEntry(comm);
+  if (reshardStagingBucketsEnabled()) {
+    return (comm == gCurrentStagingComm && gCurrentStagingSlot != nullptr) ? gCurrentStagingSlot->size : 0;
+  }
+  std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+  StagingDevicePool* pool = nullptr;
+  if (acquireStagingDevicePool(&pool) != ncclSuccess) return 0;
+  TransposeBufferEntry* e = findPoolEntry(*pool, comm);
   return (e != nullptr) ? e->capacity : 0;
 }
 
 ncclResult_t transposeBufferRecordEvent(ncclComm_t comm, cudaStream_t stream) {
-  TransposeBufferEntry* e = findPoolEntry(comm);
-  if (e != nullptr) NCCL_M2N_CUDACHECK(cudaEventRecord(e->event, stream));
+  if (reshardStagingBucketsEnabled()) {
+    std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+    if (comm == gCurrentStagingComm && gCurrentStagingSlot != nullptr) {
+      StagingSlot* slot = gCurrentStagingSlot;
+      /* Release the reservation whether or not the record succeeds. A slot left
+       * reserved is never reacquired, so the communicator reports spurious
+       * concurrent use on every later call and can strand its peers in a
+       * collective the failing rank never enters. */
+      const cudaError_t err = cudaEventRecord(slot->doneEvent, stream);
+      slot->lastStream = stream;
+      slot->eventRecorded = (err == cudaSuccess);
+      slot->poisoned = (err != cudaSuccess);
+      slot->reserved = false;
+      gCurrentStagingComm = nullptr;
+      gCurrentStagingSlot = nullptr;
+      NCCL_M2N_CUDACHECK(err);
+    }
+    return ncclSuccess;
+  }
+  std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+  StagingDevicePool* pool = nullptr;
+  NCCL_M2N_CHECK(acquireStagingDevicePool(&pool));
+  TransposeBufferEntry* e = findPoolEntry(*pool, comm);
+  if (e != nullptr) {
+    const cudaError_t err = cudaEventRecord(e->event, stream);
+    e->stream = stream;
+    e->eventRecorded = (err == cudaSuccess);
+    e->poisoned = (err != cudaSuccess);
+    e->reserved = false;
+    gCurrentTransposeEntry = nullptr;
+    NCCL_M2N_CUDACHECK(err);
+  }
   return ncclSuccess;
 }
 
 void transposeBufferFinalize() {
-  for (int i = 0; i < gPoolCount; i++) {
-    if (gPool[i].event != nullptr) cudaEventDestroy(gPool[i].event);
-    if (gPool[i].buffer != nullptr) ncclMemFree(gPool[i].buffer);
-    gPool[i] = {};
-  }
-  gPoolCount = 0;
-
-  for (int i = 0; i < gRetiredCount; i++) {
-    if (gRetired[i] != nullptr) {
-      ncclMemFree(gRetired[i]);
-      gRetired[i] = nullptr;
+  std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+  int currentDevice = -1;
+  NCCL_M2N_CUDACHECK_WARN(cudaGetDevice(&currentDevice));
+  for (int device = 0; device < gStagingDevicePoolCount; device++) {
+    StagingDevicePool& pool = gStagingDevicePools[device];
+    bool hasAllocation = false;
+    for (int entryIdx = 0; entryIdx < pool.transposeEntryCount && !hasAllocation; entryIdx++) {
+      hasAllocation = pool.transposeEntries[entryIdx].allocated;
     }
+    for (int bucketIdx = 0; bucketIdx < pool.bucketCount && !hasAllocation; bucketIdx++) {
+      hasAllocation = pool.buckets[bucketIdx].allocated;
+    }
+    if (!pool.built && !hasAllocation) continue;
+    if (hasAllocation) NCCL_M2N_CUDACHECK_WARN(cudaSetDevice(pool.cudaDev));
+    for (int entryIdx = 0; entryIdx < pool.transposeEntryCount; entryIdx++) {
+      if (pool.transposeEntries[entryIdx].event != nullptr) cudaEventDestroy(pool.transposeEntries[entryIdx].event);
+      if (pool.transposeEntries[entryIdx].buffer != nullptr) ncclMemFree(pool.transposeEntries[entryIdx].buffer);
+      pool.transposeEntries[entryIdx] = {};
+    }
+    pool.transposeEntryCount = 0;
+    for (int bucketIdx = 0; bucketIdx < pool.bucketCount; bucketIdx++) {
+      StagingBucketRT& bucket = pool.buckets[bucketIdx];
+      for (int slotIdx = 0; slotIdx < bucket.numSlots; slotIdx++) {
+        if (bucket.slots[slotIdx].doneEvent != nullptr) cudaEventDestroy(bucket.slots[slotIdx].doneEvent);
+        if (bucket.slots[slotIdx].buffer != nullptr) {
+          ncclMemFree(bucket.slots[slotIdx].buffer);
+        }
+      }
+      bucket = {};
+    }
+    pool = {};
   }
-  gRetiredCount = 0;
+  if (currentDevice >= 0) NCCL_M2N_CUDACHECK_WARN(cudaSetDevice(currentDevice));
+  gStagingDevicePoolCount = 0;
+  gCurrentStagingComm = nullptr;
+  gCurrentStagingSlot = nullptr;
+  gCurrentTransposeEntry = nullptr;
 }
 
 bool shouldTransposeForCrossDim(const size_t* srcDimsBytes, const size_t* dstDimsBytes, int ndims, int srcShardDim,

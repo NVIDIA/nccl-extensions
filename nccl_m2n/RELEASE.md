@@ -89,6 +89,9 @@ Existing binaries must be rebuilt against the updated header.
     but must be rank-uniform. The default cached pool is 256 MiB per
     communicator (4 channels times 64 MiB); the configured 1 MiB chunk is kept
     when safe and otherwise reduced uniformly from shared geometry.
+  - `NCCL_RESHARD_STAGING_BUCKETS` enables a bounded best-fit staging-buffer
+    pool, and `NCCL_RESHARD_STAGING_WATERMARK_BYTES` sets the minimum per-comm
+    staging allocation.
   - Kernel launch is asynchronous. Callers complete the stream before
     finalizing M2N or releasing communicators, buffers, and streams used by the
     operation.

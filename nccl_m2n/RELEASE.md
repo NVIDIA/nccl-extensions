@@ -41,6 +41,15 @@ Existing binaries must be rebuilt against the updated header.
   `NCCL_M2N_BUILD_BENCH` and `NCCL_M2N_BUILD_TESTS` enable the optional
   benchmark and test builds. There is deliberately no repository-root
   `CMakeLists.txt`.
+- **Benchmark argument parsing:** All three public benchmark drivers —
+  `reshard_bench`, `reshard_batch_bench_user_window`, and
+  `reshard_model_bench` — now use a shared strict argument parser.
+  Unknown options and unknown enum values are fatal. Previously, a stray or
+  obsolete flag was silently ignored, so existing wrapper scripts that pass
+  one may now fail.
+- **Qwen3-32B benchmark configs:** Adds the Qwen3-32B model configuration and
+  DP1/TP1-to-DP1/TP1, DP1/TP2-to-DP1/TP2, and DP1/TP4-to-DP1/TP4 system
+  configurations.
 - **Public C API cleanup:**
   - `ncclMesh_t` carries topology only (`dims[]`, `startRank`).
   - Tensor placement moves from `mesh.placement[]` to

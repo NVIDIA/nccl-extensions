@@ -43,6 +43,9 @@
 #include <nccl.h>
 
 #include "nccl_m2n.h"
+#ifdef NCCL_M2N_TESTING
+#include "reshard_internal.h"
+#endif
 #include "test_helpers.h"
 
 /* ======================================================================
@@ -76,6 +79,7 @@ struct TestEnv {
   void* copyBuffer;
   size_t copyBufferBytes;
   ApiKind apiKind;
+  bool expectPackWindow;
   bool verbose;
 
   void (*barrier)(TestEnv* env);
@@ -126,6 +130,7 @@ struct BasicApiCliArgs {
   bool verbose = false;
   const char* filter = nullptr;
   const char* algorithm = "ring";
+  const char* copyAlgorithm = "direct";
   const char* lbMode = "uniform";
   const char* api = "window"; /* "window", "default", or "all" */
   int maxWorld = 0; /* 0 = unrestricted */
@@ -152,6 +157,8 @@ static void basicApiPrintUsage(const char* prog, const char* usageFmt, bool allo
          "rank tier)\n");
   printf("  --algorithm ring|direct%s  Reshard algorithm (default: ring%s)\n", allowAlgorithmAll ? "|all" : "   ",
          allowAlgorithmAll ? "; 'all' registers one gtest case per algorithm" : "");
+  printf("  --copy-algorithm direct|packwindow\n");
+  printf("                               Default-API copy algorithm (default: direct)\n");
   printf("  --api  window|default|all    Reshard API surface (default: "
          "window;\n");
   printf("                               'all' runs both window and default)\n");
@@ -207,6 +214,12 @@ static BasicApiCliArgs basicApiParseCli(int argc, char** argv, const char* usage
       a.algorithm = basicApiRequireValue(argc, argv, &i);
       if (!allowAlgorithmAll && strcmp(a.algorithm, "all") == 0) {
         fprintf(stderr, "--algorithm all is supported by MPI only\n");
+        _Exit(2);
+      }
+    } else if (strcmp(k, "--copy-algorithm") == 0) {
+      a.copyAlgorithm = basicApiRequireValue(argc, argv, &i);
+      if (strcmp(a.copyAlgorithm, "direct") != 0 && strcmp(a.copyAlgorithm, "packwindow") != 0) {
+        fprintf(stderr, "Unknown copy algorithm '%s'. Use 'direct' or 'packwindow'\n", a.copyAlgorithm);
         _Exit(2);
       }
     } else if (strcmp(k, "--api") == 0) {
@@ -1069,6 +1082,8 @@ static const char* basicApiRequestedAlgorithmEnv(const BasicApiCliArgs& cli, boo
 
 static void basicApiConfigureReshardEnv(const BasicApiCliArgs& cli, const char* algorithmEnv) {
   testSetEnv("NCCL_RESHARD_ALGORITHM", algorithmEnv);
+  testSetEnv("NCCL_RESHARD_COPY_ALGORITHM",
+             strcmp(cli.copyAlgorithm, "packwindow") == 0 ? "PACKWINDOW" : "DIRECT");
   testSetEnv("NCCL_RESHARD_LB_MODE", strcmp(cli.lbMode, "node") == 0 ? "NODE_AWARE" : "UNIFORM");
   if (cli.verbose) testSetEnv("NCCL_RESHARD_LOG_LEVEL", "DEBUG");
 }
@@ -1078,8 +1093,8 @@ static void basicApiPrintRuntimeSummary(const char* title, int worldSize, int de
   if (!shouldPrint) return;
 
   printf("=== %s ===\n", title);
-  printf("worldSize=%d, devices=%d, algo=%s, lb=%s, api=%s\n", worldSize, deviceCount, cli.algorithm, cli.lbMode,
-         cli.api);
+  printf("worldSize=%d, devices=%d, algo=%s, copy=%s, lb=%s, api=%s\n", worldSize, deviceCount, cli.algorithm,
+         cli.copyAlgorithm, cli.lbMode, cli.api);
   printf("bufferBytes=%zu, %s=%zu\n", bufferBytes, countLabel, count);
   if (cli.filter != nullptr) printf("filter='%s'\n", cli.filter);
   if (cli.maxWorld > 0) printf("maxWorld=%d\n", cli.maxWorld);
@@ -1265,6 +1280,12 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   }
 
   TEST_CUDACHECK(cudaStreamSynchronize(env->stream));
+#ifdef NCCL_M2N_TESTING
+  if (env->apiKind == ApiKind::Default && env->expectPackWindow &&
+      reshardGetLastCompletedCopyAlgorithmForTest() != RESHARD_COPY_ALGO_PACKWINDOW) {
+    return makeFail("default API did not execute the selected PACKWINDOW path");
+  }
+#endif
   env->barrier(env);
 
   /* ----- 9. validate dest ----- */

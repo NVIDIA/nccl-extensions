@@ -99,6 +99,7 @@ inline int gReshardSrcDomainSize = 0;
 inline int gReshardDstDomainSize = 0;
 inline ReshardAlgorithm gReshardAlgorithm = RESHARD_ALGO_AUTO;
 inline ReshardLoadBalanceMode gReshardLbMode = RESHARD_LB_UNIFORM;
+inline ReshardCopyAlgorithm gReshardCopyAlgorithm = RESHARD_COPY_ALGO_DIRECT;
 
 /* Upper bound on pickNumCtas() output.  0 = unset (use DEFAULT_NUM_CTAS). */
 inline int gReshardMaxCta = 0;
@@ -169,6 +170,12 @@ ncclResult_t resolveReshardDomainSizes(int worldRank, ReshardAlgorithm algo, int
 inline ReshardLoadBalanceMode reshardGetLoadBalanceMode() {
   return gReshardLbMode;
 }
+inline ReshardCopyAlgorithm reshardGetCopyAlgorithm() {
+  return gReshardCopyAlgorithm;
+}
+#ifdef NCCL_M2N_TESTING
+ReshardCopyAlgorithm reshardGetLastCompletedCopyAlgorithmForTest();
+#endif
 inline bool reshardUseInternalStreams() {
   return gReshardUseInternalStreams;
 }
@@ -476,8 +483,18 @@ bool shouldTransposeForCrossDim(const size_t* srcDimsBytes, const size_t* dstDim
 ncclResult_t ensureTransposeBuffer(ncclComm_t comm, size_t requiredBytes, cudaStream_t stream);
 void* getTransposeBuffer(ncclComm_t comm);
 size_t getTransposeBufferCapacity(ncclComm_t comm);
+ncclResult_t getTransposeBufferPackWindowState(ncclComm_t comm, bool* rmaWarmed, int* previousPeerCount,
+                                               int previousPeers[MAX_DIRECT_TARGETS]);
+ncclResult_t setTransposeBufferPackWindowState(ncclComm_t comm, bool rmaWarmed, int previousPeerCount,
+                                               const int previousPeers[MAX_DIRECT_TARGETS]);
 void transposeBufferFinalize();
 ncclResult_t transposeBufferRecordEvent(ncclComm_t comm, cudaStream_t stream);
+
+/* ======================================================================
+ * reshard_user_window.cu -- PACKWINDOW copy mode entry.
+ * ====================================================================*/
+ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTensor_t* src,
+                                             const ncclDistTensor_t* dst, cudaStream_t workStream);
 
 /* ======================================================================
  * staging_prepare.cc -- host-side descriptor builders for ncclReshard.
@@ -491,7 +508,7 @@ ncclResult_t launchStagingReshardDirect(const StagingKernelParams* hostParams, S
 
 ncclResult_t validateStagingPlanLimits(int worldRank, const ncclDistTensor_t* srcTensor,
                                        const size_t* srcTensorDims, const ncclDistTensor_t* dstTensor,
-                                       const size_t* dstTensorDims, int gpusPerDomain,
+                                       const size_t* dstTensorDims, ReshardCopyAlgorithm copyAlgo, int gpusPerDomain,
                                        size_t* maxPeerGroupSize = nullptr);
 
 ncclResult_t buildStagingDirectTransferDescriptor(ncclComm_t globalComm, void* srcBuffer, const size_t* srcTensorDims,

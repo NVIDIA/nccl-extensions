@@ -899,6 +899,7 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
         ncclReshardSourceInfo* source = &params.sources[params.numSources++];
         source->signalBase = computeReshardSignalBaseUnchecked(srcMesh, srcRank, numCtas);
         source->plan = plan;
+        source->srcShardIdx = srcShard;
 
         source->isContiguous = (plan.totalInnerTransfers == 1);
         NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(plan.totalInnerTransfers, plan.innerSize, &source->totalBytes), worldRank,

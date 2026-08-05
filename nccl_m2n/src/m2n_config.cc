@@ -47,6 +47,20 @@ bool parseAlgorithmEnv(const char* s, ReshardAlgorithm* out) {
   return false;
 }
 
+bool parseCopyAlgorithmEnv(const char* s, ReshardCopyAlgorithm* out) {
+  if (s == nullptr || out == nullptr) return false;
+  if (strcasecmp(s, "DIRECT") == 0) {
+    *out = RESHARD_COPY_ALGO_DIRECT;
+    return true;
+  }
+  if (strcasecmp(s, "PACKWINDOW") == 0) {
+    *out = RESHARD_COPY_ALGO_PACKWINDOW;
+    return true;
+  }
+  /* TMAPULL remains reserved until it has a dispatched implementation. */
+  return false;
+}
+
 bool parseLbModeEnv(const char* s, ReshardLoadBalanceMode* out) {
   if (s == nullptr || out == nullptr) return false;
   if (strcasecmp(s, "UNIFORM") == 0) {
@@ -90,6 +104,7 @@ void resetReshardRuntimeConfig() {
   gReshardDstDomainSize = 0;
   gReshardAlgorithm = RESHARD_ALGO_AUTO;
   gReshardLbMode = RESHARD_LB_UNIFORM;
+  gReshardCopyAlgorithm = RESHARD_COPY_ALGO_DIRECT;
   gReshardMaxCta = 0;
   gReshardNumCtasOverride = 0;
   gReshardNumCtas = DEFAULT_NUM_CTAS;
@@ -153,6 +168,18 @@ void applyReshardEnv() {
 
   ReshardAlgorithm algo;
   if (parseAlgorithmEnv(getenv("NCCL_RESHARD_ALGORITHM"), &algo)) gReshardAlgorithm = algo;
+
+  const char* copyAlgorithm = getenv("NCCL_RESHARD_COPY_ALGORITHM");
+  ReshardCopyAlgorithm copyAlgo;
+  if (copyAlgorithm != nullptr) {
+    if (parseCopyAlgorithmEnv(copyAlgorithm, &copyAlgo)) {
+      gReshardCopyAlgorithm = copyAlgo;
+    } else {
+      RESHARD_WARN(-1,
+                   "NCCL_RESHARD_COPY_ALGORITHM=\"%s\" is not supported; accepted values are DIRECT and PACKWINDOW",
+                   copyAlgorithm);
+    }
+  }
 
   ReshardLoadBalanceMode lb;
   if (parseLbModeEnv(getenv("NCCL_RESHARD_LB_MODE"), &lb)) gReshardLbMode = lb;

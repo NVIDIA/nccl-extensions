@@ -33,7 +33,10 @@ struct StagingSlot {
   cudaEvent_t doneEvent;
   cudaStream_t lastStream;
   int bucketIdx;
+  int packWindowPreviousPeerCount;
+  int packWindowPreviousPeers[MAX_DIRECT_TARGETS];
   bool eventRecorded;
+  bool packWindowRmaWarmed;
   bool reserved;
   bool poisoned;
 };
@@ -132,7 +135,9 @@ static void buildStagingPoolMeta(StagingDevicePool* pool) {
     bucket.numAssigned = 0;
     bucket.allocated = false;
     for (int slot = 0; slot < bucket.numSlots; slot++) {
-      bucket.slots[slot] = {nullptr, bucket.size, nullptr, nullptr, i, false, false, false};
+      bucket.slots[slot] = {};
+      bucket.slots[slot].size = bucket.size;
+      bucket.slots[slot].bucketIdx = i;
     }
   }
   pool->built = true;
@@ -348,6 +353,69 @@ size_t getTransposeBufferCapacity(ncclComm_t comm) {
   if (acquireStagingDevicePool(&pool) != ncclSuccess) return 0;
   TransposeBufferEntry* e = findPoolEntry(*pool, comm);
   return (e != nullptr) ? e->capacity : 0;
+}
+
+ncclResult_t getTransposeBufferPackWindowState(ncclComm_t comm, bool* rmaWarmed, int* previousPeerCount,
+                                               int previousPeers[MAX_DIRECT_TARGETS]) {
+  NCCL_M2N_CHECK_ARG(rmaWarmed != nullptr && previousPeerCount != nullptr && previousPeers != nullptr, -1,
+                     "PACKWINDOW staging state output must be non-null");
+  std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+  if (reshardStagingBucketsEnabled()) {
+    StagingSlot* slot = (comm == gCurrentStagingComm) ? gCurrentStagingSlot : nullptr;
+    NCCL_M2N_CHECK_ARG(slot != nullptr, -1, "PACKWINDOW staging slot is unavailable for communicator %p",
+                       (void*)comm);
+    *rmaWarmed = slot->packWindowRmaWarmed;
+    *previousPeerCount = slot->packWindowPreviousPeerCount;
+    for (int i = 0; i < *previousPeerCount; i++) {
+      previousPeers[i] = slot->packWindowPreviousPeers[i];
+    }
+    return ncclSuccess;
+  }
+
+  StagingDevicePool* pool = nullptr;
+  NCCL_M2N_CHECK(acquireStagingDevicePool(&pool));
+  TransposeBufferEntry* entry = findPoolEntry(*pool, comm);
+  NCCL_M2N_CHECK_ARG(entry != nullptr, -1, "PACKWINDOW transpose buffer is unavailable for communicator %p",
+                     (void*)comm);
+  *rmaWarmed = entry->packWindowRmaWarmed;
+  *previousPeerCount = entry->packWindowPreviousPeerCount;
+  for (int i = 0; i < *previousPeerCount; i++) {
+    previousPeers[i] = entry->packWindowPreviousPeers[i];
+  }
+  return ncclSuccess;
+}
+
+ncclResult_t setTransposeBufferPackWindowState(ncclComm_t comm, bool rmaWarmed, int previousPeerCount,
+                                               const int previousPeers[MAX_DIRECT_TARGETS]) {
+  NCCL_M2N_CHECK_ARG(previousPeerCount >= 0 && previousPeerCount <= MAX_DIRECT_TARGETS, -1,
+                     "PACKWINDOW previous-peer count %d exceeds capacity %d", previousPeerCount,
+                     MAX_DIRECT_TARGETS);
+  NCCL_M2N_CHECK_ARG(previousPeerCount == 0 || previousPeers != nullptr, -1,
+                     "PACKWINDOW previous-peer input must be non-null");
+  std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+  if (reshardStagingBucketsEnabled()) {
+    StagingSlot* slot = (comm == gCurrentStagingComm) ? gCurrentStagingSlot : nullptr;
+    NCCL_M2N_CHECK_ARG(slot != nullptr, -1, "PACKWINDOW staging slot is unavailable for communicator %p",
+                       (void*)comm);
+    slot->packWindowRmaWarmed = rmaWarmed;
+    slot->packWindowPreviousPeerCount = previousPeerCount;
+    for (int i = 0; i < previousPeerCount; i++) {
+      slot->packWindowPreviousPeers[i] = previousPeers[i];
+    }
+    return ncclSuccess;
+  }
+
+  StagingDevicePool* pool = nullptr;
+  NCCL_M2N_CHECK(acquireStagingDevicePool(&pool));
+  TransposeBufferEntry* entry = findPoolEntry(*pool, comm);
+  NCCL_M2N_CHECK_ARG(entry != nullptr, -1, "PACKWINDOW transpose buffer is unavailable for communicator %p",
+                     (void*)comm);
+  entry->packWindowRmaWarmed = rmaWarmed;
+  entry->packWindowPreviousPeerCount = previousPeerCount;
+  for (int i = 0; i < previousPeerCount; i++) {
+    entry->packWindowPreviousPeers[i] = previousPeers[i];
+  }
+  return ncclSuccess;
 }
 
 ncclResult_t transposeBufferRecordEvent(ncclComm_t comm, cudaStream_t stream) {

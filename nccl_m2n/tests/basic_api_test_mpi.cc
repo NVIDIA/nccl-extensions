@@ -195,6 +195,7 @@ TEST_P(BasicApiMpiTest, Reshard) {
   env.copyBuffer = gCopyBuffer;
   env.copyBufferBytes = gCopyBufferBytes;
   env.apiKind = param.api;
+  env.expectPackWindow = strcmp(gCli.copyAlgorithm, "packwindow") == 0;
   env.verbose = gCli.verbose;
   env.barrier = mpiBarrier;
   env.allreduceMinInt = mpiAllreduceMinInt;

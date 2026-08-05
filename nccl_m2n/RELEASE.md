@@ -79,7 +79,11 @@ Existing binaries must be rebuilt against the updated header.
     work in an epoch before finalizing the last explicit or default handle.
 - **Copy/staging API:**
   - `ncclReshard` adds internally managed copy/staging transfers alongside the
-    caller-provided user-window path, initially using the DIRECT algorithm.
+    caller-provided user-window path.
+  - `NCCL_RESHARD_COPY_ALGORITHM` selects the staging copy algorithm. `DIRECT`
+    remains the default; `PACKWINDOW` packs each destination's bytes contiguously
+    with CUDA copy engines, transfers them through the hierarchical user-window
+    path, then unpacks them. Other values are rejected rather than silently ignored.
   - Every communicator rank participates and provides both descriptors. Active
     source/destination ranks require non-NULL buffers; inactive sides still
     provide local-shape metadata.

@@ -53,7 +53,6 @@ inline constexpr int DEFAULT_NUM_CTAS = 8;
 inline constexpr int DEFAULT_KERNEL_MAX_NTHREADS = 512;
 inline constexpr int DEFAULT_GIN_CONTEXT_COUNT = 4;
 inline constexpr int DEFAULT_GPUS_PER_NODE = 8;
-inline constexpr int DEFAULT_STREAM_POOL_SIZE = 4;
 
 /* Cross-dim transpose threshold (bytes).  If the innermost transfer
    size is below this, the library transparently transposes the last
@@ -91,16 +90,6 @@ inline constexpr size_t CTRL_FIELD_LSA_TAIL = 16;
 inline constexpr size_t CTRL_FIELD_LSA_HEAD = 24;
 
 inline constexpr int MAX_STAGING_BUFFER_ENTRIES = 16;
-
-/* Stream pool — used when callers pass the default stream
- * (nullptr / cudaStreamLegacy / cudaStreamPerThread).  Caps how many
- * distinct (ncclComm_t, cuda device) entries the pool will track,
- * one stream + one back-edge event per entry (1:1 mapping).  The
- * effective entry count is driven by NCCL_RESHARD_STREAM_POOL_SIZE
- * (default 4); STREAM_POOL_MAX_SIZE is the hard upper bound on
- * that env-var setting.  The resolved value lives in process-global
- * runtime state for the init/finalize epoch. */
-inline constexpr int STREAM_POOL_MAX_SIZE = 256;
 
 /* Placement classifiers — operate on the int placement value stored
  * in ncclDistTensor_t::placements[i] (NCCL_RESHARD_REPLICATE or

@@ -17,7 +17,6 @@
 #include "nccl.h"
 #include "nccl_m2n.h"
 #include "m2n_checks.h"
-#include "m2n_env_parse.h"
 #include "reshard_types.h"
 #include "m2n_log.h"
 #include "reshard_internal.h"
@@ -46,50 +45,6 @@ struct M2nExitGuard {
   }
 };
 static M2nExitGuard gM2nExitGuard;
-
-// NCCL_RESHARD_STREAM_POOL_SIZE: max number of distinct (comm, dev)
-// pairs the pool will hold (1:1 stream+event mapping).  Default 4.
-// Values <= 0 disable the pool — default-stream callers then run on
-// the user's default stream directly (legacy synchronizing behavior).
-// Values above STREAM_POOL_MAX_SIZE are capped (with a warning).
-// Invalid values likewise disable the pool.
-
-void applyStreamPoolFromEnv() {
-  // NOLINTNEXTLINE(concurrency-mt-unsafe) — init-time, single-thread on the caller
-  const char* sizeEnv = getenv("NCCL_RESHARD_STREAM_POOL_SIZE");
-  if (sizeEnv == nullptr) {
-    return;
-  }
-
-  int n = 0;
-  if (!parseM2nEnvInt(sizeEnv, &n)) {
-    RESHARD_WARN(-1,
-                 "NCCL_RESHARD_STREAM_POOL_SIZE='%s' is not a valid integer; "
-                 "stream pool disabled — default-stream callers will run on the "
-                 "user's default stream directly.",
-                 sizeEnv);
-    gReshardStreamPoolSize = 0;
-    return;
-  }
-
-  if (n <= 0) {
-    RESHARD_WARN(-1,
-                 "NCCL_RESHARD_STREAM_POOL_SIZE='%s' (parsed as %d) <= 0; "
-                 "stream "
-                 "pool disabled — default-stream callers will run on the user's "
-                 "default stream directly.",
-                 sizeEnv, n);
-    gReshardStreamPoolSize = 0;
-  } else if (n > STREAM_POOL_MAX_SIZE) {
-    RESHARD_WARN(-1,
-                 "NCCL_RESHARD_STREAM_POOL_SIZE='%s' (parsed as %d) exceeds the "
-                 "library max %d; capping to %d.",
-                 sizeEnv, n, STREAM_POOL_MAX_SIZE, STREAM_POOL_MAX_SIZE);
-    gReshardStreamPoolSize = STREAM_POOL_MAX_SIZE;
-  } else {
-    gReshardStreamPoolSize = n;
-  }
-}
 
 static ncclResult_t copyHandleConfig(ncclM2nHandleState* handle, const ncclM2nConfig_t* config) {
   if (config == nullptr) {
@@ -131,6 +86,10 @@ static ncclResult_t createRuntime(std::shared_ptr<ncclM2nRuntime>* runtime) {
 }
 
 static void resolveNumCtas() {
+  if (gReshardNumCtasOverride > 0) {
+    gReshardNumCtas = gReshardNumCtasOverride;
+    return;
+  }
   const bool capNumCtas = gReshardMaxCta > 0 && gReshardMaxCta < DEFAULT_NUM_CTAS;
   gReshardNumCtas = capNumCtas ? gReshardMaxCta : DEFAULT_NUM_CTAS;
 }
@@ -139,7 +98,6 @@ static ncclResult_t initializeRuntimeForFirstHandle(const ncclM2nHandleState* ha
   resetReshardRuntimeConfig();
   applyReshardConfig(&handle->config);
   applyReshardEnv();
-  applyStreamPoolFromEnv();
   resolveNumCtas();
   return ncclSuccess;
 }

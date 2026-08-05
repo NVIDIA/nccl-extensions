@@ -58,6 +58,19 @@ bool parseLbModeEnv(const char* s, ReshardLoadBalanceMode* out) {
   return false;
 }
 
+bool parseBoolEnv(const char* s, bool* out) {
+  if (s == nullptr || out == nullptr) return false;
+  if (strcasecmp(s, "1") == 0 || strcasecmp(s, "true") == 0 || strcasecmp(s, "yes") == 0 || strcasecmp(s, "on") == 0) {
+    *out = true;
+    return true;
+  }
+  if (strcasecmp(s, "0") == 0 || strcasecmp(s, "false") == 0 || strcasecmp(s, "no") == 0 || strcasecmp(s, "off") == 0) {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
 } // namespace
 
 void applyReshardConfig(const ncclM2nConfig_t* config) {
@@ -76,8 +89,9 @@ void resetReshardRuntimeConfig() {
   gReshardAlgorithm = RESHARD_ALGO_AUTO;
   gReshardLbMode = RESHARD_LB_UNIFORM;
   gReshardMaxCta = 0;
+  gReshardNumCtasOverride = 0;
   gReshardNumCtas = DEFAULT_NUM_CTAS;
-  gReshardStreamPoolSize = DEFAULT_STREAM_POOL_SIZE;
+  gReshardUseInternalStreams = true;
   gReshardChunkSizeBytes = 0;
 }
 
@@ -119,9 +133,9 @@ void applyReshardEnv() {
   if (parseLbModeEnv(getenv("NCCL_RESHARD_LB_MODE"), &lb)) gReshardLbMode = lb;
 
   int n;
-  if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_MAX_CTA"), &n)) {
-    if (gReshardMaxCta > 0) RESHARD_INFO(-1, "Reshard config maxCta reset to NCCL_RESHARD_MAX_CTA=%d.", n);
-    gReshardMaxCta = n;
+  if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_NUM_CTAS"), &n)) {
+    gReshardNumCtasOverride = n;
+    gReshardNumCtas = n;
   }
 
   if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_SRC_DOMAIN_SIZE"), &n)) gReshardSrcDomainSize = n;
@@ -132,6 +146,11 @@ void applyReshardEnv() {
    * getenv on the hot path. */
   if (parseM2nEnvSize(getenv("NCCL_RESHARD_CHUNK_SIZE"), &sizeValue, false)) {
     gReshardChunkSizeBytes = sizeValue;
+  }
+
+  bool useInternalStreams;
+  if (parseBoolEnv(getenv("NCCL_RESHARD_USE_INTERNAL_STREAMS"), &useInternalStreams)) {
+    gReshardUseInternalStreams = useInternalStreams;
   }
 }
 // NOLINTEND(concurrency-mt-unsafe)

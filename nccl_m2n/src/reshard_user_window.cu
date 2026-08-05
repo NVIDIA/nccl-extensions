@@ -659,21 +659,15 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
     if (devCommPtr == nullptr) devCommPtr = &localDevComm;
   }
 
-  // Domain-size resolution: override > LSA team size > gpusPerNode.
   const int lsaSizeFromComm = (devCommPtr->lsaSize > 0) ? devCommPtr->lsaSize : 0;
   const int gpusPerNode = reshardGetGpusPerNode();
   const int srcOverride = reshardGetSrcDomainSize();
   const int dstOverride = reshardGetDstDomainSize();
 
-  int srcGpusPerDomain;
-  if (srcOverride > 0) srcGpusPerDomain = srcOverride;
-  else if (lsaSizeFromComm > 0) srcGpusPerDomain = lsaSizeFromComm;
-  else srcGpusPerDomain = (gpusPerNode > 0) ? gpusPerNode : 1;
-
-  int dstGpusPerDomain;
-  if (dstOverride > 0) dstGpusPerDomain = dstOverride;
-  else if (lsaSizeFromComm > 0) dstGpusPerDomain = lsaSizeFromComm;
-  else dstGpusPerDomain = (gpusPerNode > 0) ? gpusPerNode : 1;
+  int srcGpusPerDomain = 0;
+  int dstGpusPerDomain = 0;
+  NCCL_M2N_CHECK(resolveReshardDomainSizes(worldRank, algo, lsaSizeFromComm, lsaSizeFromComm, &srcGpusPerDomain,
+                                           &dstGpusPerDomain));
 
   RESHARD_INFO(worldRank,
                "algo=%s, lsa_size=%d, srcGpusPerDomain=%d, dstGpusPerDomain=%d, "

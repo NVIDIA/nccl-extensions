@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# See LICENSE.txt for more license information.
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(CUDAToolkit)
+
+if(NOT TARGET NCCL::nccl)
+  set(_NCCL_M2N_NCCL_ROOTS "")
+  if(NCCL_HOME)
+    list(APPEND _NCCL_M2N_NCCL_ROOTS "${NCCL_HOME}")
+  endif()
+  if(DEFINED ENV{NCCL_HOME} AND NOT "$ENV{NCCL_HOME}" STREQUAL "")
+    list(APPEND _NCCL_M2N_NCCL_ROOTS "$ENV{NCCL_HOME}")
+  endif()
+  if(NOT "@NCCL_M2N_CONFIG_NCCL_HINT@" STREQUAL "")
+    list(APPEND _NCCL_M2N_NCCL_ROOTS "@NCCL_M2N_CONFIG_NCCL_HINT@")
+  endif()
+
+  find_path(NCCL_M2N_NCCL_INCLUDE_DIR
+      NAMES nccl.h
+      HINTS ${_NCCL_M2N_NCCL_ROOTS}
+      PATH_SUFFIXES include)
+  find_library(NCCL_M2N_NCCL_LIBRARY
+      NAMES nccl
+      HINTS ${_NCCL_M2N_NCCL_ROOTS}
+      PATH_SUFFIXES lib lib64)
+  if(NOT NCCL_M2N_NCCL_INCLUDE_DIR OR NOT NCCL_M2N_NCCL_LIBRARY)
+    set(NCCLM2N_FOUND FALSE)
+    set(NCCLM2N_NOT_FOUND_MESSAGE
+        "NCCL M2N requires NCCL headers and libnccl.so. Set NCCL_HOME to an \
+NCCL build/install prefix or provide an NCCL::nccl target before \
+find_package(NCCLM2N).")
+    return()
+  endif()
+
+  add_library(NCCL::nccl SHARED IMPORTED)
+  set_target_properties(NCCL::nccl PROPERTIES
+      IMPORTED_LOCATION "${NCCL_M2N_NCCL_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${NCCL_M2N_NCCL_INCLUDE_DIR}")
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/NCCLM2NTargets.cmake")
+check_required_components(NCCLM2N)

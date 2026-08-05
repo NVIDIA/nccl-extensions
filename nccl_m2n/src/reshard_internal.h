@@ -212,10 +212,32 @@ inline size_t pickElementsPerChunk(size_t bytesPerRank, ReshardAlgorithm algo) {
  * reshard_cache.cc — DevComm and Window caches
  * ====================================================================*/
 
-ncclDevComm* findCachedDevComm(ncclComm_t comm, int numCtas, int signalCount, cudaStream_t stream = nullptr);
+enum ReshardDevCommBarrierKind {
+  RESHARD_DEVCOMM_BARRIER_HYBRID,
+  RESHARD_DEVCOMM_BARRIER_WORLD,
+};
 
-ncclResult_t cacheDevComm(ncclComm_t comm, int numCtas, int signalCount, const ncclDevComm* devComm,
-                          cudaStream_t stream = nullptr);
+/* DevComm resource requirements must participate in cache identity so an
+ * undersized allocation is never reused. Stream identity is intentionally not
+ * part of the key: a DevComm is a communicator resource, not a stream resource. */
+struct ReshardDevCommCacheKey {
+  ncclComm_t comm;
+  int numCtas;
+  int ginSignalCount;
+  int ginCounterCount;
+  int ginContextCount;
+  ReshardDevCommBarrierKind barrierKind;
+
+  bool operator==(const ReshardDevCommCacheKey& other) const {
+    return comm == other.comm && numCtas == other.numCtas && ginSignalCount == other.ginSignalCount &&
+           ginCounterCount == other.ginCounterCount && ginContextCount == other.ginContextCount &&
+           barrierKind == other.barrierKind;
+  }
+};
+
+ncclDevComm* findCachedDevComm(const ReshardDevCommCacheKey& key);
+
+ncclResult_t cacheDevComm(const ReshardDevCommCacheKey& key, const ncclDevComm* devComm);
 
 ncclWindow_t* findCachedInternalWindowByPtr(ncclComm_t comm, void* buffer, size_t size);
 

@@ -181,6 +181,7 @@ static void* threadMain(void* p) {
   env.copyBuffer = copyBuffer;
   env.copyBufferBytes = (copyBuffer != nullptr) ? gBufferBytes : 0;
   env.apiKind = a->api;
+  env.expectPackWindow = strcmp(gCli.copyAlgorithm, "packwindow") == 0;
   env.verbose = a->verbose;
   env.barrier = localBarrier;
   env.allreduceMinInt = localAllreduceMinInt;

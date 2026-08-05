@@ -82,6 +82,30 @@ static void uwLaunchTranspose2DInner(const void* in, void* out, size_t D0, size_
   uwTranspose2DInnerKernel<<<numBlocks, blockSize, 0, stream>>>((const char*)in, (char*)out, D0, D1, D2);
 }
 
+struct TransposeBufferEventGuard {
+  ncclComm_t comm = nullptr;
+  cudaStream_t stream = nullptr;
+
+  ~TransposeBufferEventGuard() {
+    if (comm != nullptr) {
+      NCCL_M2N_CHECK_WARN(transposeBufferRecordEvent(comm, stream));
+    }
+  }
+
+  void arm(ncclComm_t guardedComm, cudaStream_t guardedStream) {
+    comm = guardedComm;
+    stream = guardedStream;
+  }
+
+  ncclResult_t record() {
+    ncclResult_t result = transposeBufferRecordEvent(comm, stream);
+    if (result == ncclSuccess) {
+      comm = nullptr;
+    }
+    return result;
+  }
+};
+
 // ============================================================================
 // RING (hierarchical) Kernel — User-Window Variant
 //
@@ -965,4 +989,555 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   }
 
   return workCompletion.complete();
+}
+
+// ============================================================================
+// PACKWINDOW copy mode
+//
+// Pack each destination's bytes contiguously into the reused transpose/
+// transfer buffer (CE cudaMemcpy3D), transfer with the hierarchical
+// user-window kernel over contiguous plans, then unpack into the user dst
+// buffer (CE cudaMemcpy3D).
+//
+// Two plans per (src,dst) pair:
+//   * the original plan drives pack with source strides and unpack with
+//     destination strides;
+//   * a synthesized contiguous plan drives the transfer kernel.
+//
+// Receive offsets are keyed by source shard so every destination replica
+// places a given source's bytes at the same staging offset.
+// ============================================================================
+
+static inline bool pwPlanPairBytes(const ncclReshardTransferPlan& plan, size_t* bytes) {
+  return m2nCheckedMulSize(plan.totalInnerTransfers, plan.innerSize, bytes);
+}
+
+static cudaMemcpy3DParms pwBuildCopy(void* srcPtr, void* dstPtr, const ncclReshardTransferPlan& plan,
+                                     const size_t* srcStrides, const size_t* dstStrides) {
+  const size_t width = plan.innerSize;
+  size_t height = 1;
+  size_t depth = 1;
+  if (plan.numOuterLoops == 1) {
+    height = plan.outerCounts[0];
+  } else if (plan.numOuterLoops >= 2) {
+    height = plan.outerCounts[1];
+    depth = plan.outerCounts[0];
+  }
+
+  size_t srcPitch = width;
+  size_t srcSliceHeight = height;
+  if (srcStrides != nullptr) {
+    srcPitch = (plan.numOuterLoops >= 1) ? srcStrides[plan.numOuterLoops - 1] : width;
+    srcSliceHeight = (depth > 1 && srcStrides[1] > 0) ? srcStrides[0] / srcStrides[1] : height;
+  }
+  size_t dstPitch = width;
+  size_t dstSliceHeight = height;
+  if (dstStrides != nullptr) {
+    dstPitch = (plan.numOuterLoops >= 1) ? dstStrides[plan.numOuterLoops - 1] : width;
+    dstSliceHeight = (depth > 1 && dstStrides[1] > 0) ? dstStrides[0] / dstStrides[1] : height;
+  }
+
+  cudaMemcpy3DParms copy = {};
+  copy.kind = cudaMemcpyDeviceToDevice;
+  copy.srcPtr = make_cudaPitchedPtr(srcPtr, srcPitch, width, srcSliceHeight);
+  copy.dstPtr = make_cudaPitchedPtr(dstPtr, dstPitch, width, dstSliceHeight);
+  copy.extent = make_cudaExtent(width, height, depth);
+  return copy;
+}
+
+template <typename Params>
+static ncclResult_t pwPackedRxOffset(const Params& params, int dstShard, int srcShardLimit, size_t rxBase,
+                                     size_t* offset) {
+  size_t current = rxBase;
+  for (int srcShard = 0; srcShard < srcShardLimit; srcShard++) {
+    ncclReshardTransferPlan plan;
+    NCCL_M2N_CHECK(computeTransferPlanChecked(
+      params.srcDims, params.srcStrides, params.srcShardTensorDim, srcShard, params.dstDims, params.dstStrides,
+      params.dstShardTensorDim, dstShard, params.ndims, params.elementsPerChunk, &plan));
+    size_t pairBytes = 0;
+    NCCL_M2N_CHECK_ARG(pwPlanPairBytes(plan, &pairBytes) && m2nCheckedAddSize(current, pairBytes, &current), -1,
+                       "reshardCopyPackWindow: packed receive offset overflow for dstShard=%d srcShard=%d",
+                       dstShard, srcShard);
+  }
+  *offset = current;
+  return ncclSuccess;
+}
+
+static ncclResult_t pwLsaHputWarmup(ncclComm_t comm, int worldRank, int worldSize, cudaStream_t stream) {
+  if (worldSize < 2) return ncclSuccess;
+  const int next = (worldRank + 1) % worldSize;
+  const int previous = (worldRank - 1 + worldSize) % worldSize;
+  M2nApiUnlock apiUnlock;
+  NCCL_M2N_CHECK(ncclSignal(next, 0, 0, 0, comm, stream));
+  ncclWaitSignalDesc_t wait = {1, previous, 0, 0};
+  NCCL_M2N_CHECK(ncclWaitSignal(1, &wait, comm, stream));
+  return ncclSuccess;
+}
+
+static ncclResult_t pwGetOrRegisterStagingWindow(ncclComm_t comm, void* staging, size_t capacity,
+                                                 ncclWindow_t* outWindow) {
+  NCCL_M2N_CHECK_ARG(outWindow != nullptr, -1, "PACKWINDOW staging-window output must be non-null");
+  ncclWindow_t* cachedWindow = findCachedInternalWindowByPtr(comm, staging, capacity);
+  if (cachedWindow != nullptr) {
+    *outWindow = *cachedWindow;
+    return ncclSuccess;
+  }
+
+  ncclWindow_t window = nullptr;
+  {
+    M2nApiUnlock apiUnlock;
+    NCCL_M2N_CHECK(ncclCommWindowRegister(comm, staging, capacity, &window, NCCL_WIN_COLL_SYMMETRIC));
+  }
+  NCCL_M2N_CHECK(cacheInternalWindow(comm, staging, capacity, window));
+  *outWindow = window;
+  return ncclSuccess;
+}
+
+static ncclResult_t reshardCopyPackWindowLsaHput(ncclComm_t comm, const ncclDistTensor_t* src,
+                                                 const size_t srcDimsBytes[], const ncclDistTensor_t* dst,
+                                                 const size_t dstDimsBytes[], void* staging, size_t stagingCapacity,
+                                                 ncclWindow_t stagingWindow, size_t rxBase, size_t elementsPerChunk,
+                                                 int worldRank, int worldSize, cudaStream_t workStream) {
+  std::vector<size_t> allWindowOffsets(worldSize, 0);
+  ncclReshardDirectParams params{};
+  NCCL_M2N_CHECK(validateReshardPlanLimits(worldRank, src, srcDimsBytes, dst, dstDimsBytes, elementsPerChunk,
+                                           RESHARD_ALGO_DIRECT, worldSize));
+  NCCL_M2N_CHECK(prepareDirectReshardParams(worldRank, src, srcDimsBytes, dst, dstDimsBytes, stagingWindow,
+                                            elementsPerChunk, 1, 0, worldSize, allWindowOffsets.data(), &params));
+  params.myWindowOffset = 0;
+
+  ncclReshardTransferPlan targetPlans[MAX_DIRECT_TARGETS];
+  size_t txOffset[MAX_DIRECT_TARGETS] = {0};
+  size_t txBytes[MAX_DIRECT_TARGETS] = {0};
+  size_t peerRx[MAX_DIRECT_TARGETS] = {0};
+  size_t shardTxOffset[MAX_DIRECT_TARGETS];
+  bool packTarget[MAX_DIRECT_TARGETS] = {false};
+  for (size_t& offset : shardTxOffset) offset = SIZE_MAX;
+
+  if (params.isSource) {
+    size_t cursor = 0;
+    for (int targetIdx = 0; targetIdx < params.numTargets; targetIdx++) {
+      const ncclReshardDirectTargetInfo& target = params.targets[targetIdx];
+      NCCL_M2N_CHECK_ARG(target.dstShardIdx >= 0 && target.dstShardIdx < MAX_DIRECT_TARGETS, worldRank,
+                         "PACKWINDOW LSA target shard index %d exceeds capacity %d", target.dstShardIdx,
+                         MAX_DIRECT_TARGETS);
+      targetPlans[targetIdx] = target.plan;
+      NCCL_M2N_CHECK_ARG(pwPlanPairBytes(targetPlans[targetIdx], &txBytes[targetIdx]), worldRank,
+                         "PACKWINDOW LSA target %d byte count overflow", targetIdx);
+      if (shardTxOffset[target.dstShardIdx] == SIZE_MAX) {
+        shardTxOffset[target.dstShardIdx] = cursor;
+        packTarget[targetIdx] = true;
+        size_t txEnd = 0;
+        NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(cursor, txBytes[targetIdx], &txEnd) && txEnd <= rxBase, worldRank,
+                           "PACKWINDOW LSA packed source range exceeds %zu bytes", rxBase);
+        cursor = txEnd;
+      }
+      txOffset[targetIdx] = shardTxOffset[target.dstShardIdx];
+      NCCL_M2N_CHECK(
+        pwPackedRxOffset(params, target.dstShardIdx, params.mySrcShardIdx, rxBase, &peerRx[targetIdx]));
+      size_t peerEnd = 0;
+      NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(peerRx[targetIdx], txBytes[targetIdx], &peerEnd) &&
+                           peerEnd <= stagingCapacity,
+                         worldRank, "PACKWINDOW LSA target %d peer range exceeds %zu bytes", targetIdx,
+                         stagingCapacity);
+    }
+  }
+
+  bool rmaWarmed = false;
+  int previousPeerCount = 0;
+  int previousPeers[MAX_DIRECT_TARGETS] = {0};
+  NCCL_M2N_CHECK(getTransposeBufferPackWindowState(comm, &rmaWarmed, &previousPeerCount, previousPeers));
+  if (!rmaWarmed) {
+    NCCL_M2N_CHECK(pwLsaHputWarmup(comm, worldRank, worldSize, workStream));
+    rmaWarmed = true;
+    NCCL_M2N_CHECK(setTransposeBufferPackWindowState(comm, rmaWarmed, previousPeerCount, previousPeers));
+  }
+
+  if (previousPeerCount > 0) {
+    ncclWaitSignalDesc_t drains[MAX_DIRECT_TARGETS];
+    for (int i = 0; i < previousPeerCount; i++) drains[i] = {1, previousPeers[i], 0, 0};
+    M2nApiUnlock apiUnlock;
+    NCCL_M2N_CHECK(ncclWaitSignal(previousPeerCount, drains, comm, workStream));
+  }
+
+  if (params.isSource && src->dataPtr != nullptr) {
+    for (int targetIdx = 0; targetIdx < params.numTargets; targetIdx++) {
+      if (!packTarget[targetIdx] || txBytes[targetIdx] == 0) continue;
+      cudaMemcpy3DParms copy =
+        pwBuildCopy((char*)src->dataPtr + targetPlans[targetIdx].srcBaseOffset,
+                    (char*)staging + txOffset[targetIdx], targetPlans[targetIdx],
+                    targetPlans[targetIdx].outerSrcStrides, nullptr);
+      NCCL_M2N_CUDACHECK(cudaMemcpy3DAsync(&copy, workStream));
+    }
+  }
+
+  int currentPeerCount = 0;
+  int currentPeers[MAX_DIRECT_TARGETS] = {0};
+  {
+    M2nApiUnlock apiUnlock;
+    NCCL_M2N_CHECK(ncclGroupStart());
+    ncclResult_t putResult = ncclSuccess;
+    if (params.isSource) {
+      for (int targetIdx = 0; targetIdx < params.numTargets; targetIdx++) {
+        if (txBytes[targetIdx] == 0) continue;
+        putResult = ncclPutSignal((char*)staging + txOffset[targetIdx], txBytes[targetIdx], ncclUint8,
+                                  params.targets[targetIdx].dstWorldRank, stagingWindow, peerRx[targetIdx], 0, 0, 0,
+                                  comm, workStream);
+        if (putResult != ncclSuccess) break;
+        currentPeers[currentPeerCount++] = params.targets[targetIdx].dstWorldRank;
+      }
+    }
+    const ncclResult_t groupResult = ncclGroupEnd();
+    NCCL_M2N_CHECK(putResult);
+    NCCL_M2N_CHECK(groupResult);
+  }
+  NCCL_M2N_CHECK(setTransposeBufferPackWindowState(comm, rmaWarmed, currentPeerCount, currentPeers));
+
+  if (params.isDest && params.numSources > 0) {
+    ncclWaitSignalDesc_t arrivals[MAX_DIRECT_SOURCES];
+    for (int sourceIdx = 0; sourceIdx < params.numSources; sourceIdx++) {
+      const int sourceRank = src->mesh->startRank + (int)params.sources[sourceIdx].signalBase;
+      arrivals[sourceIdx] = {1, sourceRank, 0, 0};
+    }
+    M2nApiUnlock apiUnlock;
+    NCCL_M2N_CHECK(ncclWaitSignal(params.numSources, arrivals, comm, workStream));
+  }
+
+  if (params.isDest && dst->dataPtr != nullptr) {
+    for (int srcShard = 0; srcShard < params.srcShardCount; srcShard++) {
+      ncclReshardTransferPlan plan;
+      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardTensorDim, srcShard,
+                                                params.dstDims, params.dstStrides, params.dstShardTensorDim,
+                                                params.myDstShardIdx, params.ndims, params.elementsPerChunk, &plan));
+      size_t pairBytes = 0;
+      NCCL_M2N_CHECK_ARG(pwPlanPairBytes(plan, &pairBytes), worldRank,
+                         "PACKWINDOW LSA unpack shard %d byte count overflow", srcShard);
+      if (pairBytes == 0) continue;
+      size_t rxOffset = 0;
+      size_t rxEnd = 0;
+      NCCL_M2N_CHECK(pwPackedRxOffset(params, params.myDstShardIdx, srcShard, rxBase, &rxOffset));
+      NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(rxOffset, pairBytes, &rxEnd) && rxEnd <= stagingCapacity, worldRank,
+                         "PACKWINDOW LSA unpack shard %d range exceeds %zu bytes", srcShard, stagingCapacity);
+      cudaMemcpy3DParms copy = pwBuildCopy((char*)staging + rxOffset, (char*)dst->dataPtr + plan.dstBaseOffset, plan,
+                                           nullptr, plan.outerDstStrides);
+      NCCL_M2N_CUDACHECK(cudaMemcpy3DAsync(&copy, workStream));
+    }
+  }
+
+  if (params.isDest && params.numSources > 0) {
+    M2nApiUnlock apiUnlock;
+    NCCL_M2N_CHECK(ncclGroupStart());
+    ncclResult_t signalResult = ncclSuccess;
+    for (int sourceIdx = 0; sourceIdx < params.numSources; sourceIdx++) {
+      const int sourceRank = src->mesh->startRank + (int)params.sources[sourceIdx].signalBase;
+      signalResult = ncclSignal(sourceRank, 0, 0, 0, comm, workStream);
+      if (signalResult != ncclSuccess) break;
+    }
+    const ncclResult_t groupResult = ncclGroupEnd();
+    NCCL_M2N_CHECK(signalResult);
+    NCCL_M2N_CHECK(groupResult);
+  }
+  return ncclSuccess;
+}
+
+ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTensor_t* src,
+                                             const ncclDistTensor_t* dst, cudaStream_t workStream) {
+  const int ndims = src->ndims;
+  void* srcBuffer = src->dataPtr;
+  void* dstBuffer = dst->dataPtr;
+  const size_t elementSize = getNcclDtSize(src->dtype);
+  const ncclMesh_t* srcMesh = src->mesh;
+  const ncclMesh_t* dstMesh = dst->mesh;
+
+  int worldRank = 0;
+  int worldSize = 0;
+  NCCL_M2N_CHECK(ncclCommUserRank(comm, &worldRank));
+  NCCL_M2N_CHECK(ncclCommCount(comm, &worldSize));
+
+  size_t srcDimsBytes[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
+  size_t dstDimsBytes[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
+  NCCL_M2N_CHECK(reshardDimsToBytes(worldRank, "reshardCopyPackWindow:", ndims, elementSize, src->localShape,
+                                    dst->localShape, srcDimsBytes, dstDimsBytes));
+
+  const int srcMeshSize = srcMesh->dims[0] * srcMesh->dims[1];
+  const bool isSource = worldRank >= srcMesh->startRank && worldRank < srcMesh->startRank + srcMeshSize;
+  int srcShardTensorDim = -1;
+  int dstShardTensorDim = -1;
+  int srcShardCount = 1;
+  int dstShardCount = 1;
+  for (int i = 0; i < NCCL_RESHARD_MESH_NDIMS; i++) {
+    if (isShardPlacement(src->placements[i])) {
+      srcShardTensorDim = getShardTensorDim(src->placements[i]);
+      srcShardCount = srcMesh->dims[i];
+    }
+    if (isShardPlacement(dst->placements[i])) {
+      dstShardTensorDim = getShardTensorDim(dst->placements[i]);
+      dstShardCount = dstMesh->dims[i];
+    }
+  }
+
+  size_t globalDims[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  for (int d = 0; d < ndims; d++) {
+    globalDims[d] = srcDimsBytes[d];
+    if (d == srcShardTensorDim) {
+      NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(globalDims[d], (size_t)srcShardCount, &globalDims[d]), worldRank,
+                         "reshardCopyPackWindow: source global size overflow at dim %d", d);
+    }
+  }
+
+  size_t srcLocal = 1;
+  size_t dstLocal = 1;
+  for (int d = 0; d < ndims; d++) {
+    size_t srcDim = (d == srcShardTensorDim && srcShardCount > 1) ? globalDims[d] / srcShardCount : globalDims[d];
+    size_t dstDim = (d == dstShardTensorDim && dstShardCount > 1) ? globalDims[d] / dstShardCount : globalDims[d];
+    NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(srcLocal, srcDim, &srcLocal), worldRank,
+                       "reshardCopyPackWindow: source staging size overflow at dim %d", d);
+    NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(dstLocal, dstDim, &dstLocal), worldRank,
+                       "reshardCopyPackWindow: destination staging size overflow at dim %d", d);
+  }
+
+  size_t regionBytes = std::max(srcLocal, dstLocal);
+  if (regionBytes < 2048) regionBytes = 2048;
+  size_t areaBytes = 0;
+  NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(regionBytes, (size_t)2, &areaBytes), worldRank,
+                     "reshardCopyPackWindow: staging region size overflow");
+  const size_t rxBase = regionBytes;
+  const int numCtas = pickNumCtas(areaBytes, RESHARD_ALGO_RING);
+  const size_t elementsPerChunk = pickElementsPerChunk(areaBytes, RESHARD_ALGO_RING);
+  int ginSignalCount = 0;
+  NCCL_M2N_CHECK(computeReshardGinSignalCount(srcMesh, numCtas, worldRank, &ginSignalCount));
+  unsigned int mySignalBase = 0;
+  if (isSource) {
+    NCCL_M2N_CHECK(computeReshardSignalBase(srcMesh, worldRank, numCtas, worldRank, &mySignalBase));
+  }
+
+  ncclCommProperties commProperties = NCCL_COMM_PROPERTIES_INITIALIZER;
+  ncclResult_t queryResult = ncclSuccess;
+  {
+    M2nApiUnlock apiUnlock;
+    queryResult = ncclCommQueryProperties(comm, &commProperties);
+  }
+  NCCL_M2N_CHECK(queryResult);
+  int cudaDriverVersion = 0;
+  NCCL_M2N_CUDACHECK(cudaDriverGetVersion(&cudaDriverVersion));
+  int ncclVersion = 0;
+  NCCL_M2N_CHECK(ncclGetVersion(&ncclVersion));
+  const bool lsaCePlanFits =
+    worldSize <= MAX_DIRECT_TARGETS && srcShardCount <= MAX_DIRECT_SOURCES && dstShardCount <= MAX_DIRECT_TARGETS;
+  const bool hostRmaOrderingSupport = ncclVersion >= NCCL_VERSION(2, 30, 7);
+  const bool forwardMeshOrder = srcMesh->startRank < dstMesh->startRank;
+  const bool useLsaHput = commProperties.deviceApiSupport && commProperties.hostRmaSupport &&
+                          commProperties.nLsaTeams == 1 && cudaDriverVersion >= 12050 && hostRmaOrderingSupport &&
+                          forwardMeshOrder && lsaCePlanFits;
+
+  NCCL_M2N_CHECK(ensureTransposeBuffer(comm, areaBytes, workStream));
+  TransposeBufferEventGuard stagingEvent;
+  stagingEvent.arm(comm, workStream);
+  void* staging = getTransposeBuffer(comm);
+  const size_t stagingCapacity = getTransposeBufferCapacity(comm);
+
+  if (useLsaHput) {
+    ncclWindow_t stagingWindow = nullptr;
+    NCCL_M2N_CHECK(pwGetOrRegisterStagingWindow(comm, staging, stagingCapacity, &stagingWindow));
+    RESHARD_INFO(worldRank, "packwindow-lsa-hput: ranks=%d srcShards=%d dstShards=%d areaBytes=%zu", worldSize,
+                 srcShardCount, dstShardCount, areaBytes);
+    NCCL_M2N_CHECK(reshardCopyPackWindowLsaHput(comm, src, srcDimsBytes, dst, dstDimsBytes, staging,
+                                                stagingCapacity, stagingWindow, rxBase, elementsPerChunk, worldRank,
+                                                worldSize, workStream));
+    NCCL_M2N_CHECK(stagingEvent.record());
+    return ncclSuccess;
+  }
+
+  if (commProperties.nLsaTeams == 1 && !hostRmaOrderingSupport) {
+    RESHARD_INFO(worldRank,
+                 "packwindow-lsa-hput: NCCL %d.%d.%d predates ordered host-RMA data/signal launch; using existing "
+                 "kernel",
+                 ncclVersion / 10000, (ncclVersion % 10000) / 100, ncclVersion % 100);
+  } else if (commProperties.nLsaTeams == 1 && cudaDriverVersion < 12050) {
+    RESHARD_INFO(worldRank,
+                 "packwindow-lsa-hput: CUDA driver %d.%d is below the NCCL host-RMA minimum 12.5; using existing "
+                 "kernel",
+                 cudaDriverVersion / 1000, (cudaDriverVersion % 1000) / 10);
+  } else if (commProperties.nLsaTeams == 1 && !forwardMeshOrder) {
+    RESHARD_INFO(worldRank,
+                 "packwindow-lsa-hput: reversed source/destination mesh ordering is not enabled; using existing "
+                 "kernel");
+  } else if (commProperties.nLsaTeams == 1 && !lsaCePlanFits) {
+    RESHARD_INFO(worldRank,
+                 "packwindow-lsa-hput: plan exceeds conservative limits (ranks=%d srcShards=%d dstShards=%d); "
+                 "using existing kernel",
+                 worldSize, srcShardCount, dstShardCount);
+  }
+
+  ncclWindow_t stagingWindow = nullptr;
+  NCCL_M2N_CHECK(pwGetOrRegisterStagingWindow(comm, staging, stagingCapacity, &stagingWindow));
+
+  const ReshardDevCommCacheKey devCommKey = {
+    comm, numCtas, ginSignalCount, 0, DEFAULT_GIN_CONTEXT_COUNT, RESHARD_DEVCOMM_BARRIER_HYBRID
+  };
+  ncclDevComm* devComm = findCachedDevComm(devCommKey);
+  ncclDevComm localDevComm;
+  if (devComm == nullptr) {
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+    ncclDevCommRequirements requirements = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+#else
+    ncclDevCommRequirements requirements = {};
+#endif
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 0)
+    requirements.barrierCount = numCtas;
+#else
+    requirements.lsaBarrierCount = numCtas;
+    requirements.railGinBarrierCount = numCtas;
+#endif
+    requirements.ginSignalCount = ginSignalCount;
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 3)
+    requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+#else
+    requirements.ginForceEnable = true;
+#endif
+    requirements.ginContextCount = DEFAULT_GIN_CONTEXT_COUNT;
+
+    memset(&localDevComm, 0, sizeof(localDevComm));
+    {
+      M2nApiUnlock apiUnlock;
+      NCCL_M2N_CHECK(ncclDevCommCreate(comm, &requirements, &localDevComm));
+    }
+    NCCL_M2N_CHECK(cacheDevComm(devCommKey, &localDevComm));
+    devComm = findCachedDevComm(devCommKey);
+    if (devComm == nullptr) devComm = &localDevComm;
+  }
+
+  const int lsaSize = devComm->lsaSize > 0 ? devComm->lsaSize : 0;
+  int srcGpusPerDomain = 0;
+  int dstGpusPerDomain = 0;
+  NCCL_M2N_CHECK(resolveReshardDomainSizes(worldRank, RESHARD_ALGO_RING, lsaSize, lsaSize, &srcGpusPerDomain,
+                                           &dstGpusPerDomain));
+
+  std::vector<size_t> allWindowOffsets(worldSize, 0);
+  ncclReshardParams params{};
+  NCCL_M2N_CHECK(validateReshardPlanLimits(worldRank, src, srcDimsBytes, dst, dstDimsBytes, elementsPerChunk,
+                                           RESHARD_ALGO_RING, dstGpusPerDomain));
+  NCCL_M2N_CHECK(prepareReshardParams(worldRank, src, srcDimsBytes, dst, dstDimsBytes, stagingWindow,
+                                      elementsPerChunk, numCtas, mySignalBase, srcGpusPerDomain, dstGpusPerDomain,
+                                      allWindowOffsets.data(), &params));
+  params.window = stagingWindow;
+  params.myWindowOffset = 0;
+  params.ringNextWindowOffset = 0;
+  for (int follower = 0; follower < params.numLocalFollowers; follower++) {
+    params.localFollowerWindowOffsets[follower] = 0;
+  }
+
+  RESHARD_INFO(worldRank,
+               "reshardCopyPackWindow: isSource=%d isDest=%d numTargets=%d numSources=%d numCtas=%d "
+               "ginSignal=%d areaBytes=%zu staging=%p lsa=%d",
+               (int)params.isSource, (int)params.isDest, params.numTargets, params.numSources, numCtas, ginSignalCount,
+               areaBytes, staging, lsaSize);
+
+  ncclReshardTransferPlan originalTargetPlans[MAX_TARGETS];
+  size_t txOffset[MAX_TARGETS] = {0};
+  size_t txBytes[MAX_TARGETS] = {0};
+  size_t peerRx[MAX_TARGETS] = {0};
+  size_t rxOffset[MAX_SOURCES] = {0};
+  size_t rxBytes[MAX_SOURCES] = {0};
+
+  if (params.isSource) {
+    size_t cursor = 0;
+    for (int targetIdx = 0; targetIdx < params.numTargets; targetIdx++) {
+      originalTargetPlans[targetIdx] = params.targets[targetIdx].plan;
+      NCCL_M2N_CHECK_ARG(pwPlanPairBytes(originalTargetPlans[targetIdx], &txBytes[targetIdx]), worldRank,
+                         "reshardCopyPackWindow: target %d byte count overflow", targetIdx);
+      txOffset[targetIdx] = cursor;
+      NCCL_M2N_CHECK(pwPackedRxOffset(params, params.targets[targetIdx].dstShardIdx, params.mySrcShardIdx, rxBase,
+                                      &peerRx[targetIdx]));
+      size_t txEnd = 0;
+      size_t peerEnd = 0;
+      NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(cursor, txBytes[targetIdx], &txEnd) && txEnd <= stagingCapacity, worldRank,
+                         "reshardCopyPackWindow: target %d staging range exceeds %zu bytes", targetIdx,
+                         stagingCapacity);
+      NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(peerRx[targetIdx], txBytes[targetIdx], &peerEnd) &&
+                           peerEnd <= stagingCapacity,
+                         worldRank, "reshardCopyPackWindow: target %d peer range exceeds %zu bytes", targetIdx,
+                         stagingCapacity);
+      cursor = txEnd;
+    }
+  }
+
+  if (params.isDest) {
+    for (int sourceIdx = 0; sourceIdx < params.numSources; sourceIdx++) {
+      NCCL_M2N_CHECK_ARG(pwPlanPairBytes(params.sources[sourceIdx].plan, &rxBytes[sourceIdx]), worldRank,
+                         "reshardCopyPackWindow: source %d byte count overflow", sourceIdx);
+      NCCL_M2N_CHECK(pwPackedRxOffset(params, params.myDstShardIdx, params.sources[sourceIdx].srcShardIdx, rxBase,
+                                      &rxOffset[sourceIdx]));
+      size_t rxEnd = 0;
+      NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(rxOffset[sourceIdx], rxBytes[sourceIdx], &rxEnd) &&
+                           rxEnd <= stagingCapacity,
+                         worldRank, "reshardCopyPackWindow: source %d staging range exceeds %zu bytes", sourceIdx,
+                         stagingCapacity);
+    }
+  }
+
+  if (params.isSource && srcBuffer != nullptr) {
+    for (int targetIdx = 0; targetIdx < params.numTargets; targetIdx++) {
+      if (txBytes[targetIdx] == 0) continue;
+      cudaMemcpy3DParms copy =
+        pwBuildCopy((char*)srcBuffer + originalTargetPlans[targetIdx].srcBaseOffset,
+                    (char*)staging + txOffset[targetIdx], originalTargetPlans[targetIdx],
+                    originalTargetPlans[targetIdx].outerSrcStrides, nullptr);
+      NCCL_M2N_CUDACHECK(cudaMemcpy3DAsync(&copy, workStream));
+    }
+  }
+
+  if (params.isSource) {
+    for (int targetIdx = 0; targetIdx < params.numTargets; targetIdx++) {
+      ncclReshardTargetInfo& target = params.targets[targetIdx];
+      target.windowOffset = 0;
+      target.isContiguous = true;
+      target.totalBytes = txBytes[targetIdx];
+      target.plan.srcBaseOffset = txOffset[targetIdx];
+      target.plan.dstBaseOffset = peerRx[targetIdx];
+      if (target.plan.totalInnerTransfers == 0) target.plan.totalInnerTransfers = 1;
+    }
+  }
+  if (params.isDest) {
+    for (int sourceIdx = 0; sourceIdx < params.numSources; sourceIdx++) {
+      ncclReshardSourceInfo& source = params.sources[sourceIdx];
+      source.isContiguous = true;
+      source.totalBytes = rxBytes[sourceIdx];
+      source.plan.dstBaseOffset = rxOffset[sourceIdx];
+      if (source.plan.totalInnerTransfers == 0) source.plan.totalInnerTransfers = 1;
+    }
+  }
+
+  const int threadsPerCta = DEFAULT_KERNEL_MAX_NTHREADS;
+  reshardKernelUserWindow<<<numCtas, threadsPerCta, 0, workStream>>>(params, *devComm);
+  cudaError_t launchError = cudaGetLastError();
+  if (launchError != cudaSuccess) {
+    NCCL_M2N_FAIL(ncclSystemError, worldRank, "reshardCopyPackWindow kernel launch failed: %s [numCtas=%d]",
+                  cudaGetErrorString(launchError), numCtas);
+  }
+
+  if (params.isDest && dstBuffer != nullptr) {
+    for (int srcShard = 0; srcShard < params.srcShardCount; srcShard++) {
+      ncclReshardTransferPlan plan;
+      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardTensorDim, srcShard,
+                                                params.dstDims, params.dstStrides, params.dstShardTensorDim,
+                                                params.myDstShardIdx, params.ndims, params.elementsPerChunk, &plan));
+      size_t pairBytes = 0;
+      NCCL_M2N_CHECK_ARG(pwPlanPairBytes(plan, &pairBytes), worldRank,
+                         "reshardCopyPackWindow: unpack shard %d byte count overflow", srcShard);
+      if (pairBytes == 0) continue;
+      size_t rx = 0;
+      size_t rxEnd = 0;
+      NCCL_M2N_CHECK(pwPackedRxOffset(params, params.myDstShardIdx, srcShard, rxBase, &rx));
+      NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(rx, pairBytes, &rxEnd) && rxEnd <= stagingCapacity, worldRank,
+                         "reshardCopyPackWindow: unpack shard %d staging range exceeds %zu bytes", srcShard,
+                         stagingCapacity);
+      cudaMemcpy3DParms copy = pwBuildCopy((char*)staging + rx, (char*)dstBuffer + plan.dstBaseOffset, plan, nullptr,
+                                           plan.outerDstStrides);
+      NCCL_M2N_CUDACHECK(cudaMemcpy3DAsync(&copy, workStream));
+    }
+  }
+
+  NCCL_M2N_CHECK(stagingEvent.record());
+  return ncclSuccess;
 }

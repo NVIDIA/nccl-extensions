@@ -83,6 +83,14 @@ NVCUFLAGS := -ccbin $(CXX) \
              -DNCCL_OS_LINUX \
              $(INCLUDES)
 
+# Test-only instrumentation. Off by default, so a normal build carries none of
+# it. The CMake test targets set the same macro; this is the Make equivalent,
+# and it must reach the library too -- the instrumentation lives there, and the
+# Make tests link the library rather than compiling its sources.
+ifdef NCCL_M2N_TESTING
+NVCUFLAGS += -DNCCL_M2N_TESTING
+endif
+
 ifndef NVCC_GENCODE
 NVCUFLAGS += -gencode=arch=compute_80,code=sm_80
 NVCUFLAGS += -gencode=arch=compute_90,code=sm_90

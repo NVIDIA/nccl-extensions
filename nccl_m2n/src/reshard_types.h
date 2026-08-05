@@ -39,6 +39,13 @@ typedef enum {
   RESHARD_LB_NODE_AWARE = 1
 } ReshardLoadBalanceMode;
 
+typedef enum {
+  /* Reserved for a future implementation; not currently supported. */
+  RESHARD_COPY_ALGO_TMAPULL = 0,
+  RESHARD_COPY_ALGO_DIRECT = 1,
+  RESHARD_COPY_ALGO_PACKWINDOW = 2
+} ReshardCopyAlgorithm;
+
 /* ncclDevComm is defined in nccl_device.h; only TUs that need the
    DevCommCacheEntry (reshard_cache.cc) include that header directly. */
 
@@ -94,6 +101,11 @@ typedef struct {
 
   bool isContiguous;
   size_t totalBytes;
+
+  /* Source shard index that produced this entry. PACKWINDOW uses it to compute
+   * a rank-independent contiguous staging offset -- the cumulative bytes of the
+   * smaller source shards feeding this destination shard. -1 when unused. */
+  int srcShardIdx;
 } ncclReshardSourceInfo;
 
 typedef struct {
@@ -267,7 +279,10 @@ struct TransposeBufferEntry {
   size_t capacity;
   cudaStream_t stream; /* last stream that used this buffer */
   cudaEvent_t event; /* recorded after UNPACK; used for cross-stream sync */
+  int packWindowPreviousPeerCount;
+  int packWindowPreviousPeers[MAX_DIRECT_TARGETS];
   bool eventRecorded;
+  bool packWindowRmaWarmed;
   bool reserved;
   bool poisoned;
   bool allocated;

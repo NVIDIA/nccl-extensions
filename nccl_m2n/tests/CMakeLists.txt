@@ -165,6 +165,9 @@ endif()
 add_test(NAME basic_api_test_local
          COMMAND basic_api_test_local
          WORKING_DIRECTORY "${NCCL_M2N_RUNTIME_DIR}")
+add_test(NAME basic_api_packwindow_local
+         COMMAND basic_api_test_local --api default --copy-algorithm packwindow
+         WORKING_DIRECTORY "${NCCL_M2N_RUNTIME_DIR}")
 # basic_api_test_mpi is launched under mpirun, not registered as a plain
 # ctest entry.
 

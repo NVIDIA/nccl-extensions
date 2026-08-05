@@ -209,7 +209,7 @@ static ncclResult_t validateRankStagingCounts(
   int worldRank, int rank, const ncclDistTensor_t* srcTensor, const ncclReshardMeshGroupInfo* fullSrcInfo,
   const ncclDistTensor_t* dstTensor, const ncclReshardMeshGroupInfo* fullDstInfo, const size_t srcDims[],
   const size_t srcStrides[], const size_t dstDims[], const size_t dstStrides[], int ndims,
-  const ncclReshardRepLoadBalancer* lb, size_t* maxPeerGroupSize) {
+  const ncclReshardRepLoadBalancer* lb, ReshardCopyAlgorithm copyAlgo, int gpusPerDomain, size_t* maxPeerGroupSize) {
   const bool isSource = reshardRankInMesh(srcTensor->mesh, rank);
   const bool isDest = reshardRankInMesh(dstTensor->mesh, rank);
   if (!isSource && !isDest) {
@@ -238,11 +238,15 @@ static ncclResult_t validateRankStagingCounts(
       const int overlapDstCount =
         countOverlappingDstShards(srcDims, srcStrides, fullSrcInfo->shardTensorDim, srcInfo.shardIdx, dstDims,
                                   dstStrides, fullDstInfo->shardTensorDim, fullDstInfo->shardCount, ndims);
-      size_t directTargets = 0;
-      NCCL_M2N_CHECK_ARG(
-        m2nCheckedMulSize(static_cast<size_t>(overlapDstCount), static_cast<size_t>(targetRepCount), &directTargets),
-        worldRank, "validateStagingPlanLimits: direct target count overflows size_t for rank %d", rank);
-      NCCL_M2N_CHECK(addTargets(directTargets));
+      if (copyAlgo == RESHARD_COPY_ALGO_DIRECT) {
+        size_t directTargets = 0;
+        NCCL_M2N_CHECK_ARG(
+          m2nCheckedMulSize(static_cast<size_t>(overlapDstCount), static_cast<size_t>(targetRepCount), &directTargets),
+          worldRank, "validateStagingPlanLimits: direct target count overflows size_t for rank %d", rank);
+        NCCL_M2N_CHECK(addTargets(directTargets));
+      } else {
+        NCCL_M2N_CHECK(addTargets(static_cast<size_t>(overlapDstCount)));
+      }
     }
   }
 
@@ -252,6 +256,87 @@ static ncclResult_t validateRankStagingCounts(
     numSources = countOverlappingSrcShards(srcDims, srcStrides, fullSrcInfo->shardTensorDim, fullSrcInfo->shardCount,
                                            dstDims, dstStrides, fullDstInfo->shardTensorDim, dstInfo.shardIdx, ndims);
 
+    if (copyAlgo != RESHARD_COPY_ALGO_DIRECT && numSources > 0) {
+      int sourceRep = getSourceRepForDest(lb, dstInfo.repIdx);
+      int targetRepStart = 0;
+      int targetRepEnd = 0;
+      getTargetRepRange(lb, sourceRep, &targetRepStart, &targetRepEnd);
+
+      int numLocalReps = 0;
+      int myLocalRepIdx = -1;
+      const int myNode = rank / gpusPerDomain;
+      for (int rep = targetRepStart; rep < targetRepEnd; rep++) {
+        int repRank = getMeshRank(dstTensor, fullDstInfo, dstInfo.shardIdx, rep);
+        if (repRank / gpusPerDomain != myNode) continue;
+        if (rep == dstInfo.repIdx) myLocalRepIdx = numLocalReps;
+        numLocalReps++;
+      }
+
+      NCCL_M2N_CHECK_ARG(numLocalReps <= MAX_LOCAL_FOLLOWERS + 1, worldRank,
+                         "validateStagingPlanLimits: local destination fan-out exceeds capacity at rank %d, "
+                         "dstShard %d, domain %d (localRepCount=%d > MAX_LOCAL_FOLLOWERS+1=%d)",
+                         rank, dstInfo.shardIdx, myNode, numLocalReps, MAX_LOCAL_FOLLOWERS + 1);
+      NCCL_M2N_CHECK_ARG(myLocalRepIdx >= 0, worldRank,
+                         "validateStagingPlanLimits: destination rank %d has no local handler in target rep range "
+                         "[%d, %d)",
+                         rank, targetRepStart, targetRepEnd);
+
+      int firstRepNodeDest = -1;
+      int firstNodeLocalReps = 0;
+      if (targetRepStart < targetRepEnd) {
+        firstRepNodeDest = getMeshRank(dstTensor, fullDstInfo, dstInfo.shardIdx, targetRepStart) / gpusPerDomain;
+        for (int rep = targetRepStart; rep < targetRepEnd; rep++) {
+          int repRank = getMeshRank(dstTensor, fullDstInfo, dstInfo.shardIdx, rep);
+          if (repRank / gpusPerDomain == firstRepNodeDest) firstNodeLocalReps++;
+        }
+      }
+
+      int sourceRepSlots = firstNodeLocalReps > 0 ? firstNodeLocalReps : numLocalReps;
+      int activeSourceSlots = sourceRepSlots;
+      for (int node = firstRepNodeDest; node >= 0 && node <= myNode; node++) {
+        int nodeLocalReps = 0;
+        for (int rep = targetRepStart; rep < targetRepEnd; rep++) {
+          int repRank = getMeshRank(dstTensor, fullDstInfo, dstInfo.shardIdx, rep);
+          if (repRank / gpusPerDomain == node) nodeLocalReps++;
+        }
+        if (nodeLocalReps > 0 && nodeLocalReps < activeSourceSlots) activeSourceSlots = nodeLocalReps;
+      }
+
+      int mySourceStart = 0;
+      int mySourceEnd = 0;
+      int mySourceSlotStart = myLocalRepIdx;
+      int mySourceSlotEnd = myLocalRepIdx + 1;
+      if (activeSourceSlots > 0 && myLocalRepIdx == activeSourceSlots - 1 && sourceRepSlots > activeSourceSlots) {
+        mySourceSlotEnd = sourceRepSlots;
+      }
+      if (sourceRepSlots > 0 && mySourceSlotStart < activeSourceSlots) {
+        int sourcesPerRep = numSources / sourceRepSlots;
+        int extra = numSources % sourceRepSlots;
+        int threshold = extra * (sourcesPerRep + 1);
+        mySourceStart = (mySourceSlotStart < extra) ? mySourceSlotStart * (sourcesPerRep + 1)
+                                                   : threshold + (mySourceSlotStart - extra) * sourcesPerRep;
+        if (mySourceSlotEnd >= sourceRepSlots) mySourceEnd = numSources;
+        else if (mySourceSlotEnd < extra) mySourceEnd = mySourceSlotEnd * (sourcesPerRep + 1);
+        else mySourceEnd = threshold + (mySourceSlotEnd - extra) * sourcesPerRep;
+      }
+
+      bool hasRingNext = false;
+      for (int rep = targetRepStart; rep < targetRepEnd; rep++) {
+        int repRank = getMeshRank(dstTensor, fullDstInfo, dstInfo.shardIdx, rep);
+        if (repRank / gpusPerDomain > myNode) {
+          hasRingNext = true;
+          break;
+        }
+      }
+
+      const int handledSources = mySourceEnd - mySourceStart;
+      size_t localTargets = 0;
+      NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(static_cast<size_t>(handledSources),
+                                           static_cast<size_t>(numLocalReps - 1), &localTargets),
+                         worldRank, "validateStagingPlanLimits: local target count overflows size_t for rank %d", rank);
+      NCCL_M2N_CHECK(addTargets(localTargets));
+      if (hasRingNext) NCCL_M2N_CHECK(addTargets(static_cast<size_t>(handledSources)));
+    }
   }
 
   if (numTargets > static_cast<size_t>(MAX_TARGETS)) {
@@ -274,7 +359,7 @@ static ncclResult_t validateRankStagingCounts(
 
 ncclResult_t validateStagingPlanLimits(int worldRank, const ncclDistTensor_t* srcTensor, const size_t* srcTensorDims,
                                        const ncclDistTensor_t* dstTensor, const size_t* dstTensorDims,
-                                       int gpusPerDomain, size_t* maxPeerGroupSize) {
+                                       ReshardCopyAlgorithm copyAlgo, int gpusPerDomain, size_t* maxPeerGroupSize) {
   NCCL_M2N_CHECK_ARG(srcTensor != nullptr, worldRank, "validateStagingPlanLimits: src tensor must be non-null");
   NCCL_M2N_CHECK_ARG(dstTensor != nullptr, worldRank, "validateStagingPlanLimits: dst tensor must be non-null");
   NCCL_M2N_CHECK_ARG(srcTensor->mesh != nullptr, worldRank, "validateStagingPlanLimits: src mesh must be non-null");
@@ -319,7 +404,8 @@ ncclResult_t validateStagingPlanLimits(int worldRank, const ncclDistTensor_t* sr
   size_t maxPeerGroup = 1;
   for (int rank = firstRank; rank < lastRank; rank++) {
     NCCL_M2N_CHECK(validateRankStagingCounts(worldRank, rank, srcTensor, &fullSrcInfo, dstTensor, &fullDstInfo, srcDims,
-                                             srcStrides, dstDims, dstStrides, srcTensor->ndims, &lb,
+                                             srcStrides, dstDims, dstStrides, srcTensor->ndims, &lb, copyAlgo,
+                                             gpusPerDomain,
                                              &maxPeerGroup));
   }
   if (maxPeerGroupSize != nullptr) {

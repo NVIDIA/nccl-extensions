@@ -12,7 +12,7 @@
  * takes arbitrary device buffers (no symmetric-window contract) and runs
  * the staging-buffer-backed kernel.
  *
- * Design differences from the nccl-rl variant (ncclReshard):
+ * Implementation notes for ncclReshard:
  *   1. No NVL domain detection — gpus_per_domain derived from
  *      devComm->lsaSize, matching the window API.
  *   2. No separate devComm for the staging path — uses the main comm's
@@ -23,6 +23,9 @@
  ************************************************************************/
 
 #include <algorithm>
+#ifdef NCCL_M2N_TESTING
+#include <atomic>
+#endif
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -47,6 +50,14 @@
 static void CUDART_CB releaseStagingKernelParams(void* data) {
   delete static_cast<StagingKernelParams*>(data);
 }
+
+#ifdef NCCL_M2N_TESTING
+static std::atomic<ReshardCopyAlgorithm> gLastCompletedCopyAlgorithm{RESHARD_COPY_ALGO_DIRECT};
+
+ReshardCopyAlgorithm reshardGetLastCompletedCopyAlgorithmForTest() {
+  return gLastCompletedCopyAlgorithm.load(std::memory_order_relaxed);
+}
+#endif
 
 /* ======================================================================
  * ncclReshard — copy/staging-based public entry.
@@ -145,6 +156,15 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   }
   ReshardWorkStreamCompletion workCompletion(stream, &work);
   cudaStream_t workStream = work.stream;
+
+  if (reshardGetCopyAlgorithm() == RESHARD_COPY_ALGO_PACKWINDOW) {
+    NCCL_M2N_CHECK(reshardCopyPackWindowNormalized(comm, &src_local, &dst_local, workStream));
+    NCCL_M2N_CHECK(workCompletion.complete());
+#ifdef NCCL_M2N_TESTING
+    gLastCompletedCopyAlgorithm.store(RESHARD_COPY_ALGO_PACKWINDOW, std::memory_order_relaxed);
+#endif
+    return ncclSuccess;
+  }
 
   const bool debugLogging = reshardGetLogLevel() >= RESHARD_LOG_DEBUG;
   auto profile = debugLogging ? stagingProfileCreate() : std::unique_ptr<StagingProfile>{};
@@ -251,7 +271,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   {
     StagingProfileScope profileScope(profile.get(), STAGING_PROFILE_BUILD_DESCRIPTOR);
     NCCL_M2N_CHECK(validateStagingPlanLimits(world_rank, &src_local, src_dims_bytes, &dst_local, dst_dims_bytes,
-                                             gpus_per_domain, &maxPeerGroupSize));
+                                             reshardGetCopyAlgorithm(), gpus_per_domain, &maxPeerGroupSize));
     memset(&desc, 0, sizeof(desc));
     NCCL_M2N_CHECK(buildStagingDirectTransferDescriptor(comm, srcBuffer, src_dims_bytes, ndims, &src_local, dstBuffer,
                                                         dst_dims_bytes, &dst_local, gpus_per_domain, node_local_rank,
@@ -393,6 +413,9 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   NCCL_M2N_CHECK(stagingBufferPoolRecordEvent(comm, workStream));
 
   NCCL_M2N_CHECK(workCompletion.complete());
+#ifdef NCCL_M2N_TESTING
+  gLastCompletedCopyAlgorithm.store(RESHARD_COPY_ALGO_DIRECT, std::memory_order_relaxed);
+#endif
 
   return ncclSuccess;
 }

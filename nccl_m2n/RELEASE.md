@@ -111,6 +111,8 @@ Existing binaries must be rebuilt against the updated header.
 - **Error reporting:**
   - `ncclM2nGetLastError()` exposes thread-local detail for the most recent M2N
     failure, and Python exceptions include that detail when available.
+  - Calling a public reshard API from inside a CUDA graph capture now fails with
+    `ncclInvalidUsage` and an explanatory message.
 - **Documentation:**
   - Public header comments are now Doxygen-readable and document the handle,
     descriptor, stream, and window contracts in the installed header.

@@ -257,7 +257,9 @@ NCCL_M2N_API const char* ncclM2nGetLastError(void);
  *                    before and after the reshard operation.
  *
  * @return ncclSuccess on success, ncclInvalidArgument if any precondition is
- *         violated, or ncclSystemError if default-handle creation fails.
+ *         violated, ncclInvalidUsage if the stream is capturing a CUDA graph
+ *         (capture is not supported), or ncclSystemError if default-handle
+ *         creation fails.
  */
 NCCL_M2N_API ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm,
                                                 ncclWindow_t window,
@@ -274,6 +276,11 @@ NCCL_M2N_API ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm
  * @param[in] src     Source-side tensor descriptor (non-NULL on every rank).
  * @param[in] dst     Destination-side tensor descriptor (non-NULL on every rank).
  * @param[in] stream  CUDA stream (explicit or default).
+ *
+ * @return ncclSuccess on success, ncclInvalidArgument if any precondition is
+ *         violated, ncclInvalidUsage if the stream is capturing a CUDA graph
+ *         (capture is not supported), or ncclSystemError if default-handle
+ *         creation fails.
  */
 NCCL_M2N_API ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm,
                                       const ncclDistTensor_t* src, const ncclDistTensor_t* dst,

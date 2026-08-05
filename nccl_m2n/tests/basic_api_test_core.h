@@ -112,6 +112,8 @@ struct TestCase {
   int worldDivisor; /* skip if worldSize % this != 0 */
 
   int srcRatioNum, dstRatioNum; /* (0,0) ⇒ even split */
+  bool bGraphCapture;
+  bool bGraphCapturePrewarmed;
 };
 
 static inline void printTo(const TestCase& tc, std::ostream* os) {
@@ -509,6 +511,29 @@ static void emitStagingSlotPressure(std::vector<TestCase>& cases) {
   cases.push_back(std::move(tc));
 }
 
+static void emitGraphCapture(std::vector<TestCase>& cases) {
+  for (bool bPrewarmed : {false, true}) {
+    TestCase tc{};
+    tc.group = "graph_capture";
+    tc.ndims = 2;
+    tc.globalDims[0] = 64;
+    tc.globalDims[1] = 64;
+    tc.srcDim0 = 0;
+    tc.dstDim0 = 0;
+    tc.srcShardDim = 0;
+    tc.dstShardDim = 0;
+    tc.srcPl = PL_RS;
+    tc.dstPl = PL_RS;
+    tc.elementSize = 4;
+    tc.worldMin = 4;
+    tc.worldDivisor = 2;
+    tc.bGraphCapture = true;
+    tc.bGraphCapturePrewarmed = bPrewarmed;
+    tc.name = buildCaseName(tc) + (bPrewarmed ? "_prewarmed" : "_first_use");
+    cases.push_back(std::move(tc));
+  }
+}
+
 /* ======================================================================
  * 1D tensor variants — placement / sharding coverage with ndims=1 and
  * sharding_dim always 0 (only one tensor axis).
@@ -702,6 +727,7 @@ static std::vector<TestCase> buildAllTestCases() {
   emitTensorSizeSensitivity(cases);
   emitNdTensors(cases);
   emitStagingSlotPressure(cases);
+  emitGraphCapture(cases);
   /* 1D tensor groups (extends pytest matrix). */
   emit1dFullSharding(cases);
   emit1d2dPlacement(cases);
@@ -1197,11 +1223,38 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   dstT.placements[1] = dstLayout.placement[1];
   for (int d = 0; d < tc.ndims; d++) dstT.localShape[d] = dstLocalDimsElems[d];
 
-  ncclResult_t r;
-  if (env->apiKind == ApiKind::Default) {
-    r = ncclReshard(env->m2nHandle, env->comm, &srcT, &dstT, env->stream);
+  auto reshard = [&](cudaStream_t callStream) {
+    if (env->apiKind == ApiKind::Default) {
+      return ncclReshard(env->m2nHandle, env->comm, &srcT, &dstT, callStream);
+    }
+    return ncclReshardWithWindow(env->m2nHandle, env->comm, window, &srcT, &dstT, callStream);
+  };
+
+  cudaGraph_t graph = nullptr;
+  ncclResult_t r = ncclSuccess;
+  if (tc.bGraphCapture) {
+    if (tc.bGraphCapturePrewarmed) {
+      r = reshard(env->stream);
+      if (r == ncclSuccess) {
+        TEST_CUDACHECK(cudaStreamSynchronize(env->stream));
+        env->barrier(env);
+      }
+    }
+    if (r == ncclSuccess) {
+      TEST_CUDACHECK(cudaStreamBeginCapture(env->stream, cudaStreamCaptureModeGlobal));
+      r = reshard(env->stream);
+      TEST_CUDACHECK(cudaStreamEndCapture(env->stream, &graph));
+    }
+    if (graph != nullptr) {
+      TEST_CUDACHECK(cudaGraphDestroy(graph));
+    }
+    if (window != nullptr) {
+      TEST_NCCLCHECK(ncclCommWindowDeregister(env->comm, window));
+    }
+    const bool bActionableError = strstr(ncclM2nGetLastError(), "does not support CUDA graph capture") != nullptr;
+    return (r == ncclInvalidUsage && bActionableError) ? makePass() : makeFail("graph capture was not rejected");
   } else {
-    r = ncclReshardWithWindow(env->m2nHandle, env->comm, window, &srcT, &dstT, env->stream);
+    r = reshard(env->stream);
   }
 
   if (r != ncclSuccess) {

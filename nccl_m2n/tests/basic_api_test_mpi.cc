@@ -176,6 +176,41 @@ static void activateAlgorithm(const std::string& algorithmEnv) {
 
 class BasicApiMpiTest : public ::testing::TestWithParam<MpiParam> {};
 
+static CaseResult runStreamChurn(const TestCase& tc, TestEnv* env) {
+  CaseShape shape;
+  const char* skipReason = nullptr;
+  if (!caseFeasibleAt(tc, env->worldSize, &shape, &skipReason)) {
+    return runOneCase(tc, env);
+  }
+
+  constexpr int kStreamCount = 3;
+  cudaStream_t freshStreams[kStreamCount] = {};
+  const bool bUseFreshStreams = env->rank >= shape.srcTotal;
+  if (bUseFreshStreams) {
+    // Keep every handle live so CUDA cannot recycle one and hide cache churn.
+    for (cudaStream_t& stream : freshStreams) {
+      TEST_CUDACHECK(cudaStreamCreate(&stream));
+    }
+  }
+
+  CaseResult result = makePass();
+  for (int i = 0; i < kStreamCount; i++) {
+    env->stream = bUseFreshStreams ? freshStreams[i] : gStream;
+    result = runOneCase(tc, env);
+    if (result.status != CASE_PASS) {
+      break;
+    }
+  }
+
+  if (bUseFreshStreams) {
+    for (cudaStream_t stream : freshStreams) {
+      TEST_CUDACHECK(cudaStreamDestroy(stream));
+    }
+  }
+  env->stream = gStream;
+  return result;
+}
+
 TEST_P(BasicApiMpiTest, Reshard) {
   const MpiParam& param = GetParam();
   SCOPED_TRACE(param.tc.name);
@@ -202,7 +237,12 @@ TEST_P(BasicApiMpiTest, Reshard) {
   env.isRank0Printer = mpiIsRank0Printer;
   env.ctx = nullptr;
 
-  CaseResult res = runOneCase(param.tc, &env);
+  CaseResult res;
+  if (param.tc.group == "stream_churn") {
+    res = runStreamChurn(param.tc, &env);
+  } else {
+    res = runOneCase(param.tc, &env);
+  }
 
   if (res.status == CASE_SKIP) {
     env.barrier(&env);

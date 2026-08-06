@@ -676,6 +676,74 @@ static void emitTinyContribution(std::vector<TestCase>& cases) {
   cases.push_back(std::move(tc));
 }
 
+static void emitStreamChurn(std::vector<TestCase>& cases) {
+  TestCase tc{};
+  tc.group = "stream_churn";
+  tc.ndims = 2;
+  tc.globalDims[0] = 64;
+  tc.globalDims[1] = 64;
+  tc.srcDim0 = 0;
+  tc.dstDim0 = 0;
+  tc.srcShardDim = 0;
+  tc.dstShardDim = 0;
+  tc.srcPl = PL_RS;
+  tc.dstPl = PL_RS;
+  tc.elementSize = 4;
+  tc.worldMin = 4;
+  tc.worldDivisor = 2;
+  tc.name = buildCaseName(tc);
+  cases.push_back(std::move(tc));
+}
+
+static void emitPackWindowRegressions(std::vector<TestCase>& cases) {
+  /* Minimal forward-order source/destination pair for the single-LSA host-RMA
+   * activation gate. Two element sizes make the focused local run reuse the
+   * same communicator and PACKWINDOW staging state across consecutive tests. */
+  for (size_t elementSize : {2UL, 1UL}) {
+    TestCase tc{};
+    tc.group = "packwindow_lsa_hput";
+    tc.ndims = 1;
+    tc.globalDims[0] = 4096;
+    tc.globalDims[1] = 1;
+    tc.globalDims[2] = 1;
+    tc.srcDim0 = 0;
+    tc.dstDim0 = 0;
+    tc.srcShardDim = 0;
+    tc.dstShardDim = 0;
+    tc.srcPl = PL_RS;
+    tc.dstPl = PL_RS;
+    tc.elementSize = elementSize;
+    tc.worldMin = 2;
+    tc.worldMax = 2;
+    tc.worldDivisor = 2;
+    tc.name = buildCaseName(tc);
+    cases.push_back(std::move(tc));
+  }
+
+  /* The non-split PACKWINDOW producer and consumer must use the same
+   * source-relative GIN signal bank. With two source shards, source rank 1
+   * uses the second bank instead of aliasing source rank 0. The tiny transfer
+   * also leaves trailing CTAs idle, which verifies that each still signals. */
+  TestCase tc{};
+  tc.group = "packwindow_signal_bank";
+  tc.ndims = 1;
+  tc.globalDims[0] = 4;
+  tc.globalDims[1] = 1;
+  tc.globalDims[2] = 1;
+  tc.srcDim0 = 0;
+  tc.dstDim0 = 0;
+  tc.srcShardDim = 0;
+  tc.dstShardDim = 0;
+  tc.srcPl = PL_RS;
+  tc.dstPl = PL_RS;
+  tc.elementSize = 2;
+  tc.worldMin = 4;
+  tc.worldMax = 4;
+  tc.worldDivisor = 2;
+  tc.name = buildCaseName(tc);
+  cases.push_back(std::move(tc));
+}
+
 static void emitCrossDimRegression(std::vector<TestCase>& cases) {
   /* issue !5: 2D mesh 2x4, sd=0/1, four placement permutations.
    * worldMin = src_shards * dst_shards = 2 * 4 = 8 (even split → /2). */
@@ -772,6 +840,8 @@ static std::vector<TestCase> buildAllTestCases() {
   /* Targeted regression coverage for historical cross-dim bugs. */
   emitCrossDimRegression(cases);
   emitTinyContribution(cases);
+  emitStreamChurn(cases);
+  emitPackWindowRegressions(cases);
   return cases;
 }
 

@@ -165,6 +165,18 @@ inline int gReshardNumCtasOverride = 0;
  * per-call branch. */
 inline int gReshardNumCtas = DEFAULT_NUM_CTAS;
 
+/* Chunking granularity used by transfer planning.  Parsed once from
+ * NCCL_RESHARD_ELEMENTS_PER_CHUNK at first init. */
+inline size_t gReshardElementsPerChunk = DEFAULT_ELEMENTS_PER_CHUNK;
+
+/* GIN context count requested when creating ncclDevComm. Parsed once from
+ * NCCL_RESHARD_GIN_CONTEXT_COUNT at first init. */
+inline int gReshardGinContextCount = DEFAULT_GIN_CONTEXT_COUNT;
+
+/* Threshold for the transparent cross-dim transpose optimization. Parsed once
+ * from NCCL_RESHARD_CROSS_DIM_TRANSPOSE_THRESHOLD at first init; 0 disables it. */
+inline size_t gReshardCrossDimTransposeThresholdBytes = CROSS_DIM_TRANSPOSE_THRESHOLD_BYTES;
+
 /* Stream execution mode populated at first ncclM2nInit from
  * NCCL_RESHARD_USE_INTERNAL_STREAMS. Internal streams are the default; false
  * keeps work on caller streams with ordered DevComm reuse. */
@@ -268,7 +280,10 @@ inline ReshardCopyAlgorithm reshardGetCopyAlgorithm() {
   return gReshardCopyAlgorithm;
 }
 inline int reshardGetGinContextCount() {
-  return DEFAULT_GIN_CONTEXT_COUNT;
+  return gReshardGinContextCount;
+}
+inline size_t reshardGetCrossDimTransposeThresholdBytes() {
+  return gReshardCrossDimTransposeThresholdBytes;
 }
 inline bool reshardGetSplitCommEnabled() {
   return gReshardAdaptiveCallConfigValid ? gReshardAdaptiveCallConfig.splitComm : gReshardSplitComm;
@@ -359,7 +374,7 @@ inline int pickNumCtas(size_t bytesPerRank, ReshardAlgorithm algo) {
 inline size_t pickElementsPerChunk(size_t bytesPerRank, ReshardAlgorithm algo) {
   (void)bytesPerRank;
   (void)algo;
-  return DEFAULT_ELEMENTS_PER_CHUNK;
+  return gReshardElementsPerChunk;
 }
 
 /* ======================================================================

@@ -652,7 +652,7 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   const ReshardDevCommBarrierKind barrierKind =
     (algo == RESHARD_ALGO_DIRECT) ? RESHARD_DEVCOMM_BARRIER_WORLD : RESHARD_DEVCOMM_BARRIER_HYBRID;
   const ReshardDevCommCacheKey devCommKey = {
-    comm, numCtas, ginSignalCount, 0, DEFAULT_GIN_CONTEXT_COUNT, barrierKind
+    comm, numCtas, ginSignalCount, 0, reshardGetGinContextCount(), barrierKind
   };
   ncclDevComm* devCommPtr = findCachedDevComm(devCommKey);
   ncclDevComm localDevComm;
@@ -675,7 +675,7 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
 #else
     reqs.ginForceEnable = true;
 #endif
-    reqs.ginContextCount = DEFAULT_GIN_CONTEXT_COUNT;
+    reqs.ginContextCount = reshardGetGinContextCount();
 
     memset(&localDevComm, 0, sizeof(localDevComm));
 {
@@ -1405,7 +1405,7 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
   }
 
   const ReshardDevCommCacheKey devCommKey = {
-    comm, numCtas, ginSignalCount, 0, DEFAULT_GIN_CONTEXT_COUNT, RESHARD_DEVCOMM_BARRIER_HYBRID
+    comm, numCtas, ginSignalCount, 0, reshardGetGinContextCount(), RESHARD_DEVCOMM_BARRIER_HYBRID
   };
   ncclDevComm* devComm = nullptr;
   ncclDevComm localDevComm;
@@ -1435,7 +1435,7 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
 #else
     requirements.ginForceEnable = true;
 #endif
-    requirements.ginContextCount = DEFAULT_GIN_CONTEXT_COUNT;
+    requirements.ginContextCount = reshardGetGinContextCount();
 
     memset(&localDevComm, 0, sizeof(localDevComm));
     {

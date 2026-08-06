@@ -119,6 +119,9 @@ void resetReshardRuntimeConfig() {
   gReshardMaxCta = 0;
   gReshardNumCtasOverride = 0;
   gReshardNumCtas = DEFAULT_NUM_CTAS;
+  gReshardElementsPerChunk = DEFAULT_ELEMENTS_PER_CHUNK;
+  gReshardGinContextCount = DEFAULT_GIN_CONTEXT_COUNT;
+  gReshardCrossDimTransposeThresholdBytes = CROSS_DIM_TRANSPOSE_THRESHOLD_BYTES;
   gReshardUseInternalStreams = true;
   gReshardChunkSizeBytes = 0;
   gReshardStagingWatermarkBytes = 256ULL * 1024ULL * 1024ULL;
@@ -203,17 +206,27 @@ void applyReshardEnv() {
     gReshardNumCtasOverride = n;
     gReshardNumCtas = n;
   }
+  if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_GIN_CONTEXT_COUNT"), &n)) {
+    gReshardGinContextCount = n;
+  }
 
   if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_SRC_DOMAIN_SIZE"), &n)) gReshardSrcDomainSize = n;
   if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_DST_DOMAIN_SIZE"), &n)) gReshardDstDomainSize = n;
 
   size_t sizeValue;
+  if (parseM2nEnvSize(getenv("NCCL_RESHARD_ELEMENTS_PER_CHUNK"), &sizeValue, false)) {
+    gReshardElementsPerChunk = sizeValue;
+  }
+
   /* Cache chunk-size override so prepareReshardParams doesn't touch
    * getenv on the hot path. */
   if (parseM2nEnvSize(getenv("NCCL_RESHARD_CHUNK_SIZE"), &sizeValue, false)) {
     gReshardChunkSizeBytes = sizeValue;
   }
 
+  if (parseM2nEnvSize(getenv("NCCL_RESHARD_CROSS_DIM_TRANSPOSE_THRESHOLD"), &sizeValue, true)) {
+    gReshardCrossDimTransposeThresholdBytes = sizeValue;
+  }
   if (parseM2nEnvSize(getenv("NCCL_RESHARD_STAGING_WATERMARK_BYTES"), &sizeValue, false)) {
     gReshardStagingWatermarkBytes = sizeValue;
   }

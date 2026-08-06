@@ -526,11 +526,13 @@ void transposeBufferFinalize() {
 
 bool shouldTransposeForCrossDim(const size_t* srcDimsBytes, const size_t* dstDimsBytes, int ndims, int srcShardDim,
                                 int dstShardDim, int srcShardCount, int dstShardCount, int* swapDimA, int* swapDimB) {
+  const size_t transposeThreshold = reshardGetCrossDimTransposeThresholdBytes();
+
   // 2D case: replicated src (or shard on dim 0) -> dst shards innermost dim
   if (ndims == 2 && dstShardDim == 1 && srcShardDim != 1) {
     const size_t* dims = (dstDimsBytes[0] > 0) ? dstDimsBytes : srcDimsBytes;
     size_t innerSize = dims[1];
-    if (innerSize < CROSS_DIM_TRANSPOSE_THRESHOLD_BYTES) {
+    if (innerSize < transposeThreshold) {
       *swapDimA = 0;
       *swapDimB = 1;
       return true;
@@ -552,7 +554,7 @@ bool shouldTransposeForCrossDim(const size_t* srcDimsBytes, const size_t* dstDim
   if (dstShardDim == ndims - 1) innerSize = globalInner / dstShardCount;
   if (srcShardDim == ndims - 1) innerSize = globalInner / srcShardCount;
 
-  if (innerSize >= CROSS_DIM_TRANSPOSE_THRESHOLD_BYTES) return false;
+  if (innerSize >= transposeThreshold) return false;
 
   int freeDim = -1;
   for (int d = 0; d < ndims; d++) {

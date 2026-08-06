@@ -127,7 +127,7 @@ inline int gReshardSrcDomainSize = 0;
 inline int gReshardDstDomainSize = 0;
 inline ReshardAlgorithm gReshardAlgorithm = RESHARD_ALGO_AUTO;
 inline ReshardLoadBalanceMode gReshardLbMode = RESHARD_LB_UNIFORM;
-inline ReshardCopyAlgorithm gReshardCopyAlgorithm = RESHARD_COPY_ALGO_DIRECT;
+inline ReshardCopyAlgorithm gReshardCopyAlgorithm = RESHARD_COPY_ALGO_PACKWINDOW;
 
 /* When set (default), a transfer whose src AND dst are both fully replicated
  * (a pure broadcast, no Shard dim on either side) is auto-routed to UNIFORM

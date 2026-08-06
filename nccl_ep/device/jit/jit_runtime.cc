@@ -225,12 +225,13 @@ struct SmEnvInfo {
     std::string env_hash;  // hash(compiler_id + headers + options)
 };
 
-const SmEnvInfo& get_sm_env_info(int sm) {
+const SmEnvInfo& get_sm_env_info(int sm, std::string_view target_arch) {
     static std::mutex env_mutex;
-    static std::unordered_map<int, SmEnvInfo> env_cache;
+    static std::unordered_map<std::string, SmEnvInfo> env_cache;
     std::lock_guard<std::mutex> lock(env_mutex);
 
-    auto it = env_cache.find(sm);
+    const std::string cache_key = std::to_string(sm) + ":" + std::string(target_arch);
+    auto it = env_cache.find(cache_key);
     if (it != env_cache.end()) return it->second;
 
     SmEnvInfo info;
@@ -242,6 +243,7 @@ const SmEnvInfo& get_sm_env_info(int sm) {
     info.compiler_id = compiler.compiler_id();
     JitCompileConfig compile_config;
     compile_config.sm = sm;
+    compile_config.target_arch = target_arch;
     compile_config.source_dir = info.source_dir;
     compile_config.build_include_dir = info.build_include_dir;
     compile_config.cuda_include_dir = info.cuda_include_dir;
@@ -255,7 +257,7 @@ const SmEnvInfo& get_sm_env_info(int sm) {
     env_parts.insert(env_parts.end(), info.options.begin(), info.options.end());
     info.env_hash = fnv1a_digest(env_parts);
 
-    auto [inserted_it, ok] = env_cache.emplace(sm, std::move(info));
+    auto [inserted_it, ok] = env_cache.emplace(cache_key, std::move(info));
     (void)ok;
     return inserted_it->second;
 }
@@ -276,6 +278,7 @@ std::string source_fingerprint(const JitKernelVariant& variant, int sm, const st
         std::string(variant.entry_name),
         std::string(variant.source),
         "sm=" + std::to_string(sm),
+        "target_arch=" + std::string(variant.target_arch),
         "runtime_key=" + std::to_string(variant.runtime_key),
         env_hash,
     };
@@ -877,7 +880,7 @@ JitKernelStatus launch_jit_kernel(
         return JitKernelStatus::kUnsupportedDevice;
     }
 
-    const SmEnvInfo& env_info = get_sm_env_info(sm);
+    const SmEnvInfo& env_info = get_sm_env_info(sm, variant.target_arch);
     const std::string key = source_fingerprint(variant, sm, env_info.env_hash);
     JitCache& cache = JitCache::instance();
     if (cache.has_failed(key)) return JitKernelStatus::kCompileFailed;
@@ -887,6 +890,7 @@ JitKernelStatus launch_jit_kernel(
         variant,
         log_prefix + " request variant=" + std::string(variant.variant_name) + " key=" + key +
             " device=" + std::to_string(device) + " sm=" + std::to_string(sm) +
+            " target_arch=" + std::string(variant.target_arch) +
             " cache_root=" + cache.root_dir().string() + " source_dir=" + env_info.source_dir.string());
 
     std::string cubin;

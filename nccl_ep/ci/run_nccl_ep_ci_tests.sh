@@ -118,6 +118,14 @@ run_ep_bench_layout_size_sweep low-latency em rm
 # not the size axis — already swept above).
 run_ep_bench_variants low-latency 128
 
+# Experimental NVFP4 combine requires FP4-capable hardware. Pre-Tyche enables this one
+# end-to-end integration case; unit tests carry the detailed layout coverage.
+if [[ "${NCCL_EP_BENCH_NVFP4:-0}" == "1" ]]; then
+  run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+    --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
+    --datatype bf16 --combine-quantization nvfp4 --disable-token-dropping --validate
+fi
+
 # QUANT_FWD preserves both tensor dtypes. Smoke the one-byte, packed-FP4,
 # multi-byte, and LL rank-major zero-copy paths; unit tests carry a broader dtype matrix.
 run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \

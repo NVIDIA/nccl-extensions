@@ -500,9 +500,15 @@ static ncclResult_t validateDispatchRecipe(
 static ncclResult_t validateCombineRecipe(
     const ncclEpCombineInputs_t* inputs,
     const ncclEpCombineOutputs_t* outputs,
-    const ncclEpCombineConfig_t* config) {
-    (void)outputs;
+    const ncclEpCombineConfig_t* config,
+    unsigned int device_sm) {
     const auto recipe = config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
+    const ncclEpTensor_t* tokens = tensor_required(inputs->tokens);
+    const ncclEpTensor_t* scales = tensor_ptr(inputs->scales);
+    // Recipe validation must be able to reject an invalid input contract before
+    // later execution validation requires an output descriptor.  This preserves
+    // the public invalid-argument behavior for malformed NONE calls.
+    const ncclEpTensor_t* output_tokens = tensor_ptr(outputs->tokens);
     auto fail = [&](const char* message) -> ncclResult_t {
         fprintf(stderr, "NCCL EP warning: combine recipe %d: %s\n",
                 static_cast<int>(recipe), message);
@@ -510,8 +516,30 @@ static ncclResult_t validateCombineRecipe(
     };
     switch (recipe) {
         case NCCL_EP_COMB_QUANT_NONE:
-            return validate_dtype(tensor_required(inputs->tokens)->datatype)
+            if (scales != nullptr) {
+                return fail("inputs->scales must be null for NONE");
+            }
+            return validate_dtype(tokens->datatype)
                 ? ncclSuccess : fail("tokens has unsupported dtype");
+        case NCCL_EP_COMB_QUANT_NVFP4:
+            if (!nccl_ep::host_build_supports_fp4()) {
+                fprintf(stderr, "NCCL EP warning: NVFP4 combine requires CUDA 12.9+ with cuda_fp4.h\n");
+                return ncclInvalidUsage;
+            }
+            if (!nccl_ep::host_device_supports_fp4(device_sm)) {
+                fprintf(stderr,
+                        "NCCL EP warning: NVFP4 combine is unsupported on sm_%u; "
+                        "requires an E2M1 FP4 family target\n",
+                        device_sm);
+                return ncclInvalidUsage;
+            }
+            if (output_tokens == nullptr || tokens->datatype != ncclBfloat16 || output_tokens->datatype != ncclBfloat16) {
+                return fail("NVFP4 requires BF16 input and output tokens");
+            }
+            if (scales == nullptr || scales->datatype != ncclFloat32 || scales->ndim != 3) {
+                return fail("NVFP4 requires FP32 3D inputs->scales global scales");
+            }
+            return ncclSuccess;
         default:
             return fail("recipe is not implemented");
     }
@@ -721,6 +749,7 @@ struct ncclEpGroup {
     int max_recv_tokens;      // Resolved per-rank IPC slot budget (= config.max_recv_tokens_per_rank).
 
     // SM-count configuration, all resolved once at ncclEpCreateGroup.
+    unsigned int device_sm;
     unsigned int device_sm_count;   // Number of SMs on the device
     unsigned int comm_num_sms;      // Resolved SM count for EP kernels (from config.max_num_sms)
     unsigned int shuffle_sms; // Resolved SM count for the shuffle kernels (local_dup, local_reduce).
@@ -842,7 +871,7 @@ struct ncclEpGroup {
     ncclEpGroup()
         : comm(nullptr), nRanks(0), rank(0), nNodes(0), ep_workspace(nullptr), cuda_device_id(0), lsa_team_size(0),
           lsa_rank(0), rdma_team_size(0), rdma_rank(0), rdma_buffer(nullptr), rdma_buffer_size_alloc(0), config{},
-          num_local_experts(0), max_recv_tokens(0), device_sm_count(0), comm_num_sms(0), shuffle_sms(0),
+          num_local_experts(0), max_recv_tokens(0), device_sm(0), device_sm_count(0), comm_num_sms(0), shuffle_sms(0),
           preprocess_num_sms(0), ht_em_mode(HtEmMode::kLocalPermute), alloc{}, gpus_per_node(0), rank_in_node(0),
           node_id(0), num_nccl_comms(0), nccl_comms{}, nccl_dev_comms(nullptr), nccl_wins(nullptr),
           num_dispatch_signals(0), clean_barrier_signal_base(0), ht_buffers{}, eager_mode(false) {}
@@ -1671,6 +1700,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     CUDA_CHECK(cudaSetDevice(ep_group->cuda_device_id));
     cudaDeviceProp device_prop = {};
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, ep_group->cuda_device_id));
+    ep_group->device_sm = static_cast<unsigned int>(device_prop.major * 10 + device_prop.minor);
     ep_group->device_sm_count = device_prop.multiProcessorCount;
 
     // Resolve SM counts for EP kernels (dispatch, combine, preprocessing)
@@ -4188,7 +4218,9 @@ ncclResult_t ncclEpCombine(
 
     const unsigned int send_only = config ? config->send_only : 0;
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
-    NCCLCHECK(validateCombineRecipe(inputs, outputs, config));
+    const ncclEpCombQuant_t quantization_recipe =
+        config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
+    NCCLCHECK(validateCombineRecipe(inputs, outputs, config, handle->group->device_sm));
     if (pass_direction != NCCL_EP_FWD_PASS && handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         fprintf(stderr, "ncclEpCombine: backward pass (pass_direction=%d) is not supported in LL mode\n",
                 (int)pass_direction);
@@ -4220,6 +4252,7 @@ ncclResult_t ncclEpCombine(
     if (handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         // Find and validate input tensors
         const ncclEpTensor_t* x = tensor_required(inputs->tokens);
+        const ncclEpTensor_t* global_scales = tensor_ptr(inputs->scales);
         assert(x->ndim > 0);
 
         const ncclEpTensor_t* topk_idx = &handle->topk_idx;
@@ -4262,6 +4295,34 @@ ncclResult_t ncclEpCombine(
             assert(x->sizes[2] % 128 == 0);
             hidden = static_cast<int>(x->sizes[2]);
             break;
+        }
+
+        if (quantization_recipe == NCCL_EP_COMB_QUANT_NVFP4) {
+            constexpr int kNvfp4WarpSize = 32;
+            constexpr int kNvfp4MaxSendUnrolls = 4;
+            constexpr int kNvfp4ElementsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
+            const int nvfp4_send_unrolls =
+                hidden % (kNvfp4WarpSize * kNvfp4MaxSendUnrolls * kNvfp4ElementsPerInt4) == 0
+                ? kNvfp4MaxSendUnrolls : 2;
+            const int nvfp4_send_iteration_elements =
+                kNvfp4WarpSize * nvfp4_send_unrolls * kNvfp4ElementsPerInt4;
+            const size_t expected_slots = static_cast<size_t>(num_ranks) * num_max_dispatch_tokens_per_rank;
+            const bool expert_major_scales =
+                global_scales != nullptr && global_scales->ndim == 3 &&
+                global_scales->sizes[0] == static_cast<size_t>(num_experts / num_ranks) &&
+                global_scales->sizes[1] == expected_slots;
+            const bool rank_major_scales =
+                global_scales != nullptr && global_scales->ndim == 3 &&
+                global_scales->sizes[0] == static_cast<size_t>(num_ranks) &&
+                global_scales->sizes[1] == static_cast<size_t>(num_max_dispatch_tokens_per_rank);
+            const bool valid_scales = handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR
+                ? expert_major_scales : rank_major_scales;
+            if (hidden % nvfp4_send_iteration_elements != 0 ||
+                global_scales->sizes[2] != 1 || !valid_scales) {
+                fprintf(stderr, "NCCL EP: LL NVFP4 combine requires a hidden dimension with whole send iterations and FP32 scales "
+                                "[local_experts, recv_slots, 1] (expert-major) or [ranks, max_tokens, 1] (rank-major)\n");
+                return ncclInvalidArgument;
+            }
         }
 
         // Validate topk_idx tensor (LL: int32 or int64; dtype must
@@ -4337,6 +4398,7 @@ ncclResult_t ncclEpCombine(
             auto launch_combine = [&](auto* topk_idx_data, bool topk_is_int64) {
                 nccl_ep::ll::CombineParams params{};
                 params.inData = x_data;
+                params.inGlobalScales = global_scales ? static_cast<const float*>(global_scales->data) : nullptr;
                 params.srcInfo = src_info_data;
                 params.layoutRange = layout_range_data;
                 params.inTopkIdx = topk_idx_data;
@@ -4366,22 +4428,24 @@ ncclResult_t ncclEpCombine(
                 params.signalsBase = signal_base;
                 params.workspace = handle->group->ep_workspace;
                 params.numDeviceSms = handle->group->comm_num_sms;
+                params.deviceSm = handle->group->device_sm;
                 params.rankMask = handle->group->mask_buffer;
                 params.asyncErrorFlag = handle->group->async_error_flag;
                 params.timeoutCycles = handle->group->timeout_cycles;
+                // LogFMT compression is not wired into the LL combine API or call flow;
+                // keep the retained JIT template path disabled until that integration exists.
                 params.useLogFmt = false;
                 params.zeroCopy = false;
                 params.phases = phases;
                 params.tokenDtype = x->datatype;
-                nccl_ep::ll::call_combine(params, stream);
+                params.quantizationRecipe = quantization_recipe;
+                return nccl_ep::ll::call_combine(params, stream);
             };
             switch (topk_idx->datatype) {
             case ncclInt32:
-                launch_combine(static_cast<const int32_t*>(topk_idx->data), /*topk_is_int64=*/false);
-                    return ncclSuccess;
+                return launch_combine(static_cast<const int32_t*>(topk_idx->data), /*topk_is_int64=*/false);
             case ncclInt64:
-                launch_combine(static_cast<const int64_t*>(topk_idx->data), /*topk_is_int64=*/true);
-                    return ncclSuccess;
+                return launch_combine(static_cast<const int64_t*>(topk_idx->data), /*topk_is_int64=*/true);
             default:
                     std::fprintf(stderr, "NCCL EP warning: LL topk_idx has unsupported dtype %d\n",
                                  static_cast<int>(topk_idx->datatype));

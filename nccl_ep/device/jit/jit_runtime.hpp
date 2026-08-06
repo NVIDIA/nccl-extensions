@@ -37,6 +37,7 @@ struct JitKernelVariant {
     int block_dim = 0;
     int dynamic_smem_bytes = 0;
     int min_sm = 90;
+    std::string_view target_arch;
     // Optional launch attributes (default = off).
     // Cooperative launch enables cg::this_grid().sync() inside the kernel.
     // Cluster dim > 1 enables distributed shared memory across the cluster.

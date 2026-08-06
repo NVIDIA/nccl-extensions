@@ -6,6 +6,7 @@
 #include "test_common.h"
 #include "quantization_recipe.hpp"
 #include "../nccl_ep_test_internal.h"
+#include "nccl_ep/common.hpp"
 
 #include <algorithm>
 #include <numeric>
@@ -119,6 +120,56 @@ static bool has_nonzero_bytes(const std::vector<uint8_t>& values) {
 
 static bool has_nonzero_scales(const std::vector<float>& values) {
     return std::any_of(values.begin(), values.end(), [](float value) { return value != 0.0f; });
+}
+
+static bool nvfp4_supported() {
+    static const bool supported = [] {
+        int device = 0;
+        int major = 0;
+        int minor = 0;
+        return cudaGetDevice(&device) == cudaSuccess &&
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess &&
+            nccl_ep::host_device_supports_fp4(static_cast<unsigned int>(major * 10 + minor));
+    }();
+    return supported;
+}
+
+TEST(NvFp4SupportTest, MapsDocumentedFamilyTargets) {
+    EXPECT_FALSE(nccl_ep::host_device_supports_fp4(90));
+    EXPECT_EQ(nccl_ep::host_device_fp4_target_arch(100), "sm_100f");
+    EXPECT_EQ(nccl_ep::host_device_fp4_target_arch(103), "sm_100f");
+    EXPECT_EQ(nccl_ep::host_device_fp4_target_arch(110), "sm_110f");
+    EXPECT_EQ(nccl_ep::host_device_fp4_target_arch(120), "sm_120f");
+    EXPECT_EQ(nccl_ep::host_device_fp4_target_arch(121), "sm_120f");
+    EXPECT_FALSE(nccl_ep::host_device_supports_fp4(107));
+}
+
+// These are exact E2M1 values. Every 16-element block contains +/-6, so the
+// per-row global scale below follows the NVFP4 contract exactly.
+// Keeping the reference in an exactly representable subset makes it independent
+// of the implementation's reciprocal approximation and rounding details.
+static float nvfp4_test_value(int token, int channel) {
+    constexpr float kValues[] = {
+        -6.f, -4.f, -3.f, -2.f, -1.5f, -1.f, -0.5f, 0.f,
+        0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -6.f};
+    return kValues[(token * 5 + channel) % (sizeof(kValues) / sizeof(kValues[0]))];
+}
+
+static float nvfp4_test_global_scale(int token, int hidden) {
+    float amax = 0.f;
+    for (int channel = 0; channel < hidden; ++channel) {
+        amax = std::max(amax, std::abs(nvfp4_test_value(token, channel)));
+    }
+    return amax == 0.f ? 0.f : 2688.f / amax;
+}
+
+static void fill_nvfp4_test_tokens(std::vector<nv_bfloat16>* tokens, int hidden) {
+    for (size_t i = 0; i < tokens->size(); ++i) {
+        const int token = i / hidden;
+        const int channel = i % hidden;
+        (*tokens)[i] = __float2bfloat16(nvfp4_test_value(token, channel));
+    }
 }
 
 static uint8_t ht_em_token_byte(int src_rank, int token, int byte) {
@@ -1282,6 +1333,200 @@ TEST_F(QuantizationRecipeTest, CombineNoneRejectsDispatchWireDtype) {
     ncclEpHandle_t handle = make_handle(nullptr);
     EXPECT_EQ(ncclEpCombine(handle, &inputs, &outputs, nullptr, g_stream), ncclInvalidArgument);
     NCCL_ASSERT(ncclEpHandleDestroy(handle));
+}
+
+TEST_F(QuantizationRecipeTest, NvFp4CombineRejectsUnsupportedDeviceBeforeJit) {
+    if (nvfp4_supported()) GTEST_SKIP() << "requires a GPU without E2M1 FP4 support";
+    RecipeTensor tokens(ncclBfloat16);
+    RecipeTensor output_tokens(ncclBfloat16);
+    ncclEpCombineInputs_t inputs = NCCL_EP_COMBINE_INPUTS_INIT;
+    ncclEpCombineOutputs_t outputs = NCCL_EP_COMBINE_OUTPUTS_INIT;
+    ncclEpCombineConfig_t config = NCCL_EP_COMBINE_CONFIG_INIT;
+    inputs.tokens = &tokens.tensor;
+    outputs.tokens = &output_tokens.tensor;
+    config.quant_recipe = NCCL_EP_COMB_QUANT_NVFP4;
+    ncclEpHandle_t handle = make_handle(nullptr);
+    ASSERT_NE(handle, nullptr);
+    EXPECT_EQ(ncclEpCombine(handle, &inputs, &outputs, &config, g_stream), ncclInvalidUsage);
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+}
+
+TEST_F(QuantizationRecipeTest, NvFp4CombineExpertMajorProducesWeightedBf16) {
+    if (!nvfp4_supported()) GTEST_SKIP() << "NVFP4 combine requires E2M1 FP4 support";
+    constexpr int kNvFp4Hidden = 4096;
+    ASSERT_EQ(kNumExperts % g_nranks, 0);
+    const int local_experts = kNumExperts / g_nranks;
+    const int recv_slots = g_nranks * kNumTokens;
+
+    ncclEpGroupConfig_t group_config = NCCL_EP_GROUP_CONFIG_INIT;
+    group_config.algorithm = NCCL_EP_ALGO_LOW_LATENCY;
+    group_config.num_experts = kNumExperts;
+    group_config.max_dispatch_tokens_per_rank = kNumTokens;
+    group_config.max_token_bytes = kNvFp4Hidden * sizeof(nv_bfloat16);
+    group_config.rdma_buffer_size = NCCL_EP_AUTO;
+    group_config.num_qp_per_rank = local_experts;
+    group_config.num_channels = NCCL_EP_AUTO;
+    group_config.max_recv_tokens_per_rank = kNumTokens;
+    ncclEpGroup_t group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&group, g_comm, &group_config));
+
+    const size_t expert_elems = static_cast<size_t>(local_experts) * recv_slots * kNvFp4Hidden;
+    nv_bfloat16 *d_input = nullptr, *d_expert = nullptr, *d_combined = nullptr;
+    float *d_global_scales = nullptr, *d_topk_weights = nullptr;
+    int* d_expert_counters = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_input, static_cast<size_t>(kNumTokens) * kNvFp4Hidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_expert, expert_elems * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_combined, static_cast<size_t>(kNumTokens) * kNvFp4Hidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_global_scales, static_cast<size_t>(local_experts) * recv_slots * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_topk_weights, static_cast<size_t>(kNumTokens) * kTopK * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_expert_counters, local_experts * sizeof(int)));
+    std::vector<nv_bfloat16> h_input(static_cast<size_t>(kNumTokens) * kNvFp4Hidden);
+    std::vector<float> h_scales(static_cast<size_t>(local_experts) * recv_slots);
+    std::vector<float> h_weights(static_cast<size_t>(kNumTokens) * kTopK, 1.f);
+    fill_nvfp4_test_tokens(&h_input, kNvFp4Hidden);
+    for (size_t slot = 0; slot < h_scales.size(); ++slot) {
+        h_scales[slot] = nvfp4_test_global_scale(static_cast<int>(slot % kNumTokens), kNvFp4Hidden);
+    }
+    CUDA_ASSERT(cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_global_scales, h_scales.data(), h_scales.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_topk_weights, h_weights.data(), h_weights.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    ncclEpTensor_t *input = nullptr, *expert = nullptr, *combined = nullptr, *scales = nullptr, *weights = nullptr, *counters = nullptr;
+    NCCL_ASSERT(epTensorCreate(&input, 2, ncclBfloat16, d_input, kNumTokens, kNvFp4Hidden));
+    NCCL_ASSERT(epTensorCreate(&expert, 3, ncclBfloat16, d_expert, local_experts, recv_slots, kNvFp4Hidden));
+    NCCL_ASSERT(epTensorCreate(&combined, 2, ncclBfloat16, d_combined, kNumTokens, kNvFp4Hidden));
+    NCCL_ASSERT(epTensorCreate(&scales, 3, ncclFloat32, d_global_scales, local_experts, recv_slots, 1));
+    NCCL_ASSERT(epTensorCreate(&weights, 2, ncclFloat32, d_topk_weights, kNumTokens, kTopK));
+    NCCL_ASSERT(epTensorCreate(&counters, 1, ncclInt32, d_expert_counters, local_experts));
+    ncclEpHandle_t handle = nullptr;
+    NCCL_ASSERT(ncclEpCreateHandle(&handle, group, NCCL_EP_LAYOUT_EXPERT_MAJOR, topk_idx_em_, nullptr, nullptr, g_stream));
+    ncclEpDispatchInputs_t dispatch_inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t dispatch_outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpLayoutInfo_t layout_info = NCCL_EP_LAYOUT_INFO_INIT;
+    dispatch_inputs.tokens = input; dispatch_outputs.tokens = expert; layout_info.expert_counters = counters;
+    ASSERT_EQ(ncclEpDispatch(handle, &dispatch_inputs, &dispatch_outputs, &layout_info, nullptr, g_stream), ncclSuccess);
+    ASSERT_EQ(ncclEpComplete(handle, nullptr, g_stream), ncclSuccess);
+    ncclEpCombineInputs_t combine_inputs = NCCL_EP_COMBINE_INPUTS_INIT;
+    ncclEpCombineOutputs_t combine_outputs = NCCL_EP_COMBINE_OUTPUTS_INIT;
+    ncclEpCombineConfig_t combine_config = NCCL_EP_COMBINE_CONFIG_INIT;
+    combine_inputs.tokens = expert; combine_inputs.scales = scales;
+    combine_outputs.tokens = combined; combine_outputs.topk_weights = weights;
+    combine_config.quant_recipe = NCCL_EP_COMB_QUANT_NVFP4;
+    ASSERT_EQ(ncclEpCombine(handle, &combine_inputs, &combine_outputs, &combine_config, g_stream), ncclSuccess);
+    ASSERT_EQ(ncclEpComplete(handle, nullptr, g_stream), ncclSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+    std::vector<nv_bfloat16> h_combined(static_cast<size_t>(kNumTokens) * kNvFp4Hidden);
+    CUDA_ASSERT(cudaMemcpy(h_combined.data(), d_combined, h_combined.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < h_combined.size(); ++i) {
+        const int token = i / kNvFp4Hidden;
+        const int channel = i % kNvFp4Hidden;
+        EXPECT_NEAR(__bfloat162float(h_combined[i]), nvfp4_test_value(token, channel), 1e-3f);
+    }
+
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+    ncclEpTensorDestroy(input); ncclEpTensorDestroy(expert); ncclEpTensorDestroy(combined);
+    ncclEpTensorDestroy(scales); ncclEpTensorDestroy(weights); ncclEpTensorDestroy(counters);
+    cudaFree(d_input); cudaFree(d_expert); cudaFree(d_combined); cudaFree(d_global_scales); cudaFree(d_topk_weights); cudaFree(d_expert_counters);
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
+}
+
+TEST_F(QuantizationRecipeTest, NvFp4CombineRankMajorProducesBf16) {
+    if (!nvfp4_supported()) GTEST_SKIP() << "NVFP4 combine requires E2M1 FP4 support";
+    constexpr int kNvFp4Hidden = 4096;
+    constexpr int kRmTopK = 2;
+    const int recv_slots = g_nranks * kNumTokens;
+    ncclEpGroupConfig_t group_config = NCCL_EP_GROUP_CONFIG_INIT;
+    group_config.algorithm = NCCL_EP_ALGO_LOW_LATENCY;
+    group_config.num_experts = kNumExperts;
+    group_config.max_dispatch_tokens_per_rank = kNumTokens;
+    group_config.max_token_bytes = kNvFp4Hidden * sizeof(nv_bfloat16);
+    group_config.rdma_buffer_size = NCCL_EP_AUTO;
+    group_config.num_qp_per_rank = kNumExperts / g_nranks;
+    group_config.num_channels = NCCL_EP_AUTO;
+    group_config.max_recv_tokens_per_rank = kNumTokens;
+    group_config.num_topk = kRmTopK;
+    ncclEpGroup_t group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&group, g_comm, &group_config));
+
+    nv_bfloat16 *d_input = nullptr, *d_expert = nullptr, *d_combined = nullptr;
+    float *d_global_scales = nullptr, *d_topk_weights = nullptr, *d_recv_topk_weights = nullptr;
+    int64_t* d_topk = nullptr;
+    int *d_recv_topk_idx = nullptr, *d_src_rank_counters = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_input, static_cast<size_t>(kNumTokens) * kNvFp4Hidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_expert, static_cast<size_t>(recv_slots) * kNvFp4Hidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_combined, static_cast<size_t>(kNumTokens) * kNvFp4Hidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_global_scales, static_cast<size_t>(recv_slots) * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_topk, static_cast<size_t>(kNumTokens) * kRmTopK * sizeof(int64_t)));
+    CUDA_ASSERT(cudaMalloc(&d_topk_weights, static_cast<size_t>(kNumTokens) * kRmTopK * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_topk_weights, static_cast<size_t>(recv_slots) * kRmTopK * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_topk_idx, static_cast<size_t>(recv_slots) * kRmTopK * sizeof(int)));
+    CUDA_ASSERT(cudaMalloc(&d_src_rank_counters, g_nranks * sizeof(int)));
+    std::vector<nv_bfloat16> h_input(static_cast<size_t>(kNumTokens) * kNvFp4Hidden);
+    std::vector<float> h_scales(recv_slots);
+    std::vector<int64_t> h_topk(static_cast<size_t>(kNumTokens) * kRmTopK);
+    std::vector<float> h_weights(static_cast<size_t>(kNumTokens) * kRmTopK, 1.f);
+    const int local_experts = kNumExperts / g_nranks;
+    fill_nvfp4_test_tokens(&h_input, kNvFp4Hidden);
+    for (int slot = 0; slot < recv_slots; ++slot) {
+        h_scales[slot] = nvfp4_test_global_scale(static_cast<int>(slot % kNumTokens), kNvFp4Hidden);
+    }
+    for (int token = 0; token < kNumTokens; ++token) {
+        const int first = expert_for_token(token);
+        h_topk[token * kRmTopK] = first;
+        h_topk[token * kRmTopK + 1] =
+            (first / local_experts) * local_experts + (first + 1) % local_experts;
+    }
+    CUDA_ASSERT(cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_topk, h_topk.data(), h_topk.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_global_scales, h_scales.data(), h_scales.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_topk_weights, h_weights.data(), h_weights.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    ncclEpTensor_t *input = nullptr, *expert = nullptr, *combined = nullptr, *scales = nullptr;
+    ncclEpTensor_t *topk = nullptr, *weights = nullptr, *recv_weights = nullptr, *recv_idx = nullptr, *src_counters = nullptr;
+    NCCL_ASSERT(epTensorCreate(&input, 2, ncclBfloat16, d_input, kNumTokens, kNvFp4Hidden));
+    NCCL_ASSERT(epTensorCreate(&expert, 3, ncclBfloat16, d_expert, g_nranks, kNumTokens, kNvFp4Hidden));
+    NCCL_ASSERT(epTensorCreate(&combined, 2, ncclBfloat16, d_combined, kNumTokens, kNvFp4Hidden));
+    NCCL_ASSERT(epTensorCreate(&scales, 3, ncclFloat32, d_global_scales, g_nranks, kNumTokens, 1));
+    NCCL_ASSERT(epTensorCreate(&topk, 2, ncclInt64, d_topk, kNumTokens, kRmTopK));
+    NCCL_ASSERT(epTensorCreate(&weights, 2, ncclFloat32, d_topk_weights, kNumTokens, kRmTopK));
+    NCCL_ASSERT(epTensorCreate(&recv_weights, 3, ncclFloat32, d_recv_topk_weights, g_nranks, kNumTokens, kRmTopK));
+    NCCL_ASSERT(epTensorCreate(&recv_idx, 3, ncclInt32, d_recv_topk_idx, g_nranks, kNumTokens, kRmTopK));
+    NCCL_ASSERT(epTensorCreate(&src_counters, 1, ncclInt32, d_src_rank_counters, g_nranks));
+    ncclEpHandle_t handle = nullptr;
+    NCCL_ASSERT(ncclEpCreateHandle(&handle, group, NCCL_EP_LAYOUT_RANK_MAJOR, topk, nullptr, nullptr, g_stream));
+    ncclEpDispatchInputs_t dispatch_inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t dispatch_outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpLayoutInfo_t layout_info = NCCL_EP_LAYOUT_INFO_INIT;
+    dispatch_inputs.tokens = input; dispatch_inputs.topk_weights = weights;
+    dispatch_outputs.tokens = expert; dispatch_outputs.topk_weights = recv_weights; dispatch_outputs.topk_idx = recv_idx;
+    layout_info.src_rank_counters = src_counters;
+    ASSERT_EQ(ncclEpDispatch(handle, &dispatch_inputs, &dispatch_outputs, &layout_info, nullptr, g_stream), ncclSuccess);
+    ASSERT_EQ(ncclEpComplete(handle, nullptr, g_stream), ncclSuccess);
+
+    ncclEpCombineInputs_t combine_inputs = NCCL_EP_COMBINE_INPUTS_INIT;
+    ncclEpCombineOutputs_t combine_outputs = NCCL_EP_COMBINE_OUTPUTS_INIT;
+    ncclEpCombineConfig_t combine_config = NCCL_EP_COMBINE_CONFIG_INIT;
+    combine_inputs.tokens = expert;
+    combine_inputs.scales = scales;
+    combine_outputs.tokens = combined;
+    combine_config.quant_recipe = NCCL_EP_COMB_QUANT_NVFP4;
+    ASSERT_EQ(ncclEpCombine(handle, &combine_inputs, &combine_outputs, &combine_config, g_stream), ncclSuccess);
+    ASSERT_EQ(ncclEpComplete(handle, nullptr, g_stream), ncclSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+    std::vector<nv_bfloat16> h_combined(static_cast<size_t>(kNumTokens) * kNvFp4Hidden);
+    CUDA_ASSERT(cudaMemcpy(h_combined.data(), d_combined, h_combined.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < h_combined.size(); ++i) {
+        const int token = i / kNvFp4Hidden;
+        const int channel = i % kNvFp4Hidden;
+        EXPECT_NEAR(__bfloat162float(h_combined[i]), nvfp4_test_value(token, channel), 1e-3f);
+    }
+
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+    ncclEpTensorDestroy(input); ncclEpTensorDestroy(expert); ncclEpTensorDestroy(combined); ncclEpTensorDestroy(scales);
+    ncclEpTensorDestroy(topk); ncclEpTensorDestroy(weights); ncclEpTensorDestroy(recv_weights); ncclEpTensorDestroy(recv_idx); ncclEpTensorDestroy(src_counters);
+    cudaFree(d_input); cudaFree(d_expert); cudaFree(d_combined); cudaFree(d_global_scales);
+    cudaFree(d_topk); cudaFree(d_topk_weights); cudaFree(d_recv_topk_weights); cudaFree(d_recv_topk_idx); cudaFree(d_src_rank_counters);
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
 }
 
 int main(int argc, char* argv[]) {

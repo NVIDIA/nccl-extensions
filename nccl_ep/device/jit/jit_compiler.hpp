@@ -15,6 +15,7 @@ namespace jit {
 
 struct JitCompileConfig {
     int sm = 0;
+    std::string target_arch;
     std::filesystem::path source_dir;
     std::filesystem::path build_include_dir;
     std::filesystem::path cuda_include_dir;

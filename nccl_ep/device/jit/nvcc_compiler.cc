@@ -191,12 +191,16 @@ std::vector<std::string> NvccCompiler::compile_options(const JitCompileConfig& c
     options.push_back("--extended-lambda");
     options.push_back("--expt-relaxed-constexpr");
 
-    const std::string arch_flags = env_value("NVCC_ARCH_FLAGS");
-    std::vector<std::string> arch_options = split_env_flags(arch_flags.c_str());
-    if (arch_options.empty()) {
-        options.push_back("-arch=sm_" + std::to_string(config.sm));
+    if (!config.target_arch.empty()) {
+        options.push_back("-arch=" + config.target_arch);
     } else {
-        options.insert(options.end(), arch_options.begin(), arch_options.end());
+        const std::string arch_flags = env_value("NVCC_ARCH_FLAGS");
+        std::vector<std::string> arch_options = split_env_flags(arch_flags.c_str());
+        if (arch_options.empty()) {
+            options.push_back("-arch=sm_" + std::to_string(config.sm));
+        } else {
+            options.insert(options.end(), arch_options.begin(), arch_options.end());
+        }
     }
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     options.push_back("-DNCCL_EP_HT_ENABLE_WARP_TIMING=1");

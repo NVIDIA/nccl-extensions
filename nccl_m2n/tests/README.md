@@ -22,11 +22,14 @@ make tests
 tree is available. `tests/gtest.mk` looks for one in this order:
 
 1. `$(GTEST_DIR)` — caller-supplied (highest priority).
-2. `tests/googletest/` — vendored alongside the tests.
+2. `third_party/googletest/googletest/` — the repository-root googletest
+   submodule, shared with the other extensions in this repo. Fetch it with
+   `git submodule update --init third_party/googletest`.
+3. `tests/googletest/` — vendored alongside the tests.
 
-If neither resolves, `make tests` prints a friendly skip message and
+If none resolves, `make tests` prints a friendly skip message and
 returns success — the library and benchmarks build either way. To build
-the tests against a googletest checkout
+the tests against any googletest checkout
 (<https://github.com/google/googletest>):
 
 ```sh

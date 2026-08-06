@@ -56,8 +56,10 @@ ifeq ($(GTEST_AVAILABLE),0)
 # point GTEST_DIR at a googletest source tree to build the tests.
 tests basic_api_test_mpi basic_api_test_local gtest:
 	@echo "tests/Makefile: googletest not found — skipping basic_api test build."
-	@echo "  Looked for vendored copy at \$$(TESTSDIR)/googletest."
-	@echo "  To build the tests, point GTEST_DIR at a googletest source tree:"
+	@echo "  Looked for $(GTEST_SUBMODULE) and \$$(TESTSDIR)/googletest."
+	@echo "  Fetch the submodule:"
+	@echo "    git submodule update --init third_party/googletest"
+	@echo "  Or point GTEST_DIR at a googletest source tree:"
 	@echo "    make tests GTEST_DIR=/path/to/googletest"
 
 gtest-clean:
@@ -110,7 +112,7 @@ help:
 	@echo "  tests                 - Same as all"
 	@echo "  basic_api_test_mpi    - Build only the MPI gtest matrix binary"
 	@echo "  basic_api_test_local  - Build only the local pthread gtest matrix binary"
-	@echo "  gtest                 - Build gtest.a / gtest_main.a (from tests/googletest/)"
+	@echo "  gtest                 - Build gtest.a / gtest_main.a (from \$$(GTEST_DIR))"
 	@echo "  clean                 - Remove all test binaries + gtest objects"
 	@echo "  help                  - Show this help"
 	@echo ""

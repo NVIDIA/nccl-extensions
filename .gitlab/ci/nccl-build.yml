@@ -39,7 +39,7 @@ variables:
       current_dir="$(realpath .)"
       NCCL_COMMIT="$(git -C third_party/nccl rev-parse HEAD)"
       echo "Building public NCCL at ${NCCL_COMMIT}"
-      test -f nccl_ep/third_party/googletest/googletest/src/gtest-all.cc
+      test -f third_party/googletest/googletest/src/gtest-all.cc
       srun \
         -p cpuonly \
         -J nccl-extensions:nccl \
@@ -52,7 +52,7 @@ variables:
         make -C "${current_dir}/third_party/nccl" -j"$(nproc)" src.build
       mkdir -p .ci
       cp -a third_party/nccl .ci/nccl
-      cp -a nccl_ep/third_party/googletest .ci/googletest
+      cp -a third_party/googletest .ci/googletest
       printf '%s\n' "${NCCL_COMMIT}" > .ci/nccl/NCCL_COMMIT
   artifacts:
     name: "nccl-${CI_COMMIT_SHORT_SHA}"

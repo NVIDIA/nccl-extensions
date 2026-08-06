@@ -124,7 +124,7 @@ ncclResult_t call_dispatch(
 // Resolves (numSms, numWarps), computes the dynamic SMEM budget, packs args,
 // and hands off to launch_ll_combine() for JIT compile + launch.
 // ============================================================================
-void call_combine(const CombineParams& params, cudaStream_t stream) {
+ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
     const int numWarpGroups = ceil_div(params.numExperts, params.numDeviceSms);
     const int numWarpsPerGroup = 32 / numWarpGroups;
     const int numRecvPerSm = ceil_div(params.numCombinedTokens, params.numDeviceSms);
@@ -138,8 +138,6 @@ void call_combine(const CombineParams& params, cudaStream_t stream) {
     auto atomicCleanFlag = static_cast<int*>(params.workspace);
     EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
     EP_HOST_ASSERT(params.numTopk <= jit::kLlCombineMaxTopk);
-
-    // Online cast (LogFMT) is incompatible with zero-copy.
     EP_HOST_ASSERT(not(params.zeroCopy and params.useLogFmt));
 
     // Per-block SMEM = max(send-side TMA staging, recv-side TMA staging).
@@ -164,6 +162,7 @@ void call_combine(const CombineParams& params, cudaStream_t stream) {
 
     combine_kernel_args_t args{};
     args.inData = params.inData;
+    args.inGlobalScales = params.inGlobalScales;
     args.srcInfo = params.srcInfo;
     args.layoutRange = params.layoutRange;
     args.inTopkIdx = params.inTopkIdx;
@@ -198,10 +197,10 @@ void call_combine(const CombineParams& params, cudaStream_t stream) {
     args.signalsBase = params.signalsBase;
     args.timeoutCycles = params.timeoutCycles;
 
-    jit::launch_ll_combine(
-        // LogFMT compression is not wired into the current code flow; force it
-        // off until it is revisited (the template plumbing is kept).
-        /*useLogFmt=*/false,
+    return jit::launch_ll_combine(
+        params.useLogFmt,
+        params.quantizationRecipe,
+        params.deviceSm,
         hidden,
         params.layout,
         params.topkIdxIsInt64,

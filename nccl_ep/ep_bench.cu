@@ -23,6 +23,7 @@
 #include <vector>
 #include <mpi.h>
 #include <cuda_runtime.h>
+#include <cuda_fp8.h>
 #include <cuda_profiler_api.h>
 #ifdef HAVE_CUPTI
 #include <cupti.h>
@@ -31,6 +32,18 @@
 #include <nccl.h>
 #include <nccl_device.h>
 #include "nccl_ep.h"
+#if defined(__has_include)
+#if __has_include(<cuda_fp4.h>)
+#include <cuda_fp4.h>
+#define NCCL_EP_BENCH_HAS_CUDA_FP4_TYPES 1
+#endif
+#endif
+#ifndef NCCL_EP_BENCH_HAS_CUDA_FP4_TYPES
+#define NCCL_EP_BENCH_HAS_CUDA_FP4_TYPES 0
+#endif
+
+static constexpr bool kNvfp4BenchmarkSupported =
+    NCCL_EP_BENCH_HAS_CUDA_FP4_TYPES && CUDART_VERSION >= 12090;
 
 #define MPICHECK(cmd) \
     do { \
@@ -2828,8 +2841,43 @@ int countValidExperts(const int64_t* topk_idx_host, unsigned int token_idx, unsi
     return count;
 }
 
-// Validate combine output for Low Latency mode
+// Validate combine output for Low Latency mode.
+// For NVFP4, validation mirrors the transport quantization: derive one global scale
+// per post-expert row, quantize/dequantize each 16-element block with its E4M3
+// scale, then apply routing weights and compare against the combined BF16 output.
 // DeepEP formula: check = combined / is_token_in_rank.sum()
+// Populate the NVFP4 per-row global quantization scale from post-expert activations.
+// This matches the DeepEP contract: global_scale = 448 * 6 / row_amax.
+static void initializeNvfp4ValidationScales(
+    const BenchmarkAllocState& alloc, ncclEpCombineInputs_t& combine_inputs) {
+    const size_t* sizes = combine_inputs.tokens->sizes;
+    const int ndim = combine_inputs.tokens->ndim;
+    const unsigned int hidden = static_cast<unsigned int>(sizes[ndim - 1]);
+    size_t rows = 1;
+    for (int dim = 0; dim < ndim - 1; ++dim) rows *= sizes[dim];
+
+    const ncclDataType_t dtype = combine_inputs.tokens->datatype;
+    const size_t elem_bytes = tokenElemBytes(dtype);
+    std::vector<char> tokens(rows * hidden * elem_bytes);
+    void* token_data;
+    NCCLCHECK(epGetTensorData(alloc, combine_inputs.tokens, &token_data));
+    CUDACHECK(cudaMemcpy(tokens.data(), token_data, tokens.size(), cudaMemcpyDeviceToHost));
+
+    std::vector<float> scales(rows, 0.f);
+    for (size_t row = 0; row < rows; ++row) {
+        float amax = 0.f;
+        for (unsigned int h = 0; h < hidden; ++h) {
+            const float value = tokenElemToFloat(tokens.data(), row * hidden + h, dtype);
+            if (std::isfinite(value)) amax = std::max(amax, std::abs(value));
+        }
+        scales[row] = amax == 0.f ? 0.f : 2688.f / amax;
+    }
+
+    void* scale_data;
+    NCCLCHECK(epGetTensorData(alloc, combine_inputs.scales, &scale_data));
+    CUDACHECK(cudaMemcpy(scale_data, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice));
+}
+
 // LL combine applies weighted sum: combined[t] = x[t] * sum(valid weights)
 // Compared using calc_diff in double precision against kCombineLLThreshold.
 ValidationResult validateCombineOutputLL(
@@ -2843,7 +2891,9 @@ ValidationResult validateCombineOutputLL(
     int myRank,
     int nRanks,
     int64_t* topk_idx_host,
-    ncclDataType_t token_dtype = ncclBfloat16) {
+    bool expert_major,
+    ncclDataType_t token_dtype,
+    ncclEpCombQuant_t combine_quantization) {
     (void)num_experts;
     (void)nRanks;
 
@@ -2893,12 +2943,48 @@ ValidationResult validateCombineOutputLL(
         floatToTokenElem(tmp, 0, original_rank_val, token_dtype);
         double rank_val = static_cast<double>(tokenElemToFloat(tmp, 0, token_dtype));
 
+        auto input_value = [&](unsigned int column) {
+            if (column < hidden - TOKEN_ID_COLS) return rank_val;
+            return column == hidden - TOKEN_ID_COLS ? token_hi_val : token_lo_val;
+        };
+
+        float nvfp4_input_weight = 1.f;
+        double output_weight = weight_sum;
+        float nvfp4_global_scale = 1.f;
+#if NCCL_EP_BENCH_HAS_CUDA_FP4_TYPES
+        if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4) {
+            // Rank-major applies weights before quantization; expert-major applies them after decode.
+            nvfp4_input_weight = expert_major ? 1.f : static_cast<float>(weight_sum);
+            output_weight = expert_major ? weight_sum : 1.0;
+            float row_amax = 0.f;
+            for (unsigned int column = 0; column < hidden; ++column) {
+                row_amax = std::max(row_amax,
+                                    std::abs(static_cast<float>(input_value(column)) * nvfp4_input_weight));
+            }
+            nvfp4_global_scale = row_amax == 0.f ? 0.f : 2688.f / row_amax;
+        }
+#endif
+
         for (unsigned int h = 0; h < hidden; h++) {
-            double orig;
-            if (h == hidden - TOKEN_ID_COLS) orig = token_hi_val;
-            else if (h > hidden - TOKEN_ID_COLS) orig = token_lo_val;
-            else orig = rank_val;
-            ref[idx] = orig * weight_sum;
+            double orig = input_value(h) * nvfp4_input_weight;
+#if NCCL_EP_BENCH_HAS_CUDA_FP4_TYPES
+            if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4) {
+                // NVFP4 uses one scale for each 16-element input block.
+                constexpr unsigned int kNvfp4BlockSize = 16;
+                const unsigned int block_start = h / kNvfp4BlockSize * kNvfp4BlockSize;
+                float block_max = 0.f;
+                for (unsigned int column = block_start; column < block_start + kNvfp4BlockSize; ++column) {
+                    block_max = std::max(block_max,
+                                         std::abs(static_cast<float>(input_value(column)) * nvfp4_input_weight));
+                }
+                const __nv_fp8_e4m3 block_scale(nvfp4_global_scale * (block_max / 6.f));
+                const float narrowed_scale =
+                    nvfp4_global_scale == 0.f ? 0.f : static_cast<float>(block_scale) / nvfp4_global_scale;
+                const __nv_fp4_e2m1 quantized(narrowed_scale != 0.f ? static_cast<float>(orig) / narrowed_scale : 0.f);
+                orig = static_cast<float>(quantized) * narrowed_scale;
+            }
+#endif
+            ref[idx] = orig * output_weight;
             float actual_f = tokenElemToFloat(combined_data, t * hidden + h, token_dtype);
             actual[idx] = static_cast<double>(actual_f);
             if (std::isnan(actual_f)) has_nan = true;
@@ -3026,7 +3112,8 @@ ValidationResult validateCombineOutput(
     bool is_ht_mode,
     int64_t* topk_idx_host,
     bool expert_major = false,
-    ncclDataType_t token_dtype = ncclBfloat16) {
+    ncclDataType_t token_dtype = ncclBfloat16,
+    ncclEpCombQuant_t combine_quantization = NCCL_EP_COMB_QUANT_NONE) {
     if (is_ht_mode) {
         return validateCombineOutputHT(
             alloc,
@@ -3052,7 +3139,9 @@ ValidationResult validateCombineOutput(
             myRank,
             nRanks,
             topk_idx_host,
-            token_dtype);
+            expert_major,
+            token_dtype,
+            combine_quantization);
     }
 }
 
@@ -3187,18 +3276,20 @@ PairedBenchResult runPairedBenchmark(
     return result;
 }
 
-// Logical user payload transported by LL. Protocol headers are intentionally
-// excluded so dtype comparisons reflect tokens plus forwarded scales.
+// LL wire-payload bytes: excludes transport/protocol headers but includes
+// recipe-owned packet metadata (such as NVFP4 block and global scales).
 struct LowLatencyBytes {
-    size_t dispatch_bytes;
+    size_t dispatch_bytes; // physical recipe bytes carried by the transport
     size_t combine_bytes;
+    size_t dispatch_algorithm_bytes; // unquantized token bytes represented by the algorithm
+    size_t combine_algorithm_bytes;
     unsigned int num_valid_selections;
     unsigned int num_dispatch_messages;
     unsigned int num_combine_messages;
 };
 
 // Calculate bytes for Low Latency mode.
-// Dispatch can be scales-forward or NONE-mode (bf16/fp16/fp32); combine is always the NONE-mode dtype.
+// Dispatch can be scales-forward or NONE-mode (bf16/fp16/fp32).
 LowLatencyBytes calculateLowLatencyBytes(
     const int64_t* topk_idx_host,
     unsigned int num_tokens,
@@ -3208,9 +3299,10 @@ LowLatencyBytes calculateLowLatencyBytes(
     int nRanks,
     ncclEpLayout_t layout,
     ncclEpDispQuant_t dispatch_quantization,
+    ncclEpCombQuant_t combine_quantization,
     ncclDataType_t token_dtype,
     ncclDataType_t scales_forward_token_dtype) {
-    LowLatencyBytes bytes = {0, 0, 0, 0, 0};
+    LowLatencyBytes bytes = {0, 0, 0, 0, 0, 0, 0};
 
     const unsigned int num_local_experts = num_experts / static_cast<unsigned int>(nRanks);
     for (unsigned int token = 0; token < num_tokens; ++token) {
@@ -3254,7 +3346,14 @@ LowLatencyBytes calculateLowLatencyBytes(
                     static_cast<int>(dispatch_quantization));
             return bytes;
     }
-    bytes.combine_bytes = static_cast<size_t>(bytes.num_combine_messages) * none_payload_bytes;
+    size_t combine_payload_bytes = none_payload_bytes;
+    if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4) {
+        const size_t nvfp4_packet_bytes = hidden / 2 + hidden / 16 + sizeof(float);
+        combine_payload_bytes = (nvfp4_packet_bytes + sizeof(int4) - 1) & ~(sizeof(int4) - 1);
+    }
+    bytes.combine_bytes = static_cast<size_t>(bytes.num_combine_messages) * combine_payload_bytes;
+    bytes.dispatch_algorithm_bytes = static_cast<size_t>(bytes.num_dispatch_messages) * none_payload_bytes;
+    bytes.combine_algorithm_bytes = static_cast<size_t>(bytes.num_combine_messages) * none_payload_bytes;
 
     return bytes;
 }
@@ -3431,6 +3530,15 @@ void printLowLatencyResults(
 
     const unsigned long long local_dispatch_bytes = ll_bytes.dispatch_bytes;
     const unsigned long long local_combine_bytes = ll_bytes.combine_bytes;
+    const unsigned long long local_dispatch_algorithm_bytes = ll_bytes.dispatch_algorithm_bytes;
+    const unsigned long long local_combine_algorithm_bytes = ll_bytes.combine_algorithm_bytes;
+    const double dispatch_algorithm_factor = local_dispatch_bytes == 0 ? 0.0 :
+        static_cast<double>(local_dispatch_algorithm_bytes) / local_dispatch_bytes;
+    const double combine_algorithm_factor = local_combine_bytes == 0 ? 0.0 :
+        static_cast<double>(local_combine_algorithm_bytes) / local_combine_bytes;
+    const double total_algorithm_factor = local_dispatch_bytes + local_combine_bytes == 0 ? 0.0 :
+        static_cast<double>(local_dispatch_algorithm_bytes + local_combine_algorithm_bytes) /
+        (local_dispatch_bytes + local_combine_bytes);
     const unsigned long long local_dispatch_messages = ll_bytes.num_dispatch_messages;
     const unsigned long long local_combine_messages = ll_bytes.num_combine_messages;
     const unsigned long long local_valid_selections = ll_bytes.num_valid_selections;
@@ -3580,43 +3688,60 @@ void printLowLatencyResults(
 
         printf("Dispatch:  avg=%.2f us, min=%.2f us, max=%.2f us\n", global_dispatch_avg * 1000,
                global_dispatch_min * 1000, global_dispatch_max * 1000);
-        printf("          logical payload throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
+        printf("          bus bandwidth (excl. protocol headers): avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
                avg_dispatch_tp, global_dispatch_tp_min.value, global_dispatch_tp_min.rank, global_dispatch_tp_max.value,
                global_dispatch_tp_max.rank);
+        printf("          algorithm bandwidth: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
+               avg_dispatch_tp * dispatch_algorithm_factor, global_dispatch_tp_min.value * dispatch_algorithm_factor,
+               global_dispatch_tp_max.value * dispatch_algorithm_factor);
         if (!dispatch_only) {
             printf("Combine:   avg=%.2f us, min=%.2f us, max=%.2f us\n", global_combine_avg * 1000,
                    global_combine_min * 1000, global_combine_max * 1000);
-            printf("          logical payload throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
+            printf("          bus bandwidth (excl. protocol headers): avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
                    avg_combine_tp, global_combine_tp_min.value, global_combine_tp_min.rank,
                    global_combine_tp_max.value, global_combine_tp_max.rank);
+            printf("          algorithm bandwidth: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
+                   avg_combine_tp * combine_algorithm_factor, global_combine_tp_min.value * combine_algorithm_factor,
+                   global_combine_tp_max.value * combine_algorithm_factor);
             printf("Total (D+C):      avg=%.2f us, min=%.2f us, max=%.2f us\n", global_total_avg * 1000,
                    global_total_min * 1000, global_total_max * 1000);
-            printf("          logical payload throughput: avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
+            printf("          bus bandwidth (excl. protocol headers): avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
                    avg_total_tp, global_total_tp_min.value, global_total_tp_min.rank,
                    global_total_tp_max.value, global_total_tp_max.rank);
+            printf("          algorithm bandwidth: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
+                   avg_total_tp * total_algorithm_factor, global_total_tp_min.value * total_algorithm_factor,
+                   global_total_tp_max.value * total_algorithm_factor);
         }
 
         printf("\n--- Kernel-only performance ---\n");
         if (ktimer.is_valid()) {
             printf("Dispatch:    avg=%.2f us, min=%.2f us, max=%.2f us\n", dispatch_kernel_avg, dispatch_kernel_min,
                    dispatch_kernel_max);
-            printf("          logical payload throughput: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
+            printf("          bus bandwidth (excl. protocol headers): avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
                    dispatch_kernel_tp_sum / nRanks,
                    dispatch_kernel_tp_min,
                    dispatch_kernel_tp_max);
+            printf("          algorithm bandwidth: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
+                   dispatch_kernel_tp_sum / nRanks * dispatch_algorithm_factor,
+                   dispatch_kernel_tp_min * dispatch_algorithm_factor,
+                   dispatch_kernel_tp_max * dispatch_algorithm_factor);
             if (!dispatch_only) {
                 printf("Combine:     avg=%.2f us, min=%.2f us, max=%.2f us\n", combine_kernel_avg,
                        combine_kernel_min, combine_kernel_max);
-                printf("          logical payload throughput: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
+                printf("          bus bandwidth (excl. protocol headers): avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
                        combine_kernel_tp_sum / nRanks,
                        combine_kernel_tp_min,
                        combine_kernel_tp_max);
+                printf("          algorithm bandwidth: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
+                       combine_kernel_tp_sum / nRanks * combine_algorithm_factor,
+                       combine_kernel_tp_min * combine_algorithm_factor,
+                       combine_kernel_tp_max * combine_algorithm_factor);
             }
         } else {
             printf("  NOTE: CUPTI support was not compiled.\n");
         }
 
-        printf("\nMean logical payload/rank: dispatch=%.2f MB (%.1f messages), combine=%.2f MB (%.1f messages), "
+        printf("\nMean payload/rank: dispatch=%.2f MB (%.1f messages), combine=%.2f MB (%.1f messages), "
                "valid selections=%.1f\n",
                mean_dispatch_bytes / 1e6,
                mean_dispatch_messages,
@@ -3996,6 +4121,7 @@ void printUsage(const char* programName, int myRank) {
         printf("  --mask-test             Simulate rank failures and test active-mask (LL only, implies --validate)\n");
         printf("  --topk-idx-int32        LL only: pass ncclInt32 topk_idx instead of ncclInt64\n");
         printf("  --dispatch-quantization <recipe>  Dispatch quantization recipe: none|scales-forward|ds-fp8e3m4.\n");
+        printf("  --combine-quantization <recipe>   Combine quantization recipe: none|nvfp4 (experimental).\n");
         printf("  --mxfp8                 Shorthand: FP8 E4M3 tokens with Uint8 block-32 scales.\n");
         printf("  --scales-forward-token-dtype <t>  scales-forward wire type: fp32|fp16|bf16|fp8e4m3|fp8e5m2|fp4x2.\n");
         printf("                                      fp4x2 is packed FP4: physical H/2 bytes, two values per byte (H multiple of 32).\n");
@@ -4028,6 +4154,7 @@ int main(int argc, char* argv[]) {
     bool disable_nvlink = false;  // Force RDMA instead of NVLink
     bool user_handle_mem = false;  // Use caller-owned buffer via ncclEpInitHandle+ncclEpUpdateHandle
     bool validate_data = false;  // Validate dispatch/combine correctness
+    bool validation_passed = true;  // Aggregated across ranks when validation is enabled
     bool dispatch_only = false;  // Skip combine run and validation (use with --validate)
     bool dynamic_tokens = false;  // Enable dynamic token allocation (HT only, for random topk)
     size_t expert_major_alignment = 0;  // 0 = no padding; >1 aligns each expert zone
@@ -4045,6 +4172,7 @@ int main(int argc, char* argv[]) {
     bool topk_idx_int32 = false;  // LL only: pass ncclInt32 topk_idx instead of ncclInt64
     bool em_nvlink_dup = false;       // HT+EM only: force nvlink_dup path (sender duplicates per-expert over NVLink)
     ncclEpDispQuant_t dispatch_quantization = NCCL_EP_DISP_QUANT_NONE;
+    ncclEpCombQuant_t combine_quantization = NCCL_EP_COMB_QUANT_NONE;
     // Numbering selector for recv_topk_idx writes (LL rank-major / HT FLAT only).
     // AUTO leaves the lib at its default (resolves to LOCAL today); LOCAL / GLOBAL pin
     // a stable contract end-to-end.
@@ -4085,6 +4213,7 @@ int main(int argc, char* argv[]) {
         {"non-uniform-tokens", no_argument, 0, 'N'},
         {"topk-idx-int32", no_argument, 0, 'I'},
         {"dispatch-quantization", required_argument, 0, 0},
+        {"combine-quantization", required_argument, 0, 1004},
         {"mxfp8", no_argument, 0, 0},
         {"scales-forward-token-dtype", required_argument, 0, 1002},
         {"scales-forward-scale-dtype", required_argument, 0, 1003},
@@ -4294,6 +4423,17 @@ int main(int argc, char* argv[]) {
             }
             g_scaleDtypeExplicit = true;
             break;
+        case 1004:  // --combine-quantization
+            if (strcmp(optarg, "none") == 0) {
+                combine_quantization = NCCL_EP_COMB_QUANT_NONE;
+            } else if (strcmp(optarg, "nvfp4") == 0) {
+                combine_quantization = NCCL_EP_COMB_QUANT_NVFP4;
+            } else {
+                if (myRank == 0) printf("Error: --combine-quantization must be none or nvfp4\n");
+                MPI_Finalize();
+                return 1;
+            }
+            break;
         case 1001:  // --disable-token-dropping
             g_disable_token_dropping = true;
             break;
@@ -4356,6 +4496,23 @@ int main(int argc, char* argv[]) {
             MPI_Finalize();
             return 1;
         }
+    }
+
+    if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4 &&
+        (algorithm != NCCL_EP_ALGO_LOW_LATENCY || token_dtype != ncclBfloat16 || dispatch_only)) {
+        if (myRank == 0) {
+            printf("Error: NVFP4 combine requires LL BF16 with combine enabled.\n");
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4 && !kNvfp4BenchmarkSupported) {
+        if (myRank == 0) {
+            printf("Error: NVFP4 combine requires CUDA 12.9+ with cuda_fp4.h.\n");
+        }
+        MPI_Finalize();
+        return 1;
     }
 
     // Set algorithm-specific default for max_tokens_per_rank if not explicitly provided
@@ -4770,6 +4927,7 @@ int main(int argc, char* argv[]) {
             nRanks,
             layout,
             dispatch_quantization,
+            combine_quantization,
             token_dtype,
             scales_forward_token_dtype);
     } else {
@@ -5076,6 +5234,15 @@ int main(int argc, char* argv[]) {
         fflush(stdout);
     }
 
+    if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4) {
+        const unsigned int scale_rows = layout == NCCL_EP_LAYOUT_EXPERT_MAJOR
+            ? num_local_experts : static_cast<unsigned int>(nRanks);
+        const unsigned int scale_slots = layout == NCCL_EP_LAYOUT_EXPERT_MAJOR
+            ? static_cast<unsigned int>(nRanks) * max_tokens_per_rank : max_tokens_per_rank;
+        NCCLCHECK(epMakeTensor(
+            &combine_inputs.scales, 3, ncclFloat32, scale_rows, scale_slots, 1));
+    }
+
     // Apply the CLI-selected recv_topk_idx numbering. The kind only matters for
     // layouts that populate recv_topk_idx (LL rank-major, HT FLAT); other layouts
     // ignore it. Setting the field on dispatch_layout_info is safe even when the
@@ -5185,6 +5352,7 @@ int main(int argc, char* argv[]) {
     }
 
     ncclEpCombineConfig_t combine_config = NCCL_EP_COMBINE_CONFIG_INIT;
+    combine_config.quant_recipe = combine_quantization;
     const ncclEpLayoutInfo_t* update_layout_info_ptr = has_handle_layout_info ? &handle_layout_info : nullptr;
     auto update_fn = [&]() { NCCLCHECK(ncclEpUpdateHandle(ep_handle, topk_idx, update_layout_info_ptr, stream)); };
 
@@ -5500,6 +5668,11 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4) {
+                // The production caller supplies these post-expert row scales before combine.
+                initializeNvfp4ValidationScales(alloc, combine_inputs);
+            }
+
             // Run combine
             combine_fn();
             CUDACHECK(cudaStreamSynchronize(stream));
@@ -5522,7 +5695,8 @@ int main(int argc, char* argv[]) {
                 !is_ll_mode,
                 topk_idx_host,
                 layout == NCCL_EP_LAYOUT_EXPERT_MAJOR,
-                token_dtype);
+                token_dtype,
+                combine_quantization);
         }
 
         // Print validation results (rank 0 only to avoid clutter)
@@ -5550,13 +5724,14 @@ int main(int argc, char* argv[]) {
 
         MPICHECK(MPI_Allreduce(&local_dispatch_pass, &global_dispatch_pass, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD));
         MPICHECK(MPI_Allreduce(&local_combine_pass, &global_combine_pass, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD));
+        validation_passed = global_dispatch_pass && (dispatch_only || global_combine_pass);
 
         if (myRank == 0) {
             if (dispatch_only) {
                 printf("\nGlobal validation: Dispatch=%s\n", global_dispatch_pass ? "PASSED" : "FAILED");
             } else {
-                printf("\nGlobal validation: Dispatch=%s, Combine=%s\n", global_dispatch_pass ? "PASSED" : "FAILED",
-                       global_combine_pass ? "PASSED" : "FAILED");
+                printf("\nGlobal validation: Dispatch=%s, Combine=%s\n",
+                       global_dispatch_pass ? "PASSED" : "FAILED", global_combine_pass ? "PASSED" : "FAILED");
             }
             fflush(stdout);
         }
@@ -5768,5 +5943,5 @@ int main(int argc, char* argv[]) {
     MPICHECK(MPI_Finalize());
     cudaDeviceReset();
 
-    return 0;
+    return validation_passed ? 0 : 2;
 }

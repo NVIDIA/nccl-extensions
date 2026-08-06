@@ -103,7 +103,8 @@ void ncclEpCombineInputs_backwards_compat_test() {
     static_assert(offsetof(ncclEpCombineInputs_t, magic) == 4);
     static_assert(offsetof(ncclEpCombineInputs_t, tokens) == 8);
     static_assert(offsetof(ncclEpCombineInputs_t, topk_weights) == 16);
-    static_assert(sizeof(ncclEpCombineInputs_t) == 24);
+    static_assert(offsetof(ncclEpCombineInputs_t, scales) == 24);
+    static_assert(sizeof(ncclEpCombineInputs_t) == 32);
 }
 
 void ncclEpCombineOutputs_backwards_compat_test() {

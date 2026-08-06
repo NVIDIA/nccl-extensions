@@ -910,7 +910,7 @@ tma_load_1d(const void* smem_ptr, const void* gmem_ptr, uint64_t* mbar_ptr, int 
 }
 
 __device__ __forceinline__ void
-tma_store_1d(const void* smem_ptr, const void* gmem_ptr, int num_bytes, bool evict_first = true) {
+tma_store_1d_no_commit(const void* smem_ptr, const void* gmem_ptr, int num_bytes, bool evict_first = true) {
     auto smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     const auto cache_hint = evict_first ? kEvictFirst : kEvictNormal;
     asm volatile("cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%0], [%1], %2, %3;\n" ::"l"(gmem_ptr),
@@ -918,7 +918,16 @@ tma_store_1d(const void* smem_ptr, const void* gmem_ptr, int num_bytes, bool evi
                  "r"(num_bytes),
                  "l"(cache_hint)
                  : "memory");
+}
+
+__device__ __forceinline__ void tma_store_commit_group() {
     asm volatile("cp.async.bulk.commit_group;");
+}
+
+__device__ __forceinline__ void
+tma_store_1d(const void* smem_ptr, const void* gmem_ptr, int num_bytes, bool evict_first = true) {
+    tma_store_1d_no_commit(smem_ptr, gmem_ptr, num_bytes, evict_first);
+    tma_store_commit_group();
 }
 
 template <int N = 0>

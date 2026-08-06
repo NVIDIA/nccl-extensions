@@ -91,6 +91,7 @@ struct dispatch_kernel_args_t {
 struct combine_kernel_args_t {
     // INPUT
     const void* inData;
+    const float* inGlobalScales;
     const int* srcInfo;
     const int64_t* layoutRange;
     const void* inTopkIdx;        // cast to const TopkIdxT* by the JIT entry
@@ -230,6 +231,7 @@ struct DispatchParams {
 struct CombineParams {
     // User inputs
     const void* inData;
+    const float* inGlobalScales = nullptr;
     const int* srcInfo;
     const int64_t* layoutRange;
     const void* inTopkIdx;        // int32_t* or int64_t*; see topkIdxIsInt64
@@ -269,6 +271,7 @@ struct CombineParams {
     // Runtime workspace + error tracking
     void* workspace;
     int numDeviceSms;
+    unsigned int deviceSm;
     int* rankMask = nullptr;
     int* asyncErrorFlag = nullptr;
     uint64_t timeoutCycles = NUM_TIMEOUT_CYCLES;
@@ -282,6 +285,7 @@ struct CombineParams {
     // so BF16/FP16/FP32 are three distinct kernel specializations (FP32 also
     // halves kMaxNumGroups to stay within the dynamic-SMEM cap).
     ncclDataType_t tokenDtype = ncclBfloat16;
+    ncclEpCombQuant_t quantizationRecipe = NCCL_EP_COMB_QUANT_NONE;
 };
 
 struct CleanLowLatencyBufferParams {
@@ -310,7 +314,7 @@ ncclResult_t call_dispatch(
     ncclEpDispQuant_t recipe,
     cudaStream_t stream = 0);
 
-void call_combine(const CombineParams& params, cudaStream_t stream = 0);
+ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream = 0);
 
 void call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStream_t stream = 0);
 

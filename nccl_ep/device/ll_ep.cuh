@@ -1463,15 +1463,164 @@ __forceinline__ __device__ void sendTokenViaRdma(
         expectedDstOffset,
         ncclWindow,
         expectedBufOffset,
-        hidden * sizeof(nv_bfloat16),
+        numBytesPerSlot,
         ncclGin_None{}, // no signal
         ncclGin_None{}, // no counter
         ncclCoopThread());
 }
 
+// Combine recipes own packet representation and numerical conversion.
+template <ncclEpCombQuant_t kRecipe>
+struct CombineRecipeTraits;
+
+template <>
+struct CombineRecipeTraits<NCCL_EP_COMB_QUANT_NONE> {};
+
+template <>
+struct CombineRecipeTraits<NCCL_EP_COMB_QUANT_NVFP4> {
+    using input_token_t = nv_bfloat16;
+#if NCCL_EP_HAS_CUDA_FP4_TYPES
+    using quantized_token_t = __nv_fp4_e2m1;
+    using packed_token_t = __nv_fp4x2_e2m1;
+#else
+    using quantized_token_t = uint8_t;
+    using packed_token_t = uint8_t;
+#endif
+    using scale_t = __nv_fp8_e4m3;
+    using reduction_t = float;
+    using global_scale_t = float;
+
+    static constexpr int kBlockSize = 16;
+    static constexpr int kElementsPerVector = 8;
+    static constexpr int kElementsPerByte = 2;
+    static constexpr int kSmemPayloadDivisor = 4;
+    static constexpr int kSmemScaleDivisor = 32;
+
+    template <int kHidden>
+    static constexpr size_t payload_bytes() {
+        return kHidden / kElementsPerByte * sizeof(packed_token_t);
+    }
+
+    template <int kHidden>
+    static constexpr size_t scale_bytes() {
+        return kHidden / kBlockSize * sizeof(scale_t);
+    }
+
+    template <int kHidden>
+    static constexpr size_t slot_bytes() {
+        return align(
+            payload_bytes<kHidden>() + scale_bytes<kHidden>() + sizeof(global_scale_t), sizeof(int4));
+    }
+
+    static constexpr int smem_payload_bytes(int smemBytes) {
+        return smemBytes / kSmemPayloadDivisor;
+    }
+
+    static constexpr int smem_scale_bytes(int smemBytes) {
+        return smemBytes / kSmemScaleDivisor;
+    }
+};
+
+__device__ __forceinline__ float nvfp4_rcp(float a);
+__device__ __forceinline__ uint32_t nvfp4_pack_e2m1(
+    float (&v)[CombineRecipeTraits<NCCL_EP_COMB_QUANT_NVFP4>::kElementsPerVector]);
+
+template <ncclEpCombQuant_t kRecipe>
+struct CombineRecipeSendOps;
+
+template <>
+struct CombineRecipeSendOps<NCCL_EP_COMB_QUANT_NVFP4> {
+    template <int kHidden, int kNumSendUnrolls>
+    __forceinline__ __device__ static void quantizeTokenData(
+        int4* smemData,
+        int smemBytes,
+        float globalScale,
+        bool lastIter,
+        int laneId) {
+        using Recipe = CombineRecipeTraits<NCCL_EP_COMB_QUANT_NVFP4>;
+        constexpr int kVectorsPerBlock = Recipe::kBlockSize / Recipe::kElementsPerVector;
+        const int payloadChunkBytes = Recipe::smem_payload_bytes(smemBytes);
+        const int scaleChunkBytes = Recipe::smem_scale_bytes(smemBytes);
+        const float rcpSix = nvfp4_rcp(6.0f);
+        const float rcpGlobal = globalScale != 0.f ? nvfp4_rcp(globalScale) : 0.f;
+        int4 inputs[kNumSendUnrolls];
+#pragma unroll
+        for (int q = 0; q < kNumSendUnrolls; ++q) {
+            inputs[q] = smemData[laneId + 32 * q];
+        }
+        __syncwarp();
+
+        // Reuse the TMA staging buffer as the quantized wire packet.
+        auto* staged_packet = reinterpret_cast<uint8_t*>(smemData);
+        auto* packed_payload = reinterpret_cast<uint32_t*>(staged_packet);
+        auto* block_scales = staged_packet + payloadChunkBytes;
+#pragma unroll
+        for (int q = 0; q < kNumSendUnrolls; ++q) {
+            const int vec = laneId + 32 * q;
+            const int4 in = inputs[q];
+            const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&in);
+            __nv_bfloat162 local = __habs2(pairs[0]);
+#pragma unroll
+            for (int j = 1; j < 4; ++j) {
+                local = __hmax2(local, __habs2(pairs[j]));
+            }
+            // Two adjacent lanes own one 16-element FP4 block.
+            // Exchange their 8-element maxima to derive its shared scale.
+            local = __hmax2(local, __shfl_xor_sync(0xffffffff, local, 1));
+            const float maxv = static_cast<float>(__hmax(local.x, local.y));
+            const float scale = globalScale * (maxv * rcpSix);
+            const typename Recipe::scale_t narrowed = static_cast<typename Recipe::scale_t>(scale);
+            const float inv = scale != 0.f ? nvfp4_rcp(static_cast<float>(narrowed) * rcpGlobal) : 0.f;
+            typename Recipe::reduction_t values[Recipe::kElementsPerVector];
+            const auto* token = reinterpret_cast<const typename Recipe::input_token_t*>(&in);
+#pragma unroll
+            for (int j = 0; j < Recipe::kElementsPerVector; ++j) {
+                values[j] = static_cast<float>(token[j]) * inv;
+            }
+            packed_payload[vec] = nvfp4_pack_e2m1(values);
+            if (vec % kVectorsPerBlock == 0) {
+                block_scales[vec / kVectorsPerBlock] = narrowed.__x;
+            }
+        }
+        if (lastIter && laneId == 0) {
+            auto* globalScaleSlot = reinterpret_cast<typename Recipe::global_scale_t*>(
+                staged_packet + payloadChunkBytes + scaleChunkBytes);
+            *globalScaleSlot = globalScale;
+        }
+        __syncwarp();
+    }
+
+    template <int kHidden>
+    __forceinline__ __device__ static void storeQuantizedTokenData(
+        uint8_t* smemData,
+        uint8_t* dst,
+        int smemBytes,
+        int packedVec,
+        bool lastIter) {
+        using Recipe = CombineRecipeTraits<NCCL_EP_COMB_QUANT_NVFP4>;
+        constexpr int kPayloadBytes = Recipe::template payload_bytes<kHidden>();
+        constexpr int kVectorsPerBlock = Recipe::kBlockSize / Recipe::kElementsPerVector;
+        const int payloadChunkBytes = Recipe::smem_payload_bytes(smemBytes);
+        const int scaleChunkBytes = Recipe::smem_scale_bytes(smemBytes);
+        auto* scales = smemData + payloadChunkBytes;
+
+        tma_store_fence();
+        if (elect_one_sync()) {
+            tma_store_1d_no_commit(smemData, dst + packedVec * sizeof(uint32_t), payloadChunkBytes);
+            // On the last iteration, the extra int4 carries the FP32 global scale and unused slot-alignment padding.
+            tma_store_1d_no_commit(
+                scales,
+                dst + kPayloadBytes + packedVec / kVectorsPerBlock,
+                scaleChunkBytes + (lastIter ? sizeof(int4) : 0));
+            tma_store_commit_group();
+        }
+    }
+};
+
 // Process and send a single token with TMA copy and optional RDMA
 template <
     bool kUseLogFMT,
+    ncclEpCombQuant_t kRecipe,
     int kHidden,
     int kNumSendUnrolls,
     int kNumStages,
@@ -1482,6 +1631,7 @@ template <
     typename GetNumTmaBytesT>
 __forceinline__ __device__ void processAndSendToken(
     int tokenIdx,
+    float globalScale,
     const int4* srcDataInt4Ptr,
     int4* sendBufInt4Ptr,
     uint64_t recvPtr,
@@ -1509,6 +1659,8 @@ __forceinline__ __device__ void processAndSendToken(
     int laneId,
     ncclDevComm* devComms,
     const ncclWindow_t* windows) {
+    EP_STATIC_ASSERT(kRecipe != NCCL_EP_COMB_QUANT_NVFP4 || !kUseLogFMT,
+                     "NVFP4 combine does not support LogFMT");
     constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
     const int kNumIters = hiddenBf16Int4Pad / (32 * kNumSendUnrolls);
 
@@ -1530,7 +1682,7 @@ __forceinline__ __device__ void processAndSendToken(
             const int& nextStageIdx = (iterIdx + 1) % kNumStages;
             if (iterIdx + 1 < kNumIters and elect_one_sync()) {
                 tma_store_wait<kNumStages - kNumPrefetch - 1>();
-                const auto& offsetInt4 = i + 32 * kNumSendUnrolls;
+                const auto offsetInt4 = i + 32 * kNumSendUnrolls;
                 tmaLoadAndArrive(nextStageIdx, copySrcPtr + offsetInt4, getNumTmaBytes(offsetInt4));
             }
             __syncwarp();
@@ -1538,7 +1690,20 @@ __forceinline__ __device__ void processAndSendToken(
             // Wait the current TMA arrival
             EP_STATIC_ASSERT(kNumStages < 32, "Too many stages");
             mbarrier_wait<true>(fullBarriers[stageIdx], tmaPhase, stageIdx);
-            if constexpr (kUseLogFMT) {
+
+            if constexpr (kRecipe != NCCL_EP_COMB_QUANT_NONE) {
+                const bool lastIter = iterIdx + 1 == kNumIters;
+                auto* smemData = reinterpret_cast<int4*>(tmaBuffers[stageIdx]);
+
+                CombineRecipeSendOps<kRecipe>::template quantizeTokenData<kHidden, kNumSendUnrolls>(
+                    smemData, kNumTMABufferBytes, globalScale, lastIter, laneId);
+                CombineRecipeSendOps<kRecipe>::template storeQuantizedTokenData<kHidden>(
+                    reinterpret_cast<uint8_t*>(smemData),
+                    reinterpret_cast<uint8_t*>(copyDstPtr),
+                    kNumTMABufferBytes,
+                    iterIdx * 32 * kNumSendUnrolls,
+                    lastIter);
+            } else if constexpr (kUseLogFMT) {
                 // Cast if possible
                 constexpr int kNumInt4PerDivision = 128 / kNumElemsPerInt4;
                 int numTmaBytes = logfmtEncode<kNumSendUnrolls>(
@@ -1590,10 +1755,98 @@ __forceinline__ __device__ void processAndSendToken(
     }
 }
 
-template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, ncclEpLayout_t kLayout, typename TopkIdxT,
-          ncclDataType_t kTokenDtype>
+// The arithmetic below mirrors DeepEP's extension_kernels.cu NVFP4 helpers.
+// Keep its operation order intact: quantization recipes are precision-sensitive.
+#if defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && \
+    (__CUDA_ARCH_FAMILY_SPECIFIC__ == 1000 || __CUDA_ARCH_FAMILY_SPECIFIC__ == 1100 || \
+     __CUDA_ARCH_FAMILY_SPECIFIC__ == 1200)
+__device__ __forceinline__ float nvfp4_rcp(float a) {
+    float b;
+    asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
+    return b;
+}
+
+__device__ __forceinline__ uint32_t nvfp4_pack_e2m1(
+    float (&v)[CombineRecipeTraits<NCCL_EP_COMB_QUANT_NVFP4>::kElementsPerVector]) {
+    uint32_t out;
+    asm volatile(
+        "{ .reg .b8 b0,b1,b2,b3;"
+        "cvt.rn.satfinite.e2m1x2.f32 b0,%2,%1; cvt.rn.satfinite.e2m1x2.f32 b1,%4,%3;"
+        "cvt.rn.satfinite.e2m1x2.f32 b2,%6,%5; cvt.rn.satfinite.e2m1x2.f32 b3,%8,%7;"
+        "mov.b32 %0,{b0,b1,b2,b3}; }"
+        : "=r"(out)
+        : "f"(v[0]), "f"(v[1]), "f"(v[2]), "f"(v[3]), "f"(v[4]), "f"(v[5]), "f"(v[6]), "f"(v[7]));
+    return out;
+}
+
+__device__ __forceinline__ void nvfp4_unpack_e2m1(
+    uint32_t in,
+    float (&v)[CombineRecipeTraits<NCCL_EP_COMB_QUANT_NVFP4>::kElementsPerVector]) {
+    uint32_t fp16[4];
+    asm volatile(
+        "{ .reg .b8 b0,b1,b2,b3; mov.b32 {b0,b1,b2,b3},%4;"
+        "cvt.rn.f16x2.e2m1x2 %0,b0; cvt.rn.f16x2.e2m1x2 %1,b1;"
+        "cvt.rn.f16x2.e2m1x2 %2,b2; cvt.rn.f16x2.e2m1x2 %3,b3; }"
+        : "=r"(fp16[0]), "=r"(fp16[1]), "=r"(fp16[2]), "=r"(fp16[3]) : "r"(in));
+    const float2 a = __half22float2(reinterpret_cast<__half2&>(fp16[0]));
+    const float2 b = __half22float2(reinterpret_cast<__half2&>(fp16[1]));
+    const float2 c = __half22float2(reinterpret_cast<__half2&>(fp16[2]));
+    const float2 d = __half22float2(reinterpret_cast<__half2&>(fp16[3]));
+    v[0]=a.x; v[1]=a.y; v[2]=b.x; v[3]=b.y; v[4]=c.x; v[5]=c.y; v[6]=d.x; v[7]=d.y;
+}
+#else
+__device__ __forceinline__ void nvfp4_unsupported_device() {
+    EP_DEVICE_ASSERT(false && "NVFP4 E2M1 requires an FP4 family target");
+}
+__device__ __forceinline__ float nvfp4_rcp(float a) {
+    nvfp4_unsupported_device();
+    return a;
+}
+__device__ __forceinline__ uint32_t nvfp4_pack_e2m1(
+    float (&)[CombineRecipeTraits<NCCL_EP_COMB_QUANT_NVFP4>::kElementsPerVector]) {
+    nvfp4_unsupported_device();
+    return 0;
+}
+__device__ __forceinline__ void nvfp4_unpack_e2m1(
+    uint32_t,
+    float (&v)[CombineRecipeTraits<NCCL_EP_COMB_QUANT_NVFP4>::kElementsPerVector]) {
+    nvfp4_unsupported_device();
+#pragma unroll
+    for (int i = 0; i < CombineRecipeTraits<NCCL_EP_COMB_QUANT_NVFP4>::kElementsPerVector; ++i) v[i] = 0.f;
+}
+#endif
+
+// LogFMT stores one BF16 min/max pair for each 128-element block.
+constexpr int kLogFmtElementsPerMeta = 128;
+
+template <int kHidden, int kNumUnrolls>
+__device__ __forceinline__ void decodeAndAccumulateNvfp4(
+    const uint8_t* slot,
+    int firstVec,
+    float globalReciprocal,
+    float weight,
+    float (&accum)[CombineRecipeTraits<NCCL_EP_COMB_QUANT_NVFP4>::kElementsPerVector * kNumUnrolls]) {
+    using Recipe = CombineRecipeTraits<NCCL_EP_COMB_QUANT_NVFP4>;
+    constexpr int kVectorsPerBlock = Recipe::kBlockSize / Recipe::kElementsPerVector;
+#pragma unroll
+    for (int unroll = 0; unroll < kNumUnrolls; ++unroll) {
+        const int vec = firstVec + unroll;
+        typename Recipe::scale_t scale;
+        scale.__x = slot[Recipe::template payload_bytes<kHidden>() + vec / kVectorsPerBlock];
+        typename Recipe::reduction_t values[Recipe::kElementsPerVector];
+        nvfp4_unpack_e2m1(reinterpret_cast<const uint32_t*>(slot)[vec], values);
+        const typename Recipe::reduction_t factor = static_cast<float>(scale) * globalReciprocal * weight;
+#pragma unroll
+        for (int j = 0; j < Recipe::kElementsPerVector; ++j) {
+            accum[unroll * Recipe::kElementsPerVector + j] += values[j] * factor;
+        }
+    }
+}
+
+template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, ncclEpLayout_t kLayout, typename TopkIdxT, ncclDataType_t kTokenDtype,
+          ncclEpCombQuant_t kRecipe>
 __device__ __forceinline__ void combine_kernel_impl( // INPUT
-  const void* inData, const int* srcInfo, const int64_t* layoutRange, const TopkIdxT* inTopkIdx,
+  const void* inData, const float* inGlobalScales, const int* srcInfo, const int64_t* layoutRange, const TopkIdxT* inTopkIdx,
   const float* topkWeights, int* rankMask, int* asyncErrorFlag,
   // OUTPUT
   void* outData,
@@ -1604,6 +1857,14 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
   int numCombinedTokens, int hidden, int numTopk, int maxTokensPerRank, int numExperts, int currRank, int numRanks,
   int numWarpGroups, int numWarpsPerGroup, int phases, bool zeroCopy, int numComms, ncclDevComm* devComms,
   const ncclWindow_t* windows, unsigned signalsBase, uint64_t timeoutCycles) {
+#if !defined(__CUDA_ARCH_FAMILY_SPECIFIC__) || \
+    (__CUDA_ARCH_FAMILY_SPECIFIC__ != 1000 && __CUDA_ARCH_FAMILY_SPECIFIC__ != 1100 && \
+     __CUDA_ARCH_FAMILY_SPECIFIC__ != 1200)
+    if constexpr (kRecipe == NCCL_EP_COMB_QUANT_NVFP4) {
+        nvfp4_unsupported_device();
+        return;
+    }
+#endif
     // Token dtype derivations
     constexpr int kElemBytes = (kTokenDtype == ncclFloat32) ? 4 : 2;
 
@@ -1621,22 +1882,41 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
 
     // Data type staffs
     constexpr int kNumElemsPerInt4 = sizeof(int4) / kElemBytes;
+    constexpr int kWarpSize = 32;
+    constexpr int kMaxSendUnrolls = 4;
     constexpr int64_t hiddenBf16Int4 = kHidden / kNumElemsPerInt4;
 
     // Use different unroll factors for send and recv phases
-    constexpr int kNumSendUnrolls = kHidden % (32 * 4 * sizeof(int4) / kElemBytes) == 0 ? 4 : 2;
+    constexpr int kNumSendUnrolls =
+        kHidden % (kWarpSize * kMaxSendUnrolls * kNumElemsPerInt4) == 0 ? kMaxSendUnrolls : 2;
     constexpr int kNumRecvUnrolls = 2;
-    constexpr int hiddenBf16Int4Pad = align(static_cast<int>(hiddenBf16Int4), 32 * kNumSendUnrolls);
-    EP_STATIC_ASSERT(kHidden % (32 * 2 * sizeof(int4) / kElemBytes) == 0, "Invalid hidden");
+    constexpr int hiddenBf16Int4Pad = align(static_cast<int>(hiddenBf16Int4), kWarpSize * kNumSendUnrolls);
+    EP_STATIC_ASSERT(kHidden % (kWarpSize * 2 * kNumElemsPerInt4) == 0, "Invalid hidden");
     EP_STATIC_ASSERT(kNumSendUnrolls <= kNumMaxUnrolls and kNumRecvUnrolls <= kNumMaxUnrolls, "Invalid unrolls");
     EP_STATIC_ASSERT(hiddenBf16Int4 % kNumSendUnrolls == 0, "Invalid hidden");
     EP_STATIC_ASSERT(kNumSendUnrolls >= kNumRecvUnrolls, "Invalid unroll factors");
 
     // Message package
-    EP_STATIC_ASSERT(kHidden % 128 == 0, "Invalid hidden");
-    constexpr int kNumDivisions = kHidden / 128;
-    constexpr int kNumMetaBytes = kNumDivisions * sizeof(nv_bfloat162);
-    constexpr size_t numBytesPerSlot = kHidden * kElemBytes + kNumMetaBytes;
+    using Recipe = CombineRecipeTraits<kRecipe>;
+    EP_STATIC_ASSERT(kRecipe != NCCL_EP_COMB_QUANT_NVFP4 || !kUseLogFMT,
+                     "NVFP4 combine does not support LogFMT");
+    EP_STATIC_ASSERT(kRecipe != NCCL_EP_COMB_QUANT_NVFP4 || kTokenDtype == ncclBfloat16,
+                     "NVFP4 combine requires BF16 input");
+    if constexpr (kRecipe == NCCL_EP_COMB_QUANT_NVFP4) {
+        EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumSendUnrolls * kNumElemsPerInt4) == 0,
+                         "NVFP4 combine requires whole send iterations");
+    }
+    EP_STATIC_ASSERT(kHidden % kLogFmtElementsPerMeta == 0, "Invalid hidden");
+    constexpr int kNumDivisions = kHidden / kLogFmtElementsPerMeta;
+    // Preserve the legacy NONE packet layout, including its metadata tail.
+    constexpr int kNumMetaBytes =
+        kRecipe == NCCL_EP_COMB_QUANT_NONE ? kNumDivisions * sizeof(nv_bfloat162) : 0;
+    constexpr size_t numBytesPerSlot = [] {
+        if constexpr (kRecipe == NCCL_EP_COMB_QUANT_NVFP4) {
+            return Recipe::template slot_bytes<kHidden>();
+        }
+        return static_cast<size_t>(kHidden * kElemBytes + kHidden / kLogFmtElementsPerMeta * sizeof(nv_bfloat162));
+    }();
     EP_STATIC_ASSERT(numBytesPerSlot % sizeof(int4) == 0, "Invalid vectorization");
 
     // Sending phase
@@ -1728,9 +2008,12 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
                     const auto expectedDstOffset = recvOff + rcvTokenOffset;
                     const auto dstP2pPtr =
                         ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComms);
+                    const float globalScale =
+                        kRecipe == NCCL_EP_COMB_QUANT_NVFP4 ? __ldg(inGlobalScales + offset) : 1.f;
 
-                    processAndSendToken<kUseLogFMT, kHidden, kNumSendUnrolls, kNumStages, kNumPrefetch>(
+                    processAndSendToken<kUseLogFMT, kRecipe, kHidden, kNumSendUnrolls, kNumStages, kNumPrefetch>(
                         tokenIdx,
+                        globalScale,
                         srcDataInt4Ptr,
                         sendBufInt4,
                         recvPtr,
@@ -1788,9 +2071,12 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
                     const auto expectedDstOffset = recvOff + rcvTokenOffset;
                     const auto dstP2pPtr =
                         ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComms);
+                    const float globalScale =
+                        kRecipe == NCCL_EP_COMB_QUANT_NVFP4 ? __ldg(inGlobalScales + slot) : 1.f;
 
-                    processAndSendToken<kUseLogFMT, kHidden, kNumSendUnrolls, kNumStages, kNumPrefetch>(
+                    processAndSendToken<kUseLogFMT, kRecipe, kHidden, kNumSendUnrolls, kNumStages, kNumPrefetch>(
                         tokenIdx,
+                        globalScale,
                         srcDataInt4Ptr,
                         sendBufPtr,
                         recvPtr,
@@ -1898,7 +2184,14 @@ LOW_LATENCY_COMBINE_RECV:
 
     if (groupIdx < numGroups) {
         constexpr int kNumStages = 3;
-        constexpr int kNumTMABufferBytes = 16 * 2 + kHidden * kElemBytes;
+        constexpr int kTmaBarrierBytes = 2 * sizeof(uint64_t);
+        constexpr int kTmaPaddingBytes = sizeof(int4);
+        constexpr int kNumTMABufferBytes = [] {
+            if constexpr (kRecipe == NCCL_EP_COMB_QUANT_NVFP4) {
+                return kTmaBarrierBytes + static_cast<int>(Recipe::template slot_bytes<kHidden>());
+            }
+            return kTmaBarrierBytes + kTmaPaddingBytes + kHidden * kElemBytes;
+        }();
         constexpr int kNumBF16PerWarpBytes = 32 * kNumRecvUnrolls * kNumElemsPerInt4 * kElemBytes;
         constexpr int kNumLogFMTPerWarpBytes = kNumBF16PerWarpBytes / 16 * 10;
         constexpr int kNumDivisionBytes = kNumDivisions * sizeof(uint32_t);
@@ -1975,16 +2268,23 @@ LOW_LATENCY_COMBINE_RECV:
                             laneId);
                     }
                     if (elect_one_sync()) {
-                        int numCasted = 0;
-                        if constexpr (kUseLogFMT) {
-                            const auto& info = castInfoBuffers[stageIdx][numDecodeWarps - 1];
-                            numCasted = (info >> 1) + (info & 1);
+                        int numTmaBytes;
+                        const uint8_t* tmaSrc = recvBufData;
+                        if constexpr (kRecipe == NCCL_EP_COMB_QUANT_NVFP4) {
+                            numTmaBytes = Recipe::template slot_bytes<kHidden>();
+                        } else {
+                            int numCasted = 0;
+                            if constexpr (kUseLogFMT) {
+                                const auto& info = castInfoBuffers[stageIdx][numDecodeWarps - 1];
+                                numCasted = (info >> 1) + (info & 1);
+                            }
+                            numTmaBytes =
+                                numCasted * kNumLogFMTPerWarpBytes + (numDecodeWarps - numCasted) * kNumBF16PerWarpBytes;
+                            tmaSrc += kUseLogFMT ? kNumMetaBytes : 0;
                         }
-                        int numTmaBytes =
-                            numCasted * kNumLogFMTPerWarpBytes + (numDecodeWarps - numCasted) * kNumBF16PerWarpBytes;
                         tma_load_1d(
                             tmaLdBuffers[stageIdx],
-                            recvBufData + (kUseLogFMT ? kNumMetaBytes : 0),
+                            tmaSrc,
                             fullBarriers[stageIdx],
                             numTmaBytes);
                         mbarrier_arrive_and_expect_tx(fullBarriers[stageIdx], numTmaBytes);
@@ -2024,7 +2324,22 @@ LOW_LATENCY_COMBINE_RECV:
                     }
 
                     mbarrier_wait<true>(fullBarriers[stageIdx], tmaPhase, stageIdx);
-                    if constexpr (kUseLogFMT) {
+                    if constexpr (kRecipe == NCCL_EP_COMB_QUANT_NVFP4) {
+                        const uint8_t* slot = tmaLdBuffers[stageIdx];
+                        float globalReciprocal = 1.f;
+                        if (laneId == 0) {
+                            const float globalScale =
+                            *reinterpret_cast<const typename Recipe::global_scale_t*>(
+                                slot + Recipe::template payload_bytes<kHidden>() +
+                                Recipe::template scale_bytes<kHidden>());
+                            globalReciprocal = 1.f / globalScale;
+                            if (__isinf(globalReciprocal)) globalReciprocal = 1.f;
+                        }
+                        globalReciprocal = __shfl_sync(0xffffffff, globalReciprocal, 0);
+                        const int firstVec = (decodeWarpIdx * 32 + laneId) * kNumRecvUnrolls;
+                        decodeAndAccumulateNvfp4<kHidden, kNumRecvUnrolls>(
+                            slot, firstVec, globalReciprocal, topkWeight, combinedData);
+                    } else if constexpr (kUseLogFMT) {
                         const auto& info = castInfoBuffers[stageIdx][decodeWarpIdx];
                         bool enableCast = info & 1;
                         int numCastedPrefix = info >> 1;

@@ -490,6 +490,10 @@ typedef struct {
     ncclEpTensor_t* tokens; // required; post-expert activation tensor
     ncclEpTensor_t* topk_weights; // optional; HT backward combine only:
   //   2D [num_recv_tokens, top_k], ncclFloat32
+    // Experimental NVFP4 combine only: FP32 per-expert-token global quantization scales.
+    // For each valid token row, pass 2688 / amax(abs(tokens[row, :])); use 0 when amax is 0.
+    // This scale is computed from the post-expert activation before ncclEpCombine.
+    ncclEpTensor_t* scales;
 } ncclEpCombineInputs_t;
 
 #define NCCL_EP_COMBINE_INPUTS_INIT \
@@ -499,11 +503,14 @@ typedef struct {
 
 #define NCCL_EP_COMBINE_INPUTS_V1_LAST_FIELD topk_weights
 #define NCCL_EP_COMBINE_INPUTS_V1_SIZE 24u
+#define NCCL_EP_COMBINE_INPUTS_V2_LAST_FIELD scales
+#define NCCL_EP_COMBINE_INPUTS_V2_SIZE 32u
 
-#define NCCL_EP_COMBINE_INPUTS_CURRENT_VERSION 1
+#define NCCL_EP_COMBINE_INPUTS_CURRENT_VERSION 2
 
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpCombineInputs_t, NCCL_EP_COMBINE_INPUTS);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpCombineInputs_t, NCCL_EP_COMBINE_INPUTS, 1);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpCombineInputs_t, NCCL_EP_COMBINE_INPUTS, 2);
 
 // Output tensors for ncclEpCombine.
 // All fields except tokens are optional (NULL = not provided). Each field is a
@@ -776,9 +783,12 @@ typedef enum {
 } ncclEpDispQuant_t;
 
 typedef enum {
-    // Combine currently supports only unquantized token transport. Future
-    // recipes must document their HT and LL semantics alongside dispatch.
     NCCL_EP_COMB_QUANT_NONE = 0,
+    // EXPERIMENTAL: LL-only BF16 expert-output transport. Its API contract,
+    // supported shapes, and numerical behavior may change before graduation.
+    // The caller supplies FP32 global scales through combine inputs->scales;
+    // the kernel follows the DeepEP-LL NVFP4 pack/dequantize contract.
+    NCCL_EP_COMB_QUANT_NVFP4 = 1,
 } ncclEpCombQuant_t;
 
 // EP dispatch configuration structure
@@ -895,7 +905,7 @@ typedef struct {
     //   FWD forbids inputs->topk_weights; BWD requires inputs->topk_weights
     //   and outputs->topk_weights.
     // New fields must be appended here to keep existing field offsets stable for ABI compatibility.
-    ncclEpCombQuant_t quant_recipe; // NONE by default; reserved recipes validate future combine support
+    ncclEpCombQuant_t quant_recipe; // NONE by default; see recipe documentation above
 } ncclEpCombineConfig_t;
 
 #define NCCL_EP_COMBINE_CONFIG_INIT \

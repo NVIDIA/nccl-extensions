@@ -79,8 +79,18 @@
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 #include <cuda_bf16.h>
+#if defined(__has_include)
+#if __has_include(<cuda_fp4.h>)
+#include <cuda_fp4.h>
+#define NCCL_EP_HAS_CUDA_FP4_TYPES 1
+#endif
+#endif
+#ifndef NCCL_EP_HAS_CUDA_FP4_TYPES
+#define NCCL_EP_HAS_CUDA_FP4_TYPES 0
+#endif
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include "nccl.h"
@@ -89,6 +99,26 @@
 #include "ep_enums.h"
 
 namespace nccl_ep {
+
+inline constexpr std::string_view host_device_fp4_target_arch(unsigned int sm) {
+    switch (sm) {
+    case 100:
+    case 103: return "sm_100f";
+    case 110: return "sm_110f";
+    case 120:
+    case 121: return "sm_120f";
+    default: return {};
+    }
+}
+
+inline constexpr bool host_device_supports_fp4(unsigned int sm) {
+    return !host_device_fp4_target_arch(sm).empty();
+}
+
+// cuda_fp4.h first ships in CUDA 12.8, but NVFP4 family targets require CUDA 12.9.
+inline constexpr bool host_build_supports_fp4() {
+    return NCCL_EP_HAS_CUDA_FP4_TYPES && CUDART_VERSION >= 12090;
+}
 
 constexpr int kDsFp8E3M4ElementsPerScale = 128;
 

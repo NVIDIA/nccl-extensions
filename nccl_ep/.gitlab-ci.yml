@@ -483,6 +483,7 @@ integration_test_pretyche:
     SLURM_ACCOUNT: "coreai_libraries_nccl"
     SLURM_TIME: "60"
     NCCL_EP_BENCH_HT: "1"
+    NCCL_EP_BENCH_NVFP4: "1"
   script:
     - |
       set -euxo pipefail

@@ -32,6 +32,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <new>
 #include <vector>
 
 #include "cuda_runtime.h"
@@ -755,6 +756,7 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   void* effSrcBuffer = srcBuffer;
   void* effDstBuffer = dstBuffer;
   ncclWindow_t effWindow = window;
+  TransposeBufferEventGuard transposeEvent;
 
   size_t dstMeshSize = 0;
   NCCL_M2N_CHECK(computeReshardMeshSize(dstMesh, worldRank, &dstMeshSize));
@@ -835,6 +837,7 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
     }
     size_t myLocalSize = std::max(srcLocal, dstLocal);
     NCCL_M2N_CHECK(ensureTransposeBuffer(comm, myLocalSize, workStream));
+    transposeEvent.arm(comm, workStream);
 
     {
       cudaError_t err = cudaGetLastError();
@@ -983,7 +986,7 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   }
 
   if (doTranspose) {
-    NCCL_M2N_CHECK(transposeBufferRecordEvent(comm, workStream));
+    NCCL_M2N_CHECK(transposeEvent.record());
   }
 
   return workCompletion.complete();

@@ -104,7 +104,7 @@ void resetReshardRuntimeConfig() {
   gReshardDstDomainSize = 0;
   gReshardAlgorithm = RESHARD_ALGO_AUTO;
   gReshardLbMode = RESHARD_LB_UNIFORM;
-  gReshardCopyAlgorithm = RESHARD_COPY_ALGO_DIRECT;
+  gReshardCopyAlgorithm = RESHARD_COPY_ALGO_PACKWINDOW;
   gReshardAutoUniformBcast = true;
   gReshardAutoUniformBcastSet = false;
   gReshardSplitComm = true;

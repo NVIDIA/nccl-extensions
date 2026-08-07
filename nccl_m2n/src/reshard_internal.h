@@ -404,9 +404,86 @@ struct ReshardDevCommCacheKey {
   }
 };
 
-ncclDevComm* findCachedDevComm(const ReshardDevCommCacheKey& key);
+/* Present only in user-stream mode, where it serializes event reuse and
+ * quarantines an entry if neither the event nor its stream can provide a
+ * completion fence. */
+struct ReshardDevCommUseState {
+  std::mutex mutex;
+  bool bSerializeUses = true;
+  bool bPoisoned = false;
+};
+
+/* Token threaded from DevComm acquisition to the point where the caller has
+ * finished enqueuing work on it. Holding the API lock keeps other host calls
+ * out, but it says nothing about kernels already in flight, so the completion
+ * event is what makes eviction and finalize safe. */
+struct ReshardDevCommUse {
+  cudaEvent_t completionEvent = nullptr;
+  std::shared_ptr<ReshardDevCommUseState> state;
+  std::unique_lock<std::mutex> reservation;
+};
+
+ncclDevComm* findCachedDevComm(const ReshardDevCommCacheKey& key,
+                               cudaEvent_t* outCompletionEvent = nullptr,
+                               std::shared_ptr<ReshardDevCommUseState>* outUseState = nullptr);
 
 ncclResult_t cacheDevComm(const ReshardDevCommCacheKey& key, const ncclDevComm* devComm);
+
+/* Records `event` on `stream`. If the record fails the work may already be
+ * enqueued, so the stream is synchronized before the resource can be reused;
+ * if that also fails there is no way left to prove completion and the epoch is
+ * quarantined. */
+ncclResult_t reshardRecordCompletionEvent(cudaEvent_t event, cudaStream_t stream, const char* resource,
+                                          bool* poisoned = nullptr);
+
+bool reshardResourcesNeedQuarantine();
+void reshardRequireResourceQuarantine();
+void reshardClearResourceQuarantine();
+
+inline ncclResult_t reshardPrepareDevCommUse(cudaEvent_t completionEvent,
+                                             const std::shared_ptr<ReshardDevCommUseState>& state,
+                                             cudaStream_t stream, ReshardDevCommUse* use) {
+  use->completionEvent = completionEvent;
+  use->state = state;
+  if (state != nullptr) {
+    NCCL_M2N_CHECK_ARG(completionEvent != nullptr, -1, "DevComm use state has no completion event");
+    if (state->bSerializeUses) {
+      M2nApiUnlock apiUnlock;
+      use->reservation = std::unique_lock<std::mutex>(state->mutex);
+    }
+    if (state->bPoisoned) {
+      if (use->reservation.owns_lock()) {
+        use->reservation.unlock();
+      }
+      use->state.reset();
+      NCCL_M2N_FAIL(ncclSystemError, -1,
+                    "DevComm is unavailable after its completion stream could not be synchronized");
+    }
+    if (state->bSerializeUses) {
+      NCCL_M2N_CUDACHECK(cudaStreamWaitEvent(stream, completionEvent, 0));
+    }
+  }
+  return ncclSuccess;
+}
+
+inline ncclResult_t reshardRecordDevCommUse(ReshardDevCommUse* use, cudaStream_t stream) {
+  if (use->completionEvent != nullptr) {
+    const ncclResult_t result = reshardRecordCompletionEvent(
+      use->completionEvent, stream, "DevComm", use->state != nullptr ? &use->state->bPoisoned : nullptr);
+    if (use->reservation.owns_lock()) {
+      use->reservation.unlock();
+    }
+    use->state.reset();
+    use->completionEvent = nullptr;
+    return result;
+  }
+  return ncclSuccess;
+}
+
+#ifdef NCCL_M2N_TESTING
+void reshardFailNextCompletionEventRecordForTest(bool bFailStreamSynchronize = false);
+void reshardFailNextCacheEventSynchronizeForTest();
+#endif
 
 ncclWindow_t* findCachedInternalWindowByPtr(ncclComm_t comm, void* buffer, size_t size);
 

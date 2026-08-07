@@ -310,6 +310,9 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
 
   /* Get/create a devComm sized for the staging kernel's actual resource needs. */
   ncclDevComm* devCommPtr = nullptr;
+  ReshardDevCommUse devCommUse;
+  cudaEvent_t devCommCompletionEvent = nullptr;
+  std::shared_ptr<ReshardDevCommUseState> devCommUseState;
   ncclDevComm localDevComm;
   {
     StagingProfileScope profileScope(profile.get(), STAGING_PROFILE_GET_DEV_COMM);
@@ -317,7 +320,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
       comm, staging_num_ctas, params.ginSignalCount, params.ginCounterCount, staging_num_ctas,
       RESHARD_DEVCOMM_BARRIER_WORLD
     };
-    devCommPtr = findCachedDevComm(devCommKey);
+    devCommPtr = findCachedDevComm(devCommKey, &devCommCompletionEvent, &devCommUseState);
     if (devCommPtr == nullptr) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
       ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
@@ -345,11 +348,12 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
         NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, &localDevComm));
       }
       NCCL_M2N_CHECK(cacheDevComm(devCommKey, &localDevComm));
-      devCommPtr = findCachedDevComm(devCommKey);
+      devCommPtr = findCachedDevComm(devCommKey, &devCommCompletionEvent, &devCommUseState);
       if (devCommPtr == nullptr) {
         devCommPtr = &localDevComm;
       }
     }
+    NCCL_M2N_CHECK(reshardPrepareDevCommUse(devCommCompletionEvent, devCommUseState, workStream, &devCommUse));
   }
 
   RESHARD_INFO(world_rank,
@@ -378,11 +382,16 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
     paramsOwner.release();
   }
 
+  /* Fence the DevComm whether or not the launch succeeded: a failed launch can
+   * still have enqueued work behind it. */
+  const ncclResult_t devCommUseResult = reshardRecordDevCommUse(&devCommUse, workStream);
+
   if (launchResult != ncclSuccess) {
     NCCL_M2N_CHECK_WARN(stagingBufferPoolRecordEvent(comm, workStream));
     NCCL_M2N_CHECK_WARN(workCompletion.complete());
     return launchResult;
   }
+  NCCL_M2N_CHECK(devCommUseResult);
 
   if (profile != nullptr) {
     profile->log(world_rank);

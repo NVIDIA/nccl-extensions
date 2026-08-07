@@ -777,8 +777,9 @@ static ncclResult_t createKernelDevComm(ncclComm_t comm, int numCtas, int signal
 
 ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stagingBuffer, size_t stagingCapacity,
                                          int numCtas, int ginSignalCountA, int signalsPerSlotB, int ctxPerSlotB,
-                                         int maxConcurrency, ncclWindow_t* outWindowA, ncclWindow_t* outWindowB,
-                                         ncclDevComm* outDevCommA, ncclDevComm* outDevCommB) {
+                                         int maxConcurrency, cudaStream_t stream, ncclWindow_t* outWindowA,
+                                         ncclWindow_t* outWindowB, ncclDevComm* outDevCommA,
+                                         ReshardDevCommUse* outDevCommAUse, ncclDevComm* outDevCommB) {
   NCCL_M2N_CHECK_ARG(sc != nullptr && stagingBuffer != nullptr, -1,
                      "reshardSplitEnsureResources: split state and staging buffer must be non-null");
   if (outWindowA != nullptr) *outWindowA = nullptr;
@@ -811,7 +812,9 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
                                         /*ginCounterCount=*/0,
                                         ginContextCount,
                                         RESHARD_DEVCOMM_BARRIER_HYBRID};
-    ncclDevComm* dc = findCachedDevComm(key);
+    cudaEvent_t completionEventA = nullptr;
+    std::shared_ptr<ReshardDevCommUseState> useStateA;
+    ncclDevComm* dc = findCachedDevComm(key, &completionEventA, &useStateA);
     ncclDevComm localA;
     if (dc == nullptr) {
       SP_NCCLCHECK(createKernelDevComm(sc->commA, numCtas, ginSignalCountA, NCCL_GIN_CONNECTION_FULL, ginContextCount,
@@ -821,11 +824,14 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
         NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(sc->commA, &localA));
         return cacheResult;
       }
-      dc = findCachedDevComm(key);
+      dc = findCachedDevComm(key, &completionEventA, &useStateA);
       NCCL_M2N_CHECK_ARG(dc != nullptr, sc->parentRank,
                          "reshardSplitEnsureResources: newly cached commA DevComm was not found");
     }
     if (outDevCommA != nullptr) *outDevCommA = *dc;
+    if (outDevCommAUse != nullptr) {
+      NCCL_M2N_CHECK(reshardPrepareDevCommUse(completionEventA, useStateA, stream, outDevCommAUse));
+    }
   }
 
   /* commB (RAIL): all generator ranks. Its kernel DevComm is cached for this

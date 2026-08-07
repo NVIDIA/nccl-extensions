@@ -102,15 +102,16 @@ ncclResult_t reshardComputeStagingGinCounts(int logRank, int numCtas, size_t max
 
 ncclResult_t reshardGetOrCreateDevComm(ncclComm_t comm, int numCtas, int ginSignalCount, int ginCounterCount,
                                        ReshardDevCommBarrierKind barrierKind, int ginContextCount, cudaStream_t stream,
-                                       ncclDevComm* activeDevComm) {
-  NCCL_M2N_CHECK_ARG(activeDevComm != nullptr, -1,
-                     "reshardGetOrCreateDevComm: output DevComm must be non-null");
-  (void)stream;
+                                       ncclDevComm* activeDevComm, ReshardDevCommUse* use) {
+  NCCL_M2N_CHECK_ARG(activeDevComm != nullptr && use != nullptr, -1,
+                     "reshardGetOrCreateDevComm: output DevComm and use token must be non-null");
+  cudaEvent_t completionEvent = nullptr;
+  std::shared_ptr<ReshardDevCommUseState> useState;
   const ReshardDevCommCacheKey key = {comm, numCtas, ginSignalCount, ginCounterCount, ginContextCount, barrierKind};
-  ncclDevComm* devComm = findCachedDevComm(key);
+  ncclDevComm* devComm = findCachedDevComm(key, &completionEvent, &useState);
   if (devComm != nullptr) {
     *activeDevComm = *devComm;
-    return ncclSuccess;
+    return reshardPrepareDevCommUse(completionEvent, useState, stream, use);
   }
 
   ncclDevComm localDevComm = {};
@@ -137,8 +138,8 @@ ncclResult_t reshardGetOrCreateDevComm(ncclComm_t comm, int numCtas, int ginSign
     }
     return cacheResult;
   }
-  devComm = findCachedDevComm(key);
+  devComm = findCachedDevComm(key, &completionEvent, &useState);
   NCCL_M2N_CHECK_ARG(devComm != nullptr, -1, "reshardGetOrCreateDevComm: newly cached DevComm was not found");
   *activeDevComm = *devComm;
-  return ncclSuccess;
+  return reshardPrepareDevCommUse(completionEvent, useState, stream, use);
 }

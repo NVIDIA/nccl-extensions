@@ -183,10 +183,14 @@ __global__ __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void reshardKernelU
           size_t myStart = blockIdx.x * bytesPerCta;
           size_t myEnd = min(myStart + bytesPerCta, totalSize);
 
-          if (myStart < totalSize && laneId == 0) {
-            gin.put(world, target.dstWorldRank, params.window, target.windowOffset + plan.dstBaseOffset + myStart,
-                    params.window, params.myWindowOffset + plan.srcBaseOffset + myStart, myEnd - myStart,
-                    ncclGin_SignalInc{signalIdx});
+          if (laneId == 0) {
+            if (myStart < totalSize) {
+              gin.put(world, target.dstWorldRank, params.window, target.windowOffset + plan.dstBaseOffset + myStart,
+                      params.window, params.myWindowOffset + plan.srcBaseOffset + myStart, myEnd - myStart,
+                      ncclGin_SignalInc{signalIdx});
+            } else {
+              gin.signal(world, target.dstWorldRank, ncclGin_SignalInc{signalIdx});
+            }
           }
         } else {
           size_t itersPerCta = (plan.totalInnerTransfers + params.totalCtas - 1) / params.totalCtas;
@@ -254,6 +258,8 @@ __global__ __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void reshardKernelU
                     params.ringNextWindowOffset + plan.dstBaseOffset + myStart, params.window,
                     params.myWindowOffset + plan.dstBaseOffset + myStart, myEnd - myStart,
                     ncclGin_SignalInc{signalIdx});
+          } else {
+            gin.signal(world, params.ringNextWorldRank, ncclGin_SignalInc{signalIdx});
           }
         }
 

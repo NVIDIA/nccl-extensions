@@ -653,6 +653,29 @@ static void emit1dTensorSizeSensitivity(std::vector<TestCase>& cases) {
  *              Shard(innermost) with >INT32_MAX global elements.
  * ====================================================================*/
 
+static void emitTinyContribution(std::vector<TestCase>& cases) {
+  /* Every CTA must signal even when a transfer contribution is smaller than
+   * the configured CTA count. Full replication keeps each contribution at
+   * exactly four bytes regardless of the allocation size. */
+  TestCase tc{};
+  tc.group = "tiny_contribution";
+  tc.ndims = 1;
+  tc.globalDims[0] = 4;
+  tc.globalDims[1] = 1;
+  tc.globalDims[2] = 1;
+  tc.srcDim0 = 0;
+  tc.dstDim0 = 0;
+  tc.srcShardDim = -1;
+  tc.dstShardDim = -1;
+  tc.srcPl = PL_REPL;
+  tc.dstPl = PL_REPL;
+  tc.elementSize = 1;
+  tc.worldMin = 4;
+  tc.worldDivisor = 2;
+  tc.name = buildCaseName(tc);
+  cases.push_back(std::move(tc));
+}
+
 static void emitCrossDimRegression(std::vector<TestCase>& cases) {
   /* issue !5: 2D mesh 2x4, sd=0/1, four placement permutations.
    * worldMin = src_shards * dst_shards = 2 * 4 = 8 (even split → /2). */
@@ -748,6 +771,7 @@ static std::vector<TestCase> buildAllTestCases() {
   emit1dTensorSizeSensitivity(cases);
   /* Targeted regression coverage for historical cross-dim bugs. */
   emitCrossDimRegression(cases);
+  emitTinyContribution(cases);
   return cases;
 }
 

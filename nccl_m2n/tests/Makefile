@@ -84,12 +84,15 @@ $(BINDIR)/basic_api_test_mpi: $(TEST_MPI_SRCS) $(GTEST_A) \
 	    $(TEST_MPI_SRCS) $(GTEST_A) $(M2N_CLIENT_LDFLAGS) $(BENCH_LDFLAGS) -lpthread
 	@printf "Done! Test binary at: $@\n"
 
-$(BINDIR)/basic_api_test_local: $(TEST_LOCAL_SRCS) $(GTEST_A) \
-                                $(M2N_LIBTARGET) $(LIB_HDRS) $(TEST_HDRS)
+# basic_api_test_local exercises library-internal symbols, including the
+# NCCL_M2N_TESTING-only reshardTestBroadcastMaxInt, so link the library sources
+# directly (same pattern as tests/ci/unit_tests) instead of -lnccl_m2n.
+$(BINDIR)/basic_api_test_local: $(TEST_LOCAL_SRCS) $(LIB_SRCS) $(GTEST_A) \
+                                $(LIB_HDRS) $(TEST_HDRS)
 	@printf "Building basic_api_test_local (gtest, no MPI, GTEST_DIR=$(GTEST_DIR))...\n"
 	@mkdir -p $(BINDIR)
-	$(NVCC) -o $@ $(NVCUFLAGS) -I$(TESTSDIR) -I$(GTEST_INC) \
-	    $(TEST_LOCAL_SRCS) $(GTEST_A) $(M2N_CLIENT_LDFLAGS) $(LIB_LDFLAGS) -lpthread
+	$(NVCC) -o $@ $(NVCUFLAGS) -DNCCL_M2N_TESTING -I$(TESTSDIR) -I$(GTEST_INC) \
+	    $(TEST_LOCAL_SRCS) $(LIB_SRCS) $(GTEST_A) $(LIB_LDFLAGS) -lpthread -ldl
 	@printf "Done! Test binary at: $@\n"
 
 clean:

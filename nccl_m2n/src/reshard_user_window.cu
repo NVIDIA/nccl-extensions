@@ -655,7 +655,10 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
   const ReshardDevCommCacheKey devCommKey = {
     comm, numCtas, ginSignalCount, 0, reshardGetGinContextCount(), barrierKind
   };
-  ncclDevComm* devCommPtr = findCachedDevComm(devCommKey);
+  ReshardDevCommUse devCommUse;
+  cudaEvent_t devCommCompletionEvent = nullptr;
+  std::shared_ptr<ReshardDevCommUseState> devCommUseState;
+  ncclDevComm* devCommPtr = findCachedDevComm(devCommKey, &devCommCompletionEvent, &devCommUseState);
   ncclDevComm localDevComm;
   if (devCommPtr == nullptr) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
@@ -684,9 +687,10 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
       NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, &localDevComm));
     }
     NCCL_M2N_CHECK(cacheDevComm(devCommKey, &localDevComm));
-    devCommPtr = findCachedDevComm(devCommKey);
+    devCommPtr = findCachedDevComm(devCommKey, &devCommCompletionEvent, &devCommUseState);
     if (devCommPtr == nullptr) devCommPtr = &localDevComm;
   }
+  NCCL_M2N_CHECK(reshardPrepareDevCommUse(devCommCompletionEvent, devCommUseState, workStream, &devCommUse));
 
   const int lsaSizeFromComm = (devCommPtr->lsaSize > 0) ? devCommPtr->lsaSize : 0;
   const int gpusPerNode = reshardGetGpusPerNode();
@@ -989,6 +993,7 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
     NCCL_M2N_CHECK(transposeEvent.record());
   }
 
+  NCCL_M2N_CHECK(reshardRecordDevCommUse(&devCommUse, workStream));
   return workCompletion.complete();
 }
 
@@ -1411,6 +1416,9 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
     comm, numCtas, ginSignalCount, 0, reshardGetGinContextCount(), RESHARD_DEVCOMM_BARRIER_HYBRID
   };
   ncclDevComm* devComm = nullptr;
+  ReshardDevCommUse devCommUse;
+  cudaEvent_t devCommCompletionEvent = nullptr;
+  std::shared_ptr<ReshardDevCommUseState> devCommUseState;
   ncclDevComm localDevComm;
   int srcLsaSize = 0;
   int dstLsaSize = 0;
@@ -1418,7 +1426,7 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
     srcLsaSize = splitComms.srcLsaSize;
     dstLsaSize = splitComms.lsaSize;
   } else {
-    devComm = findCachedDevComm(devCommKey);
+    devComm = findCachedDevComm(devCommKey, &devCommCompletionEvent, &devCommUseState);
   }
   if (!splitActive && devComm == nullptr) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
@@ -1446,8 +1454,11 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
       NCCL_M2N_CHECK(ncclDevCommCreate(comm, &requirements, &localDevComm));
     }
     NCCL_M2N_CHECK(cacheDevComm(devCommKey, &localDevComm));
-    devComm = findCachedDevComm(devCommKey);
+    devComm = findCachedDevComm(devCommKey, &devCommCompletionEvent, &devCommUseState);
     if (devComm == nullptr) devComm = &localDevComm;
+  }
+  if (!splitActive) {
+    NCCL_M2N_CHECK(reshardPrepareDevCommUse(devCommCompletionEvent, devCommUseState, workStream, &devCommUse));
   }
 
   if (!splitActive) {
@@ -1593,6 +1604,7 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
     }
   }
 
+  NCCL_M2N_CHECK(reshardRecordDevCommUse(&devCommUse, workStream));
   NCCL_M2N_CHECK(stagingEvent.record());
   return ncclSuccess;
 }
@@ -1764,8 +1776,9 @@ static ncclResult_t reshardCopyPackWindowGroupNormalized(ncclComm_t comm, const 
   }
 
   ncclDevComm activeDevComm;
+  ReshardDevCommUse devCommUse;
   NCCL_M2N_CHECK(reshardGetOrCreateDevComm(comm, numCtas, ginSignalCount, 0, RESHARD_DEVCOMM_BARRIER_HYBRID,
-                                           reshardGetGinContextCount(), workStream, &activeDevComm));
+                                           reshardGetGinContextCount(), workStream, &activeDevComm, &devCommUse));
   const int lsaSize = activeDevComm.lsaSize > 0 ? activeDevComm.lsaSize : 0;
   int srcGpusPerDomain = 0;
   int dstGpusPerDomain = 0;
@@ -1976,6 +1989,7 @@ static ncclResult_t reshardCopyPackWindowGroupNormalized(ncclComm_t comm, const 
     }
   }
 
+  NCCL_M2N_CHECK(reshardRecordDevCommUse(&devCommUse, workStream));
   NCCL_M2N_CHECK(stagingEvent.record());
   return ncclSuccess;
 }

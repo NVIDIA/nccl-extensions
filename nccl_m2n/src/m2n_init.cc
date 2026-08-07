@@ -98,6 +98,9 @@ static void resolveNumCtas() {
 }
 
 static ncclResult_t initializeRuntimeForFirstHandle(const ncclM2nHandleState* handle) {
+  /* A quarantine only outlives the epoch that raised it. The previous epoch's
+   * caches are gone by now, so a fresh one starts clean. */
+  reshardClearResourceQuarantine();
   resetReshardRuntimeConfig();
   applyReshardConfig(&handle->config);
   applyReshardEnv();

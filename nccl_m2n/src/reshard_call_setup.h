@@ -59,7 +59,7 @@ ncclResult_t reshardComputeStagingGinCounts(int logRank, int numCtas, size_t max
 
 ncclResult_t reshardGetOrCreateDevComm(ncclComm_t comm, int numCtas, int ginSignalCount, int ginCounterCount,
                                        ReshardDevCommBarrierKind barrierKind, int ginContextCount, cudaStream_t stream,
-                                       ncclDevComm* activeDevComm);
+                                       ncclDevComm* activeDevComm, ReshardDevCommUse* use);
 
 static inline ncclResult_t reshardRejectGraphCapture(const char* apiName, cudaStream_t stream) {
   cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;

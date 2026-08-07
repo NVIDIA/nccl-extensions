@@ -28,6 +28,13 @@ struct DevCommCacheEntry {
   ReshardDevCommCacheKey key;
   bool valid;
   ncclDevComm devComm;
+  /* Recorded after each launch that used this DevComm, so retirement can prove
+   * the GPU is done with it rather than inferring it from host-call state.
+   * useState is present only in user-stream mode, where it serializes event
+   * reuse and quarantines an entry if neither the event nor its stream can
+   * provide a completion fence. */
+  cudaEvent_t completionEvent;
+  std::shared_ptr<ReshardDevCommUseState> useState;
 };
 
 /* One pool entry per (comm, dev) — a non-blocking stream paired with
@@ -53,6 +60,101 @@ static int gDevcommCacheNextIdx = 0;
  * The vector itself just owns memory; handles inside it are released
  * explicitly there before the vector is cleared. */
 static std::vector<StreamPoolEntry> gStreamPool;
+
+#ifdef NCCL_M2N_TESTING
+static bool gFailNextCompletionEventRecordForTest = false;
+static bool gFailNextCompletionStreamSynchronizeForTest = false;
+static bool gFailNextCacheEventSynchronizeForTest = false;
+#endif
+
+/* Without a valid fence, quarantine the whole runtime epoch because cached GPU
+ * resources may still be in use. */
+static bool gReshardResourceQuarantineRequired = false;
+
+static cudaError_t recordEvent(cudaEvent_t event, cudaStream_t stream) {
+#ifdef NCCL_M2N_TESTING
+  if (gFailNextCompletionEventRecordForTest) {
+    gFailNextCompletionEventRecordForTest = false;
+    return cudaErrorUnknown;
+  }
+#endif
+  return cudaEventRecord(event, stream);
+}
+
+static cudaError_t synchronizeStream(cudaStream_t stream) {
+#ifdef NCCL_M2N_TESTING
+  if (gFailNextCompletionStreamSynchronizeForTest) {
+    gFailNextCompletionStreamSynchronizeForTest = false;
+    return cudaErrorUnknown;
+  }
+#endif
+  return cudaStreamSynchronize(stream);
+}
+
+static cudaError_t synchronizeEvent(cudaEvent_t event) {
+#ifdef NCCL_M2N_TESTING
+  if (gFailNextCacheEventSynchronizeForTest) {
+    gFailNextCacheEventSynchronizeForTest = false;
+    return cudaErrorUnknown;
+  }
+#endif
+  return cudaEventSynchronize(event);
+}
+
+/* An armed injection that its test never reached would otherwise fire inside
+ * whatever ran next. Teardown disarms them all. */
+static void resetCompletionFailureInjection() {
+#ifdef NCCL_M2N_TESTING
+  gFailNextCompletionEventRecordForTest = false;
+  gFailNextCompletionStreamSynchronizeForTest = false;
+  gFailNextCacheEventSynchronizeForTest = false;
+#endif
+}
+
+ncclResult_t reshardRecordCompletionEvent(cudaEvent_t event, cudaStream_t stream, const char* resource,
+                                          bool* poisoned) {
+  const cudaError_t recordResult = recordEvent(event, stream);
+  if (recordResult == cudaSuccess) {
+    return ncclSuccess;
+  }
+
+  // Work may already be enqueued. Fence it before allowing resource reuse.
+  const cudaError_t syncResult = synchronizeStream(stream);
+  if (syncResult != cudaSuccess) {
+    gReshardResourceQuarantineRequired = true;
+    if (poisoned != nullptr) {
+      *poisoned = true;
+    }
+    NCCL_M2N_FAIL(ncclSystemError, -1, "Failed to record %s completion event (%s) and synchronize its stream (%s)",
+                  resource, cudaGetErrorString(recordResult), cudaGetErrorString(syncResult));
+  }
+  NCCL_M2N_FAIL(ncclSystemError, -1,
+                "Failed to record %s completion event: %s; synchronized its stream before reuse", resource,
+                cudaGetErrorString(recordResult));
+}
+
+#ifdef NCCL_M2N_TESTING
+void reshardFailNextCompletionEventRecordForTest(bool bFailStreamSynchronize) {
+  gFailNextCompletionEventRecordForTest = true;
+  gFailNextCompletionStreamSynchronizeForTest = bFailStreamSynchronize;
+}
+
+void reshardFailNextCacheEventSynchronizeForTest() {
+  gFailNextCacheEventSynchronizeForTest = true;
+}
+#endif
+
+bool reshardResourcesNeedQuarantine() {
+  return gReshardResourceQuarantineRequired;
+}
+
+void reshardRequireResourceQuarantine() {
+  gReshardResourceQuarantineRequired = true;
+}
+
+void reshardClearResourceQuarantine() {
+  gReshardResourceQuarantineRequired = false;
+}
 
 static ncclWindow_t* findCachedWindowByPtr(WindowCache* cache, ncclComm_t comm, void* buffer, size_t size) {
   for (int i = 0; i < cache->count; i++) {
@@ -86,21 +188,89 @@ static ncclResult_t reclaimRetiredWindowEntriesIfIdle() {
   return ncclSuccess;
 }
 
+/* The API lock proves no other host call is running; it does not prove the GPU
+ * is finished. Sync the entry's completion event before destroying it. */
+static ncclResult_t synchronizeDevCommCacheEntry(DevCommCacheEntry* entry) {
+  if (entry->useState != nullptr && entry->useState->bPoisoned) {
+    RESHARD_WARN(-1, "Retaining poisoned DevComm because its last use could not be fenced safely");
+    gReshardResourceQuarantineRequired = true;
+    return ncclSystemError;
+  }
+  if (entry->completionEvent != nullptr) {
+    const cudaError_t syncResult = synchronizeEvent(entry->completionEvent);
+    if (syncResult != cudaSuccess) {
+      gReshardResourceQuarantineRequired = true;
+      if (entry->useState != nullptr) {
+        entry->useState->bPoisoned = true;
+      }
+      RESHARD_WARN(-1, "Retaining DevComm after its completion event could not be synchronized: %s",
+                   cudaGetErrorString(syncResult));
+      return ncclSystemError;
+    }
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t destroyDevCommCacheEntry(DevCommCacheEntry* entry) {
+  ncclResult_t result = ncclSuccess;
+  if (entry->completionEvent != nullptr) {
+    const cudaError_t eventResult = cudaEventDestroy(entry->completionEvent);
+    if (eventResult != cudaSuccess) {
+      RESHARD_WARN(-1, "Failed to destroy DevComm completion event: %s", cudaGetErrorString(eventResult));
+      result = ncclSystemError;
+    }
+    entry->completionEvent = nullptr;
+  }
+  entry->useState.reset();
+  const ncclResult_t devCommResult = ncclDevCommDestroy(entry->key.comm, &entry->devComm);
+  if (devCommResult != ncclSuccess) {
+    RESHARD_WARN(-1, "Failed to destroy cached DevComm: %s", ncclGetErrorString(devCommResult));
+    if (result == ncclSuccess) {
+      result = devCommResult;
+    }
+  }
+  entry->valid = false;
+  return result;
+}
+
+/* On a failed fence the entry is dropped from the cache but its DevComm is
+ * deliberately leaked: destroying it could free memory a running kernel is
+ * still reading. The epoch is quarantined instead. */
+static ncclResult_t releaseDevCommCacheEntry(DevCommCacheEntry* entry) {
+  const ncclResult_t syncResult = synchronizeDevCommCacheEntry(entry);
+  if (syncResult != ncclSuccess) {
+    entry->valid = false;
+    return syncResult;
+  }
+  return destroyDevCommCacheEntry(entry);
+}
+
 static ncclResult_t reclaimRetiredDevCommEntriesIfIdle() {
   if (m2nApiHasConcurrentCalls() || gRetiredDevcommCacheEntries.empty()) {
     return ncclSuccess;
   }
   std::vector<DevCommCacheEntry> retired;
   retired.swap(gRetiredDevcommCacheEntries);
+  ncclResult_t result = ncclSuccess;
   {
     M2nApiUnlock apiUnlock;
     for (DevCommCacheEntry& entry : retired) {
       if (entry.valid) {
-        NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(entry.key.comm, &entry.devComm));
+        const ncclResult_t releaseResult = releaseDevCommCacheEntry(&entry);
+        if (result == ncclSuccess) {
+          result = releaseResult;
+        }
       }
     }
   }
-  return ncclSuccess;
+  if (reshardResourcesNeedQuarantine()) {
+    NCCL_M2N_FAIL(ncclSystemError, -1,
+                  "Unable to reclaim a retired DevComm because its completion could not be proven");
+  }
+  if (result != ncclSuccess) {
+    NCCL_M2N_FAIL(result, -1, "Failed to destroy a retired DevComm cache entry");
+  }
+  return result;
 }
 
 static ncclResult_t cacheWindow(WindowCache* cache, ncclComm_t comm, void* windowBuffer, size_t windowSize,
@@ -143,15 +313,48 @@ ncclResult_t cacheInternalWindow(ncclComm_t comm, void* buffer, size_t size, ncc
   return cacheWindow(&gInternalWindowCache, comm, buffer, size, window);
 }
 
-ncclDevComm* findCachedDevComm(const ReshardDevCommCacheKey& key) {
+ncclDevComm* findCachedDevComm(const ReshardDevCommCacheKey& key, cudaEvent_t* outCompletionEvent,
+                               std::shared_ptr<ReshardDevCommUseState>* outUseState) {
+  if (outCompletionEvent != nullptr) {
+    *outCompletionEvent = nullptr;
+  }
+  if (outUseState != nullptr) {
+    outUseState->reset();
+  }
   for (int i = 0; i < gDevcommCacheCount; i++) {
     DevCommCacheEntry& e = gDevcommCache[i];
-    if (e.valid && e.key == key) return &e.devComm;
+    if (e.valid && e.key == key) {
+      if (outCompletionEvent != nullptr) {
+        *outCompletionEvent = e.completionEvent;
+      }
+      if (outUseState != nullptr) {
+        *outUseState = e.useState;
+      }
+      return &e.devComm;
+    }
   }
   return nullptr;
 }
 
 ncclResult_t cacheDevComm(const ReshardDevCommCacheKey& key, const ncclDevComm* devComm) {
+  NCCL_M2N_CHECK(reclaimRetiredDevCommEntriesIfIdle());
+
+  /* Created before any eviction so a failure here leaves the cache untouched. */
+  cudaEvent_t completionEvent = nullptr;
+  std::shared_ptr<ReshardDevCommUseState> useState;
+  const cudaError_t eventResult = cudaEventCreateWithFlags(&completionEvent, cudaEventDisableTiming);
+  if (eventResult != cudaSuccess) {
+    NCCL_M2N_FAIL(ncclSystemError, -1, "Failed to create DevComm completion event: %s",
+                  cudaGetErrorString(eventResult));
+  }
+  try {
+    useState = std::make_shared<ReshardDevCommUseState>();
+  } catch (const std::bad_alloc&) {
+    NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(completionEvent));
+    NCCL_M2N_FAIL(ncclSystemError, -1, "Failed to create DevComm use state");
+  }
+  useState->bSerializeUses = !reshardUseInternalStreams();
+
   int idx;
   if (gDevcommCacheCount >= MAX_DEVCOMM_CACHE_ENTRIES) {
     idx = gDevcommCacheNextIdx;
@@ -162,11 +365,12 @@ ncclResult_t cacheDevComm(const ReshardDevCommCacheKey& key, const ncclDevComm* 
         try {
           gRetiredDevcommCacheEntries.push_back(old);
         } catch (const std::bad_alloc&) {
+          NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(completionEvent));
           NCCL_M2N_FAIL(ncclSystemError, -1, "failed to retain an in-use DevComm cache entry");
         }
       } else {
         M2nApiUnlock apiUnlock;
-        NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(old.key.comm, &old.devComm));
+        NCCL_M2N_CHECK_WARN(releaseDevCommCacheEntry(&old));
       }
     }
     gDevcommCacheNextIdx = (gDevcommCacheNextIdx + 1) % MAX_DEVCOMM_CACHE_ENTRIES;
@@ -176,6 +380,8 @@ ncclResult_t cacheDevComm(const ReshardDevCommCacheKey& key, const ncclDevComm* 
   DevCommCacheEntry& e = gDevcommCache[idx];
   e.key = key;
   e.devComm = *devComm;
+  e.completionEvent = completionEvent;
+  e.useState = std::move(useState);
   e.valid = true;
   return ncclSuccess;
 }
@@ -293,8 +499,7 @@ void cacheFinalize() {
     for (int i = 0; i < gDevcommCacheCount; i++) {
       DevCommCacheEntry& e = gDevcommCache[i];
       if (e.valid) {
-        NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(e.key.comm, &e.devComm));
-        e.valid = false;
+        NCCL_M2N_CHECK_WARN(releaseDevCommCacheEntry(&e));
       }
     }
     gDevcommCacheCount = 0;
@@ -314,6 +519,7 @@ void cacheFinalize() {
   gStreamPool.clear();
 
   stagingBufferPoolFinalize();
+  resetCompletionFailureInjection();
 }
 
 ncclResult_t streamPoolAcquire(ncclComm_t comm, int dev, cudaStream_t* outStream, cudaEvent_t* outReadyEvent,

@@ -39,6 +39,10 @@
 #include "nccl_m2n.h"
 #include "reshard_types.h"
 
+/* Defined in reshard_internal.h. Only ever passed through by pointer here, so
+ * this header does not need the definition. */
+struct ReshardDevCommUse;
+
 /* Rail GIN connection type for the generator-only sub-comm (commB).
  * The rest of the library only ever requests NCCL_GIN_CONNECTION_FULL.
  * The rail-only enum name must be confirmed against the on-cluster NCCL
@@ -227,8 +231,9 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
  * then reused across streams. */
 ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stagingBuffer, size_t stagingCapacity,
                                          int numCtas, int ginSignalCountA, int signalsPerSlotB, int ctxPerSlotB,
-                                         int maxConcurrency, ncclWindow_t* outWindowA, ncclWindow_t* outWindowB,
-                                         ncclDevComm* outDevCommA, ncclDevComm* outDevCommB);
+                                         int maxConcurrency, cudaStream_t stream, ncclWindow_t* outWindowA,
+                                         ncclWindow_t* outWindowB, ncclDevComm* outDevCommA,
+                                         ReshardDevCommUse* outDevCommAUse, ncclDevComm* outDevCommB);
 
 /* ======================================================================
  * reshard_split_prepare.cc — cross-comm RING param builder

@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <thread>
@@ -32,7 +33,9 @@
 
 #include "nccl_m2n.h"
 #include "basic_api_test_core.h"
+#include "m2n_log.h"
 #include "reshard_internal.h"
+#include "reshard_call_setup.h"
 
 namespace {
 
@@ -93,6 +96,74 @@ static std::vector<ncclM2nHandle_t> gM2nHandles;
 #if !defined(GTEST_SKIP)
 static int gSkippedCases = 0;
 #endif
+
+#ifdef NCCL_M2N_TESTING
+/* The completion-fence failure paths decide whether an epoch is quarantined,
+ * and nothing exercised them. Injection and quarantine are both process-global,
+ * so every case here restores them through a guard rather than on the happy
+ * path only. */
+class DevCommFailureStateGuard {
+public:
+  DevCommFailureStateGuard()
+    : quarantineWasRequired_(reshardResourcesNeedQuarantine()), logLevel_(reshardGetLogLevel()) {}
+
+  /* Runs on every exit path, including an assertion failure part-way through a
+   * case. cacheFinalize disarms any injection the case never reached, so there
+   * is no bookkeeping here about how far it got. */
+  ~DevCommFailureStateGuard() {
+    cacheFinalize();
+    if (quarantineWasRequired_) {
+      reshardRequireResourceQuarantine();
+    } else {
+      reshardClearResourceQuarantine();
+    }
+    reshardSetLogLevel(logLevel_);
+  }
+
+  void failNextCompletionRecord(bool failStreamSynchronize) {
+    reshardFailNextCompletionEventRecordForTest(failStreamSynchronize);
+  }
+
+  void failNextCacheEventSynchronize() { reshardFailNextCacheEventSynchronizeForTest(); }
+
+  void enableWarningLogs() { reshardSetLogLevel(RESHARD_LOG_WARN); }
+
+private:
+  bool quarantineWasRequired_;
+  ReshardLogLevel logLevel_;
+};
+
+/* A CUDA stream and event owned for the duration of one case. */
+struct FenceProbeResources {
+  cudaStream_t stream = nullptr;
+  cudaEvent_t event = nullptr;
+
+  ~FenceProbeResources() {
+    if (event != nullptr) {
+      (void)cudaEventDestroy(event);
+    }
+    if (stream != nullptr) {
+      (void)cudaStreamSynchronize(stream);
+      (void)cudaStreamDestroy(stream);
+    }
+  }
+
+  cudaError_t create() {
+    cudaError_t result = cudaSetDevice(0);
+    if (result == cudaSuccess) {
+      result = cudaStreamCreate(&stream);
+    }
+    if (result == cudaSuccess) {
+      result = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    }
+    return result;
+  }
+};
+
+static bool fenceTestSelected() {
+  return gCli.filter != nullptr && strcmp(gCli.filter, "devcomm_fence_failures") == 0;
+}
+#endif /* NCCL_M2N_TESTING */
 
 static void* callInvalidReshard(void* resultPtr) {
   ncclResult_t* result = static_cast<ncclResult_t*>(resultPtr);
@@ -367,6 +438,157 @@ TEST(LocalRankProgressTest, CollectiveSectionsAdmitPeerRanks) {
   EXPECT_EQ(1, reduced[1]);
   EXPECT_EQ(cudaSuccess, cudaResults[0]);
   EXPECT_EQ(cudaSuccess, cudaResults[1]);
+}
+
+/* A failed record leaves work possibly already enqueued, so the stream is
+ * synchronized instead. That still fences the resource, so the call reports the
+ * failure without condemning the epoch. */
+TEST(DevCommFenceFailureTest, RecordFailureFencedByStreamSyncDoesNotQuarantine) {
+  if (!fenceTestSelected()) {
+#if defined(GTEST_SKIP)
+    GTEST_SKIP() << "run with --filter devcomm_fence_failures";
+#else
+    return;
+#endif
+  }
+  DevCommFailureStateGuard stateGuard;
+  reshardClearResourceQuarantine();
+  FenceProbeResources probe;
+  ASSERT_EQ(cudaSuccess, probe.create());
+
+  stateGuard.failNextCompletionRecord(/*failStreamSynchronize=*/false);
+  EXPECT_EQ(ncclSystemError, reshardRecordCompletionEvent(probe.event, probe.stream, "DevComm"));
+  EXPECT_FALSE(reshardResourcesNeedQuarantine());
+}
+
+/* Neither the event nor its stream can fence the work, so there is no way left
+ * to prove the GPU is done and the epoch has to be quarantined. */
+TEST(DevCommFenceFailureTest, RecordAndStreamSyncFailureQuarantinesEpoch) {
+  if (!fenceTestSelected()) {
+#if defined(GTEST_SKIP)
+    GTEST_SKIP() << "run with --filter devcomm_fence_failures";
+#else
+    return;
+#endif
+  }
+  DevCommFailureStateGuard stateGuard;
+  reshardClearResourceQuarantine();
+  FenceProbeResources probe;
+  ASSERT_EQ(cudaSuccess, probe.create());
+
+  stateGuard.failNextCompletionRecord(/*failStreamSynchronize=*/true);
+  EXPECT_EQ(ncclSystemError, reshardRecordCompletionEvent(probe.event, probe.stream, "DevComm"));
+  EXPECT_TRUE(reshardResourcesNeedQuarantine());
+}
+
+/* The poisoned flag is what stops a DevComm whose last use could not be fenced
+ * from being handed straight back out. bSerializeUses is set explicitly because
+ * it normally tracks NCCL_RESHARD_USE_INTERNAL_STREAMS, and the refusal must
+ * hold regardless of how the process was configured. */
+TEST(DevCommFenceFailureTest, PoisonedUseStateIsRefusedOnNextAcquisition) {
+  if (!fenceTestSelected()) {
+#if defined(GTEST_SKIP)
+    GTEST_SKIP() << "run with --filter devcomm_fence_failures";
+#else
+    return;
+#endif
+  }
+  DevCommFailureStateGuard stateGuard;
+  reshardClearResourceQuarantine();
+  FenceProbeResources probe;
+  ASSERT_EQ(cudaSuccess, probe.create());
+
+  std::shared_ptr<ReshardDevCommUseState> useState = std::make_shared<ReshardDevCommUseState>();
+  useState->bSerializeUses = true;
+
+  ReshardDevCommUse firstUse;
+  ASSERT_EQ(ncclSuccess, reshardPrepareDevCommUse(probe.event, useState, probe.stream, &firstUse));
+  stateGuard.failNextCompletionRecord(/*failStreamSynchronize=*/true);
+  EXPECT_EQ(ncclSystemError, reshardRecordDevCommUse(&firstUse, probe.stream));
+  EXPECT_TRUE(useState->bPoisoned);
+
+  /* The reservation must have been released even though recording failed, or
+   * this second prepare would deadlock rather than return. */
+  ReshardDevCommUse secondUse;
+  EXPECT_EQ(ncclSystemError, reshardPrepareDevCommUse(probe.event, useState, probe.stream, &secondUse));
+}
+
+/* Retirement is where the fence actually protects something: if the completion
+ * event cannot be synchronized, the DevComm must be retained rather than
+ * destroyed under a running kernel. Needs a genuinely cached DevComm, so this
+ * case creates one collectively across both local ranks. */
+TEST(DevCommFenceFailureTest, RetirementRetainsDevCommWhenCompletionCannotBeProven) {
+  if (!fenceTestSelected()) {
+#if defined(GTEST_SKIP)
+    GTEST_SKIP() << "run with --filter devcomm_fence_failures";
+#else
+    return;
+#endif
+  }
+  if (gWorldSize != 2) {
+#if defined(GTEST_SKIP)
+    GTEST_SKIP() << "requires exactly two local ranks";
+#else
+    return;
+#endif
+  }
+
+  DevCommFailureStateGuard stateGuard;
+  stateGuard.enableWarningLogs();
+  reshardClearResourceQuarantine();
+
+  /* ncclDevCommCreate is collective, so both ranks must reach it. */
+  std::atomic<int> ready{0};
+  std::atomic<bool> start{false};
+  ncclResult_t results[2] = {};
+  cudaError_t cudaResults[2] = {};
+  std::thread threads[2];
+  for (int rank = 0; rank < 2; rank++) {
+    threads[rank] = std::thread([&, rank] {
+      cudaResults[rank] = cudaSetDevice(rank);
+      cudaStream_t stream = nullptr;
+      if (cudaResults[rank] == cudaSuccess) {
+        cudaResults[rank] = cudaStreamCreate(&stream);
+      }
+      ready.fetch_add(1, std::memory_order_release);
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      if (cudaResults[rank] == cudaSuccess) {
+        M2nApiLock apiLock;
+        ncclDevComm devComm{};
+        ReshardDevCommUse use;
+        results[rank] = reshardGetOrCreateDevComm(gComms[rank], /*numCtas=*/1, /*ginSignalCount=*/1,
+                                                  /*ginCounterCount=*/0, RESHARD_DEVCOMM_BARRIER_WORLD,
+                                                  reshardGetGinContextCount(), stream, &devComm, &use);
+        if (results[rank] == ncclSuccess) {
+          results[rank] = reshardRecordDevCommUse(&use, stream);
+        }
+        cudaResults[rank] = cudaStreamDestroy(stream);
+      }
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != 2) {
+    std::this_thread::yield();
+  }
+  start.store(true, std::memory_order_release);
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  ASSERT_EQ(cudaSuccess, cudaResults[0]);
+  ASSERT_EQ(cudaSuccess, cudaResults[1]);
+  ASSERT_EQ(ncclSuccess, results[0]);
+  ASSERT_EQ(ncclSuccess, results[1]);
+
+  /* Finalize is the deterministic retirement path; filling all 64 cache
+   * identities would be testing eviction policy instead. */
+  stateGuard.failNextCacheEventSynchronize();
+  testing::internal::CaptureStdout();
+  cacheFinalize();
+  const std::string warnings = testing::internal::GetCapturedStdout();
+
+  EXPECT_TRUE(reshardResourcesNeedQuarantine());
+  EXPECT_NE(std::string::npos, warnings.find("Retaining DevComm after its completion event"));
 }
 #endif  /* NCCL_M2N_TESTING */
 

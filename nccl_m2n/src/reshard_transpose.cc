@@ -434,14 +434,14 @@ ncclResult_t transposeBufferRecordEvent(ncclComm_t comm, cudaStream_t stream) {
        * reserved is never reacquired, so the communicator reports spurious
        * concurrent use on every later call and can strand its peers in a
        * collective the failing rank never enters. */
-      const cudaError_t err = cudaEventRecord(slot->doneEvent, stream);
+      const ncclResult_t result =
+        reshardRecordCompletionEvent(slot->doneEvent, stream, "staging slot", &slot->poisoned);
       slot->lastStream = stream;
-      slot->eventRecorded = (err == cudaSuccess);
-      slot->poisoned = (err != cudaSuccess);
+      slot->eventRecorded = (result == ncclSuccess);
       slot->reserved = false;
       gCurrentStagingComm = nullptr;
       gCurrentStagingSlot = nullptr;
-      NCCL_M2N_CUDACHECK(err);
+      NCCL_M2N_CHECK(result);
     }
     return ncclSuccess;
   }
@@ -450,13 +450,13 @@ ncclResult_t transposeBufferRecordEvent(ncclComm_t comm, cudaStream_t stream) {
   NCCL_M2N_CHECK(acquireStagingDevicePool(&pool));
   TransposeBufferEntry* e = findPoolEntry(*pool, comm);
   if (e != nullptr) {
-    const cudaError_t err = cudaEventRecord(e->event, stream);
+    const ncclResult_t result =
+      reshardRecordCompletionEvent(e->event, stream, "transpose buffer", &e->poisoned);
     e->stream = stream;
-    e->eventRecorded = (err == cudaSuccess);
-    e->poisoned = (err != cudaSuccess);
+    e->eventRecorded = (result == ncclSuccess);
     e->reserved = false;
     gCurrentTransposeEntry = nullptr;
-    NCCL_M2N_CUDACHECK(err);
+    NCCL_M2N_CHECK(result);
   }
   return ncclSuccess;
 }

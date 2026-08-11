@@ -47,11 +47,19 @@ make tests GTEST_DIR=/path/to/googletest
 | `tensor_size_sensitivity`  | `world ≥ 4`, even           | 576², 3072², 3072×6144 | bf16 | n_shards (4,4) |
 | `nd_tensors`               | `world ≥ 4`, even           | (64,128,128), (128,64,64) | bf16 | 3D only; the `(64,128,128), sd=(0,1)` historical case lives in `cross_dim_regression` |
 | `staging_slot_pressure`    | `world = 4`                 | (64,128,128) | bf16 | 3D Shard(0) → Shard(2) default-API reproducer for CI when run with a 4 MiB staging channel |
+| `stream_churn`             | `world ≥ 4`, even           | (64,64) | fp32 | Reuses the case with fresh destination streams in the MPI driver |
+| `stream_ordering`          | `world ≥ 4`, even           | (64,64) | fp32 | Asynchronous producer, reshard, and consumer ordering |
+| `graph_capture`            | `world ≥ 4`, even           | (64,64) | fp32 | MPI-only first-use and prewarmed variants verify capture rejection |
 | `1d_full_sharding`            | `world ≥ 4`, even           | (8192,)            | fp32 / bf16 / uint8 | 1D mesh, sd=(0,0) (only one tensor axis) |
 | `1d_2d_placement`             | `world ≥ 4`, even           | (8192,)            | bf16 | n_shards ∈ {(2,4),(4,2),(2,2)}, placement ∈ {sr/sr, rs/rs, sr/rs, rs/sr} |
 | `1d_uneven_ratio`             | `world ≥ 4`, `world % 4 == 0` | (16384,)         | bf16 | ratio ∈ {(3,1),(1,3)}, n_shards (2,2) |
 | `1d_tensor_size_sensitivity`  | `world ≥ 4`, even           | (16384,), (1048576,), (4194304,) | bf16 | n_shards (4,4) |
 | `cross_dim_regression`        | `world ≥ 8`, even           | (200, 200), (64,128,128) | bf16 | Targeted historical cross-dim regressions for transpose and non-transpose paths |
+| `split_tiny_contribution`  | `world ≥ 4`, even           | (4,) | uint8 | Every CTA signals when a contribution is smaller than the CTA count |
+| `split_reverse_mesh`       | `world ≥ 4`, even           | (4096,) | uint8 | Source communicator ranks precede destination ranks when the destination mesh starts at rank 0 |
+
+`basic_api_test_local` omits `graph_capture`. Its pthread ranks share one
+process, while CUDA graph-capture coverage runs through `basic_api_test_mpi`.
 
 Each case carries additional **runtime feasibility checks** (n_shards
 must divide `src_total` / `dst_total`, the chosen tensor dim must divide

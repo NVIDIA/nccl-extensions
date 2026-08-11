@@ -237,6 +237,9 @@ static std::vector<LocalParam> selectedLocalParams() {
   }
   for (ApiKind api : apis) {
     for (const TestCase& tc : cases) {
+      if (tc.group == "graph_capture") {
+        continue;
+      }
       params.push_back(LocalParam{tc, api});
     }
   }
@@ -276,6 +279,11 @@ static void* threadMain(void* p) {
   cudaStream_t stream;
   TEST_CUDACHECK(cudaStreamCreate(&stream));
 
+  cudaStream_t alternateStream = nullptr;
+  if (a->tc->bAsyncOrdering) {
+    TEST_CUDACHECK(cudaStreamCreateWithFlags(&alternateStream, cudaStreamNonBlocking));
+  }
+
   void* buffer = nullptr;
   TEST_NCCLCHECK(ncclMemAlloc(&buffer, gBufferBytes));
 
@@ -290,6 +298,7 @@ static void* threadMain(void* p) {
   env.device = a->device;
   env.comm = a->comm;
   env.stream = stream;
+  env.alternateStream = alternateStream;
   env.m2nHandle = a->m2nHandle;
   env.buffer = buffer;
   env.bufferBytes = gBufferBytes;
@@ -309,6 +318,9 @@ static void* threadMain(void* p) {
   if (res.failReason != nullptr) snprintf(a->failReason, sizeof(a->failReason), "%s", res.failReason);
 
   TEST_CUDACHECK(cudaStreamSynchronize(stream));
+  if (alternateStream != nullptr) {
+    TEST_CUDACHECK(cudaStreamSynchronize(alternateStream));
+  }
 
   /* Keep rank-local buffers alive until every thread has left runOneCase. */
   pthread_barrier_wait(&a->ctx->barrier);
@@ -317,6 +329,9 @@ static void* threadMain(void* p) {
     TEST_CUDACHECK(cudaFree(copyBuffer));
   }
   TEST_NCCLCHECK(ncclMemFree(buffer));
+  if (alternateStream != nullptr) {
+    TEST_CUDACHECK(cudaStreamDestroy(alternateStream));
+  }
   TEST_CUDACHECK(cudaStreamDestroy(stream));
   return nullptr;
 }

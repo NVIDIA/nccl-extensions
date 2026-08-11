@@ -73,6 +73,7 @@ struct TestEnv {
   int device;
   ncclComm_t comm;
   cudaStream_t stream;
+  cudaStream_t alternateStream;
   ncclM2nHandle_t m2nHandle;
   void* buffer;
   size_t bufferBytes;
@@ -116,6 +117,8 @@ struct TestCase {
   int worldDivisor; /* skip if worldSize % this != 0 */
 
   int srcRatioNum, dstRatioNum; /* (0,0) ⇒ even split */
+  bool dstFirst; /* place destination mesh before source mesh in parent rank order */
+  bool bAsyncOrdering; /* keep source fill and destination validation on the caller stream */
   bool bGraphCapture;
   bool bGraphCapturePrewarmed;
 };
@@ -284,7 +287,9 @@ static std::string buildCaseName(const TestCase& tc) {
              tc.srcDim0, tc.dstDim0, plName(tc.srcPl), plName(tc.dstPl), tc.srcShardDim, tc.dstShardDim, tc.elementSize,
              tc.srcRatioNum, tc.dstRatioNum);
   }
-  return buf;
+  std::string name(buf);
+  if (tc.dstFirst) name += "[dst-first]";
+  return name;
 }
 
 /* ======================================================================
@@ -695,6 +700,69 @@ static void emitStreamChurn(std::vector<TestCase>& cases) {
   cases.push_back(std::move(tc));
 }
 
+static void emitStreamOrdering(std::vector<TestCase>& cases) {
+  TestCase tc{};
+  tc.group = "stream_ordering";
+  tc.ndims = 2;
+  tc.globalDims[0] = 64;
+  tc.globalDims[1] = 64;
+  tc.srcDim0 = 0;
+  tc.dstDim0 = 0;
+  tc.srcShardDim = 0;
+  tc.dstShardDim = 0;
+  tc.srcPl = PL_RS;
+  tc.dstPl = PL_RS;
+  tc.elementSize = 4;
+  tc.worldMin = 4;
+  tc.worldDivisor = 2;
+  tc.bAsyncOrdering = true;
+  tc.name = buildCaseName(tc);
+  cases.push_back(std::move(tc));
+}
+
+static void emitSplitRegressions(std::vector<TestCase>& cases) {
+  {
+    TestCase tc{};
+    tc.group = "split_tiny_contribution";
+    tc.ndims = 1;
+    tc.globalDims[0] = 4;
+    tc.globalDims[1] = 1;
+    tc.globalDims[2] = 1;
+    tc.srcDim0 = 0;
+    tc.dstDim0 = 0;
+    tc.srcShardDim = -1;
+    tc.dstShardDim = -1;
+    tc.srcPl = PL_REPL;
+    tc.dstPl = PL_REPL;
+    tc.elementSize = 1;
+    tc.worldMin = 4;
+    tc.worldDivisor = 2;
+    tc.name = buildCaseName(tc);
+    cases.push_back(std::move(tc));
+  }
+
+  {
+    TestCase tc{};
+    tc.group = "split_reverse_mesh";
+    tc.ndims = 1;
+    tc.globalDims[0] = 4096;
+    tc.globalDims[1] = 1;
+    tc.globalDims[2] = 1;
+    tc.srcDim0 = 0;
+    tc.dstDim0 = 0;
+    tc.srcShardDim = 0;
+    tc.dstShardDim = 0;
+    tc.srcPl = PL_RS;
+    tc.dstPl = PL_RS;
+    tc.elementSize = 1;
+    tc.worldMin = 4;
+    tc.worldDivisor = 2;
+    tc.dstFirst = true;
+    tc.name = buildCaseName(tc);
+    cases.push_back(std::move(tc));
+  }
+}
+
 static void emitPackWindowRegressions(std::vector<TestCase>& cases) {
   /* Minimal forward-order source/destination pair for the single-LSA host-RMA
    * activation gate. Two element sizes make the focused local run reuse the
@@ -841,6 +909,8 @@ static std::vector<TestCase> buildAllTestCases() {
   emitCrossDimRegression(cases);
   emitTinyContribution(cases);
   emitStreamChurn(cases);
+  emitStreamOrdering(cases);
+  emitSplitRegressions(cases);
   emitPackWindowRegressions(cases);
   return cases;
 }
@@ -1208,6 +1278,7 @@ static void basicApiPrintRuntimeSummary(const char* title, int worldSize, int de
  * ====================================================================*/
 
 static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
+  const bool asyncOrdering = tc.bAsyncOrdering && env->alternateStream != nullptr;
   /* ----- 1. feasibility check (single source of truth, see
    * caseFeasibleAt). On skip, also include the minimum world that
    * would let the case run so the user can plan a larger allocation.
@@ -1226,6 +1297,7 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     return makeSkip(buf);
   }
   int srcTotal = shape.srcTotal;
+  int dstTotal = shape.dstTotal;
   int srcDim0 = shape.srcDim0, srcDim1 = shape.srcDim1;
   int dstDim0 = shape.dstDim0, dstDim1 = shape.dstDim1;
   int srcShardCount = shape.srcShardCount;
@@ -1233,14 +1305,16 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
 
   /* ----- 2. build mesh layouts ----- */
   MeshLayout srcLayout, dstLayout;
+  const int srcStart = tc.dstFirst ? dstTotal : 0;
+  const int dstStart = tc.dstFirst ? 0 : srcTotal;
   buildMesh(&srcLayout, tc.srcPl, tc.srcShardDim, srcDim0, srcDim1,
-            /*startRank=*/0);
+            /*startRank=*/srcStart);
   buildMesh(&dstLayout, tc.dstPl, tc.dstShardDim, dstDim0, dstDim1,
-            /*startRank=*/srcTotal);
+            /*startRank=*/dstStart);
 
   /* ----- 3. determine role and per-rank local dims (in elements) ----- */
-  bool isSrc = (env->rank < srcTotal);
-  bool isDst = !isSrc;
+  bool isSrc = (env->rank >= srcStart && env->rank < srcStart + srcTotal);
+  bool isDst = (env->rank >= dstStart && env->rank < dstStart + dstTotal);
 
   size_t srcLocalDimsElems[3] = {tc.globalDims[0], tc.globalDims[1], tc.globalDims[2]};
   size_t dstLocalDimsElems[3] = {tc.globalDims[0], tc.globalDims[1], tc.globalDims[2]};
@@ -1273,7 +1347,7 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     activeBufferBytes = env->bufferBytes;
   }
 #ifdef NCCL_M2N_TESTING
-  const bool testPackWindowFusion = env->apiKind == ApiKind::Default && env->expectPackWindow;
+  const bool testPackWindowFusion = env->apiKind == ApiKind::Default && env->expectPackWindow && !asyncOrdering;
 #else
   const bool testPackWindowFusion = false;
 #endif
@@ -1303,7 +1377,9 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     }
 #endif
   }
-  TEST_CUDACHECK(cudaStreamSynchronize(env->stream));
+  if (!asyncOrdering) {
+    TEST_CUDACHECK(cudaStreamSynchronize(env->stream));
+  }
   env->barrier(env);
 
   /* ----- 8. resharding call ----- */
@@ -1378,6 +1454,17 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     }
     const bool bActionableError = strstr(ncclM2nGetLastError(), "does not support CUDA graph capture") != nullptr;
     return (r == ncclInvalidUsage && bActionableError) ? makePass() : makeFail("graph capture was not rejected");
+  } else if (asyncOrdering) {
+    for (int call = 0; call < 3; call++) {
+      cudaStream_t callStream = (call % 2 == 0) ? env->stream : env->alternateStream;
+      r = reshard(callStream);
+      if (call + 1 < 3) {
+        env->barrier(env);
+      }
+      if (r != ncclSuccess) {
+        break;
+      }
+    }
   } else if (env->apiKind == ApiKind::Default) {
 #ifdef NCCL_M2N_TESTING
     if (testPackWindowFusion) {
@@ -1407,7 +1494,9 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     return makeFail("reshard call returned error");
   }
 
-  TEST_CUDACHECK(cudaStreamSynchronize(env->stream));
+  if (!asyncOrdering) {
+    TEST_CUDACHECK(cudaStreamSynchronize(env->stream));
+  }
   /* These observations are rank-local, so a rank must not return on them before
    * the barrier below -- its peers would still enter, and the harness would
    * deadlock rather than report the failure. Record and report after. */
@@ -1417,7 +1506,7 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     if (reshardGetFusedSubmissionCountForTest() != 1) {
       instrumentationFailure = "compatible grouped tensors did not produce exactly one fused PACKWINDOW submission";
     }
-  } else if (env->apiKind == ApiKind::Default && env->expectPackWindow &&
+  } else if (!asyncOrdering && env->apiKind == ApiKind::Default && env->expectPackWindow &&
              reshardGetLastCompletedCopyAlgorithmForTest() != RESHARD_COPY_ALGO_PACKWINDOW) {
     instrumentationFailure = "default API did not execute the selected PACKWINDOW path";
   }
@@ -1439,6 +1528,9 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     }
 #endif
     localOk = ok ? 1 : 0;
+  }
+  if (asyncOrdering) {
+    TEST_CUDACHECK(cudaStreamSynchronize(env->stream));
   }
   /* Fold the rank-local instrumentation result into the same reduction as data
    * validation. Returning on it separately would leave a failing rank out of

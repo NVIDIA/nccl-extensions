@@ -521,7 +521,12 @@ static void printUsage(const char* prog) {
   printf("  --algorithm <auto|ring|direct>  Reshard algorithm (default: "
          "auto)\n");
   printf("  --api <window|default>             Public API to drive (default: "
-         "window).\n");
+         "default).\n");
+  printf("  --copy-algorithm <a>            Advanced staging override: "
+         "'packwindow'\n");
+  printf("                                  or 'direct' (default: "
+         "packwindow;\n");
+  printf("                                  requires --api default)\n");
   printf("                                  'default' uses ncclReshard with "
          "cudaMalloc'd\n");
   printf("                                  buffers; window registration is "
@@ -553,8 +558,9 @@ int main(int argc, char* argv[]) {
   int validateIterations = 3;
   bool verbose = false;
   const char* algorithm = "AUTO";
-  const char* lbMode = "UNIFORM";
-  ReshardApiMode apiMode = ReshardApiMode::Window;
+  const char* lbMode = "NODE_AWARE";
+  ReshardApiMode apiMode = ReshardApiMode::Default;
+  const char* copyAlgorithm = nullptr;
 
   auto parseModelConfig = [&](const char* value) {
     modelConfigPath = value;
@@ -579,6 +585,9 @@ int main(int argc, char* argv[]) {
       .enumValue("--algorithm", &algorithm, {{"auto", "AUTO"}, {"direct", "DIRECT"}, {"ring", "RING"}},
           "ERROR: unknown --algorithm '%s' (use 'auto', 'ring', or 'direct')\n")
       .apiMode("--api", &apiMode)
+      .enumValue("--copy-algorithm", &copyAlgorithm,
+          {{"direct", "DIRECT"}, {"packwindow", "PACKWINDOW"}},
+          "ERROR: unknown --copy-algorithm '%s' (use 'direct' or 'packwindow')\n")
       .enumValue("--lb-mode", &lbMode, {{"node", "NODE_AWARE"}, {"uniform", "UNIFORM"}},
           "ERROR: unknown --lb-mode '%s' (use 'uniform' or 'node')\n")
       .help(printUsage);
@@ -593,6 +602,11 @@ int main(int argc, char* argv[]) {
       printf("ERROR: --iterations > 0, --warmup >= 0, --gpus-per-node > 0, "
              "--validate-iterations > 0 are required\n");
     }
+    MPI_Finalize();
+    return 1;
+  }
+
+  if (!benchConfigureCopyAlgorithm(apiMode, copyAlgorithm, mpiRank)) {
     MPI_Finalize();
     return 1;
   }
@@ -757,7 +771,7 @@ int main(int argc, char* argv[]) {
     printf("Layers: %d, Params (after grouping+dedup): %zu (%d skipped)\n", numLayers, allTransfers.size(), skipped);
     printf("PP comm pairs: %zu\n", ppCommPairs.size());
     if (apiMode == ReshardApiMode::Default) {
-      printf("API: default (ncclReshard)\n");
+      printf("API: default (ncclReshard, copy-algorithm=%s)\n", benchResolvedCopyAlgorithm());
     } else {
       printf("API: window (ncclReshardWithWindow)\n");
     }

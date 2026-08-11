@@ -47,7 +47,12 @@ static void printUsage(const char* prog) {
   printf("  --algorithm <algo>               Algorithm: 'ring' (default) or "
          "'direct'\n");
   printf("  --api <window|default>           API to benchmark (default: "
-         "window)\n");
+         "default)\n");
+  printf("  --copy-algorithm <a>             Advanced staging override: "
+         "'packwindow'\n");
+  printf("                                   or 'direct' (default: "
+         "packwindow;\n");
+  printf("                                   requires --api default)\n");
   printf("  --lb-mode <uniform|node>         Load balancing: 'uniform' "
          "(default) or 'node'\n");
   printf("  --verbose                        Enable debug output\n");
@@ -95,9 +100,10 @@ int main(int argc, char* argv[]) {
   bool verbose = false;
   bool printAllRanks = false;
   bool useDefaultStream = false;
-  ReshardApiMode apiMode = ReshardApiMode::Window;
+  ReshardApiMode apiMode = ReshardApiMode::Default;
   const char* algorithm = "RING";
-  const char* lbMode = "UNIFORM";
+  const char* lbMode = "NODE_AWARE";
+  const char* copyAlgorithm = nullptr;
   const char* pMetricsOutput = nullptr;
 
   BenchArgParser parser(argc, argv, mpiRank);
@@ -119,6 +125,9 @@ int main(int argc, char* argv[]) {
       .enumValue("--algorithm", &algorithm, {{"direct", "DIRECT"}, {"ring", "RING"}},
           "ERROR: Unknown algorithm '%s'. Use 'ring' or 'direct'\n")
       .apiMode("--api", &apiMode)
+    .enumValue("--copy-algorithm", &copyAlgorithm,
+               {{"direct", "DIRECT"}, {"packwindow", "PACKWINDOW"}},
+               "ERROR: Unknown copy-algorithm '%s'. Use 'packwindow' or 'direct'\n")
       .enumValue("--lb-mode", &lbMode, {{"node", "NODE_AWARE"}, {"uniform", "UNIFORM"}},
           "ERROR: Unknown lb-mode '%s'. Use 'uniform' or 'node'\n")
       .help(printUsage);
@@ -126,6 +135,10 @@ int main(int argc, char* argv[]) {
   int parseExit = benchParseExitCode(parser.parse());
   if (parseExit >= 0) {
     return parseExit;
+  }
+  if (!benchConfigureCopyAlgorithm(apiMode, copyAlgorithm, mpiRank)) {
+    MPI_Finalize();
+    return 1;
   }
 
   if (iterations <= 0 || warmup < 0) {
@@ -197,7 +210,7 @@ int main(int argc, char* argv[]) {
   if (mpiRank == 0) {
     printf("=== Tensor Reshard Benchmark ===\n");
     if (apiMode == ReshardApiMode::Default) {
-      printf("Using: ncclReshard (default API)\n");
+      printf("Using: ncclReshard (default API, copy-algorithm=%s)\n", benchResolvedCopyAlgorithm());
     } else {
       printf("Using: ncclReshardWithWindow (user window API)\n");
     }

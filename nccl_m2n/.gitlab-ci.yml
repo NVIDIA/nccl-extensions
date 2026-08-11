@@ -2,9 +2,19 @@
 
 include:
   - local: .gitlab/ci/nccl-build.yml
+  - local: .gitlab/cluster-paths.yml
 
 stages:
   - build
+  - setup
+  - unit_test
+
+variables:
+  CI_JOB_SUBPATH: "${CI_PIPELINE_ID}/${CI_JOB_ID}"
+  EOS_INSTALL_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/install/${CI_PIPELINE_ID}/eos"
+  EOS_CUDA_HOME: "/lustre/fsw/coreai_libraries_nccl/toolkits/cuda-12.8.0"
+  PRE_TYCHE_INSTALL_DIR: "/lustre/fsw/coreai_libraries_nccl/gitlab-runner/install/${CI_PIPELINE_ID}/pretyche"
+  PRE_TYCHE_CUDA_HOME: "/lustre/fsw/coreai_libraries_nccl/toolkits/cuda-13.0"
 
 workflow:
   rules:
@@ -34,11 +44,15 @@ build:nccl_m2n:
         --container-mounts="${CI_PROJECT_DIR}:${CI_PROJECT_DIR}" \
         env \
         NCCL_HOME="${CI_PROJECT_DIR}/.ci/nccl/build" \
+        MPI_HOME="/usr/local/openmpi" \
         make -C "${CI_PROJECT_DIR}/nccl_m2n" -j"$(nproc)" \
         NVCC_GENCODE="$NVCC_GENCODE" \
-        lib
+        GTEST_DIR="${CI_PROJECT_DIR}/.ci/googletest/googletest" \
+        lib tests
       test -s nccl_m2n/build/lib/libnccl_m2n.so
       test -s nccl_m2n/build/include/nccl_m2n.h
+      test -x nccl_m2n/build/bin/basic_api_test_local
+      test -x nccl_m2n/build/bin/basic_api_test_mpi
       # Every function declared in the public header must (a) carry
       # NCCL_M2N_API and (b) be an exported, defined text symbol. The CMake
       # build compiles hidden-by-default, so a missing annotation links here
@@ -84,3 +98,176 @@ build:nccl_m2n:
     paths:
       - nccl_m2n/build/include/
       - nccl_m2n/build/lib/
+      - nccl_m2n/build/bin/
+
+build_pretyche:
+  stage: build
+  tags:
+    - ptyche
+  timeout: 2h
+  needs:
+    - pipeline: "${PARENT_PIPELINE_ID}"
+      job: build:nccl
+      artifacts: true
+  variables:
+    CI_BUILDS_DIR: "${PRE_TYCHE_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
+    NVIDIA_VISIBLE_DEVICES: "void"
+    SLURM_PARTITION: ""
+  script:
+    - |
+      set -euxo pipefail
+      source "${CI_PROJECT_DIR}/.gitlab/ci/clusters/pre-tyche-config.sh"
+      current_dir="$(realpath .)"
+      build_image_version="$(get_build_image_version)"
+      container_image="$(get_build_tools_image "${build_image_version}")"
+      install_dir="${PRE_TYCHE_INSTALL_DIR}"
+      rm -rf "${install_dir}/build"
+      mkdir -p "${install_dir}/build"
+      cp -a "${CI_PROJECT_DIR}/.gitlab/ci/clusters/pre-tyche-config.sh" "${install_dir}/"
+      container_mounts="${current_dir}:/workspace,${current_dir}/.ci/nccl:/nccl,${install_dir}:/nccl_install"
+
+      srun \
+        --account="$(get_slurm_account)" \
+        -p batch \
+        -J nccl:m2n-build-base \
+        -t 01:00:00 \
+        -n 1 \
+        --exclusive \
+        --container-image="${container_image}" \
+        --container-mounts="${container_mounts}" \
+        env NVCC_GENCODE='-gencode=arch=compute_100,code=sm_100' \
+        bash -lc 'make -C /nccl -j"$(nproc)" BUILDDIR=/nccl_install/build src.build'
+
+      srun \
+        --account="$(get_slurm_account)" \
+        -p batch \
+        -J nccl:m2n-build-tests \
+        -t 01:00:00 \
+        -n 1 \
+        --exclusive \
+        --container-image="${container_image}" \
+        --container-mounts="${container_mounts}" \
+        env NCCL_HOME=/nccl_install/build \
+        MPI_HOME=/usr/local/openmpi \
+        make -C /workspace/nccl_m2n -j"$(nproc)" \
+          BUILDDIR=/nccl_install/build \
+          NVCC_GENCODE='-gencode=arch=compute_100,code=sm_100' \
+          GTEST_DIR=/workspace/.ci/googletest/googletest \
+          lib tests
+
+      test -x "${install_dir}/build/bin/basic_api_test_local"
+      test -x "${install_dir}/build/bin/basic_api_test_mpi"
+      artifact_dir="${NCCL_M2N_ARTIFACT_STAGING:-nccl_m2n_install_artifact}"
+      rm -rf "${artifact_dir}"
+      mkdir -p "${artifact_dir}/bin" "${artifact_dir}/include" "${artifact_dir}/lib"
+      cp -a "${install_dir}/build/lib/libnccl_m2n.so" "${artifact_dir}/lib/"
+      cp -a "${install_dir}/build/include/nccl_m2n.h" "${artifact_dir}/include/"
+      cp -a "${install_dir}/build/bin/basic_api_test_local" "${artifact_dir}/bin/"
+      cp -a "${install_dir}/build/bin/basic_api_test_mpi" "${artifact_dir}/bin/"
+  artifacts:
+    paths:
+      - nccl_m2n_install_artifact/
+    expire_in: 48 hours
+
+setup_eos:
+  stage: setup
+  tags:
+    - nccl-eos
+  needs:
+    - pipeline: "${PARENT_PIPELINE_ID}"
+      job: build:nccl
+      artifacts: true
+    - job: build:nccl_m2n
+      artifacts: true
+  variables:
+    CI_BUILDS_DIR: "${EOS_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
+  script:
+    - |
+      set -euxo pipefail
+      dst="${EOS_INSTALL_DIR}/build"
+      rm -rf "${dst}"
+      mkdir -p "${dst}/bin" "${dst}/include" "${dst}/lib"
+      cp -a "${CI_PROJECT_DIR}/.ci/nccl/build/." "${dst}/"
+      cp -a "${CI_PROJECT_DIR}/nccl_m2n/build/lib/libnccl_m2n.so" "${dst}/lib/"
+      cp -a "${CI_PROJECT_DIR}/nccl_m2n/build/include/nccl_m2n.h" "${dst}/include/"
+      cp -a "${CI_PROJECT_DIR}/nccl_m2n/build/bin/basic_api_test_local" "${dst}/bin/"
+      cp -a "${CI_PROJECT_DIR}/nccl_m2n/build/bin/basic_api_test_mpi" "${dst}/bin/"
+
+setup_pretyche:
+  stage: setup
+  tags:
+    - ptyche
+  needs:
+    - job: build_pretyche
+      artifacts: true
+  variables:
+    CI_BUILDS_DIR: "${PRE_TYCHE_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
+  script:
+    - |
+      set -euxo pipefail
+      artifact_dir="${NCCL_M2N_ARTIFACT_DIR:-${CI_PROJECT_DIR}/nccl_m2n_install_artifact}"
+      dst="${PRE_TYCHE_INSTALL_DIR}/build"
+      mkdir -p "${dst}/bin" "${dst}/include" "${dst}/lib"
+      cp -a "${artifact_dir}/." "${dst}/"
+
+unit_test_eos:
+  stage: unit_test
+  tags:
+    - nccl-eos
+  needs:
+    - setup_eos
+  variables:
+    NCCL_HOME: "${EOS_INSTALL_DIR}/build"
+    CI_BUILDS_DIR: "${EOS_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
+    NNODES: "1"
+    NP: "8"
+    NGPUS: "8"
+    SLURM_ACCOUNT: "coreai_libraries_nccl"
+    SLURM_TIME: "30"
+  script:
+    - |
+      set -euxo pipefail
+      export CUDA_HOME="${EOS_CUDA_HOME}"
+      export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
+      salloc \
+        -N "${NNODES}" \
+        --ntasks-per-node "${NP}" \
+        --exclusive \
+        --account="${SLURM_ACCOUNT}" \
+        -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN:-ci}:nccl-m2n-unit-eos::${CI_COMMIT_REF_NAME:-detached}:${CI_COMMIT_SHORT_SHA}" \
+        -t "${SLURM_TIME}" \
+        bash nccl_m2n/ci/run_nccl_m2n_tests.sh
+
+unit_test_pretyche:
+  stage: unit_test
+  tags:
+    - ptyche
+  needs:
+    - setup_pretyche
+  variables:
+    NCCL_HOME: "${PRE_TYCHE_INSTALL_DIR}/build"
+    CI_BUILDS_DIR: "${PRE_TYCHE_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
+    NNODES: "1"
+    NP: "4"
+    NGPUS: "4"
+    SLURM_PARTITION: "batch"
+    SLURM_ACCOUNT: "coreai_libraries_nccl"
+    SLURM_TIME: "30"
+  script:
+    - |
+      set -euxo pipefail
+      source "${PRE_TYCHE_INSTALL_DIR}/pre-tyche-config.sh"
+      export CUDA_HOME="${PRE_TYCHE_CUDA_HOME}"
+      export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
+      # Ptyche mlx5_0,1,4,5 connect to the compute fabric. mlx5_2,6 connect
+      # to the storage fabric and must not be mixed into proxy-GIN rings.
+      export NCCL_IB_HCA="mlx5_0,mlx5_1,mlx5_4,mlx5_5"
+      salloc \
+        -N "${NNODES}" \
+        --ntasks-per-node "${NP}" \
+        --exclusive \
+        -p "${SLURM_PARTITION}" \
+        --account="${SLURM_ACCOUNT}" \
+        -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN:-ci}:nccl-m2n-unit-pretyche::${CI_COMMIT_REF_NAME:-detached}:${CI_COMMIT_SHORT_SHA}" \
+        -t "${SLURM_TIME}" \
+        bash nccl_m2n/ci/run_nccl_m2n_tests.sh

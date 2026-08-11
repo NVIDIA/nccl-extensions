@@ -47,6 +47,29 @@ enum class ReshardApiMode {
   Default,
 };
 
+static inline bool benchConfigureCopyAlgorithm(ReshardApiMode apiMode, const char* copyAlgorithm, int mpiRank) {
+  if (apiMode == ReshardApiMode::Window) {
+    if (copyAlgorithm != nullptr) {
+      if (mpiRank == 0) {
+        printf("ERROR: --copy-algorithm requires --api default\n");
+      }
+      return false;
+    }
+    return true;
+  }
+
+  if (copyAlgorithm != nullptr) {
+    benchSetEnv("NCCL_RESHARD_COPY_ALGORITHM", copyAlgorithm);
+  }
+  return true;
+}
+
+static inline const char* benchResolvedCopyAlgorithm() {
+  // NOLINTNEXTLINE(concurrency-mt-unsafe) — benchmark configuration is resolved before worker threads start.
+  const char* copyAlgorithm = getenv("NCCL_RESHARD_COPY_ALGORITHM");
+  return copyAlgorithm != nullptr ? copyAlgorithm : "PACKWINDOW";
+}
+
 static inline bool benchArgIs(const char* value, const char* expected) {
   return value != nullptr && strcmp(value, expected) == 0;
 }

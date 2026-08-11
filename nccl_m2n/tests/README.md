@@ -60,6 +60,10 @@ make tests GTEST_DIR=/path/to/googletest
 
 `basic_api_test_local` omits `graph_capture`. Its pthread ranks share one
 process, while CUDA graph-capture coverage runs through `basic_api_test_mpi`.
+The MPI driver runs `stream_churn`, `stream_ordering`, and `graph_capture`
+with both caller streams and internal stream-pool mode. Its
+`group_mixed_context` filter also checks ordering across overlapping
+communicator contexts.
 
 Each case carries additional **runtime feasibility checks** (n_shards
 must divide `src_total` / `dst_total`, the chosen tensor dim must divide

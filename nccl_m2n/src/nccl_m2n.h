@@ -23,6 +23,16 @@
 #include "cuda_runtime.h"
 #include "nccl.h"
 
+// Library release version. These are the single source of truth for the
+// version this library ships as. Distinct from NCCL_M2N_API_VERSION below,
+// which guards the public struct ABI and moves only when that layout changes.
+#define NCCL_M2N_MAJOR 0
+#define NCCL_M2N_MINOR 2
+#define NCCL_M2N_PATCH 0
+
+// Packed version code: MAJOR*10000 + MINOR*100 + PATCH. Mirrors NCCL_VERSION_CODE.
+#define NCCL_M2N_VERSION_CODE (NCCL_M2N_MAJOR * 10000 + NCCL_M2N_MINOR * 100 + NCCL_M2N_PATCH)
+
 /** Oldest NCCL release supported by this NCCL M2N API and implementation. */
 #define NCCL_M2N_MIN_NCCL_VERSION_CODE NCCL_VERSION(2, 30, 5)
 
@@ -122,7 +132,8 @@ typedef struct ncclDistTensor_v2 {
 /** ABI guard value set by NCCL_M2N_CONFIG_INITIALIZER. */
 #define NCCL_M2N_API_MAGIC 0x4d324e32u /* 'M2N2' */
 
-/** NCCL M2N API version. */
+/** NCCL M2N public struct ABI version. Not the library release version —
+ * see NCCL_M2N_MAJOR / MINOR / PATCH at the top of this header. */
 #define NCCL_M2N_API_VERSION 2u
 
 /**

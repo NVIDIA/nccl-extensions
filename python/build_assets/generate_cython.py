@@ -134,23 +134,12 @@ def _nccl_m2n_target() -> Target:
         raise RuntimeError(f"nccl_m2n public header not found: {public_header}")
     return Target(
         name="nccl_m2n",
-        # Unlike nccl_ep, M2N does not publish semantic-version macros in its
-        # C header. The cybind configuration owns its generation version.
-        version=_read_asset_version(ASSETS_DIR / "configs" / "nccl_m2n.cybind.yaml"),
+        version=_read_version(public_header, "NCCL_M2N"),
         headers={
             "nccl_m2n.h": public_header,
             "nccl.h": HEADERS_DIR / "nccl" / str(NCCL_PIN) / "nccl.h",
         },
     )
-
-
-def _read_asset_version(yaml_path: Path) -> Version:
-    """Read the sole ``data.versions`` entry from a cybind asset config."""
-    text = yaml_path.read_text()
-    match = re.search(r"versions:\n\s*- - (\S+)", text)
-    if match is None:
-        raise RuntimeError(f"No data.versions entry found in {yaml_path}")
-    return Version(match.group(1))
 
 
 def _stamp_asset_yaml(yaml_path: Path, version: Version) -> None:

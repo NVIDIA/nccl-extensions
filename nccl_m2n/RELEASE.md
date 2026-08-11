@@ -28,6 +28,11 @@ Existing binaries must be rebuilt against the updated header.
 
 - **NCCL compatibility:** NCCL 2.30.5 or newer is required to build and use
   this release.
+- **Release version macros:** `nccl_m2n.h` publishes `NCCL_M2N_MAJOR`,
+  `NCCL_M2N_MINOR`, `NCCL_M2N_PATCH` and the packed `NCCL_M2N_VERSION_CODE`,
+  matching the convention `nccl_ep.h` already uses. These carry the library
+  release version and are distinct from `NCCL_M2N_API_VERSION`, which guards
+  the public struct ABI. No build system consumes them yet.
 - **Exported symbols:** the five public entry points carry default-visibility
   annotations, so a build that compiles hidden-by-default exports exactly those
   five. The Make build does not enable `-fvisibility=hidden`, so it additionally

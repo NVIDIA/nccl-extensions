@@ -90,6 +90,10 @@ the C kernel has no inherent 8-rank requirement.
 # Run only one group.
 ./build/bin/basic_api_test_local --filter full_replication
 
+# Sweep CTA counts in separate processes, including counts that do not divide
+# evenly by the GIN context count.
+bash tests/run_cta_count_regression.sh -N 4
+
 # Switch to the direct-put kernel.
 ./build/bin/basic_api_test_local --algorithm direct
 ```

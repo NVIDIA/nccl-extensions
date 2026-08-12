@@ -80,24 +80,14 @@ __global__ __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void reshardKernelU
   // of ctxPerSlotB contexts, then offsets by slotIdx*ctxPerSlotB.
   int ginContextA = 0;
   if (inA) {
-    int ctxCountA = (int)devCommA.ginContextCount;
-    int numCtxA = min((int)gridDim.x, ctxCountA > 0 ? ctxCountA : 1);
-    if (numCtxA < 1) numCtxA = 1;
-    int ctasPerCtxA = (int)gridDim.x / numCtxA;
-    if (ctasPerCtxA < 1) ctasPerCtxA = 1;
-    ginContextA = (int)blockIdx.x / ctasPerCtxA;
-    if (ginContextA >= numCtxA) ginContextA = numCtxA - 1;
+    int ctxCountA = (devCommA.ginContextCount > 0) ? (int)devCommA.ginContextCount : 1;
+    ginContextA = reshardMapCtaToGinContext((int)blockIdx.x, (int)gridDim.x, ctxCountA);
   }
 
   int ginContextB = 0;
   if (inB) {
     int ctxPerSlot = (params.ctxPerSlotB > 0) ? params.ctxPerSlotB : 1;
-    int numCtxB = min((int)gridDim.x, ctxPerSlot);
-    if (numCtxB < 1) numCtxB = 1;
-    int ctasPerCtxB = (int)gridDim.x / numCtxB;
-    if (ctasPerCtxB < 1) ctasPerCtxB = 1;
-    int localCtxB = (int)blockIdx.x / ctasPerCtxB;
-    if (localCtxB >= numCtxB) localCtxB = numCtxB - 1;
+    int localCtxB = reshardMapCtaToGinContext((int)blockIdx.x, (int)gridDim.x, ctxPerSlot);
     ginContextB = params.slotIdx * ctxPerSlot + localCtxB;
   }
 

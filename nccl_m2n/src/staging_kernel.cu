@@ -87,9 +87,7 @@ __global__ __launch_bounds__(DIRECT_TOTAL_WARPS * 32, 1) void StagingReshardKern
   StagingKernelParams* __restrict__ params, ncclDevComm devComm) {
   const int channel_id = (int)blockIdx.x;
 
-  int numContexts = min((int)gridDim.x, (int)devComm.ginContextCount);
-  int ctasPerContext = (int)gridDim.x / numContexts;
-  int ginContext = (int)blockIdx.x / ctasPerContext;
+  int ginContext = reshardMapCtaToGinContext((int)blockIdx.x, (int)gridDim.x, (int)devComm.ginContextCount);
   ncclGin gin{devComm, ginContext};
   ncclTeam world = ncclTeamWorld(devComm);
 

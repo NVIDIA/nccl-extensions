@@ -54,6 +54,19 @@ inline constexpr int DEFAULT_KERNEL_MAX_NTHREADS = 512;
 inline constexpr int DEFAULT_GIN_CONTEXT_COUNT = 4;
 inline constexpr int DEFAULT_GPUS_PER_NODE = 8;
 
+/* Assign contiguous CTA ranges as evenly as possible across the available
+ * GIN contexts.  Callers guarantee 0 <= ctaIdx < numCtas. */
+constexpr int reshardMapCtaToGinContext(int ctaIdx, int numCtas, int ginContextCount) {
+  if (numCtas < 1) {
+    return 0;
+  }
+  int numContexts = ginContextCount < numCtas ? ginContextCount : numCtas;
+  if (numContexts < 1) {
+    numContexts = 1;
+  }
+  return (int)(((size_t)ctaIdx * (size_t)numContexts) / (size_t)numCtas);
+}
+
 /* Cross-dim transpose threshold (bytes).  If the innermost transfer
    size is below this, the library transparently transposes the last
    two tensor dims to improve RDMA throughput.

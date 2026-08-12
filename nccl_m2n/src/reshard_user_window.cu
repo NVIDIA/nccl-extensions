@@ -129,9 +129,7 @@ struct TransposeBufferEventGuard {
 
 __global__ __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void reshardKernelUserWindow(ncclReshardParams params,
                                                                                           struct ncclDevComm devComm) {
-  int numContexts = min((int)gridDim.x, (int)devComm.ginContextCount);
-  int ctasPerContext = (int)gridDim.x / numContexts;
-  int ginContext = (int)blockIdx.x / ctasPerContext;
+  int ginContext = reshardMapCtaToGinContext((int)blockIdx.x, (int)gridDim.x, (int)devComm.ginContextCount);
   ncclGin gin{devComm, ginContext};
 
   ncclTeam world = ncclTeamWorld(devComm);
@@ -364,9 +362,7 @@ directReshardKernelUserWindow(
     struct ncclDevComm      devComm)
 // clang-format on
 {
-  int numContexts = min((int)gridDim.x, (int)devComm.ginContextCount);
-  int ctasPerContext = (int)gridDim.x / numContexts;
-  int ginContext = (int)blockIdx.x / ctasPerContext;
+  int ginContext = reshardMapCtaToGinContext((int)blockIdx.x, (int)gridDim.x, (int)devComm.ginContextCount);
   ncclGin gin{devComm, ginContext};
 
   ncclTeam world = ncclTeamWorld(devComm);

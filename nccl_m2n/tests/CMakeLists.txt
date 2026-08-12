@@ -15,7 +15,7 @@
 # GTest discovery, in order:
 #   1) Existing GTest::gtest or gtest target from the parent build.
 #   2) Installed GTest package.
-#   3) GTEST_DIR override, the repository-root third_party/googletest
+#   3) GTEST_DIR CMake/environment override, the repository-root third_party/googletest
 #      submodule, or a vendored tests/googletest source.
 #   4) Skip the test build with a clear message.
 #
@@ -43,6 +43,12 @@ endif()
 
 set(SRCS ${NCCL_M2N_SRC_FULL_PATHS})
 
+# Match Make's environment-variable support without overriding an explicit
+# -DGTEST_DIR value, including an intentionally empty one.
+if(NOT DEFINED GTEST_DIR AND DEFINED ENV{GTEST_DIR})
+  set(GTEST_DIR "$ENV{GTEST_DIR}")
+endif()
+
 # The upstream googletest repo nests the framework one level down, so the
 # usable source root of the repository-root submodule is
 # third_party/googletest/googletest.
@@ -64,13 +70,14 @@ endif()
 if(NOT _NCCL_M2N_GTEST_TARGET AND NOT _NCCL_M2N_GTEST_DIR)
   message(STATUS
     "nccl_m2n tests/: googletest not found — skipping basic_api. "
-    "Provide GTest::gtest, install GTest, run "
+    "Provide GTest::gtest, install GTest, export GTEST_DIR, run "
     "'git submodule update --init third_party/googletest', or pass "
     "-DGTEST_DIR=/path/to/googletest.")
   return()
 endif()
 
 if(NOT _NCCL_M2N_GTEST_TARGET)
+  message(STATUS "nccl_m2n tests/: using googletest source ${_NCCL_M2N_GTEST_DIR}")
   add_library(nccl_m2n_gtest STATIC
       "${_NCCL_M2N_GTEST_DIR}/src/gtest-all.cc")
   target_include_directories(nccl_m2n_gtest
@@ -82,6 +89,8 @@ if(NOT _NCCL_M2N_GTEST_TARGET)
       CXX_STANDARD_REQUIRED ON
       POSITION_INDEPENDENT_CODE ON)
   set(_NCCL_M2N_GTEST_TARGET nccl_m2n_gtest)
+else()
+  message(STATUS "nccl_m2n tests/: using googletest target ${_NCCL_M2N_GTEST_TARGET}")
 endif()
 
 # ─── MPI (optional) ───────────────────────────────────────────────────────────

@@ -35,6 +35,44 @@ handles, resharding, and DTensor interop) under `nccl/m2n/`.
 `nccl.m2n.reshard` uses staging. `nccl.m2n.reshard_with_window` uses a
 caller-registered window.
 
+### Grouping M2N calls
+
+Use `m2n.group()` to submit several reshard calls together. The context ends
+the group on success and aborts it if its body raises an exception.
+
+Grouping defines a submission boundary and preserves abort and error
+semantics. Grouping does not guarantee a performance benefit, and broader
+grouping optimizations are future work.
+
+```python
+import nccl.m2n as m2n
+
+# `comm`, `stream`, `src0`, `dst0`, `src1`, and `dst1` are prepared as for a
+# normal M2N reshard call.
+with m2n.init() as handle:
+    with m2n.group():
+        handle.reshard(comm, src0, dst0, stream=stream)
+        handle.reshard(comm, src1, dst1, stream=stream)
+    stream.synchronize()
+```
+
+For explicit control, pair `group_start()` with `group_end()` and abort on an
+exception:
+
+```python
+with m2n.init() as handle:
+    m2n.group_start()
+    try:
+        handle.reshard(comm, src0, dst0, stream=stream)
+        handle.reshard(comm, src1, dst1, stream=stream)
+    except BaseException:
+        m2n.group_abort()
+        raise
+    else:
+        m2n.group_end()
+    stream.synchronize()
+```
+
 Install the optional benchmark dependency before running the packaged M2N
 benchmark:
 

@@ -18,6 +18,18 @@ cdef ncclResult_t ncclM2nFinalize(ncclM2nHandle_t handle) except?_NCCLRESULT_T_I
     return _nccl_m2n._ncclM2nFinalize(handle)
 
 
+cdef ncclResult_t ncclM2nGroupStart() except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    return _nccl_m2n._ncclM2nGroupStart()
+
+
+cdef ncclResult_t ncclM2nGroupEnd() except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    return _nccl_m2n._ncclM2nGroupEnd()
+
+
+cdef ncclResult_t ncclM2nGroupAbort() except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    return _nccl_m2n._ncclM2nGroupAbort()
+
+
 cdef ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm, ncclWindow_t window, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
     return _nccl_m2n._ncclReshardWithWindow(handle, comm, window, src, dst, stream)
 

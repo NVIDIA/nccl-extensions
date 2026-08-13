@@ -32,6 +32,9 @@ nccl_m2n:
       return: handle
       except?: 0
     ncclM2nFinalize: {}
+    ncclM2nGroupStart: {}
+    ncclM2nGroupEnd: {}
+    ncclM2nGroupAbort: {}
     ncclReshardWithWindow: {}
     ncclReshard: {}
   types:

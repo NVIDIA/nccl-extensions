@@ -11,9 +11,16 @@ shared ``nccl`` namespace. It wraps the global NCCL M2N C API from
 conventions.
 """
 
-from nccl._extensions.bindings.nccl_m2n import NCCLReshardError as NcclReshardError
+from nccl._extensions.bindings.nccl_m2n import (
+    FunctionNotFoundError,
+    NCCLReshardError as NcclReshardError,
+)
 from nccl.m2n.api import (
     finalize,
+    group,
+    group_abort,
+    group_end,
+    group_start,
     init,
     reshard,
     reshard_with_window,
@@ -31,12 +38,17 @@ __all__ = [
     "MESH_NDIMS",
     "Config",
     "DistTensor",
+    "FunctionNotFoundError",
     "Handle",
     "Mesh",
     "NcclReshardError",
     "Replicate",
     "Shard",
     "finalize",
+    "group",
+    "group_abort",
+    "group_end",
+    "group_start",
     "init",
     "reshard",
     "reshard_with_window",

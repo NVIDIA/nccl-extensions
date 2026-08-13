@@ -85,6 +85,7 @@ REPLICATE = NCCL_RESHARD_REPLICATE
 
 from nccl.bindings.nccl import NCCLError as _NCCLError
 from nccl._extensions._runtime import NATIVE_CALL_LOCK as _NATIVE_CALL_LOCK
+from ._internal.utils import FunctionNotFoundError
 
 
 class NCCLReshardError(_NCCLError):
@@ -134,6 +135,30 @@ cpdef finalize(intptr_t handle):
     with _NATIVE_CALL_LOCK:
         with nogil:
             status = ncclM2nFinalize(<Handle>handle)
+        check_status(status)
+
+
+cpdef group_start():
+    cdef ncclResult_t status
+    with _NATIVE_CALL_LOCK:
+        with nogil:
+            status = ncclM2nGroupStart()
+        check_status(status)
+
+
+cpdef group_end():
+    cdef ncclResult_t status
+    with _NATIVE_CALL_LOCK:
+        with nogil:
+            status = ncclM2nGroupEnd()
+        check_status(status)
+
+
+cpdef group_abort():
+    cdef ncclResult_t status
+    with _NATIVE_CALL_LOCK:
+        with nogil:
+            status = ncclM2nGroupAbort()
         check_status(status)
 
 

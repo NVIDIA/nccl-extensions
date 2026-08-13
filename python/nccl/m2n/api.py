@@ -7,7 +7,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 from nccl.core.typing import NcclInvalid, NcclStreamSpec
@@ -55,6 +56,38 @@ def finalize(handle: Handle | None = None) -> None:
         handle.destroy()
     else:
         raise TypeError(f"handle must be nccl.m2n.Handle or None, got {type(handle).__name__}")
+
+
+def group_start() -> None:
+    """Begin recording M2N reshard calls on the current host thread."""
+
+    _m2n_bindings.group_start()
+
+
+def group_end() -> None:
+    """Close one M2N group level and submit the outermost group."""
+
+    _m2n_bindings.group_end()
+
+
+def group_abort() -> None:
+    """Discard every active M2N group level on the current host thread."""
+
+    _m2n_bindings.group_abort()
+
+
+@contextmanager
+def group() -> Iterator[None]:
+    """Record reshard calls and submit them when the context exits."""
+
+    group_start()
+    try:
+        yield
+    except BaseException:
+        group_abort()
+        raise
+    else:
+        group_end()
 
 
 def _is_dtensor_like(tensor: object) -> bool:
@@ -719,6 +752,10 @@ def xdtensor_reshard(
 
 __all__ = [
     "finalize",
+    "group",
+    "group_abort",
+    "group_end",
+    "group_start",
     "init",
     "reshard",
     "reshard_with_window",

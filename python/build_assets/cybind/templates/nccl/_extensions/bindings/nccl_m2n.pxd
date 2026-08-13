@@ -25,5 +25,8 @@ ctypedef cudaStream_t Stream
 
 cpdef intptr_t init(intptr_t config) except? 0
 cpdef finalize(intptr_t handle)
+cpdef group_start()
+cpdef group_end()
+cpdef group_abort()
 cpdef reshard_with_window(intptr_t handle, intptr_t comm, intptr_t window, intptr_t src, intptr_t dst, intptr_t stream)
 cpdef reshard(intptr_t handle, intptr_t comm, intptr_t src, intptr_t dst, intptr_t stream)

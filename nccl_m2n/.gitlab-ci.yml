@@ -6,6 +6,7 @@ include:
 
 stages:
   - build
+  - package
   - setup
   - unit_test
 
@@ -271,3 +272,36 @@ unit_test_pretyche:
         -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN:-ci}:nccl-m2n-unit-pretyche::${CI_COMMIT_REF_NAME:-detached}:${CI_COMMIT_SHORT_SHA}" \
         -t "${SLURM_TIME}" \
         bash nccl_m2n/ci/run_nccl_m2n_tests.sh
+
+package:python_m2n:
+  extends: .ipp6-build
+  stage: package
+  timeout: 1h
+  needs:
+    - pipeline: "${PARENT_PIPELINE_ID}"
+      job: build:nccl
+      artifacts: true
+    - job: build:nccl_m2n
+      artifacts: true
+  script:
+    - |
+      set -euxo pipefail
+      current_dir="$(realpath .)"
+      srun \
+        -p cpuonly \
+        -J nccl-extensions:m2n-python \
+        -t 01:00:00 \
+        -n 1 \
+        --exclusive \
+        --container-image="${BUILD_CONTAINER_IMAGE}" \
+        --container-mounts="${current_dir}:${current_dir}" \
+        env \
+        CUDA_HOME=/usr/local/cuda \
+        NCCL_HOME="${CI_PROJECT_DIR}/.ci/nccl/build" \
+        bash "${CI_PROJECT_DIR}/python/ci/verify_m2n_package.sh" \
+        "${CI_PROJECT_DIR}/nccl_m2n/build"
+  artifacts:
+    name: "nccl-extensions-python-${CI_COMMIT_SHORT_SHA}"
+    expire_in: 24 hours
+    paths:
+      - python/dist/

@@ -45,6 +45,7 @@ nccl_m2n:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
         - nccl_m2n/**/*
+        - python/**/*
         - .gitlab-ci.yml
         - .gitlab/**/*
         - .gitmodules

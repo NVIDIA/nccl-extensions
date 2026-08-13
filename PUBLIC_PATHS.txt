@@ -24,3 +24,9 @@ README.md
 .gitlab/
 **/.gitlab-ci.yml
 PUBLIC_PATHS.txt
+
+# Internal NCCL EP PLC design documents are never part of the public export.
+nccl_ep/docs/plc/**
+
+# Internal NCCL M2N PLC design documents are never part of the public export.
+nccl_m2n/docs/plc/**

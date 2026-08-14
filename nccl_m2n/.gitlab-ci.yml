@@ -9,6 +9,7 @@ stages:
   - package
   - setup
   - unit_test
+  - integration_test
 
 variables:
   CI_JOB_SUBPATH: "${CI_PIPELINE_ID}/${CI_JOB_ID}"
@@ -49,11 +50,12 @@ build:nccl_m2n:
         make -C "${CI_PROJECT_DIR}/nccl_m2n" -j"$(nproc)" \
         NVCC_GENCODE="$NVCC_GENCODE" \
         GTEST_DIR="${CI_PROJECT_DIR}/.ci/googletest/googletest" \
-        lib tests
+        lib tests bench reshard
       test -s nccl_m2n/build/lib/libnccl_m2n.so
       test -s nccl_m2n/build/include/nccl_m2n.h
       test -x nccl_m2n/build/bin/basic_api_test_local
       test -x nccl_m2n/build/bin/basic_api_test_mpi
+      test -x nccl_m2n/build/bin/reshard_bench
       # Every function declared in the public header must (a) carry
       # NCCL_M2N_API and (b) be an exported, defined text symbol. The CMake
       # build compiles hidden-by-default, so a missing annotation links here
@@ -154,10 +156,11 @@ build_pretyche:
           BUILDDIR=/nccl_install/build \
           NVCC_GENCODE='-gencode=arch=compute_100,code=sm_100' \
           GTEST_DIR=/workspace/.ci/googletest/googletest \
-          lib tests
+          lib tests bench reshard
 
       test -x "${install_dir}/build/bin/basic_api_test_local"
       test -x "${install_dir}/build/bin/basic_api_test_mpi"
+      test -x "${install_dir}/build/bin/reshard_bench"
       artifact_dir="${NCCL_M2N_ARTIFACT_STAGING:-nccl_m2n_install_artifact}"
       rm -rf "${artifact_dir}"
       mkdir -p "${artifact_dir}/bin" "${artifact_dir}/include" "${artifact_dir}/lib"
@@ -165,6 +168,7 @@ build_pretyche:
       cp -a "${install_dir}/build/include/nccl_m2n.h" "${artifact_dir}/include/"
       cp -a "${install_dir}/build/bin/basic_api_test_local" "${artifact_dir}/bin/"
       cp -a "${install_dir}/build/bin/basic_api_test_mpi" "${artifact_dir}/bin/"
+      cp -a "${install_dir}/build/bin/reshard_bench" "${artifact_dir}/bin/"
   artifacts:
     paths:
       - nccl_m2n_install_artifact/
@@ -193,6 +197,7 @@ setup_eos:
       cp -a "${CI_PROJECT_DIR}/nccl_m2n/build/include/nccl_m2n.h" "${dst}/include/"
       cp -a "${CI_PROJECT_DIR}/nccl_m2n/build/bin/basic_api_test_local" "${dst}/bin/"
       cp -a "${CI_PROJECT_DIR}/nccl_m2n/build/bin/basic_api_test_mpi" "${dst}/bin/"
+      cp -a "${CI_PROJECT_DIR}/nccl_m2n/build/bin/reshard_bench" "${dst}/bin/"
 
 setup_pretyche:
   stage: setup
@@ -305,3 +310,71 @@ package:python_m2n:
     expire_in: 24 hours
     paths:
       - python/dist/
+
+integration_test_eos:
+  stage: integration_test
+  tags:
+    - nccl-eos
+  needs:
+    - setup_eos
+    - unit_test_eos
+  variables:
+    NCCL_HOME: "${EOS_INSTALL_DIR}/build"
+    CI_BUILDS_DIR: "${EOS_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
+    NCCL_M2N_MPI_TEST_PROFILE: "four_rank"
+    NCCL_M2N_MPI_NNODES: "2"
+    NCCL_M2N_MPI_NTASKS_PER_NODE: "2"
+    SLURM_ACCOUNT: "coreai_libraries_nccl"
+    SLURM_TIME: "60"
+  script:
+    - |
+      set -euxo pipefail
+      export CUDA_HOME="${EOS_CUDA_HOME}"
+      export MPI_HOME="/usr/mpi/gcc/openmpi-4.1.5rc2"
+      export PATH="${MPI_HOME}/bin:${PATH}"
+      export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
+      export OMPI_MCA_btl="tcp,self"
+      export OMPI_MCA_btl_tcp_if_include="eth3"
+      salloc \
+        -N "${NCCL_M2N_MPI_NNODES}" \
+        --ntasks-per-node "${NCCL_M2N_MPI_NTASKS_PER_NODE}" \
+        --exclusive \
+        --account="${SLURM_ACCOUNT}" \
+        -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN:-ci}:nccl-m2n-integration-eos::${CI_COMMIT_REF_NAME:-detached}:${CI_COMMIT_SHORT_SHA}" \
+        -t "${SLURM_TIME}" \
+        bash nccl_m2n/ci/run_nccl_m2n_mpi_tests.sh
+
+integration_test_pretyche:
+  stage: integration_test
+  tags:
+    - ptyche
+  needs:
+    - setup_pretyche
+    - unit_test_pretyche
+  variables:
+    NCCL_HOME: "${PRE_TYCHE_INSTALL_DIR}/build"
+    CI_BUILDS_DIR: "${PRE_TYCHE_CI_BUILDS_DIR}/${CI_JOB_SUBPATH}"
+    NCCL_M2N_MPI_TEST_PROFILE: "eight_rank"
+    NCCL_M2N_MPI_NNODES: "2"
+    NCCL_M2N_MPI_NTASKS_PER_NODE: "4"
+    SLURM_PARTITION: "batch"
+    SLURM_ACCOUNT: "coreai_libraries_nccl"
+    SLURM_TIME: "60"
+  script:
+    - |
+      set -euxo pipefail
+      source "${PRE_TYCHE_INSTALL_DIR}/pre-tyche-config.sh"
+      configure_test_env
+      export CUDA_HOME="${PRE_TYCHE_CUDA_HOME}"
+      export MPI_HOME="/lustre/fsw/coreai_libraries_nccl/toolkits/openmpi-5.0.6"
+      export PATH="${MPI_HOME}/bin:${PATH}"
+      export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
+      salloc \
+        -N "${NCCL_M2N_MPI_NNODES}" \
+        --ntasks-per-node "${NCCL_M2N_MPI_NTASKS_PER_NODE}" \
+        --exclusive \
+        -p "${SLURM_PARTITION}" \
+        --account="${SLURM_ACCOUNT}" \
+        -J "${SLURM_ACCOUNT}-cicd::${GITLAB_USER_LOGIN:-ci}:nccl-m2n-integration-pretyche::${CI_COMMIT_REF_NAME:-detached}:${CI_COMMIT_SHORT_SHA}" \
+        -t "${SLURM_TIME}" \
+        bash nccl_m2n/ci/run_nccl_m2n_mpi_tests.sh

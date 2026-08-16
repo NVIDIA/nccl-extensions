@@ -1759,19 +1759,6 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             fprintf(stderr, "Error: NCCL EP requires max_num_sms <= device_sm_count\n");
             return ncclInvalidUsage;
         }
-        if (in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-            // This reflects the current limitation of the LL backend
-            // TODO: validate that the limitation is valid and if need - relax it in a follow-up fix
-            constexpr int llMaxWarpGroupsLimit = nccl_ep::ll::kLlDispatchMaxWarpGroups;
-            const int numWarpGroups = (in_config->num_experts + (in_config->max_num_sms - 1)) / in_config->max_num_sms;
-            if (numWarpGroups > llMaxWarpGroupsLimit) {
-                const int required_sms = (in_config->num_experts + (llMaxWarpGroupsLimit - 1)) / llMaxWarpGroupsLimit;
-                fprintf(stderr,
-                        "Error: insufficient 'max_num_sms'. In Low-Latency mode, NCCL EP requires at least %d SMs\n",
-                        required_sms);
-                return ncclInvalidUsage;
-            }
-        }
         ep_group->comm_num_sms = in_config->max_num_sms;
         ep_group->shuffle_sms = in_config->max_num_sms;
         ep_group->preprocess_num_sms = in_config->max_num_sms;
@@ -1794,6 +1781,25 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     apply_sms_override(ep_group->env.comm_num_sms, ep_group->comm_num_sms);
     apply_sms_override(ep_group->env.shuffle_sms, ep_group->shuffle_sms);
     apply_sms_override(ep_group->env.preprocess_num_sms, ep_group->preprocess_num_sms);
+
+    // LL warp-group bound. Validate the RESOLVED comm SM count
+    if (in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
+        // This reflects the current limitation of the LL backend
+        // TODO: validate that the limitation is valid and if need - relax it in a follow-up fix
+        constexpr int llMaxWarpGroupsLimit = nccl_ep::ll::kLlDispatchMaxWarpGroups;
+        const int num_experts = ep_group->config.num_experts;
+        const int sms = static_cast<int>(ep_group->comm_num_sms);
+        const int numWarpGroups = (num_experts + (sms - 1)) / sms;
+        if (numWarpGroups > llMaxWarpGroupsLimit) {
+            const int required_sms = (num_experts + (llMaxWarpGroupsLimit - 1)) / llMaxWarpGroupsLimit;
+            fprintf(stderr,
+                    "Error: insufficient comm SM count for Low-Latency mode: %d SMs with %d "
+                    "experts gives %d warp groups (max %d). Need >= %d SMs -- raise "
+                    "ncclEpGroupConfig_t::max_num_sms or NCCL_EP_COMM_SMS.\n",
+                    sms, num_experts, numWarpGroups, llMaxWarpGroupsLimit, required_sms);
+            return ncclInvalidUsage;
+        }
+    }
 
     // Determine number of nodes by gathering hostnames and counting unique ones
     constexpr size_t HOSTNAME_LEN = 256;

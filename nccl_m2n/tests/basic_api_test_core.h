@@ -36,6 +36,7 @@
 #include <cctype>
 #include <ostream>
 #include <string>
+#include <strings.h>
 #include <vector>
 #include <algorithm>
 
@@ -121,6 +122,7 @@ struct TestCase {
   bool bAsyncOrdering; /* keep source fill and destination validation on the caller stream */
   bool bGraphCapture;
   bool bGraphCapturePrewarmed;
+  bool bNullWindow; /* pass NULL to ncclReshardWithWindow */
 };
 
 static inline void printTo(const TestCase& tc, std::ostream* os) {
@@ -133,7 +135,7 @@ struct BasicApiCliArgs {
   bool verbose = false;
   const char* filter = nullptr;
   const char* algorithm = "ring";
-  const char* copyAlgorithm = "direct";
+  const char* copyAlgorithm = nullptr;
   const char* lbMode = "uniform";
   const char* api = "window"; /* "window", "default", or "all" */
   int maxWorld = 0; /* 0 = unrestricted */
@@ -158,10 +160,11 @@ static void basicApiPrintUsage(const char* prog, const char* usageFmt, bool allo
   printf("  --min-world <N>              Skip cases whose minimum world < N\n");
   printf("                               (combine with --max-world to bin by "
          "rank tier)\n");
-  printf("  --algorithm ring|direct%s  Reshard algorithm (default: ring%s)\n", allowAlgorithmAll ? "|all" : "   ",
-         allowAlgorithmAll ? "; 'all' registers one gtest case per algorithm" : "");
+  printf("  --algorithm ring|direct%s  Legacy scenario label (default: ring%s)\n", allowAlgorithmAll ? "|all" : "   ",
+         allowAlgorithmAll ? "; 'all' registers one gtest case per label" : "");
   printf("  --copy-algorithm direct|packwindow\n");
-  printf("                               Default-API copy algorithm (default: direct)\n");
+  printf("                               Copy transport for every selected API\n");
+  printf("                               (default: PACKWINDOW for ring, DIRECT for direct)\n");
   printf("  --api  window|default|all    Reshard API surface (default: "
          "window;\n");
   printf("                               'all' runs both window and default)\n");
@@ -289,6 +292,7 @@ static std::string buildCaseName(const TestCase& tc) {
   }
   std::string name(buf);
   if (tc.dstFirst) name += "[dst-first]";
+  if (tc.bNullWindow) name += "[null-window]";
   return name;
 }
 
@@ -642,18 +646,15 @@ static void emit1dTensorSizeSensitivity(std::vector<TestCase>& cases) {
 /* ======================================================================
  * Cross-dim regression group — hand-picked shapes from historical bugs.
  *
- * Each case is a cross-dim layout that has previously broken either the
- * non-transpose RING / DIRECT path or the `shouldTransposeForCrossDim`-
- * gated transpose path.  Curated, intentionally small — meant to be
+ * Each case is a cross-dim layout that previously exposed a data-layout or
+ * transfer-path bug. Curated, intentionally small — meant to be
  * run quickly via `--filter cross_dim_regression` as a fast targeted
  * gate.  Not a substitute for the full 2d_placement / nd_tensors
  * matrices; complements them.
  *
  * Mapping:
- *   issue !4 — 3D, sd=0/1, dstShardDim != ndims-1 → transpose path
- *              skipped, non-transpose RING/DIRECT was broken.
- *   issue !5 — 2D, sd=0/1, mesh 2x4, rs/rs placement → 2D transpose
- *              path (enabled by bc0b99c) hangs.
+ *   issue !4 — 3D, sd=0/1, dstShardDim != ndims-1.
+ *   issue !5 — 2D, sd=0/1, mesh 2x4, rs/rs placement.
  *   staging high-fanout — 3D, train-style Shard(0) to gen-style
  *              Shard(innermost) with >INT32_MAX global elements.
  * ====================================================================*/
@@ -842,9 +843,9 @@ static void emitCrossDimRegression(std::vector<TestCase>& cases) {
     }
   }
 
-  /* issue !4: 3D, sd=0/1, dstShardDim is NOT innermost so the
-   * transpose gate stays off.  1D mesh per side (dim0=0) with rs/rs
-   * placement; each side 4 shards → worldMin = 8. */
+  /* issue !4: 3D, sd=0/1, dstShardDim is not innermost. 1D mesh per
+   * side (dim0=0) with rs/rs placement; each side has 4 shards, so
+   * worldMin = 8. */
   {
     TestCase tc{};
     tc.group = "cross_dim_regression";
@@ -890,6 +891,27 @@ static void emitCrossDimRegression(std::vector<TestCase>& cases) {
   }
 }
 
+static void emitWindowNullCase(std::vector<TestCase>& cases) {
+  TestCase tc{};
+  tc.group = "window_null";
+  tc.ndims = 1;
+  tc.globalDims[0] = 4096;
+  tc.globalDims[1] = 1;
+  tc.globalDims[2] = 1;
+  tc.srcDim0 = 0;
+  tc.dstDim0 = 0;
+  tc.srcShardDim = 0;
+  tc.dstShardDim = 0;
+  tc.srcPl = PL_RS;
+  tc.dstPl = PL_RS;
+  tc.elementSize = 1;
+  tc.worldMin = 2;
+  tc.worldDivisor = 2;
+  tc.bNullWindow = true;
+  tc.name = buildCaseName(tc);
+  cases.push_back(std::move(tc));
+}
+
 static std::vector<TestCase> buildAllTestCases() {
   std::vector<TestCase> cases;
   emitFullReplication(cases);
@@ -907,6 +929,7 @@ static std::vector<TestCase> buildAllTestCases() {
   emit1dTensorSizeSensitivity(cases);
   /* Targeted regression coverage for historical cross-dim bugs. */
   emitCrossDimRegression(cases);
+  emitWindowNullCase(cases);
   emitTinyContribution(cases);
   emitStreamChurn(cases);
   emitStreamOrdering(cases);
@@ -1248,21 +1271,42 @@ static const char* basicApiRequestedAlgorithmEnv(const BasicApiCliArgs& cli, boo
   return "RING";
 }
 
-static void basicApiConfigureReshardEnv(const BasicApiCliArgs& cli, const char* algorithmEnv) {
+static const char* basicApiConfigureReshardEnv(const BasicApiCliArgs& cli, const char* algorithmEnv) {
   testSetEnv("NCCL_RESHARD_ALGORITHM", algorithmEnv);
-  testSetEnv("NCCL_RESHARD_COPY_ALGORITHM",
-             strcmp(cli.copyAlgorithm, "packwindow") == 0 ? "PACKWINDOW" : "DIRECT");
+  static bool inheritedCopyAlgorithmCaptured = false;
+  static const char* inheritedCopyAlgorithm = nullptr;
+  if (!inheritedCopyAlgorithmCaptured) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe) — serialized test configuration
+    const char* copyAlgorithmEnv = getenv("NCCL_RESHARD_COPY_ALGORITHM");
+    if (copyAlgorithmEnv != nullptr) {
+      inheritedCopyAlgorithm = strcasecmp(copyAlgorithmEnv, "DIRECT") == 0 ? "DIRECT" : "PACKWINDOW";
+    }
+    inheritedCopyAlgorithmCaptured = true;
+  }
+
+  const char* copyAlgorithm = nullptr;
+  if (cli.copyAlgorithm != nullptr) {
+    copyAlgorithm = strcmp(cli.copyAlgorithm, "packwindow") == 0 ? "PACKWINDOW" : "DIRECT";
+    testSetEnv("NCCL_RESHARD_COPY_ALGORITHM", copyAlgorithm);
+  } else if (inheritedCopyAlgorithm != nullptr) {
+    copyAlgorithm = inheritedCopyAlgorithm;
+  } else {
+    copyAlgorithm = strcmp(algorithmEnv, "DIRECT") == 0 ? "DIRECT" : "PACKWINDOW";
+    testSetEnv("NCCL_RESHARD_COPY_ALGORITHM", copyAlgorithm);
+  }
   testSetEnv("NCCL_RESHARD_LB_MODE", strcmp(cli.lbMode, "node") == 0 ? "NODE_AWARE" : "UNIFORM");
   if (cli.verbose) testSetEnv("NCCL_RESHARD_LOG_LEVEL", "DEBUG");
+  return copyAlgorithm;
 }
 
-static void basicApiPrintRuntimeSummary(const char* title, int worldSize, int deviceCount, const BasicApiCliArgs& cli,
-                                        size_t bufferBytes, const char* countLabel, size_t count, bool shouldPrint) {
+static void basicApiPrintRuntimeSummary(const char* title, int worldSize, int deviceCount,
+                                        const BasicApiCliArgs& cli, const char* copyAlgorithm, size_t bufferBytes,
+                                        const char* countLabel, size_t count, bool shouldPrint) {
   if (!shouldPrint) return;
 
   printf("=== %s ===\n", title);
   printf("worldSize=%d, devices=%d, algo=%s, copy=%s, lb=%s, api=%s\n", worldSize, deviceCount, cli.algorithm,
-         cli.copyAlgorithm, cli.lbMode, cli.api);
+         copyAlgorithm, cli.lbMode, cli.api);
   printf("bufferBytes=%zu, %s=%zu\n", bufferBytes, countLabel, count);
   if (cli.filter != nullptr) printf("filter='%s'\n", cli.filter);
   if (cli.maxWorld > 0) printf("maxWorld=%d\n", cli.maxWorld);
@@ -1347,7 +1391,11 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     activeBufferBytes = env->bufferBytes;
   }
 #ifdef NCCL_M2N_TESTING
-  const bool testPackWindowFusion = env->apiKind == ApiKind::Default && env->expectPackWindow && !asyncOrdering;
+  /* Selects the grouped two-tensor fusion scenario, which halves the buffer and
+   * issues a grouped pair through the selected entry point. The window entry
+   * point is a compatibility alias for the default one, so it must fuse the
+   * same way -- that is what this MR claims, so both kinds run the scenario. */
+  const bool testPackWindowFusion = env->expectPackWindow && !asyncOrdering;
 #else
   const bool testPackWindowFusion = false;
 #endif
@@ -1358,7 +1406,7 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
 
   /* ----- 6. window registration (window path only) ----- */
   ncclWindow_t window = nullptr;
-  if (env->apiKind == ApiKind::Window) {
+  if (env->apiKind == ApiKind::Window && !tc.bNullWindow) {
     TEST_NCCLCHECK(ncclCommWindowRegister(env->comm, activeBuffer, activeBufferBytes, &window,
                                           NCCL_WIN_COLL_SYMMETRIC));
   }
@@ -1424,12 +1472,15 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   dstT.placements[1] = dstLayout.placement[1];
   for (int d = 0; d < tc.ndims; d++) dstT.localShape[d] = dstLocalDimsElems[d];
 
-  auto reshard = [&](cudaStream_t callStream) {
+  /* Every call below goes through this one helper, so a scenario that issues
+   * several calls stays on the selected entry point for all of them. */
+  auto reshardTensors = [&](ncclDistTensor_t* src, ncclDistTensor_t* dst, cudaStream_t callStream) {
     if (env->apiKind == ApiKind::Default) {
-      return ncclReshard(env->m2nHandle, env->comm, &srcT, &dstT, callStream);
+      return ncclReshard(env->m2nHandle, env->comm, src, dst, callStream);
     }
-    return ncclReshardWithWindow(env->m2nHandle, env->comm, window, &srcT, &dstT, callStream);
+    return ncclReshardWithWindow(env->m2nHandle, env->comm, tc.bNullWindow ? nullptr : window, src, dst, callStream);
   };
+  auto reshard = [&](cudaStream_t callStream) { return reshardTensors(&srcT, &dstT, callStream); };
 
   cudaGraph_t graph = nullptr;
   ncclResult_t r = ncclSuccess;
@@ -1465,23 +1516,20 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
         break;
       }
     }
-  } else if (env->apiKind == ApiKind::Default) {
 #ifdef NCCL_M2N_TESTING
-    if (testPackWindowFusion) {
-      ncclDistTensor_t srcT2 = srcT;
-      ncclDistTensor_t dstT2 = dstT;
-      if (srcT2.dataPtr != nullptr) srcT2.dataPtr = (char*)srcT2.dataPtr + tensorRegionBytes;
-      if (dstT2.dataPtr != nullptr) dstT2.dataPtr = (char*)dstT2.dataPtr + tensorRegionBytes;
-      r = ncclM2nGroupStart();
-      if (r == ncclSuccess) r = ncclReshard(env->m2nHandle, env->comm, &srcT, &dstT, env->stream);
-      if (r == ncclSuccess) r = ncclReshard(env->m2nHandle, env->comm, &srcT2, &dstT2, env->stream);
-      if (r == ncclSuccess) r = ncclM2nGroupEnd();
-      if (r != ncclSuccess) (void)ncclM2nGroupAbort();
-    } else {
-      r = ncclReshard(env->m2nHandle, env->comm, &srcT, &dstT, env->stream);
-    }
-#else
-    r = ncclReshard(env->m2nHandle, env->comm, &srcT, &dstT, env->stream);
+  } else if (testPackWindowFusion) {
+    /* Both entries go through reshardTensors, so the window kind submits two
+     * grouped ncclReshardWithWindow calls and the assertion below observes the
+     * alias fusing rather than the default entry point standing in for it. */
+    ncclDistTensor_t srcT2 = srcT;
+    ncclDistTensor_t dstT2 = dstT;
+    if (srcT2.dataPtr != nullptr) srcT2.dataPtr = (char*)srcT2.dataPtr + tensorRegionBytes;
+    if (dstT2.dataPtr != nullptr) dstT2.dataPtr = (char*)dstT2.dataPtr + tensorRegionBytes;
+    r = ncclM2nGroupStart();
+    if (r == ncclSuccess) r = reshardTensors(&srcT, &dstT, env->stream);
+    if (r == ncclSuccess) r = reshardTensors(&srcT2, &dstT2, env->stream);
+    if (r == ncclSuccess) r = ncclM2nGroupEnd();
+    if (r != ncclSuccess) (void)ncclM2nGroupAbort();
 #endif
   } else {
     r = reshard(env->stream);
@@ -1506,9 +1554,9 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     if (reshardGetFusedSubmissionCountForTest() != 1) {
       instrumentationFailure = "compatible grouped tensors did not produce exactly one fused PACKWINDOW submission";
     }
-  } else if (!asyncOrdering && env->apiKind == ApiKind::Default && env->expectPackWindow &&
+  } else if (!asyncOrdering && env->expectPackWindow &&
              reshardGetLastCompletedCopyAlgorithmForTest() != RESHARD_COPY_ALGO_PACKWINDOW) {
-    instrumentationFailure = "default API did not execute the selected PACKWINDOW path";
+    instrumentationFailure = "selected API did not execute the selected PACKWINDOW path";
   }
 #endif
   env->barrier(env);

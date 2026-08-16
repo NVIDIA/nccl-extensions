@@ -8,8 +8,9 @@
 /*************************************************************************
  * Tensor Reshard Benchmark
  *
- * Benchmarks either ncclReshardWithWindow with caller-registered
- * ncclWindow_t, or ncclReshard with staging buffers.
+ * Benchmarks ncclReshard or the ncclReshardWithWindow entry point.
+ * The window-mode setup is retained for API regression coverage; the library
+ * ignores that caller window and uses the configured copy transport.
  *
  * Usage:
  *   mpirun -np <N> reshard_bench [options]
@@ -44,15 +45,12 @@ static void printUsage(const char* prog) {
   printf("  --iterations <N>                 Timed iterations (default: 10)\n");
   printf("  --warmup <N>                     Warmup iterations (default: 2)\n");
   printf("  --validate                       Validate data correctness\n");
-  printf("  --algorithm <algo>               Algorithm: 'ring' (default) or "
-         "'direct'\n");
-  printf("  --api <window|default>           API to benchmark (default: "
-         "default)\n");
+  printf("  --algorithm <algo>               Legacy compatibility setting: 'ring' "
+         "(default) or 'direct'\n");
+  printf("  --api <window|default>           Public entry point (default: default)\n");
   printf("  --copy-algorithm <a>             Advanced staging override: "
          "'packwindow'\n");
-  printf("                                   or 'direct' (default: "
-         "packwindow;\n");
-  printf("                                   requires --api default)\n");
+  printf("                                   or 'direct' (default: packwindow)\n");
   printf("  --lb-mode <uniform|node>         Load balancing: 'uniform' "
          "(default) or 'node'\n");
   printf("  --verbose                        Enable debug output\n");
@@ -136,10 +134,7 @@ int main(int argc, char* argv[]) {
   if (parseExit >= 0) {
     return parseExit;
   }
-  if (!benchConfigureCopyAlgorithm(apiMode, copyAlgorithm, mpiRank)) {
-    MPI_Finalize();
-    return 1;
-  }
+  benchConfigureCopyAlgorithm(copyAlgorithm);
 
   if (iterations <= 0 || warmup < 0) {
     if (mpiRank == 0) {
@@ -212,7 +207,8 @@ int main(int argc, char* argv[]) {
     if (apiMode == ReshardApiMode::Default) {
       printf("Using: ncclReshard (default API, copy-algorithm=%s)\n", benchResolvedCopyAlgorithm());
     } else {
-      printf("Using: ncclReshardWithWindow (user window API)\n");
+      printf("Using: ncclReshardWithWindow (window entry point, copy-algorithm=%s)\n",
+             benchResolvedCopyAlgorithm());
     }
     printf("Global tensor: [%zu", globalTensorDims[0]);
     for (int d = 1; d < ndims; d++) {
@@ -233,7 +229,7 @@ int main(int argc, char* argv[]) {
       printf(", %zu", dstLocalDims[d]);
     }
     printf("]\n");
-    printf("Algorithm: %s\n", algorithm);
+    printf("Algorithm setting (compatibility): %s\n", algorithm);
     if (strcmp(algorithm, "RING") == 0) {
       printf("Load Balance Mode: %s\n", lbMode);
     }
@@ -256,9 +252,9 @@ int main(int argc, char* argv[]) {
   ncclComm_t worldComm;
   NCCLCHECK(ncclCommInitRank(&worldComm, mpiSize, worldId, mpiRank));
 
-  // Allocate buffer. The window API requires NCCL symmetric memory; the default
-  // API intentionally uses plain cudaMalloc so the benchmark measures the
-  // staging path without the user-window allocation requirement.
+  // Compatibility mode retains its historical symmetric allocation and window
+  // setup for API regression coverage. The library ignores that caller window;
+  // the default mode uses the ordinary cudaMalloc integration contract.
   size_t srcBufferSize = 1, dstBufferSize = 1;
   for (int d = 0; d < ndims; d++) {
     srcBufferSize *= srcLocalDims[d];
@@ -278,7 +274,7 @@ int main(int argc, char* argv[]) {
   }
   CUDACHECK(cudaMemset(buffer, 0xDE, allocSize)); // Initialize with pattern
 
-  // Register window for user-window API
+  // Retain the legacy caller-window setup for compatibility-mode coverage.
   ncclWindow_t window = nullptr;
   if (apiMode == ReshardApiMode::Window) {
     NCCLCHECK(ncclCommWindowRegister(worldComm, buffer, allocSize, &window, NCCL_WIN_COLL_SYMMETRIC));
@@ -293,7 +289,7 @@ int main(int argc, char* argv[]) {
   cudaStream_t stream;
   CUDACHECK(cudaStreamCreate(&stream));
 
-  // Stream we actually pass to ncclReshardWithWindow.  When
+  // Stream we pass to the selected reshard API. When
   // --use-default-stream is set we pass nullptr, exercising the
   // library's internal stream pool; otherwise we hand the explicit
   // stream through.  Init / validation kernels still use the

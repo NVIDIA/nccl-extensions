@@ -21,11 +21,12 @@
  *   Efficiency = Speedup / N           (100% = perfectly parallel)
  *
  * Differences from the legacy reshard_batch_bench.cu (MR !16):
- *   - Calls ncclReshardWithWindow with a caller-managed window per
- *     (comm, buffer) pair, registered ONCE before the sweep and reused
- *     for every (tensor × shard) configuration.
- *   - No per-iteration ncclM2nFinalize / library-managed window
- *     cache — the user-window path skips both.
+ *   - Calls the ncclReshardWithWindow entry point and retains a caller-managed
+ *     window per (comm, buffer) pair for API regression coverage. The library
+ *     ignores the window and uses the same configured copy transport as
+ *     ncclReshard.
+ *   - No per-iteration ncclM2nFinalize; the handle is created once and
+ *     reused for the whole sweep.
  *
  * Usage:
  *   mpirun -np <worldSize> reshard_batch_bench_user_window [options]
@@ -263,7 +264,8 @@ static void benchPrintUsage(const char* prog) {
   printf("  --warmup <N>                           Warmup iterations (default: "
          "4)\n");
   printf("  --validate                             Check data correctness\n");
-  printf("  --algorithm <ring|direct>              Algorithm (default: ring)\n");
+  printf("  --algorithm <ring|direct>              Legacy compatibility setting "
+         "(default: ring)\n");
   printf("  --lb-mode <uniform|node>               Load balance (default: "
          "uniform)\n");
   printf("  --print-all-ranks                      Per-rank timing\n");
@@ -458,7 +460,7 @@ int main(int argc, char* argv[]) {
     printf("Tensors   : %d per batch\n", numTensors);
     printf("Src mesh  : %dx%d\n", srcMdims[0], srcMdims[1]);
     printf("Dst mesh  : %dx%d\n", dstMdims[0], dstMdims[1]);
-    printf("Algorithm : %s\n", algorithm);
+    printf("Algorithm setting (compatibility): %s\n", algorithm);
     printf("Iters     : %d  warmup=%d\n", iterations, warmup);
     printf("\n");
     printf("%-24s %-12s %9s %9s %8s %7s %9s %9s\n", "Tensor dims", "Pattern", "Seq ms", "Con ms", "Speedup", "Eff%",

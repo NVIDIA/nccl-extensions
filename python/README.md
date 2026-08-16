@@ -32,8 +32,9 @@ dispatch/combine, tensors, torch interop) under `nccl/ep/`.
 `nccl/_extensions/bindings/` plus the Python facade (meshes, placements,
 handles, resharding, and DTensor interop) under `nccl/m2n/`.
 
-`nccl.m2n.reshard` uses staging. `nccl.m2n.reshard_with_window` uses a
-caller-registered window.
+`nccl.m2n.reshard` is the primary entry point and uses staging.
+`nccl.m2n.reshard_with_window` is a compatibility alias that ignores the
+supplied window; providing one does not guarantee zero-copy execution.
 
 ### Grouping M2N calls
 

@@ -18,10 +18,8 @@ namespace {
 
 struct M2nGroupEntry {
   size_t originalIndex = 0;
-  M2nGroupReshardKind kind = M2nGroupReshardKind::Staging;
   ncclM2nHandle_t handle = nullptr;
   ncclComm_t comm = nullptr;
-  ncclWindow_t window = nullptr;
   cudaStream_t stream = nullptr;
   bool hasSrc = false;
   bool hasDst = false;
@@ -64,8 +62,8 @@ cudaStream_t normalizeGroupStream(cudaStream_t stream) {
 }
 
 bool groupContextMatches(const M2nGroupEntry& first, const M2nGroupEntry& next) {
-  return first.kind == next.kind && first.handle == next.handle && first.comm == next.comm &&
-         first.window == next.window && normalizeGroupStream(first.stream) == normalizeGroupStream(next.stream);
+  return first.handle == next.handle && first.comm == next.comm &&
+         normalizeGroupStream(first.stream) == normalizeGroupStream(next.stream);
 }
 
 ncclResult_t indexGroupError(ncclResult_t result, size_t originalIndex, size_t groupSize) {
@@ -103,8 +101,7 @@ ncclResult_t partitionGroupEntries(std::vector<M2nGroupEntry>&& entries,
 }
 
 ncclResult_t executeGroupBucket(const std::vector<M2nGroupEntry>& entries, size_t groupSize) {
-  bool canFuse = entries.size() > 1 && entries.size() <= kM2nGroupMaxFusionEntries &&
-                 entries.front().kind == M2nGroupReshardKind::Staging;
+  bool canFuse = entries.size() > 1 && entries.size() <= kM2nGroupMaxFusionEntries;
   for (const M2nGroupEntry& entry : entries) {
     canFuse = canFuse && entry.hasSrc && entry.hasDst;
   }
@@ -147,12 +144,7 @@ ncclResult_t executeGroupBucket(const std::vector<M2nGroupEntry>& entries, size_
     dst.mesh = entry.hasDstMesh ? &entry.dstMesh : nullptr;
     const ncclDistTensor_t* srcPtr = entry.hasSrc ? &src : nullptr;
     const ncclDistTensor_t* dstPtr = entry.hasDst ? &dst : nullptr;
-    ncclResult_t result = ncclSuccess;
-    if (entry.kind == M2nGroupReshardKind::Window) {
-      result = ncclReshardWithWindow(entry.handle, entry.comm, entry.window, srcPtr, dstPtr, entry.stream);
-    } else {
-      result = ncclReshard(entry.handle, entry.comm, srcPtr, dstPtr, entry.stream);
-    }
+    ncclResult_t result = ncclReshard(entry.handle, entry.comm, srcPtr, dstPtr, entry.stream);
     if (result != ncclSuccess) {
       return indexGroupError(result, entry.originalIndex, groupSize);
     }
@@ -166,9 +158,8 @@ bool m2nGroupIsActive() {
   return gM2nGroupState.active;
 }
 
-ncclResult_t m2nGroupEnqueueReshard(M2nGroupReshardKind kind, ncclM2nHandle_t handle, ncclComm_t comm,
-                                    ncclWindow_t window, const ncclDistTensor_t* src, const ncclDistTensor_t* dst,
-                                    cudaStream_t stream) {
+ncclResult_t m2nGroupEnqueueReshard(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src,
+                                    const ncclDistTensor_t* dst, cudaStream_t stream) {
   m2nClearLastError();
   NCCL_M2N_CHECK_ARG(gM2nGroupState.active, -1, "m2nGroupEnqueueReshard: no group is active on this host thread");
   if (gM2nGroupState.error != ncclSuccess) {
@@ -178,10 +169,8 @@ ncclResult_t m2nGroupEnqueueReshard(M2nGroupReshardKind kind, ncclM2nHandle_t ha
 
   M2nGroupEntry entry;
   entry.originalIndex = gM2nGroupState.entries.size();
-  entry.kind = kind;
   entry.handle = handle;
   entry.comm = comm;
-  entry.window = window;
   entry.stream = stream;
   entry.hasSrc = src != nullptr;
   entry.hasDst = dst != nullptr;

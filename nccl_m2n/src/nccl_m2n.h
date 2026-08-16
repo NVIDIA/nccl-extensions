@@ -96,9 +96,7 @@ typedef struct ncclMesh_v2 {
  */
 typedef struct ncclDistTensor_v2 {
   /** Local buffer for this rank.  Must be non-NULL when this rank belongs to
-   * this side's mesh; may be NULL when it does not participate as this side.
-   * The window passed to ncclReshardWithWindow must cover this buffer, and
-   * participating ranks must use the same offset within their local window. */
+   * this side's mesh; may be NULL when it does not participate as this side. */
   void* dataPtr;
   /** Per-axis element count on this rank.  Only the first `ndims` entries are
    * read.  Inactive ranks must still provide the side's local shape metadata
@@ -242,7 +240,9 @@ NCCL_M2N_API const char* ncclM2nGetLastError(void);
  *
  * Calls to ncclReshard or ncclReshardWithWindow made before the matching
  * ncclM2nGroupEnd are recorded instead of issued immediately.  One group may
- * span handles, communicators, streams, reshard entry points, and windows.
+ * span handles, communicators, and streams. Calls are bucketed by handle,
+ * communicator, and normalized stream; the reshard entry point and window
+ * argument do not create separate execution contexts.
  * `NULL` and `cudaStreamLegacy` identify the same execution context;
  * `cudaStreamPerThread` remains distinct.  Buckets are submitted sequentially
  * in first-occurrence order.  Entries outside documented fused paths retain
@@ -278,8 +278,9 @@ NCCL_M2N_API ncclResult_t ncclM2nGroupStart(void);
  * Close one group level and, at the outermost level, issue and clear the
  * reshard group recorded by ncclM2nGroupStart.
  *
- * Calls are partitioned by handle, communicator, normalized stream, reshard API,
- * and window.  Buckets are submitted sequentially on the calling host thread in
+ * Calls are partitioned by handle, communicator, and normalized stream.  The
+ * reshard entry point and window argument do not create separate buckets.
+ * Buckets are submitted sequentially on the calling host thread in
  * first-occurrence order; buckets on distinct streams may execute concurrently
  * on the device.  Within each bucket, compatible ncclReshard calls are
  * partitioned by normalized topology and packed into staging-bounded PACKWINDOW
@@ -319,7 +320,7 @@ NCCL_M2N_API ncclResult_t ncclM2nGroupAbort(void);
  * ====================================================================*/
 
 /**
- * Single-shot resharding using a caller-registered window.
+ * Single-shot resharding with a caller-registered window.
  *
  * Passing NULL as `handle` lazily creates and uses an internal default handle.
  *
@@ -333,8 +334,8 @@ NCCL_M2N_API ncclResult_t ncclM2nGroupAbort(void);
  * @param[in] handle  NCCL M2N handle returned by ncclM2nInit, or NULL for the
  *                    internal default handle.
  * @param[in] comm    NCCL communicator containing all ranks (src + dst).
- * @param[in] window  ncclWindow_t registered on `comm` covering this rank's
- *                    local tensor buffer.
+ * @param[in] window  User-provided NCCL window; may be NULL. The current
+ *                    implementation may not use it for best performance.
  * @param[in] src     Source-side tensor descriptor (non-NULL on every rank).
  *                    `dataPtr` may be NULL on dest-only ranks.  `mesh`,
  *                    `placements`, `ndims`, and `dtype` are required and

@@ -6,11 +6,11 @@ global tensor between two disjoint groups of GPU processes (the source group
 holds one sharding / replication layout, the destination group holds
 another), with a single call that moves the data with no host involvement.
 
-The library is built on NCCL's user-window API (`ncclWindow_t` +
-`ncclMemAlloc`) for zero-copy, one-sided transfers, and also exposes a
-copy/staging reshard path for callers that do not manage a window. The public
-reshard entry points are `ncclReshardWithWindow` and `ncclReshard`. The shared
-library is installed as `libnccl_m2n.so`; the
+The library uses copy/staging-backed reshard transports. `ncclReshard` is the
+primary entry point. `ncclReshardWithWindow` remains available as a
+compatibility alias; its window argument is ignored and may be `NULL`. Both
+entry points use the transport selected by `NCCL_RESHARD_COPY_ALGORITHM`, whose
+default is `PACKWINDOW`. The shared library is installed as `libnccl_m2n.so`; the
 public header is `nccl_m2n.h`.
 
 > **Status.** Experimental — see [RELEASE.md](RELEASE.md) for the full list of
@@ -34,8 +34,8 @@ public header is `nccl_m2n.h`.
 A typical caller has two disjoint sets of ranks (e.g. trainer ranks and
 inference / generator ranks) inside one NCCL communicator. Each side owns a
 local tile of the same logical tensor under a different layout. One call to
-`ncclReshardWithWindow` or `ncclReshard` reshapes
-the tile on every destination rank to match the destination layout.
+`ncclReshard` or `ncclReshardWithWindow` reshapes the tile on every destination
+rank to match the destination layout.
 
 **Mesh** (`ncclMesh_t`) — describes one side's rank topology only (no
 per-tensor placement, matching PyTorch DTensor's `DeviceMesh` / JAX's `Mesh`).
@@ -70,11 +70,6 @@ their union is the world.
 and destination shard the tensor along the same axis (a partial-overlap copy
 between rank groups). Otherwise it is **cross-dim sharding** — effectively an
 all-to-all between groups along different axes.
-
-**Single-offset window contract** — each participating pointer must live at a
-non-negative offset inside the registered window. Both `src->dataPtr` and
-`dst->dataPtr` must have the same offset within that window. A zero-offset
-buffer is the common case, but a matching non-zero offset is accepted.
 
 ---
 
@@ -139,15 +134,9 @@ sketch:
 ```cpp
 #include "nccl_m2n.h"
 
-// Caller-allocated, communicator-wide symmetric buffer (sized to the worst
-// case across all reshard calls that will use this comm).
+// Caller-owned device buffer for this rank's local tensor.
 void* buffer;
-ncclMemAlloc(&buffer, max_local_bytes);
-
-// Register one window on the comm; reuse for many reshards.
-ncclWindow_t window;
-ncclCommWindowRegister(comm, buffer, max_local_bytes, &window,
-                       NCCL_WIN_COLL_SYMMETRIC);
+cudaMalloc(&buffer, local_bytes);
 
 // Initialize the reshard library. Optional config struct lets you cap
 // CTA count; runtime tuning knobs are env-driven (see "Tuning" below).
@@ -192,19 +181,19 @@ dst.mesh = &dstMesh;
 dst.placements[0] = NCCL_RESHARD_REPLICATE;
 dst.placements[1] = NCCL_RESHARD_SHARD(0);
 
-r = ncclReshardWithWindow(m2nHandle, comm, window, &src, &dst, stream);
+r = ncclReshard(m2nHandle, comm, &src, &dst, stream);
 if (r != ncclSuccess) { /* handle */ }
 
 // Reshard is asynchronous. Complete the work before releasing its resources.
 cudaError_t cudaResult = cudaStreamSynchronize(stream);
 if (cudaResult != cudaSuccess) { /* handle */ }
-ncclCommWindowDeregister(comm, window);
 ncclM2nFinalize(m2nHandle);
-ncclMemFree(buffer);
+cudaFree(buffer);
 ```
 
-The window must be registered on the **full** communicator regardless
-of whether this rank's `dataPtr` is NULL on either side.
+Callers that already provide an NCCL window may continue using
+`ncclReshardWithWindow`. The window is ignored, and new integrations should
+generally use `ncclReshard`.
 
 ---
 
@@ -256,25 +245,24 @@ library reads both meshes everywhere to derive the transfer geometry.
 
 ### Reshard
 
-Use `ncclReshardWithWindow` with an M2N handle and a registered symmetric NCCL
-window around the participating buffers. Pass `NULL` as the handle to lazily
-use the internal default handle.
-Use `ncclReshard` for the copy/staging path when no caller-managed window is
-available.
+Use `ncclReshard` as the primary reshard entry point. Pass `NULL` as the handle
+to lazily use the internal default handle. `ncclReshardWithWindow` remains
+available as a compatibility alias; its window argument may be `NULL` and is
+ignored. Both entry points follow the same transport selection.
 
 ```c
-ncclResult_t ncclReshardWithWindow(
+ncclResult_t ncclReshard(
     ncclM2nHandle_t         m2nHandle, // returned by ncclM2nInit, or NULL for default
     ncclComm_t                comm,    // contains all ranks (src + dst)
-    ncclWindow_t              window,  // registered on comm
     const ncclDistTensor_t*   src,     // source-side descriptor
     const ncclDistTensor_t*   dst,     // destination-side descriptor
     cudaStream_t              stream   // explicit stream, or default-stream sentinel
 );
 
-ncclResult_t ncclReshard(
+ncclResult_t ncclReshardWithWindow(
     ncclM2nHandle_t         m2nHandle, // returned by ncclM2nInit, or NULL for default
     ncclComm_t                comm,    // contains all ranks (src + dst)
+    ncclWindow_t              window,  // may be NULL; ignored
     const ncclDistTensor_t*   src,     // source-side descriptor
     const ncclDistTensor_t*   dst,     // destination-side descriptor
     cudaStream_t              stream   // explicit stream, or default-stream sentinel
@@ -306,8 +294,7 @@ noted otherwise):
 - `src->ndims == dst->ndims`, both in `1..NCCL_RESHARD_MAX_TENSOR_DIMS`
   (currently 3; 4-D is not supported).
 - `src->dtype == dst->dtype` and is a supported dtype (see list above).
-- For `ncclReshardWithWindow`, `window` is non-NULL and registered on `comm`
-  itself with `NCCL_WIN_COLL_SYMMETRIC`.
+- For `ncclReshardWithWindow`, `window` may be NULL and is ignored.
 - `stream` is either an explicit CUDA stream or a default-stream sentinel
   (`NULL`, `cudaStreamLegacy`, or `cudaStreamPerThread`). By default every call
   runs on a library-owned non-blocking stream cached for its `(comm, device)`
@@ -315,12 +302,7 @@ noted otherwise):
   caller stream. Setting `NCCL_RESHARD_USE_INTERNAL_STREAMS=0` keeps work on the
   caller stream and preserves ordering for reused DevComm entries.
 - `src->dataPtr` and `dst->dataPtr` are non-NULL on ranks that belong to the
-  corresponding mesh. A pointer may be NULL only on an inactive side. For the
-  window API, active pointers lie inside the registered window; if both are
-  present on one rank, their window offsets must match. Window-offset checks require
-  NCCL ≥ 2.29.2 (`ncclWinGetUserPtr`); on older NCCL the offset symmetry is
-  trusted. Violations of the single-offset contract abort the process via
-  `RESHARD_FATAL` rather than returning `ncclInvalidArgument`.
+  corresponding mesh. A pointer may be NULL only on an inactive side.
 - `localShape` remains required metadata for inactive sides in both APIs;
   ranks that are outside both meshes must still pass source and destination
   shapes that derive the same global tensor shape as active ranks.
@@ -354,8 +336,8 @@ Reshard calls enqueue asynchronous CUDA work, and `ncclM2nFinalize` does not
 synchronize caller streams. Complete all work submitted with a handle before
 finalizing it. Before finalizing the last explicit or default handle in an
 epoch, complete all M2N work from that epoch. Keep the associated communicators,
-windows, streams, and buffers valid until the work completes, and finalize M2N
-before destroying those communicators.
+streams, and buffers valid until the work completes, and finalize M2N before
+destroying those communicators.
 
 ### Library configuration
 
@@ -505,8 +487,8 @@ grouping, PP stage mapping, and deduplication.
             │    - Create dedicated CUDA stream                               │
             │                                                                 │
             │  Per transfer descriptor (param):                               │
-            │    - Allocate symmetric buffer (ncclMemAlloc)                   │
-            │    - Register ncclWindow_t (ncclCommWindowRegister)              │
+            │    - Allocate device buffer (cudaMalloc)                        │
+            │    - Window mode also registers a window (ignored)               │
             └────────────────────────────────┬────────────────────────────────┘
                                              │
                     ┌────────────────────────▼─────────────────────────┐
@@ -533,7 +515,12 @@ grouping, PP stage mapping, and deduplication.
 
 6. **NCCL communicators** -- one `ncclComm_t` and one `cudaStream_t` per (train_stage, gen_stage) pair. Trainer ranks occupy `[0, trainStageSize)` and generator ranks occupy `[trainStageSize, trainStageSize + genStageSize)` within each sub-communicator.
 
-7. **Buffer allocation** -- one symmetric buffer per transfer descriptor (i.e. per parameter). Each buffer is registered as an `ncclWindow_t` on the corresponding PP communicator. This per-param allocation ensures that multiple parameters within the same pattern group can be in flight simultaneously without data corruption, which is critical for validation correctness.
+7. **Buffer allocation** -- one device buffer per transfer descriptor (i.e. per
+parameter). The compatibility window mode retains its caller-window setup, but
+the registered window is ignored by `ncclReshardWithWindow`. This per-param
+allocation ensures that multiple parameters within the same pattern group can
+be in flight simultaneously without data corruption, which is critical for
+validation correctness.
 
 8. **Execution** -- all transfers in a pattern group are launched asynchronously on per-PP-comm CUDA streams (NCCL serializes ops on the same communicator), then synchronized once. Per-pattern and aggregate bandwidth/latency are reported.
 
@@ -603,7 +590,8 @@ mpirun -np <total_gpus> ./build/bin/reshard_model_bench \
 | `--iterations <N>` | 10 | Timed iterations per pattern. |
 | `--warmup <N>` | 2 | Warmup iterations. |
 | `--gpus-per-node <N>` | 8 | GPUs per node for load balancing. |
-| `--algorithm <auto\|ring\|direct>` | auto | Reshard algorithm selection. |
+| `--algorithm <auto\|ring\|direct>` | auto | Legacy setting; see `--copy-algorithm`. |
+| `--copy-algorithm <packwindow\|direct>` | packwindow | Copy-transport override for the reshard benchmark. |
 | `--lb-mode <uniform\|node>` | uniform | Load-balance mode. |
 | `--no-dedup` | off | Benchmark all layers instead of one representative per repeated pattern. |
 | `--validate` | off | Run correctness validation before timing. |
@@ -638,9 +626,10 @@ representative per pattern). "Max latency" is the final-aggregate
 `Latency Max` line from the benchmark summary: the slowest rank's wall-clock
 summed across all per-pattern timings.
 
-The two columns compare the hierarchical algorithm (intra-NVL fan-out plus
-cross-NVL ring) against the direct point-to-point algorithm (every source rank
-issues GIN puts to every destination rank), holding everything else fixed:
+These historical measurements predate the compatibility-alias behavior. The
+two columns compare the hierarchical algorithm (intra-NVL fan-out plus
+cross-NVL ring) against the direct point-to-point algorithm, holding everything
+else fixed:
 
 - **Hierarchical**: `--algorithm ring --lb-mode node`
 - **Direct P2P**: `--algorithm direct --lb-mode uniform`
@@ -700,8 +689,9 @@ Case groups: `full_replication`, `full_sharding`, `2d_placement`,
 `uneven_ratio`, `tensor_size_sensitivity`, `nd_tensors`, `cross_dim_regression`,
 plus 1-D analogues. See [`tests/README.md`](tests/README.md) for the full
 matrix and the `--list` / `--min-world` / `--max-world` flags used to bin a CI
-run into rank tiers. The C-level matrix covers RING and DIRECT; the MPI binary
-also accepts `--algorithm all`.
+run into rank tiers. The legacy test-scenario parameter `--algorithm` chooses a
+PACKWINDOW default for `ring` and a staging-DIRECT default for `direct` when
+`--copy-algorithm` is omitted; the MPI binary also accepts `--algorithm all`.
 
 Exit code is `1` if any case reports `FAIL`, `0` otherwise. `SKIP` does
 not fail the run.
@@ -712,14 +702,11 @@ not fail the run.
 
 **Algorithm**
 
-- `NCCL_RESHARD_ALGORITHM=AUTO` (default) — currently falls through to `RING`; no
-  NVL-domain auto-detection in this build.
-- `NCCL_RESHARD_ALGORITHM=RING` — hierarchical ring + intra-NVL fan-out via the input
-  comm's window. Best for cross-NVL transfers and scales linearly with
-  bandwidth.
-- `NCCL_RESHARD_ALGORITHM=DIRECT` — every src rank issues GIN puts directly to every
-  dst rank. Lower latency for small transfers; higher pressure on the NIC
-  and on the prepare-time fan-out.
+- `NCCL_RESHARD_ALGORITHM` is retained as a parsed compatibility setting; the
+  current copy transport does not dispatch on it.
+- `NCCL_RESHARD_COPY_ALGORITHM=PACKWINDOW` (default) selects the PACKWINDOW
+  staging transport.
+- `NCCL_RESHARD_COPY_ALGORITHM=DIRECT` selects the direct staging transport.
 
 **Load balance**
 
@@ -733,11 +720,6 @@ initialization: built-in default 8, then optional `config.maxCta`, then
 compile-time default (`DEFAULT_ELEMENTS_PER_CHUNK = 32`). The RING prepare path
 also uses `CHUNK_SIZE_BYTES` (256 KB) as a byte-level chunk size, overridable
 per-process via `NCCL_RESHARD_CHUNK_SIZE` (bytes).
-
-**Cross-dim transpose** — when cross-dim sharding would produce per-rank inner
-strides below `CROSS_DIM_TRANSPOSE_THRESHOLD` (256 KB), the library
-transparently transposes dimensions into a private buffer to keep GIN puts
-large. Applies to both 2-D and 3-D tensors and is transparent to callers.
 
 ---
 
@@ -763,7 +745,8 @@ have identical effective values on every rank in the communicator.
 | Variable | Effect |
 |---|---|
 | `NCCL_RESHARD_LOG_LEVEL`        | One of `NONE`, `WARN` (default), `INFO`, `DEBUG`, `TRACE`. |
-| `NCCL_RESHARD_ALGORITHM`        | `AUTO` (default), `RING`, or `DIRECT`. |
+| `NCCL_RESHARD_ALGORITHM`        | Parsed compatibility setting; the current copy transport does not dispatch on it. |
+| `NCCL_RESHARD_COPY_ALGORITHM`   | Copy transport for both entry points: `PACKWINDOW` (default) or `DIRECT`. |
 | `NCCL_RESHARD_LB_MODE`          | `UNIFORM` (default) or `NODE_AWARE`. |
 | `NCCL_RESHARD_NUM_CTAS`         | Directly overrides the resolved CTA count; invalid values are ignored. |
 | `NCCL_RESHARD_SRC_DOMAIN_SIZE`  | Positive source domain-size override; invalid values are ignored. |
@@ -794,8 +777,8 @@ have identical effective values on every rank in the communicator.
 │   ├── reshard_mesh.cc                   # Mesh analysis helpers               (host)
 │   ├── reshard_loadbalance.cc            # Replication load balancer           (host)
 │   ├── reshard_prepare.cc                # Kernel-parameter builders           (host)
-│   ├── reshard_transpose.cc              # Cross-dim transpose buffer mgmt     (host)
-│   ├── reshard_user_window.cu            # Window API entries + CUDA kernels
+│   ├── reshard_transpose.cc              # PACKWINDOW staging-buffer mgmt     (host)
+│   ├── reshard_user_window.cu            # WithWindow alias + PACKWINDOW transport/kernel
 │   ├── reshard_staging.cu                # ncclReshard staging-path entry + dispatch
 │   ├── staging_prepare.cc                # Staging transfer-descriptor builders (host)
 │   ├── staging_buffer.{cc,h}             # Staging-buffer lifecycle             (host)
@@ -835,7 +818,7 @@ have identical effective values on every rank in the communicator.
 
 | Symptom | Likely cause |
 |---|---|
-| `ncclInvalidArgument` from `ncclReshardWithWindow` / `ncclReshard` | One of the preconditions failed: NULL comm/window/descriptor/mesh, mismatched `ndims`/dtype, `ndims` outside 1..3, or an unsupported dtype. |
+| `ncclInvalidArgument` from `ncclReshardWithWindow` / `ncclReshard` | One of the preconditions failed: NULL comm/descriptor/mesh, mismatched `ndims`/dtype, `ndims` outside 1..3, or an unsupported dtype. |
 | Validation fails with destination still containing the pre-call bytes | The kernel did not write to dest. Re-run with `NCCL_RESHARD_LOG_LEVEL=DEBUG` to see the prepared plan, then file an issue with the `reshard_bench` command line that reproduces the failure. |
 | `nccl_device.h: No such file or directory` at compile time | `NCCL_HOME` points at a binary install rather than a from-source build. Build NCCL from source or point at one, or build the vendored default: `git submodule update --init third_party/nccl && make -C third_party/nccl -j src.build`. |
 | Fast-but-wrong: `make` succeeds yet runtime crashes with "illegal instruction" | Often a downstream symptom of a kernel that completed with corrupt state on the previous reshard call. Re-run with `NCCL_RESHARD_LOG_LEVEL=DEBUG` to see the prepared plan. |

@@ -121,7 +121,6 @@ void resetReshardRuntimeConfig() {
   gReshardNumCtas = DEFAULT_NUM_CTAS;
   gReshardElementsPerChunk = DEFAULT_ELEMENTS_PER_CHUNK;
   gReshardGinContextCount = DEFAULT_GIN_CONTEXT_COUNT;
-  gReshardCrossDimTransposeThresholdBytes = CROSS_DIM_TRANSPOSE_THRESHOLD_BYTES;
   gReshardUseInternalStreams = true;
   gReshardChunkSizeBytes = 0;
   gReshardStagingWatermarkBytes = 256ULL * 1024ULL * 1024ULL;
@@ -224,9 +223,6 @@ void applyReshardEnv() {
     gReshardChunkSizeBytes = sizeValue;
   }
 
-  if (parseM2nEnvSize(getenv("NCCL_RESHARD_CROSS_DIM_TRANSPOSE_THRESHOLD"), &sizeValue, true)) {
-    gReshardCrossDimTransposeThresholdBytes = sizeValue;
-  }
   if (parseM2nEnvSize(getenv("NCCL_RESHARD_STAGING_WATERMARK_BYTES"), &sizeValue, false)) {
     gReshardStagingWatermarkBytes = sizeValue;
   }

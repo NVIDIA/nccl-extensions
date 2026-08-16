@@ -54,7 +54,7 @@ make tests GTEST_DIR=/path/to/googletest
 | `1d_2d_placement`             | `world ≥ 4`, even           | (8192,)            | bf16 | n_shards ∈ {(2,4),(4,2),(2,2)}, placement ∈ {sr/sr, rs/rs, sr/rs, rs/sr} |
 | `1d_uneven_ratio`             | `world ≥ 4`, `world % 4 == 0` | (16384,)         | bf16 | ratio ∈ {(3,1),(1,3)}, n_shards (2,2) |
 | `1d_tensor_size_sensitivity`  | `world ≥ 4`, even           | (16384,), (1048576,), (4194304,) | bf16 | n_shards (4,4) |
-| `cross_dim_regression`        | `world ≥ 8`, even           | (200, 200), (64,128,128) | bf16 | Targeted historical cross-dim regressions for transpose and non-transpose paths |
+| `cross_dim_regression`        | `world ≥ 8`, even           | (200, 200), (64,128,128) | bf16 | Targeted historical cross-dimension data-layout regressions |
 | `split_tiny_contribution`  | `world ≥ 4`, even           | (4,) | uint8 | Every CTA signals when a contribution is smaller than the CTA count |
 | `split_reverse_mesh`       | `world ≥ 4`, even           | (4096,) | uint8 | Source communicator ranks precede destination ranks when the destination mesh starts at rank 0 |
 
@@ -94,7 +94,7 @@ the C kernel has no inherent 8-rank requirement.
 # evenly by the GIN context count.
 bash tests/run_cta_count_regression.sh -N 4
 
-# Switch to the direct-put kernel.
+# Select the DIRECT reshard algorithm.
 ./build/bin/basic_api_test_local --algorithm direct
 ```
 
@@ -118,7 +118,8 @@ mpirun -np 8 ./build/bin/basic_api_test_mpi --filter 2d_placement
 | `--gtest_filter=<pattern>`            | Native gtest filtering over sanitized parameter names, after the custom matrix filters above. |
 | `--max-world <N>`                     | Skip cases whose minimum required world size is `> N`. |
 | `--min-world <N>`                     | Skip cases whose minimum required world size is `< N`. |
-| `--algorithm ring\|direct`            | Algorithm selection (default ring). `basic_api_test_mpi` also accepts `all`, registering one parameter per algorithm. |
+| `--algorithm ring\|direct`            | Legacy test-scenario label (default ring). If no copy algorithm is supplied, `ring` selects PACKWINDOW and `direct` selects DIRECT. `basic_api_test_mpi` also accepts `all`, registering one parameter per label. |
+| `--copy-algorithm direct\|packwindow` | Copy transport exercised through every selected API surface. |
 | `--lb-mode uniform\|node`             | Load-balance mode (default uniform). |
 | `--verbose`                           | Library verbose + per-rank diagnostics. |
 | `-N <ranks>` *(local only)*           | Number of ranks/threads (clamped to device count). |

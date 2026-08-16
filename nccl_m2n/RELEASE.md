@@ -6,16 +6,15 @@ global tensor between two disjoint groups of GPU processes (the source group
 holds one sharding / replication layout, the destination group holds
 another). Future releases may extend the same library to other cross-group
 transfer primitives under the same `NCCL M2N` umbrella. The reshard
-functionality is built on NCCL's user-window API (`ncclWindow_t` +
-`ncclMemAlloc`) and on the NCCL Device API (LSA load/store and GIN
-put/signal), so transfers are zero-copy, one-sided, and have no host
-involvement on the critical path.
+functionality uses NCCL windows and the NCCL Device API (LSA load/store and GIN
+put/signal) behind copy/staging transports. Transfers have no host involvement
+on the critical path.
 
 Install artifacts are shared library `libnccl_m2n.so` and public header
-`include/nccl_m2n.h`. v0.2 keeps `ncclReshardWithWindow` for the user-window
-operation, adds `ncclReshard` for copy/staging transfers, moves generic
-concepts to library-scope `ncclM2n*` names, and adds an explicit handle for
-lifecycle-managed runtime state.
+`include/nccl_m2n.h`. v0.2 keeps `ncclReshardWithWindow` as a compatibility
+alias, adds `ncclReshard` for copy/staging transfers, moves generic concepts to
+library-scope `ncclM2n*` names, and adds an explicit handle for lifecycle-managed
+runtime state.
 
 This is the first official release of NCCL M2N. The earlier v0.1 and v0.2 drops
 were experimental and are not supported upgrade sources.
@@ -231,15 +230,14 @@ This preview is experimental.
 | **Limited QA coverage**           | Functional matrix is the C-level basic_api suite × {RING, DIRECT} × dtype mix. Large multi-node coverage is still cluster-limited and workload-specific. |
 | **Tensor rank ≤ 3**               | `NCCL_RESHARD_MAX_TENSOR_DIMS = 3`. 4-D and higher are not supported. |
 | **Both-REPLICATE meshes unsupported** | `placement = {REPLICATE, REPLICATE}` falls into a degenerate prepare-time branch that the test suite does not exercise. Encode full replication as a 1-shard layout (mesh axis of size 1). |
-| **Single-offset window contract** | Per-rank source and destination pointers must have the same offset within the registered window when both are present; asymmetric source/destination offsets are rejected. |
-| **Cross-rank offset symmetry trusted** | The API validates local offset consistency but does not currently perform a cross-rank collective check that every rank uses the same offset. |
-| **Algorithm auto-select unimplemented** | `NCCL_RESHARD_ALGORITHM=AUTO` currently aliases to `RING`; no input/topology-aware algorithm picker in this build. |
-| **Single in-flight reshard per `(comm, effective stream)`** | The internal DevComm/window/transpose caches are designed for sequential use on a comm. Use separate communicators for concurrent transfers, as in `reshard_batch_bench_user_window --num-comms`. |
+| **Window transport selection** | Providing a window does not guarantee zero-copy execution; the configured transport may use library-managed PACKWINDOW staging. |
+| **Legacy algorithm selector is dormant** | `NCCL_RESHARD_ALGORITHM` remains accepted for compatibility, but the current public path selects its transport through `NCCL_RESHARD_COPY_ALGORITHM`. |
+| **Single in-flight reshard per `(comm, effective stream)`** | The internal DevComm/window/staging caches are designed for sequential use on a comm. Use separate communicators for concurrent transfers, as in `reshard_batch_bench_user_window --num-comms`. |
 | **Not thread-safe — process-wide single-thread access** | The init-time globals and the internal caches (DevComm cache, window cache, stream pool) are process-wide shared state. Caller is responsible for serializing every lifecycle call and every `ncclReshardWithWindow` / `ncclReshard` call on the host side — including calls on different `ncclComm_t` handles. Device-side concurrency (issuing successive reshards on separate CUDA streams from a single host thread) is supported. |
-| **Caller-synchronized finalization** | `ncclM2nFinalize` does not synchronize caller streams. Callers must complete M2N work before finalizing the associated handle and before releasing communicators, windows, streams, or buffers used by that work. |
+| **Caller-synchronized finalization** | `ncclM2nFinalize` does not synchronize caller streams. Callers must complete M2N work before finalizing the associated handle and before releasing communicators, streams, or buffers used by that work. |
 | **Static mesh-size caps**         | Compile-time array bounds in `src/reshard_limits.h` cap supported mesh sizes: `MAX_SOURCES = 16`, `MAX_TARGETS = 64`, `MAX_LOCAL_FOLLOWERS = 128` (RING); `MAX_DIRECT_SOURCES = 32`, `MAX_DIRECT_TARGETS = 64` (DIRECT). Larger meshes require recompiling. |
 | **Copy/staging peer caps** | The initial DIRECT copy/staging path uses `MAX_SOURCES = 16`, `MAX_TARGETS = 64`, and at most `STAGING_MAX_CHANNELS = 32`. The rank-uniform preflight rejects plans that exceed these static arrays. |
-| **Single-shot public API**        | The public API exposes one window or staging collective per call (`ncclReshardWithWindow` / `ncclReshard`). Batched/concurrent behavior is built by callers with multiple descriptors/comms, not by a persistent public API. |
+| **Single-shot public API**        | The public API exposes one reshard operation per call (`ncclReshardWithWindow` / `ncclReshard`). Batched/concurrent behavior is built by callers with multiple descriptors/comms, not by a persistent public API. |
 
 ## References
 

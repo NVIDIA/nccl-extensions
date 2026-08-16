@@ -103,6 +103,7 @@ struct MpiParam {
 }
 
 static BasicApiCliArgs gCli;
+static const char* gResolvedCopyAlgorithm = "PACKWINDOW";
 static std::vector<TestCase> gCases;
 static int gWorldRank = 0;
 static int gWorldSize = 0;
@@ -142,6 +143,12 @@ static std::vector<MpiParam> selectedParams() {
   std::vector<TestCase> cases = basicApiSelectCases(gCases, gCli);
 
   auto appendParams = [&](const TestCase& tc, const char* algo, ApiKind api) {
+    /* window_null asserts that ncclReshardWithWindow tolerates a NULL window.
+     * The default API takes no window at all, so the case is meaningless there
+     * and would only inflate default-API case counts. */
+    if (tc.group == "window_null" && api != ApiKind::Window) {
+      return;
+    }
     if (tc.group == "stream_ordering" || tc.group == "stream_churn" || tc.group == "graph_capture") {
       params.push_back(MpiParam{tc, algo, api, 1});
       params.push_back(MpiParam{tc, algo, api, 0});
@@ -208,7 +215,7 @@ static void activateRuntime(const MpiParam& param, bool bForceReset = false) {
   if (!bForceReset && gActiveAlgorithm == param.algorithmEnv && gActiveStreamPoolMode == param.streamPoolMode) return;
 
   TEST_CUDACHECK(cudaStreamSynchronize(gStream));
-  basicApiConfigureReshardEnv(gCli, param.algorithmEnv.c_str());
+  gResolvedCopyAlgorithm = basicApiConfigureReshardEnv(gCli, param.algorithmEnv.c_str());
   applyStreamPoolMode(param.streamPoolMode);
   TEST_NCCLCHECK(ncclM2nFinalize(gM2nHandle));
   gM2nHandle = nullptr;
@@ -410,7 +417,7 @@ TEST_P(BasicApiMpiTest, Reshard) {
   env.copyBuffer = gCopyBuffer;
   env.copyBufferBytes = gCopyBufferBytes;
   env.apiKind = param.api;
-  env.expectPackWindow = strcmp(gCli.copyAlgorithm, "packwindow") == 0;
+  env.expectPackWindow = strcmp(gResolvedCopyAlgorithm, "PACKWINDOW") == 0;
   env.verbose = gCli.verbose;
   env.barrier = mpiBarrier;
   env.allreduceMinInt = mpiAllreduceMinInt;
@@ -474,7 +481,7 @@ static int initMpiRuntime() {
     gInitialUseInternalStreamsEnvSet = true;
     gInitialUseInternalStreamsEnv = initialUseInternalStreamsEnv;
   }
-  basicApiConfigureReshardEnv(gCli, initialAlgorithm);
+  gResolvedCopyAlgorithm = basicApiConfigureReshardEnv(gCli, initialAlgorithm);
   TEST_NCCLCHECK(ncclM2nInit(&gM2nHandle, NULL));
   gActiveAlgorithm = initialAlgorithm;
   gActiveStreamPoolMode = -1;
@@ -489,8 +496,8 @@ static int initMpiRuntime() {
 
   if (gWorldRank == 0) {
     std::vector<MpiParam> params = selectedParams();
-    basicApiPrintRuntimeSummary("basic_api_test_mpi (gtest)", gWorldSize, gNumDevices, gCli, gBufferBytes, "num_tests",
-                                params.size(), true);
+    basicApiPrintRuntimeSummary("basic_api_test_mpi (gtest)", gWorldSize, gNumDevices, gCli, gResolvedCopyAlgorithm,
+                                gBufferBytes, "num_tests", params.size(), true);
   }
   return 0;
 }

@@ -22,7 +22,7 @@
  *   - Groups per-expert 2D tensors into combined 3D expert tensors
  *   - Deduplicates across layers (keeps one representative per pattern)
  *   - PP-aware: one NCCL communicator per (train_stage, gen_stage) pair
- *   - User-window API: one ncclWindow_t per PP comm, pre-registered
+ *   - Compatibility API coverage with pre-registered caller windows
  *   - Per-pattern and aggregate bandwidth / latency reporting
  *
  * Grid order (innermost to outermost): TP -> CP -> EP -> DP -> PP
@@ -518,19 +518,19 @@ static void printUsage(const char* prog) {
   printf("  --iterations <N>        Timed iterations (default: 10)\n");
   printf("  --warmup <N>            Warmup iterations (default: 2)\n");
   printf("  --gpus-per-node <N>     GPUs per node (default: 8)\n");
-  printf("  --algorithm <auto|ring|direct>  Reshard algorithm (default: "
-         "auto)\n");
+  printf("  --algorithm <auto|ring|direct>  Legacy compatibility setting "
+         "(default: auto)\n");
   printf("  --api <window|default>             Public API to drive (default: "
          "default).\n");
-  printf("  --copy-algorithm <a>            Advanced staging override: "
-         "'packwindow'\n");
-  printf("                                  or 'direct' (default: "
-         "packwindow;\n");
-  printf("                                  requires --api default)\n");
   printf("                                  'default' uses ncclReshard with "
          "cudaMalloc'd\n");
   printf("                                  buffers; window registration is "
          "skipped.\n");
+  printf("                                  'window' calls ncclReshardWithWindow with\n");
+  printf("                                  caller-window setup.\n");
+  printf("  --copy-algorithm <a>            Advanced staging override: "
+         "'packwindow'\n");
+  printf("                                  or 'direct' (default: packwindow)\n");
   printf("  --lb-mode <uniform|node>        Load balance mode (default: "
          "uniform)\n");
   printf("  --no-dedup              Disable param deduplication\n");
@@ -606,10 +606,7 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  if (!benchConfigureCopyAlgorithm(apiMode, copyAlgorithm, mpiRank)) {
-    MPI_Finalize();
-    return 1;
-  }
+  benchConfigureCopyAlgorithm(copyAlgorithm);
 
   if (modelConfigPath.empty() || systemConfigPath.empty()) {
     if (mpiRank == 0) {
@@ -773,9 +770,10 @@ int main(int argc, char* argv[]) {
     if (apiMode == ReshardApiMode::Default) {
       printf("API: default (ncclReshard, copy-algorithm=%s)\n", benchResolvedCopyAlgorithm());
     } else {
-      printf("API: window (ncclReshardWithWindow)\n");
+      printf("API: window entry point (ncclReshardWithWindow, copy-algorithm=%s)\n",
+             benchResolvedCopyAlgorithm());
     }
-    printf("Algorithm: %s, LB Mode: %s\n", algorithm, lbMode);
+    printf("Algorithm setting (compatibility): %s, LB Mode: %s\n", algorithm, lbMode);
     printf("Iterations: %d (warmup: %d), Validate: %s (iters: %d), Dedup: "
            "%s\n",
            iterations, warmup, validate ? "yes" : "no", validateIterations, deduplicate ? "yes" : "no");
@@ -848,12 +846,13 @@ int main(int argc, char* argv[]) {
   }
 
   // ========================================================================
-  // Allocate per-param buffers + register windows
+  // Allocate per-param buffers + compatibility-mode windows
   //
-  // Each transfer descriptor gets its own buffer and window so that
-  // multiple params in the same pattern group can be in flight without
-  // overwriting each other.  Streams remain one-per-PP-comm (NCCL ops
-  // on the same communicator serialize anyway).
+  // Each transfer descriptor gets its own buffer so that multiple params in
+  // the same pattern group can be in flight without overwriting each other.
+  // Compatibility mode also retains the old caller-window setup, although the
+  // library ignores it. Streams remain one-per-PP-comm (NCCL ops on the same
+  // communicator serialize anyway).
   // ========================================================================
   struct TransferBufferEntry {
     void* buffer = nullptr;

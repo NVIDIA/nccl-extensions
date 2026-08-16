@@ -87,6 +87,7 @@ struct LocalParam {
 }
 
 static BasicApiCliArgs gCli;
+static const char* gResolvedCopyAlgorithm = "PACKWINDOW";
 static std::vector<TestCase> gCases;
 static int gWorldSize = 0;
 static int gNumDevices = 0;
@@ -240,6 +241,12 @@ static std::vector<LocalParam> selectedLocalParams() {
       if (tc.group == "graph_capture") {
         continue;
       }
+      /* window_null asserts that ncclReshardWithWindow tolerates a NULL
+       * window. The default API takes no window at all, so the case is
+       * meaningless there and would only inflate default-API case counts. */
+      if (tc.group == "window_null" && api != ApiKind::Window) {
+        continue;
+      }
       params.push_back(LocalParam{tc, api});
     }
   }
@@ -305,7 +312,7 @@ static void* threadMain(void* p) {
   env.copyBuffer = copyBuffer;
   env.copyBufferBytes = (copyBuffer != nullptr) ? gBufferBytes : 0;
   env.apiKind = a->api;
-  env.expectPackWindow = strcmp(gCli.copyAlgorithm, "packwindow") == 0;
+  env.expectPackWindow = strcmp(gResolvedCopyAlgorithm, "PACKWINDOW") == 0;
   env.verbose = a->verbose;
   env.barrier = localBarrier;
   env.allreduceMinInt = localAllreduceMinInt;
@@ -643,7 +650,7 @@ static int initLocalRuntime() {
     gWorldSize = gNumDevices;
   }
 
-  basicApiConfigureReshardEnv(gCli, basicApiRequestedAlgorithmEnv(gCli, true));
+  gResolvedCopyAlgorithm = basicApiConfigureReshardEnv(gCli, basicApiRequestedAlgorithmEnv(gCli, true));
 
   std::vector<int> devlist(gWorldSize);
   gComms.assign(gWorldSize, nullptr);
@@ -659,8 +666,8 @@ static int initLocalRuntime() {
   gBufferBytes = computeMaxBufferBytes(cases, gWorldSize);
 
   std::vector<LocalParam> localParams = selectedLocalParams();
-  basicApiPrintRuntimeSummary("basic_api_test_local (gtest, no MPI)", gWorldSize, gNumDevices, gCli, gBufferBytes,
-                              "num_tests", localParams.size(), true);
+  basicApiPrintRuntimeSummary("basic_api_test_local (gtest, no MPI)", gWorldSize, gNumDevices, gCli,
+                              gResolvedCopyAlgorithm, gBufferBytes, "num_tests", localParams.size(), true);
   return 0;
 }
 

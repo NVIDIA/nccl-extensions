@@ -67,18 +67,6 @@ constexpr int reshardMapCtaToGinContext(int ctaIdx, int numCtas, int ginContextC
   return (int)(((size_t)ctaIdx * (size_t)numContexts) / (size_t)numCtas);
 }
 
-/* Cross-dim transpose threshold (bytes).  If the innermost transfer
-   size is below this, the library transparently transposes the last
-   two tensor dims to improve RDMA throughput.
-
-   Keep the macro as the build-time override surface
-   (`-DCROSS_DIM_TRANSPOSE_THRESHOLD=...`); internal code uses the typed
-   constexpr value below. */
-#ifndef CROSS_DIM_TRANSPOSE_THRESHOLD
-#define CROSS_DIM_TRANSPOSE_THRESHOLD (256ULL * 1024ULL)
-#endif
-inline constexpr size_t CROSS_DIM_TRANSPOSE_THRESHOLD_BYTES = CROSS_DIM_TRANSPOSE_THRESHOLD;
-
 /* Cache capacities. */
 inline constexpr int MAX_WINDOW_CACHE_ENTRIES = 128;
 inline constexpr int MAX_DEVCOMM_CACHE_ENTRIES = 64;

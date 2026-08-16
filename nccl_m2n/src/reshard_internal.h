@@ -86,16 +86,10 @@ class M2nApiUnlock {
   bool unlocked_ = false;
 };
 
-enum class M2nGroupReshardKind {
-  Staging,
-  Window,
-};
-
 constexpr size_t kM2nGroupMaxFusionEntries = 4096;
 
 bool m2nGroupIsActive();
-ncclResult_t m2nGroupEnqueueReshard(M2nGroupReshardKind kind, ncclM2nHandle_t handle, ncclComm_t comm,
-                                    ncclWindow_t window, const ncclDistTensor_t* src,
+ncclResult_t m2nGroupEnqueueReshard(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src,
                                     const ncclDistTensor_t* dst, cudaStream_t stream);
 ncclResult_t reshardTryExecuteStagingGroup(ncclM2nHandle_t handle, ncclComm_t comm,
                                            const ncclDistTensor_t* srcs, const ncclDistTensor_t* dsts,
@@ -173,10 +167,6 @@ inline size_t gReshardElementsPerChunk = DEFAULT_ELEMENTS_PER_CHUNK;
  * NCCL_RESHARD_GIN_CONTEXT_COUNT at first init. */
 inline int gReshardGinContextCount = DEFAULT_GIN_CONTEXT_COUNT;
 
-/* Threshold for the transparent cross-dim transpose optimization. Parsed once
- * from NCCL_RESHARD_CROSS_DIM_TRANSPOSE_THRESHOLD at first init; 0 disables it. */
-inline size_t gReshardCrossDimTransposeThresholdBytes = CROSS_DIM_TRANSPOSE_THRESHOLD_BYTES;
-
 /* Stream execution mode populated at first ncclM2nInit from
  * NCCL_RESHARD_USE_INTERNAL_STREAMS. Internal streams are the default; false
  * keeps work on caller streams with ordered DevComm reuse. */
@@ -194,9 +184,8 @@ inline size_t gReshardChunkSizeBytes = 0;
 inline size_t gReshardStagingWatermarkBytes = 256ULL * 1024ULL * 1024ULL;
 
 /* Enables the split-comm (commA FULL + commB RAIL) RING path for QP
- * scalability. Only takes effect for ncclReshard PACKWINDOW with RING +
- * NODE_AWARE. Parsed once from NCCL_RESHARD_SPLIT_COMM at first init. Default
- * on for that path. */
+ * scalability. Takes effect for PACKWINDOW RING + NODE_AWARE. Parsed once from
+ * NCCL_RESHARD_SPLIT_COMM at first init. Default on for that path. */
 inline bool gReshardSplitComm = true;
 
 /* Optional bucketed staging-buffer pool (env NCCL_RESHARD_STAGING_BUCKETS =
@@ -233,9 +222,6 @@ inline bool gReshardSplitSingleRepInject = false;
  * NCCL_CROSS_NIC=0. Requires NCCL_NO_CACHE=NCCL_CROSS_NIC. Default off. */
 inline bool gReshardCommBForceRail = false;
 
-inline ReshardAlgorithm reshardGetAlgorithm() {
-  return gReshardAlgorithm;
-}
 inline int reshardGetGpusPerNode() {
   return gReshardGpusPerNode;
 }
@@ -281,9 +267,6 @@ inline ReshardCopyAlgorithm reshardGetCopyAlgorithm() {
 }
 inline int reshardGetGinContextCount() {
   return gReshardGinContextCount;
-}
-inline size_t reshardGetCrossDimTransposeThresholdBytes() {
-  return gReshardCrossDimTransposeThresholdBytes;
 }
 inline bool reshardGetSplitCommEnabled() {
   return gReshardAdaptiveCallConfigValid ? gReshardAdaptiveCallConfig.splitComm : gReshardSplitComm;
@@ -699,11 +682,8 @@ ncclResult_t validateReshardPlanLimits(int worldRank, const ncclDistTensor_t* sr
                                        size_t elementsPerChunk, ReshardAlgorithm algo, int dstGpusPerDomain);
 
 /* ======================================================================
- * reshard_transpose.cc — Cross-dim transpose buffer
+ * reshard_transpose.cc — PACKWINDOW staging-buffer pool
  * ====================================================================*/
-
-bool shouldTransposeForCrossDim(const size_t* srcDimsBytes, const size_t* dstDimsBytes, int ndims, int srcShardDim,
-                                int dstShardDim, int srcShardCount, int dstShardCount, int* swapDimA, int* swapDimB);
 
 ncclResult_t ensureTransposeBuffer(ncclComm_t comm, size_t requiredBytes, cudaStream_t stream);
 void* getTransposeBuffer(ncclComm_t comm);

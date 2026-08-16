@@ -66,7 +66,7 @@ ReshardCopyAlgorithm reshardGetLastCompletedCopyAlgorithmForTest() {
 extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src,
                                     const ncclDistTensor_t* dst, cudaStream_t stream) {
   if (m2nGroupIsActive()) {
-    return m2nGroupEnqueueReshard(M2nGroupReshardKind::Staging, handle, comm, nullptr, src, dst, stream);
+    return m2nGroupEnqueueReshard(handle, comm, src, dst, stream);
   }
   M2nApiLock apiLock;
   m2nClearLastError();

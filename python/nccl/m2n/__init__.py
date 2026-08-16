@@ -23,6 +23,8 @@ from nccl.m2n.api import (
     group_start,
     init,
     reshard,
+    reshard_quantized,
+    reshard_scaled,
     reshard_with_window,
     xdtensor_reshard,
 )
@@ -31,7 +33,7 @@ from nccl.m2n.constants import MAX_TENSOR_DIMS, MESH_NDIMS
 from nccl.m2n.handle import Handle
 from nccl.m2n.mesh import Mesh
 from nccl.m2n.placement import Replicate, Shard
-from nccl.m2n.tensor import DistTensor
+from nccl.m2n.tensor import QUANT_FP8E4M3, QUANT_MXFP8, DistTensor, QuantSpec, ScalePlane
 
 __all__ = [
     "MAX_TENSOR_DIMS",
@@ -42,7 +44,11 @@ __all__ = [
     "Handle",
     "Mesh",
     "NcclReshardError",
+    "QUANT_FP8E4M3",
+    "QUANT_MXFP8",
+    "QuantSpec",
     "Replicate",
+    "ScalePlane",
     "Shard",
     "finalize",
     "group",
@@ -51,6 +57,8 @@ __all__ = [
     "group_start",
     "init",
     "reshard",
+    "reshard_quantized",
+    "reshard_scaled",
     "reshard_with_window",
     "xdtensor_reshard",
 ]

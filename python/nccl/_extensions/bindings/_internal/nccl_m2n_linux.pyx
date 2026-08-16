@@ -105,6 +105,9 @@ cdef void* __ncclM2nGroupAbort = NULL
 cdef void* __ncclM2nGetLastError = NULL
 cdef void* __ncclReshardWithWindow = NULL
 cdef void* __ncclReshard = NULL
+cdef void* __ncclReshardScaled = NULL
+cdef void* __ncclReshardScaledWithWindow = NULL
+cdef void* __ncclReshardQuantized = NULL
 
 
 cdef int _check_or_init_nccl_m2n() except -1 nogil:
@@ -121,6 +124,9 @@ cdef int _check_or_init_nccl_m2n() except -1 nogil:
     cdef void* get_last_error_fn = NULL
     cdef void* reshard_with_window_fn = NULL
     cdef void* reshard_fn = NULL
+    cdef void* reshard_scaled_fn = NULL
+    cdef void* reshard_scaled_with_window_fn = NULL
+    cdef void* reshard_quantized_fn = NULL
 
     with gil, __symbol_lock:
         if __py_nccl_m2n_init:
@@ -134,6 +140,9 @@ cdef int _check_or_init_nccl_m2n() except -1 nogil:
         global __ncclM2nGetLastError
         global __ncclReshardWithWindow
         global __ncclReshard
+        global __ncclReshardScaled
+        global __ncclReshardScaledWithWindow
+        global __ncclReshardQuantized
 
         handle = load_library()
         init_fn = dlsym(handle, 'ncclM2nInit')
@@ -144,6 +153,9 @@ cdef int _check_or_init_nccl_m2n() except -1 nogil:
         get_last_error_fn = dlsym(handle, 'ncclM2nGetLastError')
         reshard_with_window_fn = dlsym(handle, 'ncclReshardWithWindow')
         reshard_fn = dlsym(handle, 'ncclReshard')
+        reshard_scaled_fn = dlsym(handle, 'ncclReshardScaled')
+        reshard_scaled_with_window_fn = dlsym(handle, 'ncclReshardScaledWithWindow')
+        reshard_quantized_fn = dlsym(handle, 'ncclReshardQuantized')
 
         missing = []
         if init_fn == NULL:
@@ -179,6 +191,9 @@ cdef int _check_or_init_nccl_m2n() except -1 nogil:
         __ncclM2nGetLastError = get_last_error_fn
         __ncclReshardWithWindow = reshard_with_window_fn
         __ncclReshard = reshard_fn
+        __ncclReshardScaled = reshard_scaled_fn
+        __ncclReshardScaledWithWindow = reshard_scaled_with_window_fn
+        __ncclReshardQuantized = reshard_quantized_fn
 
         __py_nccl_m2n_init = True
         return 0
@@ -218,6 +233,15 @@ cpdef dict _inspect_function_pointers():
 
     global __ncclReshard
     data["__ncclReshard"] = <intptr_t>__ncclReshard
+
+    global __ncclReshardScaled
+    data["__ncclReshardScaled"] = <intptr_t>__ncclReshardScaled
+
+    global __ncclReshardScaledWithWindow
+    data["__ncclReshardScaledWithWindow"] = <intptr_t>__ncclReshardScaledWithWindow
+
+    global __ncclReshardQuantized
+    data["__ncclReshardQuantized"] = <intptr_t>__ncclReshardQuantized
 
     func_ptrs = data
     return data

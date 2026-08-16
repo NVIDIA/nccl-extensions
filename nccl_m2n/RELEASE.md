@@ -20,6 +20,31 @@ lifecycle-managed runtime state.
 This is the first official release of NCCL M2N. The earlier v0.1 and v0.2 drops
 were experimental and are not supported upgrade sources.
 
+## Unreleased
+
+- **On-the-fly quantization:** new `ncclReshardQuantized` entry point and
+  `ncclReshardQuantConfig_t` descriptor compress the payload on the wire as
+  FP8 (E4M3) with generated per-block scales. The destination dtype selects
+  whether it is reconstructed in the original dtype or kept quantized with the
+  generated scales handed back — the latter is what an FP8 inference consumer
+  wants, and avoids a dequantize/re-quantize round trip. Two recipes:
+  `FP8E4M3` (FP32 scales) and `MXFP8` (E8M0 shared scales, block 32).
+  Additive; `NULL` config or `NCCL_M2N_QUANT_NONE` is exactly `ncclReshard`.
+  Implemented by staging quantize/dequantize around an ordinary coupled
+  reshard, so no transport code changed. Lossy by construction, and not a win
+  when bandwidth is not the bottleneck — see the README.
+- **Scale forwarding:** new `ncclReshardScaled` and
+  `ncclReshardScaledWithWindow` entry points reshard a quantized payload and
+  its companion per-block scale plane as one validated call, described by the
+  new `ncclReshardScalePlane_t` descriptor. Purely additive — no existing
+  struct or entry point changed, so the ABI is unaffected, and passing
+  `NULL` scales (or `NCCL_M2N_SCALE_NONE`) is exactly the unquantized path.
+  The library validates that shard boundaries on the block dimension land on
+  scale-block boundaries; resharding the two planes as separate calls cannot
+  perform that check and silently mis-splits when it is violated. Both planes
+  are submitted as one M2N group, so on the `ncclReshard` path they normally
+  fuse into a single kernel launch and barrier epoch.
+
 ## v0.2
 
 API-breaking cleanup for NCCL M2N naming, descriptors, and runtime ownership.

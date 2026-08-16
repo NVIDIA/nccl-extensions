@@ -30,3 +30,9 @@ nccl_ep/docs/plc/**
 
 # Internal NCCL M2N PLC design documents are never part of the public export.
 nccl_m2n/docs/plc/**
+
+# Private M2N CI unit-test harness (not part of the public GitHub export).
+nccl_m2n/tests/ci/**
+
+# Internal M2N source inventory.
+nccl_m2n/docs/source_layout.md

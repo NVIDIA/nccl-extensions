@@ -37,6 +37,9 @@ nccl_m2n:
     ncclM2nGroupAbort: {}
     ncclReshardWithWindow: {}
     ncclReshard: {}
+    ncclReshardScaled: {}
+    ncclReshardScaledWithWindow: {}
+    ncclReshardQuantized: {}
   types:
     ncclM2nConfig_t:
       AUTO_LOWPP_CLASS:

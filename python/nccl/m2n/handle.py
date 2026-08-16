@@ -13,7 +13,7 @@ from nccl._extensions.bindings import nccl_m2n as _m2n_bindings
 from nccl._extensions._runtime import NATIVE_CALL_LOCK
 from nccl.core.typing import NcclInvalid, NcclStreamSpec
 from nccl.m2n.config import Config
-from nccl.m2n.tensor import DistTensor
+from nccl.m2n.tensor import DistTensor, QuantSpec, ScalePlane
 
 
 def _extract_ptr(obj: object, *, attr: str, name: str) -> int:
@@ -98,6 +98,51 @@ def _reshard_with_window(
             int(src_prepared.struct.ptr),
             int(dst_prepared.struct.ptr),
             _stream_ptr(stream),
+def _reshard_scaled(
+    handle: int,
+    comm: object,
+    src: DistTensor,
+    dst: DistTensor,
+    scales: ScalePlane,
+    stream: NcclStreamSpec | None = None,
+) -> None:
+    with NATIVE_CALL_LOCK:
+        _validate_tensors(src, dst)
+        src_prepared = src.as_binding()
+        dst_prepared = dst.as_binding()
+        scale_struct = scales.as_binding()
+        _m2n_bindings.reshard_scaled(
+            handle,
+            _extract_ptr(comm, attr="ptr", name="comm"),
+            int(src_prepared.struct.ptr),
+            int(dst_prepared.struct.ptr),
+            int(scale_struct.ptr),
+            _stream_ptr(stream),
+        )
+
+
+def _reshard_quantized(
+    handle: int,
+    comm: object,
+    src: DistTensor,
+    dst: DistTensor,
+    quant: QuantSpec,
+    stream: NcclStreamSpec | None = None,
+) -> None:
+    with NATIVE_CALL_LOCK:
+        _validate_tensors(src, dst)
+        QuantSpec.check_payload_dtype(src.dtype)
+        src_prepared = src.as_binding()
+        dst_prepared = dst.as_binding()
+        quant_struct = quant.as_binding()
+        _m2n_bindings.reshard_quantized(
+            handle,
+            _extract_ptr(comm, attr="ptr", name="comm"),
+            int(src_prepared.struct.ptr),
+            int(dst_prepared.struct.ptr),
+            int(quant_struct.ptr),
+            _stream_ptr(stream),
+        )
         )
 
 
@@ -190,6 +235,77 @@ class Handle:
         with NATIVE_CALL_LOCK, self._lock:
             self._check_valid("reshard")
             _reshard(self._ptr, comm, src, dst, stream)
+
+    def reshard_scaled(
+        self,
+        comm: object,
+        src: DistTensor,
+        dst: DistTensor,
+        scales: ScalePlane,
+        *,
+        stream: NcclStreamSpec | None = None,
+    ) -> None:
+        """Call ``ncclReshardScaled`` for a coupled (payload, scales) reshard.
+
+        Both planes are submitted as one group so they can fuse into a single
+        kernel and barrier epoch.  Buffer lifetime follows :meth:`reshard`, and
+        applies to the scale buffers as well as the payload.
+        """
+
+        with NATIVE_CALL_LOCK, self._lock:
+            self._check_valid("reshard_scaled")
+            _reshard_scaled(self._ptr, comm, src, dst, scales, stream)
+
+    def reshard_scaled_with_window(
+        self,
+        comm: object,
+        window: object,
+        src: DistTensor,
+        dst: DistTensor,
+        scales: ScalePlane,
+        *,
+        stream: NcclStreamSpec | None = None,
+    ) -> None:
+        """Call ``ncclReshardScaledWithWindow``.
+
+        One window must cover all four buffers.  The payload pair and the scale
+        pair each have their own single-offset contract; the two offsets may
+        differ but each must be identical on every rank.
+        """
+
+        with NATIVE_CALL_LOCK, self._lock:
+            self._check_valid("reshard_scaled_with_window")
+            _validate_tensors(src, dst)
+            src_prepared = src.as_binding()
+            dst_prepared = dst.as_binding()
+            scale_struct = scales.as_binding()
+            _m2n_bindings.reshard_scaled_with_window(
+                self._ptr,
+                _extract_ptr(comm, attr="ptr", name="comm"),
+                _extract_ptr(window, attr="handle", name="window"),
+                int(src_prepared.struct.ptr),
+                int(dst_prepared.struct.ptr),
+                int(scale_struct.ptr),
+                _stream_ptr(stream),
+            )
+
+    def reshard_quantized(
+        self,
+        comm: object,
+        src: DistTensor,
+        dst: DistTensor,
+        quant: QuantSpec,
+        *,
+        stream: NcclStreamSpec | None = None,
+    ) -> None:
+        """Call ``ncclReshardQuantized`` for a wire-compressed reshard.
+
+        Lossy; see :class:`QuantSpec`.  Buffer lifetime follows :meth:`reshard`.
+        """
+
+        with NATIVE_CALL_LOCK, self._lock:
+            self._check_valid("reshard_quantized")
+            _reshard_quantized(self._ptr, comm, src, dst, quant, stream)
 
     def destroy(self) -> None:
         """Release the handle. Subsequent operations on this object are invalid."""

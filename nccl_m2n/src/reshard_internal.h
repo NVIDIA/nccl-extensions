@@ -102,6 +102,37 @@ ncclResult_t reshardTryExecuteStagingGroup(ncclM2nHandle_t handle, ncclComm_t co
                                            const size_t* originalIndices, size_t count, cudaStream_t stream,
                                            bool* handled, size_t* failedOriginalIndex);
 
+/* ======================================================================
+ * reshard_scale_plane.cc — coupled (payload, scales) reshard support
+ * ====================================================================*/
+
+/* True iff a scale pass must run.  A NULL descriptor and a descriptor with
+ * recipe == NCCL_M2N_SCALE_NONE both yield false. */
+bool reshardScalePlaneActive(const ncclReshardScalePlane_t* scales);
+
+/* The single validation point for the scale plane.  Every field is checked
+ * here; no downstream code re-derives or infers scale geometry.
+ *
+ * This validator is load-bearing beyond argument checking.  Requiring the scale
+ * extent to divide exactly by blockSize on both sides is what makes the scale
+ * plane's shard-overlap geometry identical to the payload's, which is in turn
+ * what lets the two planes share one fused PACKWINDOW group bin.  Relaxing it
+ * would not merely admit wrong results; it would push a mismatched pair into
+ * reshardCopyPackWindowGroupNormalized, which rejects differing peer topology
+ * with a hard error that fails the whole group.  Do not "simplify" these
+ * checks. */
+ncclResult_t validateReshardScalePlane(const char* apiName, const ncclDistTensor_t* src,
+                                       const ncclDistTensor_t* dst,
+                                       const ncclReshardScalePlane_t* scales);
+
+/* Materialize the scale plane as a pair of ordinary ncclDistTensor_t so the
+ * existing reshard entry points consume it unchanged.  The outputs borrow the
+ * payload descriptors' mesh pointers and placements verbatim, so the payload
+ * descriptors must outlive the outputs. */
+ncclResult_t buildReshardScaleTensors(const ncclDistTensor_t* src, const ncclDistTensor_t* dst,
+                                      const ncclReshardScalePlane_t* scales,
+                                      ncclDistTensor_t* outSrcScale, ncclDistTensor_t* outDstScale);
+
 class ScopedCrossNicRailOverride {
  public:
   explicit ScopedCrossNicRailOverride(bool enabled);

@@ -179,6 +179,8 @@ set(NCCL_M2N_HOST_SRC
     src/reshard_loadbalance.cc
     src/reshard_mesh.cc
     src/reshard_prepare.cc
+    src/reshard_quantize.cc
+    src/reshard_scale_plane.cc
     src/reshard_split_prepare.cc
     src/reshard_transpose.cc
     src/staging_buffer.cc
@@ -191,6 +193,7 @@ set(NCCL_M2N_DEVICE_SRC
     src/reshard_split_user_window.cu
     src/reshard_user_window.cu
     src/reshard_staging.cu
+    src/reshard_quantize.cu
     src/staging_kernel.cu
 )
 

@@ -168,6 +168,204 @@ typedef struct ncclM2nConfig_v2 {
   }
 
 /* ======================================================================
+ * Scale Plane Descriptor
+ * ====================================================================*/
+
+/** ABI guard value set by NCCL_M2N_SCALE_PLANE_INITIALIZER. */
+#define NCCL_M2N_SCALE_PLANE_MAGIC 0x4d325350u /* 'M2SP' */
+
+/**
+ * Scale-forwarding recipe.
+ *
+ * The set is CLOSED: every branch that consumes a recipe handles each
+ * enumerator explicitly.  Nothing is inferred from an optional pointer or from
+ * a dtype.  NONE is zero so a zero-initialized plane is exactly the
+ * unquantized path.
+ *
+ * NONE: no companion scale plane.  ncclReshardScaled and
+ *       ncclReshardScaledWithWindow behave exactly as ncclReshard and
+ *       ncclReshardWithWindow.  Every other scale field must be zero/NULL.
+ *
+ * FWD ("forwarded"): the caller already holds a companion per-block scale
+ *       tensor alongside a quantized payload.  Both planes are resharded under
+ *       one validated call.  NO arithmetic is performed on either plane — this
+ *       is pure byte movement, exactly like an unquantized reshard.  The scale
+ *       plane reuses the payload's meshes and placements verbatim, and shard
+ *       boundaries on the block dimension are validated to land on scale-block
+ *       boundaries.
+ */
+typedef enum {
+  NCCL_M2N_SCALE_NONE = 0,
+  NCCL_M2N_SCALE_FWD = 1,
+} ncclM2nScaleRecipe_t;
+
+/**
+ * Companion per-block scale plane for a coupled (payload, scales) reshard.
+ *
+ * Topology is deliberately NOT restated here: the plane reuses `src->mesh` /
+ * `dst->mesh` and `src->placements` / `dst->placements` from the payload
+ * descriptors passed to the same call.  That coupling is the invariant this
+ * descriptor exists to enforce — resharding a payload and its scales as two
+ * independent calls cannot check it, and silently produces a wrong result when
+ * a shard boundary falls inside a scale block.
+ *
+ * Implementation note for maintainers: the coupling here is a *validation-time*
+ * property, not a runtime ordering one.  The two planes occupy disjoint
+ * allocations and have no ordering dependency on each other, which is why they
+ * are legal to submit as two independent entries of one M2N group (see
+ * ncclM2nGroupStart).  Submitting them that way is what lets them fuse into a
+ * single kernel and barrier epoch.
+ */
+typedef struct ncclReshardScalePlane_v2 {
+  /** Struct size; initialized by NCCL_M2N_SCALE_PLANE_INITIALIZER. */
+  size_t size;
+  /** ABI guard; initialized by NCCL_M2N_SCALE_PLANE_INITIALIZER. */
+  unsigned int magic;
+  /** NCCL M2N API version used by this descriptor. */
+  unsigned int version;
+  /** Recipe selector.  Must be set explicitly; never inferred. */
+  ncclM2nScaleRecipe_t recipe;
+
+  /** Local source-side scale tile.  Non-NULL if and only if the payload's
+   * `src->dataPtr` is non-NULL on this rank. */
+  void* srcDataPtr;
+  /** Local destination-side scale tile.  Non-NULL if and only if the payload's
+   * `dst->dataPtr` is non-NULL on this rank. */
+  void* dstDataPtr;
+
+  /** Scale element type.  Supported: ncclFloat32, ncclFloat16, ncclBfloat16,
+   * ncclFloat8e4m3, ncclFloat8e5m2, ncclUint8.  This set is deliberately
+   * narrower than the payload dtype set.  ncclUint8 covers raw scale byte
+   * storage such as E8M0; the library treats the contents as opaque bytes and
+   * does not interpret or validate them. */
+  ncclDataType_t dtype;
+
+  /** Payload tensor dimension that one scale element spans.  In [0, ndims). */
+  int blockDim;
+  /** Payload elements per scale element along `blockDim`.  Caller-supplied;
+   * the library never infers a block size. */
+  size_t blockSize;
+
+  /** Scale-plane element counts for each side.  Required on every rank,
+   * including ranks where the corresponding `dataPtr` is NULL — the same rule
+   * ncclDistTensor_t::localShape follows.  These are validated against the
+   * payload shapes rather than derived from them; the redundancy is
+   * intentional, because it is what catches a caller who used the right
+   * blockSize for one side and the wrong one for the other. */
+  size_t srcLocalShape[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t dstLocalShape[NCCL_RESHARD_MAX_TENSOR_DIMS];
+} ncclReshardScalePlane_t;
+
+/** Static initializer for ncclReshardScalePlane_t. */
+#define NCCL_M2N_SCALE_PLANE_INITIALIZER  \
+  {                                       \
+    sizeof(ncclReshardScalePlane_t),      \
+    NCCL_M2N_SCALE_PLANE_MAGIC,           \
+    NCCL_M2N_API_VERSION,                 \
+    NCCL_M2N_SCALE_NONE,                  \
+    NULL,                                 \
+    NULL,                                 \
+    ncclUint8,                            \
+    0,                                    \
+    0,                                    \
+    {0, 0, 0},                            \
+    {0, 0, 0},                            \
+  }
+
+/* ======================================================================
+ * On-the-fly Quantization
+ * ====================================================================*/
+
+/** ABI guard value set by NCCL_M2N_QUANT_CONFIG_INITIALIZER. */
+#define NCCL_M2N_QUANT_CONFIG_MAGIC 0x4d325143u /* 'M2QC' */
+
+/**
+ * Wire-compression recipe for ncclReshardQuantized.
+ *
+ * The set is CLOSED, on the same terms as ncclM2nScaleRecipe_t.
+ *
+ * NONE: no compression.  ncclReshardQuantized behaves exactly as ncclReshard.
+ *
+ * FP8E4M3: E4M3 payload with generated FP32 per-block inverse scales.
+ *
+ * MXFP8: E4M3 payload with generated E8M0 per-block scales — the MX shared-scale
+ *       encoding, one byte holding the exponent of a power-of-two scale.
+ *       Requires blockSize == 32 and roundScales, since E8M0 cannot represent
+ *       anything else.
+ *
+ * Both quantizing recipes are LOSSY: each block of `blockSize` elements shares
+ * one scale, so values far below their block's maximum lose precision.
+ */
+typedef enum {
+  NCCL_M2N_QUANT_NONE = 0,
+  NCCL_M2N_QUANT_FP8E4M3 = 1,
+  NCCL_M2N_QUANT_MXFP8 = 2,
+} ncclM2nQuantRecipe_t;
+
+/**
+ * Configuration for ncclReshardQuantized.
+ *
+ * The destination descriptor's dtype selects what the destination receives:
+ *
+ *   dst->dtype == src->dtype
+ *       DEQUANTIZE.  The payload is reconstructed in the caller's dtype at the
+ *       destination, so the quantized form exists only on the wire and in
+ *       library-owned scratch.  This is transparent wire compression; the
+ *       caller never sees the scales, and `dstScales` must be NULL.
+ *
+ *   dst->dtype == ncclFloat8e4m3
+ *       KEEP QUANTIZED.  The destination receives the E4M3 payload directly,
+ *       and `dstScales` receives the generated scales, so a consumer that
+ *       computes in FP8 can use both without a dequantize/re-quantize round
+ *       trip.  This is the mode weight synchronization to an FP8 inference
+ *       engine wants.
+ */
+typedef struct ncclReshardQuantConfig_v2 {
+  /** Struct size; initialized by NCCL_M2N_QUANT_CONFIG_INITIALIZER. */
+  size_t size;
+  /** ABI guard; initialized by NCCL_M2N_QUANT_CONFIG_INITIALIZER. */
+  unsigned int magic;
+  /** NCCL M2N API version used by this config. */
+  unsigned int version;
+  /** Recipe selector.  Must be set explicitly; never inferred. */
+  ncclM2nQuantRecipe_t recipe;
+
+  /** Payload tensor dimension that one scale block spans.  In [0, ndims).
+   * The extent of this dimension must be a multiple of `blockSize` on both
+   * sides, so that no shard boundary falls inside a block. */
+  int blockDim;
+  /** Payload elements per generated scale.  Caller-supplied; the library
+   * never infers a block size. */
+  size_t blockSize;
+  /** If non-zero, round each scale to a power of two.  This makes the scale
+   * exactly representable and the exponent reconstruction exact, at the cost
+   * of up to one bit of mantissa range within each block.  Required for
+   * MXFP8, whose E8M0 scales are powers of two by construction. */
+  unsigned int roundScales;
+  /** Destination buffer for the generated scales, in the KEEP QUANTIZED mode
+   * described above.  Required when `dst->dtype` is ncclFloat8e4m3 and this
+   * rank participates on the destination side; must be NULL otherwise.
+   *
+   * Its shape is the destination payload shape with `blockDim` divided by
+   * `blockSize`, and its element type is recipe-defined: FP32 for FP8E4M3,
+   * one raw E8M0 byte for MXFP8. */
+  void* dstScales;
+} ncclReshardQuantConfig_t;
+
+/** Static initializer for ncclReshardQuantConfig_t. */
+#define NCCL_M2N_QUANT_CONFIG_INITIALIZER \
+  {                                       \
+    sizeof(ncclReshardQuantConfig_t),     \
+    NCCL_M2N_QUANT_CONFIG_MAGIC,          \
+    NCCL_M2N_API_VERSION,                 \
+    NCCL_M2N_QUANT_NONE,                  \
+    0,                                    \
+    0,                                    \
+    0,                                    \
+    NULL,                                 \
+  }
+
+/* ======================================================================
  * Library Lifecycle
  * ====================================================================*/
 
@@ -378,6 +576,117 @@ NCCL_M2N_API ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm
 NCCL_M2N_API ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm,
                                       const ncclDistTensor_t* src, const ncclDistTensor_t* dst,
                                       cudaStream_t stream);
+
+/**
+ * Coupled resharding of a quantized payload and its companion scale plane.
+ *
+ * Equivalent to ncclReshard for the payload, plus a second reshard of the
+ * scale plane derived from `scales`, submitted together as one M2N group so
+ * they can fuse into a single kernel and barrier epoch.  Passing `scales` as
+ * NULL, or with `recipe == NCCL_M2N_SCALE_NONE`, is exactly ncclReshard.
+ *
+ * The scale plane reuses the payload's meshes and placements; `scales` carries
+ * only the buffers, dtype, block geometry, and per-side scale shapes.  The
+ * library validates that every shard boundary on `scales->blockDim` lands on a
+ * scale-block boundary — the check that resharding the two planes as separate
+ * calls cannot perform, and whose absence silently corrupts the result.
+ *
+ * This call is collective and every rank must invoke it in the same order, with
+ * identical descriptor metadata, exactly as for ncclReshard.  When invoked
+ * inside a caller's ncclM2nGroupStart/ncclM2nGroupEnd region, both planes are
+ * appended to that group and issued with it.
+ *
+ * @param[in] handle  NCCL M2N handle returned by ncclM2nInit, or NULL for the
+ *                    internal default handle.
+ * @param[in] comm    NCCL communicator containing all ranks (src + dst).
+ * @param[in] src     Source-side payload descriptor (non-NULL on every rank).
+ * @param[in] dst     Destination-side payload descriptor (non-NULL on every rank).
+ * @param[in] scales  Companion scale plane, or NULL for an unquantized reshard.
+ * @param[in] stream  CUDA stream (explicit or default), with the same ordering
+ *                    contract as ncclReshard.
+ *
+ * @return ncclSuccess on success, ncclInvalidArgument if any precondition is
+ *         violated, or ncclSystemError if default-handle creation fails.
+ */
+NCCL_M2N_API ncclResult_t ncclReshardScaled(ncclM2nHandle_t handle, ncclComm_t comm,
+                                            const ncclDistTensor_t* src,
+                                            const ncclDistTensor_t* dst,
+                                            const ncclReshardScalePlane_t* scales,
+                                            cudaStream_t stream);
+
+/**
+ * Window-based coupled resharding of a payload and its companion scale plane.
+ *
+ * The window-API counterpart of ncclReshardScaled, with the same validation and
+ * the same NULL / NCCL_M2N_SCALE_NONE passthrough behavior.  One window must
+ * cover all four buffers.  Two independent single-offset contracts apply: the
+ * payload's `src->dataPtr` and `dst->dataPtr` share one offset within the
+ * window, and `scales->srcDataPtr` and `scales->dstDataPtr` share another.  The
+ * two offsets may differ from each other, but each must be identical on every
+ * rank; as elsewhere in this API that symmetry is trusted rather than verified,
+ * and a mismatch causes peers to wait indefinitely.
+ *
+ * Note: unlike ncclReshardScaled, the window path does not currently fuse the
+ * two planes into one kernel — they are issued as two ordered reshards.  The
+ * correctness contract is identical either way.
+ *
+ * @param[in] handle  NCCL M2N handle returned by ncclM2nInit, or NULL for the
+ *                    internal default handle.
+ * @param[in] comm    NCCL communicator containing all ranks (src + dst).
+ * @param[in] window  ncclWindow_t registered on `comm` covering this rank's
+ *                    payload and scale buffers.
+ * @param[in] src     Source-side payload descriptor (non-NULL on every rank).
+ * @param[in] dst     Destination-side payload descriptor (non-NULL on every rank).
+ * @param[in] scales  Companion scale plane, or NULL for an unquantized reshard.
+ * @param[in] stream  CUDA stream (explicit or default).
+ *
+ * @return ncclSuccess on success, ncclInvalidArgument if any precondition is
+ *         violated, or ncclSystemError if default-handle creation fails.
+ */
+NCCL_M2N_API ncclResult_t ncclReshardScaledWithWindow(ncclM2nHandle_t handle, ncclComm_t comm,
+                                                      ncclWindow_t window,
+                                                      const ncclDistTensor_t* src,
+                                                      const ncclDistTensor_t* dst,
+                                                      const ncclReshardScalePlane_t* scales,
+                                                      cudaStream_t stream);
+
+/**
+ * Reshard with on-the-fly wire compression.
+ *
+ * The payload is quantized to FP8 with generated per-block scales before
+ * transport, so roughly half the bytes cross the wire.  What the destination
+ * receives is selected by `dst->dtype` — either the reconstructed original
+ * dtype, or the FP8 payload plus its scales.  See ncclReshardQuantConfig_t.
+ *
+ * Passing `quant` as NULL, or with `recipe == NCCL_M2N_QUANT_NONE`, is exactly
+ * ncclReshard.
+ *
+ * THIS IS LOSSY.  Values are reconstructed per block from a shared scale; see
+ * ncclM2nQuantRecipe_t.
+ *
+ * Requirements beyond ncclReshard:
+ *   - `src->dtype` is ncclBfloat16, ncclFloat16, or ncclFloat32.
+ *   - `dst->dtype` is either `src->dtype` (dequantize) or ncclFloat8e4m3
+ *     (keep quantized, with `quant->dstScales` supplied).
+ *   - `quant->blockDim` is in [0, ndims) and `quant->blockSize >= 1`.
+ *   - The `blockDim` extent is a multiple of `blockSize` on both sides, so no
+ *     shard boundary falls inside a scale block.
+ *
+ * @param[in] handle  NCCL M2N handle, or NULL for the internal default handle.
+ * @param[in] comm    NCCL communicator containing all ranks (src + dst).
+ * @param[in] src     Source-side descriptor (non-NULL on every rank).
+ * @param[in] dst     Destination-side descriptor (non-NULL on every rank).
+ * @param[in] quant   Quantization config, or NULL for an uncompressed reshard.
+ * @param[in] stream  CUDA stream (explicit or default).
+ *
+ * @return ncclSuccess on success, ncclInvalidArgument if any precondition is
+ *         violated, or ncclSystemError if scratch allocation fails.
+ */
+NCCL_M2N_API ncclResult_t ncclReshardQuantized(ncclM2nHandle_t handle, ncclComm_t comm,
+                                               const ncclDistTensor_t* src,
+                                               const ncclDistTensor_t* dst,
+                                               const ncclReshardQuantConfig_t* quant,
+                                               cudaStream_t stream);
 
 #ifdef __cplusplus
 }

@@ -81,6 +81,63 @@ pip install 'nccl-extensions[bench]'
 python -m nccl.m2n.benchmarks.reshard_bench --help
 ```
 
+### Scale forwarding
+
+Reshard a quantized payload together with its companion per-block scale plane
+in one validated call. `block_size` is always caller-supplied; per-side scale
+shapes can be derived from the payload descriptors or given explicitly.
+
+```python
+from nccl.m2n import DistTensor, ScalePlane, reshard_scaled
+
+scales = ScalePlane(
+    src_scale_buf, dst_scale_buf,
+    dtype="float32",       # fp32/fp16/bf16/fp8/uint8 only
+    block_size=128,
+    block_dim=1,
+    src_payload=src_desc,  # derive scale shapes from the payload...
+    dst_payload=dst_desc,
+)
+# ...or pass src_local_shape=/dst_local_shape= explicitly instead.
+
+reshard_scaled(src_buf, dst_buf, comm, scales, stream=stream, ...)
+```
+
+`Handle.reshard_scaled` and `Handle.reshard_scaled_with_window` are the
+handle-scoped equivalents. The buffer-lifetime contract below applies to the
+scale buffers as well as the payload.
+
+Note: `ncclReshardScaled` / `ncclReshardScaledWithWindow` are post-v2 additions
+and are resolved lazily. Against an older `libnccl_m2n.so` the package still
+imports; calling them raises `FunctionNotFoundError`.
+
+### On-the-fly quantization
+
+Compress the payload on the wire as FP8 with generated per-block scales,
+reconstructing the caller's dtype at the destination:
+
+```python
+from nccl.m2n import QUANT_MXFP8, QuantSpec, reshard_quantized
+
+# Dequantizing: destination gets the original dtype back.
+quant = QuantSpec(block_dim=1, block_size=128, round_scales=True)
+
+# Keep-quantized: destination declares ncclFloat8e4m3 and receives the
+# generated scales, for a consumer that computes in FP8.
+quant = QuantSpec(block_dim=1, recipe=QUANT_MXFP8, round_scales=True,
+                  dst_scales=dst_scale_buf)
+
+reshard_quantized(src_buf, dst_buf, comm, quant, stream=stream, ...)
+```
+
+`Handle.reshard_quantized` is the handle-scoped equivalent. Payload dtype must
+be bfloat16, float16, or float32, and the block dimension's extent must be a
+multiple of `block_size` on both sides.
+
+This is **lossy** — each block is reconstructed from one shared scale — and it
+is **not always faster**, because it adds a pass over the tile on each side.
+Measure before adopting it.
+
 ## Install
 
 ```bash

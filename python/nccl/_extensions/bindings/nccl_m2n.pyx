@@ -685,3 +685,299 @@ cpdef reshard(intptr_t handle, intptr_t comm, intptr_t src, intptr_t dst, intptr
         with nogil:
             status = ncclReshard(<Handle>handle, <Comm>comm, <const ncclDistTensor_t*>src, <const ncclDistTensor_t*>dst, <Stream>stream)
         check_status(status)
+
+cdef class ScalePlane:
+    """Initialize an instance of ``ncclReshardScalePlane_t`` using C defaults.
+
+    Mirrors ``NCCL_M2N_SCALE_PLANE_INITIALIZER``: the ABI guard fields are
+    populated and the recipe defaults to ``NCCL_M2N_SCALE_NONE``, which is the
+    unquantized passthrough.
+    """
+
+    def __init__(self):
+        self._ptr = <ncclReshardScalePlane_t *>calloc(1, sizeof(ncclReshardScalePlane_t))
+        if self._ptr == NULL:
+            raise MemoryError("Error allocating ScalePlane")
+        self._owner = None
+        self._owned = True
+        self._readonly = False
+
+        self._ptr[0].size = sizeof(ncclReshardScalePlane_t)
+        self._ptr[0].magic = NCCL_M2N_SCALE_PLANE_MAGIC
+        self._ptr[0].version = NCCL_M2N_API_VERSION
+        self._ptr[0].recipe = NCCL_M2N_SCALE_NONE
+
+    def __dealloc__(self):
+        cdef ncclReshardScalePlane_t *ptr
+        if self._owned and self._ptr != NULL:
+            ptr = self._ptr
+            self._ptr = NULL
+            free(ptr)
+
+    def __repr__(self):
+        return f"<{__name__}.ScalePlane object at {hex(id(self))}>"
+
+    @property
+    def ptr(self):
+        return <intptr_t>(self._ptr)
+
+    cdef intptr_t _get_ptr(self):
+        return <intptr_t>(self._ptr)
+
+    def __int__(self):
+        return <intptr_t>(self._ptr)
+
+    def __eq__(self, other):
+        cdef ScalePlane other_
+        if not isinstance(other, ScalePlane):
+            return False
+        other_ = other
+        return memcmp(<void *>self._ptr, <void *>other_._ptr, sizeof(ncclReshardScalePlane_t)) == 0
+
+    def __getbuffer__(self, Py_buffer *buffer, int flags):
+        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclReshardScalePlane_t), self._readonly)
+
+    def __releasebuffer__(self, Py_buffer *buffer):
+        pass
+
+    cdef _check_writable(self):
+        if self._readonly:
+            raise ValueError("This ScalePlane instance is read-only")
+
+    @property
+    def recipe(self):
+        return int(self._ptr[0].recipe)
+
+    @recipe.setter
+    def recipe(self, val):
+        self._check_writable()
+        self._ptr[0].recipe = <ncclM2nScaleRecipe_t>(<int>val)
+
+    @property
+    def srcDataPtr(self):
+        return <intptr_t>(self._ptr[0].srcDataPtr)
+
+    @srcDataPtr.setter
+    def srcDataPtr(self, val):
+        self._check_writable()
+        self._ptr[0].srcDataPtr = <void *>(<intptr_t>val)
+
+    @property
+    def dstDataPtr(self):
+        return <intptr_t>(self._ptr[0].dstDataPtr)
+
+    @dstDataPtr.setter
+    def dstDataPtr(self, val):
+        self._check_writable()
+        self._ptr[0].dstDataPtr = <void *>(<intptr_t>val)
+
+    @property
+    def dtype(self):
+        return int(self._ptr[0].dtype)
+
+    @dtype.setter
+    def dtype(self, val):
+        self._check_writable()
+        self._ptr[0].dtype = <ncclDataType_t>(<int>val)
+
+    @property
+    def blockDim(self):
+        return self._ptr[0].blockDim
+
+    @blockDim.setter
+    def blockDim(self, val):
+        self._check_writable()
+        self._ptr[0].blockDim = val
+
+    @property
+    def blockSize(self):
+        return self._ptr[0].blockSize
+
+    @blockSize.setter
+    def blockSize(self, val):
+        self._check_writable()
+        self._ptr[0].blockSize = val
+
+    @property
+    def srcLocalShape(self):
+        return tuple(self._ptr[0].srcLocalShape[i] for i in range(NCCL_RESHARD_MAX_TENSOR_DIMS))
+
+    @srcLocalShape.setter
+    def srcLocalShape(self, val):
+        self._check_writable()
+        if len(val) != NCCL_RESHARD_MAX_TENSOR_DIMS:
+            raise ValueError(f"srcLocalShape must have {NCCL_RESHARD_MAX_TENSOR_DIMS} entries")
+        for i in range(NCCL_RESHARD_MAX_TENSOR_DIMS):
+            self._ptr[0].srcLocalShape[i] = val[i]
+
+    @property
+    def dstLocalShape(self):
+        return tuple(self._ptr[0].dstLocalShape[i] for i in range(NCCL_RESHARD_MAX_TENSOR_DIMS))
+
+    @dstLocalShape.setter
+    def dstLocalShape(self, val):
+        self._check_writable()
+        if len(val) != NCCL_RESHARD_MAX_TENSOR_DIMS:
+            raise ValueError(f"dstLocalShape must have {NCCL_RESHARD_MAX_TENSOR_DIMS} entries")
+        for i in range(NCCL_RESHARD_MAX_TENSOR_DIMS):
+            self._ptr[0].dstLocalShape[i] = val[i]
+
+    @staticmethod
+    def from_buffer(buffer):
+        return __from_buffer(buffer, sizeof(ncclReshardScalePlane_t), ScalePlane)
+
+    @staticmethod
+    def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
+        if ptr == 0:
+            raise ValueError("ptr must not be null (0)")
+        cdef ScalePlane obj = ScalePlane.__new__(ScalePlane)
+        if owner is None:
+            obj._ptr = <ncclReshardScalePlane_t *>malloc(sizeof(ncclReshardScalePlane_t))
+            if obj._ptr == NULL:
+                raise MemoryError("Error allocating ScalePlane")
+            memcpy(<void *>obj._ptr, <void *>ptr, sizeof(ncclReshardScalePlane_t))
+            obj._owner = None
+            obj._owned = True
+        else:
+            obj._ptr = <ncclReshardScalePlane_t *>ptr
+            obj._owner = owner
+            obj._owned = False
+        obj._readonly = readonly
+        return obj
+
+
+cpdef reshard_scaled(intptr_t handle, intptr_t comm, intptr_t src, intptr_t dst, intptr_t scales, intptr_t stream):
+    cdef ncclResult_t status
+    with _NATIVE_CALL_LOCK:
+        with nogil:
+            status = ncclReshardScaled(<Handle>handle, <Comm>comm, <const ncclDistTensor_t*>src,
+                                           <const ncclDistTensor_t*>dst,
+                                           <const ncclReshardScalePlane_t*>scales, <Stream>stream)
+        check_status(status)
+
+
+cpdef reshard_scaled_with_window(intptr_t handle, intptr_t comm, intptr_t window, intptr_t src, intptr_t dst, intptr_t scales, intptr_t stream):
+    cdef ncclResult_t status
+    with _NATIVE_CALL_LOCK:
+        with nogil:
+            status = ncclReshardScaledWithWindow(<Handle>handle, <Comm>comm, <Window>window,
+                                                     <const ncclDistTensor_t*>src, <const ncclDistTensor_t*>dst,
+                                                     <const ncclReshardScalePlane_t*>scales, <Stream>stream)
+        check_status(status)
+
+
+cdef class QuantConfig:
+    """Initialize an instance of ``ncclReshardQuantConfig_t`` using C defaults.
+
+    Mirrors ``NCCL_M2N_QUANT_CONFIG_INITIALIZER``: ABI guard fields populated,
+    recipe defaulting to ``NCCL_M2N_QUANT_NONE`` (uncompressed passthrough).
+    """
+
+    def __init__(self):
+        self._ptr = <ncclReshardQuantConfig_t *>calloc(1, sizeof(ncclReshardQuantConfig_t))
+        if self._ptr == NULL:
+            raise MemoryError("Error allocating QuantConfig")
+        self._owner = None
+        self._owned = True
+        self._readonly = False
+
+        self._ptr[0].size = sizeof(ncclReshardQuantConfig_t)
+        self._ptr[0].magic = NCCL_M2N_QUANT_CONFIG_MAGIC
+        self._ptr[0].version = NCCL_M2N_API_VERSION
+        self._ptr[0].recipe = NCCL_M2N_QUANT_NONE
+
+    def __dealloc__(self):
+        cdef ncclReshardQuantConfig_t *ptr
+        if self._owned and self._ptr != NULL:
+            ptr = self._ptr
+            self._ptr = NULL
+            free(ptr)
+
+    def __repr__(self):
+        return f"<{__name__}.QuantConfig object at {hex(id(self))}>"
+
+    @property
+    def ptr(self):
+        return <intptr_t>(self._ptr)
+
+    cdef intptr_t _get_ptr(self):
+        return <intptr_t>(self._ptr)
+
+    def __int__(self):
+        return <intptr_t>(self._ptr)
+
+    def __eq__(self, other):
+        cdef QuantConfig other_
+        if not isinstance(other, QuantConfig):
+            return False
+        other_ = other
+        return memcmp(<void *>self._ptr, <void *>other_._ptr, sizeof(ncclReshardQuantConfig_t)) == 0
+
+    def __getbuffer__(self, Py_buffer *buffer, int flags):
+        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclReshardQuantConfig_t), self._readonly)
+
+    def __releasebuffer__(self, Py_buffer *buffer):
+        pass
+
+    cdef _check_writable(self):
+        if self._readonly:
+            raise ValueError("This QuantConfig instance is read-only")
+
+    @property
+    def recipe(self):
+        return int(self._ptr[0].recipe)
+
+    @recipe.setter
+    def recipe(self, val):
+        self._check_writable()
+        self._ptr[0].recipe = <ncclM2nQuantRecipe_t>(<int>val)
+
+    @property
+    def blockDim(self):
+        return self._ptr[0].blockDim
+
+    @blockDim.setter
+    def blockDim(self, val):
+        self._check_writable()
+        self._ptr[0].blockDim = val
+
+    @property
+    def blockSize(self):
+        return self._ptr[0].blockSize
+
+    @blockSize.setter
+    def blockSize(self, val):
+        self._check_writable()
+        self._ptr[0].blockSize = val
+
+    @property
+    def roundScales(self):
+        return self._ptr[0].roundScales
+
+    @roundScales.setter
+    def roundScales(self, val):
+        self._check_writable()
+        self._ptr[0].roundScales = val
+
+    @property
+    def dstScales(self):
+        return <intptr_t>(self._ptr[0].dstScales)
+
+    @dstScales.setter
+    def dstScales(self, val):
+        self._check_writable()
+        self._ptr[0].dstScales = <void *>(<intptr_t>val)
+
+    @staticmethod
+    def from_buffer(buffer):
+        return __from_buffer(buffer, sizeof(ncclReshardQuantConfig_t), QuantConfig)
+
+
+cpdef reshard_quantized(intptr_t handle, intptr_t comm, intptr_t src, intptr_t dst, intptr_t quant, intptr_t stream):
+    cdef ncclResult_t status
+    with _NATIVE_CALL_LOCK:
+        with nogil:
+            status = ncclReshardQuantized(<Handle>handle, <Comm>comm, <const ncclDistTensor_t*>src,
+                                              <const ncclDistTensor_t*>dst,
+                                              <const ncclReshardQuantConfig_t*>quant, <Stream>stream)
+        check_status(status)

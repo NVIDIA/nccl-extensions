@@ -22,7 +22,9 @@ cdef extern from *:
       NCCL_RESHARD_REPLICATE = -1,
       NCCL_M2N_CONFIG_UNDEF_INT = INT_MIN,
       NCCL_M2N_API_MAGIC = 0x4d324e32u,
-      NCCL_M2N_API_VERSION = 2u
+      NCCL_M2N_API_VERSION = 2u,
+      NCCL_M2N_SCALE_PLANE_MAGIC = 0x4d325350u,
+      NCCL_M2N_QUANT_CONFIG_MAGIC = 0x4d325143u
     };
     """
     enum:
@@ -32,6 +34,8 @@ cdef extern from *:
         NCCL_M2N_CONFIG_UNDEF_INT
         NCCL_M2N_API_MAGIC
         NCCL_M2N_API_VERSION
+        NCCL_M2N_SCALE_PLANE_MAGIC
+        NCCL_M2N_QUANT_CONFIG_MAGIC
 
 # enums
 
@@ -67,6 +71,39 @@ ctypedef struct ncclDistTensor_t 'ncclDistTensor_t':
     int placements[2]
 
 
+ctypedef enum ncclM2nScaleRecipe_t 'ncclM2nScaleRecipe_t':
+    NCCL_M2N_SCALE_NONE
+    NCCL_M2N_SCALE_FWD
+
+ctypedef struct ncclReshardScalePlane_t 'ncclReshardScalePlane_t':
+    size_t size
+    unsigned int magic
+    unsigned int version
+    ncclM2nScaleRecipe_t recipe
+    void* srcDataPtr
+    void* dstDataPtr
+    ncclDataType_t dtype
+    int blockDim
+    size_t blockSize
+    size_t srcLocalShape[3]
+    size_t dstLocalShape[3]
+
+ctypedef enum ncclM2nQuantRecipe_t 'ncclM2nQuantRecipe_t':
+    NCCL_M2N_QUANT_NONE
+    NCCL_M2N_QUANT_FP8E4M3
+    NCCL_M2N_QUANT_MXFP8
+
+ctypedef struct ncclReshardQuantConfig_t 'ncclReshardQuantConfig_t':
+    size_t size
+    unsigned int magic
+    unsigned int version
+    ncclM2nQuantRecipe_t recipe
+    int blockDim
+    size_t blockSize
+    unsigned int roundScales
+    void* dstScales
+
+
 ###############################################################################
 # Functions
 ###############################################################################
@@ -78,6 +115,9 @@ cdef ncclResult_t ncclM2nGroupEnd() except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR 
 cdef ncclResult_t ncclM2nGroupAbort() except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm, ncclWindow_t window, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t ncclReshardScaled(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, const ncclReshardScalePlane_t* scales, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t ncclReshardScaledWithWindow(ncclM2nHandle_t handle, ncclComm_t comm, ncclWindow_t window, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, const ncclReshardScalePlane_t* scales, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t ncclReshardQuantized(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, const ncclReshardQuantConfig_t* quant, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 
 # Keep the error-detail query on the original no-throw Cython contract.
 cdef const char* ncclM2nGetLastError() noexcept nogil

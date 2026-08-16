@@ -18,3 +18,6 @@ cdef ncclResult_t _ncclM2nGroupAbort() except?_NCCLRESULT_T_INTERNAL_LOADING_ERR
 cdef const char* _ncclM2nGetLastError() noexcept nogil
 cdef ncclResult_t _ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm, ncclWindow_t window, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t _ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t _ncclReshardScaled(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, const ncclReshardScalePlane_t* scales, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t _ncclReshardScaledWithWindow(ncclM2nHandle_t handle, ncclComm_t comm, ncclWindow_t window, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, const ncclReshardScalePlane_t* scales, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t _ncclReshardQuantized(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, const ncclReshardQuantConfig_t* quant, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil

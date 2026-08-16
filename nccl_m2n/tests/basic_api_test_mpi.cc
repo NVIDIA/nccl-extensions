@@ -264,6 +264,134 @@ static CaseResult runStreamOrdering(const TestCase& tc, TestEnv* env) {
   return result;
 }
 
+TEST(M2nGroupMpiTest, ScaledReshardMovesBothPlanes) {
+  if (gCli.filter == nullptr || strcmp(gCli.filter, "scaled_reshard") != 0) {
+#if defined(GTEST_SKIP)
+    GTEST_SKIP() << "needs --filter scaled_reshard";
+#else
+    recordFallbackSkip("needs --filter scaled_reshard");
+    return;
+#endif
+  }
+  if (gWorldSize < 2) {
+#if defined(GTEST_SKIP)
+    GTEST_SKIP() << "needs at least 2 ranks";
+#else
+    recordFallbackSkip("needs at least 2 ranks");
+    return;
+#endif
+  }
+
+  ncclUniqueId id;
+  if (gWorldRank == 0) {
+    TEST_NCCLCHECK(ncclGetUniqueId(&id));
+  }
+  MPICHECK(MPI_Bcast(&id, sizeof(id), testMpiByte(), 0, testMpiWorld()));
+
+  const bool participating = gWorldRank <= 1;
+  ncclComm_t comm = nullptr;
+  cudaStream_t stream = nullptr;
+  void* buffer = nullptr;
+  if (participating) {
+    TEST_NCCLCHECK(ncclCommInitRank(&comm, 2, id, gWorldRank));
+    TEST_CUDACHECK(cudaStreamCreate(&stream));
+    TEST_NCCLCHECK(ncclMemAlloc(&buffer, 4096));
+  }
+
+  /* [tokens=8, hidden=64] uint8 payload, replicated 1-rank meshes so rank 0
+   * sends and rank 1 receives, plus a [8, 2] fp32 scale plane at blockSize=32. */
+  constexpr size_t kTokens = 8;
+  constexpr size_t kHidden = 64;
+  constexpr size_t kBlockSize = 32;
+  constexpr size_t kScaleCols = kHidden / kBlockSize;
+  constexpr size_t kPayloadBytes = kTokens * kHidden;
+  constexpr size_t kScaleBytes = kTokens * kScaleCols * sizeof(float);
+  constexpr size_t kScaleOffset = 1024; /* keep the two planes disjoint */
+
+  ncclMesh_t srcMesh{};
+  srcMesh.dims[0] = 1;
+  srcMesh.dims[1] = 1;
+  srcMesh.startRank = 0;
+  ncclMesh_t dstMesh = srcMesh;
+  dstMesh.startRank = 1;
+
+  auto makeTensor = [](void* data, ncclMesh_t* mesh, size_t d0, size_t d1, ncclDataType_t dtype) {
+    ncclDistTensor_t tensor{};
+    tensor.dataPtr = data;
+    tensor.localShape[0] = d0;
+    tensor.localShape[1] = d1;
+    tensor.ndims = 2;
+    tensor.dtype = dtype;
+    tensor.mesh = mesh;
+    tensor.placements[0] = NCCL_RESHARD_REPLICATE;
+    tensor.placements[1] = NCCL_RESHARD_REPLICATE;
+    return tensor;
+  };
+
+  char* payloadBuf = participating ? static_cast<char*>(buffer) : nullptr;
+  char* scaleBuf = participating ? static_cast<char*>(buffer) + kScaleOffset : nullptr;
+  const bool isSrc = participating && gWorldRank == 0;
+  const bool isDst = participating && gWorldRank == 1;
+
+  ncclDistTensor_t src = makeTensor(isSrc ? payloadBuf : nullptr, &srcMesh, kTokens, kHidden, ncclUint8);
+  ncclDistTensor_t dst = makeTensor(isDst ? payloadBuf : nullptr, &dstMesh, kTokens, kHidden, ncclUint8);
+
+  ncclReshardScalePlane_t scales = NCCL_M2N_SCALE_PLANE_INITIALIZER;
+  scales.recipe = NCCL_M2N_SCALE_FWD;
+  scales.srcDataPtr = isSrc ? scaleBuf : nullptr;
+  scales.dstDataPtr = isDst ? scaleBuf : nullptr;
+  scales.dtype = ncclFloat32;
+  scales.blockDim = 1;
+  scales.blockSize = kBlockSize;
+  scales.srcLocalShape[0] = kTokens;
+  scales.srcLocalShape[1] = kScaleCols;
+  scales.dstLocalShape[0] = kTokens;
+  scales.dstLocalShape[1] = kScaleCols;
+
+  if (isSrc) {
+    TEST_CUDACHECK(cudaMemsetAsync(payloadBuf, 0x5a, kPayloadBytes, stream));
+    TEST_CUDACHECK(cudaMemsetAsync(scaleBuf, 0x3c, kScaleBytes, stream));
+  }
+  if (isDst) {
+    TEST_CUDACHECK(cudaMemsetAsync(payloadBuf, 0, kPayloadBytes, stream));
+    TEST_CUDACHECK(cudaMemsetAsync(scaleBuf, 0, kScaleBytes, stream));
+  }
+
+  if (participating) {
+    TEST_NCCLCHECK(ncclReshardScaled(gM2nHandle, comm, &src, &dst, &scales, stream));
+    TEST_CUDACHECK(cudaStreamSynchronize(stream));
+  }
+
+  /* Both planes must land; checking only the payload would pass even if the
+   * scale plane were dropped entirely. */
+  if (isDst) {
+    std::vector<unsigned char> payload(kPayloadBytes, 0);
+    std::vector<unsigned char> scaleBytes(kScaleBytes, 0);
+    TEST_CUDACHECK(cudaMemcpy(payload.data(), payloadBuf, kPayloadBytes, cudaMemcpyDeviceToHost));
+    TEST_CUDACHECK(cudaMemcpy(scaleBytes.data(), scaleBuf, kScaleBytes, cudaMemcpyDeviceToHost));
+    EXPECT_TRUE(std::all_of(payload.begin(), payload.end(), [](unsigned char v) { return v == 0x5a; }));
+    EXPECT_TRUE(std::all_of(scaleBytes.begin(), scaleBytes.end(), [](unsigned char v) { return v == 0x3c; }));
+  }
+
+  /* A shard boundary interior to a scale block must be rejected on every rank,
+   * not silently mis-split.  This is the case two independent reshards cannot
+   * detect, and the reason this API exists. */
+  if (participating) {
+    ncclReshardScalePlane_t bad = scales;
+    bad.blockSize = kHidden * 2; /* does not divide the payload extent */
+    EXPECT_EQ(ncclInvalidArgument, ncclReshardScaled(gM2nHandle, comm, &src, &dst, &bad, stream));
+  }
+
+  MPICHECK(MPI_Barrier(testMpiWorld()));
+  if (participating) {
+    TEST_CUDACHECK(cudaStreamSynchronize(stream));
+    TEST_NCCLCHECK(ncclCommDestroy(comm));
+    TEST_CUDACHECK(cudaStreamDestroy(stream));
+    TEST_NCCLCHECK(ncclMemFree(buffer));
+  }
+}
+
+
 TEST(M2nGroupMpiTest, OverlappingCommunicatorsPreserveBucketOrder) {
   if (gCli.filter == nullptr || strcmp(gCli.filter, "group_mixed_context") != 0) {
 #if defined(GTEST_SKIP)

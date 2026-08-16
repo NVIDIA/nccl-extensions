@@ -20,10 +20,12 @@ from nccl.m2n.handle import (
     Handle,
     _reshard as _reshard_with_handle,
     _reshard_with_window as _reshard_with_window_with_handle,
+    _reshard_scaled as _reshard_scaled_with_handle,
+    _reshard_quantized as _reshard_quantized_with_handle,
 )
 from nccl.m2n.mesh import Mesh
 from nccl.m2n.placement import Replicate, Shard
-from nccl.m2n.tensor import DistTensor, normalize_dtype
+from nccl.m2n.tensor import DistTensor, QuantSpec, ScalePlane, normalize_dtype
 
 if TYPE_CHECKING:
     import torch
@@ -463,6 +465,8 @@ def _reshard(
     handle: Handle | None = None,
     window: object | None = None,
     allow_dtensor: bool = False,
+    scales: ScalePlane | None = None,
+    quant: QuantSpec | None = None,
     api: str,
 ) -> None:
     if allow_dtensor:
@@ -621,7 +625,23 @@ def _reshard(
         placements=_placement_objects(dst_placement_values),
     )
 
-    if handle is None:
+    if quant is not None:
+        if window is not None:
+            raise NcclInvalid(f"{api} does not support window together with quant")
+        if handle is None:
+            with NATIVE_CALL_LOCK:
+                _reshard_quantized_with_handle(0, comm, src_desc, dst_desc, quant, stream)
+        else:
+            handle.reshard_quantized(comm, src_desc, dst_desc, quant, stream=stream)
+    elif scales is not None:
+        if window is not None:
+            raise NcclInvalid(f"{api} does not support window together with scales")
+        if handle is None:
+            with NATIVE_CALL_LOCK:
+                _reshard_scaled_with_handle(0, comm, src_desc, dst_desc, scales, stream)
+        else:
+            handle.reshard_scaled(comm, src_desc, dst_desc, scales, stream=stream)
+    elif handle is None:
         if window is None:
             with NATIVE_CALL_LOCK:
                 _reshard_with_handle(0, comm, src_desc, dst_desc, stream)
@@ -750,6 +770,97 @@ def xdtensor_reshard(
     )
 
 
+
+def reshard_scaled(
+    src: object | None,
+    dst: object | None,
+    comm: Any,
+    scales: ScalePlane,
+    stream: NcclStreamSpec | None = None,
+    *,
+    src_mesh: object | None = None,
+    src_placements: Sequence[object] | None = None,
+    src_local_shape: Sequence[int] | None = None,
+    src_dtype: object | None = None,
+    dst_mesh: object | None = None,
+    dst_placements: Sequence[object] | None = None,
+    dst_local_shape: Sequence[int] | None = None,
+    dst_dtype: object | None = None,
+    handle: Handle | None = None,
+) -> None:
+    """Reshard a quantized payload together with its companion scale plane.
+
+    Identical to :func:`reshard` for the payload, plus a coupled reshard of
+    ``scales``.  The scale plane must be fully specified (both per-side shapes
+    given, or derived at construction from the payload descriptors); this
+    helper does not infer scale shapes from the payload metadata it resolves.
+
+    See :meth:`Handle.reshard` for the asynchronous buffer-lifetime contract,
+    which applies to the scale buffers as well.
+    """
+
+    return _reshard(
+        src,
+        dst,
+        comm,
+        stream,
+        src_mesh=src_mesh,
+        src_placements=src_placements,
+        src_local_shape=src_local_shape,
+        src_dtype=src_dtype,
+        dst_mesh=dst_mesh,
+        dst_placements=dst_placements,
+        dst_local_shape=dst_local_shape,
+        dst_dtype=dst_dtype,
+        handle=handle,
+        scales=scales,
+        api="reshard_scaled",
+    )
+
+
+def reshard_quantized(
+    src: object | None,
+    dst: object | None,
+    comm: Any,
+    quant: QuantSpec,
+    stream: NcclStreamSpec | None = None,
+    *,
+    src_mesh: object | None = None,
+    src_placements: Sequence[object] | None = None,
+    src_local_shape: Sequence[int] | None = None,
+    src_dtype: object | None = None,
+    dst_mesh: object | None = None,
+    dst_placements: Sequence[object] | None = None,
+    dst_local_shape: Sequence[int] | None = None,
+    dst_dtype: object | None = None,
+    handle: Handle | None = None,
+) -> None:
+    """Reshard with on-the-fly FP8 wire compression.
+
+    Identical to :func:`reshard` from the caller's side — same descriptors and
+    dtypes — but roughly half the bytes cross the wire.  LOSSY, and not always
+    faster; see :class:`QuantSpec` and the README.
+    """
+
+    return _reshard(
+        src,
+        dst,
+        comm,
+        stream,
+        src_mesh=src_mesh,
+        src_placements=src_placements,
+        src_local_shape=src_local_shape,
+        src_dtype=src_dtype,
+        dst_mesh=dst_mesh,
+        dst_placements=dst_placements,
+        dst_local_shape=dst_local_shape,
+        dst_dtype=dst_dtype,
+        handle=handle,
+        quant=quant,
+        api="reshard_quantized",
+    )
+
+
 __all__ = [
     "finalize",
     "group",
@@ -758,6 +869,8 @@ __all__ = [
     "group_start",
     "init",
     "reshard",
+    "reshard_quantized",
+    "reshard_scaled",
     "reshard_with_window",
     "xdtensor_reshard",
 ]

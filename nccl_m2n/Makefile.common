@@ -143,6 +143,8 @@ LIB_CC_SRCS := $(SRCDIR)/m2n_config.cc \
                $(SRCDIR)/reshard_mesh.cc \
                $(SRCDIR)/reshard_loadbalance.cc \
                $(SRCDIR)/reshard_prepare.cc \
+               $(SRCDIR)/reshard_quantize.cc \
+               $(SRCDIR)/reshard_scale_plane.cc \
                $(SRCDIR)/reshard_split_prepare.cc \
                $(SRCDIR)/reshard_transpose.cc \
                $(SRCDIR)/m2n_init.cc \
@@ -154,6 +156,7 @@ LIB_CU_SRCS := $(SRCDIR)/reshard_user_window.cu \
                $(SRCDIR)/reshard_split_comm.cu \
                $(SRCDIR)/reshard_split_user_window.cu \
                $(SRCDIR)/reshard_staging.cu \
+               $(SRCDIR)/reshard_quantize.cu \
                $(SRCDIR)/staging_kernel.cu
 
 LIB_SRCS := $(LIB_CC_SRCS) $(LIB_CU_SRCS)

@@ -255,4 +255,347 @@ class DistTensor:
         )
 
 
-__all__ = ["DistTensor", "normalize_dtype"]
+SCALE_NONE = 0
+SCALE_FWD = 1
+
+# Deliberately narrower than the payload dtype set; mirrors the C validator.
+_SCALE_DTYPES: frozenset[NcclDataType] = frozenset(
+    {
+        nccl_typing.FLOAT32,
+        nccl_typing.FLOAT16,
+        nccl_typing.BFLOAT16,
+        nccl_typing.FLOAT8E4M3,
+        nccl_typing.FLOAT8E5M2,
+        nccl_typing.UINT8,
+    }
+)
+
+
+@dataclass
+class _PreparedDistTensor:
+    mesh: _m2n_bindings.Mesh
+    struct: _m2n_bindings.DistTensor
+
+
+class DistTensor:
+    """Pythonic ``ncclDistTensor_t`` descriptor.
+
+    ``buffer=None`` represents a non-participating side for this rank.  Mesh,
+    placements, local shape, and dtype are still required because NCCL M2N
+    reads both side descriptors on every rank.
+    """
+
+    def __init__(
+        self,
+        buffer: object,
+        local_shape: Sequence[int] | None = None,
+        dtype: object | None = None,
+        *,
+        mesh: Mesh,
+        placements: Sequence[object],
+    ) -> None:
+        if not isinstance(mesh, Mesh):
+            raise TypeError(f"mesh must be nccl.m2n.Mesh, got {type(mesh).__name__}")
+        ptr, inferred_shape, inferred_dtype = _resolve_buffer(buffer)
+        if local_shape is None:
+            if inferred_shape is None:
+                raise ValueError("local_shape is required for None or raw-pointer buffers")
+            local_shape = inferred_shape
+        if dtype is None:
+            if inferred_dtype is None:
+                raise ValueError("dtype is required for None or raw-pointer buffers")
+            dtype = inferred_dtype
+
+        shape = _shape_tuple(local_shape)
+        self._buffer = buffer
+        self._data_ptr = int(ptr)
+        self._local_shape = shape
+        self._dtype = normalize_dtype(dtype)
+        self._mesh = mesh
+        self._placements = normalize_placements(placements)
+
+    @property
+    def data_ptr(self) -> int:
+        return self._data_ptr
+
+    @property
+    def buffer(self) -> object:
+        return self._buffer
+
+    @property
+    def local_shape(self) -> tuple[int, ...]:
+        return self._local_shape
+
+    @property
+    def ndims(self) -> int:
+        return len(self._local_shape)
+
+    @property
+    def dtype(self) -> NcclDataType:
+        return self._dtype
+
+    @property
+    def mesh(self) -> Mesh:
+        return self._mesh
+
+    @property
+    def placements(self) -> tuple[int, int]:
+        return self._placements
+
+    @property
+    def is_participating(self) -> bool:
+        return self._data_ptr != 0
+
+    def as_binding(self) -> _PreparedDistTensor:
+        mesh_struct = self._mesh.to_binding()
+        local_shape = list(self._local_shape) + [1] * (MAX_TENSOR_DIMS - self.ndims)
+        struct = _m2n_bindings.DistTensor()
+        struct.dataPtr = int(self._data_ptr)
+        struct.localShape = tuple(local_shape)
+        struct.ndims = self.ndims
+        struct.dtype = int(self._dtype)
+        struct.mesh = int(mesh_struct.ptr)
+        struct.placements = tuple(int(p) for p in self._placements)
+        return _PreparedDistTensor(mesh=mesh_struct, struct=struct)
+
+    def __repr__(self) -> str:
+        role = "data" if self.is_participating else "none"
+        return (
+            f"<DistTensor role={role} shape={self.local_shape} "
+            f"dtype={self.dtype.name} mesh={self.mesh.dims}@{self.mesh.start_rank}>"
+        )
+
+
+class ScalePlane:
+    """Companion per-block scale plane for a coupled reshard.
+
+    Wraps ``ncclReshardScalePlane_t``.  Topology is not restated: the plane
+    reuses the payload tensors' meshes and placements, which is the invariant
+    the C layer validates.  ``src``/``dst`` accept the same buffer forms as
+    :class:`DistTensor` (``None`` for a non-participating side).
+
+    ``block_size`` is required and never inferred, matching the C contract.
+    Per-side scale shapes default to the payload shape with ``block_dim``
+    divided by ``block_size``; supply them explicitly to have the C layer
+    validate your own arithmetic instead.
+    """
+
+    def __init__(
+        self,
+        src: object,
+        dst: object,
+        *,
+        dtype: object,
+        block_size: int,
+        block_dim: int = -1,
+        src_local_shape: Sequence[int] | None = None,
+        dst_local_shape: Sequence[int] | None = None,
+        src_payload: DistTensor | None = None,
+        dst_payload: DistTensor | None = None,
+    ) -> None:
+        if int(block_size) < 1:
+            raise NcclInvalid(f"block_size must be at least 1, got {block_size}")
+
+        resolved_dtype = normalize_dtype(dtype)
+        if resolved_dtype not in _SCALE_DTYPES:
+            raise NcclInvalid(
+                f"unsupported scale dtype {resolved_dtype.name}; supported: "
+                + ", ".join(sorted(d.name for d in _SCALE_DTYPES))
+            )
+
+        src_ptr, _, _ = _resolve_buffer(src)
+        dst_ptr, _, _ = _resolve_buffer(dst)
+
+        if src_local_shape is None or dst_local_shape is None:
+            if src_payload is None or dst_payload is None:
+                raise NcclInvalid(
+                    "ScalePlane needs either explicit src/dst_local_shape or "
+                    "src_payload/dst_payload to derive them from"
+                )
+
+        def _derive(payload: DistTensor, dim: int) -> tuple[int, ...]:
+            shape = list(payload.local_shape)
+            if shape[dim] % int(block_size) != 0:
+                raise NcclInvalid(
+                    f"block_size {block_size} does not divide payload extent "
+                    f"{shape[dim]} on dim {dim}"
+                )
+            shape[dim] //= int(block_size)
+            return tuple(shape)
+
+        reference = src_payload if src_payload is not None else dst_payload
+        if block_dim < 0:
+            if reference is None:
+                raise NcclInvalid("block_dim must be given when no payload tensor is supplied")
+            block_dim = reference.ndims - 1
+
+        if src_local_shape is None:
+            src_local_shape = _derive(src_payload, block_dim)
+        if dst_local_shape is None:
+            dst_local_shape = _derive(dst_payload, block_dim)
+
+        self._src_data_ptr = src_ptr
+        self._dst_data_ptr = dst_ptr
+        self._src_buffer = src
+        self._dst_buffer = dst
+        self._dtype = resolved_dtype
+        self._block_dim = int(block_dim)
+        self._block_size = int(block_size)
+        self._src_local_shape = tuple(int(v) for v in src_local_shape)
+        self._dst_local_shape = tuple(int(v) for v in dst_local_shape)
+
+    @property
+    def dtype(self) -> NcclDataType:
+        return self._dtype
+
+    @property
+    def block_dim(self) -> int:
+        return self._block_dim
+
+    @property
+    def block_size(self) -> int:
+        return self._block_size
+
+    @property
+    def src_local_shape(self) -> tuple[int, ...]:
+        return self._src_local_shape
+
+    @property
+    def dst_local_shape(self) -> tuple[int, ...]:
+        return self._dst_local_shape
+
+    def as_binding(self) -> _m2n_bindings.ScalePlane:
+        struct = _m2n_bindings.ScalePlane()
+        struct.recipe = SCALE_FWD
+        struct.srcDataPtr = int(self._src_data_ptr)
+        struct.dstDataPtr = int(self._dst_data_ptr)
+        struct.dtype = int(self._dtype)
+        struct.blockDim = self._block_dim
+        struct.blockSize = self._block_size
+        pad = lambda s: tuple(list(s) + [0] * (MAX_TENSOR_DIMS - len(s)))
+        struct.srcLocalShape = pad(self._src_local_shape)
+        struct.dstLocalShape = pad(self._dst_local_shape)
+        return struct
+
+    def __repr__(self) -> str:
+        return (
+            f"<ScalePlane dtype={self._dtype.name} block_dim={self._block_dim} "
+            f"block_size={self._block_size} src={self._src_local_shape} "
+            f"dst={self._dst_local_shape}>"
+        )
+
+
+QUANT_NONE = 0
+QUANT_FP8E4M3 = 1
+QUANT_MXFP8 = 2
+
+# The quantizer works through float, so integer payloads have no meaningful
+# FP8 representation.  Mirrors the C validator.
+_QUANT_PAYLOAD_DTYPES: frozenset[NcclDataType] = frozenset(
+    {nccl_typing.BFLOAT16, nccl_typing.FLOAT16, nccl_typing.FLOAT32}
+)
+
+
+class QuantSpec:
+    """On-the-fly wire compression settings for :func:`reshard_quantized`.
+
+    Wraps ``ncclReshardQuantConfig_t``.  Carries no buffers: the FP8 payload
+    and its generated scales live in library-owned scratch for the duration of
+    the call.
+
+    This is LOSSY — each block of ``block_size`` elements is reconstructed from
+    one shared scale — and it is not unconditionally faster, since it adds a
+    pass over the tile on each side.  See the README.
+    """
+
+    def __init__(
+        self,
+        *,
+        block_dim: int,
+        block_size: int | None = None,
+        round_scales: bool = False,
+        recipe: int = QUANT_FP8E4M3,
+        dst_scales: object = None,
+    ) -> None:
+        if recipe not in (QUANT_FP8E4M3, QUANT_MXFP8):
+            raise NcclInvalid(f"unsupported quantization recipe {recipe}")
+        if recipe == QUANT_MXFP8:
+            # MX defines a 32-element shared scale, and E8M0 can only hold a
+            # power of two; mirror the C validator rather than silently fixing
+            # up the caller's values.
+            if block_size is None:
+                block_size = 32
+            if int(block_size) != 32:
+                raise NcclInvalid(f"MXFP8 requires block_size == 32, got {block_size}")
+            if not round_scales:
+                raise NcclInvalid("MXFP8 scales are E8M0 (powers of two); set round_scales=True")
+        if block_size is None:
+            raise NcclInvalid("block_size is required")
+        if int(block_size) < 1:
+            raise NcclInvalid(f"block_size must be at least 1, got {block_size}")
+        if int(block_dim) < 0:
+            raise NcclInvalid(f"block_dim must be non-negative, got {block_dim}")
+        self._recipe = int(recipe)
+        self._block_size = int(block_size)
+        self._block_dim = int(block_dim)
+        self._round_scales = bool(round_scales)
+        self._dst_scales_ptr, _, _ = _resolve_buffer(dst_scales)
+        self._dst_scales = dst_scales
+
+    @property
+    def block_size(self) -> int:
+        return self._block_size
+
+    @property
+    def block_dim(self) -> int:
+        return self._block_dim
+
+    @property
+    def round_scales(self) -> bool:
+        return self._round_scales
+
+    @property
+    def recipe(self) -> int:
+        return self._recipe
+
+    @property
+    def dst_scales(self) -> object:
+        return self._dst_scales
+
+    @staticmethod
+    def check_payload_dtype(dtype: NcclDataType) -> None:
+        if dtype not in _QUANT_PAYLOAD_DTYPES:
+            raise NcclInvalid(
+                f"unsupported quantized payload dtype {dtype.name}; supported: "
+                + ", ".join(sorted(d.name for d in _QUANT_PAYLOAD_DTYPES))
+            )
+
+    def as_binding(self) -> _m2n_bindings.QuantConfig:
+        struct = _m2n_bindings.QuantConfig()
+        struct.recipe = self._recipe
+        struct.blockDim = self._block_dim
+        struct.blockSize = self._block_size
+        struct.roundScales = 1 if self._round_scales else 0
+        struct.dstScales = int(self._dst_scales_ptr)
+        return struct
+
+    def __repr__(self) -> str:
+        name = "MXFP8" if self._recipe == QUANT_MXFP8 else "FP8E4M3"
+        mode = "keep-quantized" if self._dst_scales_ptr else "dequantize"
+        return (
+            f"<QuantSpec {name} block_dim={self._block_dim} block_size={self._block_size} "
+            f"round_scales={self._round_scales} {mode}>"
+        )
+
+
+__all__ = [
+    "DistTensor",
+    "QuantSpec",
+    "QUANT_FP8E4M3",
+    "QUANT_MXFP8",
+    "QUANT_NONE",
+    "SCALE_FWD",
+    "SCALE_NONE",
+    "ScalePlane",
+    "normalize_dtype",
+]

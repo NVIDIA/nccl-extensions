@@ -30,3 +30,28 @@ cpdef group_end()
 cpdef group_abort()
 cpdef reshard_with_window(intptr_t handle, intptr_t comm, intptr_t window, intptr_t src, intptr_t dst, intptr_t stream)
 cpdef reshard(intptr_t handle, intptr_t comm, intptr_t src, intptr_t dst, intptr_t stream)
+cdef class ScalePlane:
+    cdef:
+        ncclReshardScalePlane_t *_ptr
+        object _owner
+        bint _owned
+        bint _readonly
+    cdef intptr_t _get_ptr(self)
+    cdef _check_writable(self)
+
+
+cpdef reshard_scaled(intptr_t handle, intptr_t comm, intptr_t src, intptr_t dst, intptr_t scales, intptr_t stream)
+cpdef reshard_scaled_with_window(intptr_t handle, intptr_t comm, intptr_t window, intptr_t src, intptr_t dst, intptr_t scales, intptr_t stream)
+
+
+cdef class QuantConfig:
+    cdef:
+        ncclReshardQuantConfig_t *_ptr
+        object _owner
+        bint _owned
+        bint _readonly
+    cdef intptr_t _get_ptr(self)
+    cdef _check_writable(self)
+
+
+cpdef reshard_quantized(intptr_t handle, intptr_t comm, intptr_t src, intptr_t dst, intptr_t quant, intptr_t stream)

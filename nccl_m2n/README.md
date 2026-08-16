@@ -337,6 +337,145 @@ single reshard at a time per `(comm, effective stream)`. Use separate
 communicators for concurrent transfers; the batched benchmark does this with
 `--num-comms`.
 
+### Scale forwarding
+
+A quantized payload usually travels with a companion per-block scale tensor.
+Both can be resharded with two separate `ncclReshard` calls, but the library
+then has no way to know they are related — and when the shard dimension is the
+block-quantized dimension and the shard extent is not a multiple of the block
+size, the two calls split at different logical boundaries and silently produce
+a wrong result.
+
+`ncclReshardScaled` couples them into one validated call:
+
+```c
+ncclResult_t ncclReshardScaled(
+    ncclM2nHandle_t                m2nHandle,
+    ncclComm_t                     comm,
+    const ncclDistTensor_t*        src,     // payload, source side
+    const ncclDistTensor_t*        dst,     // payload, destination side
+    const ncclReshardScalePlane_t* scales,  // NULL == plain ncclReshard
+    cudaStream_t                   stream
+);
+
+ncclResult_t ncclReshardScaledWithWindow(
+    ncclM2nHandle_t handle, ncclComm_t comm, ncclWindow_t window,
+    const ncclDistTensor_t* src, const ncclDistTensor_t* dst,
+    const ncclReshardScalePlane_t* scales, cudaStream_t stream);
+```
+
+The scale plane reuses the payload's meshes and placements — that shared
+topology is the invariant being enforced — so `ncclReshardScalePlane_t` carries
+only the buffers, dtype, block geometry, and per-side scale shapes:
+
+```c
+ncclReshardScalePlane_t scales = NCCL_M2N_SCALE_PLANE_INITIALIZER;
+scales.recipe        = NCCL_M2N_SCALE_FWD;   /* NONE == unquantized passthrough */
+scales.srcDataPtr    = srcScales;            /* non-NULL iff src->dataPtr is    */
+scales.dstDataPtr    = dstScales;
+scales.dtype         = ncclFloat32;          /* fp32/fp16/bf16/fp8/uint8 only   */
+scales.blockDim      = 1;                    /* payload dim one scale spans     */
+scales.blockSize     = 128;                  /* caller-supplied; never inferred */
+scales.srcLocalShape[0] = tokens;  scales.srcLocalShape[1] = hidden / 128;
+scales.dstLocalShape[0] = tokens;  scales.dstLocalShape[1] = hidden / 128;
+```
+
+Additional preconditions, on top of those for `ncclReshard`:
+
+- `size`/`magic` must come from `NCCL_M2N_SCALE_PLANE_INITIALIZER`.
+- `dtype` is one of `ncclFloat32`, `ncclFloat16`, `ncclBfloat16`,
+  `ncclFloat8e4m3`, `ncclFloat8e5m2`, `ncclUint8` — deliberately narrower than
+  the payload dtype set. `ncclUint8` covers raw scale bytes such as E8M0; the
+  contents are treated as opaque and are not interpreted or validated.
+- `blockDim` is in `[0, ndims)` and `blockSize >= 1`.
+- `srcDataPtr`/`dstDataPtr` are non-NULL exactly when the corresponding
+  payload `dataPtr` is.
+- Per side, `scaleShape[d] == payloadShape[d]` for every `d != blockDim`, and
+  `scaleShape[blockDim] * blockSize == payloadShape[blockDim]`.
+- Both sides must derive the same global scale shape.
+- **When a side shards `blockDim`, its shard extent must be a multiple of
+  `blockSize`** — otherwise every shard boundary falls inside a scale block.
+  This is the check that separate calls cannot perform.
+
+**Performance** — the two planes are submitted as one M2N group, so on the
+`ncclReshard` path they normally fuse into a single kernel launch and a single
+barrier epoch instead of two. Fusion is silently skipped (correctness is
+unaffected; the pair simply runs as two reshards) when
+`NCCL_RESHARD_COPY_ALGORITHM` is not `PACKWINDOW`, when
+`NCCL_RESHARD_SPLIT_COMM` is explicitly set, or under CUDA graph capture.
+`ncclReshardScaledWithWindow` does not fuse today — the window path has no
+grouped-fusion implementation — so it always issues two reshards.
+
+Calling `ncclReshardScaled` inside a caller's own
+`ncclM2nGroupStart`/`ncclM2nGroupEnd` region appends both planes to that group
+instead, where they bin with the caller's other tensors.
+
+### On-the-fly quantization
+
+`ncclReshardQuantized` quantizes the payload to FP8 with generated per-block
+scales before transport, so roughly half the bytes cross the wire. What the
+destination receives is chosen by `dst->dtype`:
+
+| `dst->dtype` | Mode | Destination gets |
+|---|---|---|
+| same as `src->dtype` | dequantize | the original dtype reconstructed; scales stay internal |
+| `ncclFloat8e4m3` | keep quantized | the E4M3 payload plus the generated scales in `quant->dstScales` |
+
+Keep-quantized is the mode a consumer that computes in FP8 wants — a weight
+sync to an FP8 inference engine, for example. Dequantizing only to have the
+consumer re-quantize would be two lossy conversions back to where the source
+already was.
+
+```c
+ncclReshardQuantConfig_t quant = NCCL_M2N_QUANT_CONFIG_INITIALIZER;
+quant.recipe      = NCCL_M2N_QUANT_FP8E4M3;  /* or NCCL_M2N_QUANT_MXFP8 */
+quant.blockDim    = 1;    /* payload dim one scale block spans */
+quant.blockSize   = 128;  /* elements per generated scale      */
+quant.roundScales = 1;    /* power-of-two scales               */
+quant.dstScales   = dstScaleBuf;  /* keep-quantized only; NULL to dequantize */
+
+ncclReshardQuantized(handle, comm, &src, &dst, &quant, stream);
+```
+
+Passing `quant` as NULL, or `recipe = NCCL_M2N_QUANT_NONE`, is exactly
+`ncclReshard`.
+
+Recipes:
+
+- **`NCCL_M2N_QUANT_FP8E4M3`** — E4M3 payload, FP32 per-block inverse scales.
+- **`NCCL_M2N_QUANT_MXFP8`** — E4M3 payload, E8M0 shared scales (one exponent
+  byte per block, the MX encoding). Requires `blockSize == 32` and
+  `roundScales`, since E8M0 cannot represent anything but a power of two.
+
+**This is lossy.** Each block of `blockSize` elements shares one scale, so
+values far below their block's maximum lose precision. E4M3 carries three
+mantissa bits, bounding the error of a value near the block maximum at about
+6%.
+
+**It is not always a win.** Quantize adds a pass over the source tile, and the
+dequantizing mode adds another on the destination, so on an intra-node NVLink
+transfer the extra passes can cost more than the halved wire bytes save.
+Measure before adopting it. Keep-quantized is the cheaper of the two modes: it
+has no destination-side pass and needs no destination scratch.
+
+Preconditions beyond `ncclReshard`:
+
+- `src->dtype` is `ncclBfloat16`, `ncclFloat16`, or `ncclFloat32`. Integer
+  payloads are rejected.
+- `dst->dtype` is either `src->dtype` or `ncclFloat8e4m3`, per the table above.
+- `quant->dstScales` is supplied on an active destination rank in
+  keep-quantized mode, and NULL when dequantizing.
+- `blockDim` is in `[0, ndims)` and `blockSize >= 1`. The block dimension need
+  not be innermost.
+- The `blockDim` extent is a multiple of `blockSize` on **both** sides, so no
+  shard boundary falls inside a scale block.
+
+Internally this quantizes, calls `ncclReshardScaled` on the FP8 payload and its
+scales, then dequantizes only when the destination asked for the original
+dtype — so it inherits the coupled reshard's validation and group fusion rather
+than duplicating them.
+
+
 ### Lifecycle
 
 ```c

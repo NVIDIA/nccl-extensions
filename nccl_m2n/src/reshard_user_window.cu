@@ -397,8 +397,10 @@ static ncclResult_t pwLsaHputWarmup(ncclComm_t comm, int worldRank, int worldSiz
   const int previous = (worldRank - 1 + worldSize) % worldSize;
   M2nApiUnlock apiUnlock;
   NCCL_M2N_CHECK(ncclSignal(next, 0, 0, 0, comm, stream));
+  NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   ncclWaitSignalDesc_t wait = {1, previous, 0, 0};
   NCCL_M2N_CHECK(ncclWaitSignal(1, &wait, comm, stream));
+  NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   return ncclSuccess;
 }
 
@@ -415,6 +417,7 @@ static ncclResult_t pwGetOrRegisterStagingWindow(ncclComm_t comm, void* staging,
   {
     M2nApiUnlock apiUnlock;
     NCCL_M2N_CHECK(ncclCommWindowRegister(comm, staging, capacity, &window, NCCL_WIN_COLL_SYMMETRIC));
+    NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   }
   NCCL_M2N_CHECK(cacheInternalWindow(comm, staging, capacity, window));
   *outWindow = window;
@@ -486,6 +489,7 @@ static ncclResult_t reshardCopyPackWindowLsaHput(ncclComm_t comm, const ncclDist
     for (int i = 0; i < previousPeerCount; i++) drains[i] = {1, previousPeers[i], 0, 0};
     M2nApiUnlock apiUnlock;
     NCCL_M2N_CHECK(ncclWaitSignal(previousPeerCount, drains, comm, workStream));
+    NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   }
 
   if (params.isSource && src->dataPtr != nullptr) {
@@ -511,13 +515,14 @@ static ncclResult_t reshardCopyPackWindowLsaHput(ncclComm_t comm, const ncclDist
         putResult = ncclPutSignal((char*)staging + txOffset[targetIdx], txBytes[targetIdx], ncclUint8,
                                   params.targets[targetIdx].dstWorldRank, stagingWindow, peerRx[targetIdx], 0, 0, 0,
                                   comm, workStream);
-        if (putResult != ncclSuccess) break;
+        if (putResult != ncclSuccess && putResult != ncclInProgress) break;
         currentPeers[currentPeerCount++] = params.targets[targetIdx].dstWorldRank;
       }
     }
     const ncclResult_t groupResult = ncclGroupEnd();
     NCCL_M2N_CHECK(putResult);
     NCCL_M2N_CHECK(groupResult);
+    NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   }
   NCCL_M2N_CHECK(setTransposeBufferPackWindowState(comm, rmaWarmed, currentPeerCount, currentPeers));
 
@@ -529,6 +534,7 @@ static ncclResult_t reshardCopyPackWindowLsaHput(ncclComm_t comm, const ncclDist
     }
     M2nApiUnlock apiUnlock;
     NCCL_M2N_CHECK(ncclWaitSignal(params.numSources, arrivals, comm, workStream));
+    NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   }
 
   if (params.isDest && dst->dataPtr != nullptr) {
@@ -559,11 +565,12 @@ static ncclResult_t reshardCopyPackWindowLsaHput(ncclComm_t comm, const ncclDist
     for (int sourceIdx = 0; sourceIdx < params.numSources; sourceIdx++) {
       const int sourceRank = src->mesh->startRank + (int)params.sources[sourceIdx].signalBase;
       signalResult = ncclSignal(sourceRank, 0, 0, 0, comm, workStream);
-      if (signalResult != ncclSuccess) break;
+      if (signalResult != ncclSuccess && signalResult != ncclInProgress) break;
     }
     const ncclResult_t groupResult = ncclGroupEnd();
     NCCL_M2N_CHECK(signalResult);
     NCCL_M2N_CHECK(groupResult);
+    NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   }
   return ncclSuccess;
 }
@@ -774,6 +781,7 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
     {
       M2nApiUnlock apiUnlock;
       NCCL_M2N_CHECK(ncclDevCommCreate(comm, &requirements, &localDevComm));
+      NCCL_M2N_CHECK(m2nWaitCommReady(comm));
     }
     NCCL_M2N_CHECK(cacheDevComm(devCommKey, &localDevComm));
     devComm = findCachedDevComm(devCommKey, &devCommCompletionEvent, &devCommUseState);
@@ -1091,8 +1099,9 @@ static ncclResult_t reshardCopyPackWindowGroupNormalized(ncclComm_t comm, const 
   } else {
     {
       M2nApiUnlock apiUnlock;
-      NCCL_M2N_CHECK(
-        ncclCommWindowRegister(comm, staging, stagingCapacity, &stagingWindow, NCCL_WIN_COLL_SYMMETRIC));
+      NCCL_M2N_CHECK(ncclCommWindowRegister(comm, staging, stagingCapacity, &stagingWindow,
+                                             NCCL_WIN_COLL_SYMMETRIC));
+      NCCL_M2N_CHECK(m2nWaitCommReady(comm));
     }
     NCCL_M2N_CHECK(cacheInternalWindow(comm, staging, stagingCapacity, stagingWindow));
   }
@@ -1344,6 +1353,11 @@ ncclResult_t reshardTryExecuteStagingGroup(ncclM2nHandle_t handle, ncclComm_t co
 
   std::shared_ptr<ncclM2nHandleState> handleState;
   NCCL_M2N_CHECK(acquireM2nHandle(handle, &handleState));
+  /* Grouped execution bypasses ncclReshard; ready the parent before metadata. */
+  {
+    M2nApiUnlock apiUnlock;
+    NCCL_M2N_CHECK(m2nWaitCommReady(comm));
+  }
   int parentCommSize = 0;
   NCCL_M2N_CHECK(ncclCommCount(comm, &parentCommSize));
   reshardResolveAdaptiveScaleConfig(parentCommSize, /*splitCapable=*/false);

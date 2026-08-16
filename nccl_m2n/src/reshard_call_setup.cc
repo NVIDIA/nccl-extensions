@@ -129,6 +129,7 @@ ncclResult_t reshardGetOrCreateDevComm(ncclComm_t comm, int numCtas, int ginSign
   {
     M2nApiUnlock apiUnlock;
     NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, &localDevComm));
+    NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   }
   ncclResult_t cacheResult = cacheDevComm(key, &localDevComm);
   if (cacheResult != ncclSuccess) {

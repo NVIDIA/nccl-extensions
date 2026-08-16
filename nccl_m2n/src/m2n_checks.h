@@ -8,6 +8,8 @@
 #ifndef NCCL_M2N_CHECKS_H_
 #define NCCL_M2N_CHECKS_H_
 
+#include <sched.h>
+
 #include <cstdio>
 #include <cstdlib>
 
@@ -53,12 +55,14 @@ static inline bool m2nSameTensorTopology(const ncclDistTensor_t& a, const ncclDi
 
 /*
  * Library-safe macros: return an error code instead of calling exit().
- * Use these in any function that returns ncclResult_t.
+ * Treat ncclInProgress as non-terminal; callers must establish readiness
+ * before consuming asynchronous outputs. Use these in functions that return
+ * ncclResult_t.
  */
 #define NCCL_M2N_CHECK_IMPL(cmd, resultVar)                                                         \
   do {                                                                                              \
     ncclResult_t resultVar = (cmd);                                                                 \
-    if ((resultVar) != ncclSuccess) {                                                               \
+    if ((resultVar) != ncclSuccess && (resultVar) != ncclInProgress) {                            \
       if (ncclM2nGetLastError()[0] == '\0') {                                                      \
         NCCL_M2N_SET_ERROR("NCCL operation %s failed: %s", #cmd, ncclGetErrorString(resultVar));  \
         RESHARD_WARN(-1, "%s", ncclM2nGetLastError());                                            \
@@ -113,5 +117,17 @@ static inline bool m2nSameTensorTopology(const ncclDistTensor_t& a, const ncclDi
 
 #define NCCL_M2N_CUDACHECK_WARN(cmd) \
   NCCL_M2N_CUDACHECK_WARN_IMPL(cmd, NCCL_M2N_UNIQUE(m2nCudaWarnError_))
+
+/* A non-blocking communicator can publish operation outputs after returning.
+ * Callers unlock the M2N API gate before waiting. */
+inline ncclResult_t m2nWaitCommReady(ncclComm_t comm) {
+  ncclResult_t state = ncclSuccess;
+  do {
+    if (state == ncclInProgress) sched_yield();
+    const ncclResult_t queryResult = ncclCommGetAsyncError(comm, &state);
+    if (queryResult != ncclSuccess) return queryResult;
+  } while (state == ncclInProgress);
+  return state;
+}
 
 #endif /* NCCL_M2N_CHECKS_H_ */

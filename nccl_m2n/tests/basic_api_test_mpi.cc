@@ -214,7 +214,11 @@ static void applyStreamPoolMode(int streamPoolMode) {
 static void activateRuntime(const MpiParam& param, bool bForceReset = false) {
   if (!bForceReset && gActiveAlgorithm == param.algorithmEnv && gActiveStreamPoolMode == param.streamPoolMode) return;
 
-  TEST_CUDACHECK(cudaStreamSynchronize(gStream));
+  if (testUsesNonBlockingComm()) {
+    TEST_NCCL_ASYNC_CHECK(gComm, gStream);
+  } else {
+    TEST_CUDACHECK(cudaStreamSynchronize(gStream));
+  }
   gResolvedCopyAlgorithm = basicApiConfigureReshardEnv(gCli, param.algorithmEnv.c_str());
   applyStreamPoolMode(param.streamPoolMode);
   TEST_NCCLCHECK(ncclM2nFinalize(gM2nHandle));
@@ -301,12 +305,12 @@ TEST(M2nGroupMpiTest, OverlappingCommunicatorsPreserveBucketOrder) {
   const int rankA = gWorldRank;
   const int rankB = gWorldRank - 1;
   if (inA) {
-    TEST_NCCLCHECK(ncclCommInitRank(&gGroupCommA, 2, ids[0], rankA));
+    TEST_NCCL_COMM_CHECK(gGroupCommA, ncclCommInitRank(&gGroupCommA, 2, ids[0], rankA));
     TEST_CUDACHECK(cudaStreamCreate(&gGroupStreamA));
     TEST_NCCLCHECK(ncclMemAlloc(&gGroupBufferA, 4096));
   }
   if (inB) {
-    TEST_NCCLCHECK(ncclCommInitRank(&gGroupCommB, 2, ids[1], rankB));
+    TEST_NCCL_COMM_CHECK(gGroupCommB, ncclCommInitRank(&gGroupCommB, 2, ids[1], rankB));
     TEST_CUDACHECK(cudaStreamCreate(&gGroupStreamB));
     TEST_NCCLCHECK(ncclMemAlloc(&gGroupBufferB, 4096));
   }
@@ -354,8 +358,8 @@ TEST(M2nGroupMpiTest, OverlappingCommunicatorsPreserveBucketOrder) {
   if (inA) TEST_NCCLCHECK(ncclReshard(gM2nHandle, gGroupCommA, &srcA[1], &dstA[1], gGroupStreamA));
   if (inB) TEST_NCCLCHECK(ncclReshard(gM2nHandle, gGroupCommB, &srcB[1], &dstB[1], gGroupStreamB));
   TEST_NCCLCHECK(ncclM2nGroupEnd());
-  if (inA) TEST_CUDACHECK(cudaStreamSynchronize(gGroupStreamA));
-  if (inB) TEST_CUDACHECK(cudaStreamSynchronize(gGroupStreamB));
+  if (inA) TEST_NCCL_ASYNC_CHECK(gGroupCommA, gGroupStreamA);
+  if (inB) TEST_NCCL_ASYNC_CHECK(gGroupCommB, gGroupStreamB);
 
   std::array<unsigned char, 32> actual{};
   auto expectPattern = [&](const ncclDistTensor_t& tensor, int expected) {
@@ -378,7 +382,7 @@ TEST(M2nGroupMpiTest, OverlappingCommunicatorsPreserveBucketOrder) {
   if (inA) TEST_NCCLCHECK(ncclReshard(gM2nHandle, gGroupCommA, &srcA[1], &dstA[1], gGroupStreamA));
   ncclResult_t bucketOrderResult = ncclM2nGroupEnd();
   EXPECT_EQ(inB ? ncclInvalidArgument : ncclSuccess, bucketOrderResult);
-  if (inA) TEST_CUDACHECK(cudaStreamSynchronize(gGroupStreamA));
+  if (inA) TEST_NCCL_ASYNC_CHECK(gGroupCommA, gGroupStreamA);
   if (inA && rankA == 1) {
     expectPattern(dstA[0], 0x20);
     expectPattern(dstA[1], 0x21);
@@ -393,7 +397,7 @@ TEST(M2nGroupMpiTest, OverlappingCommunicatorsPreserveBucketOrder) {
   }
   ncclResult_t entryOrderResult = ncclM2nGroupEnd();
   EXPECT_EQ(inA ? ncclInvalidArgument : ncclSuccess, entryOrderResult);
-  if (inA) TEST_CUDACHECK(cudaStreamSynchronize(gGroupStreamA));
+  if (inA) TEST_NCCL_ASYNC_CHECK(gGroupCommA, gGroupStreamA);
   if (inA && rankA == 1) expectPattern(dstA[0], 0x20);
   MPICHECK(MPI_Barrier(testMpiWorld()));
 }
@@ -469,7 +473,7 @@ static int initMpiRuntime() {
   if (gWorldRank == 0) TEST_NCCLCHECK(ncclGetUniqueId(&uid));
   MPICHECK(MPI_Bcast(&uid, sizeof(uid), testMpiByte(), 0, testMpiWorld()));
 
-  TEST_NCCLCHECK(ncclCommInitRank(&gComm, gWorldSize, uid, gWorldRank));
+  TEST_NCCL_COMM_CHECK(gComm, ncclCommInitRank(&gComm, gWorldSize, uid, gWorldRank));
 
   std::vector<TestCase> cases = basicApiSelectCases(gCases, gCli);
   gBufferBytes = computeMaxBufferBytes(cases, gWorldSize);
@@ -503,24 +507,30 @@ static int initMpiRuntime() {
 }
 
 static void shutdownMpiRuntime() {
-  if (gStream != nullptr) TEST_CUDACHECK(cudaStreamSynchronize(gStream));
-  if (gGroupStreamA != nullptr) TEST_CUDACHECK(cudaStreamSynchronize(gGroupStreamA));
-  if (gGroupStreamB != nullptr) TEST_CUDACHECK(cudaStreamSynchronize(gGroupStreamB));
+  if (gStream != nullptr) {
+    if (testUsesNonBlockingComm()) {
+      TEST_NCCL_ASYNC_CHECK(gComm, gStream);
+    } else {
+      TEST_CUDACHECK(cudaStreamSynchronize(gStream));
+    }
+  }
+  if (gGroupStreamA != nullptr) TEST_NCCL_ASYNC_CHECK(gGroupCommA, gGroupStreamA);
+  if (gGroupStreamB != nullptr) TEST_NCCL_ASYNC_CHECK(gGroupCommB, gGroupStreamB);
   TEST_NCCLCHECK(ncclM2nFinalize(gM2nHandle));
   gM2nHandle = nullptr;
   if (gGroupBufferB != nullptr) TEST_NCCLCHECK(ncclMemFree(gGroupBufferB));
   if (gGroupStreamB != nullptr) TEST_CUDACHECK(cudaStreamDestroy(gGroupStreamB));
-  if (gGroupCommB != nullptr) TEST_NCCLCHECK(ncclCommDestroy(gGroupCommB));
+  if (gGroupCommB != nullptr) TEST_NCCLCHECK(testDestroyComm(gGroupCommB));
   if (gGroupBufferA != nullptr) TEST_NCCLCHECK(ncclMemFree(gGroupBufferA));
   if (gGroupStreamA != nullptr) TEST_CUDACHECK(cudaStreamDestroy(gGroupStreamA));
-  if (gGroupCommA != nullptr) TEST_NCCLCHECK(ncclCommDestroy(gGroupCommA));
+  if (gGroupCommA != nullptr) TEST_NCCLCHECK(testDestroyComm(gGroupCommA));
   if (gCopyBuffer != nullptr) {
     TEST_CUDACHECK(cudaFree(gCopyBuffer));
   }
   gCopyBuffer = nullptr;
   if (gBuffer != nullptr) TEST_NCCLCHECK(ncclMemFree(gBuffer));
   if (gStream != nullptr) TEST_CUDACHECK(cudaStreamDestroy(gStream));
-  if (gComm != nullptr) TEST_NCCLCHECK(ncclCommDestroy(gComm));
+  if (gComm != nullptr) TEST_NCCLCHECK(testDestroyComm(gComm));
 }
 
 } // namespace

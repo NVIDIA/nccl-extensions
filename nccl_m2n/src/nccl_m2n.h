@@ -364,6 +364,10 @@ NCCL_M2N_API ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm
 /**
  * Copy/staging-based resharding (no caller-registered window needed).
  *
+ * A communicator created with `ncclConfig_t.blocking = 0` is supported. The
+ * library waits for it before accessing communicator metadata or resources and
+ * returns any terminal asynchronous NCCL error.
+ *
  * @param[in] handle  NCCL M2N handle returned by ncclM2nInit, or NULL for the
  *                    internal default handle.
  * @param[in] comm    NCCL communicator containing all ranks (src + dst).

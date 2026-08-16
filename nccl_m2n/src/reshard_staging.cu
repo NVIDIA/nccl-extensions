@@ -87,6 +87,13 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   const ncclMesh_t* const dst_mesh = &tensorSetup.dstMesh;
   std::shared_ptr<ncclM2nHandleState> handleState;
   NCCL_M2N_CHECK(acquireM2nHandle(handle, &handleState));
+  /* A caller comm created with ncclConfig_t.blocking=0 may still be
+   * initializing; drive it to readiness before the first communicator query.
+   * Run under M2nApiUnlock so a peer rank in this process can progress it. */
+  {
+    M2nApiUnlock apiUnlock;
+    NCCL_M2N_CHECK(m2nWaitCommReady(comm));
+  }
   int world_rank = 0, world_size = 0;
   NCCL_M2N_CHECK(ncclCommUserRank(comm, &world_rank));
   NCCL_M2N_CHECK(ncclCommCount(comm, &world_size));
@@ -176,7 +183,8 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
       {
         M2nApiUnlock apiUnlock;
         NCCL_M2N_CHECK(ncclCommWindowRegister(comm, staging->buffer, staging->totalSize, &staging_window,
-                                              NCCL_WIN_COLL_SYMMETRIC));
+                                               NCCL_WIN_COLL_SYMMETRIC));
+        NCCL_M2N_CHECK(m2nWaitCommReady(comm));
       }
       NCCL_M2N_CHECK(cacheInternalWindow(comm, staging->buffer, staging->totalSize, staging_window));
     }
@@ -226,6 +234,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
       {
         M2nApiUnlock apiUnlock;
         NCCL_M2N_CHECK(ncclDevCommCreate(comm, &probeReqs, &probeLocalDevComm));
+        NCCL_M2N_CHECK(m2nWaitCommReady(comm));
       }
       NCCL_M2N_CHECK(cacheDevComm(probeKey, &probeLocalDevComm));
       probeDevComm = findCachedDevComm(probeKey);
@@ -346,6 +355,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
       {
         M2nApiUnlock apiUnlock;
         NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, &localDevComm));
+        NCCL_M2N_CHECK(m2nWaitCommReady(comm));
       }
       NCCL_M2N_CHECK(cacheDevComm(devCommKey, &localDevComm));
       devCommPtr = findCachedDevComm(devCommKey, &devCommCompletionEvent, &devCommUseState);

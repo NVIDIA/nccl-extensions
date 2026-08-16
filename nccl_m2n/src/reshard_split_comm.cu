@@ -228,7 +228,8 @@ ncclResult_t createProbeDevComm(ncclComm_t comm, int ginConnectionType, ncclDevC
   memset(out, 0, sizeof(*out));
   {
     M2nApiUnlock apiUnlock;
-    SP_NCCLCHECK(ncclDevCommCreate(comm, &reqs, out));
+    NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, out));
+    NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   }
   return ncclSuccess;
 }
@@ -241,14 +242,18 @@ ncclResult_t broadcastMaxInt(ncclComm_t comm, cudaStream_t stream, int localValu
   SP_CUDACHECK(cudaMalloc(&dev, 2 * sizeof(int)));
   int host = localValue;
   ncclResult_t rc = ncclSuccess;
+  /* FIXME: Simplify these staged checks after the device allocation has automatic cleanup. */
   cudaError_t cerr = cudaMemcpyAsync(dev, &host, sizeof(int), cudaMemcpyHostToDevice, stream);
   if (cerr == cudaSuccess) {
     rc = ncclAllReduce(dev, dev + 1, 1, ncclInt, ncclMax, comm, stream);
   }
+  if (cerr == cudaSuccess && (rc == ncclSuccess || rc == ncclInProgress)) {
+    rc = m2nWaitCommReady(comm);
+  }
   if (cerr == cudaSuccess && rc == ncclSuccess) {
     cerr = cudaMemcpyAsync(&host, dev + 1, sizeof(int), cudaMemcpyDeviceToHost, stream);
   }
-  if (cerr == cudaSuccess) {
+  if (cerr == cudaSuccess && rc == ncclSuccess) {
     cerr = cudaStreamSynchronize(stream);
   }
   cudaFree(dev);
@@ -373,7 +378,6 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
      * restored and stays FULL (all-to-all). */
     const int colorB = isDst ? 0 : NCCL_SPLIT_NOCOLOR;
     const bool forceRail = reshardGetCommBForceRail();
-    ncclResult_t splitRc = ncclSuccess;
     {
       ScopedCrossNicRailOverride crossNicOverride(forceRail);
       if (forceRail && parentRank == 0) {
@@ -382,10 +386,15 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
       }
       {
         M2nApiUnlock apiUnlock;
-        splitRc = ncclCommSplit(comm, colorB, parentRank, &commB, nullptr);
+        NCCL_M2N_CHECK(ncclCommSplit(comm, colorB, parentRank, &commB, nullptr));
+        NCCL_M2N_CHECK(m2nWaitCommReady(comm));
+      }
+      if (isDst) {
+        NCCL_M2N_CHECK_ARG(commB != nullptr, parentRank, "split-comm: ncclCommSplit did not publish commB");
+        M2nApiUnlock apiUnlock;
+        NCCL_M2N_CHECK(m2nWaitCommReady(commB));
       }
     }
-    SP_NCCLCHECK(splitRc);
 
     /* Probe commB for lsaSize (generator ranks only). */
     if (isDst && commB != nullptr) {
@@ -478,11 +487,17 @@ ncclResult_t ensureCommA(ncclComm_t comm, const CommBParentEntry* b, int K, cuda
     const int colorA = inA ? 0 : NCCL_SPLIT_NOCOLOR;
     const int keyA = isSrc ? (parentRank - b->srcStart) : (b->srcSize + parentRank - b->dstStart);
     M2nApiUnlock apiUnlock;
-    SP_NCCLCHECK(ncclCommSplit(comm, colorA, keyA, &commA, nullptr));
+    NCCL_M2N_CHECK(ncclCommSplit(comm, colorA, keyA, &commA, nullptr));
+    NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   }
 
   int rankInA = -1;
-  if (inA && commA != nullptr) {
+  if (inA) {
+    NCCL_M2N_CHECK_ARG(commA != nullptr, parentRank, "split-comm: ncclCommSplit did not publish commA");
+    {
+      M2nApiUnlock apiUnlock;
+      NCCL_M2N_CHECK(m2nWaitCommReady(commA));
+    }
     SP_NCCLCHECK(ncclCommUserRank(commA, &rankInA));
   }
 
@@ -553,6 +568,10 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
   out->rankInB = -1;
   out->slotIdx = 0;
 
+  {
+    M2nApiUnlock apiUnlock;
+    NCCL_M2N_CHECK(m2nWaitCommReady(comm));
+  }
   int parentRank = -1, parentSize = 0;
   SP_NCCLCHECK(ncclCommUserRank(comm, &parentRank));
   SP_NCCLCHECK(ncclCommCount(comm, &parentSize));
@@ -770,7 +789,8 @@ static ncclResult_t createKernelDevComm(ncclComm_t comm, int numCtas, int signal
   memset(out, 0, sizeof(*out));
   {
     M2nApiUnlock apiUnlock;
-    SP_NCCLCHECK(ncclDevCommCreate(comm, &reqs, out));
+    NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, out));
+    NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   }
   return ncclSuccess;
 }
@@ -799,7 +819,9 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
     } else {
       {
         M2nApiUnlock apiUnlock;
-        SP_NCCLCHECK(ncclCommWindowRegister(sc->commA, stagingBuffer, stagingCapacity, &winA, NCCL_WIN_COLL_SYMMETRIC));
+        NCCL_M2N_CHECK(ncclCommWindowRegister(sc->commA, stagingBuffer, stagingCapacity, &winA,
+                                               NCCL_WIN_COLL_SYMMETRIC));
+        NCCL_M2N_CHECK(m2nWaitCommReady(sc->commA));
       }
       SP_NCCLCHECK(cacheInternalWindow(sc->commA, stagingBuffer, stagingCapacity, winA));
     }
@@ -845,7 +867,9 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
     } else {
       {
         M2nApiUnlock apiUnlock;
-        SP_NCCLCHECK(ncclCommWindowRegister(sc->commB, stagingBuffer, stagingCapacity, &winB, NCCL_WIN_COLL_SYMMETRIC));
+        NCCL_M2N_CHECK(ncclCommWindowRegister(sc->commB, stagingBuffer, stagingCapacity, &winB,
+                                               NCCL_WIN_COLL_SYMMETRIC));
+        NCCL_M2N_CHECK(m2nWaitCommReady(sc->commB));
       }
       SP_NCCLCHECK(cacheInternalWindow(sc->commB, stagingBuffer, stagingCapacity, winB));
     }

@@ -308,6 +308,11 @@ noted otherwise):
   shapes that derive the same global tensor shape as active ranks.
 - Each `localShape[shard_dim]` × shard count divides cleanly into the
   global tensor dim.
+- `comm` may be created non-blocking (`ncclConfig_t.blocking = 0`). Both reshard
+  entry points poll it to readiness before accessing communicator metadata or
+  resources, and propagate a terminal NCCL error. Resource-creating NCCL
+  operations are also driven to completion before M2N consumes their output
+  handles. The M2N call itself stays blocking either way.
 
 **Returns** `ncclSuccess` on success, otherwise an `ncclResult_t` from NCCL or
 `ncclInvalidArgument` from the preconditions above.

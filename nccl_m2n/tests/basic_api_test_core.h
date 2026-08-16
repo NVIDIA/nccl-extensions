@@ -1407,8 +1407,8 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   /* ----- 6. window registration (window path only) ----- */
   ncclWindow_t window = nullptr;
   if (env->apiKind == ApiKind::Window && !tc.bNullWindow) {
-    TEST_NCCLCHECK(ncclCommWindowRegister(env->comm, activeBuffer, activeBufferBytes, &window,
-                                          NCCL_WIN_COLL_SYMMETRIC));
+    TEST_NCCL_COMM_CHECK(env->comm, ncclCommWindowRegister(env->comm, activeBuffer, activeBufferBytes, &window,
+                                                           NCCL_WIN_COLL_SYMMETRIC));
   }
   TEST_CUDACHECK(cudaMemsetAsync(activeBuffer, 0xDE, activeBufferBytes, env->stream));
 
@@ -1488,7 +1488,11 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     if (tc.bGraphCapturePrewarmed) {
       r = reshard(env->stream);
       if (r == ncclSuccess) {
-        TEST_CUDACHECK(cudaStreamSynchronize(env->stream));
+        if (testUsesNonBlockingComm()) {
+          TEST_NCCL_ASYNC_CHECK(env->comm, env->stream);
+        } else {
+          TEST_CUDACHECK(cudaStreamSynchronize(env->stream));
+        }
         env->barrier(env);
       }
     }
@@ -1501,7 +1505,7 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
       TEST_CUDACHECK(cudaGraphDestroy(graph));
     }
     if (window != nullptr) {
-      TEST_NCCLCHECK(ncclCommWindowDeregister(env->comm, window));
+      TEST_NCCL_COMM_CHECK(env->comm, ncclCommWindowDeregister(env->comm, window));
     }
     const bool bActionableError = strstr(ncclM2nGetLastError(), "does not support CUDA graph capture") != nullptr;
     return (r == ncclInvalidUsage && bActionableError) ? makePass() : makeFail("graph capture was not rejected");
@@ -1537,12 +1541,14 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
 
   if (r != ncclSuccess) {
     if (window != nullptr) {
-      TEST_NCCLCHECK(ncclCommWindowDeregister(env->comm, window));
+      TEST_NCCL_COMM_CHECK(env->comm, ncclCommWindowDeregister(env->comm, window));
     }
     return makeFail("reshard call returned error");
   }
 
-  if (!asyncOrdering) {
+  if (testUsesNonBlockingComm()) {
+    TEST_NCCL_ASYNC_CHECK(env->comm, env->stream);
+  } else if (!asyncOrdering) {
     TEST_CUDACHECK(cudaStreamSynchronize(env->stream));
   }
   /* These observations are rank-local, so a rank must not return on them before
@@ -1589,7 +1595,7 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   int globalOk = env->allreduceMinInt(env, localOk);
 
   if (window != nullptr) {
-    TEST_NCCLCHECK(ncclCommWindowDeregister(env->comm, window));
+    TEST_NCCL_COMM_CHECK(env->comm, ncclCommWindowDeregister(env->comm, window));
   }
 
   if (instrumentationFailure != nullptr) {

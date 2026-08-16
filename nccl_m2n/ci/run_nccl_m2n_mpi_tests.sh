@@ -33,6 +33,7 @@ if [[ "${SLURM_NNODES:-}" != "${NCCL_M2N_MPI_NNODES}" ]]; then
 fi
 
 expectedRanks=$((NCCL_M2N_MPI_NNODES * NCCL_M2N_MPI_NTASKS_PER_NODE))
+splitReverseMeshActivated=0
 binary="${NCCL_HOME}/bin/basic_api_test_mpi"
 if [[ ! -x "${binary}" ]]; then
   echo "Missing executable basic MPI API test: ${binary}" >&2
@@ -117,6 +118,7 @@ runCase() {
 
 runPackWindowSplitCase() {
   local caseFilter="$1"
+  local requireSplit="${2:-0}"
   local log
   log="$(mktemp)"
 
@@ -162,15 +164,43 @@ runPackWindowSplitCase() {
   # Match the activation line exactly: four other messages share this prefix
   # and every one of them means the fast path was declined.
   if grep -Fq 'packwindow-lsa-hput: ranks=' "${log}"; then
+    if [[ "${requireSplit}" -eq 1 ]]; then
+      echo "basic_api_test_mpi [${caseFilter}, PACKWINDOW split] did not activate split." >&2
+      cat "${log}"
+      rm -f "${log}"
+      return 1
+    fi
     echo "    one NVLink domain spans this allocation; the single-domain" \
          "host-RMA path claimed this case before the split path"
-  elif ! grep -Fq 'split-launch:' "${log}"; then
+  elif grep -Fq 'split-launch:' "${log}"; then
+    if [[ "${caseFilter}" == split_reverse_mesh ]]; then
+      splitReverseMeshActivated=1
+    fi
+  else
     echo "basic_api_test_mpi [${caseFilter}, PACKWINDOW split] took neither the split path nor the single-domain host-RMA path." >&2
     cat "${log}"
     rm -f "${log}"
     return 1
   fi
   rm -f "${log}"
+}
+
+runNonBlockingCase() {
+  NCCL_COMM_BLOCKING=0 runCase "$@"
+}
+
+runNonBlockingCoverage() {
+  echo "=== basic_api_test_mpi: bounded nonblocking coverage ==="
+  runNonBlockingCase "nonblocking DIRECT/default API" \
+    --filter tiny_contribution --algorithm direct --api default --lb-mode uniform
+  runNonBlockingCase "nonblocking PACKWINDOW/default API" \
+    --filter tiny_contribution --algorithm ring --api default --copy-algorithm packwindow --lb-mode uniform
+  runNonBlockingCase "nonblocking PACKWINDOW/window API" \
+    --filter tiny_contribution --algorithm ring --api window --copy-algorithm packwindow --lb-mode uniform
+  if [[ "${NCCL_M2N_MPI_TEST_PROFILE}" == eight_rank ]]; then
+    NCCL_COMM_BLOCKING=0 runPackWindowGroupCase
+  fi
+  NCCL_COMM_BLOCKING=0 runPackWindowSplitCase split_reverse_mesh "${splitReverseMeshActivated}"
 }
 
 runPackWindowGroupCase() {
@@ -304,3 +334,5 @@ case "${NCCL_M2N_MPI_TEST_PROFILE}" in
     done
     ;;
 esac
+
+runNonBlockingCoverage

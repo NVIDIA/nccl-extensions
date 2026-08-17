@@ -480,12 +480,21 @@ static ncclResult_t validateDispatchRecipe(
             }
             const size_t expected_scales =
                 static_cast<size_t>(launch.hidden / nccl_ep::kDsFp8E3M4ElementsPerScale);
+            size_t expected_rows = 0;
+            size_t expected_slots = 0;
+            if (launch.layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+                expected_rows = static_cast<size_t>(launch.num_ranks);
+                expected_slots = static_cast<size_t>(launch.max_tokens_per_rank);
+            } else {
+                expected_rows = static_cast<size_t>(launch.num_local_experts);
+                expected_slots = static_cast<size_t>(launch.max_tokens_per_rank) * launch.num_ranks;
+            }
             if (output_scales->ndim != 3 || output_scales->datatype != ncclFloat32 ||
-                output_scales->sizes[0] != static_cast<size_t>(launch.num_local_experts) ||
-                output_scales->sizes[1] !=
-                    static_cast<size_t>(launch.max_tokens_per_rank) * launch.num_ranks ||
+                output_scales->sizes[0] != expected_rows ||
+                output_scales->sizes[1] != expected_slots ||
                 output_scales->sizes[2] != expected_scales) {
-                return fail("DS_FP8E3M4 outputs->scales must be FP32 [local_experts, recv_slots, hidden / 128]");
+                return fail("DS_FP8E3M4 outputs->scales must be FP32 3D matching the selected layout "
+                            "and hidden / 128");
             }
             if (static_cast<size_t>(launch.hidden) + expected_scales * sizeof(float) > launch.max_token_bytes) {
                 return fail("DS_FP8E3M4 token bytes plus scale bytes exceed the group token-byte limit");

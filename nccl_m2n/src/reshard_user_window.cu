@@ -288,13 +288,13 @@ __global__ __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void reshardKernelU
 // Host: ncclReshardWithWindow
 // ============================================================================
 
-struct TransposeBufferEventGuard {
+struct PackWindowStagingEventGuard {
   ncclComm_t comm = nullptr;
   cudaStream_t stream = nullptr;
 
-  ~TransposeBufferEventGuard() {
+  ~PackWindowStagingEventGuard() {
     if (comm != nullptr) {
-      NCCL_M2N_CHECK_WARN(transposeBufferRecordEvent(comm, stream));
+      NCCL_M2N_CHECK_WARN(packWindowStagingRecordEvent(comm, stream));
     }
   }
 
@@ -304,7 +304,7 @@ struct TransposeBufferEventGuard {
   }
 
   ncclResult_t record() {
-    ncclResult_t result = transposeBufferRecordEvent(comm, stream);
+    ncclResult_t result = packWindowStagingRecordEvent(comm, stream);
     if (result == ncclSuccess) {
       comm = nullptr;
     }
@@ -322,8 +322,8 @@ extern "C" ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t
 // ============================================================================
 // PACKWINDOW copy mode
 //
-// Pack each destination's bytes contiguously into the reused transpose/
-// transfer buffer (CE cudaMemcpy3D), transfer with the hierarchical
+// Pack each destination's bytes contiguously into the reused PACKWINDOW staging
+// buffer (CE cudaMemcpy3D), transfer with the hierarchical
 // user-window kernel over contiguous plans, then unpack into the user dst
 // buffer (CE cudaMemcpy3D).
 //
@@ -452,8 +452,9 @@ static ncclResult_t pwGetOrRegisterStagingWindow(ncclComm_t comm, void* staging,
 static ncclResult_t reshardCopyPackWindowLsaHput(ncclComm_t comm, const ncclDistTensor_t* src,
                                                  const size_t srcDimsBytes[], const ncclDistTensor_t* dst,
                                                  const size_t dstDimsBytes[], void* staging, size_t stagingCapacity,
-                                                 ncclWindow_t stagingWindow, size_t rxBase, size_t elementsPerChunk,
-                                                 int worldRank, int worldSize, cudaStream_t workStream) {
+                                                 ncclWindow_t stagingWindow, size_t txLimit, size_t rxBase,
+                                                 size_t elementsPerChunk, int worldRank, int worldSize,
+                                                 cudaStream_t workStream) {
   std::vector<size_t> allWindowOffsets(worldSize, 0);
   ncclReshardDirectParams params{};
   NCCL_M2N_CHECK(validateReshardPlanLimits(worldRank, src, srcDimsBytes, dst, dstDimsBytes, elementsPerChunk,
@@ -487,8 +488,8 @@ static ncclResult_t reshardCopyPackWindowLsaHput(ncclComm_t comm, const ncclDist
         shardTxOffset[target.dstShardIdx] = cursor;
         packTarget[targetIdx] = true;
         size_t txEnd = 0;
-        NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(cursor, txBytes[targetIdx], &txEnd) && txEnd <= rxBase, worldRank,
-                           "PACKWINDOW LSA packed source range exceeds %zu bytes", rxBase);
+        NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(cursor, txBytes[targetIdx], &txEnd) && txEnd <= txLimit, worldRank,
+                           "PACKWINDOW LSA packed source range exceeds %zu bytes", txLimit);
         cursor = txEnd;
       }
       txOffset[targetIdx] = shardTxOffset[target.dstShardIdx];
@@ -679,12 +680,7 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
                        "reshardCopyPackWindow: destination staging size overflow at dim %d", d);
   }
 
-  size_t regionBytes = std::max(srcLocal, dstLocal);
-  if (regionBytes < 2048) regionBytes = 2048;
-  size_t areaBytes = 0;
-  NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(regionBytes, (size_t)2, &areaBytes), worldRank,
-                     "reshardCopyPackWindow: staging region size overflow");
-  const size_t rxBase = regionBytes;
+  const size_t areaBytes = std::max(std::max(srcLocal, dstLocal), kMinPackWindowStagingBytes);
   const int numCtas = pickNumCtas(areaBytes, RESHARD_ALGO_RING);
   const size_t elementsPerChunk = pickElementsPerChunk(areaBytes, RESHARD_ALGO_RING);
   int ginSignalCount = 0;
@@ -713,20 +709,21 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
                           commProperties.nLsaTeams == 1 && cudaDriverVersion >= 12050 && hostRmaOrderingSupport &&
                           forwardMeshOrder && lsaCePlanFits;
 
-  NCCL_M2N_CHECK(ensureTransposeBuffer(comm, areaBytes, workStream));
-  TransposeBufferEventGuard stagingEvent;
+  NCCL_M2N_CHECK(ensurePackWindowStagingBuffer(comm, areaBytes, workStream));
+  PackWindowStagingEventGuard stagingEvent;
   stagingEvent.arm(comm, workStream);
-  void* staging = getTransposeBuffer(comm);
-  const size_t stagingCapacity = getTransposeBufferCapacity(comm);
+  void* staging = getPackWindowStagingBuffer(comm);
+  const size_t stagingCapacity = getPackWindowStagingCapacity(comm);
 
   if (useLsaHput) {
     ncclWindow_t stagingWindow = nullptr;
     NCCL_M2N_CHECK(pwGetOrRegisterStagingWindow(comm, staging, stagingCapacity, &stagingWindow));
-    RESHARD_INFO(worldRank, "packwindow-lsa-hput: ranks=%d srcShards=%d dstShards=%d areaBytes=%zu", worldSize,
-                 srcShardCount, dstShardCount, areaBytes);
+    RESHARD_INFO(worldRank,
+                 "packwindow-lsa-hput: ranks=%d srcShards=%d dstShards=%d areaBytes=%zu stagingCapacity=%zu",
+                 worldSize, srcShardCount, dstShardCount, areaBytes, stagingCapacity);
     NCCL_M2N_CHECK(reshardCopyPackWindowLsaHput(comm, src, srcDimsBytes, dst, dstDimsBytes, staging,
-                                                stagingCapacity, stagingWindow, rxBase, elementsPerChunk, worldRank,
-                                                worldSize, workStream));
+                                                stagingCapacity, stagingWindow, areaBytes, /*rxBase=*/0,
+                                                elementsPerChunk, worldRank, worldSize, workStream));
     NCCL_M2N_CHECK(stagingEvent.record());
     return ncclSuccess;
   }
@@ -887,13 +884,12 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
       NCCL_M2N_CHECK_ARG(pwPlanPairBytes(originalTargetPlans[targetIdx], &txBytes[targetIdx]), worldRank,
                          "reshardCopyPackWindow: target %d byte count overflow", targetIdx);
       txOffset[targetIdx] = cursor;
-      NCCL_M2N_CHECK(pwPackedRxOffset(params, params.targets[targetIdx].dstShardIdx, params.mySrcShardIdx, rxBase,
+      NCCL_M2N_CHECK(pwPackedRxOffset(params, params.targets[targetIdx].dstShardIdx, params.mySrcShardIdx, /*rxBase=*/0,
                                       &peerRx[targetIdx]));
       size_t txEnd = 0;
       size_t peerEnd = 0;
-      NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(cursor, txBytes[targetIdx], &txEnd) && txEnd <= stagingCapacity, worldRank,
-                         "reshardCopyPackWindow: target %d staging range exceeds %zu bytes", targetIdx,
-                         stagingCapacity);
+      NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(cursor, txBytes[targetIdx], &txEnd) && txEnd <= areaBytes, worldRank,
+                         "reshardCopyPackWindow: target %d staging range exceeds %zu bytes", targetIdx, areaBytes);
       NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(peerRx[targetIdx], txBytes[targetIdx], &peerEnd) &&
                            peerEnd <= stagingCapacity,
                          worldRank, "reshardCopyPackWindow: target %d peer range exceeds %zu bytes", targetIdx,
@@ -906,7 +902,7 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
     for (int sourceIdx = 0; sourceIdx < params.numSources; sourceIdx++) {
       NCCL_M2N_CHECK_ARG(pwPlanPairBytes(params.sources[sourceIdx].plan, &rxBytes[sourceIdx]), worldRank,
                          "reshardCopyPackWindow: source %d byte count overflow", sourceIdx);
-      NCCL_M2N_CHECK(pwPackedRxOffset(params, params.myDstShardIdx, params.sources[sourceIdx].srcShardIdx, rxBase,
+      NCCL_M2N_CHECK(pwPackedRxOffset(params, params.myDstShardIdx, params.sources[sourceIdx].srcShardIdx, /*rxBase=*/0,
                                       &rxOffset[sourceIdx]));
       size_t rxEnd = 0;
       NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(rxOffset[sourceIdx], rxBytes[sourceIdx], &rxEnd) &&
@@ -972,7 +968,7 @@ ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTens
       if (pairBytes == 0) continue;
       size_t rx = 0;
       size_t rxEnd = 0;
-      NCCL_M2N_CHECK(pwPackedRxOffset(params, params.myDstShardIdx, srcShard, rxBase, &rx));
+      NCCL_M2N_CHECK(pwPackedRxOffset(params, params.myDstShardIdx, srcShard, /*rxBase=*/0, &rx));
       NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(rx, pairBytes, &rxEnd) && rxEnd <= stagingCapacity, worldRank,
                          "reshardCopyPackWindow: unpack shard %d staging range exceeds %zu bytes", srcShard,
                          stagingCapacity);
@@ -1064,14 +1060,6 @@ static size_t groupOriginalIndex(const size_t* originalIndices, size_t entry) {
   return originalIndices == nullptr ? entry : originalIndices[entry];
 }
 
-static bool pwGroupAreaBytes(size_t srcBytes, size_t dstBytes, size_t* areaBytes) {
-  size_t regionBytes = std::max(srcBytes, dstBytes);
-  if (regionBytes < 2048) {
-    regionBytes = 2048;
-  }
-  return m2nCheckedMulSize(regionBytes, (size_t)2, areaBytes);
-}
-
 static ncclResult_t pwGroupPairOffset(const size_t* pairBytes, size_t count, int srcShardCount, int dstShardCount,
                                       int srcShard, int dstShard, size_t entry, size_t rxBase, size_t* offset) {
   size_t result = rxBase;
@@ -1114,14 +1102,7 @@ static ncclResult_t reshardCopyPackWindowGroupNormalized(ncclComm_t comm, const 
                        worldRank, "ncclM2nGroupEnd: aggregate local byte size overflow at entry %zu", entries[e]);
   }
 
-  size_t regionBytes = std::max(srcBatchBytes, dstBatchBytes);
-  if (regionBytes < 2048) {
-    regionBytes = 2048;
-  }
-  size_t areaBytes = 0;
-  NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(regionBytes, (size_t)2, &areaBytes), worldRank,
-                     "ncclM2nGroupEnd: staging region size overflow");
-  const size_t rxBase = regionBytes;
+  const size_t areaBytes = std::max(std::max(srcBatchBytes, dstBatchBytes), kMinPackWindowStagingBytes);
   const int numCtas = pickNumCtas(areaBytes, RESHARD_ALGO_RING);
   const size_t elementsPerChunk = pickElementsPerChunk(areaBytes, RESHARD_ALGO_RING);
 
@@ -1134,11 +1115,11 @@ static ncclResult_t reshardCopyPackWindowGroupNormalized(ncclComm_t comm, const 
     NCCL_M2N_CHECK(computeReshardSignalBase(srcMesh, worldRank, numCtas, worldRank, &mySignalBase));
   }
 
-  NCCL_M2N_CHECK(ensureTransposeBuffer(comm, areaBytes, workStream));
-  TransposeBufferEventGuard stagingEvent;
+  NCCL_M2N_CHECK(ensurePackWindowStagingBuffer(comm, areaBytes, workStream));
+  PackWindowStagingEventGuard stagingEvent;
   stagingEvent.arm(comm, workStream);
-  void* staging = getTransposeBuffer(comm);
-  const size_t stagingCapacity = getTransposeBufferCapacity(comm);
+  void* staging = getPackWindowStagingBuffer(comm);
+  const size_t stagingCapacity = getPackWindowStagingCapacity(comm);
 
   ncclWindow_t stagingWindow = nullptr;
   ncclWindow_t* cachedWindow = findCachedInternalWindowByPtr(comm, staging, stagingCapacity);
@@ -1276,11 +1257,11 @@ static ncclResult_t reshardCopyPackWindowGroupNormalized(ncclComm_t comm, const 
                          worldRank, "ncclM2nGroupEnd: target payload overflow");
     }
     size_t txEnd = 0;
-    NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(txCursor, total, &txEnd) && txEnd <= stagingCapacity, worldRank,
-                       "ncclM2nGroupEnd: source staging range exceeds %zu bytes", stagingCapacity);
+    NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(txCursor, total, &txEnd) && txEnd <= areaBytes, worldRank,
+                       "ncclM2nGroupEnd: source staging range exceeds %zu bytes", areaBytes);
     size_t peerOffset = 0;
     NCCL_M2N_CHECK(pwGroupPairOffset(pairBytes.get(), count, srcShardCount, dstShardCount,
-                                     aggregate->mySrcShardIdx, aggregate->targets[t].dstShardIdx, 0, rxBase,
+                                     aggregate->mySrcShardIdx, aggregate->targets[t].dstShardIdx, 0, /*rxBase=*/0,
                                      &peerOffset));
     size_t peerEnd = 0;
     NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(peerOffset, total, &peerEnd) && peerEnd <= stagingCapacity, worldRank,
@@ -1325,7 +1306,7 @@ static ncclResult_t reshardCopyPackWindowGroupNormalized(ncclComm_t comm, const 
       }
       size_t offset = 0;
       NCCL_M2N_CHECK(pwGroupPairOffset(pairBytes.get(), count, srcShardCount, dstShardCount, source.srcShardIdx,
-                                       aggregate->myDstShardIdx, 0, rxBase, &offset));
+                                       aggregate->myDstShardIdx, 0, /*rxBase=*/0, &offset));
       source.isContiguous = true;
       source.totalBytes = total;
       source.plan.dstBaseOffset = offset;
@@ -1355,7 +1336,7 @@ static ncclResult_t reshardCopyPackWindowGroupNormalized(ncclComm_t comm, const 
         const ncclReshardTransferPlan& plan = unpackPlans[e * (size_t)srcShardCount + (size_t)s];
         size_t offset = 0;
         NCCL_M2N_CHECK(pwGroupPairOffset(pairBytes.get(), count, srcShardCount, dstShardCount, s,
-                                         aggregate->myDstShardIdx, e, rxBase, &offset));
+                                         aggregate->myDstShardIdx, e, /*rxBase=*/0, &offset));
         size_t end = 0;
         NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(offset, pairBytes[pairIndex], &end) && end <= stagingCapacity, worldRank,
                            "ncclM2nGroupEnd: unpack range exceeds %zu bytes", stagingCapacity);
@@ -1443,10 +1424,8 @@ ncclResult_t reshardTryExecuteStagingGroup(ncclM2nHandle_t handle, ncclComm_t co
   for (size_t e = 0; e < count; e++) {
     *failedOriginalIndex = groupOriginalIndex(originalIndices, e);
     NCCL_M2N_CHECK(pwGroupTensorBytes(worldRank, setups[e], &srcEntryBytes[e], &dstEntryBytes[e]));
-    size_t areaBytes = 0;
-    NCCL_M2N_CHECK_ARG(pwGroupAreaBytes(srcEntryBytes[e], dstEntryBytes[e], &areaBytes), worldRank,
-                       "ncclM2nGroupEnd: entry %zu staging size overflow", e);
-    largestSingleArea = std::max(largestSingleArea, areaBytes);
+    largestSingleArea = std::max(
+      largestSingleArea, std::max(std::max(srcEntryBytes[e], dstEntryBytes[e]), kMinPackWindowStagingBytes));
   }
 
   struct GroupBufferRange {
@@ -1493,17 +1472,12 @@ ncclResult_t reshardTryExecuteStagingGroup(ncclM2nHandle_t handle, ncclComm_t co
     NCCL_M2N_FAIL(ncclSystemError, worldRank, "ncclM2nGroupEnd: failed to allocate overlap validation storage");
   }
 
-  size_t stagingBudget = getTransposeBufferCapacity(comm);
-  if (reshardStagingBucketsEnabled()) {
-    stagingBudget = gReshardStagingBuckets[gReshardStagingBucketCount - 1].size;
-    for (int i = 0; i < gReshardStagingBucketCount; i++) {
-      if (gReshardStagingBuckets[i].size >= largestSingleArea) {
-        stagingBudget = gReshardStagingBuckets[i].size;
-        break;
-      }
+  size_t stagingBudget = gReshardStagingBuckets[gReshardStagingBucketCount - 1].size;
+  for (int i = 0; i < gReshardStagingBucketCount; i++) {
+    if (gReshardStagingBuckets[i].size >= largestSingleArea) {
+      stagingBudget = gReshardStagingBuckets[i].size;
+      break;
     }
-  } else if (stagingBudget == 0) {
-    stagingBudget = std::max(gReshardStagingWatermarkBytes, largestSingleArea);
   }
 
   std::vector<PwGroupBin> bins;
@@ -1517,16 +1491,15 @@ ncclResult_t reshardTryExecuteStagingGroup(ncclM2nHandle_t handle, ncclComm_t co
         }
         size_t srcBytes = 0;
         size_t dstBytes = 0;
-        size_t areaBytes = 0;
         if (!m2nCheckedAddSize(bin.srcBytes, srcEntryBytes[e], &srcBytes) ||
             !m2nCheckedAddSize(bin.dstBytes, dstEntryBytes[e], &dstBytes) ||
-            !pwGroupAreaBytes(srcBytes, dstBytes, &areaBytes) || areaBytes > stagingBudget) {
+            std::max(std::max(srcBytes, dstBytes), kMinPackWindowStagingBytes) > stagingBudget) {
           continue;
         }
         bin.entries.push_back(e);
         bin.srcBytes = srcBytes;
         bin.dstBytes = dstBytes;
-        bin.areaBytes = areaBytes;
+        bin.areaBytes = std::max(std::max(srcBytes, dstBytes), kMinPackWindowStagingBytes);
         added = true;
         break;
       }
@@ -1535,8 +1508,7 @@ ncclResult_t reshardTryExecuteStagingGroup(ncclM2nHandle_t handle, ncclComm_t co
         bin.entries.push_back(e);
         bin.srcBytes = srcEntryBytes[e];
         bin.dstBytes = dstEntryBytes[e];
-        NCCL_M2N_CHECK_ARG(pwGroupAreaBytes(bin.srcBytes, bin.dstBytes, &bin.areaBytes), worldRank,
-                           "ncclM2nGroupEnd: entry %zu staging size overflow", e);
+        bin.areaBytes = std::max(std::max(bin.srcBytes, bin.dstBytes), kMinPackWindowStagingBytes);
         bins.push_back(std::move(bin));
       }
     }

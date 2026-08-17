@@ -387,7 +387,7 @@ ncclResult_t cacheDevComm(const ReshardDevCommCacheKey& key, const ncclDevComm* 
 }
 
 /* ======================================================================
- * Staging buffer pool -- per-comm entries, mirroring TransposeBufferEntry.
+ * Staging buffer pool -- per-comm entries for the DIRECT copy path.
  * ====================================================================*/
 
 static StagingBufferPoolEntry gStagingPool[MAX_STAGING_BUFFER_ENTRIES];

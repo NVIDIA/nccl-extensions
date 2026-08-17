@@ -18,8 +18,7 @@
  *   2. No separate devComm for the staging path — uses the main comm's
  *      devComm and caches via the existing findCachedDevComm pattern.
  *   3. Per-comm staging buffer pool (StagingBufferPoolEntry) with
- *      event-based cross-stream ordering, mirroring the transpose
- *      buffer in the window API.
+ *      event-based cross-stream ordering matching the PACKWINDOW staging pool.
  ************************************************************************/
 
 #include <algorithm>
@@ -170,8 +169,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
 
   /* ----------------------------------------------------------------
    * Register a window on the staging buffer for this comm (cached
-   * by the internal window cache — same pattern as the transpose
-   * buffer in the window API).
+   * by the internal window cache, like the PACKWINDOW staging-pool buffer).
    * ---------------------------------------------------------------- */
   ncclWindow_t staging_window = nullptr;
   {

@@ -292,28 +292,6 @@ struct WindowCache {
    for the ncclDevComm by-value member). */
 
 /* ======================================================================
- * Per-comm transpose buffer pool (used by reshard_transpose.cc)
- *
- * One entry per ncclComm_t.  The buffer is reused across sequential
- * collective calls on the same comm.  When a different stream reuses
- * the buffer, a cudaStreamWaitEvent serializes access.  High-water-
- * mark growth retires the old buffer (freed at finalization) and
- * allocates a new larger one — no cudaDeviceSynchronize on any path.
- * ====================================================================*/
-
-struct TransposeBufferEntry {
-  ncclComm_t comm;
-  void* buffer;
-  size_t capacity;
-  cudaStream_t stream; /* last stream that used this buffer */
-  cudaEvent_t event; /* recorded after UNPACK; used for cross-stream sync */
-  bool eventRecorded;
-  bool reserved;
-  bool poisoned;
-  bool allocated;
-};
-
-/* ======================================================================
  * Per-comm staging buffer pool (used by reshard_cache.cc)
  * ====================================================================*/
 

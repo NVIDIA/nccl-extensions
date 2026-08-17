@@ -202,7 +202,7 @@ NCCL_M2N_API ncclResult_t ncclM2nInit(ncclM2nHandle_t* handle, const ncclM2nConf
  * receive a NULL handle.  Repeated NULL finalization is allowed.  A non-NULL
  * handle must not be reused after this call returns; finalizing an unknown or
  * already-finalized non-NULL handle returns ncclInvalidArgument.  Internal
- * process-global caches and temporary transpose buffers are released when the
+ * process-global caches and temporary PACKWINDOW staging buffers are released when the
  * last active handle is finalized.  Caller-owned comms, windows, streams, and
  * buffers are not destroyed.  Reshard calls enqueue asynchronous CUDA work;
  * this function does not synchronize caller streams.  Before finalizing a
@@ -332,6 +332,9 @@ NCCL_M2N_API ncclResult_t ncclM2nGroupAbort(void);
  * not participate on a given side passes a fully-formed descriptor
  * with `dataPtr = NULL` on that side, while still providing shape
  * metadata for that side so all ranks validate the same plan.
+ * For communicators larger than one rank, the source and destination mesh
+ * rank intervals must be disjoint. A one-rank self-copy is retained for local
+ * API-contract testing.
  *
  * @param[in] handle  NCCL M2N handle returned by ncclM2nInit, or NULL for the
  *                    internal default handle.
@@ -367,6 +370,9 @@ NCCL_M2N_API ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm
  * A communicator created with `ncclConfig_t.blocking = 0` is supported. The
  * library waits for it before accessing communicator metadata or resources and
  * returns any terminal asynchronous NCCL error.
+ * For communicators larger than one rank, the source and destination mesh
+ * rank intervals must be disjoint. A one-rank self-copy is retained for local
+ * API-contract testing.
  *
  * @param[in] handle  NCCL M2N handle returned by ncclM2nInit, or NULL for the
  *                    internal default handle.

@@ -87,6 +87,26 @@ bool parseBoolEnv(const char* s, bool* out) {
   return false;
 }
 
+bool parseStagingBucketSize(const char* s, const char** endOut, size_t* sizeOut) {
+  if (s == nullptr || endOut == nullptr || sizeOut == nullptr || !isM2nEnvDigit(*s)) return false;
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long long value = strtoull(s, &end, 10);
+  if (errno == ERANGE || end == s || value == 0) return false;
+  size_t multiplier = 1;
+  if (*end == 'k' || *end == 'K') {
+    multiplier = 1024;
+    end++;
+  } else if (*end == 'm' || *end == 'M') {
+    multiplier = 1024 * 1024;
+    end++;
+  }
+  if (value > std::numeric_limits<size_t>::max() / multiplier) return false;
+  *sizeOut = static_cast<size_t>(value) * multiplier;
+  *endOut = skipM2nEnvSpaces(end);
+  return true;
+}
+
 } // namespace
 
 void applyReshardConfig(const ncclM2nConfig_t* config) {
@@ -123,8 +143,10 @@ void resetReshardRuntimeConfig() {
   gReshardGinContextCount = DEFAULT_GIN_CONTEXT_COUNT;
   gReshardUseInternalStreams = true;
   gReshardChunkSizeBytes = 0;
-  gReshardStagingWatermarkBytes = 256ULL * 1024ULL * 1024ULL;
-  gReshardStagingBucketCount = 0;
+  for (int i = 0; i < kMaxStagingBuckets; i++) gReshardStagingBuckets[i] = {};
+  gReshardStagingBuckets[0] = {kDefaultStagingBucketBytes, kDefaultStagingBucketSlots};
+  gReshardStagingBucketCount = 1;
+  gReshardStagingBucketsImplicitDefault = true;
 }
 
 ncclResult_t validateReshardConfigHeader(const ncclM2nConfig_t* config) {
@@ -223,10 +245,6 @@ void applyReshardEnv() {
     gReshardChunkSizeBytes = sizeValue;
   }
 
-  if (parseM2nEnvSize(getenv("NCCL_RESHARD_STAGING_WATERMARK_BYTES"), &sizeValue, false)) {
-    gReshardStagingWatermarkBytes = sizeValue;
-  }
-
   bool useInternalStreams;
   if (parseBoolEnv(getenv("NCCL_RESHARD_USE_INTERNAL_STREAMS"), &useInternalStreams)) {
     gReshardUseInternalStreams = useInternalStreams;
@@ -259,17 +277,22 @@ void applyReshardEnv() {
     gReshardAutoUniformBcastSet = true;
   }
 
-  /* Optional bucketed staging pool: "size:slots,size:slots,..." (size in bytes).
-   * Unset/empty/malformed -> count stays 0 -> per-comm staging (unchanged).
-   * Parsed buckets are kept ascending by size so best-fit is a forward scan. */
-  const char* buckets = getenv("NCCL_RESHARD_STAGING_BUCKETS");
-  if (buckets != nullptr && buckets[0] != '\0') {
-    gReshardStagingBucketCount = 0;
-    bool valid = true;
+  /* "size[:slots],size[:slots],..."; bare sizes use one slot and sizes accept
+   * bytes or binary K/M suffixes. Invalid explicit profiles retain the
+   * built-in default so PACKWINDOW always has a bounded staging pool. */
+  const char* buckets = getenv("NCCL_RESHARD_PACK_BUFFSIZES");
+  if (buckets == nullptr) {
+    RESHARD_INFO(-1, "staging-bucket pool enabled: %d buckets, %d total slots (implicit default)",
+                 gReshardStagingBucketCount, reshardStagingTotalSlots());
+  } else {
+    const char* value = skipM2nEnvSpaces(buckets);
+    ReshardStagingBucketCfg parsed[kMaxStagingBuckets] = {};
+    int parsedCount = 0;
+    bool valid = *value != '\0';
     int totalSlots = 0;
-    const char* p = buckets;
-    while (*p != '\0') {
-      if (gReshardStagingBucketCount >= kMaxStagingBuckets) {
+    const char* p = value;
+    while (valid && *p != '\0') {
+      if (parsedCount >= kMaxStagingBuckets) {
         valid = false;
         break;
       }
@@ -278,30 +301,37 @@ void applyReshardEnv() {
         valid = false;
         break;
       }
-      char* end = nullptr;
-      errno = 0;
-      unsigned long long sz = strtoull(p, &end, 10);
-      if (errno == ERANGE || end == p || *end != ':' || sz > std::numeric_limits<size_t>::max()) {
+      size_t size = 0;
+      const char* sizeEnd = nullptr;
+      if (!parseStagingBucketSize(p, &sizeEnd, &size)) {
         valid = false;
         break;
       }
-      p = skipM2nEnvSpaces(end + 1);
-      if (!isM2nEnvDigit(*p)) {
-        valid = false;
-        break;
+      long slots = 1;
+      const char* itemEnd = sizeEnd;
+      if (*sizeEnd == ':') {
+        p = skipM2nEnvSpaces(sizeEnd + 1);
+        if (!isM2nEnvDigit(*p)) {
+          valid = false;
+          break;
+        }
+        char* slotsEnd = nullptr;
+        errno = 0;
+        slots = strtol(p, &slotsEnd, 10);
+        if (errno == ERANGE || slotsEnd == p) {
+          valid = false;
+          break;
+        }
+        itemEnd = skipM2nEnvSpaces(slotsEnd);
       }
-      errno = 0;
-      long slots = strtol(p, &end, 10);
-      if (errno == ERANGE || end == p || sz == 0 || slots <= 0 || slots > MAX_SPLIT_CONCURRENCY ||
+      if (slots <= 0 || slots > MAX_SPLIT_CONCURRENCY ||
           totalSlots > MAX_SPLIT_CONCURRENCY - slots) {
         valid = false;
         break;
       }
-      gReshardStagingBuckets[gReshardStagingBucketCount].size = static_cast<size_t>(sz);
-      gReshardStagingBuckets[gReshardStagingBucketCount].numSlots = static_cast<int>(slots);
-      gReshardStagingBucketCount++;
+      parsed[parsedCount++] = {size, static_cast<int>(slots)};
       totalSlots += static_cast<int>(slots);
-      p = end;
+      p = itemEnd;
       if (*p == ',') {
         p++;
         if (*p == '\0') valid = false;
@@ -310,29 +340,39 @@ void applyReshardEnv() {
         break;
       }
     }
-    if (!valid) gReshardStagingBucketCount = 0;
-    for (int i = 1; i < gReshardStagingBucketCount; i++) {
-      ReshardStagingBucketCfg key = gReshardStagingBuckets[i];
+    for (int i = 1; i < parsedCount; i++) {
+      ReshardStagingBucketCfg key = parsed[i];
       int j = i - 1;
-      while (j >= 0 && gReshardStagingBuckets[j].size > key.size) {
-        gReshardStagingBuckets[j + 1] = gReshardStagingBuckets[j];
+      while (j >= 0 && parsed[j].size > key.size) {
+        parsed[j + 1] = parsed[j];
         j--;
       }
-      gReshardStagingBuckets[j + 1] = key;
+      parsed[j + 1] = key;
     }
-    for (int i = 1; i < gReshardStagingBucketCount; i++) {
-      if (gReshardStagingBuckets[i - 1].size == gReshardStagingBuckets[i].size) {
+    for (int i = 1; i < parsedCount; i++) {
+      if (parsed[i - 1].size == parsed[i].size) {
         valid = false;
-        gReshardStagingBucketCount = 0;
         break;
       }
     }
-    if (valid && gReshardStagingBucketCount > 0) {
+    /* Every PACKWINDOW request reserves at least 2 KiB. A profile below that
+     * ceiling can never service a call, so reject it at configuration time. */
+    if (parsedCount == 0 || parsed[parsedCount - 1].size < kMinPackWindowStagingBytes) valid = false;
+    if (valid) {
+      for (int i = 0; i < kMaxStagingBuckets; i++) {
+        gReshardStagingBuckets[i] = i < parsedCount ? parsed[i] : ReshardStagingBucketCfg{};
+      }
+      gReshardStagingBucketCount = parsedCount;
+      gReshardStagingBucketsImplicitDefault = false;
       RESHARD_INFO(-1, "staging-bucket pool enabled: %d buckets, %d total slots", gReshardStagingBucketCount,
                    reshardStagingTotalSlots());
     } else {
-      RESHARD_WARN(-1, "NCCL_RESHARD_STAGING_BUCKETS=\"%s\" parsed to 0 buckets; staging-bucket pool disabled",
-                   buckets);
+      for (int i = 0; i < kMaxStagingBuckets; i++) gReshardStagingBuckets[i] = {};
+      gReshardStagingBuckets[0] = {kDefaultStagingBucketBytes, kDefaultStagingBucketSlots};
+      gReshardStagingBucketCount = 1;
+      gReshardStagingBucketsImplicitDefault = true;
+      RESHARD_WARN(-1, "ignoring invalid NCCL_RESHARD_PACK_BUFFSIZES=\"%s\"; using built-in default %zu:%d",
+                   buckets, kDefaultStagingBucketBytes, kDefaultStagingBucketSlots);
     }
   }
 }

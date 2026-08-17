@@ -290,7 +290,9 @@ noted otherwise):
 
 - `comm`, `src`, `dst`, `src->mesh`, `dst->mesh` are non-NULL.
 - Mesh starts are non-negative, dimensions and interval arithmetic are valid,
-  and both half-open mesh intervals fit within `comm`.
+  both half-open mesh intervals fit within `comm`, and the source/destination
+  intervals are disjoint for communicators larger than one rank. A one-rank
+  self-copy is retained for local API-contract tests.
 - `src->ndims == dst->ndims`, both in `1..NCCL_RESHARD_MAX_TENSOR_DIMS`
   (currently 3; 4-D is not supported).
 - `src->dtype == dst->dtype` and is a supported dtype (see list above).
@@ -330,7 +332,7 @@ both meshes, must call the same reshard operation in the same collective order
 and provide both descriptors. The call follows CUDA stream semantics. Issue a
 single reshard at a time per `(comm, effective stream)`. Use separate
 communicators for concurrent transfers; the batched benchmark does this with
-`--num-comms`. When `NCCL_RESHARD_STAGING_BUCKETS` is set, submit reshard calls
+`--num-comms`. PACKWINDOW uses a bounded staging pool; submit reshard calls
 serially on the host within each process, including calls on different
 communicators that may share a physical slot. Ranks in overlapping
 communicators must submit those communicators in one consistent logical order.
@@ -771,8 +773,7 @@ have identical effective values on every rank in the communicator.
 | `NCCL_RESHARD_DST_DOMAIN_SIZE`  | Positive destination domain-size override; invalid values are ignored. |
 | `NCCL_RESHARD_USE_INTERNAL_STREAMS` | Cache one internal stream per observed `(comm, device)` pair until runtime finalization (default `1`); `0` keeps work on caller streams with ordered DevComm reuse. |
 | `NCCL_RESHARD_CHUNK_SIZE`       | Positive RING byte-level chunk size; invalid values are ignored. |
-| `NCCL_RESHARD_STAGING_WATERMARK_BYTES` | Fixed per-communicator staging floor allocated on first use (default 256 MiB). Without buckets, later requests above the first allocation fail. |
-| `NCCL_RESHARD_STAGING_BUCKETS` | Opt-in bounded staging pool as comma-separated `bytes:slots` buckets; total slots must not exceed 64. Communicators reuse slots in stable round-robin waves, so slots bound asynchronous GPU staging lanes rather than communicator count. Host submissions must be serialized per process and overlapping communicators submitted in rank-consistent order. Unset retains per-communicator staging. |
+| `NCCL_RESHARD_PACK_BUFFSIZES` | Bounded PACKWINDOW staging pool as comma-separated `size[:slots]` buckets (default `2147483648:4`). Sizes accept bytes or binary `k`/`m` suffixes; omitted slots default to one. Total slots must not exceed 64. Selected slots allocate lazily and communicators reuse them in stable round-robin waves. Invalid profiles retain the built-in default. |
 | `NCCL_RESHARD_STAGING_NUM_CHANNELS` | Positive staging channel count used by `ncclReshard`. |
 | `NCCL_RESHARD_STAGING_CHANNEL_SIZE` | Positive per-channel staging allocation in bytes. |
 | `NCCL_RESHARD_STAGING_CHUNK_SIZE` | Positive staging transfer chunk size in bytes. |
@@ -797,7 +798,7 @@ have identical effective values on every rank in the communicator.
 │   ├── reshard_mesh.cc                   # Mesh analysis helpers               (host)
 │   ├── reshard_loadbalance.cc            # Replication load balancer           (host)
 │   ├── reshard_prepare.cc                # Kernel-parameter builders           (host)
-│   ├── reshard_transpose.cc              # PACKWINDOW staging-buffer mgmt     (host)
+│   ├── packwindow_staging.cc             # PACKWINDOW staging-buffer pool     (host)
 │   ├── reshard_user_window.cu            # WithWindow alias + PACKWINDOW transport/kernel
 │   ├── reshard_staging.cu                # ncclReshard staging-path entry + dispatch
 │   ├── staging_prepare.cc                # Staging transfer-descriptor builders (host)

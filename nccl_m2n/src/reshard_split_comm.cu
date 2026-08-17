@@ -581,15 +581,6 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
   const int dstStart = dstMesh->startRank;
   const int dstSize = dstMesh->dims[0] * dstMesh->dims[1];
 
-  /* commA orders source ranks before destination-only ranks. The split
-   * parameter translation currently relies on that disjoint layout. */
-  const bool meshesOverlap = srcStart < dstStart + dstSize && dstStart < srcStart + srcSize;
-  if (meshesOverlap) {
-    RESHARD_INFO(parentRank, "split-comm: overlapping source/destination meshes -> fallback to parent DevComm");
-    out->parentComm = comm;
-    return ncclSuccess;
-  }
-
   /* On the first reshard for this parent comm, lazily form or load commB
    * and cache the resulting split geometry. */
   CommBParentEntry* pe = findCommBParent(comm, srcStart, srcSize, dstStart, dstSize);

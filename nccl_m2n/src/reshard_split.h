@@ -107,8 +107,8 @@ struct ReshardSplitComms {
   int rankInA;
   int rankInB;
 
-  /* Slot within commB's DevComm. Bucketed staging uses its rank-stable
-   * bucket index; per-communicator staging uses slot zero. */
+  /* Slot within commB's DevComm, selected by the rank-stable PACKWINDOW
+   * staging-bucket index. */
   int slotIdx;
 
   bool valid; /* internal: entry has been populated */

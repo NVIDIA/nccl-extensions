@@ -172,6 +172,18 @@ static void* callInvalidReshard(void* resultPtr) {
   return nullptr;
 }
 
+TEST(ReshardMeshValidationTest, RequiresDisjointIntervalsForMultiRankCommunicators) {
+  ncclMesh_t src = {{2, 1}, 0};
+  ncclMesh_t overlappingDst = {{2, 1}, 1};
+  ncclMesh_t disjointDst = {{2, 1}, 2};
+
+  EXPECT_EQ(ncclInvalidArgument, validateReshardMeshBounds(&src, &overlappingDst, 4, 0));
+  EXPECT_EQ(ncclSuccess, validateReshardMeshBounds(&src, &disjointDst, 4, 0));
+
+  ncclMesh_t self = {{1, 1}, 0};
+  EXPECT_EQ(ncclSuccess, validateReshardMeshBounds(&self, &self, 1, 0));
+}
+
 TEST(M2nGroupTest, DeeplyNestedGroupDefersSubmissionToOutermostEnd) {
   EXPECT_EQ(ncclSuccess, ncclM2nGroupStart());
   EXPECT_EQ(ncclSuccess, ncclReshard(nullptr, nullptr, nullptr, nullptr, nullptr));

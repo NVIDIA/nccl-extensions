@@ -44,7 +44,7 @@ TEST_HDRS := $(TESTSDIR)/test_helpers.h $(TESTSDIR)/basic_api_test_core.h
 TEST_HELPERS_SRC := $(TESTSDIR)/test_helpers.cu
 TEST_MPI_SRCS    := $(TESTSDIR)/basic_api_test_mpi.cc   $(TEST_HELPERS_SRC)
 TEST_LOCAL_SRCS  := $(TESTSDIR)/basic_api_test_local.cc \
-                    $(TESTSDIR)/staging_slot_reuse_test.cc \
+                    $(TESTSDIR)/packwindow_staging_pool_test.cc \
                     $(TEST_HELPERS_SRC)
 
 .PHONY: all tests basic_api_test_mpi basic_api_test_local gtest gtest-clean clean help

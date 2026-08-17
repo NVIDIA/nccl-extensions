@@ -70,7 +70,7 @@ constexpr int reshardMapCtaToGinContext(int ctaIdx, int numCtas, int ginContextC
 /* Cache capacities. */
 inline constexpr int MAX_WINDOW_CACHE_ENTRIES = 128;
 inline constexpr int MAX_DEVCOMM_CACHE_ENTRIES = 64;
-inline constexpr int MAX_TRANSPOSE_BUFFER_ENTRIES = 16;
+inline constexpr int MAX_PACKWINDOW_STAGING_ENTRIES = 16;
 /* Hard upper bound on staging slots across all configured buckets. */
 inline constexpr int MAX_SPLIT_CONCURRENCY = 64;
 

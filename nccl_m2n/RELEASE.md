@@ -96,21 +96,25 @@ Existing binaries must be rebuilt against the updated header.
   - `ncclReshard` adds internally managed copy/staging transfers alongside the
     caller-provided user-window path.
   - `NCCL_RESHARD_COPY_ALGORITHM` selects the staging copy algorithm. `DIRECT`
-    remains the default; `PACKWINDOW` packs each destination's bytes contiguously
+    and `PACKWINDOW` are supported; `PACKWINDOW` remains the default and packs each destination's bytes contiguously
     with CUDA copy engines, transfers them through the hierarchical user-window
     path, then unpacks them. Other values are rejected rather than silently ignored.
   - Every communicator rank participates and provides both descriptors. Active
     source/destination ranks require non-NULL buffers; inactive sides still
     provide local-shape metadata.
   - Both mesh intervals are checked against the communicator before rank
-    planning, and descriptor/rank/count arithmetic rejects overflow.
+    planning. Multi-rank source/destination intervals must be disjoint; the
+    one-rank self-copy remains available to local API-contract tests.
+    Descriptor/rank/count arithmetic rejects overflow.
   - Staging channel count, channel size, and chunk size are environment-tunable
     but must be rank-uniform. The default cached pool is 256 MiB per
     communicator (4 channels times 64 MiB); the configured 1 MiB chunk is kept
     when safe and otherwise reduced uniformly from shared geometry.
-  - `NCCL_RESHARD_STAGING_BUCKETS` enables a bounded best-fit staging-buffer
-    pool, and `NCCL_RESHARD_STAGING_WATERMARK_BYTES` sets the minimum per-comm
-    staging allocation.
+  - PACKWINDOW now always uses a bounded best-fit staging pool. The legacy
+    per-communicator fallback and staging watermark are removed.
+    `NCCL_RESHARD_PACK_BUFFSIZES` configures `size[:slots]` buckets; invalid
+    profiles retain the built-in `2147483648:4` default and slots allocate
+    individually on first assignment.
   - `ncclReshard` supports split communicators on the `PACKWINDOW`, `RING`,
     `NODE_AWARE` path. The library collectively forms a FULL communicator for
     source injection and a RAIL communicator for destination forwarding; the

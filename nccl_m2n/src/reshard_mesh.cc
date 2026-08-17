@@ -64,6 +64,15 @@ ncclResult_t validateReshardMeshBounds(const ncclMesh_t* srcMesh, const ncclMesh
   NCCL_M2N_CHECK_ARG(dstInterval.endRank <= commSize, logRank,
                      "reshard: dst mesh interval [%d, %d) exceeds communicator size %d", dstInterval.startRank,
                      dstInterval.endRank, commSize);
+  /* Preserve the one-rank self-copy used by local API-contract tests. Real
+   * cross-group resharding requires a multi-rank communicator and disjoint
+   * source/destination rank intervals. */
+  NCCL_M2N_CHECK_ARG(commSize == 1 || srcInterval.endRank <= dstInterval.startRank ||
+                       dstInterval.endRank <= srcInterval.startRank,
+                     logRank,
+                     "reshard: source and destination mesh intervals must be disjoint "
+                     "(src=[%d,%d), dst=[%d,%d))",
+                     srcInterval.startRank, srcInterval.endRank, dstInterval.startRank, dstInterval.endRank);
   return ncclSuccess;
 }
 

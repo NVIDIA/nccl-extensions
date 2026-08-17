@@ -175,10 +175,10 @@ static ncclResult_t destroyExplicitHandle(ncclM2nHandle_t handle) {
 }
 
 ncclM2nRuntime::~ncclM2nRuntime() {
-  transposeBufferSynchronize();
+  packWindowStagingSynchronize();
   cacheFinalize();
   reshardSplitCommFinalize();
-  transposeBufferFinalize();
+  packWindowStagingFinalize();
   resetReshardRuntimeConfig();
 }
 

@@ -179,30 +179,30 @@ inline bool gReshardUseInternalStreams = true;
  * "use the compile-time default". */
 inline size_t gReshardChunkSizeBytes = 0;
 
-/* Minimum per-communicator staging allocation. Parsed once from
- * NCCL_RESHARD_STAGING_WATERMARK_BYTES at first init. */
-inline size_t gReshardStagingWatermarkBytes = 256ULL * 1024ULL * 1024ULL;
-
 /* Enables the split-comm (commA FULL + commB RAIL) RING path for QP
  * scalability. Takes effect for PACKWINDOW RING + NODE_AWARE. Parsed once from
  * NCCL_RESHARD_SPLIT_COMM at first init. Default on for that path. */
 inline bool gReshardSplitComm = true;
 
-/* Optional bucketed staging-buffer pool (env NCCL_RESHARD_STAGING_BUCKETS =
- * "size:slots,size:slots,..."; size in bytes). When set, it replaces the
- * per-comm staging buffer with fixed best-fit buckets. Communicators reuse the
- * physical slots in stable round-robin waves; slots bound staging memory and
- * asynchronous lanes rather than communicator identities. Unset keeps the
- * per-comm path. */
+/* Bounded PACKWINDOW staging pool (env NCCL_RESHARD_PACK_BUFFSIZES =
+ * "size[:slots],size[:slots],..."; sizes accept bytes or binary K/M suffixes,
+ * and omitted slots default to one). The built-in profile is one 2-GiB bucket
+ * with four slots, allocated lazily as selected. Explicit profiles replace the
+ * default. Communicators reuse physical slots in stable round-robin waves. */
 struct ReshardStagingBucketCfg {
   size_t size;
   int numSlots;
 };
 inline constexpr int kMaxStagingBuckets = 8;
-inline ReshardStagingBucketCfg gReshardStagingBuckets[kMaxStagingBuckets] = {};
-inline int gReshardStagingBucketCount = 0;
-inline bool reshardStagingBucketsEnabled() {
-  return gReshardStagingBucketCount > 0;
+inline constexpr size_t kMinPackWindowStagingBytes = 2048;
+inline constexpr size_t kDefaultStagingBucketBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+inline constexpr int kDefaultStagingBucketSlots = 4;
+inline ReshardStagingBucketCfg gReshardStagingBuckets[kMaxStagingBuckets] = {
+  {kDefaultStagingBucketBytes, kDefaultStagingBucketSlots}};
+inline int gReshardStagingBucketCount = 1;
+inline bool gReshardStagingBucketsImplicitDefault = true;
+inline bool reshardStagingBucketsUseImplicitDefault() {
+  return gReshardStagingBucketsImplicitDefault;
 }
 inline int reshardStagingTotalSlots() {
   int total = 0;
@@ -210,7 +210,7 @@ inline int reshardStagingTotalSlots() {
   return total;
 }
 inline int reshardGetSplitSlotCount() {
-  return reshardStagingBucketsEnabled() ? gReshardStagingBucketCount : 1;
+  return gReshardStagingBucketCount;
 }
 
 /* When true AND a dst replica spans >1 NVL domain (domainsPerRep > 1,
@@ -508,9 +508,9 @@ ncclResult_t computeReshardMeshInterval(const ncclMesh_t* mesh, int logRank, Res
 ncclResult_t computeStridesChecked(const size_t dims[], int ndims, size_t strides[]);
 void computeStrides(const size_t dims[], int ndims, size_t strides[]);
 
-/* Validate that both meshes have positive dimensions before any mesh-group
- * math divides by them.  Host-only; returns ncclInvalidArgument on a null
- * mesh or a non-positive dim. */
+/* Validate host-side mesh arithmetic before normalization or group planning.
+ * Communicator-aware bounds validation also enforces the disjoint-mesh
+ * contract for multi-rank resharding. */
 ncclResult_t validateReshardMeshDims(const ncclMesh_t* srcMesh, const ncclMesh_t* dstMesh);
 ncclResult_t validateReshardMeshBounds(const ncclMesh_t* srcMesh, const ncclMesh_t* dstMesh, int commSize,
                                       int logRank);
@@ -684,23 +684,22 @@ ncclResult_t validateReshardPlanLimits(int worldRank, const ncclDistTensor_t* sr
                                        size_t elementsPerChunk, ReshardAlgorithm algo, int dstGpusPerDomain);
 
 /* ======================================================================
- * reshard_transpose.cc — PACKWINDOW staging-buffer pool
+ * packwindow_staging.cc — PACKWINDOW staging-buffer pool
  * ====================================================================*/
 
-ncclResult_t ensureTransposeBuffer(ncclComm_t comm, size_t requiredBytes, cudaStream_t stream);
-void* getTransposeBuffer(ncclComm_t comm);
-size_t getTransposeBufferCapacity(ncclComm_t comm);
-/* Rank-stable staging bucket index for a communicator, or -1 when the
- * bucketed pool is disabled. Derived from the configured bucket set, not from
- * the physical slot assignment, so every rank of a communicator agrees. */
+ncclResult_t ensurePackWindowStagingBuffer(ncclComm_t comm, size_t requiredBytes, cudaStream_t stream);
+void* getPackWindowStagingBuffer(ncclComm_t comm);
+size_t getPackWindowStagingCapacity(ncclComm_t comm);
+/* Rank-stable staging bucket index for the calling thread's in-flight reshard. */
 int getStagingBucketIndex(ncclComm_t comm);
 ncclResult_t getPackWindowRmaWarmed(ncclComm_t comm, bool* warmed);
 ncclResult_t setPackWindowRmaWarmed(ncclComm_t comm, bool warmed);
-void transposeBufferSynchronize();
-void transposeBufferFinalize();
-ncclResult_t transposeBufferRecordEvent(ncclComm_t comm, cudaStream_t stream);
+void packWindowStagingSynchronize();
+void packWindowStagingFinalize();
+ncclResult_t packWindowStagingRecordEvent(ncclComm_t comm, cudaStream_t stream);
 #ifdef NCCL_M2N_TESTING
 ncclResult_t reshardTestBroadcastMaxInt(ncclComm_t comm, cudaStream_t stream, int localValue, int* out);
+int packWindowStagingAllocationCountForTest();
 #endif
 
 /* ======================================================================

@@ -180,7 +180,7 @@ set(NCCL_M2N_HOST_SRC
     src/reshard_mesh.cc
     src/reshard_prepare.cc
     src/reshard_split_prepare.cc
-    src/reshard_transpose.cc
+    src/packwindow_staging.cc
     src/staging_buffer.cc
     src/staging_profile.cc
     src/staging_prepare.cc

@@ -99,7 +99,7 @@ find_package(MPI)
 # ─── basic_api_test_local (no MPI) ────────────────────────────────────────────
 add_executable(basic_api_test_local
     basic_api_test_local.cc
-    staging_slot_reuse_test.cc
+    packwindow_staging_pool_test.cc
     test_helpers.cu
     ${SRCS}
 )

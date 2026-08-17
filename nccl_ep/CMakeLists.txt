@@ -138,6 +138,7 @@ set(NCCL_EP_JIT_HEADERS
     device/macros.cuh
     device/ll_ep.cuh
     device/ll_ep_adapter.cuh
+    device/ll_ep_smem.cuh
 )
 
 file(MAKE_DIRECTORY "${NCCL_EP_JIT_SOURCE_DIR}")

@@ -7,15 +7,67 @@
 #pragma once
 
 #include "nccl_ep.h"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include "nccl_device.h"
 #include "ep_enums.h"
 #include "common.hpp"
+#include "ll_ep_smem.cuh"
 
 namespace nccl_ep {
 namespace ll {
+
+// LL combine uses dynamic shared memory for independent send and receive
+// phases. Keep this host-side accounting next to the launch parameters so it
+// can be checked before configuring a JIT kernel.
+struct combine_smem_config_t {
+    int num_warps_per_group;
+    int num_warps;
+    int num_recv_groups;
+    int dynamic_smem_bytes;
+    bool feasible;
+};
+
+inline int ll_combine_dynamic_smem_bytes(
+    int hidden,
+    ncclDataType_t token_dtype,
+    ncclEpCombQuant_t quantization_recipe,
+    int num_warps,
+    int* num_recv_groups) {
+    const int elem_bytes = token_dtype == ncclFloat32 ? 4 : 2;
+    const bool nvfp4 = quantization_recipe == NCCL_EP_COMB_QUANT_NVFP4;
+    const int decode_warps = combine_smem::recv_decode_warps(hidden, elem_bytes);
+    const int recv_groups = std::min(combine_smem::max_recv_groups(elem_bytes), num_warps / (decode_warps + 1));
+    if (num_recv_groups != nullptr) *num_recv_groups = recv_groups;
+    return combine_smem::dynamic_smem_bytes(hidden, elem_bytes, num_warps, recv_groups, nvfp4);
+}
+
+// Keep the requested mapping from warp groups to experts, reducing only the
+// per-group parallelism. This preserves correctness while trading throughput
+// to fit the device's opt-in dynamic shared-memory limit.
+inline combine_smem_config_t choose_combine_smem_config(
+    int hidden,
+    ncclDataType_t token_dtype,
+    ncclEpCombQuant_t quantization_recipe,
+    int num_warp_groups,
+    int requested_warps_per_group,
+    int max_dynamic_smem) {
+    combine_smem_config_t result{0, 0, 0, 0, false};
+    if (hidden <= 0 || num_warp_groups <= 0 || requested_warps_per_group < 2 || max_dynamic_smem <= 0) return result;
+
+    for (int warps_per_group = requested_warps_per_group; warps_per_group >= 2; --warps_per_group) {
+        const int num_warps = num_warp_groups * warps_per_group;
+        if (num_warps > 32) continue;
+        int num_recv_groups = 0;
+        const int smem =
+            ll_combine_dynamic_smem_bytes(hidden, token_dtype, quantization_recipe, num_warps, &num_recv_groups);
+        if (num_recv_groups == 0 || smem > max_dynamic_smem) continue;
+        return combine_smem_config_t{warps_per_group, num_warps, num_recv_groups, smem, true};
+    }
+    return result;
+}
 
 // ============================================================================
 // Packed kernel parameter structs.
@@ -274,6 +326,8 @@ struct CombineParams {
     void* workspace;
     int numDeviceSms;
     unsigned int deviceSm;
+    int maxDynamicSmem;
+    int* resolvedWarpsPerGroup = nullptr; // Host-only test/diagnostic output
     int* rankMask = nullptr;
     int* asyncErrorFlag = nullptr;
     uint64_t timeoutCycles = NUM_TIMEOUT_CYCLES;

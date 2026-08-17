@@ -35,3 +35,12 @@ ncclResult_t ncclEpHandle_test_getNumRecvTokens(ncclEpHandle_t handle, unsigned 
 // Clear the handle's cached topk_idx pointer so the next ncclEpDispatch runs in
 // scatter (backward, no-routing) mode.  HT only.
 void ncclEpHandle_test_clearTopkIdx(ncclEpHandle_t handle);
+
+// Override the cached dynamic shared-memory limit for an internally-created
+// test group. This is test-only and lets unit tests exercise launch fitting on
+// devices whose physical limit is larger than the target budget.
+ncclResult_t ncclEpGroup_test_setMaxDynamicSmem(ncclEpGroup_t group, int max_dynamic_smem);
+
+// Returns the last LL combine launch's resolved warps-per-group, or zero when
+// that group has not launched LL combine.
+int ncclEpGroup_test_getLastLlCombineWarpsPerGroup(ncclEpGroup_t group);

@@ -743,14 +743,6 @@ size_t get_em_scan_gscratch_size(int lsa_team_size, int experts_per_rank, int nu
     return static_cast<size_t>(num_sms) * lsa_team_size * experts_per_rank * sizeof(int32_t);
 }
 
-int get_device_max_dynamic_smem() {
-    int device = 0;
-    int max_smem = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    CUDA_CHECK(cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-    return max_smem;
-}
-
 static int env_or_default(const ncclEpEnvVar* var, int default_value) {
     if (var == nullptr || !var->is_set) return default_value;
     return var->value.ul <= static_cast<unsigned long>(INT_MAX) ? static_cast<int>(var->value.ul) : 0;
@@ -994,6 +986,7 @@ ncclResult_t dispatch_impl(
     int num_lsa_teams,
     ncclEpPassDir_t pass_direction,
     int num_blocks,
+    int max_dynamic_smem,
     int sf_bytes_per_token,
     const ncclEpEnvConfig* env,
     cudaStream_t stream,
@@ -1089,7 +1082,7 @@ ncclResult_t dispatch_impl(
             return ncclInvalidArgument;
         }
 
-        const int max_smem = get_device_max_dynamic_smem();
+        const int max_smem = max_dynamic_smem;
         // Fit within the SMEM budget. If the requested in_flight_s2g admits no
         // fit (its min-stages floor is too tall), reduce it toward 1 -- lowering
         // in_flight_s2g lowers the required stages/pipeline. in_flight_s2g is
@@ -1194,6 +1187,7 @@ ncclResult_t call_dispatch(
     ncclEpDispQuant_t recipe,
     ncclEpPassDir_t pass_direction,
     int num_blocks,
+    int max_dynamic_smem,
     int sf_bytes_per_token,
     const ncclEpEnvConfig* env,
     cudaStream_t stream,
@@ -1205,7 +1199,7 @@ ncclResult_t call_dispatch(
     }
     return dispatch_impl(
         params, max_dispatch_tokens_per_rank, num_tokens_per_chunk, num_lsa_teams,
-        pass_direction, num_blocks, sf_bytes_per_token, env, stream, kernel_spec);
+        pass_direction, num_blocks, max_dynamic_smem, sf_bytes_per_token, env, stream, kernel_spec);
 }
 
 // ============================================================================
@@ -1304,6 +1298,7 @@ ncclResult_t combine_impl(
     int num_tokens_per_chunk,
     int num_lsa_teams,
     int num_blocks,
+    int max_dynamic_smem,
     const ncclEpEnvConfig* env,
     cudaStream_t stream) {
     // env is a required argument: callers pass &group->env, which is never null.
@@ -1378,7 +1373,7 @@ ncclResult_t combine_impl(
         ::ht_ep::calc_comb_smem_cost<ncclBfloat16>(
             max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model);
 
-    const int max_smem = get_device_max_dynamic_smem();
+    const int max_smem = max_dynamic_smem;
     const combine_smem_fit_t fit = choose_combine_smem_config(
         cost, static_cast<size_t>(max_smem),
         requested_g2s_stages, g2s_from_env,
@@ -1563,6 +1558,7 @@ ncclResult_t call_combine(
     int num_lsa_teams,
     bool backward_combine,
     int num_blocks,
+    int max_dynamic_smem,
     const ncclEpEnvConfig* env,
     cudaStream_t stream) {
     if (backward_combine) {
@@ -1572,6 +1568,7 @@ ncclResult_t call_combine(
             num_tokens_per_chunk,
             num_lsa_teams,
             num_blocks,
+            max_dynamic_smem,
             env,
             stream);
     }
@@ -1581,6 +1578,7 @@ ncclResult_t call_combine(
         num_tokens_per_chunk,
         num_lsa_teams,
         num_blocks,
+        max_dynamic_smem,
         env,
         stream);
 }

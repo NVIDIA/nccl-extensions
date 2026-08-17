@@ -13,6 +13,7 @@
 #include "quantization_recipe.hpp"
 
 #include <algorithm>
+#include <cstdio>
 
 namespace nccl_ep {
 namespace ll {
@@ -125,40 +126,73 @@ ncclResult_t call_dispatch(
 // and hands off to launch_ll_combine() for JIT compile + launch.
 // ============================================================================
 ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
+    if (params.numDeviceSms <= 0 || params.numExperts <= 0 || params.numCombinedTokens < 0) {
+        std::fprintf(
+            stderr,
+            "[nccl_ep] LL combine requires positive device SMs and experts, and non-negative combined tokens: "
+            "device_sms=%d, experts=%d, combined_tokens=%d.\n",
+            params.numDeviceSms, params.numExperts, params.numCombinedTokens);
+        return ncclInvalidArgument;
+    }
     const int numWarpGroups = ceil_div(params.numExperts, params.numDeviceSms);
-    const int numWarpsPerGroup = 32 / numWarpGroups;
+    const int requestedWarpsPerGroup = 32 / numWarpGroups;
     const int numRecvPerSm = ceil_div(params.numCombinedTokens, params.numDeviceSms);
-    EP_HOST_ASSERT(numWarpGroups > 0 and numWarpsPerGroup > 0 and numRecvPerSm >= 0);
+    if (numWarpGroups <= 0 || requestedWarpsPerGroup <= 0 || numRecvPerSm < 0) {
+        std::fprintf(
+            stderr,
+            "[nccl_ep] LL combine produced an invalid launch configuration: warp_groups=%d, "
+            "requested_warps_per_group=%d, recv_per_sm=%d.\n",
+            numWarpGroups, requestedWarpsPerGroup, numRecvPerSm);
+        return ncclInvalidArgument;
+    }
 
-    const int numWarps = numWarpGroups * numWarpsPerGroup;
+    const combine_smem_config_t smem_config = choose_combine_smem_config(
+        params.hidden,
+        params.tokenDtype,
+        params.quantizationRecipe,
+        numWarpGroups,
+        requestedWarpsPerGroup,
+        params.maxDynamicSmem);
+    if (!smem_config.feasible) {
+        std::fprintf(
+            stderr,
+            "[nccl_ep] LL combine shared memory cannot fit: hidden=%d, dtype=%d, warp_groups=%d, "
+            "requested_warps_per_group=%d, limit=%d bytes.\n",
+            params.hidden, static_cast<int>(params.tokenDtype), numWarpGroups, requestedWarpsPerGroup,
+            params.maxDynamicSmem);
+        return ncclInvalidArgument;
+    }
+    const int numWarpsPerGroup = smem_config.num_warps_per_group;
+    const int numWarps = smem_config.num_warps;
+    if (params.resolvedWarpsPerGroup != nullptr) *params.resolvedWarpsPerGroup = numWarpsPerGroup;
     const int numSms = std::max(
         ceil_div(params.numExperts, numWarpGroups),
         numRecvPerSm == 0 ? 1 : ceil_div(params.numCombinedTokens, numRecvPerSm));
 
-    auto atomicCleanFlag = static_cast<int*>(params.workspace);
-    EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
-    EP_HOST_ASSERT(params.numTopk <= jit::kLlCombineMaxTopk);
-    EP_HOST_ASSERT(not(params.zeroCopy and params.useLogFmt));
+    if (NUM_WORKSPACE_BYTES < sizeof(int) || params.workspace == nullptr) {
+        std::fprintf(
+            stderr,
+            "[nccl_ep] LL combine requires at least %zu workspace bytes for its atomic flag; available=%d, "
+            "workspace=%p.\n",
+            sizeof(int), NUM_WORKSPACE_BYTES, params.workspace);
+        return ncclInvalidArgument;
+    }
+    if (params.numTopk < 0 || params.numTopk > jit::kLlCombineMaxTopk) {
+        std::fprintf(
+            stderr,
+            "[nccl_ep] LL combine top-k is unsupported: num_topk=%d, maximum=%d.\n",
+            params.numTopk, jit::kLlCombineMaxTopk);
+        return ncclInvalidArgument;
+    }
+    if (params.zeroCopy && params.useLogFmt) {
+        std::fprintf(stderr, "[nccl_ep] LL combine does not support zero-copy with LogFMT.\n");
+        return ncclInvalidArgument;
+    }
 
-    // Per-block SMEM = max(send-side TMA staging, recv-side TMA staging).
-    // Send side: numWarps × kNumStages TMA buffers + per-warp LogFMT metadata.
-    // Recv side: kMaxNumGroups × (kNumStages TMA buffers + decoded output +
-    //            kNumStages × LogFMT decode metadata).
-    constexpr int kNumStages = 3;
-    // Must mirror the kernel's group count exactly (see combine_kernel_impl
-    // kMaxNumGroups): FP32 doubles per-stage token bytes, so it runs 1 group to
-    // stay within the device dynamic-SMEM cap; BF16/FP16 run 2. Computing 2 for
-    // FP32 would over-request SMEM and fail the func attribute at large hidden.
-    const int elemBytes = (params.tokenDtype == ncclFloat32) ? 4 : 2;
-    const int kMaxNumGroups = (elemBytes == 2) ? 2 : 1;
+    auto atomicCleanFlag = static_cast<int*>(params.workspace);
+
     const int hidden = params.hidden;
-    const int numMetaBytes = hidden / 128 * 4;
-    const int numSendTmaBytes = 32 * static_cast<int>(sizeof(int4)) * jit::kLlCombineMaxUnrolls + 16;
-    const int smemSendSize = numWarps * (kNumStages * numSendTmaBytes + numMetaBytes);
-    const int numRecvTmaBytes = 16 + hidden * elemBytes;
-    const int smemRecvSize =
-        kMaxNumGroups * (kNumStages * numRecvTmaBytes + hidden * elemBytes + kNumStages * numMetaBytes * 3);
-    const int smem_size = std::max(smemSendSize, smemRecvSize);
+    const int smem_size = smem_config.dynamic_smem_bytes;
 
     combine_kernel_args_t args{};
     args.inData = params.inData;

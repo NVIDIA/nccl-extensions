@@ -73,7 +73,8 @@ NCCL_EP_JIT_HEADERS := \
     device/scan_kernel.cuh \
     device/macros.cuh \
     device/ll_ep.cuh \
-    device/ll_ep_adapter.cuh
+    device/ll_ep_adapter.cuh \
+    device/ll_ep_smem.cuh
 NCCL_EP_JIT_STAGED_HEADERS := include/common.hpp include/ep_enums.h
 NCCL_EP_JIT_STAGED_TARGETS := $(NCCL_EP_JIT_STAGED_HEADERS:include/%=$(JIT_DIR)/%)
 NCCL_EP_JIT_HEADER_TARGETS := $(NCCL_EP_JIT_HEADERS:%=$(JIT_DIR)/%) $(NCCL_EP_JIT_STAGED_TARGETS)

@@ -18,6 +18,77 @@
 
 #include "test_common.h"
 #include "../nccl_ep_test_internal.h"
+#include "../device/ll_ep_adapter.cuh"
+
+TEST(LlCombineSmem, PreservesRequestedParallelismWhenItFits) {
+    const auto config = nccl_ep::ll::choose_combine_smem_config(
+        /*hidden=*/4096,
+        ncclBfloat16,
+        NCCL_EP_COMB_QUANT_NONE,
+        /*num_warp_groups=*/1,
+        /*requested_warps_per_group=*/32,
+        /*max_dynamic_smem=*/1024 * 1024);
+    ASSERT_TRUE(config.feasible);
+    EXPECT_EQ(config.num_warps_per_group, 32);
+    EXPECT_EQ(config.num_warps, 32);
+}
+
+TEST(LlCombineSmem, ReducesParallelismToFitSharedMemory) {
+    const auto config = nccl_ep::ll::choose_combine_smem_config(
+        /*hidden=*/7168,
+        ncclBfloat16,
+        NCCL_EP_COMB_QUANT_NONE,
+        /*num_warp_groups=*/1,
+        /*requested_warps_per_group=*/32,
+        /*max_dynamic_smem=*/100000);
+    ASSERT_TRUE(config.feasible);
+    EXPECT_LT(config.num_warps_per_group, 32);
+    EXPECT_EQ(config.num_recv_groups, 1);
+    EXPECT_LE(config.dynamic_smem_bytes, 100000);
+}
+
+TEST(LlCombineSmem, AcceptsExactSharedMemoryBoundary) {
+    int recv_groups = 0;
+    const int exact_limit = nccl_ep::ll::ll_combine_dynamic_smem_bytes(
+        /*hidden=*/4096, ncclBfloat16, NCCL_EP_COMB_QUANT_NONE, /*num_warps=*/32, &recv_groups);
+    const auto config = nccl_ep::ll::choose_combine_smem_config(
+        /*hidden=*/4096,
+        ncclBfloat16,
+        NCCL_EP_COMB_QUANT_NONE,
+        /*num_warp_groups=*/1,
+        /*requested_warps_per_group=*/32,
+        exact_limit);
+    ASSERT_TRUE(config.feasible);
+    EXPECT_EQ(config.num_warps_per_group, 32);
+    EXPECT_EQ(config.dynamic_smem_bytes, exact_limit);
+}
+
+TEST(LlCombineSmem, RejectsConfigurationsBelowMinimumFootprint) {
+    const auto config = nccl_ep::ll::choose_combine_smem_config(
+        /*hidden=*/7168,
+        ncclBfloat16,
+        NCCL_EP_COMB_QUANT_NONE,
+        /*num_warp_groups=*/1,
+        /*requested_warps_per_group=*/32,
+        /*max_dynamic_smem=*/50000);
+    EXPECT_FALSE(config.feasible);
+}
+
+TEST(LlCombineSmem, Nvfp4ReceiveBufferMatchesDevicePacketLayout) {
+    constexpr int kHidden = 7168;
+    constexpr int kPacketBytes =
+        kHidden / nccl_ep::ll::combine_smem::kNvfp4ElementsPerPackedByte +
+        kHidden / nccl_ep::ll::combine_smem::kNvfp4ElementsPerScale +
+        nccl_ep::ll::combine_smem::kNvfp4GlobalScaleBytes;
+    constexpr int kAlignedPacketBytes =
+        (kPacketBytes + sizeof(int4) - 1) / sizeof(int4) * sizeof(int4);
+
+    EXPECT_EQ(nccl_ep::ll::combine_smem::nvfp4_slot_bytes(kHidden), kAlignedPacketBytes);
+    EXPECT_EQ(
+        nccl_ep::ll::combine_smem::recv_tma_buffer_bytes(
+            kHidden, nccl_ep::ll::combine_smem::kTwoByteElementBytes, /*nvfp4=*/true),
+        nccl_ep::ll::combine_smem::kRecvTmaBarrierBytes + kAlignedPacketBytes);
+}
 
 static float bf16_val(nv_bfloat16 v) {
     return __bfloat162float(v);
@@ -103,6 +174,111 @@ protected:
         return vals;
     }
 };
+
+TEST_F(LifecycleTest, LlCombineFitsMockedSmallSharedMemoryAndPreservesResults) {
+    constexpr int kLargeHidden = 7168;
+    constexpr int kMockDynamicSmem = 100000;
+    const int recv_rows = g_nranks * kNumTokens;
+
+    ncclEpGroupConfig_t group_config = NCCL_EP_GROUP_CONFIG_INIT;
+    group_config.algorithm = NCCL_EP_ALGO_LOW_LATENCY;
+    group_config.num_experts = kNumExperts;
+    group_config.max_dispatch_tokens_per_rank = kNumTokens;
+    group_config.max_recv_tokens_per_rank = recv_rows;
+    group_config.max_token_bytes = kLargeHidden * sizeof(nv_bfloat16);
+    group_config.rdma_buffer_size = NCCL_EP_AUTO;
+    group_config.num_qp_per_rank = kNumExperts / g_nranks;
+    group_config.num_channels = NCCL_EP_AUTO;
+
+    ncclEpGroup_t group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&group, g_comm, &group_config));
+    NCCL_ASSERT(ncclEpGroup_test_setMaxDynamicSmem(group, kMockDynamicSmem));
+
+    nv_bfloat16 *d_tokens = nullptr, *d_recv = nullptr, *d_out = nullptr;
+    float *d_weights = nullptr, *d_recv_weights = nullptr;
+    int *d_recv_topk_idx = nullptr, *d_src_rank_counters = nullptr;
+    ncclEpTensor_t *tokens = nullptr, *recv = nullptr, *out = nullptr, *weights = nullptr;
+    ncclEpTensor_t *recv_weights = nullptr, *recv_topk_idx = nullptr, *src_rank_counters = nullptr;
+    ncclEpHandle_t handle = nullptr;
+
+    std::vector<nv_bfloat16> host_tokens(kNumTokens * kLargeHidden);
+    for (int token = 0; token < kNumTokens; ++token) {
+        const float value = static_cast<float>(g_rank * kNumTokens + token + 1);
+        for (int h = 0; h < kLargeHidden; ++h) host_tokens[token * kLargeHidden + h] = __float2bfloat16(value);
+    }
+    std::vector<float> host_weights(kNumTokens * kTopK, 1.0f);
+
+    CUDA_ASSERT(cudaMalloc(&d_tokens, host_tokens.size() * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_recv, recv_rows * kLargeHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_out, host_tokens.size() * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_weights, host_weights.size() * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_weights, recv_rows * kTopK * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_topk_idx, recv_rows * kTopK * sizeof(int)));
+    CUDA_ASSERT(cudaMalloc(&d_src_rank_counters, g_nranks * sizeof(int)));
+    CUDA_ASSERT(cudaMemcpy(
+        d_tokens, host_tokens.data(), host_tokens.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_weights, host_weights.data(), host_weights.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemset(d_recv, 0, recv_rows * kLargeHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMemset(d_recv_weights, 0, recv_rows * kTopK * sizeof(float)));
+    CUDA_ASSERT(cudaMemset(d_recv_topk_idx, 0xff, recv_rows * kTopK * sizeof(int)));
+    CUDA_ASSERT(cudaMemset(d_src_rank_counters, 0, g_nranks * sizeof(int)));
+
+    NCCL_ASSERT(epTensorCreate(&tokens, 2, ncclBfloat16, d_tokens, kNumTokens, kLargeHidden));
+    NCCL_ASSERT(epTensorCreate(&recv, 3, ncclBfloat16, d_recv, g_nranks, kNumTokens, kLargeHidden));
+    NCCL_ASSERT(epTensorCreate(&out, 2, ncclBfloat16, d_out, kNumTokens, kLargeHidden));
+    NCCL_ASSERT(epTensorCreate(&weights, 2, ncclFloat32, d_weights, kNumTokens, kTopK));
+    NCCL_ASSERT(epTensorCreate(&recv_weights, 3, ncclFloat32, d_recv_weights, g_nranks, kNumTokens, kTopK));
+    NCCL_ASSERT(epTensorCreate(&recv_topk_idx, 3, ncclInt32, d_recv_topk_idx, g_nranks, kNumTokens, kTopK));
+    NCCL_ASSERT(epTensorCreate(&src_rank_counters, 1, ncclInt32, d_src_rank_counters, g_nranks));
+    NCCL_ASSERT(ncclEpCreateHandle(
+        &handle, group, NCCL_EP_LAYOUT_RANK_MAJOR, topk_idx_, nullptr, nullptr, g_stream));
+
+    ncclEpDispatchInputs_t dispatch_inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t dispatch_outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpLayoutInfo_t layout_info = NCCL_EP_LAYOUT_INFO_INIT;
+    dispatch_inputs.tokens = tokens;
+    dispatch_inputs.topk_weights = weights;
+    dispatch_outputs.tokens = recv;
+    dispatch_outputs.topk_weights = recv_weights;
+    dispatch_outputs.topk_idx = recv_topk_idx;
+    layout_info.src_rank_counters = src_rank_counters;
+    NCCL_ASSERT(ncclEpDispatch(handle, &dispatch_inputs, &dispatch_outputs, &layout_info, nullptr, g_stream));
+    NCCL_ASSERT(ncclEpComplete(handle, nullptr, g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+
+    ncclEpCombineInputs_t combine_inputs = NCCL_EP_COMBINE_INPUTS_INIT;
+    ncclEpCombineOutputs_t combine_outputs = NCCL_EP_COMBINE_OUTPUTS_INIT;
+    combine_inputs.tokens = recv;
+    combine_outputs.tokens = out;
+    NCCL_ASSERT(ncclEpCombine(handle, &combine_inputs, &combine_outputs, nullptr, g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+    EXPECT_LT(ncclEpGroup_test_getLastLlCombineWarpsPerGroup(group), 32);
+
+    std::vector<nv_bfloat16> host_out(host_tokens.size());
+    CUDA_ASSERT(cudaMemcpy(
+        host_out.data(), d_out, host_out.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+    for (int token = 0; token < kNumTokens; ++token) {
+        EXPECT_NEAR(
+            bf16_val(host_out[token * kLargeHidden]), static_cast<float>(g_rank * kNumTokens + token + 1), 0.5f);
+    }
+
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
+    ncclEpTensorDestroy(tokens);
+    ncclEpTensorDestroy(recv);
+    ncclEpTensorDestroy(out);
+    ncclEpTensorDestroy(weights);
+    ncclEpTensorDestroy(recv_weights);
+    ncclEpTensorDestroy(recv_topk_idx);
+    ncclEpTensorDestroy(src_rank_counters);
+    cudaFree(d_tokens);
+    cudaFree(d_recv);
+    cudaFree(d_out);
+    cudaFree(d_weights);
+    cudaFree(d_recv_weights);
+    cudaFree(d_recv_topk_idx);
+    cudaFree(d_src_rank_counters);
+}
 
 // ── Test: SeparatedInitUpdate — Init then Update, dispatch+combine ────────────
 // ncclEpCreateHandle bundles Init+Update; this exercises them separately to

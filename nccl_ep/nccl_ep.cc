@@ -752,6 +752,8 @@ struct ncclEpGroup {
     // SM-count configuration, all resolved once at ncclEpCreateGroup.
     unsigned int device_sm;
     unsigned int device_sm_count;   // Number of SMs on the device
+    int max_dynamic_smem;           // Opt-in dynamic shared-memory limit per block
+    int last_ll_combine_warps_per_group; // Test/diagnostic record of the resolved LL launch shape
     unsigned int comm_num_sms;      // Resolved SM count for EP kernels (from config.max_num_sms)
     unsigned int shuffle_sms; // Resolved SM count for the shuffle kernels (local_dup, local_reduce).
     unsigned int
@@ -872,7 +874,8 @@ struct ncclEpGroup {
     ncclEpGroup()
         : comm(nullptr), nRanks(0), rank(0), nNodes(0), ep_workspace(nullptr), cuda_device_id(0), lsa_team_size(0),
           lsa_rank(0), rdma_team_size(0), rdma_rank(0), rdma_buffer(nullptr), rdma_buffer_size_alloc(0), config{},
-          num_local_experts(0), max_recv_tokens(0), device_sm(0), device_sm_count(0), comm_num_sms(0), shuffle_sms(0),
+          num_local_experts(0), max_recv_tokens(0), device_sm(0), device_sm_count(0), max_dynamic_smem(0),
+          last_ll_combine_warps_per_group(0), comm_num_sms(0), shuffle_sms(0),
           preprocess_num_sms(0), ht_em_mode(HtEmMode::kLocalPermute), alloc{}, gpus_per_node(0), rank_in_node(0),
           node_id(0), num_nccl_comms(0), nccl_comms{}, nccl_dev_comms(nullptr), nccl_wins(nullptr),
           num_dispatch_signals(0), clean_barrier_signal_base(0), ht_buffers{}, eager_mode(false) {}
@@ -1703,6 +1706,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, ep_group->cuda_device_id));
     ep_group->device_sm = static_cast<unsigned int>(device_prop.major * 10 + device_prop.minor);
     ep_group->device_sm_count = device_prop.multiProcessorCount;
+    CUDA_CHECK(cudaDeviceGetAttribute(
+        &ep_group->max_dynamic_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, ep_group->cuda_device_id));
 
     // Resolve SM counts for EP kernels (dispatch, combine, preprocessing)
     if (in_config->max_num_sms == NCCL_EP_AUTO) {
@@ -3945,6 +3950,7 @@ ncclResult_t ncclEpDispatch(
                 recipe,
                 pass_direction,
                 static_cast<int>(group->comm_num_sms),
+                group->max_dynamic_smem,
                 sf_bytes_per_token,
                 &group->env,
                 stream,
@@ -4426,6 +4432,8 @@ ncclResult_t ncclEpCombine(
                 params.workspace = handle->group->ep_workspace;
                 params.numDeviceSms = handle->group->comm_num_sms;
                 params.deviceSm = handle->group->device_sm;
+                params.maxDynamicSmem = handle->group->max_dynamic_smem;
+                params.resolvedWarpsPerGroup = &handle->group->last_ll_combine_warps_per_group;
                 params.rankMask = handle->group->mask_buffer;
                 params.asyncErrorFlag = handle->group->async_error_flag;
                 params.timeoutCycles = handle->group->timeout_cycles;
@@ -4808,6 +4816,7 @@ ncclResult_t ncclEpCombine(
                 group->rdma_team_size, // num_lsa_teams (RDMA domain size)
                 backward_combine, // backward mode flag
                 static_cast<int>(group->comm_num_sms),
+                group->max_dynamic_smem,
                 &group->env,
                 stream));
 
@@ -4994,4 +5003,15 @@ ncclResult_t ncclEpHandle_test_getNumRecvTokens(ncclEpHandle_t handle, unsigned 
 
 void ncclEpHandle_test_clearTopkIdx(ncclEpHandle_t handle) {
     handle->topk_idx.data = nullptr;
+}
+
+ncclResult_t ncclEpGroup_test_setMaxDynamicSmem(ncclEpGroup_t group, int max_dynamic_smem) {
+    if (group == nullptr || max_dynamic_smem <= 0) return ncclInvalidArgument;
+    group->max_dynamic_smem = max_dynamic_smem;
+    group->last_ll_combine_warps_per_group = 0;
+    return ncclSuccess;
+}
+
+int ncclEpGroup_test_getLastLlCombineWarpsPerGroup(ncclEpGroup_t group) {
+    return group == nullptr ? 0 : group->last_ll_combine_warps_per_group;
 }

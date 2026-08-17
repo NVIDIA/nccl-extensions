@@ -17,6 +17,7 @@
 #include "nccl_device.h"
 #include "device_primitives.cuh"
 #include "common.hpp"
+#include "ll_ep_smem.cuh"
 
 namespace cg = cooperative_groups;
 
@@ -1538,9 +1539,9 @@ struct CombineRecipeTraits<NCCL_EP_COMB_QUANT_NVFP4> {
     using reduction_t = float;
     using global_scale_t = float;
 
-    static constexpr int kBlockSize = 16;
+    static constexpr int kBlockSize = combine_smem::kNvfp4ElementsPerScale;
     static constexpr int kElementsPerVector = 8;
-    static constexpr int kElementsPerByte = 2;
+    static constexpr int kElementsPerByte = combine_smem::kNvfp4ElementsPerPackedByte;
     static constexpr int kSmemPayloadDivisor = 4;
     static constexpr int kSmemScaleDivisor = 32;
 
@@ -1556,8 +1557,10 @@ struct CombineRecipeTraits<NCCL_EP_COMB_QUANT_NVFP4> {
 
     template <int kHidden>
     static constexpr size_t slot_bytes() {
-        return align(
-            payload_bytes<kHidden>() + scale_bytes<kHidden>() + sizeof(global_scale_t), sizeof(int4));
+        static_assert(
+            sizeof(packed_token_t) == 1 && sizeof(scale_t) == 1 && sizeof(global_scale_t) == combine_smem::kNvfp4GlobalScaleBytes,
+            "NVFP4 slot-size helper assumes one-byte packed payloads and scales and a float global scale");
+        return combine_smem::nvfp4_slot_bytes(kHidden);
     }
 
     static constexpr int smem_payload_bytes(int smemBytes) {
@@ -1865,7 +1868,7 @@ __device__ __forceinline__ void nvfp4_unpack_e2m1(
 #endif
 
 // LogFMT stores one BF16 min/max pair for each 128-element block.
-constexpr int kLogFmtElementsPerMeta = 128;
+constexpr int kLogFmtElementsPerMeta = combine_smem::kLogFmtElementsPerMeta;
 
 template <int kHidden, int kNumUnrolls>
 __device__ __forceinline__ void decodeAndAccumulateNvfp4(
@@ -1943,17 +1946,15 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
     extern __shared__ __align__(1024) uint8_t smemBuffer[];
 
     // Data type staffs
-    constexpr int kNumElemsPerInt4 = sizeof(int4) / kElemBytes;
-    constexpr int kWarpSize = 32;
-    constexpr int kMaxSendUnrolls = 4;
+    constexpr int kNumElemsPerInt4 = combine_smem::elements_per_int4(kElemBytes);
+    constexpr int kWarpSize = combine_smem::kWarpSize;
     constexpr int64_t hiddenBf16Int4 = kHidden / kNumElemsPerInt4;
 
     // Use different unroll factors for send and recv phases
-    constexpr int kNumSendUnrolls =
-        kHidden % (kWarpSize * kMaxSendUnrolls * kNumElemsPerInt4) == 0 ? kMaxSendUnrolls : 2;
-    constexpr int kNumRecvUnrolls = 2;
+    constexpr int kNumSendUnrolls = combine_smem::send_unrolls(kHidden, kElemBytes);
+    constexpr int kNumRecvUnrolls = combine_smem::kNumRecvUnrolls;
     constexpr int hiddenBf16Int4Pad = align(static_cast<int>(hiddenBf16Int4), kWarpSize * kNumSendUnrolls);
-    EP_STATIC_ASSERT(kHidden % (kWarpSize * 2 * kNumElemsPerInt4) == 0, "Invalid hidden");
+    EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumRecvUnrolls * kNumElemsPerInt4) == 0, "Invalid hidden");
     EP_STATIC_ASSERT(kNumSendUnrolls <= kNumMaxUnrolls and kNumRecvUnrolls <= kNumMaxUnrolls, "Invalid unrolls");
     EP_STATIC_ASSERT(hiddenBf16Int4 % kNumSendUnrolls == 0, "Invalid hidden");
     EP_STATIC_ASSERT(kNumSendUnrolls >= kNumRecvUnrolls, "Invalid unroll factors");
@@ -2003,20 +2004,27 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
         const auto localSrcInfo = srcInfo + numRanks + dstRank * maxTokensPerRank * slotsPerToken;
 
         // TMA stuffs
-        constexpr int kNumTMABufferBytes = sizeof(int4) * 32 * kNumSendUnrolls;
-        constexpr int kNumStages = 3;
-        constexpr int kNumPrefetch = 1;
+        constexpr int kNumTMABufferBytes = sizeof(int4) * kWarpSize * kNumSendUnrolls;
+        constexpr int kNumStages = combine_smem::kNumStages;
+        constexpr int kNumPrefetch = combine_smem::kNumTmaPrefetch;
         EP_STATIC_ASSERT(kNumStages == 3 and kNumPrefetch == 1, "Invalid stages");
 
-        auto smemPtr = smemBuffer + warpId * (kNumStages * (kNumTMABufferBytes + 16) + kNumMetaBytes);
+        auto smemPtr = smemBuffer +
+            warpId * (kNumStages * (kNumTMABufferBytes + combine_smem::kTmaBarrierAndPaddingBytes) + kNumMetaBytes);
         uint32_t tmaPhase = 0;
         auto tmaBuffers = PatternVisitor(
-            [=](const int& i) { return reinterpret_cast<int4*>(smemPtr + i * (kNumTMABufferBytes + 16)); });
+            [=](const int& i) {
+                return reinterpret_cast<int4*>(
+                    smemPtr + i * (kNumTMABufferBytes + combine_smem::kTmaBarrierAndPaddingBytes));
+            });
         auto fullBarriers = PatternVisitor([=](const int& i) {
-            return reinterpret_cast<uint64_t*>(smemPtr + i * (kNumTMABufferBytes + 16) + kNumTMABufferBytes);
+            return reinterpret_cast<uint64_t*>(
+                smemPtr + i * (kNumTMABufferBytes + combine_smem::kTmaBarrierAndPaddingBytes) + kNumTMABufferBytes);
         });
         auto metaBuffers =
-            kUseLogFMT ? reinterpret_cast<nv_bfloat162*>(smemPtr + kNumStages * (kNumTMABufferBytes + 16)) : nullptr;
+            kUseLogFMT ? reinterpret_cast<nv_bfloat162*>(
+                              smemPtr + kNumStages * (kNumTMABufferBytes + combine_smem::kTmaBarrierAndPaddingBytes)) :
+                          nullptr;
         EP_STATIC_ASSERT(kNumSendUnrolls * kNumStages <= 12, "TMA buffer size exceed limit");
 
         // Initialize m-barriers
@@ -2236,39 +2244,46 @@ LOW_LATENCY_COMBINE_RECV:
     completeFullLowLatencyEpoch(epochState, phases, smId, threadId);
 
     // Reassign warp groups; FP32 doubles SMEM per group, drop to 1 group to stay within limits
-    constexpr int kMaxNumGroups = (kElemBytes == 2) ? 2 : 1;
-    const int numDecodeWarps = hiddenBf16Int4Pad / (kNumRecvUnrolls * 32);
-    const int numGroups = min(kMaxNumGroups, (numThreads / 32) / (numDecodeWarps + 1));
-    const int decodeWarpIdx = __shfl_sync(0xffffffff, warpId % (numDecodeWarps + 1), 0);
-    const int groupIdx = __shfl_sync(0xffffffff, warpId / (numDecodeWarps + 1), 0);
-    EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
-    EP_DEVICE_ASSERT(numTopk <= 32);
+    constexpr int kMaxNumGroups = combine_smem::max_recv_groups(kElemBytes);
+    const int numDecodeWarps = hiddenBf16Int4Pad / (kNumRecvUnrolls * kWarpSize);
+    const int warpsPerRecvGroup = numDecodeWarps + combine_smem::kNumRecvTmaWarps;
+    const int numGroups = min(kMaxNumGroups, (numThreads / kWarpSize) / warpsPerRecvGroup);
+    const int decodeWarpIdx = __shfl_sync(0xffffffff, warpId % warpsPerRecvGroup, 0);
+    const int groupIdx = __shfl_sync(0xffffffff, warpId / warpsPerRecvGroup, 0);
+    EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumElemsPerInt4) == 0, "Invalid vectorization");
+    EP_DEVICE_ASSERT(numTopk <= kWarpSize);
     EP_DEVICE_ASSERT(numGroups > 0);
 
     if (groupIdx < numGroups) {
-        constexpr int kNumStages = 3;
-        constexpr int kTmaBarrierBytes = 2 * sizeof(uint64_t);
-        constexpr int kTmaPaddingBytes = sizeof(int4);
+        constexpr int kNumStages = combine_smem::kNumStages;
         constexpr int kNumTMABufferBytes = [] {
             if constexpr (kRecipe == NCCL_EP_COMB_QUANT_NVFP4) {
-                return kTmaBarrierBytes + static_cast<int>(Recipe::template slot_bytes<kHidden>());
+                return combine_smem::kRecvTmaBarrierBytes + static_cast<int>(Recipe::template slot_bytes<kHidden>());
             }
-            return kTmaBarrierBytes + kTmaPaddingBytes + kHidden * kElemBytes;
+            return combine_smem::recv_tma_buffer_bytes(kHidden, kElemBytes, /*nvfp4=*/false);
         }();
-        constexpr int kNumBF16PerWarpBytes = 32 * kNumRecvUnrolls * kNumElemsPerInt4 * kElemBytes;
-        constexpr int kNumLogFMTPerWarpBytes = kNumBF16PerWarpBytes / 16 * 10;
+        constexpr int kNumBF16PerWarpBytes = kWarpSize * kNumRecvUnrolls * kNumElemsPerInt4 * kElemBytes;
+        constexpr int kNumLogFMTPerWarpBytes =
+            kNumBF16PerWarpBytes / combine_smem::kLogFmtInputBytesPerChunk * combine_smem::kLogFmtOutputBytesPerChunk;
         constexpr int kNumDivisionBytes = kNumDivisions * sizeof(uint32_t);
         constexpr int kNumBytesPerGroup =
-            kNumStages * kNumTMABufferBytes + kHidden * kElemBytes + kNumStages * kNumDivisionBytes * 3;
+            kNumStages * kNumTMABufferBytes + kHidden * kElemBytes +
+            kNumStages * kNumDivisionBytes * combine_smem::kNumRecvMetaBuffers;
 
         // Reallocate shared memory
         const auto smemGroupBuffer = smemBuffer + kNumBytesPerGroup * groupIdx;
         auto fullBarriers = PatternVisitor(
             [=](const int& i) { return reinterpret_cast<uint64_t*>(smemGroupBuffer + i * kNumTMABufferBytes); });
         auto emptyBarriers = PatternVisitor(
-            [=](const int& i) { return reinterpret_cast<uint64_t*>(smemGroupBuffer + i * kNumTMABufferBytes + 8); });
+            [=](const int& i) {
+                return reinterpret_cast<uint64_t*>(
+                    smemGroupBuffer + i * kNumTMABufferBytes + combine_smem::kRecvTmaEmptyBarrierOffsetBytes);
+            });
         auto tmaLdBuffers = PatternVisitor(
-            [=](const int& i) { return reinterpret_cast<uint8_t*>(smemGroupBuffer + i * kNumTMABufferBytes + 16); });
+            [=](const int& i) {
+                return reinterpret_cast<uint8_t*>(
+                    smemGroupBuffer + i * kNumTMABufferBytes + combine_smem::kRecvTmaPayloadOffsetBytes);
+            });
         auto tmaStBuffers = PatternVisitor([=](const int& i) {
             return reinterpret_cast<uint32_t*>(
                 smemGroupBuffer + kNumStages * kNumTMABufferBytes + i * kNumBF16PerWarpBytes);
@@ -2286,7 +2301,7 @@ LOW_LATENCY_COMBINE_RECV:
         });
 
         uint32_t tmaPhase = 0;
-        EP_STATIC_ASSERT(kNumStages < 32, "Too many stages");
+        EP_STATIC_ASSERT(kNumStages < kWarpSize, "Too many stages");
         if (decodeWarpIdx == numDecodeWarps) tmaPhase = (1 << kNumStages) - 1;
 
         // Initialize m-barriers
@@ -2294,11 +2309,11 @@ LOW_LATENCY_COMBINE_RECV:
             mbarrier_init(fullBarriers[laneId], 1);
             mbarrier_init(emptyBarriers[laneId], numDecodeWarps);
         }
-        asm volatile("bar.sync %0, %1;" ::"r"(groupIdx + 1), "r"((numDecodeWarps + 1) * 32));
+        asm volatile("bar.sync %0, %1;" ::"r"(groupIdx + 1), "r"(warpsPerRecvGroup * kWarpSize));
 
         int stageIdx = 0, topkIdxByLane = 0;
         EP_STATIC_ASSERT(
-            kNumMaxTopk <= 32,
+            kNumMaxTopk <= kWarpSize,
             "numTopk must not exceed warp size: warpMarkFirstOccurrence relies on active "
             "lanes (0..numTopk-1) having lower IDs than inactive lanes (numTopk..31)");
 

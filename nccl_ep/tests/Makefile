@@ -25,6 +25,7 @@ CXXSTD       := -std=c++17
 
 NVCUFLAGS := $(NVCC_GENCODE) \
              -I$(NCCL_EP_INCDIR) \
+             -I$(NCCL_EP_INCDIR)/nccl_ep \
              -I$(NCCL_EP_SRCDIR) \
              -I$(NCCL_INCDIR) \
              -I$(GTEST_DIR)/include \

@@ -389,6 +389,7 @@ ncclResult_t call_dispatch(
     ncclEpDispQuant_t recipe,
     ncclEpPassDir_t pass_direction,
     int num_blocks, // Number of SMs/blocks for the kernel grid
+    int max_dynamic_smem, // Cached opt-in dynamic shared-memory limit for this group
     int sf_bytes_per_token, // Total scale bytes per token (pre-computed on host)
     const ncclEpEnvConfig* env, // Group env config; gates rank-0 verbose param dump (may be null)
     cudaStream_t stream,
@@ -471,6 +472,7 @@ ncclResult_t call_combine(
     int num_lsa_teams, // Number of LSA teams (RDMA domain size)
     bool backward_combine, // True for backward (training), false for forward
     int num_blocks, // Number of SMs/blocks for the kernel grid
+    int max_dynamic_smem, // Cached opt-in dynamic shared-memory limit for this group
     const ncclEpEnvConfig* env, // Group env config; gates rank-0 verbose param dump (may be null)
     cudaStream_t stream);
 

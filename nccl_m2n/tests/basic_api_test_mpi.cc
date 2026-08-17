@@ -18,12 +18,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <mpi.h>
@@ -122,6 +125,10 @@ static cudaStream_t gGroupStreamA = nullptr;
 static cudaStream_t gGroupStreamB = nullptr;
 static void* gGroupBufferA = nullptr;
 static void* gGroupBufferB = nullptr;
+static ncclComm_t gReducedBucketCommA = nullptr;
+static ncclComm_t gReducedBucketCommB = nullptr;
+static ncclComm_t gNaturalReducedBucketCommA = nullptr;
+static ncclComm_t gNaturalReducedBucketCommB = nullptr;
 static std::string gActiveAlgorithm;
 static int gActiveStreamPoolMode = -1;
 static bool gInitialUseInternalStreamsEnvSet = false;
@@ -129,6 +136,117 @@ static std::string gInitialUseInternalStreamsEnv;
 #if !defined(GTEST_SKIP)
 static int gSkippedCases = 0;
 #endif
+
+static void CUDART_CB waitForStagingReuseRelease(void* data) {
+  auto* release = static_cast<std::atomic<bool>*>(data);
+  while (!release->load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
+constexpr size_t kReducedBucketBytes = 4096;
+
+struct ReducedBucketTestContext {
+  bool inA = false;
+  bool inB = false;
+  int rankA = -1;
+  int rankB = -1;
+  ncclComm_t commA = nullptr;
+  ncclComm_t commB = nullptr;
+  cudaStream_t streamA = nullptr;
+  cudaStream_t streamB = nullptr;
+  void* bufferA = nullptr;
+  void* bufferB = nullptr;
+  ncclMesh_t srcMesh{};
+  ncclMesh_t dstMesh{};
+  ncclDistTensor_t srcA{};
+  ncclDistTensor_t dstA{};
+  ncclDistTensor_t srcB{};
+  ncclDistTensor_t dstB{};
+};
+
+static ncclDistTensor_t makeReducedBucketTensor(void* data, ncclMesh_t* mesh) {
+  ncclDistTensor_t tensor{};
+  tensor.dataPtr = data;
+  tensor.localShape[0] = kReducedBucketBytes;
+  tensor.ndims = 1;
+  tensor.dtype = ncclUint8;
+  tensor.mesh = mesh;
+  tensor.placements[0] = NCCL_RESHARD_REPLICATE;
+  tensor.placements[1] = NCCL_RESHARD_REPLICATE;
+  return tensor;
+}
+
+static void initializeReducedBucketTest(ReducedBucketTestContext* ctx, ncclComm_t* retainedCommA,
+                                        ncclComm_t* retainedCommB) {
+  ncclUniqueId ids[2];
+  if (gWorldRank == 0) {
+    TEST_NCCLCHECK(ncclGetUniqueId(&ids[0]));
+    TEST_NCCLCHECK(ncclGetUniqueId(&ids[1]));
+  }
+  MPICHECK(MPI_Bcast(ids, sizeof(ids), testMpiByte(), 0, testMpiWorld()));
+
+  ctx->inA = gWorldRank == 0 || gWorldRank == 2;
+  ctx->inB = gWorldRank == 1 || gWorldRank == 2;
+  ctx->rankA = gWorldRank == 0 ? 0 : 1;
+  ctx->rankB = gWorldRank == 1 ? 0 : 1;
+  if (ctx->inA) {
+    TEST_NCCL_COMM_CHECK(*retainedCommA, ncclCommInitRank(retainedCommA, 2, ids[0], ctx->rankA));
+    ctx->commA = *retainedCommA;
+    TEST_CUDACHECK(cudaStreamCreateWithFlags(&ctx->streamA, cudaStreamNonBlocking));
+    TEST_CUDACHECK(cudaMalloc(&ctx->bufferA, kReducedBucketBytes));
+  }
+  if (ctx->inB) {
+    TEST_NCCL_COMM_CHECK(*retainedCommB, ncclCommInitRank(retainedCommB, 2, ids[1], ctx->rankB));
+    ctx->commB = *retainedCommB;
+    TEST_CUDACHECK(cudaStreamCreateWithFlags(&ctx->streamB, cudaStreamNonBlocking));
+    TEST_CUDACHECK(cudaMalloc(&ctx->bufferB, kReducedBucketBytes));
+  }
+
+  ctx->srcMesh.dims[0] = 1;
+  ctx->srcMesh.dims[1] = 1;
+  ctx->srcMesh.startRank = 0;
+  ctx->dstMesh = ctx->srcMesh;
+  ctx->dstMesh.startRank = 1;
+  ctx->srcA = makeReducedBucketTensor(ctx->inA && ctx->rankA == 0 ? ctx->bufferA : nullptr, &ctx->srcMesh);
+  ctx->dstA = makeReducedBucketTensor(ctx->inA && ctx->rankA == 1 ? ctx->bufferA : nullptr, &ctx->dstMesh);
+  ctx->srcB = makeReducedBucketTensor(ctx->inB && ctx->rankB == 0 ? ctx->bufferB : nullptr, &ctx->srcMesh);
+  ctx->dstB = makeReducedBucketTensor(ctx->inB && ctx->rankB == 1 ? ctx->bufferB : nullptr, &ctx->dstMesh);
+}
+
+static void expectReducedBucketPattern(void* buffer, unsigned char expected) {
+  std::array<unsigned char, kReducedBucketBytes> actual{};
+  TEST_CUDACHECK(cudaMemcpy(actual.data(), buffer, actual.size(), cudaMemcpyDeviceToHost));
+  EXPECT_TRUE(std::all_of(actual.begin(), actual.end(),
+                          [expected](unsigned char value) { return value == expected; }));
+}
+
+static void warmReducedBucketCommunicators(ReducedBucketTestContext* ctx) {
+  constexpr int kWarmPatternA = 0x11;
+  constexpr int kWarmPatternB = 0x22;
+  if (ctx->inA) {
+    TEST_CUDACHECK(cudaMemsetAsync(ctx->bufferA, ctx->rankA == 0 ? kWarmPatternA : 0, kReducedBucketBytes,
+                                  ctx->streamA));
+    TEST_NCCLCHECK(ncclReshard(gM2nHandle, ctx->commA, &ctx->srcA, &ctx->dstA, ctx->streamA));
+    TEST_NCCL_ASYNC_CHECK(ctx->commA, ctx->streamA);
+    if (ctx->rankA == 1) expectReducedBucketPattern(ctx->bufferA, kWarmPatternA);
+  }
+  if (ctx->inB) {
+    TEST_CUDACHECK(cudaMemsetAsync(ctx->bufferB, ctx->rankB == 0 ? kWarmPatternB : 0, kReducedBucketBytes,
+                                  ctx->streamB));
+    TEST_NCCLCHECK(ncclReshard(gM2nHandle, ctx->commB, &ctx->srcB, &ctx->dstB, ctx->streamB));
+    TEST_NCCL_ASYNC_CHECK(ctx->commB, ctx->streamB);
+    if (ctx->rankB == 1) expectReducedBucketPattern(ctx->bufferB, kWarmPatternB);
+  }
+  MPICHECK(MPI_Barrier(testMpiWorld()));
+}
+
+static void destroyReducedBucketUserResources(ReducedBucketTestContext* ctx) {
+  if (ctx->bufferA != nullptr) TEST_CUDACHECK(cudaFree(ctx->bufferA));
+  if (ctx->streamA != nullptr) TEST_CUDACHECK(cudaStreamDestroy(ctx->streamA));
+  if (ctx->bufferB != nullptr) TEST_CUDACHECK(cudaFree(ctx->bufferB));
+  if (ctx->streamB != nullptr) TEST_CUDACHECK(cudaStreamDestroy(ctx->streamB));
+}
 
 static bool runAllAlgorithms() {
   return basicApiRunAllAlgorithms(gCli);
@@ -402,6 +520,149 @@ TEST(M2nGroupMpiTest, OverlappingCommunicatorsPreserveBucketOrder) {
   MPICHECK(MPI_Barrier(testMpiWorld()));
 }
 
+TEST(PackWindowMpiTest, ReducedBucketWaitsForDelayedRemoteConsumer) {
+  if (gCli.filter == nullptr || strcmp(gCli.filter, "packwindow_reduced_bucket") != 0) {
+#if defined(GTEST_SKIP)
+    GTEST_SKIP() << "needs --filter packwindow_reduced_bucket";
+#else
+    recordFallbackSkip("needs --filter packwindow_reduced_bucket");
+    return;
+#endif
+  }
+  if (gWorldSize < 3) {
+#if defined(GTEST_SKIP)
+    GTEST_SKIP() << "needs at least 3 ranks";
+#else
+    recordFallbackSkip("needs at least 3 ranks");
+    return;
+#endif
+  }
+
+  /* Warm both communicators before contention so the first-use host-RMA ring
+   * cannot serialize B behind A and accidentally mask a missing GRANT lease. */
+  ReducedBucketTestContext ctx;
+  initializeReducedBucketTest(&ctx, &gReducedBucketCommA, &gReducedBucketCommB);
+  warmReducedBucketCommunicators(&ctx);
+
+  constexpr int kPatternA = 0x2a;
+  constexpr int kPatternB = 0x4b;
+  if (ctx.inA) {
+    TEST_CUDACHECK(cudaMemsetAsync(ctx.bufferA, ctx.rankA == 0 ? kPatternA : 0, kReducedBucketBytes, ctx.streamA));
+  }
+  if (ctx.inB) {
+    TEST_CUDACHECK(cudaMemsetAsync(ctx.bufferB, ctx.rankB == 0 ? kPatternB : 0, kReducedBucketBytes, ctx.streamB));
+  }
+
+  std::atomic<bool> releaseA{false};
+  if (ctx.inA && ctx.rankA == 1) {
+    TEST_CUDACHECK(cudaLaunchHostFunc(ctx.streamA, waitForStagingReuseRelease, &releaseA));
+  }
+  if (ctx.inA) {
+    TEST_NCCLCHECK(ncclReshard(gM2nHandle, ctx.commA, &ctx.srcA, &ctx.dstA, ctx.streamA));
+  }
+  MPICHECK(MPI_Barrier(testMpiWorld()));
+
+  if (ctx.inB) {
+    TEST_NCCLCHECK(ncclReshard(gM2nHandle, ctx.commB, &ctx.srcB, &ctx.dstB, ctx.streamB));
+  }
+  MPICHECK(MPI_Barrier(testMpiWorld()));
+  if (ctx.inA && ctx.rankA == 1) {
+    releaseA.store(true, std::memory_order_release);
+  }
+
+  if (ctx.inA) TEST_NCCL_ASYNC_CHECK(ctx.commA, ctx.streamA);
+  if (ctx.inB) TEST_NCCL_ASYNC_CHECK(ctx.commB, ctx.streamB);
+  if (ctx.inA && ctx.rankA == 1) expectReducedBucketPattern(ctx.bufferA, kPatternA);
+  if (ctx.inB && ctx.rankB == 1) expectReducedBucketPattern(ctx.bufferB, kPatternB);
+
+  destroyReducedBucketUserResources(&ctx);
+  MPICHECK(MPI_Barrier(testMpiWorld()));
+}
+
+TEST(PackWindowMpiTest, ReducedBucketWorksWithoutExternalPhaseBarriers) {
+  if (gCli.filter == nullptr || strcmp(gCli.filter, "packwindow_reduced_bucket") != 0) {
+#if defined(GTEST_SKIP)
+    GTEST_SKIP() << "needs --filter packwindow_reduced_bucket";
+#else
+    recordFallbackSkip("needs --filter packwindow_reduced_bucket");
+    return;
+#endif
+  }
+  if (gWorldSize < 3) {
+#if defined(GTEST_SKIP)
+    GTEST_SKIP() << "needs at least 3 ranks";
+#else
+    recordFallbackSkip("needs at least 3 ranks");
+    return;
+#endif
+  }
+
+  /* Submit repeated warmed A/B waves without an MPI transfer-phase barrier or
+   * intermediate stream synchronization. Per-iteration snapshots ensure a
+   * later successful call cannot hide an earlier overwrite. */
+  ReducedBucketTestContext ctx;
+  initializeReducedBucketTest(&ctx, &gNaturalReducedBucketCommA, &gNaturalReducedBucketCommB);
+  warmReducedBucketCommunicators(&ctx);
+
+  constexpr int kIterations = 8;
+  constexpr size_t kSnapshotBytes = kIterations * kReducedBucketBytes;
+  void* snapshotsA = nullptr;
+  void* snapshotsB = nullptr;
+  if (ctx.inA && ctx.rankA == 1) TEST_CUDACHECK(cudaMalloc(&snapshotsA, kSnapshotBytes));
+  if (ctx.inB && ctx.rankB == 1) TEST_CUDACHECK(cudaMalloc(&snapshotsB, kSnapshotBytes));
+
+  for (int i = 0; i < kIterations; i++) {
+    const int patternA = 0x30 + i;
+    const int patternB = 0x50 + i;
+    if (ctx.inA) {
+      TEST_CUDACHECK(cudaMemsetAsync(ctx.bufferA, ctx.rankA == 0 ? patternA : 0, kReducedBucketBytes, ctx.streamA));
+      TEST_NCCLCHECK(ncclReshard(gM2nHandle, ctx.commA, &ctx.srcA, &ctx.dstA, ctx.streamA));
+      if (ctx.rankA == 1) {
+        TEST_CUDACHECK(cudaMemcpyAsync(static_cast<char*>(snapshotsA) + static_cast<size_t>(i) * kReducedBucketBytes,
+                                      ctx.bufferA, kReducedBucketBytes, cudaMemcpyDeviceToDevice, ctx.streamA));
+      }
+    }
+    if (ctx.inB) {
+      TEST_CUDACHECK(cudaMemsetAsync(ctx.bufferB, ctx.rankB == 0 ? patternB : 0, kReducedBucketBytes, ctx.streamB));
+      TEST_NCCLCHECK(ncclReshard(gM2nHandle, ctx.commB, &ctx.srcB, &ctx.dstB, ctx.streamB));
+      if (ctx.rankB == 1) {
+        TEST_CUDACHECK(cudaMemcpyAsync(static_cast<char*>(snapshotsB) + static_cast<size_t>(i) * kReducedBucketBytes,
+                                      ctx.bufferB, kReducedBucketBytes, cudaMemcpyDeviceToDevice, ctx.streamB));
+      }
+    }
+  }
+
+  if (ctx.inA) TEST_NCCL_ASYNC_CHECK(ctx.commA, ctx.streamA);
+  if (ctx.inB) TEST_NCCL_ASYNC_CHECK(ctx.commB, ctx.streamB);
+
+  std::vector<unsigned char> actual(kSnapshotBytes);
+  if (snapshotsA != nullptr) {
+    TEST_CUDACHECK(cudaMemcpy(actual.data(), snapshotsA, actual.size(), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < kIterations; i++) {
+      SCOPED_TRACE(::testing::Message() << "communicator A iteration " << i);
+      const unsigned char expected = static_cast<unsigned char>(0x30 + i);
+      const auto first = actual.begin() + static_cast<size_t>(i) * kReducedBucketBytes;
+      EXPECT_TRUE(std::all_of(first, first + kReducedBucketBytes,
+                              [expected](unsigned char value) { return value == expected; }));
+    }
+  }
+  if (snapshotsB != nullptr) {
+    TEST_CUDACHECK(cudaMemcpy(actual.data(), snapshotsB, actual.size(), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < kIterations; i++) {
+      SCOPED_TRACE(::testing::Message() << "communicator B iteration " << i);
+      const unsigned char expected = static_cast<unsigned char>(0x50 + i);
+      const auto first = actual.begin() + static_cast<size_t>(i) * kReducedBucketBytes;
+      EXPECT_TRUE(std::all_of(first, first + kReducedBucketBytes,
+                              [expected](unsigned char value) { return value == expected; }));
+    }
+  }
+
+  if (snapshotsA != nullptr) TEST_CUDACHECK(cudaFree(snapshotsA));
+  if (snapshotsB != nullptr) TEST_CUDACHECK(cudaFree(snapshotsB));
+  destroyReducedBucketUserResources(&ctx);
+  MPICHECK(MPI_Barrier(testMpiWorld()));
+}
+
 TEST_P(BasicApiMpiTest, Reshard) {
   const MpiParam& param = GetParam();
   SCOPED_TRACE(param.tc.name);
@@ -524,6 +785,10 @@ static void shutdownMpiRuntime() {
   if (gGroupBufferA != nullptr) TEST_NCCLCHECK(ncclMemFree(gGroupBufferA));
   if (gGroupStreamA != nullptr) TEST_CUDACHECK(cudaStreamDestroy(gGroupStreamA));
   if (gGroupCommA != nullptr) TEST_NCCLCHECK(testDestroyComm(gGroupCommA));
+  if (gNaturalReducedBucketCommB != nullptr) TEST_NCCLCHECK(testDestroyComm(gNaturalReducedBucketCommB));
+  if (gNaturalReducedBucketCommA != nullptr) TEST_NCCLCHECK(testDestroyComm(gNaturalReducedBucketCommA));
+  if (gReducedBucketCommB != nullptr) TEST_NCCLCHECK(testDestroyComm(gReducedBucketCommB));
+  if (gReducedBucketCommA != nullptr) TEST_NCCLCHECK(testDestroyComm(gReducedBucketCommA));
   if (gCopyBuffer != nullptr) {
     TEST_CUDACHECK(cudaFree(gCopyBuffer));
   }

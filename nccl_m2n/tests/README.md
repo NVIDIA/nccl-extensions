@@ -107,6 +107,19 @@ tests/run_basic_api_tests.sh -N 32 --filter nd_tensors
 
 # Or directly:
 mpirun -np 8 ./build/bin/basic_api_test_mpi --filter 2d_placement
+
+# Focused PACKWINDOW host-RMA lease regression: two warmed communicators
+# share one destination GPU and one physical staging slot. Require INFO logs
+# to contain "packwindow-lsa-hput" so a kernel fallback cannot certify it.
+NCCL_NUM_RMA_CTX=4 \
+NCCL_RESHARD_STAGING_BUCKETS=8192:1 \
+NCCL_RESHARD_SPLIT_COMM=0 \
+NCCL_RESHARD_LOG_LEVEL=INFO \
+mpirun -np 3 ./build/bin/basic_api_test_mpi \
+  --filter packwindow_reduced_bucket \
+  --gtest_filter='PackWindowMpiTest.*' \
+  --algorithm ring --api default --copy-algorithm packwindow \
+  --lb-mode uniform
 ```
 
 ## CLI flags (both binaries)

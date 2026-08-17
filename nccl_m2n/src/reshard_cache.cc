@@ -477,6 +477,29 @@ void stagingBufferPoolFinalize() {
 }
 
 void cacheFinalize() {
+  if (reshardResourcesNeedQuarantine()) {
+    /* Post-entry host-RMA failures can leave work referencing any of these
+     * objects. Drop local ownership without destroying the underlying
+     * resources; coordinated process shutdown is the only safe recovery. */
+    RESHARD_WARN(-1, "Retaining cached windows, DevComms, streams, and staging buffers because GPU work could not "
+                     "be fenced safely");
+    gInternalWindowCache = {};
+    gRetiredWindowCacheEntries.clear();
+    for (int i = 0; i < gDevcommCacheCount; i++) {
+      gDevcommCache[i] = {};
+    }
+    gDevcommCacheCount = 0;
+    gDevcommCacheNextIdx = 0;
+    gRetiredDevcommCacheEntries.clear();
+    gStreamPool.clear();
+    for (int i = 0; i < gStagingPoolCount; i++) {
+      gStagingPool[i] = {};
+    }
+    gStagingPoolCount = 0;
+    resetCompletionFailureInjection();
+    return;
+  }
+
   /* Drain anything deferred by an eviction that raced a concurrent call. */
   (void)reclaimRetiredWindowEntriesIfIdle();
   (void)reclaimRetiredDevCommEntriesIfIdle();

@@ -190,7 +190,9 @@ inline bool gReshardSplitComm = true;
 
 /* Optional bucketed staging-buffer pool (env NCCL_RESHARD_STAGING_BUCKETS =
  * "size:slots,size:slots,..."; size in bytes). When set, it replaces the
- * per-comm staging buffer with fixed best-fit buckets. Unset keeps the
+ * per-comm staging buffer with fixed best-fit buckets. Communicators reuse the
+ * physical slots in stable round-robin waves; slots bound staging memory and
+ * asynchronous lanes rather than communicator identities. Unset keeps the
  * per-comm path. */
 struct ReshardStagingBucketCfg {
   size_t size;
@@ -692,10 +694,8 @@ size_t getTransposeBufferCapacity(ncclComm_t comm);
  * bucketed pool is disabled. Derived from the configured bucket set, not from
  * the physical slot assignment, so every rank of a communicator agrees. */
 int getStagingBucketIndex(ncclComm_t comm);
-ncclResult_t getTransposeBufferPackWindowState(ncclComm_t comm, bool* rmaWarmed, int* previousPeerCount,
-                                               int previousPeers[MAX_DIRECT_TARGETS]);
-ncclResult_t setTransposeBufferPackWindowState(ncclComm_t comm, bool rmaWarmed, int previousPeerCount,
-                                               const int previousPeers[MAX_DIRECT_TARGETS]);
+ncclResult_t getPackWindowRmaWarmed(ncclComm_t comm, bool* warmed);
+ncclResult_t setPackWindowRmaWarmed(ncclComm_t comm, bool warmed);
 void transposeBufferSynchronize();
 void transposeBufferFinalize();
 ncclResult_t transposeBufferRecordEvent(ncclComm_t comm, cudaStream_t stream);

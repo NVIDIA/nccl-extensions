@@ -307,10 +307,7 @@ struct TransposeBufferEntry {
   size_t capacity;
   cudaStream_t stream; /* last stream that used this buffer */
   cudaEvent_t event; /* recorded after UNPACK; used for cross-stream sync */
-  int packWindowPreviousPeerCount;
-  int packWindowPreviousPeers[MAX_DIRECT_TARGETS];
   bool eventRecorded;
-  bool packWindowRmaWarmed;
   bool reserved;
   bool poisoned;
   bool allocated;

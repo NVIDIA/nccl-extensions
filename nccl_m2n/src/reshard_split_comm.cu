@@ -903,6 +903,23 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
 }
 
 void reshardSplitCommFinalize() {
+  if (reshardResourcesNeedQuarantine()) {
+    RESHARD_WARN(-1, "Retaining split communicators because GPU work could not be fenced safely");
+    for (int i = 0; i < gCommACount; i++) {
+      gCommACache[i] = {};
+    }
+    gCommACount = 0;
+    for (int i = 0; i < gCommBParentCount; i++) {
+      gCommBParent[i] = {};
+    }
+    gCommBParentCount = 0;
+    for (int i = 0; i < gCommBSharedCount; i++) {
+      gCommBShared[i] = {};
+    }
+    gCommBSharedCount = 0;
+    return;
+  }
+
   /* commA entries first: destroy each probe DevComm before its commA. */
   for (int i = 0; i < gCommACount; i++) {
     CommACacheEntry& e = gCommACache[i];

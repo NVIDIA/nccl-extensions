@@ -19,6 +19,7 @@
  *
  * Buffers are fixed-size best-fit buckets. A communicator keeps one stable
  * slot per bucket so window registration remains rank-uniform across calls.
+ * Distinct communicators reuse the physical slots in round-robin waves.
  * ====================================================================*/
 
 /* The slot memo is intentionally stable for the lifetime of a communicator.
@@ -33,10 +34,7 @@ struct StagingSlot {
   cudaEvent_t doneEvent;
   cudaStream_t lastStream;
   int bucketIdx;
-  int packWindowPreviousPeerCount;
-  int packWindowPreviousPeers[MAX_DIRECT_TARGETS];
   bool eventRecorded;
-  bool packWindowRmaWarmed;
   bool reserved;
   bool poisoned;
 };
@@ -44,7 +42,7 @@ struct StagingSlot {
 struct StagingBucketRT {
   size_t size;
   int numSlots;
-  int numAssigned;
+  int nextSlotCursor;
   StagingSlot slots[MAX_SPLIT_CONCURRENCY];
   bool allocated;
 };
@@ -68,6 +66,15 @@ struct StagingDevicePool {
 
 static StagingDevicePool gStagingDevicePools[MAX_TRANSPOSE_BUFFER_ENTRIES];
 static int gStagingDevicePoolCount = 0;
+
+struct PackWindowRmaWarmupState {
+  ncclComm_t comm;
+  bool warmed;
+};
+static PackWindowRmaWarmupState
+  gPackWindowRmaWarmupStates[MAX_SPLIT_CONCURRENCY * kMaxStagingBuckets];
+static int gPackWindowRmaWarmupStateCount = 0;
+
 static std::mutex gStagingPoolMutex;
 static thread_local ncclComm_t gCurrentStagingComm = nullptr;
 static thread_local StagingSlot* gCurrentStagingSlot = nullptr;
@@ -132,7 +139,7 @@ static void buildStagingPoolMeta(StagingDevicePool* pool) {
     StagingBucketRT& bucket = pool->buckets[i];
     bucket.size = gReshardStagingBuckets[i].size;
     bucket.numSlots = gReshardStagingBuckets[i].numSlots;
-    bucket.numAssigned = 0;
+    bucket.nextSlotCursor = 0;
     bucket.allocated = false;
     for (int slot = 0; slot < bucket.numSlots; slot++) {
       bucket.slots[slot] = {};
@@ -221,12 +228,18 @@ static ncclResult_t acquireStagingSlot(ncclComm_t comm, size_t requiredBytes, cu
 
   int slotIdx = lookupCommBucketSlot(*pool, comm, bucketIdx);
   if (slotIdx < 0) {
-    NCCL_M2N_CHECK_ARG(bucket->numAssigned < bucket->numSlots, -1,
-                       "staging bucket %d has no free communicator slots (%d configured)", bucketIdx,
+    for (int i = 0; i < bucket->numSlots; i++) {
+      const int candidate = (bucket->nextSlotCursor + i) % bucket->numSlots;
+      if (!bucket->slots[candidate].poisoned) {
+        slotIdx = candidate;
+        break;
+      }
+    }
+    NCCL_M2N_CHECK_ARG(slotIdx >= 0, -1, "staging bucket %d has no reusable slots (%d configured)", bucketIdx,
                        bucket->numSlots);
-    slotIdx = bucket->numAssigned++;
     NCCL_M2N_CHECK_ARG(recordCommBucketSlot(pool, comm, bucketIdx, slotIdx), -1,
                        "staging bucket communicator memo is full");
+    bucket->nextSlotCursor = (slotIdx + 1) % bucket->numSlots;
   }
   StagingSlot* slot = &bucket->slots[slotIdx];
   /* Reclaim before the poison check, not after: reclaiming marks the slot
@@ -238,9 +251,12 @@ static ncclResult_t acquireStagingSlot(ncclComm_t comm, size_t requiredBytes, cu
   if (slot->poisoned) {
     NCCL_M2N_FAIL(ncclUnhandledCudaError, -1, "Staging bucket %d slot %d is unavailable", bucketIdx, slotIdx);
   }
-  NCCL_M2N_CHECK_ARG(!slot->reserved, -1,
-                     "Concurrent reshard operations on communicator %p are unsupported; serialize calls at the caller",
-                     (void*)comm);
+  if (slot->reserved) {
+    NCCL_M2N_FAIL(ncclInvalidUsage, -1,
+                  "Concurrent reshard operations sharing staging slot %d:%d are unsupported; serialize calls at "
+                  "the caller (communicator %p)",
+                  bucketIdx, slotIdx, (void*)comm);
+  }
   if (slot->eventRecorded && slot->lastStream != stream) {
     NCCL_M2N_CUDACHECK(cudaStreamWaitEvent(stream, slot->doneEvent, 0));
   }
@@ -355,66 +371,43 @@ size_t getTransposeBufferCapacity(ncclComm_t comm) {
   return (e != nullptr) ? e->capacity : 0;
 }
 
-ncclResult_t getTransposeBufferPackWindowState(ncclComm_t comm, bool* rmaWarmed, int* previousPeerCount,
-                                               int previousPeers[MAX_DIRECT_TARGETS]) {
-  NCCL_M2N_CHECK_ARG(rmaWarmed != nullptr && previousPeerCount != nullptr && previousPeers != nullptr, -1,
-                     "PACKWINDOW staging state output must be non-null");
-  std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
-  if (reshardStagingBucketsEnabled()) {
-    StagingSlot* slot = (comm == gCurrentStagingComm) ? gCurrentStagingSlot : nullptr;
-    NCCL_M2N_CHECK_ARG(slot != nullptr, -1, "PACKWINDOW staging slot is unavailable for communicator %p",
-                       (void*)comm);
-    *rmaWarmed = slot->packWindowRmaWarmed;
-    *previousPeerCount = slot->packWindowPreviousPeerCount;
-    for (int i = 0; i < *previousPeerCount; i++) {
-      previousPeers[i] = slot->packWindowPreviousPeers[i];
+static PackWindowRmaWarmupState* findPackWindowRmaWarmupState(ncclComm_t comm) {
+  for (int i = 0; i < gPackWindowRmaWarmupStateCount; i++) {
+    if (gPackWindowRmaWarmupStates[i].comm == comm) {
+      return &gPackWindowRmaWarmupStates[i];
     }
-    return ncclSuccess;
   }
+  return nullptr;
+}
 
-  StagingDevicePool* pool = nullptr;
-  NCCL_M2N_CHECK(acquireStagingDevicePool(&pool));
-  TransposeBufferEntry* entry = findPoolEntry(*pool, comm);
-  NCCL_M2N_CHECK_ARG(entry != nullptr, -1, "PACKWINDOW transpose buffer is unavailable for communicator %p",
-                     (void*)comm);
-  *rmaWarmed = entry->packWindowRmaWarmed;
-  *previousPeerCount = entry->packWindowPreviousPeerCount;
-  for (int i = 0; i < *previousPeerCount; i++) {
-    previousPeers[i] = entry->packWindowPreviousPeers[i];
+static ncclResult_t getOrCreatePackWindowRmaWarmupState(ncclComm_t comm, PackWindowRmaWarmupState** outState) {
+  PackWindowRmaWarmupState* state = findPackWindowRmaWarmupState(comm);
+  if (state == nullptr) {
+    const int capacity = (int)(sizeof(gPackWindowRmaWarmupStates) / sizeof(gPackWindowRmaWarmupStates[0]));
+    NCCL_M2N_CHECK_ARG(gPackWindowRmaWarmupStateCount < capacity, -1,
+                       "PACKWINDOW host-RMA warmup-state table is full (%d entries)", capacity);
+    state = &gPackWindowRmaWarmupStates[gPackWindowRmaWarmupStateCount++];
+    *state = {};
+    state->comm = comm;
   }
+  *outState = state;
   return ncclSuccess;
 }
 
-ncclResult_t setTransposeBufferPackWindowState(ncclComm_t comm, bool rmaWarmed, int previousPeerCount,
-                                               const int previousPeers[MAX_DIRECT_TARGETS]) {
-  NCCL_M2N_CHECK_ARG(previousPeerCount >= 0 && previousPeerCount <= MAX_DIRECT_TARGETS, -1,
-                     "PACKWINDOW previous-peer count %d exceeds capacity %d", previousPeerCount,
-                     MAX_DIRECT_TARGETS);
-  NCCL_M2N_CHECK_ARG(previousPeerCount == 0 || previousPeers != nullptr, -1,
-                     "PACKWINDOW previous-peer input must be non-null");
+ncclResult_t getPackWindowRmaWarmed(ncclComm_t comm, bool* warmed) {
+  NCCL_M2N_CHECK_ARG(warmed != nullptr, -1, "PACKWINDOW host-RMA warmed-state output must be non-null");
   std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
-  if (reshardStagingBucketsEnabled()) {
-    StagingSlot* slot = (comm == gCurrentStagingComm) ? gCurrentStagingSlot : nullptr;
-    NCCL_M2N_CHECK_ARG(slot != nullptr, -1, "PACKWINDOW staging slot is unavailable for communicator %p",
-                       (void*)comm);
-    slot->packWindowRmaWarmed = rmaWarmed;
-    slot->packWindowPreviousPeerCount = previousPeerCount;
-    for (int i = 0; i < previousPeerCount; i++) {
-      slot->packWindowPreviousPeers[i] = previousPeers[i];
-    }
-    return ncclSuccess;
-  }
+  PackWindowRmaWarmupState* state = nullptr;
+  NCCL_M2N_CHECK(getOrCreatePackWindowRmaWarmupState(comm, &state));
+  *warmed = state->warmed;
+  return ncclSuccess;
+}
 
-  StagingDevicePool* pool = nullptr;
-  NCCL_M2N_CHECK(acquireStagingDevicePool(&pool));
-  TransposeBufferEntry* entry = findPoolEntry(*pool, comm);
-  NCCL_M2N_CHECK_ARG(entry != nullptr, -1, "PACKWINDOW transpose buffer is unavailable for communicator %p",
-                     (void*)comm);
-  entry->packWindowRmaWarmed = rmaWarmed;
-  entry->packWindowPreviousPeerCount = previousPeerCount;
-  for (int i = 0; i < previousPeerCount; i++) {
-    entry->packWindowPreviousPeers[i] = previousPeers[i];
-  }
+ncclResult_t setPackWindowRmaWarmed(ncclComm_t comm, bool warmed) {
+  std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+  PackWindowRmaWarmupState* state = nullptr;
+  NCCL_M2N_CHECK(getOrCreatePackWindowRmaWarmupState(comm, &state));
+  state->warmed = warmed;
   return ncclSuccess;
 }
 
@@ -463,6 +456,7 @@ ncclResult_t transposeBufferRecordEvent(ncclComm_t comm, cudaStream_t stream) {
 
 void transposeBufferSynchronize() {
   std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+  if (reshardResourcesNeedQuarantine()) return;
   int currentDevice = -1;
   NCCL_M2N_CUDACHECK_WARN(cudaGetDevice(&currentDevice));
   for (int device = 0; device < gStagingDevicePoolCount; device++) {
@@ -486,6 +480,21 @@ void transposeBufferSynchronize() {
 
 void transposeBufferFinalize() {
   std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+  if (reshardResourcesNeedQuarantine()) {
+    RESHARD_WARN(-1, "Retaining transpose and staging buffers because GPU work could not be fenced safely");
+    for (int device = 0; device < gStagingDevicePoolCount; device++) {
+      gStagingDevicePools[device] = {};
+    }
+    gStagingDevicePoolCount = 0;
+    for (int i = 0; i < gPackWindowRmaWarmupStateCount; i++) {
+      gPackWindowRmaWarmupStates[i] = {};
+    }
+    gPackWindowRmaWarmupStateCount = 0;
+    gCurrentStagingComm = nullptr;
+    gCurrentStagingSlot = nullptr;
+    gCurrentTransposeEntry = nullptr;
+    return;
+  }
   int currentDevice = -1;
   NCCL_M2N_CUDACHECK_WARN(cudaGetDevice(&currentDevice));
   for (int device = 0; device < gStagingDevicePoolCount; device++) {
@@ -519,6 +528,10 @@ void transposeBufferFinalize() {
   }
   if (currentDevice >= 0) NCCL_M2N_CUDACHECK_WARN(cudaSetDevice(currentDevice));
   gStagingDevicePoolCount = 0;
+  for (int i = 0; i < gPackWindowRmaWarmupStateCount; i++) {
+    gPackWindowRmaWarmupStates[i] = {};
+  }
+  gPackWindowRmaWarmupStateCount = 0;
   gCurrentStagingComm = nullptr;
   gCurrentStagingSlot = nullptr;
   gCurrentTransposeEntry = nullptr;

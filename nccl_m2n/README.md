@@ -317,12 +317,25 @@ noted otherwise):
 **Returns** `ncclSuccess` on success, otherwise an `ncclResult_t` from NCCL or
 `ncclInvalidArgument` from the preconditions above.
 
+A PACKWINDOW host-RMA error after GRANT/ARRIVAL protocol work begins is
+fail-stop for the participating communicator and M2N runtime epoch. Every rank
+must stop issuing M2N work on that communicator and coordinate communicator or
+process-group shutdown. Retrying the transfer or continuing to another tensor
+is unsupported. The library retains local resources that may still be
+referenced by partially enqueued work, but local quarantine is not distributed
+recovery.
+
 **Participation and threading** — every rank in `comm`, including ranks outside
 both meshes, must call the same reshard operation in the same collective order
 and provide both descriptors. The call follows CUDA stream semantics. Issue a
 single reshard at a time per `(comm, effective stream)`. Use separate
 communicators for concurrent transfers; the batched benchmark does this with
-`--num-comms`.
+`--num-comms`. When `NCCL_RESHARD_STAGING_BUCKETS` is set, submit reshard calls
+serially on the host within each process, including calls on different
+communicators that may share a physical slot. Ranks in overlapping
+communicators must submit those communicators in one consistent logical order.
+This constrains host entry only: CUDA work remains asynchronous and different
+physical lanes may overlap after submission.
 
 ### Lifecycle
 
@@ -758,6 +771,8 @@ have identical effective values on every rank in the communicator.
 | `NCCL_RESHARD_DST_DOMAIN_SIZE`  | Positive destination domain-size override; invalid values are ignored. |
 | `NCCL_RESHARD_USE_INTERNAL_STREAMS` | Cache one internal stream per observed `(comm, device)` pair until runtime finalization (default `1`); `0` keeps work on caller streams with ordered DevComm reuse. |
 | `NCCL_RESHARD_CHUNK_SIZE`       | Positive RING byte-level chunk size; invalid values are ignored. |
+| `NCCL_RESHARD_STAGING_WATERMARK_BYTES` | Fixed per-communicator staging floor allocated on first use (default 256 MiB). Without buckets, later requests above the first allocation fail. |
+| `NCCL_RESHARD_STAGING_BUCKETS` | Opt-in bounded staging pool as comma-separated `bytes:slots` buckets; total slots must not exceed 64. Communicators reuse slots in stable round-robin waves, so slots bound asynchronous GPU staging lanes rather than communicator count. Host submissions must be serialized per process and overlapping communicators submitted in rank-consistent order. Unset retains per-communicator staging. |
 | `NCCL_RESHARD_STAGING_NUM_CHANNELS` | Positive staging channel count used by `ncclReshard`. |
 | `NCCL_RESHARD_STAGING_CHANNEL_SIZE` | Positive per-channel staging allocation in bytes. |
 | `NCCL_RESHARD_STAGING_CHUNK_SIZE` | Positive staging transfer chunk size in bytes. |

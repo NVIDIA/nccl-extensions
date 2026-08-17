@@ -321,6 +321,8 @@ NCCL_M2N_API ncclResult_t ncclM2nGroupAbort(void);
 
 /**
  * Single-shot resharding with a caller-registered window.
+ * See ncclReshard for the error contract, including the PACKWINDOW host-RMA
+ * fail-stop rule.
  *
  * Passing NULL as `handle` lazily creates and uses an internal default handle.
  *
@@ -350,10 +352,8 @@ NCCL_M2N_API ncclResult_t ncclM2nGroupAbort(void);
  *                    completion events preserve the caller stream's ordering
  *                    before and after the reshard operation.
  *
- * @return ncclSuccess on success, ncclInvalidArgument if any precondition is
- *         violated, ncclInvalidUsage if the stream is capturing a CUDA graph
- *         (capture is not supported), or ncclSystemError if default-handle
- *         creation fails.
+ * @return Same error contract as ncclReshard, including its fail-stop rule for
+ *         errors reported after PACKWINDOW host-RMA protocol entry.
  */
 NCCL_M2N_API ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm,
                                                 ncclWindow_t window,
@@ -375,10 +375,15 @@ NCCL_M2N_API ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm
  * @param[in] dst     Destination-side tensor descriptor (non-NULL on every rank).
  * @param[in] stream  CUDA stream (explicit or default).
  *
- * @return ncclSuccess on success, ncclInvalidArgument if any precondition is
- *         violated, ncclInvalidUsage if the stream is capturing a CUDA graph
- *         (capture is not supported), or ncclSystemError if default-handle
- *         creation fails.
+ * @return ncclSuccess on success, ncclInvalidArgument if a precondition is
+ *         violated, or another ncclResult_t reported by setup or transport
+ *         operations. A pre-entry validation error enqueues no transfer work.
+ *         If an error is reported after PACKWINDOW host-RMA protocol work has
+ *         begun, the participating communicator and M2N runtime epoch are
+ *         fail-stop: all ranks must stop issuing M2N work on this communicator
+ *         and coordinate communicator or process-group shutdown. Retrying the
+ *         failed reshard or continuing with another tensor is unsupported;
+ *         local resource quarantine is not distributed recovery.
  */
 NCCL_M2N_API ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm,
                                       const ncclDistTensor_t* src, const ncclDistTensor_t* dst,

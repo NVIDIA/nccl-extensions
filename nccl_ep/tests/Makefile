@@ -34,7 +34,7 @@ NVCUFLAGS := $(NVCC_GENCODE) \
 
 NVLDFLAGS := -L$(NCCL_EP_LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -lnccl -lpthread -lrt -ldl -lcuda
 
-TEST_BINARIES := $(DST_DIR)/test_output_layout $(DST_DIR)/test_handle_maps $(DST_DIR)/test_lifecycle $(DST_DIR)/test_public_struct_abi $(DST_DIR)/test_ht_bwd $(DST_DIR)/test_tensor_create $(DST_DIR)/test_zero_copy $(DST_DIR)/test_ht_stale_routing_map $(DST_DIR)/test_ht_overflow_drop $(DST_DIR)/test_quantization_recipe $(DST_DIR)/test_recv_topk_idx_flags $(DST_DIR)/test_elastic_buffer
+TEST_BINARIES := $(DST_DIR)/test_output_layout $(DST_DIR)/test_handle_maps $(DST_DIR)/test_lifecycle $(DST_DIR)/test_public_struct_abi $(DST_DIR)/test_ht_bwd $(DST_DIR)/test_tensor_create $(DST_DIR)/test_zero_copy $(DST_DIR)/test_ht_stale_routing_map $(DST_DIR)/test_ht_overflow_drop $(DST_DIR)/test_quantization_recipe $(DST_DIR)/test_recv_topk_idx_flags $(DST_DIR)/test_elastic_buffer $(DST_DIR)/test_ll_epoch_protocol $(DST_DIR)/test_ll_group_epoch
 
 .PHONY: all clean
 all: $(TEST_BINARIES)

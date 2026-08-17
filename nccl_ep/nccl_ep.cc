@@ -689,6 +689,7 @@ struct ncclEpGroup {
     //     to exactly that size. Handle init rejects (returns an error) any
     //     handle whose layout does not fit; no growth is performed.
     size_t rdma_buffer_size_alloc;
+    nccl_ep::LowLatencyEpochState* ll_epoch_state = nullptr;
     ncclEpGroupConfig_t config;         // Stored configuration
 
     // Environment-variable configuration, populated once at group creation
@@ -1989,7 +1990,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
         if (props.nLsaTeams > 1) {
             reqs.ginContextCount = ep_group->config.num_qp_per_rank; // all contexts in single comm
-            // Signal layout: combine [0, N), dispatch [N, 2N), clean barrier [2N]
+            // Signal layout: bank 0 [0, N), bank 1 [N, 2N), clean barrier [2N]
             reqs.ginSignalCount = 2 * num_total_signals + 1;
             reqs.ginForceEnable = true;
             reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
@@ -2003,6 +2004,9 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
 
         delete[] nccl_dev_comms_host;
         nccl_dev_comms_host = nullptr;
+
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->ll_epoch_state), sizeof(nccl_ep::LowLatencyEpochState)));
+        CUDA_CHECK(cudaMemset(ep_group->ll_epoch_state, 0, sizeof(nccl_ep::LowLatencyEpochState)));
 
         if (ep_group->config.enable_mask) {
             // Allocate the cross-rank sync buffer used by clean_low_latency_buffer.
@@ -2107,6 +2111,11 @@ ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group) {
         }
 
         // Free RDMA buffer (after window deregistered)
+        if (ep_group->ll_epoch_state != nullptr) {
+            CUDA_CHECK(cudaFree(ep_group->ll_epoch_state));
+            ep_group->ll_epoch_state = nullptr;
+        }
+
         if (ep_group->rdma_buffer) {
             NCCL_CHECK_RESULT(ncclMemFree(ep_group->rdma_buffer));
             ep_group->rdma_buffer = nullptr;
@@ -2177,8 +2186,6 @@ struct ncclEpHandle {
             // Backing storage for the two tensors above. Layout matches ll_handle_mem_size().
             void* handle_mem;
             bool owns_handle_mem;
-
-            int buffer_idx = 0;
 
             std::function<ncclResult_t(unsigned int)> continue_fn;
             nccl_ep::LowLatencyLayout layout;
@@ -3330,11 +3337,10 @@ ncclResult_t ncclEpDispatch(
             assert(recv_count->sizes[0] == group->num_local_experts);
         }
 
-        const auto& buffer = handle->ll.layout.buffers[handle->ll.buffer_idx];
-        auto& next_buffer = handle->ll.layout.buffers[handle->ll.buffer_idx ^= 1];
-        const auto next_clean_meta = next_buffer.clean_meta_offset();
+        const auto& buffer = handle->ll.layout.buffer;
+        const auto next_clean_meta = buffer.clean_meta_offset();
 
-        unsigned signal_base = group->num_dispatch_signals;
+        unsigned signal_base = 0;
         // LL rank-major zero-copy writes each available peer payload window directly.
         const bool nvlink_only = (group->lsa_team_size == group->nRanks);
         const bool recipe_zcopy_ok =
@@ -3393,11 +3399,7 @@ ncclResult_t ncclEpDispatch(
                     ? layout_info->recv_topk_idx_kind
                     : NCCL_EP_EXPERT_ID_AUTO);
         auto dispatch_fn = [=](int phases) -> ncclResult_t {
-            char* rdma_base = static_cast<char*>(group->rdma_buffer);
-            void* dispatch_send_ptr = rdma_base + buffer.dispatch_rdma_send_buffer_offset;
-            void* dispatch_recv_ptr = rdma_base + buffer.dispatch_rdma_recv_data_buffer_offset;
-            int* dispatch_count_ptr = reinterpret_cast<int*>(rdma_base + buffer.dispatch_rdma_recv_count_buffer_offset);
-            int* next_clean_ptr = reinterpret_cast<int*>(rdma_base + next_clean_meta.first);
+            void* const rdma_buf = group->rdma_buffer;
             // Prepare data pointers
             auto* recv_x_data = recv_x->data;
             auto* scales_data = scales ? scales->data : nullptr;
@@ -3440,16 +3442,16 @@ ncclResult_t ncclEpDispatch(
                 params.outCnt = recv_count_data;
                 params.outRecvTopkWeights = recv_topk_weights_data;
                 params.outRecvTopkIdx = recv_topk_idx_data;
-                params.sendBuf = dispatch_send_ptr;
-                params.recvBuf = dispatch_recv_ptr;
-                params.recvCntBuf = dispatch_count_ptr;
+                params.rdmaBuf = rdma_buf;
                 params.sendOff = buffer.dispatch_rdma_send_buffer_offset;
                 params.recvOff = buffer.dispatch_rdma_recv_data_buffer_offset;
                 params.recvCntOff = buffer.dispatch_rdma_recv_count_buffer_offset;
-                params.nextRecvCntBuf = next_clean_ptr;
                 params.nextRecvCntBufSize = next_clean_meta.second;
                 params.recvStats = nullptr;
                 params.waitStats = nullptr;
+                params.epochState = group->ll_epoch_state;
+                params.payloadSlotStride = handle->ll.layout.payload_slot_stride;
+                params.signalSlotStride = handle->ll.layout.signal_slot_stride;
                 params.numTokens = handle->num_tokens;
                 params.hidden = hidden;
                 params.maxTokensPerRank = group->config.max_dispatch_tokens_per_rank;
@@ -4350,9 +4352,8 @@ ncclResult_t ncclEpCombine(
         const int num_combined_tokens = static_cast<int>(topk_idx->sizes[0]);
 
         // Manage double-buffering
-        const auto& buffer = handle->ll.layout.buffers[handle->ll.buffer_idx];
-        auto& next_buffer = handle->ll.layout.buffers[handle->ll.buffer_idx ^= 1];
-        const auto next_clean_meta = next_buffer.clean_meta_offset();
+        const auto& buffer = handle->ll.layout.buffer;
+        const auto next_clean_meta = buffer.clean_meta_offset();
 
         // Validate buffer layout
         assert(handle->ll.layout.total_bytes <= handle->group->rdma_buffer_size_alloc);
@@ -4376,13 +4377,9 @@ ncclResult_t ncclEpCombine(
         }
 
         // Define combine lambda
-        unsigned signal_base = handle->ll.buffer_idx * (handle->group->num_dispatch_signals / 2);
+        unsigned signal_base = 0;
         auto combine_fn = [=](int phases) -> ncclResult_t {
-            char* rdma_base = static_cast<char*>(handle->group->rdma_buffer);
-            void* combine_send_ptr = rdma_base + buffer.combine_rdma_send_buffer_offset;
-            void* combine_recv_ptr = rdma_base + buffer.combine_rdma_recv_data_buffer_offset;
-            int* combine_flag_ptr = reinterpret_cast<int*>(rdma_base + buffer.combine_rdma_recv_flag_buffer_offset);
-            int* next_clean_ptr = reinterpret_cast<int*>(rdma_base + next_clean_meta.first);
+            void* const rdma_buf = handle->group->rdma_buffer;
             // Prepare data pointers
             auto* out_data = out->data;
             auto* x_data = x->data;
@@ -4405,15 +4402,15 @@ ncclResult_t ncclEpCombine(
                 params.topkIdxIsInt64 = topk_is_int64;
                 params.topkWeights = topk_weights_data;
                 params.outData = out_data;
-                params.sendBuf = combine_send_ptr;
-                params.recvBuf = combine_recv_ptr;
-                params.recvFlagBuf = combine_flag_ptr;
+                params.rdmaBuf = rdma_buf;
                 params.sendOff = buffer.combine_rdma_send_buffer_offset;
                 params.recvOff = buffer.combine_rdma_recv_data_buffer_offset;
                 params.recvFlagOff = buffer.combine_rdma_recv_flag_buffer_offset;
-                params.nextRecvCntBuf = next_clean_ptr;
                 params.nextRecvCntBufSize = next_clean_meta.second;
                 params.waitStats = nullptr;
+                params.epochState = handle->group->ll_epoch_state;
+                params.payloadSlotStride = handle->ll.layout.payload_slot_stride;
+                params.signalSlotStride = handle->ll.layout.signal_slot_stride;
                 params.numCombinedTokens = num_combined_tokens;
                 params.hidden = hidden;
                 params.maxTokensPerRank = num_max_dispatch_tokens_per_rank;
@@ -4913,8 +4910,8 @@ ncclResult_t ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) {
         MAX_NUM_TOPK,
         NCCL_EP_LAYOUT_RANK_MAJOR);
     char* rdma_base = static_cast<char*>(ep_group->rdma_buffer);
-    auto clean_0 = layout.buffers[0].clean_meta_offset();
-    auto clean_1 = layout.buffers[1].clean_meta_offset();
+    const auto clean_0 = layout.buffer.clean_meta_offset();
+    const auto clean_1 = std::pair{clean_0.first + layout.signal_slot_stride, clean_0.second};
     int* clean_0_ptr = reinterpret_cast<int*>(rdma_base + clean_0.first);
     int* clean_1_ptr = reinterpret_cast<int*>(rdma_base + clean_1.first);
 

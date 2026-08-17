@@ -217,9 +217,17 @@ struct LowLatencyBuffer {
     }
 };
 
+struct LowLatencyEpochState {
+    unsigned int epoch = 0;
+    unsigned int pending_epoch = 0;
+    unsigned int send_in_flight = 0;
+};
+
 struct LowLatencyLayout {
     size_t total_bytes = 0;
-    LowLatencyBuffer buffers[2];
+    LowLatencyBuffer buffer;
+    size_t payload_slot_stride = 0;
+    size_t signal_slot_stride = 0;
 
     template <typename out_ptr_t = void*, typename count_ptr_t = uint8_t*, typename in_ptr_t = void*>
     static out_ptr_t advance(const in_ptr_t& ptr, size_t count) {
@@ -233,10 +241,8 @@ struct LowLatencyLayout {
         int num_experts,
         int num_topk,
         ncclEpLayout_t layout) {
-        // Dispatch and combine layout:
-        //  - 2 symmetric odd/even send buffer
-        //  - 2 symmetric odd/even receive buffers
-        //  - 2 symmetric odd/even signaling buffers
+        // Two physical payload and signaling banks are addressed from one base
+        // layout by the device-selected epoch parity.
 
         // Per-slot sizes for buffer allocation are datatype-agnostic at the API;
         // max_token_bytes upper-bounds the entire dispatch payload. Recipe
@@ -287,33 +293,31 @@ struct LowLatencyLayout {
         size_t dispatch_combo_bytes = dispatch_send_buffer_bytes + dispatch_recv_data_buffer_bytes;
         size_t combine_combo_bytes = combine_send_buffer_bytes + combine_recv_buffer_bytes;
         size_t slot_bytes = std::max(dispatch_combo_bytes, combine_combo_bytes);
-        total_bytes += slot_bytes * 2;
+        payload_slot_stride = slot_bytes;
+        total_bytes += payload_slot_stride * 2;
 
         // Symmetric signaling buffers
         size_t dispatch_recv_count_buffer_bytes = num_experts * sizeof(int);
         size_t combine_recv_flag_buffer_bytes = dispatch_recv_count_buffer_bytes;
         size_t signaling_buffer_bytes = std::max(dispatch_recv_count_buffer_bytes, combine_recv_flag_buffer_bytes);
         size_t signaling_buffer_bytes_aligned = align<size_t>(signaling_buffer_bytes, 128);
-        total_bytes += signaling_buffer_bytes_aligned * 2;
+        signal_slot_stride = signaling_buffer_bytes_aligned;
+        total_bytes += signal_slot_stride * 2;
 
-        // Assign offsets into rdma_buffer. Pointers are resolved at use time
-        // by adding these offsets to the group's current rdma_buffer base.
-
-        for (int i = 0; i < 2; ++i) {
-            const size_t slot_base = signaling_buffer_bytes_aligned * 2 + slot_bytes * i;
-            const size_t count_off = signaling_buffer_bytes_aligned * i;
-            buffers[i] = LowLatencyBuffer{
-                .num_clean_int = static_cast<int>(signaling_buffer_bytes / sizeof(int)),
-                .dispatch_rdma_send_buffer_offset = slot_base,
-                .dispatch_rdma_recv_data_buffer_offset = slot_base + dispatch_send_buffer_bytes,
-                .dispatch_rdma_recv_count_buffer_offset = count_off,
-                .combine_rdma_send_buffer_offset = slot_base,
-                .combine_rdma_recv_data_buffer_offset = slot_base + combine_send_buffer_bytes,
-                .combine_rdma_recv_flag_buffer_offset = count_off,
-                .combine_rdma_send_buffer_data_start_offset = slot_base,
-                .num_bytes_per_combine_msg = num_bytes_per_combine_msg,
-            };
-        }
+        // Base-bank offsets into rdma_buffer. The device derives bank 1 with
+        // payload_slot_stride and signal_slot_stride.
+        const size_t slot_base = signal_slot_stride * 2;
+        buffer = LowLatencyBuffer{
+            .num_clean_int = static_cast<int>(signaling_buffer_bytes / sizeof(int)),
+            .dispatch_rdma_send_buffer_offset = slot_base,
+            .dispatch_rdma_recv_data_buffer_offset = slot_base + dispatch_send_buffer_bytes,
+            .dispatch_rdma_recv_count_buffer_offset = 0,
+            .combine_rdma_send_buffer_offset = slot_base,
+            .combine_rdma_recv_data_buffer_offset = slot_base + combine_send_buffer_bytes,
+            .combine_rdma_recv_flag_buffer_offset = 0,
+            .combine_rdma_send_buffer_data_start_offset = slot_base,
+            .num_bytes_per_combine_msg = num_bytes_per_combine_msg,
+        };
     }
 };
 

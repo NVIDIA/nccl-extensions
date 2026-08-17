@@ -52,6 +52,39 @@ __device__ __forceinline__ int getExpertRankIdx(int expertIdx, int numLocalExper
     return (expertIdx >= 0) ? expertIdx / numLocalExperts : -1;
 }
 
+__device__ __forceinline__ unsigned int selectLowLatencyEpoch(
+    LowLatencyEpochState* epochState, int phases, int smId, int threadId) {
+    if (phases & LOW_LATENCY_SEND_PHASE) {
+        const unsigned int epoch = epochState->epoch;
+        if (smId == 0 && threadId == 0) {
+            EP_DEVICE_ASSERT(epochState->send_in_flight == 0);
+            if ((phases & LOW_LATENCY_RECV_PHASE) == 0) {
+                epochState->pending_epoch = epoch;
+                epochState->send_in_flight = 1;
+            }
+        }
+        return epoch;
+    }
+
+    const unsigned int epoch = epochState->pending_epoch;
+    if (smId == 0 && threadId == 0) {
+        EP_DEVICE_ASSERT(epochState->send_in_flight == 1);
+        EP_DEVICE_ASSERT(epoch == epochState->epoch);
+        ++epochState->epoch;
+        epochState->send_in_flight = 0;
+    }
+    return epoch;
+}
+
+__device__ __forceinline__ void completeFullLowLatencyEpoch(
+    LowLatencyEpochState* epochState, int phases, int smId, int threadId) {
+    if ((phases & (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE)) ==
+            (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE) &&
+        smId == 0 && threadId == 0) {
+        ++epochState->epoch;
+    }
+}
+
 // Warp-cooperative: all 32 lanes must call together.
 // Each lane inspects its own topk index and matches it with others via __match_any_sync.
 // If this lane is not the first occurrence of its source rank, topkIdxByLane is dropped to -1.
@@ -612,8 +645,9 @@ __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
   void* outDataBuf, void* outScalesBuf, int* outSrcInfo, int* outRecvRankCounter, int64_t* outLayout, int* outCnt,
   float* outRecvTopkWeights, int32_t* outRecvTopkIdx,
   // INTERMEDIATE
-  void* sendBuf, void* recvBuf, int* recvCntBuf, size_t sendOff, size_t recvOff, size_t recvCntOff,
-  int* rankCountersBase, int* rankDone, int* nextRecvCntBuf, int nextRecvCntBufSize, int* recvStats, int64_t* waitStats,
+  void* rdmaBuf, size_t sendOffBase, size_t recvOffBase, size_t recvCntOffBase,
+  int* rankCountersBase, int* rankDone, int nextRecvCntBufSize, int* recvStats, int64_t* waitStats,
+  LowLatencyEpochState* epochState, size_t payloadSlotStride, size_t signalSlotStride,
   // CONFIG
   int numTokens, int scalesPerToken, int maxTokensPerRank, int numTopk, int numExperts, int currRank, int numRanks,
   int numWarpGroups, int numWarpsPerGroup, bool roundScale, ncclEpExpertIdKind_t recvTopkIdxKind, int phases,
@@ -630,6 +664,19 @@ __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
     const auto warpGroupId = warpId / numWarpsPerGroup;
     const auto subWarpId = warpId % numWarpsPerGroup;
     const auto responsibleExpertIdx = smId * numWarpGroups + warpGroupId;
+
+    const unsigned int epoch = selectLowLatencyEpoch(epochState, phases, smId, threadId);
+    const size_t bank = static_cast<size_t>(epoch & 1U);
+    const size_t bank_next = bank ^ 1U;
+    const size_t sendOff = sendOffBase + bank * payloadSlotStride;
+    const size_t recvOff = recvOffBase + bank * payloadSlotStride;
+    const size_t recvCntOff = recvCntOffBase + bank * signalSlotStride;
+    char* const rdmaBase = static_cast<char*>(rdmaBuf);
+    void* const sendBuf = rdmaBase + sendOff;
+    void* const recvBuf = rdmaBase + recvOff;
+    int* const recvCntBuf = reinterpret_cast<int*>(rdmaBase + recvCntOff);
+    int* const nextRecvCntBuf = reinterpret_cast<int*>(rdmaBase + recvCntOffBase + bank_next * signalSlotStride);
+    signalsBase += static_cast<unsigned>(bank) * static_cast<unsigned>(numExperts);
 
     auto rankSentCnt = rankCountersBase;
     auto rankArrivedCnt = rankCountersBase + numRanks;
@@ -913,6 +960,7 @@ LOW_LATENCY_DISPATCH_RECV:
 
     // For send-and-recv kernels, we need a grid sync for making `packed_recv_count` visible
     if (phases & LOW_LATENCY_SEND_PHASE) cg::this_grid().sync();
+    completeFullLowLatencyEpoch(epochState, phases, smId, threadId);
 
     // Resent counters for the next dispatch
     if (responsibleExpertIdx < numRanks) {
@@ -1851,8 +1899,9 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
   // OUTPUT
   void* outData,
   // INTERMEDIATE
-  void* sendBuf, void* recvBuf, int* recvFlagBuf, size_t sendOff, size_t recvOff, size_t recvFlagOff,
-  int* atomicCleanFlag, int* nextRecvCntBuf, int nextRecvCntBufSize, int64_t* waitStats,
+  void* rdmaBuf, size_t sendOffBase, size_t recvOffBase, size_t recvFlagOffBase,
+  int* atomicCleanFlag, int nextRecvCntBufSize, int64_t* waitStats,
+  LowLatencyEpochState* epochState, size_t payloadSlotStride, size_t signalSlotStride,
   // CONFIG
   int numCombinedTokens, int hidden, int numTopk, int maxTokensPerRank, int numExperts, int currRank, int numRanks,
   int numWarpGroups, int numWarpsPerGroup, int phases, bool zeroCopy, int numComms, ncclDevComm* devComms,
@@ -1877,6 +1926,19 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
     const auto warpGroupId = warpId / numWarpsPerGroup;
     const auto subWarpId = warpId % numWarpsPerGroup;
     const auto responsibleExpertIdx = smId * numWarpGroups + warpGroupId;
+
+    const unsigned int epoch = selectLowLatencyEpoch(epochState, phases, smId, threadId);
+    const size_t bank = static_cast<size_t>(epoch & 1U);
+    const size_t bank_next = bank ^ 1U;
+    const size_t sendOff = sendOffBase + bank * payloadSlotStride;
+    const size_t recvOff = recvOffBase + bank * payloadSlotStride;
+    const size_t recvFlagOff = recvFlagOffBase + bank * signalSlotStride;
+    char* const rdmaBase = static_cast<char*>(rdmaBuf);
+    void* const sendBuf = rdmaBase + sendOff;
+    void* const recvBuf = rdmaBase + recvOff;
+    int* const recvFlagBuf = reinterpret_cast<int*>(rdmaBase + recvFlagOff);
+    int* const nextRecvCntBuf = reinterpret_cast<int*>(rdmaBase + recvFlagOffBase + bank_next * signalSlotStride);
+    signalsBase += static_cast<unsigned>(bank) * static_cast<unsigned>(numExperts);
 
     extern __shared__ __align__(1024) uint8_t smemBuffer[];
 
@@ -2170,7 +2232,8 @@ LOW_LATENCY_COMBINE_RECV:
                 timeoutCycles);
         }
     }
-    cg::this_grid().sync();
+    if (phases & LOW_LATENCY_SEND_PHASE) cg::this_grid().sync();
+    completeFullLowLatencyEpoch(epochState, phases, smId, threadId);
 
     // Reassign warp groups; FP32 doubles SMEM per group, drop to 1 group to stay within limits
     constexpr int kMaxNumGroups = (kElemBytes == 2) ? 2 : 1;

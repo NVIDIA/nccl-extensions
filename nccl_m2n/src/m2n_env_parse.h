@@ -62,6 +62,18 @@ inline bool parseM2nPositiveEnvInt(const char* s, int* out) {
   return true;
 }
 
+inline bool parseM2nNonNegativeEnvInt(const char* s, int* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  int n = 0;
+  if (!parseM2nEnvInt(s, &n) || n < 0) {
+    return false;
+  }
+  *out = n;
+  return true;
+}
+
 inline bool parseM2nEnvSize(const char* s, size_t* out, bool allowZero) {
   if (s == nullptr || out == nullptr) {
     return false;

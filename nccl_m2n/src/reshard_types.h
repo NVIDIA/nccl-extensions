@@ -20,6 +20,7 @@
 #define NCCL_RESHARD_TYPES_H_
 
 #include <cstddef>
+#include <cstdint>
 
 #include "cuda_runtime.h"
 #include "nccl.h"
@@ -47,6 +48,11 @@ typedef enum {
    * (reshardKernelUserWindow) over contiguous plans, then unpack. */
   RESHARD_COPY_ALGO_PACK = 2
 } ReshardCopyAlgorithm;
+
+typedef enum {
+  RESHARD_PIPE_NET_DEVICE = 0,
+  RESHARD_PIPE_NET_HOST_RMA = 1
+} ReshardPipeNetMode;
 
 /* ncclDevComm is defined in nccl_device.h; only TUs that need the
    DevCommCacheEntry (reshard_cache.cc) include that header directly. */

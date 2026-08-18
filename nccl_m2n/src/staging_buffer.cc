@@ -21,11 +21,7 @@
 #include "m2n_log.h"
 
 #include <algorithm>
-#include <cerrno>
-#include <cctype>
-#include <climits>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -72,104 +68,6 @@ void stagingSetVerbose(bool verbose) {
     } \
   } while (0)
 
-/* ======================================================================
- * Env helpers
- * ====================================================================*/
-
-static bool parsePositiveInt(const char* value, int* out) {
-  if (value == nullptr || out == nullptr) {
-    return false;
-  }
-  errno = 0;
-  char* end = nullptr;
-  long parsed = strtol(value, &end, 10);
-  if (end == value || errno == ERANGE || parsed <= 0 || parsed > INT_MAX) {
-    return false;
-  }
-  while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end))) {
-    end++;
-  }
-  if (*end != '\0') {
-    return false;
-  }
-  *out = (int)parsed;
-  return true;
-}
-
-static bool parseNonNegativeInt(const char* value, int* out) {
-  if (value == nullptr || out == nullptr) {
-    return false;
-  }
-  errno = 0;
-  char* end = nullptr;
-  long parsed = strtol(value, &end, 10);
-  if (end == value || errno == ERANGE || parsed < 0 || parsed > INT_MAX) {
-    return false;
-  }
-  while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end))) {
-    end++;
-  }
-  if (*end != '\0') {
-    return false;
-  }
-  *out = (int)parsed;
-  return true;
-}
-
-static bool parsePositiveSize(const char* value, size_t* out) {
-  if (value == nullptr || out == nullptr) {
-    return false;
-  }
-  const char* scan = value;
-  while (*scan != '\0' && std::isspace(static_cast<unsigned char>(*scan))) {
-    scan++;
-  }
-  if (*scan == '-') {
-    return false;
-  }
-  errno = 0;
-  char* end = nullptr;
-  unsigned long long parsed = strtoull(value, &end, 10);
-  if (end == value || errno == ERANGE || parsed == 0 ||
-      parsed > (unsigned long long)std::numeric_limits<size_t>::max()) {
-    return false;
-  }
-  while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end))) {
-    end++;
-  }
-  if (*end != '\0') {
-    return false;
-  }
-  *out = (size_t)parsed;
-  return true;
-}
-
-static int readEnvNonNegativeInt(const char* name, int defaultVal) {
-  // NOLINTNEXTLINE(concurrency-mt-unsafe) — init-time env read during staging pool creation.
-  const char* val = getenv(name);
-  int parsed = 0;
-  if (parseNonNegativeInt(val, &parsed)) {
-    return parsed;
-  }
-  return defaultVal;
-}
-
-static int stagingTargetCtasFromEnv(bool* found) {
-  // NOLINTNEXTLINE(concurrency-mt-unsafe) — init-time env read during staging pool creation.
-  const char* val = getenv("NCCL_RESHARD_STAGING_TARGET_CTAS");
-  int parsed = 0;
-  if (parsePositiveInt(val, &parsed)) {
-    if (found != nullptr) {
-      *found = true;
-    }
-    return parsed;
-  }
-  if (found != nullptr) {
-    *found = false;
-  }
-  return 0;
-}
-
 static int stagingDefaultTargetCtasForPeerGroups(int peerGroupCount) {
   if (peerGroupCount <= 0) {
     return 6;
@@ -181,41 +79,6 @@ static int stagingDefaultTargetCtasForPeerGroups(int peerGroupCount) {
     ctasPerPeerGroup = 2;
   }
   return std::max(6, peerGroupCount * ctasPerPeerGroup);
-}
-
-static int readEnvOptionalInt(const char* name, bool* found) {
-  // NOLINTNEXTLINE(concurrency-mt-unsafe) — init-time env read during staging pool creation.
-  const char* val = getenv(name);
-  int parsed = 0;
-  if (parsePositiveInt(val, &parsed)) {
-    if (found != nullptr) {
-      *found = true;
-    }
-    return parsed;
-  }
-  if (found != nullptr) {
-    *found = false;
-  }
-  return 0;
-}
-
-static size_t readEnvSize(const char* name, size_t defaultVal) {
-  // NOLINTNEXTLINE(concurrency-mt-unsafe) — init-time env read during staging pool creation.
-  const char* val = getenv(name);
-  size_t parsed = 0;
-  if (parsePositiveSize(val, &parsed)) {
-    return parsed;
-  }
-  return defaultVal;
-}
-
-StagingBufferConfig stagingBufferConfigFromEnv() {
-  StagingBufferConfig config{};
-  config.numChannels = readEnvOptionalInt("NCCL_RESHARD_STAGING_NUM_CHANNELS", &config.numChannelsExplicit);
-  config.channelSize = readEnvSize("NCCL_RESHARD_STAGING_CHANNEL_SIZE", STAGING_DEFAULT_CHANNEL_SIZE);
-  config.chunkSize = readEnvSize("NCCL_RESHARD_STAGING_CHUNK_SIZE", STAGING_DEFAULT_CHUNK_SIZE);
-  config.peersPerChannel = readEnvNonNegativeInt("NCCL_RESHARD_STAGING_PEERS_PER_CHANNEL", 1);
-  return config;
 }
 
 static int clampNumChannels(int numChannels) {
@@ -230,6 +93,18 @@ static int clampNumChannels(int numChannels) {
   return numChannels;
 }
 
+static size_t stagingChannelControlBase(const StagingBufferState* state, int channel) {
+  return state->adaptiveChannelLayout ? (size_t)channel * state->controlRegionSize :
+                                        (size_t)channel * state->channelSize;
+}
+
+static size_t stagingChannelDataBase(const StagingBufferState* state, int channel) {
+  if (state->adaptiveChannelLayout) {
+    return (size_t)state->capacityChannels * state->controlRegionSize + (size_t)channel * state->channelDataSize;
+  }
+  return stagingChannelControlBase(state, channel) + state->controlRegionSize;
+}
+
 /* ======================================================================
  * stagingBufferInit
  * ====================================================================*/
@@ -239,50 +114,66 @@ static ncclResult_t stagingBufferInitInternal(StagingBufferState* state, int num
   NCCL_M2N_CHECK_ARG(state != nullptr, -1, "[STAGING] stagingBufferInit called with null state");
   memset(state, 0, sizeof(*state));
 
-  StagingBufferConfig config = stagingBufferConfigFromEnv();
+  const ReshardStagingRuntimeConfig& config = reshardGetStagingRuntimeConfig();
   int numChannels = (numChannelsOverride > 0) ?
                       numChannelsOverride :
-                      (config.numChannelsExplicit ? config.numChannels : STAGING_DEFAULT_NUM_CHANNELS);
+                      (config.numChannelsFixed ? config.numChannels : STAGING_DEFAULT_NUM_CHANNELS);
   numChannels = clampNumChannels(numChannels);
   int controlSlotCount = (controlSlotCountOverride > 0) ? controlSlotCountOverride : STAGING_DEFAULT_CONTROL_SLOTS;
-  size_t channelSize = config.channelSize;
+  size_t channelDataSize = config.channelDataSize;
   size_t chunkSize = config.chunkSize;
   int peersPerChannel = config.peersPerChannel;
+  const bool adaptiveChannelLayout =
+    config.hostRmaDefault && !config.numChannelsExplicit && !config.channelDataSizeExplicit;
 
   STAGING_LOG(-1, "stagingBufferInit() ENTRY");
   STAGING_LOG(-1,
-              "  numChannels=%d%s channelSize=%zu (%zuMB) controlSlots=%d chunkSize=%zu (%zuKB) "
+              "  numChannels=%d%s channelDataSize=%zu (%zuMB) controlSlots=%d chunkSize=%zu (%zuKB) "
               "peersPerChannel=%d",
-              numChannels, config.numChannelsExplicit ? " explicit" : "", channelSize, channelSize / (1024 * 1024),
-              controlSlotCount, chunkSize, chunkSize / 1024, peersPerChannel);
+              numChannels, config.numChannelsExplicit ? " explicit" : (config.numChannelsFixed ? " default" : ""),
+              channelDataSize, channelDataSize / (1024 * 1024), controlSlotCount, chunkSize, chunkSize / 1024,
+              peersPerChannel);
 
-  /* Each channel holds a control region + two equal data halves
-   * (RDMA + LSA), so we need at least ctrl + 2*chunk bytes of room. */
+  /* The configured channel size is data capacity only.  The allocator adds
+   * control space, then splits data capacity into RDMA and LSA halves. */
   size_t chunkPairSize = 0;
   NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(2, chunkSize, &chunkPairSize), -1,
                      "[STAGING] chunkSize %zu overflows staging channel sizing", chunkSize);
   size_t ctrlRegionSize = 0;
   NCCL_M2N_CHECK_ARG(m2nCheckedMulSize((size_t)controlSlotCount, (size_t)STAGING_CTRL_REGION_SIZE, &ctrlRegionSize), -1,
                      "[STAGING] controlSlotCount %d overflows staging channel sizing", controlSlotCount);
-  size_t minChannelSize = 0;
-  NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(ctrlRegionSize, chunkPairSize, &minChannelSize), -1,
-                     "[STAGING] chunkSize %zu overflows staging channel sizing", chunkSize);
-  NCCL_M2N_CHECK_ARG(channelSize >= minChannelSize, -1,
-                     "[STAGING] channelSize %zu too small (min %zu with chunkSize %zu)", channelSize, minChannelSize,
-                     chunkSize);
+  NCCL_M2N_CHECK_ARG(channelDataSize >= chunkPairSize, -1,
+                     "[STAGING] channel data size %zu too small (min %zu with chunkSize %zu)", channelDataSize,
+                     chunkPairSize, chunkSize);
+  size_t channelSize = 0;
+  NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(ctrlRegionSize, channelDataSize, &channelSize), -1,
+                     "[STAGING] channel data size %zu overflows with control region %zu", channelDataSize,
+                     ctrlRegionSize);
 
+  size_t dataCapacity = 0;
+  NCCL_M2N_CHECK_ARG(m2nCheckedMulSize((size_t)numChannels, channelDataSize, &dataCapacity), -1,
+                     "[STAGING] data capacity overflows: channels=%d channelDataSize=%zu", numChannels,
+                     channelDataSize);
   size_t totalSize = 0;
-  NCCL_M2N_CHECK_ARG(m2nCheckedMulSize((size_t)numChannels, channelSize, &totalSize), -1,
-                     "[STAGING] total staging size overflows: channels=%d channelSize=%zu", numChannels, channelSize);
-  size_t dataRegionSize = (channelSize - ctrlRegionSize) / 2;
+  if (adaptiveChannelLayout) {
+    size_t controlCapacity = 0;
+    NCCL_M2N_CHECK_ARG(m2nCheckedMulSize((size_t)numChannels, ctrlRegionSize, &controlCapacity) &&
+                         m2nCheckedAddSize(controlCapacity, dataCapacity, &totalSize),
+                       -1, "[STAGING] adaptive staging size overflows: channels=%d", numChannels);
+  } else {
+    NCCL_M2N_CHECK_ARG(m2nCheckedMulSize((size_t)numChannels, channelSize, &totalSize), -1,
+                       "[STAGING] total staging size overflows: channels=%d channelSize=%zu", numChannels, channelSize);
+  }
+  size_t dataRegionSize = channelDataSize / 2;
   size_t slotsPerRegionSize = dataRegionSize / chunkSize;
   NCCL_M2N_CHECK_ARG(slotsPerRegionSize <= (size_t)INT_MAX, -1, "[STAGING] slots/region %zu exceeds INT_MAX",
                      slotsPerRegionSize);
   int slotsPerRegion = (int)slotsPerRegionSize;
 
-  STAGING_LOG(-1, "  per-channel: ctrl=%zuB rdma_data=%zuB lsa_data=%zuB slots=%d", ctrlRegionSize, dataRegionSize,
-              dataRegionSize, slotsPerRegion);
-  STAGING_LOG(-1, "  total alloc=%zu bytes (%zuMB)", totalSize, totalSize / (1024 * 1024));
+  STAGING_LOG(-1, "  per-channel: ctrl=%zuB data=%zuB rdma_data=%zuB lsa_data=%zuB slots=%d", ctrlRegionSize,
+              channelDataSize, dataRegionSize, dataRegionSize, slotsPerRegion);
+  STAGING_LOG(-1, "  total alloc=%zu bytes (%zuMB) adaptive=%d", totalSize, totalSize / (1024 * 1024),
+              (int)adaptiveChannelLayout);
 
   void* buffer = nullptr;
   STAGING_NCCLCHECK(ncclMemAlloc(&buffer, totalSize));
@@ -290,8 +181,19 @@ static ncclResult_t stagingBufferInitInternal(StagingBufferState* state, int num
   /* From here on, state->initialized is still false, so a later
    * stagingBufferFinalize would early-out without reclaiming `buffer`.
    * Free it explicitly on any failure between here and `initialized=true`. */
-  if (cudaError_t e = cudaMemset2D(buffer, channelSize, 0, ctrlRegionSize, numChannels); e != cudaSuccess) {
-    fprintf(stderr, "[STAGING] CUDA error %s:%d '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e));
+  cudaError_t memsetResult = cudaSuccess;
+  if (adaptiveChannelLayout) {
+    size_t controlCapacity = 0;
+    if (!m2nCheckedMulSize((size_t)numChannels, ctrlRegionSize, &controlCapacity)) {
+      ncclMemFree(buffer);
+      return ncclInternalError;
+    }
+    memsetResult = cudaMemset(buffer, 0, controlCapacity);
+  } else {
+    memsetResult = cudaMemset2D(buffer, channelSize, 0, ctrlRegionSize, numChannels);
+  }
+  if (memsetResult != cudaSuccess) {
+    fprintf(stderr, "[STAGING] CUDA error %s:%d '%s'\n", __FILE__, __LINE__, cudaGetErrorString(memsetResult));
     ncclMemFree(buffer);
     return ncclInternalError;
   }
@@ -299,26 +201,24 @@ static ncclResult_t stagingBufferInitInternal(StagingBufferState* state, int num
   state->buffer = buffer;
   state->totalSize = totalSize;
   state->numChannels = numChannels;
+  state->capacityChannels = numChannels;
   state->channelSize = channelSize;
+  state->channelDataSize = channelDataSize;
+  state->dataCapacity = dataCapacity;
   state->controlSlotCount = controlSlotCount;
   state->controlRegionSize = ctrlRegionSize;
   state->chunkSize = chunkSize;
   state->peersPerChannel = peersPerChannel;
+  state->adaptiveChannelLayout = adaptiveChannelLayout;
   state->devParams = nullptr;
   state->pipePlanCacheNextVictim = 0;
-  if (cudaError_t e = cudaMalloc(&state->devParams, sizeof(StagingKernelParams)); e != cudaSuccess) {
-    fprintf(stderr, "[STAGING] CUDA error %s:%d '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e));
-    ncclMemFree(buffer);
-    state->buffer = nullptr;
-    return ncclInternalError;
-  }
   state->initialized = true;
 
   RESHARD_INFO(-1,
-               "[STAGING] init complete: %d channels x %zuMB = %zuMB total, "
+               "[STAGING] init complete: %d channels x %zuMB data (+%zuKB control) = %zuMB total, "
                "chunkSize=%zuKB controlSlots=%d slots/region=%d peersPerChannel=%d",
-               numChannels, channelSize / (1024 * 1024), totalSize / (1024 * 1024), chunkSize / 1024, controlSlotCount,
-               slotsPerRegion, peersPerChannel);
+               numChannels, channelDataSize / (1024 * 1024), ctrlRegionSize / 1024, totalSize / (1024 * 1024),
+               chunkSize / 1024, controlSlotCount, slotsPerRegion, peersPerChannel);
   return ncclSuccess;
 }
 
@@ -333,6 +233,36 @@ ncclResult_t stagingBufferInitWithNumChannels(StagingBufferState* state, int num
 ncclResult_t stagingBufferInitWithNumChannelsAndControlSlots(StagingBufferState* state, int numChannels,
                                                              int controlSlotCount) {
   return stagingBufferInitInternal(state, numChannels, controlSlotCount);
+}
+
+ncclResult_t stagingBufferConfigureActiveChannels(StagingBufferState* state, int numChannels) {
+  NCCL_M2N_CHECK_ARG(state != nullptr && state->initialized, -1,
+                     "[STAGING] configure active channels requires an initialized state");
+  NCCL_M2N_CHECK_ARG(numChannels > 0 && numChannels <= state->capacityChannels, -1,
+                     "[STAGING] active channels %d exceed pool capacity %d", numChannels, state->capacityChannels);
+  if (!state->adaptiveChannelLayout) {
+    state->numChannels = numChannels;
+    return ncclSuccess;
+  }
+
+  size_t slotPairBytes = 0;
+  NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(2, state->chunkSize, &slotPairBytes), -1,
+                     "[STAGING] chunk size %zu overflows adaptive channel sizing", state->chunkSize);
+  size_t channelDataSize = state->dataCapacity / (size_t)numChannels;
+  channelDataSize -= channelDataSize % slotPairBytes;
+  NCCL_M2N_CHECK_ARG(channelDataSize >= slotPairBytes, -1,
+                     "[STAGING] adaptive channel data size %zu is smaller than two chunks of %zu", channelDataSize,
+                     state->chunkSize);
+  size_t channelSize = 0;
+  NCCL_M2N_CHECK_ARG(m2nCheckedAddSize(state->controlRegionSize, channelDataSize, &channelSize), -1,
+                     "[STAGING] adaptive channel size overflow");
+
+  state->numChannels = numChannels;
+  state->channelDataSize = channelDataSize;
+  state->channelSize = channelSize;
+  STAGING_LOG(-1, "adaptive Host-RMA layout: activeChannels=%d channelData=%zuMB slots/region=%zu", numChannels,
+              channelDataSize / (1024 * 1024), (channelDataSize / 2) / state->chunkSize);
+  return ncclSuccess;
 }
 
 /* ======================================================================
@@ -365,7 +295,7 @@ static void setFcLsaProducer(StagingFlowCtrl* fc, size_t channelBase, int myTarg
 #ifdef STAGING_KERNEL_TRACE
   fprintf(stdout,
           "[FC_PROD] my=%d -> follower_world=%d follower_local=%d ch=%d "
-          "ch_base=%zu my_target_idx=%d my_src_idx_on_dest=%d "
+          "ch_base=%zu myTargetIdx=%d mySrcIdxOnDest=%d "
           "local_head_off=%zu remote_tail_off=%zu\n",
           myWorldRank, peerWorldRank, fc->remoteRank, channelId, channelBase, myTargetIdx, mySourceIdxOnDest,
           fc->localHeadOffset, fc->remoteTailOffset);
@@ -390,7 +320,7 @@ static void setFcLsaConsumer(StagingFlowCtrl* fc, size_t channelBase, int mySour
 #ifdef STAGING_KERNEL_TRACE
   fprintf(stdout,
           "[FC_CONS] my=%d <- src_world=%d src_local=%d ch=%d "
-          "ch_base=%zu my_source_idx=%d src_target_idx_for_me=%d "
+          "ch_base=%zu mySourceIdx=%d src_target_idx_for_me=%d "
           "local_tail_off=%zu remote_head_off=%zu\n",
           myWorldRank, peerWorldRank, fc->remoteRank, channelId, channelBase, mySourceIdx, sourceTargetIdxForMe,
           fc->localTailOffset, fc->remoteHeadOffset);
@@ -409,9 +339,8 @@ struct StagingRdmaSignalLayout {
 
 static int stagingRdmaSignalId(const StagingRdmaSignalLayout& layout, int channelId, int channelRank, int peerIndex,
                                int peerCount) {
-  /* PIPE translates the active edge to its fixed (peer, channel) slot. The
-   * resulting signal ID is stored in StagingFlowCtrl, so kernels do not need
-   * the translation metadata. */
+  /* PIPE assigns each active edge to a stable (peer, channel-rank) GIN slot.
+   * PACK retains the legacy channel-major map. */
   const int slot = layout.dense ? peerIndex * layout.channelsPerPeer + channelRank : channelId * peerCount + peerIndex;
   return slot * 2;
 }
@@ -629,24 +558,30 @@ static size_t getMaxPeerGroupSize(const StagingTransferDescriptor* desc) {
 }
 
 int stagingResolveNumChannelsForTransfer(const StagingTransferDescriptor* desc) {
-  StagingBufferConfig config = stagingBufferConfigFromEnv();
-  if (config.numChannelsExplicit) {
+  const ReshardStagingRuntimeConfig& config = reshardGetStagingRuntimeConfig();
+  if (config.numChannelsFixed) {
     return clampNumChannels(config.numChannels);
+  }
+  if (config.hostRmaDefault) {
+    if (desc == nullptr) {
+      return clampNumChannels(config.numChannels);
+    }
+    const size_t maxPeerGroupSize = getMaxPeerGroupSize(desc);
+    const int peerGroups = ceilDivInt((int)maxPeerGroupSize, std::max(1, config.peersPerChannel));
+    return clampNumChannels(std::min(std::max(1, peerGroups), config.numChannels));
   }
   if (desc != nullptr && config.peersPerChannel > 0) {
     size_t maxPeerGroupSize = getMaxPeerGroupSize(desc);
     int peerGroupCount = ceilDivInt((int)maxPeerGroupSize, config.peersPerChannel);
     int requested = peerGroupCount;
     if (desc->ctaHeuristicPeerCount > 0) {
-      bool targetCtasExplicit = false;
-      int targetCtas = stagingTargetCtasFromEnv(&targetCtasExplicit);
-      if (!targetCtasExplicit) {
+      int targetCtas = config.targetCtas;
+      if (!config.targetCtasExplicit) {
         targetCtas = stagingDefaultTargetCtasForPeerGroups(peerGroupCount);
       }
       int requestedCtas = std::max(peerGroupCount, targetCtas);
-      if (desc->hasLocalFanout && desc->maxEdgeBytes > 0 && config.chunkSize > 0 &&
-          config.channelSize > STAGING_CTRL_REGION_SIZE) {
-        size_t dataRegionSize = (config.channelSize - STAGING_CTRL_REGION_SIZE) / 2;
+      if (desc->hasLocalFanout && desc->maxEdgeBytes > 0 && config.chunkSize > 0 && config.channelDataSize > 0) {
+        size_t dataRegionSize = config.channelDataSize / 2;
         int maxChannelPeerCount = ceilDivInt((int)maxPeerGroupSize, peerGroupCount);
         size_t peerRegionSize = maxChannelPeerCount > 0 ? dataRegionSize / (size_t)maxChannelPeerCount : 0;
         size_t slotsPerPeer = peerRegionSize / config.chunkSize;
@@ -682,16 +617,16 @@ ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const Stagi
   const size_t channelSize = state->channelSize;
   const size_t C = state->controlRegionSize;
   const int controlSlot = desc->controlSlot;
-  if (numChannels <= 0) {
-    RESHARD_WARN(R, "[STAGING] invalid numChannels=%d", numChannels);
-    return ncclInvalidArgument;
-  }
   NCCL_M2N_CHECK_ARG(state->chunkSize > 0 && channelSize > C, R,
                      "[STAGING] invalid staging sizes: channel=%zu ctrl=%zu chunk=%zu", channelSize, C,
                      state->chunkSize);
   NCCL_M2N_CHECK_ARG(state->controlSlotCount > 0 && controlSlot >= 0 && controlSlot < state->controlSlotCount, R,
                      "[STAGING] invalid controlSlot=%d for controlSlotCount=%d", controlSlot, state->controlSlotCount);
-  const size_t dataRegionSize = (channelSize - C) / 2;
+  const size_t channelDataSize = state->channelDataSize;
+  NCCL_M2N_CHECK_ARG(channelDataSize >= 2 * state->chunkSize, R,
+                     "[STAGING] channel data size %zu is too small for chunk size %zu", channelDataSize,
+                     state->chunkSize);
+  const size_t dataRegionSize = channelDataSize / 2;
 
   NCCL_M2N_CHECK_ARG(desc->numTargets >= 0 && desc->numTargets <= MAX_TARGETS && desc->numSources >= 0 &&
                        desc->numSources <= MAX_SOURCES,
@@ -723,8 +658,8 @@ ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const Stagi
                      rdmaSourceCount, desc->numLsaFollowers, lsaTargetCount);
 
   const size_t maxPeerGroupSize = getMaxPeerGroupSize(desc);
-  // Only PIPE kernels consume the compact peer-to-channel map. DIRECT uses
-  // the channel-major staging map and needs every channel populated.
+  // Only PIPE consumes the compact peer-to-channel map. DIRECT needs every
+  // channel populated for its dense channel-major staging map.
   const bool groupPeersByChannel = reshardGetCopyAlgorithm() == RESHARD_COPY_ALGO_PIPE && state->peersPerChannel > 0;
   int peerGroupCount = 1;
   size_t maxChannelPeerCount = maxPeerGroupSize;
@@ -742,10 +677,6 @@ ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const Stagi
       std::max((size_t)ceilDivInt((int)maxPeerGroupSize, peerGroupCount), maxPeersInChannelGroup(desc, peerGroupCount));
   }
 
-  if (maxChannelPeerCount == 0) {
-    RESHARD_WARN(R, "[STAGING] invalid maxChannelPeerCount=0");
-    return ncclInvalidArgument;
-  }
   const size_t maxChunkSize = dataRegionSize / maxChannelPeerCount;
   NCCL_M2N_CHECK_ARG(maxChunkSize > 0, R, "[STAGING] channel data region too small (%zu B / %zu peers)", dataRegionSize,
                      maxChannelPeerCount);
@@ -753,14 +684,14 @@ ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const Stagi
   if (chunkSize != state->chunkSize) {
     STAGING_LOG(R,
                 "  chunkSize adjusted: requested=%zu effective=%zu max_peer_group=%zu "
-                "max_channel_peer_group=%zu data_region=%zu peersPerChannel=%d peer_groups=%d",
+                "max_channel_peer_group=%zu data_region=%zu peersPerChannel=%d peerGroups=%d",
                 state->chunkSize, chunkSize, maxPeerGroupSize, maxChannelPeerCount, dataRegionSize,
                 state->peersPerChannel, peerGroupCount);
   }
 
   STAGING_LOG(R,
               "stagingPrepareTransfer() ENTRY is_src=%d is_dst=%d "
-              "numTargets=%d numSources=%d numChannels=%d controlSlot=%d/%d peersPerChannel=%d peer_groups=%d",
+              "numTargets=%d numSources=%d numChannels=%d controlSlot=%d/%d peersPerChannel=%d peerGroups=%d",
               desc->isSource, desc->isDest, desc->numTargets, desc->numSources, numChannels, controlSlot,
               state->controlSlotCount, state->peersPerChannel, peerGroupCount);
 
@@ -874,10 +805,10 @@ ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const Stagi
    * 5. Per-channel descriptors.
    * ---------------------------------------------------------------- */
   for (int ch = 0; ch < numChannels; ch++) {
-    size_t channelBase = (size_t)ch * channelSize;
+    size_t channelBase = stagingChannelControlBase(state, ch);
     size_t ctrlSlotBase = channelBase + (size_t)controlSlot * STAGING_CTRL_REGION_SIZE;
-    size_t rdmaRegionStart = channelBase + C;
-    size_t lsaRegionStart = channelBase + C + dataRegionSize;
+    size_t rdmaRegionStart = stagingChannelDataBase(state, ch);
+    size_t lsaRegionStart = rdmaRegionStart + dataRegionSize;
     int peerGroup = groupPeersByChannel ? channelPeerGroup(ch, peerGroupCount) : 0;
     int channelPeerRank = groupPeersByChannel ? channelRankInPeerGroup(ch, peerGroupCount) : ch;
     int channelPeerCount =
@@ -955,14 +886,13 @@ ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const Stagi
         initFlowCtrl(fc);
         fc->remoteRank = desc->sources[j].peerWorldRank;
 
-        int edgePeerGroupId = edgePeerGroup(sourceKey, targetKey, peerGroupCount);
-        int sourceRank =
-          groupPeersByChannel ? sourceRankInGroup(sourceKey, targetKey, edgePeerGroupId, peerGroupCount) : j;
+        int peerGroup = edgePeerGroup(sourceKey, targetKey, peerGroupCount);
+        int sourceRank = groupPeersByChannel ? sourceRankInGroup(sourceKey, targetKey, peerGroup, peerGroupCount) : j;
         NCCL_M2N_CHECK_ARG((size_t)sourceRank < maxChannelPeerCount, R,
                            "[STAGING] RDMA source rank %d exceeds grouped peer slots %zu", sourceRank,
                            maxChannelPeerCount);
-        size_t peerDataOffset = rdmaRegionStart + (size_t)sourceRank * perSourceSize;
-        setFcDataRegion(fc, peerDataOffset, perSourceSlots, chunkSize);
+        size_t peerDataOff = rdmaRegionStart + (size_t)sourceRank * perSourceSize;
+        setFcDataRegion(fc, peerDataOff, perSourceSlots, chunkSize);
 
         int myTargetIdxOnSource = desc->rdmaTargetIndexOnSource[j];
         int srcNumTargets = desc->sourceNumRdmaTargets[j];
@@ -1001,14 +931,13 @@ ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const Stagi
         initFlowCtrl(fc);
         fc->remoteRank = desc->sources[j].peerLocalRank;
 
-        int edgePeerGroupId = edgePeerGroup(sourceKey, targetKey, peerGroupCount);
-        int sourceRank =
-          groupPeersByChannel ? sourceRankInGroup(sourceKey, targetKey, edgePeerGroupId, peerGroupCount) : j;
+        int peerGroup = edgePeerGroup(sourceKey, targetKey, peerGroupCount);
+        int sourceRank = groupPeersByChannel ? sourceRankInGroup(sourceKey, targetKey, peerGroup, peerGroupCount) : j;
         NCCL_M2N_CHECK_ARG((size_t)sourceRank < maxChannelPeerCount, R,
                            "[STAGING] LSA source rank %d exceeds grouped peer slots %zu", sourceRank,
                            maxChannelPeerCount);
-        size_t peerDataOffset = lsaRegionStart + (size_t)sourceRank * perSourceSize;
-        setFcDataRegion(fc, peerDataOffset, perSourceSlots, chunkSize);
+        size_t peerDataOff = lsaRegionStart + (size_t)sourceRank * perSourceSize;
+        setFcDataRegion(fc, peerDataOff, perSourceSlots, chunkSize);
 
         int sourceLsaHeadIdxForMe = desc->sourceLsaHeadIndexOnProvider[j];
         setFcLsaConsumer(fc, ctrlSlotBase, j, sourceLsaHeadIdxForMe, desc->myWorldRank, desc->sources[j].peerWorldRank,
@@ -1051,18 +980,17 @@ ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const Stagi
         size_t remotePerSrcSize =
           groupPeersByChannel ? groupedPeerSize : ((destNumSrc > 0) ? dataRegionSize / destNumSrc : dataRegionSize);
         int remotePerSrcSlots = (int)(remotePerSrcSize / chunkSize);
-        int edgePeerGroupId = edgePeerGroup(sourceKey, targetKey, peerGroupCount);
-        int sourceRank = groupPeersByChannel ?
-                           sourceRankInGroup(sourceKey, targetKey, edgePeerGroupId, peerGroupCount) :
-                           mySrcIdxOnDest;
+        int peerGroup = edgePeerGroup(sourceKey, targetKey, peerGroupCount);
+        int sourceRank =
+          groupPeersByChannel ? sourceRankInGroup(sourceKey, targetKey, peerGroup, peerGroupCount) : mySrcIdxOnDest;
         NCCL_M2N_CHECK_ARG(remotePerSrcSlots >= 1, R, "[STAGING] remote RDMA sub-region too small (%zu B, chunk=%zu)",
                            remotePerSrcSize, chunkSize);
         NCCL_M2N_CHECK_ARG((size_t)sourceRank < maxChannelPeerCount, R,
                            "[STAGING] remote RDMA source rank %d exceeds grouped peer slots %zu", sourceRank,
                            maxChannelPeerCount);
 
-        size_t peerDataOffset = rdmaRegionStart + (size_t)sourceRank * remotePerSrcSize;
-        setFcDataRegion(fc, peerDataOffset, remotePerSrcSlots, chunkSize);
+        size_t peerDataOff = rdmaRegionStart + (size_t)sourceRank * remotePerSrcSize;
+        setFcDataRegion(fc, peerDataOff, remotePerSrcSlots, chunkSize);
 
         int rdmaSrcIdxOnDest = desc->rdmaSourceIndexOnDest[j];
         int destNumRdmaSrc = desc->destNumRdmaSources[j];
@@ -1107,18 +1035,17 @@ ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const Stagi
         size_t remotePerSrcSize =
           groupPeersByChannel ? groupedPeerSize : ((destNumSrc > 0) ? dataRegionSize / destNumSrc : dataRegionSize);
         int remotePerSrcSlots = (int)(remotePerSrcSize / chunkSize);
-        int edgePeerGroupId = edgePeerGroup(sourceKey, targetKey, peerGroupCount);
-        int sourceRank = groupPeersByChannel ?
-                           sourceRankInGroup(sourceKey, targetKey, edgePeerGroupId, peerGroupCount) :
-                           mySrcIdxOnDest;
+        int peerGroup = edgePeerGroup(sourceKey, targetKey, peerGroupCount);
+        int sourceRank =
+          groupPeersByChannel ? sourceRankInGroup(sourceKey, targetKey, peerGroup, peerGroupCount) : mySrcIdxOnDest;
         NCCL_M2N_CHECK_ARG(remotePerSrcSlots >= 1, R, "[STAGING] remote LSA sub-region too small (%zu B, chunk=%zu)",
                            remotePerSrcSize, chunkSize);
         NCCL_M2N_CHECK_ARG((size_t)sourceRank < maxChannelPeerCount, R,
                            "[STAGING] remote LSA source rank %d exceeds grouped peer slots %zu", sourceRank,
                            maxChannelPeerCount);
 
-        size_t peerDataOffset = lsaRegionStart + (size_t)sourceRank * remotePerSrcSize;
-        setFcDataRegion(fc, peerDataOffset, remotePerSrcSlots, chunkSize);
+        size_t peerDataOff = lsaRegionStart + (size_t)sourceRank * remotePerSrcSize;
+        setFcDataRegion(fc, peerDataOff, remotePerSrcSlots, chunkSize);
 
         setFcLsaProducer(fc, ctrlSlotBase, lsaJ, mySrcIdxOnDest, desc->myWorldRank, desc->targets[j].peerWorldRank, ch);
         fc->cursorTailOffset =
@@ -1146,8 +1073,8 @@ ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const Stagi
           StagingFlowCtrl* lrf = &params->localRdmaFc[ch][rdmaJ];
           initFlowCtrl(lrf);
 
-          size_t targetDataOffset = rdmaRegionStart + (size_t)targetRank * perTargetSize;
-          setFcLocalPipeline(lrf, desc->myWorldRank, ctrlSlotBase, ctrlIdx, targetDataOffset, perTargetSlots, chunkSize,
+          size_t targetDataOff = rdmaRegionStart + (size_t)targetRank * perTargetSize;
+          setFcLocalPipeline(lrf, desc->myWorldRank, ctrlSlotBase, ctrlIdx, targetDataOff, perTargetSlots, chunkSize,
                              CTRL_FIELD_RDMA_TAIL, CTRL_FIELD_RDMA_HEAD);
           lrf->localPutCounter = ch * numRdmaTargets + rdmaJ;
         } else {
@@ -1155,8 +1082,8 @@ ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const Stagi
           StagingFlowCtrl* llf = &params->localLsaFc[ch][lsaJ];
           initFlowCtrl(llf);
 
-          size_t targetDataOffset = lsaRegionStart + (size_t)targetRank * perTargetSize;
-          setFcLocalPipeline(llf, desc->myWorldRank, ctrlSlotBase, ctrlIdx, targetDataOffset, perTargetSlots, chunkSize,
+          size_t targetDataOff = lsaRegionStart + (size_t)targetRank * perTargetSize;
+          setFcLocalPipeline(llf, desc->myWorldRank, ctrlSlotBase, ctrlIdx, targetDataOff, perTargetSlots, chunkSize,
                              CTRL_FIELD_LSA_TAIL, CTRL_FIELD_LSA_HEAD);
         }
       }
@@ -1190,6 +1117,8 @@ ncclResult_t stagingBufferFinalize(StagingBufferState* state) {
     STAGING_CUDACHECK(cudaFree(state->devParams));
     state->devParams = nullptr;
   }
+  stagingPipeHostRmaPipelineDestroy(state->hostRmaPipeline);
+  state->hostRmaPipeline = nullptr;
   for (int i = 0; i < STAGING_PIPE_CONTROL_SLOTS; i++) {
     StagingPipePlanCacheEntry& entry = state->pipePlanCache[i];
     delete entry.hostParams;
@@ -1209,11 +1138,15 @@ ncclResult_t stagingBufferFinalize(StagingBufferState* state) {
 
   state->totalSize = 0;
   state->numChannels = 0;
+  state->capacityChannels = 0;
   state->channelSize = 0;
+  state->channelDataSize = 0;
+  state->dataCapacity = 0;
   state->controlSlotCount = 0;
   state->controlRegionSize = 0;
   state->chunkSize = 0;
   state->peersPerChannel = 0;
+  state->adaptiveChannelLayout = false;
   state->pipePlanCacheNextVictim = 0;
   state->initialized = false;
   return ncclSuccess;

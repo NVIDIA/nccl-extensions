@@ -438,7 +438,11 @@ ncclResult_t ensureStagingBufferPool(ncclComm_t comm, uint64_t poolKey, cudaStre
     NCCL_M2N_CHECK_ARG(entry->event != nullptr, -1, "Staging buffer pool entry has no ordering event");
     NCCL_M2N_CUDACHECK(cudaStreamWaitEvent(stream, entry->event, 0));
     entry->reserved = true;
-    entry->state->numChannels = activeChannels;
+    const ncclResult_t configureResult = stagingBufferConfigureActiveChannels(entry->state, activeChannels);
+    if (configureResult != ncclSuccess) {
+      entry->reserved = false;
+      return configureResult;
+    }
     *outState = entry->state;
     return ncclSuccess;
   }
@@ -463,7 +467,12 @@ ncclResult_t ensureStagingBufferPool(ncclComm_t comm, uint64_t poolKey, cudaStre
     NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(event));
     return r;
   }
-  state->numChannels = activeChannels;
+  r = stagingBufferConfigureActiveChannels(state.get(), activeChannels);
+  if (r != ncclSuccess) {
+    stagingBufferFinalize(state.get());
+    NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(event));
+    return r;
+  }
 
   StagingBufferPoolEntry& e = gStagingPool[gStagingPoolCount++];
   e.comm = comm;

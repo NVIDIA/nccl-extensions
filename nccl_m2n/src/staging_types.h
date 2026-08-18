@@ -263,8 +263,10 @@ struct StagingPipeCallParams {
   void* srcBuffer;
   void* dstBuffer;
   uint64_t epoch;
+  size_t maxChunkRounds;
 
   bool splitComm;
+  bool hasLocalFanout;
   int splitCommBContextBase;
   int splitCommBContextCount;
 };
@@ -292,6 +294,8 @@ struct StagingPipePeerEdge {
   bool active;
 
   size_t totalBytes;
+  int channelRank;
+  int channelCount;
   size_t chunkStart;
   size_t chunkEnd;
 

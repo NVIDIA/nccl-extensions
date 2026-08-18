@@ -64,6 +64,19 @@ bool parseCopyAlgorithmEnv(const char* s, ReshardCopyAlgorithm* out) {
   return false;
 }
 
+bool parsePipeNetModeEnv(const char* s, ReshardPipeNetMode* out) {
+  if (s == nullptr || out == nullptr) return false;
+  if (strcasecmp(s, "DEVICE") == 0 || strcasecmp(s, "DEV") == 0 || strcasecmp(s, "KERNEL") == 0) {
+    *out = RESHARD_PIPE_NET_DEVICE;
+    return true;
+  }
+  if (strcasecmp(s, "HOST_RMA") == 0 || strcasecmp(s, "HOST-RMA") == 0 || strcasecmp(s, "HOSTRMA") == 0) {
+    *out = RESHARD_PIPE_NET_HOST_RMA;
+    return true;
+  }
+  return false;
+}
+
 bool parseLbModeEnv(const char* s, ReshardLoadBalanceMode* out) {
   if (s == nullptr || out == nullptr) return false;
   if (strcasecmp(s, "UNIFORM") == 0) {
@@ -128,6 +141,8 @@ void resetReshardRuntimeConfig() {
   gReshardAlgorithm = RESHARD_ALGO_AUTO;
   gReshardLbMode = RESHARD_LB_UNIFORM;
   gReshardCopyAlgorithm = RESHARD_COPY_ALGO_PACK;
+  gReshardPipeNetMode = RESHARD_PIPE_NET_DEVICE;
+  gReshardStagingRuntimeConfig = {};
   gReshardAutoUniformBcast = true;
   gReshardAutoUniformBcastSet = false;
   gReshardSplitComm = true;
@@ -154,6 +169,42 @@ void resetReshardRuntimeConfig() {
   gReshardStagingBuckets[0] = {kDefaultStagingBucketBytes, kDefaultStagingBucketSlots};
   gReshardStagingBucketCount = 1;
   gReshardStagingBucketsImplicitDefault = true;
+}
+
+void resolveReshardStagingRuntimeConfig() {
+  const bool hostRma = gReshardCopyAlgorithm == RESHARD_COPY_ALGO_PIPE &&
+                       gReshardPipeNetMode == RESHARD_PIPE_NET_HOST_RMA;
+  ReshardStagingRuntimeConfig config = {};
+  if (hostRma) {
+    config.numChannels = STAGING_PIPE_HOST_RMA_DEFAULT_NUM_CHANNELS;
+    config.channelDataSize = STAGING_PIPE_HOST_RMA_DEFAULT_CHANNEL_DATA_SIZE;
+    config.chunkSize = STAGING_PIPE_HOST_RMA_DEFAULT_CHUNK_SIZE;
+    config.hostRmaDefault = true;
+  }
+
+  int value = 0;
+  if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_STAGING_NUM_CHANNELS"), &value)) {
+    config.numChannels = value;
+    config.numChannelsExplicit = true;
+    config.numChannelsFixed = true;
+  }
+  size_t sizeValue = 0;
+  if (parseM2nEnvSize(getenv("NCCL_RESHARD_STAGING_CHANNEL_SIZE"), &sizeValue, false)) {
+    config.channelDataSize = sizeValue;
+    config.channelDataSizeExplicit = true;
+  }
+  if (parseM2nEnvSize(getenv("NCCL_RESHARD_STAGING_CHUNK_SIZE"), &sizeValue, false)) {
+    config.chunkSize = sizeValue;
+  }
+  if (parseM2nNonNegativeEnvInt(getenv("NCCL_RESHARD_STAGING_PEERS_PER_CHANNEL"), &value)) {
+    config.peersPerChannel = value;
+  }
+  if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_STAGING_TARGET_CTAS"), &value)) {
+    config.targetCtas = value;
+    config.targetCtasExplicit = true;
+  }
+
+  gReshardStagingRuntimeConfig = config;
 }
 
 ncclResult_t validateReshardConfigHeader(const ncclM2nConfig_t* config) {
@@ -221,6 +272,11 @@ void applyReshardEnv() {
                    "NCCL_RESHARD_COPY_ALGORITHM=\"%s\" is not supported; accepted values are DIRECT, PIPE, and PACK",
                    copyAlgorithm);
     }
+  }
+
+  ReshardPipeNetMode pipeNetMode;
+  if (parsePipeNetModeEnv(getenv("NCCL_RESHARD_PIPE_NET_MODE"), &pipeNetMode)) {
+    gReshardPipeNetMode = pipeNetMode;
   }
 
   ReshardLoadBalanceMode lb;
@@ -390,5 +446,6 @@ void applyReshardEnv() {
                    buckets, kDefaultStagingBucketBytes, kDefaultStagingBucketSlots);
     }
   }
+  resolveReshardStagingRuntimeConfig();
 }
 // NOLINTEND(concurrency-mt-unsafe)

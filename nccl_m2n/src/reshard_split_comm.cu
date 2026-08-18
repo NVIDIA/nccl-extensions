@@ -894,11 +894,14 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
     }
     if (outWindowA != nullptr) *outWindowA = winA;
 
-    NCCL_M2N_CHECK_ARG(outDevCommA != nullptr && outDevCommAUse != nullptr, sc->parentRank,
-                       "reshardSplitEnsureResources: commA requires DevComm and use outputs");
-    NCCL_M2N_CHECK(reshardGetOrCreateDevCommWithRequirements(
-      sc->commA, numCtas, ginSignalCountA, ginCounterCountA, RESHARD_DEVCOMM_BARRIER_HYBRID,
-      reshardGetGinContextCount(), NCCL_GIN_CONNECTION_FULL, stream, outDevCommA, outDevCommAUse));
+    const bool needDevCommA = outDevCommA != nullptr || outDevCommAUse != nullptr;
+    NCCL_M2N_CHECK_ARG(!needDevCommA || (outDevCommA != nullptr && outDevCommAUse != nullptr), sc->parentRank,
+                       "reshardSplitEnsureResources: commA DevComm and use outputs must be supplied together");
+    if (needDevCommA) {
+      NCCL_M2N_CHECK(reshardGetOrCreateDevCommWithRequirements(
+        sc->commA, numCtas, ginSignalCountA, ginCounterCountA, RESHARD_DEVCOMM_BARRIER_HYBRID,
+        reshardGetGinContextCount(), NCCL_GIN_CONNECTION_FULL, stream, outDevCommA, outDevCommAUse));
+    }
   }
 
   /* commB (RAIL): all generator ranks. Its kernel DevComm is cached for this
@@ -928,11 +931,14 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
     const int totalContexts = ctxPerSlotB * conc;
     const int totalBarriers = numCtas * conc;
 
-    NCCL_M2N_CHECK_ARG(outDevCommB != nullptr && outDevCommBUse != nullptr, sc->parentRank,
-                       "reshardSplitEnsureResources: commB requires DevComm and use outputs");
-    NCCL_M2N_CHECK(reshardGetOrCreateDevCommWithRequirements(
-      sc->commB, totalBarriers, totalSignals, totalCounters, RESHARD_DEVCOMM_BARRIER_HYBRID, totalContexts,
-      NCCLM2N_GIN_RAIL_CONNECTION, stream, outDevCommB, outDevCommBUse));
+    const bool needDevCommB = outDevCommB != nullptr || outDevCommBUse != nullptr;
+    NCCL_M2N_CHECK_ARG(!needDevCommB || (outDevCommB != nullptr && outDevCommBUse != nullptr), sc->parentRank,
+                       "reshardSplitEnsureResources: commB DevComm and use outputs must be supplied together");
+    if (needDevCommB) {
+      NCCL_M2N_CHECK(reshardGetOrCreateDevCommWithRequirements(
+        sc->commB, totalBarriers, totalSignals, totalCounters, RESHARD_DEVCOMM_BARRIER_HYBRID, totalContexts,
+        NCCLM2N_GIN_RAIL_CONNECTION, stream, outDevCommB, outDevCommBUse));
+    }
   }
 
   return ncclSuccess;

@@ -303,10 +303,11 @@ ncclResult_t reshardGetOrCreatePersistentControlSlot(ncclComm_t parentComm,
                                                      const ReshardStagingChannelSignature& channelSignature, int rank,
                                                      int* outSlot);
 
-/* Ensure (and cache) the per-staging-buffer windows + sized DevComms on
- * the split sub-comms: windowA/devCommA (FULL) on commA and
- * windowB/devCommB (RAIL) on commB.  Collective over the respective
- * sub-comms; safe to call every reshard.
+/* Ensure (and cache) the per-staging-buffer windows + optional sized DevComms
+ * on the split sub-comms: windowA/devCommA (FULL) on commA and
+ * windowB/devCommB (RAIL) on commB.  Collective over the respective sub-comms;
+ * safe to call every reshard. Pass null DevComm outputs when only split windows
+ * are needed.
  *
  * commA and commB use the shared event-ordered DevComm cache. commB's RAIL
  * entries include its slot-partitioned resource requirements, so differing

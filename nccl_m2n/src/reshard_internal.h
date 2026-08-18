@@ -26,6 +26,7 @@
 #include "m2n_checks.h"
 #include "m2n_handle.h"
 #include "m2n_log.h"
+#include "reshard_limits.h"
 #include <mutex>
 
 #include "reshard_types.h"
@@ -123,6 +124,29 @@ inline int gReshardDstDomainSize = 0;
 inline ReshardAlgorithm gReshardAlgorithm = RESHARD_ALGO_AUTO;
 inline ReshardLoadBalanceMode gReshardLbMode = RESHARD_LB_UNIFORM;
 inline ReshardCopyAlgorithm gReshardCopyAlgorithm = RESHARD_COPY_ALGO_PACK;
+
+/* PIPE transport/control mode. DEVICE keeps the CUDA persistent kernel path;
+ * HOST_RMA keeps the cached PIPE graph but enqueues CE pack/unpack plus
+ * host-initiated NCCL one-sided PutSignal/Signal/WaitSignal. */
+inline ReshardPipeNetMode gReshardPipeNetMode = RESHARD_PIPE_NET_DEVICE;
+
+/* Resolved once with the rest of the process runtime configuration at the
+ * first ncclM2nInit. Host-RMA uses its default channel count as a pool
+ * capacity; its active lanes are resolved from the peer graph unless the
+ * user explicitly fixes the channel count. */
+struct ReshardStagingRuntimeConfig {
+  int numChannels = 0;
+  bool numChannelsExplicit = false;
+  bool numChannelsFixed = false;
+  size_t channelDataSize = STAGING_DEFAULT_CHANNEL_DATA_SIZE;
+  bool channelDataSizeExplicit = false;
+  size_t chunkSize = STAGING_DEFAULT_CHUNK_SIZE;
+  bool hostRmaDefault = false;
+  int peersPerChannel = 1;
+  int targetCtas = 0;
+  bool targetCtasExplicit = false;
+};
+inline ReshardStagingRuntimeConfig gReshardStagingRuntimeConfig = {};
 
 /* When set (default), a transfer whose src AND dst are both fully replicated
  * (a pure broadcast, no Shard dim on either side) is auto-routed to UNIFORM
@@ -272,6 +296,12 @@ inline ReshardLoadBalanceMode reshardEffectiveLbMode(const ncclDistTensor_t* src
 inline ReshardCopyAlgorithm reshardGetCopyAlgorithm() {
   return gReshardCopyAlgorithm;
 }
+inline ReshardPipeNetMode reshardGetPipeNetMode() {
+  return gReshardPipeNetMode;
+}
+inline const ReshardStagingRuntimeConfig& reshardGetStagingRuntimeConfig() {
+  return gReshardStagingRuntimeConfig;
+}
 inline int reshardGetGinContextCount() {
   return gReshardGinContextCount;
 }
@@ -326,6 +356,7 @@ void resetReshardRuntimeConfig();
 void applyReshardConfig(const ncclM2nConfig_t* config);
 ncclResult_t validateReshardConfigHeader(const ncclM2nConfig_t* config);
 void applyReshardEnv();
+void resolveReshardStagingRuntimeConfig();
 
 /* Validate an explicit handle token, or lazily create the internal default for
  * a NULL token. The returned state keeps its runtime alive for the call. */

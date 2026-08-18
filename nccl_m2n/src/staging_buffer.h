@@ -57,7 +57,7 @@ struct StagingPipePlanCacheEntry {
 /* ======================================================================
  * Host-side handle returned by stagingBufferInit().
  *
- * Holds the staging buffer allocation and a pre-allocated device-side
+ * Holds the staging buffer allocation and a lazily allocated device-side
  * StagingKernelParams scratch slot for DIRECT. PIPE uses the fixed
  * associative plan cache below so alternating mesh/tensor shapes do not rebuild or
  * re-upload static metadata after warmup.
@@ -68,14 +68,19 @@ struct StagingBufferState {
   void* buffer;
   size_t totalSize;
   int numChannels;
+  int capacityChannels;
   size_t channelSize;
+  size_t channelDataSize;
+  size_t dataCapacity;
   int controlSlotCount;
   size_t controlRegionSize;
   size_t chunkSize;
   int peersPerChannel;
+  bool adaptiveChannelLayout;
   bool initialized;
 
-  StagingKernelParams* devParams; /* cudaMalloc'd once; DIRECT uses it as scratch. */
+  StagingKernelParams* devParams; /* cudaMalloc'd lazily; DIRECT uses it as scratch. */
+  void* hostRmaPipeline; /* Host-RMA CUDA streams/events, retained across plans. */
 
   /* PIPE plan entries are associative. Persistent-control slots isolate
    * cursor/counter state; plans are keyed by mesh, active channels, and tensor
@@ -84,36 +89,37 @@ struct StagingBufferState {
   int pipePlanCacheNextVictim;
 };
 
-struct StagingBufferConfig {
-  int numChannels;
-  bool numChannelsExplicit;
-  size_t channelSize;
-  size_t chunkSize;
-  int peersPerChannel;
-};
-
 /* Toggle [STAGING] verbose logging at runtime (parallels
  * NCCL_RESHARD_LOG_LEVEL=DEBUG). */
 void stagingSetVerbose(bool verbose);
 
-StagingBufferConfig stagingBufferConfigFromEnv();
-
-/* Resolve the active staging channel count for a transfer. If
- * NCCL_RESHARD_STAGING_NUM_CHANNELS is unset and peersPerChannel is set,
- * the result is derived from the transfer peer groups. Descriptors may also
- * set ctaHeuristicPeerCount to enable a peer-count-aware CTA heuristic:
+/* Resolve the active staging channel count for a transfer. A fixed channel
+ * count (an explicit override) is returned directly. Host-RMA defaults cap
+ * active peer lanes while retaining one physical pool allocation.
+ * Otherwise, when peersPerChannel is set, the result is derived from the
+ * transfer peer groups. Descriptors may also set ctaHeuristicPeerCount to
+ * enable a peer-count-aware CTA heuristic:
  * small peer-group counts get multiple CTAs per peer group, then taper to
  * one CTA per peer group as peer-group count grows. Explicit
  * NCCL_RESHARD_STAGING_TARGET_CTAS still overrides the default heuristic. */
 int stagingResolveNumChannelsForTransfer(const StagingTransferDescriptor* desc);
 
-/* Allocate the staging pool + per-call devParams slot.
+/* Allocate the staging pool. DIRECT and device PIPE lazily allocate their
+ * device-only plan/scratch slots.
  * NOT collective. Sizes default from reshard_limits.h, with internal
  * staging-pool overrides read during initialization. */
 ncclResult_t stagingBufferInit(StagingBufferState* state);
 ncclResult_t stagingBufferInitWithNumChannels(StagingBufferState* state, int numChannels);
 ncclResult_t stagingBufferInitWithNumChannelsAndControlSlots(StagingBufferState* state, int numChannels,
                                                              int controlSlotCount);
+
+/* Destroys Host-RMA CUDA scheduling resources attached to a staging pool. */
+void stagingPipeHostRmaPipelineDestroy(void* pipeline);
+
+/* Select the active channel layout within an initialized pool. Default
+ * Host-RMA pools retain a fixed total data capacity and repartition it over
+ * active peer lanes; all other paths retain fixed per-channel capacity. */
+ncclResult_t stagingBufferConfigureActiveChannels(StagingBufferState* state, int numChannels);
 
 /* Translate a host descriptor into device-ready kernel params.  The
  * caller is expected to have already registered both windows on the

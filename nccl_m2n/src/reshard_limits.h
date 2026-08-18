@@ -75,11 +75,21 @@ inline constexpr int MAX_PACK_STAGING_ENTRIES = 16;
 /* Hard upper bound on staging slots across all configured buckets. */
 inline constexpr int MAX_SPLIT_CONCURRENCY = 64;
 
-/* Staging (copy-based) algorithm sizes. */
+/* Staging (copy-based) algorithm sizes.
+ *
+ * NCCL_RESHARD_STAGING_CHANNEL_SIZE is the user-visible data capacity per
+ * channel.  The staging allocator adds the per-channel control region on top
+ * and then splits the data capacity into RDMA and LSA halves. */
 inline constexpr int STAGING_MAX_CHANNELS = 64;
 inline constexpr int STAGING_DEFAULT_NUM_CHANNELS = 4;
-inline constexpr size_t STAGING_DEFAULT_CHANNEL_SIZE = 8ULL * 1024ULL * 1024ULL;
+inline constexpr size_t STAGING_DEFAULT_CHANNEL_DATA_SIZE = 8ULL * 1024ULL * 1024ULL;
 inline constexpr size_t STAGING_DEFAULT_CHUNK_SIZE = 1ULL * 1024ULL * 1024ULL;
+/* Host-RMA PIPE uses a compact fixed pool and larger CE/RMA chunks. The
+ * default eight-lane, 128 MiB-per-lane pool is repartitioned over active peer
+ * lanes; control space is allocated separately. */
+inline constexpr int STAGING_PIPE_HOST_RMA_DEFAULT_NUM_CHANNELS = 8;
+inline constexpr size_t STAGING_PIPE_HOST_RMA_DEFAULT_CHANNEL_DATA_SIZE = 128ULL * 1024ULL * 1024ULL;
+inline constexpr size_t STAGING_PIPE_HOST_RMA_DEFAULT_CHUNK_SIZE = 32ULL * 1024ULL * 1024ULL;
 
 inline constexpr size_t STAGING_CTRL_ENTRY_SIZE = 128;
 inline constexpr int STAGING_MAX_REMOTES = 32;

@@ -53,6 +53,14 @@
 /* Advances the persistent flow-control generation for each reshard call. */
 static std::atomic<uint64_t> gStagingEpoch{0};
 
+#ifdef NCCL_M2N_TESTING
+static std::atomic<ReshardCopyAlgorithm> gLastCompletedCopyAlgorithm{RESHARD_COPY_ALGO_DIRECT};
+
+ReshardCopyAlgorithm reshardGetLastCompletedCopyAlgorithmForTest() {
+  return gLastCompletedCopyAlgorithm.load(std::memory_order_relaxed);
+}
+#endif
+
 static size_t parseEnvSize(const char* value) {
   if (value == nullptr || value[0] == '\0') {
     return 0;
@@ -741,7 +749,11 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   if (copyAlgo == RESHARD_COPY_ALGO_PACK) {
     NCCL_M2N_CHECK(reshardStartWorkStream(stream, &work));
     NCCL_M2N_CHECK(reshardCopyPackNormalized(comm, srcTensor, dstTensor, workStream));
-    return workCompletion.complete();
+    NCCL_M2N_CHECK(workCompletion.complete());
+#ifdef NCCL_M2N_TESTING
+    gLastCompletedCopyAlgorithm.store(RESHARD_COPY_ALGO_PACK, std::memory_order_relaxed);
+#endif
+    return ncclSuccess;
   }
 
   const bool debugLogging = reshardGetLogLevel() >= RESHARD_LOG_DEBUG;
@@ -1177,7 +1189,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
 
   NCCL_M2N_CHECK(workCompletion.complete());
 #ifdef NCCL_M2N_TESTING
-  gLastCompletedCopyAlgorithm.store(RESHARD_COPY_ALGO_DIRECT, std::memory_order_relaxed);
+  gLastCompletedCopyAlgorithm.store(copyAlgo, std::memory_order_relaxed);
 #endif
 
   return ncclSuccess;

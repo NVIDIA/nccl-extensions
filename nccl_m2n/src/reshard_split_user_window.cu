@@ -468,6 +468,5 @@ ncclResult_t reshardLaunchPackSplit(const ReshardSplitComms* sc, void* stagingBu
                (int)sc->inA, (int)sc->inB, sc->rankInA, sc->rankInB, sc->srcLsaSize, sc->lsaSize, sc->numGenDomains,
                ginSignalCountA, signalsPerSlotB, sc->slotIdx, maxConcurrency, ctxPerSlotB, numCtas);
 
-  SUW_NCCLCHECK(reshardRecordDevCommUse(&devCommAUse, stream));
   return ncclSuccess;
 }

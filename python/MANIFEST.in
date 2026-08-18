@@ -1,5 +1,6 @@
 include README.md
 include LICENSE.txt
+include nccl/m2n/README.md
 recursive-include nccl *.py *.pxd *.pyx
 recursive-include nccl/m2n/include *.h
 

@@ -46,7 +46,7 @@
  * identical typedefs in the same translation unit. */
 typedef uint32_t ncclGinSignal_t;
 
-constexpr inline bool stagingLsaFollowersFitLaneCapacity(int numLsaFollowers) {
+constexpr inline bool stagingLsaFollowersFitKernelCapacity(int numLsaFollowers) {
   return numLsaFollowers >= 0 && numLsaFollowers <= STAGING_LSA_FANOUT_MAX_FOLLOWERS;
 }
 
@@ -61,6 +61,12 @@ constexpr inline bool stagingLsaFanoutHasTargetDescriptors(int numRdmaSources, i
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+enum {
+  STAGING_RDMA_TRANSPORT_PARENT = 0,
+  STAGING_RDMA_TRANSPORT_SPLIT_A = 1,
+  STAGING_RDMA_TRANSPORT_SPLIT_B = 2,
+};
 
 /* ======================================================================
  * Flow control state for one producer-consumer pair.
@@ -91,12 +97,24 @@ struct StagingFlowCtrl {
   uint64_t tailSignalBase;
   uint64_t headSignalBase;
 
-  /* Path A bases (LSA staging-buffer-memory path). */
+  /* Path A bases (LSA staging-buffer-memory path).  The active PIPE
+   * persistent-counter path keeps peer-visible counters monotonically
+   * increasing and uses per-edge cursor state instead of a prologue snapshot,
+   * so these bases normally remain zero.  They are retained for the generic
+   * LSA primitive helpers and mirror tailSignalBase / headSignalBase for
+   * the GIN-signal path. */
   uint64_t lsaTailBase;
   uint64_t lsaHeadBase;
 
   /* Path C — local DMA put-completion counter (consumer-side). */
   uint32_t localPutCounter;
+
+  /* Persistent local cursors used by the PIPE NCCL-style FIFO path.
+   * Producers keep their absolute tail locally; consumers keep their absolute
+   * consumed head locally.  Peer-visible head/tail still live in the transport
+   * signal/counter fields above. */
+  size_t cursorTailOffset;
+  size_t cursorHeadOffset;
 
   /* Per-peer data sub-region inside the channel's data area. */
   size_t peerDataOffset;
@@ -146,9 +164,24 @@ struct StagingPeerInfo {
   int peerWorldRank;
   int peerShardIdx;
   int peerLocalRank; /* node-local rank for LSA peers, -1 for RDMA */
+  int rdmaTransport;  /* STAGING_RDMA_TRANSPORT_*; only meaningful for RDMA peers. */
 
   StagingFlowCtrl fc;
   StagingTransferPlan plan;
+
+  /* Channel assignment.  Legacy staging leaves every peer active on every
+   * channel with channelRank=channel_id and channelCount=numChannels.  When
+   * peer grouping is enabled, only the channels assigned to this peer are
+   * active, and chunk ranges are split across that smaller channel group. */
+  bool active;
+  int channelRank;
+  int channelCount;
+
+  /* Compact per-channel work range.  This lets control/signal paths avoid
+   * touching the full tensor transfer plan unless they actually copy data. */
+  size_t totalBytes;
+  size_t chunkStart;
+  size_t chunkEnd;
 };
 
 /* ======================================================================
@@ -175,6 +208,7 @@ struct StagingKernelParams {
   StagingRegion lsaRegions[STAGING_MAX_CHANNELS];
 
   ncclWindow_t rdmaWindow;
+  ncclWindow_t rdmaWindowB; /* Split PIPE commB RDMA window; same as rdmaWindow on the single-comm path. */
   ncclWindow_t lsaWindow;
 
   /* Per-channel, per-target local pipeline flow control. */
@@ -212,6 +246,7 @@ struct StagingKernelParams {
   size_t chunkSize;
   int ginSignalCount;
   int ginCounterCount;
+  uint64_t epoch;
 
   /* Tensor metadata for pack/unpack strides. */
   size_t srcDims[NCCL_RESHARD_MAX_TENSOR_DIMS];
@@ -219,6 +254,76 @@ struct StagingKernelParams {
   size_t srcStrides[NCCL_RESHARD_MAX_TENSOR_DIMS];
   size_t dstStrides[NCCL_RESHARD_MAX_TENSOR_DIMS];
   int ndims;
+};
+
+/* Per-call fields for the persistent-counter PIPE path.  The large
+ * StagingKernelParams block is treated as an immutable, cached device plan;
+ * these are the values that can change between ncclReshard calls. */
+struct StagingPipeCallParams {
+  void* srcBuffer;
+  void* dstBuffer;
+  uint64_t epoch;
+
+  bool splitComm;
+  int splitCommBContextBase;
+  int splitCommBContextCount;
+};
+
+struct StagingPipeCopyLayout {
+  /* Compact copy descriptor used by the PIPE kernels.  It keeps only the
+   * local tensor traversal needed at pack/unpack time, separate from the
+   * transport/control metadata in StagingPipePeerEdge. */
+  int numOuterLoops;
+  size_t outerCounts[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t outerStrides[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  size_t baseOffset;
+  size_t innerSize;
+  bool isContiguous;
+};
+
+struct StagingPipePeerEdge {
+  /* Transport/control descriptor for one active edge in one staging channel.
+   * Chunk ranges are precomputed on the host so control warps can drive the
+   * FIFO without touching the full tensor transfer plan. */
+  int peerWorldRank;
+  int peerLocalRank;
+  int rdmaTransport;
+  int copyLayoutIndex;
+  bool active;
+
+  size_t totalBytes;
+  size_t chunkStart;
+  size_t chunkEnd;
+
+  StagingFlowCtrl fc;
+};
+
+struct StagingPipeTrainerEdge {
+  /* Trainer edges need both the remote generator FIFO and the local
+   * pack-to-RDMA FIFO consumed by the trainer control warp. */
+  StagingPipePeerEdge peer;
+  StagingFlowCtrl localFc;
+};
+
+struct StagingPipeDevicePlan {
+  /* Immutable per-shape plan uploaded once per cache slot.  Active-channel
+   * launch maps compact gridDim.x while preserving channel ids used for
+   * staging-buffer, GIN context, and counter indexing. */
+  StagingPipeTrainerEdge rdmaTargets[STAGING_MAX_CHANNELS][MAX_TARGETS];
+  StagingPipePeerEdge lsaTargets[STAGING_MAX_CHANNELS][MAX_TARGETS];
+  StagingPipePeerEdge rdmaSources[STAGING_MAX_CHANNELS][MAX_SOURCES];
+  StagingPipePeerEdge lsaSources[STAGING_MAX_CHANNELS][MAX_SOURCES];
+
+  StagingPipeCopyLayout rdmaTargetLayouts[STAGING_MAX_CHANNELS][MAX_TARGETS];
+  StagingPipeCopyLayout rdmaSourceLayouts[STAGING_MAX_CHANNELS][MAX_SOURCES];
+  StagingPipeCopyLayout lsaSourceLayouts[STAGING_MAX_CHANNELS][MAX_SOURCES];
+
+  int trainerRdmaLaunchChannels[STAGING_MAX_CHANNELS];
+  int generatorRdmaLaunchChannels[STAGING_MAX_CHANNELS];
+  int generatorLsaLaunchChannels[STAGING_MAX_CHANNELS];
+  int numTrainerRdmaLaunchChannels;
+  int numGeneratorRdmaLaunchChannels;
+  int numGeneratorLsaLaunchChannels;
 };
 
 /* ======================================================================
@@ -253,6 +358,7 @@ struct StagingTransferDescriptor {
   StagingPeerDescriptor targets[MAX_TARGETS];
   int numTargets;
   int numRingTargets; /* tail of targets[] reserved for ring fwd */
+  int controlSlot;    /* graph-specific control slot within each staging channel */
 
   StagingPeerDescriptor sources[MAX_SOURCES];
   int numSources;
@@ -262,12 +368,32 @@ struct StagingTransferDescriptor {
    * for the kernel's fan-out indexing. */
   int numLsaFollowers;
 
-  /* Cross-rank sorting metadata (used to derive peer signal ids
-   * deterministically without an extra collective). */
+  /* Cross-rank sorting metadata.  Data-region indices retain the complete
+   * source/target ordering so local LSA fanout has stable buffer offsets.
+   * GIN IDs use the RDMA-only ordinals below: local LSA edges never consume
+   * a GIN signal or counter slot. */
   int destNumSources[MAX_TARGETS];
   int sourceIndexOnDest[MAX_TARGETS];
+  int destNumRdmaSources[MAX_TARGETS];
+  int rdmaSourceIndexOnDest[MAX_TARGETS];
+  /* targetIndexOnSource is the remote producer's full target slot for data
+   * placement; rdmaTargetIndexOnSource is its compact GIN ordinal.
+   * channelTargetIndexOnSource is the producer-side edge used for channel
+   * grouping; ring forwarding needs these to differ. */
   int targetIndexOnSource[MAX_SOURCES];
+  int rdmaTargetIndexOnSource[MAX_SOURCES];
+  int channelTargetIndexOnSource[MAX_SOURCES];
   int sourceNumTargets[MAX_SOURCES];
+  int sourceNumRdmaTargets[MAX_SOURCES];
+  int sourceLsaHeadIndexOnProvider[MAX_SOURCES];
+  /* PIPE's dense GIN map uses (RDMA peer ordinal, channel rank within that
+   * peer group). Zero keeps the legacy channel-major map for PACK. */
+  int pipeGinPeerCapacity;
+  int pipeGinChannelsPerPeer;
+  int peerGroupSizeBound;
+  int ctaHeuristicPeerCount;
+  size_t maxEdgeBytes;
+  bool hasLocalFanout;
 
   /* Tensor metadata. */
   size_t srcDims[NCCL_RESHARD_MAX_TENSOR_DIMS];

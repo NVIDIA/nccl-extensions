@@ -142,31 +142,34 @@ ncclResult_t reshardComputeStagingGinCounts(int logRank, int numCtas, size_t max
   return ncclSuccess;
 }
 
-ncclResult_t reshardGetOrCreateDevComm(ncclComm_t comm, int numCtas, int ginSignalCount, int ginCounterCount,
-                                       ReshardDevCommBarrierKind barrierKind, int ginContextCount, cudaStream_t stream,
-                                       ncclDevComm* activeDevComm, ReshardDevCommUse* use) {
+ncclResult_t reshardGetOrCreateDevCommWithRequirements(ncclComm_t comm, int barrierCount, int ginSignalCount,
+                                                       int ginCounterCount, ReshardDevCommBarrierKind barrierKind,
+                                                       int ginContextCount, int ginConnectionType, cudaStream_t stream,
+                                                       ncclDevComm* activeDevComm, ReshardDevCommUse* use) {
   NCCL_M2N_CHECK_ARG(activeDevComm != nullptr && use != nullptr, -1,
                      "reshardGetOrCreateDevComm: output DevComm and use token must be non-null");
   cudaEvent_t completionEvent = nullptr;
   std::shared_ptr<ReshardDevCommUseState> useState;
-  const ReshardDevCommCacheKey key = {comm, numCtas, ginSignalCount, ginCounterCount, ginContextCount, barrierKind};
+  const int effectiveGinContextCount = (ginContextCount > 0) ? ginContextCount : reshardGetGinContextCount();
+  const ReshardDevCommCacheKey key = {
+    comm, barrierCount, ginSignalCount, ginCounterCount, effectiveGinContextCount, ginConnectionType, barrierKind
+  };
   ncclDevComm* devComm = findCachedDevComm(key, &completionEvent, &useState);
   if (devComm != nullptr) {
     *activeDevComm = *devComm;
     return reshardPrepareDevCommUse(completionEvent, useState, stream, use);
   }
-
   ncclDevComm localDevComm = {};
   ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
   if (barrierKind == RESHARD_DEVCOMM_BARRIER_WORLD) {
-    reqs.worldGinBarrierCount = numCtas;
+    reqs.worldGinBarrierCount = barrierCount;
   } else {
-    reqs.barrierCount = numCtas;
+    reqs.barrierCount = barrierCount;
   }
   reqs.ginSignalCount = ginSignalCount;
   reqs.ginCounterCount = ginCounterCount;
-  reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
-  reqs.ginContextCount = ginContextCount;
+  reqs.ginConnectionType = (decltype(reqs.ginConnectionType))ginConnectionType;
+  reqs.ginContextCount = effectiveGinContextCount;
 
   {
     M2nApiUnlock apiUnlock;
@@ -185,4 +188,12 @@ ncclResult_t reshardGetOrCreateDevComm(ncclComm_t comm, int numCtas, int ginSign
   NCCL_M2N_CHECK_ARG(devComm != nullptr, -1, "reshardGetOrCreateDevComm: newly cached DevComm was not found");
   *activeDevComm = *devComm;
   return reshardPrepareDevCommUse(completionEvent, useState, stream, use);
+}
+
+ncclResult_t reshardGetOrCreateDevComm(ncclComm_t comm, int numCtas, int ginSignalCount, int ginCounterCount,
+                                       ReshardDevCommBarrierKind barrierKind, int ginContextCount, cudaStream_t stream,
+                                       ncclDevComm* activeDevComm, ReshardDevCommUse* use) {
+  return reshardGetOrCreateDevCommWithRequirements(comm, numCtas, ginSignalCount, ginCounterCount, barrierKind,
+                                                   ginContextCount, NCCL_GIN_CONNECTION_FULL, stream, activeDevComm,
+                                                   use);
 }

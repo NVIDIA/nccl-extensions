@@ -6,7 +6,7 @@
  ************************************************************************/
 
 /* Resource, configuration, and ordering coverage for the bounded
- * PACKWINDOW staging pool in src/packwindow_staging.cc. */
+ * PACK staging pool in src/pack_staging.cc. */
 
 #include <gtest/gtest.h>
 
@@ -36,7 +36,7 @@ void CUDART_CB waitForSlotRelease(void* data) {
   }
 }
 
-class PackWindowStagingPoolTest : public ::testing::Test {
+class PackStagingPoolTest : public ::testing::Test {
 protected:
   ncclComm_t comm = nullptr;
   cudaStream_t stream = nullptr;
@@ -52,7 +52,7 @@ protected:
     ASSERT_NCCL(ncclCommInitAll(&comm, 1, devices));
     ASSERT_CUDA(cudaStreamCreate(&stream));
 
-    packWindowStagingFinalize();
+    packStagingFinalize();
     reshardClearResourceQuarantine();
     savedBucketCount = gReshardStagingBucketCount;
     savedImplicitDefault = gReshardStagingBucketsImplicitDefault;
@@ -72,7 +72,7 @@ protected:
   }
 
   void TearDown() override {
-    packWindowStagingFinalize();
+    packStagingFinalize();
     reshardClearResourceQuarantine();
     gReshardStagingBucketCount = savedBucketCount;
     gReshardStagingBucketsImplicitDefault = savedImplicitDefault;
@@ -92,7 +92,7 @@ protected:
   }
 };
 
-TEST_F(PackWindowStagingPoolTest, ParsesConcisePackBufferProfile) {
+TEST_F(PackStagingPoolTest, ParsesConcisePackBufferProfile) {
   ASSERT_EQ(0, setenv("NCCL_RESHARD_PACK_BUFFSIZES", "8k:2,1m", 1));
   applyReshardEnv();
   ASSERT_EQ(2, gReshardStagingBucketCount);
@@ -103,7 +103,7 @@ TEST_F(PackWindowStagingPoolTest, ParsesConcisePackBufferProfile) {
   EXPECT_FALSE(gReshardStagingBucketsImplicitDefault);
 }
 
-TEST_F(PackWindowStagingPoolTest, RejectsProfileBelowMinimumUsableSize) {
+TEST_F(PackStagingPoolTest, RejectsProfileBelowMinimumUsableSize) {
   ASSERT_EQ(0, setenv("NCCL_RESHARD_PACK_BUFFSIZES", "1k", 1));
   applyReshardEnv();
   ASSERT_EQ(1, gReshardStagingBucketCount);
@@ -112,55 +112,55 @@ TEST_F(PackWindowStagingPoolTest, RejectsProfileBelowMinimumUsableSize) {
   EXPECT_TRUE(gReshardStagingBucketsImplicitDefault);
 }
 
-TEST_F(PackWindowStagingPoolTest, AllocatesOnlySelectedSlotsLazily) {
+TEST_F(PackStagingPoolTest, AllocatesOnlySelectedSlotsLazily) {
   gReshardStagingBuckets[0] = {kSlotBytes, 4};
   gReshardStagingBucketCount = 1;
   gReshardStagingBucketsImplicitDefault = false;
 
-  EXPECT_EQ(0, packWindowStagingAllocationCountForTest());
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm, kSlotBytes, stream));
-  EXPECT_EQ(1, packWindowStagingAllocationCountForTest());
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm, stream));
+  EXPECT_EQ(0, packStagingAllocationCountForTest());
+  ASSERT_NCCL(ensurePackStagingBuffer(comm, kSlotBytes, stream));
+  EXPECT_EQ(1, packStagingAllocationCountForTest());
+  ASSERT_NCCL(packStagingRecordEvent(comm, stream));
 
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm, kSlotBytes, stream));
-  EXPECT_EQ(1, packWindowStagingAllocationCountForTest());
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm, stream));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm, kSlotBytes, stream));
+  EXPECT_EQ(1, packStagingAllocationCountForTest());
+  ASSERT_NCCL(packStagingRecordEvent(comm, stream));
 }
 
-TEST_F(PackWindowStagingPoolTest, AllocationFailureDoesNotCommitMapping) {
+TEST_F(PackStagingPoolTest, AllocationFailureDoesNotCommitMapping) {
   gReshardStagingBuckets[0] = {kSlotBytes, 1};
   gReshardStagingBuckets[1] = {kUnsatisfiableBytes, 1};
   gReshardStagingBucketCount = 2;
   gReshardStagingBucketsImplicitDefault = false;
 
-  EXPECT_NE(ncclSuccess, ensurePackWindowStagingBuffer(comm, kUnsatisfiableBytes, stream));
-  EXPECT_EQ(nullptr, getPackWindowStagingBuffer(comm));
-  EXPECT_EQ(0U, getPackWindowStagingCapacity(comm));
-  EXPECT_EQ(0, packWindowStagingAllocationCountForTest());
+  EXPECT_NE(ncclSuccess, ensurePackStagingBuffer(comm, kUnsatisfiableBytes, stream));
+  EXPECT_EQ(nullptr, getPackStagingBuffer(comm));
+  EXPECT_EQ(0U, getPackStagingCapacity(comm));
+  EXPECT_EQ(0, packStagingAllocationCountForTest());
 
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm, kSlotBytes, stream));
-  EXPECT_NE(nullptr, getPackWindowStagingBuffer(comm));
-  EXPECT_EQ(kSlotBytes, getPackWindowStagingCapacity(comm));
-  EXPECT_EQ(1, packWindowStagingAllocationCountForTest());
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm, stream));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm, kSlotBytes, stream));
+  EXPECT_NE(nullptr, getPackStagingBuffer(comm));
+  EXPECT_EQ(kSlotBytes, getPackStagingCapacity(comm));
+  EXPECT_EQ(1, packStagingAllocationCountForTest());
+  ASSERT_NCCL(packStagingRecordEvent(comm, stream));
 }
 
-TEST_F(PackWindowStagingPoolTest, ImplicitDefaultOversizeReportsSizingGuidance) {
+TEST_F(PackStagingPoolTest, ImplicitDefaultOversizeReportsSizingGuidance) {
   constexpr size_t kLargerRequest = 1U << 20;
   gReshardStagingBuckets[0] = {kSlotBytes, kDefaultStagingBucketSlots};
   gReshardStagingBucketCount = 1;
   gReshardStagingBucketsImplicitDefault = true;
 
   m2nClearLastError();
-  EXPECT_EQ(ncclInvalidArgument, ensurePackWindowStagingBuffer(comm, kLargerRequest, stream));
+  EXPECT_EQ(ncclInvalidArgument, ensurePackStagingBuffer(comm, kLargerRequest, stream));
   const std::string detail = ncclM2nGetLastError();
   EXPECT_NE(std::string::npos, detail.find("implicit default"));
   EXPECT_NE(std::string::npos, detail.find("NCCL_RESHARD_PACK_BUFFSIZES="));
   EXPECT_NE(std::string::npos, detail.find(std::to_string(kLargerRequest)));
-  EXPECT_EQ(0, packWindowStagingAllocationCountForTest());
+  EXPECT_EQ(0, packStagingAllocationCountForTest());
 }
 
-TEST_F(PackWindowStagingPoolTest, AssignsStableRoundRobinLanesAcrossCommunicators) {
+TEST_F(PackStagingPoolTest, AssignsStableRoundRobinLanesAcrossCommunicators) {
   gReshardStagingBuckets[0] = {kSlotBytes, 2};
   gReshardStagingBucketCount = 1;
 
@@ -172,32 +172,32 @@ TEST_F(PackWindowStagingPoolTest, AssignsStableRoundRobinLanesAcrossCommunicator
   ASSERT_NCCL(ncclCommInitAll(&comm3, 1, devices));
   ASSERT_NCCL(ncclCommInitAll(&comm4, 1, devices));
 
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm, kSlotBytes, stream));
-  void* slot0 = getPackWindowStagingBuffer(comm);
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm, stream));
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm2, kSlotBytes, stream));
-  void* slot1 = getPackWindowStagingBuffer(comm2);
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm2, stream));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm, kSlotBytes, stream));
+  void* slot0 = getPackStagingBuffer(comm);
+  ASSERT_NCCL(packStagingRecordEvent(comm, stream));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm2, kSlotBytes, stream));
+  void* slot1 = getPackStagingBuffer(comm2);
+  ASSERT_NCCL(packStagingRecordEvent(comm2, stream));
   ASSERT_NE(slot0, slot1);
 
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm3, kSlotBytes, stream));
-  EXPECT_EQ(slot0, getPackWindowStagingBuffer(comm3));
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm3, stream));
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm4, kSlotBytes, stream));
-  EXPECT_EQ(slot1, getPackWindowStagingBuffer(comm4));
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm4, stream));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm3, kSlotBytes, stream));
+  EXPECT_EQ(slot0, getPackStagingBuffer(comm3));
+  ASSERT_NCCL(packStagingRecordEvent(comm3, stream));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm4, kSlotBytes, stream));
+  EXPECT_EQ(slot1, getPackStagingBuffer(comm4));
+  ASSERT_NCCL(packStagingRecordEvent(comm4, stream));
 
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm3, kSlotBytes, stream));
-  EXPECT_EQ(slot0, getPackWindowStagingBuffer(comm3));
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm3, stream));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm3, kSlotBytes, stream));
+  EXPECT_EQ(slot0, getPackStagingBuffer(comm3));
+  ASSERT_NCCL(packStagingRecordEvent(comm3, stream));
 
-  packWindowStagingFinalize();
+  packStagingFinalize();
   ASSERT_NCCL(ncclCommDestroy(comm2));
   ASSERT_NCCL(ncclCommDestroy(comm3));
   ASSERT_NCCL(ncclCommDestroy(comm4));
 }
 
-TEST_F(PackWindowStagingPoolTest, RejectsOverlappingUsersOfOnePhysicalLane) {
+TEST_F(PackStagingPoolTest, RejectsOverlappingUsersOfOnePhysicalLane) {
   enableSingleSlotBucket();
   int devices[1] = {0};
   ncclComm_t comm2 = nullptr;
@@ -212,7 +212,7 @@ TEST_F(PackWindowStagingPoolTest, RejectsOverlappingUsersOfOnePhysicalLane) {
     ownerCudaResult = cudaSetDevice(0);
     if (ownerCudaResult != cudaSuccess) return;
     M2nApiLock apiLock;
-    ownerAcquireResult = ensurePackWindowStagingBuffer(comm, kSlotBytes, stream);
+    ownerAcquireResult = ensurePackStagingBuffer(comm, kSlotBytes, stream);
     slotReady.store(true, std::memory_order_release);
     {
       M2nApiUnlock apiUnlock;
@@ -221,7 +221,7 @@ TEST_F(PackWindowStagingPoolTest, RejectsOverlappingUsersOfOnePhysicalLane) {
       }
     }
     if (ownerAcquireResult == ncclSuccess) {
-      ownerRecordResult = packWindowStagingRecordEvent(comm, stream);
+      ownerRecordResult = packStagingRecordEvent(comm, stream);
     }
   });
 
@@ -231,7 +231,7 @@ TEST_F(PackWindowStagingPoolTest, RejectsOverlappingUsersOfOnePhysicalLane) {
   ncclResult_t overlappingResult = ncclSuccess;
   {
     M2nApiLock apiLock;
-    overlappingResult = ensurePackWindowStagingBuffer(comm2, kSlotBytes, stream);
+    overlappingResult = ensurePackStagingBuffer(comm2, kSlotBytes, stream);
   }
   releaseOwner.store(true, std::memory_order_release);
   owner.join();
@@ -240,20 +240,20 @@ TEST_F(PackWindowStagingPoolTest, RejectsOverlappingUsersOfOnePhysicalLane) {
   EXPECT_EQ(ncclSuccess, ownerAcquireResult);
   EXPECT_EQ(ncclInvalidUsage, overlappingResult);
   EXPECT_EQ(ncclSuccess, ownerRecordResult);
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm2, kSlotBytes, stream));
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm2, stream));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm2, kSlotBytes, stream));
+  ASSERT_NCCL(packStagingRecordEvent(comm2, stream));
 
-  packWindowStagingFinalize();
+  packStagingFinalize();
   ASSERT_NCCL(ncclCommDestroy(comm2));
 }
 
-TEST_F(PackWindowStagingPoolTest, WaitsForPriorCommunicatorOnAnotherStream) {
+TEST_F(PackStagingPoolTest, WaitsForPriorCommunicatorOnAnotherStream) {
   enableSingleSlotBucket();
   int devices[1] = {0};
   ncclComm_t comm2 = nullptr;
   ASSERT_NCCL(ncclCommInitAll(&comm2, 1, devices));
 
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm, kSlotBytes, nullptr));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm, kSlotBytes, nullptr));
   cudaStream_t nonblocking = nullptr;
   cudaEvent_t marker = nullptr;
   ASSERT_CUDA(cudaStreamCreateWithFlags(&nonblocking, cudaStreamNonBlocking));
@@ -261,10 +261,10 @@ TEST_F(PackWindowStagingPoolTest, WaitsForPriorCommunicatorOnAnotherStream) {
 
   std::atomic<bool> release{false};
   ASSERT_CUDA(cudaLaunchHostFunc(nullptr, waitForSlotRelease, &release));
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm, nullptr));
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm2, kSlotBytes, nonblocking));
+  ASSERT_NCCL(packStagingRecordEvent(comm, nullptr));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm2, kSlotBytes, nonblocking));
   ASSERT_CUDA(cudaEventRecord(marker, nonblocking));
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm2, nonblocking));
+  ASSERT_NCCL(packStagingRecordEvent(comm2, nonblocking));
 
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
   EXPECT_EQ(cudaErrorNotReady, cudaEventQuery(marker));
@@ -274,36 +274,36 @@ TEST_F(PackWindowStagingPoolTest, WaitsForPriorCommunicatorOnAnotherStream) {
 
   EXPECT_EQ(cudaSuccess, cudaEventDestroy(marker));
   EXPECT_EQ(cudaSuccess, cudaStreamDestroy(nonblocking));
-  packWindowStagingFinalize();
+  packStagingFinalize();
   ASSERT_NCCL(ncclCommDestroy(comm2));
 }
 
-TEST_F(PackWindowStagingPoolTest, KeepsHostRmaWarmupStatePerCommunicator) {
+TEST_F(PackStagingPoolTest, KeepsHostRmaWarmupStatePerCommunicator) {
   enableSingleSlotBucket();
   int devices[1] = {0};
   ncclComm_t comm2 = nullptr;
   ASSERT_NCCL(ncclCommInitAll(&comm2, 1, devices));
 
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm, kSlotBytes, stream));
-  void* sharedSlot = getPackWindowStagingBuffer(comm);
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm, stream));
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm2, kSlotBytes, stream));
-  EXPECT_EQ(sharedSlot, getPackWindowStagingBuffer(comm2));
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm2, stream));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm, kSlotBytes, stream));
+  void* sharedSlot = getPackStagingBuffer(comm);
+  ASSERT_NCCL(packStagingRecordEvent(comm, stream));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm2, kSlotBytes, stream));
+  EXPECT_EQ(sharedSlot, getPackStagingBuffer(comm2));
+  ASSERT_NCCL(packStagingRecordEvent(comm2, stream));
 
-  ASSERT_NCCL(setPackWindowRmaWarmed(comm, true));
-  ASSERT_NCCL(setPackWindowRmaWarmed(comm2, false));
+  ASSERT_NCCL(setPackRmaWarmed(comm, true));
+  ASSERT_NCCL(setPackRmaWarmed(comm2, false));
   bool warmed = false;
-  ASSERT_NCCL(getPackWindowRmaWarmed(comm, &warmed));
+  ASSERT_NCCL(getPackRmaWarmed(comm, &warmed));
   EXPECT_TRUE(warmed);
-  ASSERT_NCCL(getPackWindowRmaWarmed(comm2, &warmed));
+  ASSERT_NCCL(getPackRmaWarmed(comm2, &warmed));
   EXPECT_FALSE(warmed);
 
-  packWindowStagingFinalize();
+  packStagingFinalize();
   ASSERT_NCCL(ncclCommDestroy(comm2));
 }
 
-TEST_F(PackWindowStagingPoolTest, NewMappingsSkipPoisonedLanes) {
+TEST_F(PackStagingPoolTest, NewMappingsSkipPoisonedLanes) {
   gReshardStagingBuckets[0] = {kSlotBytes, 2};
   gReshardStagingBucketCount = 1;
   int devices[1] = {0};
@@ -312,19 +312,19 @@ TEST_F(PackWindowStagingPoolTest, NewMappingsSkipPoisonedLanes) {
   ASSERT_NCCL(ncclCommInitAll(&comm2, 1, devices));
   ASSERT_NCCL(ncclCommInitAll(&comm3, 1, devices));
 
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm, kSlotBytes, stream));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm, kSlotBytes, stream));
   reshardFailNextCompletionEventRecordForTest(/*bFailStreamSynchronize=*/true);
-  EXPECT_EQ(ncclSystemError, packWindowStagingRecordEvent(comm, stream));
-  EXPECT_EQ(ncclUnhandledCudaError, ensurePackWindowStagingBuffer(comm, kSlotBytes, stream));
+  EXPECT_EQ(ncclSystemError, packStagingRecordEvent(comm, stream));
+  EXPECT_EQ(ncclUnhandledCudaError, ensurePackStagingBuffer(comm, kSlotBytes, stream));
 
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm2, kSlotBytes, stream));
-  void* healthySlot = getPackWindowStagingBuffer(comm2);
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm2, stream));
-  ASSERT_NCCL(ensurePackWindowStagingBuffer(comm3, kSlotBytes, stream));
-  EXPECT_EQ(healthySlot, getPackWindowStagingBuffer(comm3));
-  ASSERT_NCCL(packWindowStagingRecordEvent(comm3, stream));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm2, kSlotBytes, stream));
+  void* healthySlot = getPackStagingBuffer(comm2);
+  ASSERT_NCCL(packStagingRecordEvent(comm2, stream));
+  ASSERT_NCCL(ensurePackStagingBuffer(comm3, kSlotBytes, stream));
+  EXPECT_EQ(healthySlot, getPackStagingBuffer(comm3));
+  ASSERT_NCCL(packStagingRecordEvent(comm3, stream));
 
-  packWindowStagingFinalize();
+  packStagingFinalize();
   reshardClearResourceQuarantine();
   ASSERT_NCCL(ncclCommDestroy(comm2));
   ASSERT_NCCL(ncclCommDestroy(comm3));

@@ -108,17 +108,17 @@ tests/run_basic_api_tests.sh -N 32 --filter nd_tensors
 # Or directly:
 mpirun -np 8 ./build/bin/basic_api_test_mpi --filter 2d_placement
 
-# Focused PACKWINDOW host-RMA lease regression: two warmed communicators
+# Focused PACK host-RMA lease regression: two warmed communicators
 # share one destination GPU and one physical staging slot. Require INFO logs
-# to contain "packwindow-lsa-hput" so a kernel fallback cannot certify it.
+# to contain "pack-lsa-hput" so a kernel fallback cannot certify it.
 NCCL_NUM_RMA_CTX=4 \
 NCCL_RESHARD_PACK_BUFFSIZES=8192:1 \
 NCCL_RESHARD_SPLIT_COMM=0 \
 NCCL_RESHARD_LOG_LEVEL=INFO \
 mpirun -np 3 ./build/bin/basic_api_test_mpi \
-  --filter packwindow_reduced_bucket \
-  --gtest_filter='PackWindowMpiTest.*' \
-  --algorithm ring --api default --copy-algorithm packwindow \
+  --filter pack_reduced_bucket \
+  --gtest_filter='PackMpiTest.*' \
+  --algorithm ring --api default --copy-algorithm pack \
   --lb-mode uniform
 ```
 
@@ -131,8 +131,8 @@ mpirun -np 3 ./build/bin/basic_api_test_mpi \
 | `--gtest_filter=<pattern>`            | Native gtest filtering over sanitized parameter names, after the custom matrix filters above. |
 | `--max-world <N>`                     | Skip cases whose minimum required world size is `> N`. |
 | `--min-world <N>`                     | Skip cases whose minimum required world size is `< N`. |
-| `--algorithm ring\|direct`            | Legacy test-scenario label (default ring). If no copy algorithm is supplied, `ring` selects PACKWINDOW and `direct` selects DIRECT. `basic_api_test_mpi` also accepts `all`, registering one parameter per label. |
-| `--copy-algorithm direct\|packwindow` | Copy transport exercised through every selected API surface. |
+| `--algorithm ring\|direct`            | Legacy test-scenario label (default ring). If no copy algorithm is supplied, `ring` selects PACK and `direct` selects DIRECT. `basic_api_test_mpi` also accepts `all`, registering one parameter per label. |
+| `--copy-algorithm direct\|pack` | Copy transport exercised through every selected API surface. |
 | `--lb-mode uniform\|node`             | Load-balance mode (default uniform). |
 | `--verbose`                           | Library verbose + per-rank diagnostics. |
 | `-N <ranks>` *(local only)*           | Number of ranks/threads (clamped to device count). |

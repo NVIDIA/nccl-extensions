@@ -9,7 +9,7 @@
  * Tensor Reshard — Split-Comm RING Param Builder
  *
  * Translates a parent-comm-relative ncclReshardParams (as built by
- * prepareReshardParams, including any PACKWINDOW contiguous-plan rewrite)
+ * prepareReshardParams, including any PACK contiguous-plan rewrite)
  * into a ncclReshardParamsSplit whose peer ranks are expressed in the
  * sub-comm each operation runs on:
  *

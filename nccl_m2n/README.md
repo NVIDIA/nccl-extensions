@@ -10,7 +10,7 @@ The library uses copy/staging-backed reshard transports. `ncclReshard` is the
 primary entry point. `ncclReshardWithWindow` remains available as a
 compatibility alias; its window argument is ignored and may be `NULL`. Both
 entry points use the transport selected by `NCCL_RESHARD_COPY_ALGORITHM`, whose
-default is `PACKWINDOW`. The shared library is installed as `libnccl_m2n.so`; the
+default is `PACK`. The shared library is installed as `libnccl_m2n.so`; the
 public header is `nccl_m2n.h`.
 
 > **Status.** Experimental — see [RELEASE.md](RELEASE.md) for the full list of
@@ -331,7 +331,7 @@ noted otherwise):
 **Returns** `ncclSuccess` on success, otherwise an `ncclResult_t` from NCCL or
 `ncclInvalidArgument` from the preconditions above.
 
-A PACKWINDOW host-RMA error after GRANT/ARRIVAL protocol work begins is
+A PACK host-RMA error after GRANT/ARRIVAL protocol work begins is
 fail-stop for the participating communicator and M2N runtime epoch. Every rank
 must stop issuing M2N work on that communicator and coordinate communicator or
 process-group shutdown. Retrying the transfer or continuing to another tensor
@@ -344,7 +344,7 @@ both meshes, must call the same reshard operation in the same collective order
 and provide both descriptors. The call follows CUDA stream semantics. Issue a
 single reshard at a time per `(comm, effective stream)`. Use separate
 communicators for concurrent transfers; the batched benchmark does this with
-`--num-comms`. PACKWINDOW uses a bounded staging pool; submit reshard calls
+`--num-comms`. PACK uses a bounded staging pool; submit reshard calls
 serially on the host within each process, including calls on different
 communicators that may share a physical slot. Ranks in overlapping
 communicators must submit those communicators in one consistent logical order.
@@ -623,7 +623,7 @@ mpirun -np <total_gpus> ./build/bin/reshard_model_bench \
 | `--warmup <N>` | 2 | Warmup iterations. |
 | `--gpus-per-node <N>` | 8 | GPUs per node for load balancing. |
 | `--algorithm <auto\|ring\|direct>` | auto | Legacy setting; see `--copy-algorithm`. |
-| `--copy-algorithm <packwindow\|direct>` | packwindow | Copy-transport override for the reshard benchmark. |
+| `--copy-algorithm <pack\|direct>` | pack | Copy-transport override for the reshard benchmark. |
 | `--lb-mode <uniform\|node>` | uniform | Load-balance mode. |
 | `--no-dedup` | off | Benchmark all layers instead of one representative per repeated pattern. |
 | `--validate` | off | Run correctness validation before timing. |
@@ -722,7 +722,7 @@ Case groups: `full_replication`, `full_sharding`, `2d_placement`,
 plus 1-D analogues. See [`tests/README.md`](tests/README.md) for the full
 matrix and the `--list` / `--min-world` / `--max-world` flags used to bin a CI
 run into rank tiers. The legacy test-scenario parameter `--algorithm` chooses a
-PACKWINDOW default for `ring` and a staging-DIRECT default for `direct` when
+PACK default for `ring` and a staging-DIRECT default for `direct` when
 `--copy-algorithm` is omitted; the MPI binary also accepts `--algorithm all`.
 
 Exit code is `1` if any case reports `FAIL`, `0` otherwise. `SKIP` does
@@ -736,7 +736,7 @@ not fail the run.
 
 - `NCCL_RESHARD_ALGORITHM` is retained as a parsed compatibility setting; the
   current copy transport does not dispatch on it.
-- `NCCL_RESHARD_COPY_ALGORITHM=PACKWINDOW` (default) selects the PACKWINDOW
+- `NCCL_RESHARD_COPY_ALGORITHM=PACK` (default) selects the PACK
   staging transport.
 - `NCCL_RESHARD_COPY_ALGORITHM=DIRECT` selects the direct staging transport.
 
@@ -778,14 +778,14 @@ have identical effective values on every rank in the communicator.
 |---|---|
 | `NCCL_RESHARD_LOG_LEVEL`        | One of `NONE`, `WARN` (default), `INFO`, `DEBUG`, `TRACE`. |
 | `NCCL_RESHARD_ALGORITHM`        | Parsed compatibility setting; the current copy transport does not dispatch on it. |
-| `NCCL_RESHARD_COPY_ALGORITHM`   | Copy transport for both entry points: `PACKWINDOW` (default) or `DIRECT`. |
+| `NCCL_RESHARD_COPY_ALGORITHM`   | Copy transport for both entry points: `PACK` (default) or `DIRECT`. |
 | `NCCL_RESHARD_LB_MODE`          | `UNIFORM` (default) or `NODE_AWARE`. |
 | `NCCL_RESHARD_NUM_CTAS`         | Directly overrides the resolved CTA count; invalid values are ignored. |
 | `NCCL_RESHARD_SRC_DOMAIN_SIZE`  | Positive source domain-size override; invalid values are ignored. |
 | `NCCL_RESHARD_DST_DOMAIN_SIZE`  | Positive destination domain-size override; invalid values are ignored. |
 | `NCCL_RESHARD_USE_INTERNAL_STREAMS` | Cache one internal stream per observed `(comm, device)` pair until runtime finalization (default `1`); `0` keeps work on caller streams with ordered DevComm reuse. |
 | `NCCL_RESHARD_CHUNK_SIZE`       | Positive RING byte-level chunk size; invalid values are ignored. |
-| `NCCL_RESHARD_PACK_BUFFSIZES` | Bounded PACKWINDOW staging pool as comma-separated `size[:slots]` buckets (default `2147483648:4`). Sizes accept bytes or binary `k`/`m` suffixes; omitted slots default to one. Total slots must not exceed 64. Selected slots allocate lazily and communicators reuse them in stable round-robin waves. Invalid profiles retain the built-in default. |
+| `NCCL_RESHARD_PACK_BUFFSIZES` | Bounded PACK staging pool as comma-separated `size[:slots]` buckets (default `2147483648:4`). Sizes accept bytes or binary `k`/`m` suffixes; omitted slots default to one. Total slots must not exceed 64. Selected slots allocate lazily and communicators reuse them in stable round-robin waves. Invalid profiles retain the built-in default. |
 | `NCCL_RESHARD_STAGING_NUM_CHANNELS` | Positive staging channel count used by `ncclReshard`. |
 | `NCCL_RESHARD_STAGING_CHANNEL_SIZE` | Positive per-channel staging allocation in bytes. |
 | `NCCL_RESHARD_STAGING_CHUNK_SIZE` | Positive staging transfer chunk size in bytes. |
@@ -810,8 +810,8 @@ have identical effective values on every rank in the communicator.
 │   ├── reshard_mesh.cc                   # Mesh analysis helpers               (host)
 │   ├── reshard_loadbalance.cc            # Replication load balancer           (host)
 │   ├── reshard_prepare.cc                # Kernel-parameter builders           (host)
-│   ├── packwindow_staging.cc             # PACKWINDOW staging-buffer pool     (host)
-│   ├── reshard_user_window.cu            # WithWindow alias + PACKWINDOW transport/kernel
+│   ├── pack_staging.cc             # PACK staging-buffer pool     (host)
+│   ├── reshard_user_window.cu            # WithWindow alias + PACK transport/kernel
 │   ├── reshard_staging.cu                # ncclReshard staging-path entry + dispatch
 │   ├── staging_prepare.cc                # Staging transfer-descriptor builders (host)
 │   ├── staging_buffer.{cc,h}             # Staging-buffer lifecycle             (host)

@@ -244,7 +244,7 @@ NCCL_M2N_API ncclResult_t ncclM2nInit(ncclM2nHandle_t* handle, const ncclM2nConf
  * receive a NULL handle.  Repeated NULL finalization is allowed.  A non-NULL
  * handle must not be reused after this call returns; finalizing an unknown or
  * already-finalized non-NULL handle returns ncclInvalidArgument.  Internal
- * process-global caches and temporary PACKWINDOW staging buffers are released when the
+ * process-global caches and temporary PACK staging buffers are released when the
  * last active handle is finalized.  Caller-owned comms, windows, streams, and
  * buffers are not destroyed.  Reshard calls enqueue asynchronous CUDA work;
  * this function does not synchronize caller streams.  Before finalizing a
@@ -295,8 +295,13 @@ NCCL_M2N_API const char* ncclM2nGetLastError(void);
  * The library copies tensor descriptors and their meshes while recording.
  * Tensor storage remains caller-owned and must remain valid and unmodified
  * until ncclM2nGroupEnd has issued the group and the normal stream-ordered
- * completion contract has been satisfied.  Grouped calls must describe
- * independent, non-overlapping tensor storage and have no ordering dependency.
+ * completion contract has been satisfied.  Within one execution-context
+ * bucket, PACK-fused calls may share read-only source storage, but every
+ * destination range must remain non-overlapping with all ranges of other
+ * entries.  Calls outside the PACK path retain submission order and do
+ * not currently validate cross-entry aliases, so callers must avoid overlap
+ * involving a destination.  Fused grouped calls must have no ordering
+ * dependency.
  *
  * Each context bucket is a collective contract: every rank in its communicator
  * must record the same bucket entries in the same order, with identical
@@ -325,11 +330,14 @@ NCCL_M2N_API ncclResult_t ncclM2nGroupStart(void);
  * Buckets are submitted sequentially on the calling host thread in
  * first-occurrence order; buckets on distinct streams may execute concurrently
  * on the device.  Within each bucket, compatible ncclReshard calls are
- * partitioned by normalized topology and packed into staging-bounded PACKWINDOW
- * submissions.  Recorded calls must therefore describe independent,
- * non-overlapping storage and have no ordering dependency.  Calls outside the
- * PACKWINDOW staging path retain submission order within their bucket.  Storage
- * must not overlap across buckets because cross-bucket ranges are not checked.
+ * partitioned by normalized topology and packed into staging-bounded PACK
+ * submissions.  Within one bucket, PACK-fused calls may share read-only
+ * source storage, but every destination range must remain non-overlapping with
+ * all ranges of other entries.  Calls outside the PACK staging path
+ * retain submission order and do not currently validate cross-entry aliases,
+ * so callers must avoid overlap involving a destination.  Calls must have no
+ * ordering dependency when fused.  Storage must not overlap across buckets
+ * because cross-bucket ranges are not checked.
  * Validation and execution errors that cannot be detected while recording are
  * returned here with the original group entry index.  Remaining entries in that
  * bucket and all later buckets are not issued.  An empty group succeeds.
@@ -362,11 +370,12 @@ NCCL_M2N_API ncclResult_t ncclM2nGroupAbort(void);
  * ====================================================================*/
 
 /**
- * Single-shot resharding with a caller-registered window.
- * See ncclReshard for the error contract, including the PACKWINDOW host-RMA
- * fail-stop rule.
- *
- * Passing NULL as `handle` lazily creates and uses an internal default handle.
+ * Alternative reshard entry point for callers that provide an NCCL window.
+ * The current implementation does not use the caller-provided window and
+ * follows ncclReshard's transport selection, including
+ * NCCL_RESHARD_COPY_ALGORITHM and its PACK default.  A future
+ * implementation may use the window when beneficial; callers must not assume
+ * that providing one guarantees zero-copy execution.
  *
  * Both descriptors are required on every rank — they each carry one
  * side's mesh, and the library reads both meshes everywhere to compute
@@ -398,7 +407,7 @@ NCCL_M2N_API ncclResult_t ncclM2nGroupAbort(void);
  *                    before and after the reshard operation.
  *
  * @return Same error contract as ncclReshard, including its fail-stop rule for
- *         errors reported after PACKWINDOW host-RMA protocol entry.
+ *         errors reported after PACK host-RMA protocol entry.
  */
 NCCL_M2N_API ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm,
                                                 ncclWindow_t window,
@@ -426,7 +435,7 @@ NCCL_M2N_API ncclResult_t ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm
  * @return ncclSuccess on success, ncclInvalidArgument if a precondition is
  *         violated, or another ncclResult_t reported by setup or transport
  *         operations. A pre-entry validation error enqueues no transfer work.
- *         If an error is reported after PACKWINDOW host-RMA protocol work has
+ *         If an error is reported after PACK host-RMA protocol work has
  *         begun, the participating communicator and M2N runtime epoch are
  *         fail-stop: all ranks must stop issuing M2N work on this communicator
  *         and coordinate communicator or process-group shutdown. Retrying the

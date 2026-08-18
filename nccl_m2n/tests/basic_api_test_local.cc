@@ -87,7 +87,7 @@ struct LocalParam {
 }
 
 static BasicApiCliArgs gCli;
-static const char* gResolvedCopyAlgorithm = "PACKWINDOW";
+static const char* gResolvedCopyAlgorithm = "PACK";
 static std::vector<TestCase> gCases;
 static int gWorldSize = 0;
 static int gNumDevices = 0;
@@ -346,7 +346,7 @@ static void* threadMain(void* p) {
   env.copyBuffer = copyBuffer;
   env.copyBufferBytes = (copyBuffer != nullptr) ? gBufferBytes : 0;
   env.apiKind = a->api;
-  env.expectPackWindow = strcmp(gResolvedCopyAlgorithm, "PACKWINDOW") == 0;
+  env.expectPack = strcmp(gResolvedCopyAlgorithm, "PACK") == 0;
   env.verbose = a->verbose;
   env.barrier = localBarrier;
   env.allreduceMinInt = localAllreduceMinInt;

@@ -156,10 +156,13 @@ void reshardClearResourceQuarantine() {
   gReshardResourceQuarantineRequired = false;
 }
 
-static ncclWindow_t* findCachedWindowByPtr(WindowCache* cache, ncclComm_t comm, void* buffer, size_t size) {
+static ncclWindow_t* findCachedWindowByPtr(WindowCache* cache, ncclComm_t comm, void* buffer, size_t size,
+                                           ReshardInternalWindowKind kind) {
   for (int i = 0; i < cache->count; i++) {
     WindowCacheEntry& e = cache->entries[i];
-    if (e.valid && e.comm == comm && e.windowBuffer == buffer && e.windowSize == size) return &e.window;
+    if (e.valid && e.comm == comm && e.windowBuffer == buffer && e.windowSize == size && e.kind == kind) {
+      return &e.window;
+    }
   }
   return nullptr;
 }
@@ -274,7 +277,7 @@ static ncclResult_t reclaimRetiredDevCommEntriesIfIdle() {
 }
 
 static ncclResult_t cacheWindow(WindowCache* cache, ncclComm_t comm, void* windowBuffer, size_t windowSize,
-                                ncclWindow_t window) {
+                                ReshardInternalWindowKind kind, ncclWindow_t window) {
   int idx;
   if (cache->count >= MAX_WINDOW_CACHE_ENTRIES) {
     idx = cache->nextIdx;
@@ -300,17 +303,20 @@ static ncclResult_t cacheWindow(WindowCache* cache, ncclComm_t comm, void* windo
   e.comm = comm;
   e.windowBuffer = windowBuffer;
   e.windowSize = windowSize;
+  e.kind = kind;
   e.window = window;
   e.valid = true;
   return ncclSuccess;
 }
 
-ncclWindow_t* findCachedInternalWindowByPtr(ncclComm_t comm, void* buffer, size_t size) {
-  return findCachedWindowByPtr(&gInternalWindowCache, comm, buffer, size);
+ncclWindow_t* findCachedInternalWindowByPtr(ncclComm_t comm, void* buffer, size_t size,
+                                            ReshardInternalWindowKind kind) {
+  return findCachedWindowByPtr(&gInternalWindowCache, comm, buffer, size, kind);
 }
 
-ncclResult_t cacheInternalWindow(ncclComm_t comm, void* buffer, size_t size, ncclWindow_t window) {
-  return cacheWindow(&gInternalWindowCache, comm, buffer, size, window);
+ncclResult_t cacheInternalWindow(ncclComm_t comm, void* buffer, size_t size, ReshardInternalWindowKind kind,
+                                 ncclWindow_t window) {
+  return cacheWindow(&gInternalWindowCache, comm, buffer, size, kind, window);
 }
 
 ncclDevComm* findCachedDevComm(const ReshardDevCommCacheKey& key, cudaEvent_t* outCompletionEvent,
@@ -387,32 +393,52 @@ ncclResult_t cacheDevComm(const ReshardDevCommCacheKey& key, const ncclDevComm* 
 }
 
 /* ======================================================================
- * Staging buffer pool -- per-comm entries for the DIRECT copy path.
+ * Staging buffer pool -- per-comm entries, mirroring TransposeBufferEntry.
  * ====================================================================*/
 
 static StagingBufferPoolEntry gStagingPool[MAX_STAGING_BUFFER_ENTRIES];
 static int gStagingPoolCount = 0;
 
-static StagingBufferPoolEntry* findStagingPoolEntry(ncclComm_t comm) {
+#ifdef NCCL_M2N_TESTING
+void stagingBufferPoolSetCompletionEventForTest(cudaEvent_t event) {
+  gStagingPool[0] = {};
+  gStagingPool[0].event = event;
+  gStagingPool[0].allocated = true;
+  gStagingPoolCount = 1;
+}
+#endif
+
+static StagingBufferPoolEntry* findStagingPoolEntry(ncclComm_t comm, uint64_t poolKey) {
   for (int i = 0; i < gStagingPoolCount; i++) {
-    if (gStagingPool[i].comm == comm && gStagingPool[i].allocated) {
+    if (gStagingPool[i].comm == comm && gStagingPool[i].poolKey == poolKey && gStagingPool[i].allocated) {
       return &gStagingPool[i];
     }
   }
   return nullptr;
 }
 
-ncclResult_t ensureStagingBufferPool(ncclComm_t comm, cudaStream_t stream, StagingBufferState** outState) {
+ncclResult_t ensureStagingBufferPool(ncclComm_t comm, uint64_t poolKey, cudaStream_t stream, int activeChannels,
+                                     int capacityChannels, int controlSlotCount,
+                                     StagingBufferState** outState) {
   NCCL_M2N_CHECK_ARG(outState != nullptr, -1, "ensureStagingBufferPool called with null outState");
   *outState = nullptr;
 
-  StagingBufferPoolEntry* entry = findStagingPoolEntry(comm);
+  StagingBufferPoolEntry* entry = findStagingPoolEntry(comm, poolKey);
   if (entry != nullptr) {
-    if (entry->stream != stream) {
-      NCCL_M2N_CHECK_ARG(entry->event != nullptr, -1, "Staging buffer pool entry has no ordering event");
-      NCCL_M2N_CUDACHECK(cudaStreamWaitEvent(stream, entry->event, 0));
-      entry->stream = stream;
+    NCCL_M2N_CHECK_ARG(activeChannels <= entry->capacityChannels, -1,
+                       "Staging buffer pool capacity %d is smaller than active channel count %d",
+                       entry->capacityChannels, activeChannels);
+    if (entry->reserved) {
+      NCCL_M2N_FAIL(ncclInvalidUsage, -1,
+                    "Concurrent reshard operations on communicator %p are unsupported; serialize calls at the caller",
+                    (void*)comm);
     }
+    NCCL_M2N_CHECK_ARG(!entry->poisoned, -1,
+                       "Staging buffer pool entry is unusable after its completion stream could not be synchronized");
+    NCCL_M2N_CHECK_ARG(entry->event != nullptr, -1, "Staging buffer pool entry has no ordering event");
+    NCCL_M2N_CUDACHECK(cudaStreamWaitEvent(stream, entry->event, 0));
+    entry->reserved = true;
+    entry->state->numChannels = activeChannels;
     *outState = entry->state;
     return ncclSuccess;
   }
@@ -431,29 +457,38 @@ ncclResult_t ensureStagingBufferPool(ncclComm_t comm, cudaStream_t stream, Stagi
     NCCL_M2N_FAIL(ncclSystemError, -1, "Failed to allocate host memory for staging buffer state");
   }
 
-  ncclResult_t r = stagingBufferInit(state.get());
+  ncclResult_t r = stagingBufferInitWithNumChannelsAndControlSlots(state.get(), capacityChannels, controlSlotCount);
   if (r != ncclSuccess) {
     stagingBufferFinalize(state.get()); // reclaim anything init allocated before failing
     NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(event));
     return r;
   }
+  state->numChannels = activeChannels;
 
   StagingBufferPoolEntry& e = gStagingPool[gStagingPoolCount++];
   e.comm = comm;
-  e.stream = stream;
+  e.poolKey = poolKey;
+  e.capacityChannels = capacityChannels;
   e.event = event;
   e.state = state.release();
+  e.reserved = true;
+  e.poisoned = false;
   e.allocated = true;
-  RESHARD_DEBUG(-1, "Staging buffer pool: allocated for comm %p (%zu bytes) [slot %d]", (void*)comm,
+  RESHARD_DEBUG(-1,
+                "Staging buffer pool: allocated for comm %p pool=0x%016llx activeChannels=%d capacityChannels=%d "
+                "controlSlots=%d (%zu bytes) [slot %d]",
+                (void*)comm, (unsigned long long)poolKey, activeChannels, e.capacityChannels, controlSlotCount,
                 e.state->totalSize, gStagingPoolCount - 1);
   *outState = e.state;
   return ncclSuccess;
 }
 
-ncclResult_t stagingBufferPoolRecordEvent(ncclComm_t comm, cudaStream_t stream) {
-  StagingBufferPoolEntry* e = findStagingPoolEntry(comm);
+ncclResult_t stagingBufferPoolRecordEvent(ncclComm_t comm, uint64_t poolKey, cudaStream_t stream) {
+  StagingBufferPoolEntry* e = findStagingPoolEntry(comm, poolKey);
   if (e != nullptr) {
-    NCCL_M2N_CUDACHECK(cudaEventRecord(e->event, stream));
+    const ncclResult_t result = reshardRecordCompletionEvent(e->event, stream, "staging buffer", &e->poisoned);
+    e->reserved = false;
+    return result;
   }
   return ncclSuccess;
 }
@@ -496,6 +531,7 @@ void cacheFinalize() {
       gStagingPool[i] = {};
     }
     gStagingPoolCount = 0;
+    stagingPipeControlSlotCacheReset();
     resetCompletionFailureInjection();
     return;
   }
@@ -542,6 +578,7 @@ void cacheFinalize() {
   gStreamPool.clear();
 
   stagingBufferPoolFinalize();
+  stagingPipeControlSlotCacheReset();
   resetCompletionFailureInjection();
 }
 

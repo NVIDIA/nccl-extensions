@@ -27,6 +27,7 @@
 #define NCCL_STAGING_BUFFER_H_
 
 #include "nccl.h"
+#include "reshard_split.h"
 #include "staging_types.h"
 
 #include <cstddef>
@@ -36,12 +37,30 @@
 extern "C" {
 #endif
 
+struct StagingPipePlanCacheEntry {
+  ReshardStagingMeshSignature meshSignature;
+  ReshardStagingChannelSignature channelSignature;
+  ReshardStagingTensorSignature tensorSignature;
+
+  /* Host/device copies of the immutable PIPE launch metadata.  Runtime
+   * values that change every call stay in StagingPipeCallParams and are
+   * passed as kernel arguments instead of being copied into these blocks. */
+  StagingKernelParams* hostParams;
+  StagingPipeDevicePlan* hostPlan;
+  StagingKernelParams* devParams;
+  StagingPipeDevicePlan* devPlan;
+
+  bool hostValid;
+  bool deviceValid;
+};
+
 /* ======================================================================
  * Host-side handle returned by stagingBufferInit().
  *
  * Holds the staging buffer allocation and a pre-allocated device-side
- * StagingKernelParams scratch slot (ncclReshard host entry uploads the
- * per-call params block here, avoiding a hot-path cudaMalloc).
+ * StagingKernelParams scratch slot for DIRECT. PIPE uses the fixed
+ * associative plan cache below so alternating mesh/tensor shapes do not rebuild or
+ * re-upload static metadata after warmup.
  * Window registrations live in reshard_cache so that each (comm,
  * staging_buffer) pair gets exactly one collective registration.
  * ====================================================================*/
@@ -50,16 +69,27 @@ struct StagingBufferState {
   size_t totalSize;
   int numChannels;
   size_t channelSize;
+  int controlSlotCount;
+  size_t controlRegionSize;
   size_t chunkSize;
+  int peersPerChannel;
   bool initialized;
 
-  StagingKernelParams* devParams; /* cudaMalloc'd once, reused per launch */
+  StagingKernelParams* devParams; /* cudaMalloc'd once; DIRECT uses it as scratch. */
+
+  /* PIPE plan entries are associative. Persistent-control slots isolate
+   * cursor/counter state; plans are keyed by mesh, active channels, and tensor
+   * metadata because prepared offsets depend on all three. */
+  StagingPipePlanCacheEntry pipePlanCache[STAGING_PIPE_CONTROL_SLOTS];
+  int pipePlanCacheNextVictim;
 };
 
 struct StagingBufferConfig {
   int numChannels;
+  bool numChannelsExplicit;
   size_t channelSize;
   size_t chunkSize;
+  int peersPerChannel;
 };
 
 /* Toggle [STAGING] verbose logging at runtime (parallels
@@ -68,22 +98,28 @@ void stagingSetVerbose(bool verbose);
 
 StagingBufferConfig stagingBufferConfigFromEnv();
 
+/* Resolve the active staging channel count for a transfer. If
+ * NCCL_RESHARD_STAGING_NUM_CHANNELS is unset and peersPerChannel is set,
+ * the result is derived from the transfer peer groups. Descriptors may also
+ * set ctaHeuristicPeerCount to enable a peer-count-aware CTA heuristic:
+ * small peer-group counts get multiple CTAs per peer group, then taper to
+ * one CTA per peer group as peer-group count grows. Explicit
+ * NCCL_RESHARD_STAGING_TARGET_CTAS still overrides the default heuristic. */
+int stagingResolveNumChannelsForTransfer(const StagingTransferDescriptor* desc);
+
 /* Allocate the staging pool + per-call devParams slot.
  * NOT collective. Sizes default from reshard_limits.h, with internal
  * staging-pool overrides read during initialization. */
 ncclResult_t stagingBufferInit(StagingBufferState* state);
-
-/* Derive one rank-uniform chunk size from the configured staging geometry and
- * the exact maximum peer group computed from the shared tensor descriptors. */
-ncclResult_t stagingResolveEffectiveChunkSize(const StagingBufferState* state, size_t maxPeerGroupSize,
-                                              size_t* effectiveChunkSize);
+ncclResult_t stagingBufferInitWithNumChannels(StagingBufferState* state, int numChannels);
+ncclResult_t stagingBufferInitWithNumChannelsAndControlSlots(StagingBufferState* state, int numChannels,
+                                                             int controlSlotCount);
 
 /* Translate a host descriptor into device-ready kernel params.  The
  * caller is expected to have already registered both windows on the
  * staging buffer (see ncclReshard host entry). */
 ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const StagingTransferDescriptor* desc,
-                                    ncclWindow_t rdmaWindow, ncclWindow_t lsaWindow, size_t effectiveChunkSize,
-                                    StagingKernelParams* params);
+                                    ncclWindow_t rdmaWindow, ncclWindow_t lsaWindow, StagingKernelParams* params);
 
 /* Free the staging buffer + devParams slot.  Window deregistration is
  * driven by the global reshard_cache teardown. */

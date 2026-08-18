@@ -14,7 +14,7 @@
 #include "reshard_internal.h"
 
 /* ======================================================================
- * Bounded PACKWINDOW staging pool.
+ * Bounded PACK staging pool.
  *
  * Buffers are fixed-size best-fit buckets. A communicator keeps one stable
  * slot per bucket so window registration remains rank-uniform across calls.
@@ -57,21 +57,21 @@ struct StagingDevicePool {
   StagingBucketRT buckets[kMaxStagingBuckets];
   int bucketCount;
   bool built;
-  CommBucketSlot commSlots[MAX_PACKWINDOW_STAGING_ENTRIES * kMaxStagingBuckets];
+  CommBucketSlot commSlots[MAX_PACK_STAGING_ENTRIES * kMaxStagingBuckets];
   int commSlotCount;
 };
 
-static StagingDevicePool gStagingDevicePools[MAX_PACKWINDOW_STAGING_ENTRIES];
+static StagingDevicePool gStagingDevicePools[MAX_PACK_STAGING_ENTRIES];
 static int gStagingDevicePoolCount = 0;
-static int gPackWindowStagingAllocationCount = 0;
+static int gPackStagingAllocationCount = 0;
 
-struct PackWindowRmaWarmupState {
+struct PackRmaWarmupState {
   ncclComm_t comm;
   bool warmed;
 };
-static PackWindowRmaWarmupState
-  gPackWindowRmaWarmupStates[MAX_PACKWINDOW_STAGING_ENTRIES * kMaxStagingBuckets];
-static int gPackWindowRmaWarmupStateCount = 0;
+static PackRmaWarmupState
+  gPackRmaWarmupStates[MAX_PACK_STAGING_ENTRIES * kMaxStagingBuckets];
+static int gPackRmaWarmupStateCount = 0;
 
 static std::mutex gStagingPoolMutex;
 static thread_local ncclComm_t gCurrentStagingComm = nullptr;
@@ -89,10 +89,10 @@ static ncclResult_t acquireStagingDevicePool(StagingDevicePool** outPool) {
   NCCL_M2N_CUDACHECK(cudaGetDevice(&cudaDev));
   *outPool = findStagingDevicePool(cudaDev);
   if (*outPool != nullptr) return ncclSuccess;
-  NCCL_M2N_CHECK_ARG(gStagingDevicePoolCount < MAX_PACKWINDOW_STAGING_ENTRIES, -1,
-                     "PACKWINDOW staging device-pool table full (%d entries); increase "
-                     "MAX_PACKWINDOW_STAGING_ENTRIES",
-                     MAX_PACKWINDOW_STAGING_ENTRIES);
+  NCCL_M2N_CHECK_ARG(gStagingDevicePoolCount < MAX_PACK_STAGING_ENTRIES, -1,
+                     "PACK staging device-pool table full (%d entries); increase "
+                     "MAX_PACK_STAGING_ENTRIES",
+                     MAX_PACK_STAGING_ENTRIES);
   *outPool = &gStagingDevicePools[gStagingDevicePoolCount++];
   (*outPool)->cudaDev = cudaDev;
   return ncclSuccess;
@@ -145,16 +145,16 @@ static ncclResult_t ensureStagingSlotAllocated(StagingBucketRT* bucket, int slot
   slot->doneEvent = event;
   slot->buffer = buffer;
   bucket->allocated = true;
-  gPackWindowStagingAllocationCount++;
-  RESHARD_DEBUG(-1, "PACKWINDOW staging slot allocated: bucket=%d slot=%d size=%zu B", slot->bucketIdx,
+  gPackStagingAllocationCount++;
+  RESHARD_DEBUG(-1, "PACK staging slot allocated: bucket=%d slot=%d size=%zu B", slot->bucketIdx,
                 slotIdx, bucket->size);
   return ncclSuccess;
 }
 
 /* A reservation is abandoned when it outlived the call that took it.
  *
- * A slot is reserved by ensurePackWindowStagingBuffer and released by
- * packWindowStagingRecordEvent. Any error between the two returns early and would
+ * A slot is reserved by ensurePackStagingBuffer and released by
+ * packStagingRecordEvent. Any error between the two returns early and would
  * otherwise leave the slot reserved for good -- and a reserved slot is never
  * reacquired, so the communicator fails every later call with a spurious
  * concurrency error and stops entering collectives its peers still enter.
@@ -196,14 +196,14 @@ static ncclResult_t acquireStagingSlot(ncclComm_t comm, size_t requiredBytes, cu
     const size_t largest = pool->bucketCount > 0 ? pool->buckets[pool->bucketCount - 1].size : 0;
     if (reshardStagingBucketsUseImplicitDefault()) {
       NCCL_M2N_FAIL(ncclInvalidArgument, -1,
-                    "PACKWINDOW staging request %zu B exceeds the %zu-B bucket in the implicit default "
+                    "PACK staging request %zu B exceeds the %zu-B bucket in the implicit default "
                     "NCCL_RESHARD_PACK_BUFFSIZES=%zu:%d; configure a bucket of at least %zu B (for example "
                     "NCCL_RESHARD_PACK_BUFFSIZES=%zu:%d)",
                     requiredBytes, largest, largest, kDefaultStagingBucketSlots, requiredBytes, requiredBytes,
                     kDefaultStagingBucketSlots);
     }
     NCCL_M2N_FAIL(ncclInvalidArgument, -1,
-                  "PACKWINDOW staging request %zu B exceeds the largest configured buffer %zu B; add or enlarge "
+                  "PACK staging request %zu B exceeds the largest configured buffer %zu B; add or enlarge "
                   "an NCCL_RESHARD_PACK_BUFFSIZES bucket to at least %zu B",
                   requiredBytes, largest, requiredBytes);
   }
@@ -240,8 +240,8 @@ static ncclResult_t acquireStagingSlot(ncclComm_t comm, size_t requiredBytes, cu
   NCCL_M2N_CHECK(ensureStagingSlotAllocated(bucket, slotIdx));
   if (newMapping) {
     NCCL_M2N_CHECK_ARG(recordCommBucketSlot(pool, comm, bucketIdx, slotIdx), -1,
-                       "PACKWINDOW staging communicator memo is full (%zu entries); increase "
-                       "MAX_PACKWINDOW_STAGING_ENTRIES",
+                       "PACK staging communicator memo is full (%zu entries); increase "
+                       "MAX_PACK_STAGING_ENTRIES",
                        sizeof(pool->commSlots) / sizeof(pool->commSlots[0]));
     bucket->nextSlotCursor = (slotIdx + 1) % bucket->numSlots;
   }
@@ -255,35 +255,35 @@ static ncclResult_t acquireStagingSlot(ncclComm_t comm, size_t requiredBytes, cu
   return ncclSuccess;
 }
 
-ncclResult_t ensurePackWindowStagingBuffer(ncclComm_t comm, size_t requiredBytes, cudaStream_t stream) {
+ncclResult_t ensurePackStagingBuffer(ncclComm_t comm, size_t requiredBytes, cudaStream_t stream) {
   StagingSlot* slot = nullptr;
   return acquireStagingSlot(comm, requiredBytes, stream, &slot);
 }
 
-void* getPackWindowStagingBuffer(ncclComm_t comm) {
+void* getPackStagingBuffer(ncclComm_t comm) {
   return (comm == gCurrentStagingComm && gCurrentStagingSlot != nullptr) ? gCurrentStagingSlot->buffer : nullptr;
 }
 
-size_t getPackWindowStagingCapacity(ncclComm_t comm) {
+size_t getPackStagingCapacity(ncclComm_t comm) {
   return (comm == gCurrentStagingComm && gCurrentStagingSlot != nullptr) ? gCurrentStagingSlot->size : 0;
 }
 
-static PackWindowRmaWarmupState* findPackWindowRmaWarmupState(ncclComm_t comm) {
-  for (int i = 0; i < gPackWindowRmaWarmupStateCount; i++) {
-    if (gPackWindowRmaWarmupStates[i].comm == comm) {
-      return &gPackWindowRmaWarmupStates[i];
+static PackRmaWarmupState* findPackRmaWarmupState(ncclComm_t comm) {
+  for (int i = 0; i < gPackRmaWarmupStateCount; i++) {
+    if (gPackRmaWarmupStates[i].comm == comm) {
+      return &gPackRmaWarmupStates[i];
     }
   }
   return nullptr;
 }
 
-static ncclResult_t getOrCreatePackWindowRmaWarmupState(ncclComm_t comm, PackWindowRmaWarmupState** outState) {
-  PackWindowRmaWarmupState* state = findPackWindowRmaWarmupState(comm);
+static ncclResult_t getOrCreatePackRmaWarmupState(ncclComm_t comm, PackRmaWarmupState** outState) {
+  PackRmaWarmupState* state = findPackRmaWarmupState(comm);
   if (state == nullptr) {
-    const int capacity = (int)(sizeof(gPackWindowRmaWarmupStates) / sizeof(gPackWindowRmaWarmupStates[0]));
-    NCCL_M2N_CHECK_ARG(gPackWindowRmaWarmupStateCount < capacity, -1,
-                       "PACKWINDOW host-RMA warmup-state table is full (%d entries)", capacity);
-    state = &gPackWindowRmaWarmupStates[gPackWindowRmaWarmupStateCount++];
+    const int capacity = (int)(sizeof(gPackRmaWarmupStates) / sizeof(gPackRmaWarmupStates[0]));
+    NCCL_M2N_CHECK_ARG(gPackRmaWarmupStateCount < capacity, -1,
+                       "PACK host-RMA warmup-state table is full (%d entries)", capacity);
+    state = &gPackRmaWarmupStates[gPackRmaWarmupStateCount++];
     *state = {};
     state->comm = comm;
   }
@@ -291,19 +291,19 @@ static ncclResult_t getOrCreatePackWindowRmaWarmupState(ncclComm_t comm, PackWin
   return ncclSuccess;
 }
 
-ncclResult_t getPackWindowRmaWarmed(ncclComm_t comm, bool* warmed) {
-  NCCL_M2N_CHECK_ARG(warmed != nullptr, -1, "PACKWINDOW host-RMA warmed-state output must be non-null");
+ncclResult_t getPackRmaWarmed(ncclComm_t comm, bool* warmed) {
+  NCCL_M2N_CHECK_ARG(warmed != nullptr, -1, "PACK host-RMA warmed-state output must be non-null");
   std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
-  PackWindowRmaWarmupState* state = nullptr;
-  NCCL_M2N_CHECK(getOrCreatePackWindowRmaWarmupState(comm, &state));
+  PackRmaWarmupState* state = nullptr;
+  NCCL_M2N_CHECK(getOrCreatePackRmaWarmupState(comm, &state));
   *warmed = state->warmed;
   return ncclSuccess;
 }
 
-ncclResult_t setPackWindowRmaWarmed(ncclComm_t comm, bool warmed) {
+ncclResult_t setPackRmaWarmed(ncclComm_t comm, bool warmed) {
   std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
-  PackWindowRmaWarmupState* state = nullptr;
-  NCCL_M2N_CHECK(getOrCreatePackWindowRmaWarmupState(comm, &state));
+  PackRmaWarmupState* state = nullptr;
+  NCCL_M2N_CHECK(getOrCreatePackRmaWarmupState(comm, &state));
   state->warmed = warmed;
   return ncclSuccess;
 }
@@ -314,14 +314,14 @@ int getStagingBucketIndex(ncclComm_t comm) {
   return (slot != nullptr) ? slot->bucketIdx : -1;
 }
 
-ncclResult_t packWindowStagingRecordEvent(ncclComm_t comm, cudaStream_t stream) {
+ncclResult_t packStagingRecordEvent(ncclComm_t comm, cudaStream_t stream) {
   std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
   if (comm == gCurrentStagingComm && gCurrentStagingSlot != nullptr) {
     StagingSlot* slot = gCurrentStagingSlot;
     /* Release the reservation even when recording fails; the poisoned slot is
      * skipped while healthy slots remain available. */
     const ncclResult_t result =
-      reshardRecordCompletionEvent(slot->doneEvent, stream, "PACKWINDOW staging slot", &slot->poisoned);
+      reshardRecordCompletionEvent(slot->doneEvent, stream, "PACK staging slot", &slot->poisoned);
     slot->lastStream = stream;
     slot->eventRecorded = (result == ncclSuccess);
     slot->reserved = false;
@@ -332,7 +332,7 @@ ncclResult_t packWindowStagingRecordEvent(ncclComm_t comm, cudaStream_t stream) 
   return ncclSuccess;
 }
 
-void packWindowStagingSynchronize() {
+void packStagingSynchronize() {
   std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
   if (reshardResourcesNeedQuarantine()) return;
   int currentDevice = -1;
@@ -352,19 +352,19 @@ void packWindowStagingSynchronize() {
   if (currentDevice >= 0) NCCL_M2N_CUDACHECK_WARN(cudaSetDevice(currentDevice));
 }
 
-void packWindowStagingFinalize() {
+void packStagingFinalize() {
   std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
-  gPackWindowStagingAllocationCount = 0;
+  gPackStagingAllocationCount = 0;
   if (reshardResourcesNeedQuarantine()) {
-    RESHARD_WARN(-1, "Retaining PACKWINDOW staging buffers because GPU work could not be fenced safely");
+    RESHARD_WARN(-1, "Retaining PACK staging buffers because GPU work could not be fenced safely");
     for (int device = 0; device < gStagingDevicePoolCount; device++) {
       gStagingDevicePools[device] = {};
     }
     gStagingDevicePoolCount = 0;
-    for (int i = 0; i < gPackWindowRmaWarmupStateCount; i++) {
-      gPackWindowRmaWarmupStates[i] = {};
+    for (int i = 0; i < gPackRmaWarmupStateCount; i++) {
+      gPackRmaWarmupStates[i] = {};
     }
-    gPackWindowRmaWarmupStateCount = 0;
+    gPackRmaWarmupStateCount = 0;
     gCurrentStagingComm = nullptr;
     gCurrentStagingSlot = nullptr;
     return;
@@ -393,17 +393,17 @@ void packWindowStagingFinalize() {
   }
   if (currentDevice >= 0) NCCL_M2N_CUDACHECK_WARN(cudaSetDevice(currentDevice));
   gStagingDevicePoolCount = 0;
-  for (int i = 0; i < gPackWindowRmaWarmupStateCount; i++) {
-    gPackWindowRmaWarmupStates[i] = {};
+  for (int i = 0; i < gPackRmaWarmupStateCount; i++) {
+    gPackRmaWarmupStates[i] = {};
   }
-  gPackWindowRmaWarmupStateCount = 0;
+  gPackRmaWarmupStateCount = 0;
   gCurrentStagingComm = nullptr;
   gCurrentStagingSlot = nullptr;
 }
 
 #ifdef NCCL_M2N_TESTING
-int packWindowStagingAllocationCountForTest() {
+int packStagingAllocationCountForTest() {
   std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
-  return gPackWindowStagingAllocationCount;
+  return gPackStagingAllocationCount;
 }
 #endif

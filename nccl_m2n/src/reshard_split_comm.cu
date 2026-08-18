@@ -21,12 +21,12 @@
  *         it can only be derived after commB is probed.
  *
  * lsaSize is broadcast across the parent comm (ncclAllReduce MAX) so
- * trainer-only ranks — which are not members of commB — agree on commA
- * membership.
+ * trainer-only ranks — which are not members of commB — agree on the
+ * eligibility decision and on commA membership.
  *
- * Split formation applies to every valid disjoint source/destination layout.
- * Algorithm / load-balance / copy-mode gating lives at the dispatch site;
- * layout-specific safety fallbacks are handled after formation.
+ * Algorithm, load-balance, and copy-mode admission remain at the dispatch
+ * sites. Once admitted, PACK and PIPE share this communicator
+ * construction and forwarding topology.
  ************************************************************************/
 
 #include <algorithm>
@@ -41,6 +41,7 @@
 #include "nccl_device.h"
 
 #include "nccl_m2n.h"
+#include "reshard_call_setup.h"
 #include "reshard_types.h"
 #include "m2n_log.h"
 #include "m2n_checks.h"
@@ -78,6 +79,19 @@ ScopedCrossNicRailOverride::~ScopedCrossNicRailOverride() {
   }
 }
 
+bool reshardShouldAttemptPipeSplitComms(const ncclDistTensor_t* srcTensor, const ncclDistTensor_t* dstTensor) {
+  if (srcTensor == nullptr || dstTensor == nullptr || dstTensor->mesh == nullptr) {
+    return false;
+  }
+  if (!reshardGetSplitCommEnabled() || reshardEffectiveLbMode(srcTensor, dstTensor) != RESHARD_LB_NODE_AWARE) {
+    return false;
+  }
+
+  ncclReshardMeshGroupInfo dstInfo{};
+  computeMeshGroupInfo(dstTensor, dstTensor->mesh->startRank, &dstInfo);
+  return dstInfo.repCount > 1;
+}
+
 namespace {
 
 /* commB (RAIL, all generator ranks) state. A parent-relative mesh range does
@@ -97,14 +111,6 @@ struct CommBSharedEntry {
   int numGenDomains; /* number of NVL domains the generator spans */
   int rankInB;       /* this rank's id within commB; -1 if not a gen rank */
   bool isDst;        /* whether THIS rank is a generator rank */
-
-  /* Cached RING-sized kernel DevComm (RAIL), partitioned by staging bucket. */
-  ncclDevComm kernelDevCommB;
-  bool kernelValid;
-  int kernelSignalCount;  /* total ginSignalCount the DevComm was created with */
-  int kernelContextCount; /* total ginContextCount the DevComm was created with */
-  int signalsPerSlotB;    /* per-slot signal stride baked into the DevComm */
-  int ctxPerSlotB;        /* per-slot GIN-context stride baked into the DevComm */
 
   bool used;
 };
@@ -146,7 +152,22 @@ struct CommACacheEntry {
   bool used;
 };
 
+/* PIPE has one reusable staging allocation per parent communicator.  Every
+ * persistent cursor slice in that allocation is allocated here for both
+ * parent and split launches; split topology is in meshSignature. */
+struct PersistentControlSlotEntry {
+  ncclComm_t parent;
+  ReshardStagingMeshSignature meshSignature;
+  ReshardStagingChannelSignature channelSignature;
+  int slot;
+  bool used;
+};
+
 constexpr int kMaxSplitCommEntries = MAX_DEVCOMM_CACHE_ENTRIES;
+constexpr int kMaxPersistentControlPools = MAX_DEVCOMM_CACHE_ENTRIES;
+/* Split and non-split PIPE use the same fixed persistent-control-slot budget. */
+constexpr int kPersistentControlSlots = STAGING_PIPE_CONTROL_SLOTS;
+constexpr int kMaxPersistentControlSlotEntries = kMaxPersistentControlPools * kPersistentControlSlots;
 /* Protected by the documented single-host-thread reshard contract. */
 CommBSharedEntry gCommBShared[kMaxSplitCommEntries];
 int gCommBSharedCount = 0;
@@ -154,24 +175,65 @@ CommBParentEntry gCommBParent[kMaxSplitCommEntries];
 int gCommBParentCount = 0;
 CommACacheEntry gCommACache[kMaxSplitCommEntries];
 int gCommACount = 0;
+PersistentControlSlotEntry gPersistentControlSlots[kMaxPersistentControlSlotEntries];
+int gPersistentControlSlotCount = 0;
+
+constexpr int kSplitBroadcastScratchMaxDevices = 16;
+struct SplitBroadcastScratch {
+  int cudaDev;
+  int* dev;
+};
+SplitBroadcastScratch gSplitBroadcastScratch[kSplitBroadcastScratchMaxDevices];
+int gSplitBroadcastScratchCount = 0;
+/* Protect scratch-cache mutation only. A collective must not hold this mutex:
+ * other local ranks need to enter the same collective concurrently. */
+std::mutex gSplitBroadcastScratchMutex;
+
+ncclResult_t getSplitBroadcastScratch(int** out) {
+  NCCL_M2N_CHECK_ARG(out != nullptr, -1, "split broadcast scratch requires output pointer");
+  *out = nullptr;
+  int cudaDev = -1;
+  SP_CUDACHECK(cudaGetDevice(&cudaDev));
+  for (int i = 0; i < gSplitBroadcastScratchCount; i++) {
+    if (gSplitBroadcastScratch[i].cudaDev == cudaDev) {
+      *out = gSplitBroadcastScratch[i].dev;
+      return ncclSuccess;
+    }
+  }
+  NCCL_M2N_CHECK_ARG(gSplitBroadcastScratchCount < kSplitBroadcastScratchMaxDevices, -1,
+                     "split broadcast scratch cache exhausted (%d CUDA devices)", kSplitBroadcastScratchMaxDevices);
+  int* dev = nullptr;
+  SP_CUDACHECK(cudaMalloc(&dev, 2 * sizeof(int)));
+  gSplitBroadcastScratch[gSplitBroadcastScratchCount++] = {cudaDev, dev};
+  *out = dev;
+  return ncclSuccess;
+}
+
+void freeSplitBroadcastScratch() {
+  std::lock_guard<std::mutex> guard(gSplitBroadcastScratchMutex);
+  int savedCudaDev = -1;
+  const cudaError_t getDeviceResult = cudaGetDevice(&savedCudaDev);
+  for (int i = 0; i < gSplitBroadcastScratchCount; i++) {
+    SplitBroadcastScratch& s = gSplitBroadcastScratch[i];
+    if (s.dev != nullptr) {
+      if (getDeviceResult == cudaSuccess && s.cudaDev >= 0) {
+        NCCL_M2N_CUDACHECK_WARN(cudaSetDevice(s.cudaDev));
+      }
+      NCCL_M2N_CUDACHECK_WARN(cudaFree(s.dev));
+    }
+    s = {};
+  }
+  if (getDeviceResult == cudaSuccess && savedCudaDev >= 0) {
+    NCCL_M2N_CUDACHECK_WARN(cudaSetDevice(savedCudaDev));
+  }
+  gSplitBroadcastScratchCount = 0;
+}
 
 CommBSharedEntry* findCommBShared(ncclComm_t parent, int srcStart, int srcSize, int dstStart, int dstSize) {
   for (int i = 0; i < gCommBSharedCount; i++) {
     if (gCommBShared[i].used && gCommBShared[i].parent == parent && gCommBShared[i].srcStart == srcStart &&
         gCommBShared[i].srcSize == srcSize && gCommBShared[i].dstStart == dstStart &&
         gCommBShared[i].dstSize == dstSize) {
-      return &gCommBShared[i];
-    }
-  }
-  return nullptr;
-}
-
-CommBSharedEntry* findCommBSharedByComm(ncclComm_t commB) {
-  if (commB == nullptr) {
-    return nullptr;
-  }
-  for (int i = 0; i < gCommBSharedCount; i++) {
-    if (gCommBShared[i].used && gCommBShared[i].commB == commB) {
       return &gCommBShared[i];
     }
   }
@@ -204,6 +266,10 @@ CommACacheEntry* findCommA(ncclComm_t comm, const CommBParentEntry* b, int K) {
   return best;
 }
 
+bool samePersistentControlPool(const PersistentControlSlotEntry& e, ncclComm_t parentComm) {
+  return e.used && e.parent == parentComm;
+}
+
 /* Create the minimal DevComm on `comm` whose only purpose is to report
  * lsaSize.  lsaSize is the LSA (NVLink/same-node) team size, populated from
  * comm topology at devcomm creation.  We request a cheap GIN connection
@@ -218,8 +284,8 @@ CommACacheEntry* findCommA(ncclComm_t comm, const CommBParentEntry* b, int K) {
  * NCCL accepts RAIL on any GIN-capable comm (the only RAIL guard rejects
  * comms whose globalGinSupport == NONE).
  *
- * Set ginConnectionType directly and do not set ginForceEnable, which would
- * override the request back to FULL. */
+ * Set ginConnectionType directly; the NCCL M2N compatibility floor is
+ * NCCL 2.30.5, where this field is available. */
 ncclResult_t createProbeDevComm(ncclComm_t comm, int ginConnectionType, ncclDevComm* out) {
   ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
   /* Request the chosen GIN connection but no GIN resources; lsaSize is read
@@ -236,19 +302,27 @@ ncclResult_t createProbeDevComm(ncclComm_t comm, int ginConnectionType, ncclDevC
 
 /* AllReduce(MAX) a single int over the parent comm so every rank learns
  * the value contributed by the generator ranks (trainer ranks pass 0). */
-ncclResult_t broadcastMaxInt(ncclComm_t comm, cudaStream_t stream, int localValue, int* out) {
+static ncclResult_t broadcastMaxInt(ncclComm_t comm, cudaStream_t stream, int localValue, int* out) {
   M2nApiUnlock apiUnlock;
   int* dev = nullptr;
-  SP_CUDACHECK(cudaMalloc(&dev, 2 * sizeof(int)));
+  {
+    std::lock_guard<std::mutex> guard(gSplitBroadcastScratchMutex);
+    SP_NCCLCHECK(getSplitBroadcastScratch(&dev));
+  }
   int host = localValue;
   ncclResult_t rc = ncclSuccess;
   /* FIXME: Simplify these staged checks after the device allocation has automatic cleanup. */
   cudaError_t cerr = cudaMemcpyAsync(dev, &host, sizeof(int), cudaMemcpyHostToDevice, stream);
   if (cerr == cudaSuccess) {
+    /* Drive the AllReduce to completion (a blocking comm returns ncclSuccess
+     * immediately; a non-blocking comm is spun until the collective is enqueued
+     * on `stream`) BEFORE enqueuing the device->host copy of the reduced value,
+     * so the D2H never reads an un-enqueued result. Scratch is per CUDA device,
+     * so local NCCL ranks use distinct allocations. */
     rc = ncclAllReduce(dev, dev + 1, 1, ncclInt, ncclMax, comm, stream);
-  }
-  if (cerr == cudaSuccess && (rc == ncclSuccess || rc == ncclInProgress)) {
-    rc = m2nWaitCommReady(comm);
+    if (rc == ncclSuccess || rc == ncclInProgress) {
+      rc = m2nWaitCommReady(comm);
+    }
   }
   if (cerr == cudaSuccess && rc == ncclSuccess) {
     cerr = cudaMemcpyAsync(&host, dev + 1, sizeof(int), cudaMemcpyDeviceToHost, stream);
@@ -256,7 +330,6 @@ ncclResult_t broadcastMaxInt(ncclComm_t comm, cudaStream_t stream, int localValu
   if (cerr == cudaSuccess && rc == ncclSuccess) {
     cerr = cudaStreamSynchronize(stream);
   }
-  cudaFree(dev);
   if (rc != ncclSuccess) {
     NCCL_M2N_FAIL(rc, -1, "NCCL allreduce in split lsaSize broadcast failed: %s", ncclGetErrorString(rc));
   }
@@ -276,10 +349,9 @@ ncclResult_t broadcastMaxInt(ncclComm_t comm, cudaStream_t stream, int localValu
  * purely local cache check would therefore disagree across the parent comm
  * and deadlock the collective split.
  *
- * MUST be called collectively by every parent-comm rank.  Does NOT probe
- * the parent LSA / decide eligibility (that is per-parent; see
- * reshardGetOrCreateSplitComms). */
-ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const ncclMesh_t* dstMesh, int numCtas,
+ * MUST be called collectively by every parent-comm rank. It only forms and
+ * probes commB; dispatch sites decide whether split comms are needed. */
+ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const ncclMesh_t* dstMesh,
                                cudaStream_t stream, CommBSharedEntry** out) {
   int parentRank = -1;
   SP_NCCLCHECK(ncclCommUserRank(comm, &parentRank));
@@ -299,8 +371,8 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
   int commBExists = 0;
   SP_NCCLCHECK(broadcastMaxInt(comm, stream, localHasCommB, &commBExists));
 
-  /* A cached DevComm bakes one signal stride per slot. Reject stale resource
-   * geometry collectively instead of mixing it with this call. */
+  /* A cached commB must retain the same source membership. Otherwise use the
+   * parent path instead of mixing distinct split topologies in one commB. */
   const int localSharedSrcSize = (isDst && shared != nullptr) ? shared->srcSize : 0;
   int sharedSrcSize = 0;
   if (commBExists) {
@@ -310,25 +382,6 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
                    "split-comm: cached commB source size mismatch (cached=%d requested=%d) for gen set [%d,%d); "
                    "falling back to parent DevComm",
                    sharedSrcSize, srcSize, dstStart, dstStart + dstSize);
-      *out = nullptr;
-      return ncclSuccess;
-    }
-
-    const int concurrency = reshardGetSplitSlotCount();
-    const int signalsPerSlot = srcSize * numCtas;
-    const int contextsPerSlot = reshardGetGinContextCount();
-    const int localResourceMismatch =
-      (shared != nullptr && (shared->signalsPerSlotB != signalsPerSlot || shared->ctxPerSlotB != contextsPerSlot ||
-                             shared->kernelSignalCount < signalsPerSlot * concurrency ||
-                             shared->kernelContextCount < contextsPerSlot * concurrency)) ?
-        1 :
-        0;
-    int resourceMismatch = 0;
-    SP_NCCLCHECK(broadcastMaxInt(comm, stream, localResourceMismatch, &resourceMismatch));
-    if (resourceMismatch) {
-      RESHARD_INFO(parentRank,
-                   "split-comm: cached commB resources do not match the requested CTA/context/concurrency shape; "
-                   "falling back to parent DevComm");
       *out = nullptr;
       return ncclSuccess;
     }
@@ -439,11 +492,6 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
   e.numGenDomains = numGenDomains;
   e.rankInB = rankInB;
   e.isDst = isDst;
-  e.kernelValid = false;
-  e.signalsPerSlotB = srcSize * numCtas;
-  e.ctxPerSlotB = reshardGetGinContextCount();
-  e.kernelSignalCount = e.signalsPerSlotB * reshardGetSplitSlotCount();
-  e.kernelContextCount = e.ctxPerSlotB * reshardGetSplitSlotCount();
   e.used = true;
 
   gCommBShared[gCommBSharedCount] = e;
@@ -547,6 +595,63 @@ ncclResult_t reshardTestBroadcastMaxInt(ncclComm_t comm, cudaStream_t stream, in
 }
 #endif
 
+int reshardGetPersistentControlSlotCount() {
+  return kPersistentControlSlots;
+}
+
+void stagingPipeControlSlotCacheReset() {
+  for (int i = 0; i < gPersistentControlSlotCount; i++) {
+    gPersistentControlSlots[i] = {};
+  }
+  gPersistentControlSlotCount = 0;
+}
+
+ncclResult_t reshardGetOrCreatePersistentControlSlot(ncclComm_t parentComm,
+                                                     const ReshardStagingMeshSignature& meshSignature,
+                                                     const ReshardStagingChannelSignature& channelSignature, int rank,
+                                                     int* outSlot) {
+  NCCL_M2N_CHECK_ARG(parentComm != nullptr && outSlot != nullptr, rank,
+                     "PIPE persistent control slot requires parent comm and output");
+
+  bool usedSlots[kPersistentControlSlots] = {};
+  for (int i = 0; i < gPersistentControlSlotCount; i++) {
+    PersistentControlSlotEntry& e = gPersistentControlSlots[i];
+    if (!samePersistentControlPool(e, parentComm)) {
+      continue;
+    }
+    if (e.meshSignature == meshSignature && e.channelSignature == channelSignature) {
+      *outSlot = e.slot;
+      return ncclSuccess;
+    }
+    if (e.slot >= 0 && e.slot < kPersistentControlSlots) {
+      usedSlots[e.slot] = true;
+    }
+  }
+
+  int slot = -1;
+  for (int i = 0; i < kPersistentControlSlots; i++) {
+    if (!usedSlots[i]) {
+      slot = i;
+      break;
+    }
+  }
+  NCCL_M2N_CHECK_ARG(slot >= 0, rank, "PIPE persistent control slots exhausted (%d) for parent comm %p",
+                     kPersistentControlSlots, (void*)parentComm);
+  NCCL_M2N_CHECK_ARG(gPersistentControlSlotCount < kMaxPersistentControlSlotEntries, rank,
+                     "PIPE persistent control-slot cache full (%d)", kMaxPersistentControlSlotEntries);
+
+  PersistentControlSlotEntry e;
+  memset(&e, 0, sizeof(e));
+  e.parent = parentComm;
+  e.meshSignature = meshSignature;
+  e.channelSignature = channelSignature;
+  e.slot = slot;
+  e.used = true;
+  gPersistentControlSlots[gPersistentControlSlotCount++] = e;
+  *outSlot = slot;
+  return ncclSuccess;
+}
+
 /* Phase gate: the strided node assignment in the load balancer (needed
  * when srcRepCount < numGenDomains so injections funnel into the first K
  * domains) is implemented in reshard_loadbalance.cc / reshard_prepare.cc
@@ -581,8 +686,16 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
   const int dstStart = dstMesh->startRank;
   const int dstSize = dstMesh->dims[0] * dstMesh->dims[1];
 
-  /* On the first reshard for this parent comm, lazily form or load commB
-   * and cache the resulting split geometry. */
+  /* commA orders source ranks before destination-only ranks. The split
+   * parameter translation currently relies on that disjoint layout. */
+  const bool meshesOverlap = srcStart < dstStart + dstSize && dstStart < srcStart + srcSize;
+  if (meshesOverlap) {
+    RESHARD_INFO(parentRank, "split-comm: overlapping source/destination meshes -> fallback to parent DevComm");
+    out->parentComm = comm;
+    return ncclSuccess;
+  }
+
+  /* On the first reshard for this parent comm, lazily form or load commB. */
   CommBParentEntry* pe = findCommBParent(comm, srcStart, srcSize, dstStart, dstSize);
   CommBSharedEntry* se = nullptr;
 
@@ -597,15 +710,8 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
     }
 
     /* Stage 1: commB, cached for this parent and mesh geometry. */
-    SP_NCCLCHECK(ensureCommBShared(comm, srcMesh, dstMesh, numCtas, stream, &se));
+    SP_NCCLCHECK(ensureCommBShared(comm, srcMesh, dstMesh, stream, &se));
     if (se == nullptr) {
-      out->active = false;
-      out->parentComm = comm;
-      return ncclSuccess;
-    }
-    if (se->lsaSize <= 0 || se->numGenDomains <= 0) {
-      RESHARD_INFO(parentRank, "split-comm: invalid commB domain geometry (lsaSize=%d numGenDomains=%d) -> fallback",
-                   se->lsaSize, se->numGenDomains);
       out->active = false;
       out->parentComm = comm;
       return ncclSuccess;
@@ -652,18 +758,13 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
   r.valid = true;
 
   const int maxConcurrency = reshardGetSplitSlotCount();
-  const int concurrency = maxConcurrency;
-  const int signalsPerSlot = srcSize * numCtas;
-  const int contextsPerSlot = reshardGetGinContextCount();
-  if (se == nullptr || se->signalsPerSlotB != signalsPerSlot || se->ctxPerSlotB != contextsPerSlot ||
-      se->kernelSignalCount < signalsPerSlot * concurrency || se->kernelContextCount < contextsPerSlot * concurrency) {
-    RESHARD_INFO(parentRank,
-                 "split-comm: cached commB resources do not match the requested CTA/context/concurrency shape; "
-                 "falling back to parent DevComm");
+  if (se == nullptr) {
+    RESHARD_INFO(parentRank, "split-comm: missing cached commB shared state; falling back to parent DevComm");
     r.active = false;
     *out = r;
     return ncclSuccess;
   }
+
   /* K = number of injection NVL domains.  commA's generator block is the
    * first K*lsaSize generator ranks and must hold one COMPLETE destination
    * replica so the commB ring can replicate it to the remaining copies.
@@ -729,9 +830,8 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
   CommACacheEntry* a = nullptr;
   SP_NCCLCHECK(ensureCommA(comm, pe, numInjectionDomains, stream, &a));
 
-  /* Bucket identity is configuration-derived and therefore identical on every
-   * rank even when each rank's local buffer-slot assignment differs. */
-  const int slotIdx = getStagingBucketIndex(comm);
+  /* PIPE uses outer partition 0; persistent control slots isolate graphs. */
+  const int slotIdx = (reshardGetCopyAlgorithm() == RESHARD_COPY_ALGO_PIPE) ? 0 : getStagingBucketIndex(comm);
   if (slotIdx < 0 || slotIdx >= maxConcurrency) {
     NCCL_M2N_FAIL(ncclInvalidArgument, parentRank, "split-comm: invalid staging bucket index %d for %d partitions",
                   slotIdx, maxConcurrency);
@@ -758,52 +858,27 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
   return ncclSuccess;
 }
 
-/* Create a RING-sized kernel DevComm on `comm` with `signalCount` GIN
- * signals, `ginContextCount` GIN contexts, and the requested GIN
- * connection type.  Mirrors the single-DevComm RING requirements in
- * reshard_user_window.cu (barrierCount = numCtas), differing only in the
- * connection type so commB can be RAIL.  commB passes an inflated
- * signal/context count so staging buckets can partition the DevComm. */
-static ncclResult_t createKernelDevComm(ncclComm_t comm, int numCtas, int signalCount, int ginConnectionType,
-                                        int ginContextCount, int barrierCount, ncclDevComm* out) {
-  ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-  /* commA passes barrierCount = numCtas (per-parent, never concurrent).
-   * commB is the SHARED DevComm: it passes numCtas*maxConcurrency so each
-   * concurrent slot owns a disjoint barrier range [slot*numCtas, +numCtas)
-   * (see the slotIdx*totalCtas barrier offset in the split kernel). */
-  if (barrierCount < numCtas) barrierCount = numCtas;
-  reqs.barrierCount = barrierCount;
-  reqs.ginSignalCount = signalCount;
-  reqs.ginConnectionType = (decltype(reqs.ginConnectionType))ginConnectionType;
-  reqs.ginContextCount = (ginContextCount > 0) ? ginContextCount : reshardGetGinContextCount();
-
-  memset(out, 0, sizeof(*out));
-  {
-    M2nApiUnlock apiUnlock;
-    NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, out));
-    NCCL_M2N_CHECK(m2nWaitCommReady(comm));
-  }
-  return ncclSuccess;
-}
-
 ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stagingBuffer, size_t stagingCapacity,
-                                         int numCtas, int ginSignalCountA, int signalsPerSlotB, int ctxPerSlotB,
-                                         int maxConcurrency, cudaStream_t stream, ncclWindow_t* outWindowA,
-                                         ncclWindow_t* outWindowB, ncclDevComm* outDevCommA,
-                                         ReshardDevCommUse* outDevCommAUse, ncclDevComm* outDevCommB) {
+                                         int numCtas, int ginSignalCountA, int ginCounterCountA, int signalsPerSlotB,
+                                         int countersPerSlotB, int ctxPerSlotB, int maxConcurrency, cudaStream_t stream,
+                                         ncclWindow_t* outWindowA, ncclWindow_t* outWindowB, ncclDevComm* outDevCommA,
+                                         ReshardDevCommUse* outDevCommAUse, ncclDevComm* outDevCommB,
+                                         ReshardDevCommUse* outDevCommBUse) {
   NCCL_M2N_CHECK_ARG(sc != nullptr && stagingBuffer != nullptr, -1,
                      "reshardSplitEnsureResources: split state and staging buffer must be non-null");
   if (outWindowA != nullptr) *outWindowA = nullptr;
   if (outWindowB != nullptr) *outWindowB = nullptr;
   if (outDevCommA != nullptr) memset(outDevCommA, 0, sizeof(*outDevCommA));
   if (outDevCommB != nullptr) memset(outDevCommB, 0, sizeof(*outDevCommB));
+  if (outDevCommBUse != nullptr) *outDevCommBUse = {};
 
   /* commA (FULL): trainer + first gen NVL domain.  commA is PER-PARENT
    * (not shared), so its window + DevComm stay cached under the commA key;
    * cacheFinalize() tears them down before
    * reshardSplitCommFinalize() destroys commA. */
   if (sc->inA && sc->commA != nullptr) {
-    ncclWindow_t* cw = findCachedInternalWindowByPtr(sc->commA, stagingBuffer, stagingCapacity);
+    ncclWindow_t* cw =
+      findCachedInternalWindowByPtr(sc->commA, stagingBuffer, stagingCapacity, RESHARD_INTERNAL_WINDOW_SPLIT);
     ncclWindow_t winA = nullptr;
     if (cw != nullptr) {
       winA = *cw;
@@ -814,44 +889,24 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
                                                NCCL_WIN_COLL_SYMMETRIC));
         NCCL_M2N_CHECK(m2nWaitCommReady(sc->commA));
       }
-      SP_NCCLCHECK(cacheInternalWindow(sc->commA, stagingBuffer, stagingCapacity, winA));
+      SP_NCCLCHECK(cacheInternalWindow(sc->commA, stagingBuffer, stagingCapacity, RESHARD_INTERNAL_WINDOW_SPLIT,
+                                       winA));
     }
     if (outWindowA != nullptr) *outWindowA = winA;
 
-    const int ginContextCount = reshardGetGinContextCount();
-    const ReshardDevCommCacheKey key = {sc->commA,
-                                        numCtas,
-                                        ginSignalCountA,
-                                        /*ginCounterCount=*/0,
-                                        ginContextCount,
-                                        RESHARD_DEVCOMM_BARRIER_HYBRID};
-    cudaEvent_t completionEventA = nullptr;
-    std::shared_ptr<ReshardDevCommUseState> useStateA;
-    ncclDevComm* dc = findCachedDevComm(key, &completionEventA, &useStateA);
-    ncclDevComm localA;
-    if (dc == nullptr) {
-      SP_NCCLCHECK(createKernelDevComm(sc->commA, numCtas, ginSignalCountA, NCCL_GIN_CONNECTION_FULL, ginContextCount,
-                                       /*barrierCount=*/numCtas, &localA));
-      ncclResult_t cacheResult = cacheDevComm(key, &localA);
-      if (cacheResult != ncclSuccess) {
-        NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(sc->commA, &localA));
-        return cacheResult;
-      }
-      dc = findCachedDevComm(key, &completionEventA, &useStateA);
-      NCCL_M2N_CHECK_ARG(dc != nullptr, sc->parentRank,
-                         "reshardSplitEnsureResources: newly cached commA DevComm was not found");
-    }
-    if (outDevCommA != nullptr) *outDevCommA = *dc;
-    if (outDevCommAUse != nullptr) {
-      NCCL_M2N_CHECK(reshardPrepareDevCommUse(completionEventA, useStateA, stream, outDevCommAUse));
-    }
+    NCCL_M2N_CHECK_ARG(outDevCommA != nullptr && outDevCommAUse != nullptr, sc->parentRank,
+                       "reshardSplitEnsureResources: commA requires DevComm and use outputs");
+    NCCL_M2N_CHECK(reshardGetOrCreateDevCommWithRequirements(
+      sc->commA, numCtas, ginSignalCountA, ginCounterCountA, RESHARD_DEVCOMM_BARRIER_HYBRID,
+      reshardGetGinContextCount(), NCCL_GIN_CONNECTION_FULL, stream, outDevCommA, outDevCommAUse));
   }
 
   /* commB (RAIL): all generator ranks. Its kernel DevComm is cached for this
    * parent and mesh, sized for the staging-bucket partitions, and reused
    * across streams. */
   if (sc->inB && sc->commB != nullptr) {
-    ncclWindow_t* cw = findCachedInternalWindowByPtr(sc->commB, stagingBuffer, stagingCapacity);
+    ncclWindow_t* cw =
+      findCachedInternalWindowByPtr(sc->commB, stagingBuffer, stagingCapacity, RESHARD_INTERNAL_WINDOW_SPLIT);
     ncclWindow_t winB = nullptr;
     if (cw != nullptr) {
       winB = *cw;
@@ -862,38 +917,30 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
                                                NCCL_WIN_COLL_SYMMETRIC));
         NCCL_M2N_CHECK(m2nWaitCommReady(sc->commB));
       }
-      SP_NCCLCHECK(cacheInternalWindow(sc->commB, stagingBuffer, stagingCapacity, winB));
+      SP_NCCLCHECK(cacheInternalWindow(sc->commB, stagingBuffer, stagingCapacity, RESHARD_INTERNAL_WINDOW_SPLIT,
+                                       winB));
     }
     if (outWindowB != nullptr) *outWindowB = winB;
 
     const int conc = (maxConcurrency > 0) ? maxConcurrency : 1;
     const int totalSignals = signalsPerSlotB * conc;
+    const int totalCounters = countersPerSlotB * conc;
     const int totalContexts = ctxPerSlotB * conc;
     const int totalBarriers = numCtas * conc;
 
-    CommBSharedEntry* se = findCommBSharedByComm(sc->commB);
-    if (se != nullptr && se->kernelValid) {
-      if (outDevCommB != nullptr) *outDevCommB = se->kernelDevCommB;
-    } else {
-      ncclDevComm localB;
-      SP_NCCLCHECK(createKernelDevComm(sc->commB, numCtas, totalSignals, NCCLM2N_GIN_RAIL_CONNECTION, totalContexts,
-                                       totalBarriers, &localB));
-      if (se != nullptr) {
-        se->kernelDevCommB = localB;
-        se->kernelValid = true;
-        se->kernelSignalCount = totalSignals;
-        se->kernelContextCount = totalContexts;
-        se->signalsPerSlotB = signalsPerSlotB;
-        se->ctxPerSlotB = ctxPerSlotB;
-      }
-      if (outDevCommB != nullptr) *outDevCommB = localB;
-    }
+    NCCL_M2N_CHECK_ARG(outDevCommB != nullptr && outDevCommBUse != nullptr, sc->parentRank,
+                       "reshardSplitEnsureResources: commB requires DevComm and use outputs");
+    NCCL_M2N_CHECK(reshardGetOrCreateDevCommWithRequirements(
+      sc->commB, totalBarriers, totalSignals, totalCounters, RESHARD_DEVCOMM_BARRIER_HYBRID, totalContexts,
+      NCCLM2N_GIN_RAIL_CONNECTION, stream, outDevCommB, outDevCommBUse));
   }
 
   return ncclSuccess;
 }
 
 void reshardSplitCommFinalize() {
+  freeSplitBroadcastScratch();
+
   if (reshardResourcesNeedQuarantine()) {
     RESHARD_WARN(-1, "Retaining split communicators because GPU work could not be fenced safely");
     for (int i = 0; i < gCommACount; i++) {
@@ -933,14 +980,12 @@ void reshardSplitCommFinalize() {
   }
   gCommBParentCount = 0;
 
-  /* commB entries: destroy kernel and probe DevComms before commB. */
+  /* commB probe DevComms are private to split formation. Cached kernel
+   * DevComms were released by cacheFinalize() before this communicator. */
   for (int i = 0; i < gCommBSharedCount; i++) {
     CommBSharedEntry& e = gCommBShared[i];
     if (!e.used) {
       continue;
-    }
-    if (e.kernelValid && e.commB != nullptr) {
-      NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(e.commB, &e.kernelDevCommB));
     }
     if (e.probeValid && e.commB != nullptr) {
       NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(e.commB, &e.probeDevComm));

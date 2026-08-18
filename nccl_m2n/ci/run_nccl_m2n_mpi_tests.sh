@@ -5,7 +5,7 @@
 # Run the MPI basic API matrix within an existing multi-node Slurm allocation.
 # The selected profile keeps C API coverage proportional to its rank count.
 # The four-rank profile runs the core matrix. The eight-rank profile also runs
-# the cross-dimension regressions, PACKWINDOW split/group gates, and the
+# the cross-dimension regressions, PACK split/group gates, and the
 # benchmark validation matrix.
 
 set -euo pipefail
@@ -116,13 +116,13 @@ runCase() {
   rm -f "${log}"
 }
 
-runPackWindowSplitCase() {
+runPackSplitCase() {
   local caseFilter="$1"
   local requireSplit="${2:-0}"
   local log
   log="$(mktemp)"
 
-  echo "=== basic_api_test_mpi: ${caseFilter}, PACKWINDOW split ==="
+  echo "=== basic_api_test_mpi: ${caseFilter}, PACK split ==="
   # The node-aware load-balance mode makes the split path eligible. Domain
   # sizes stay topology-discovered rather than assuming a particular machine.
   # AUTO_UNIFORM_BCAST=0 keeps a fully replicated transfer on the node-aware
@@ -134,12 +134,12 @@ runPackWindowSplitCase() {
      NCCL_RESHARD_AUTO_UNIFORM_BCAST=0 \
      NCCL_RESHARD_LOG_LEVEL=INFO \
      runMpiProgram "${binary}" "${log}" \
-       --filter "${caseFilter}" --algorithm ring --api default --copy-algorithm packwindow --lb-mode node \
+       --filter "${caseFilter}" --algorithm ring --api default --copy-algorithm pack --lb-mode node \
        --gtest_filter='Matrix/BasicApiMpiTest.*'; then
     :
   else
     local rc=$?
-    echo "basic_api_test_mpi [${caseFilter}, PACKWINDOW split] failed with exit code ${rc}." >&2
+    echo "basic_api_test_mpi [${caseFilter}, PACK split] failed with exit code ${rc}." >&2
     cat "${log}"
     rm -f "${log}"
     return "${rc}"
@@ -148,7 +148,7 @@ runPackWindowSplitCase() {
   if ! grep -Eq "^worldSize=${expectedRanks}, devices=[1-9][0-9]*," "${log}" ||
      ! grep -Eq '^\[  PASSED  \] [1-9][0-9]* tests?\.' "${log}" ||
      grep -Fq '[  SKIPPED ]' "${log}"; then
-    echo "basic_api_test_mpi [${caseFilter}, PACKWINDOW split] did not complete a non-skipped passing case." >&2
+    echo "basic_api_test_mpi [${caseFilter}, PACK split] did not complete a non-skipped passing case." >&2
     cat "${log}"
     rm -f "${log}"
     return 1
@@ -163,9 +163,9 @@ runPackWindowSplitCase() {
   #
   # Match the activation line exactly: four other messages share this prefix
   # and every one of them means the fast path was declined.
-  if grep -Fq 'packwindow-lsa-hput: ranks=' "${log}"; then
+  if grep -Fq 'pack-lsa-hput: ranks=' "${log}"; then
     if [[ "${requireSplit}" -eq 1 ]]; then
-      echo "basic_api_test_mpi [${caseFilter}, PACKWINDOW split] did not activate split." >&2
+      echo "basic_api_test_mpi [${caseFilter}, PACK split] did not activate split." >&2
       cat "${log}"
       rm -f "${log}"
       return 1
@@ -177,7 +177,7 @@ runPackWindowSplitCase() {
       splitReverseMeshActivated=1
     fi
   else
-    echo "basic_api_test_mpi [${caseFilter}, PACKWINDOW split] took neither the split path nor the single-domain host-RMA path." >&2
+    echo "basic_api_test_mpi [${caseFilter}, PACK split] took neither the split path nor the single-domain host-RMA path." >&2
     cat "${log}"
     rm -f "${log}"
     return 1
@@ -193,31 +193,31 @@ runNonBlockingCoverage() {
   echo "=== basic_api_test_mpi: bounded nonblocking coverage ==="
   runNonBlockingCase "nonblocking DIRECT/default API" \
     --filter tiny_contribution --algorithm direct --api default --lb-mode uniform
-  runNonBlockingCase "nonblocking PACKWINDOW/default API" \
-    --filter tiny_contribution --algorithm ring --api default --copy-algorithm packwindow --lb-mode uniform
-  runNonBlockingCase "nonblocking PACKWINDOW/window API" \
-    --filter tiny_contribution --algorithm ring --api window --copy-algorithm packwindow --lb-mode uniform
+  runNonBlockingCase "nonblocking PACK/default API" \
+    --filter tiny_contribution --algorithm ring --api default --copy-algorithm pack --lb-mode uniform
+  runNonBlockingCase "nonblocking PACK/window API" \
+    --filter tiny_contribution --algorithm ring --api window --copy-algorithm pack --lb-mode uniform
   if [[ "${NCCL_M2N_MPI_TEST_PROFILE}" == eight_rank ]]; then
-    NCCL_COMM_BLOCKING=0 runPackWindowGroupCase
+    NCCL_COMM_BLOCKING=0 runPackGroupCase
   fi
-  NCCL_COMM_BLOCKING=0 runPackWindowSplitCase split_reverse_mesh "${splitReverseMeshActivated}"
+  NCCL_COMM_BLOCKING=0 runPackSplitCase split_reverse_mesh "${splitReverseMeshActivated}"
 }
 
-runPackWindowGroupCase() {
+runPackGroupCase() {
   local log
   log="$(mktemp)"
 
-  echo "=== basic_api_test_mpi: mixed communicator groups, PACKWINDOW ==="
+  echo "=== basic_api_test_mpi: mixed communicator groups, PACK ==="
   if NCCL_RESHARD_SPLIT_COMM=0 \
      NCCL_RESHARD_LOG_LEVEL=INFO \
      runMpiProgram "${binary}" "${log}" \
        --filter group_mixed_context \
        --gtest_filter='M2nGroupMpiTest.OverlappingCommunicatorsPreserveBucketOrder' \
-       --algorithm ring --api default --copy-algorithm packwindow --lb-mode uniform; then
+       --algorithm ring --api default --copy-algorithm pack --lb-mode uniform; then
     :
   else
     local rc=$?
-    echo "basic_api_test_mpi [mixed communicator groups, PACKWINDOW] failed with exit code ${rc}." >&2
+    echo "basic_api_test_mpi [mixed communicator groups, PACK] failed with exit code ${rc}." >&2
     cat "${log}"
     rm -f "${log}"
     return "${rc}"
@@ -227,7 +227,7 @@ runPackWindowGroupCase() {
      ! grep -Eq '^\[  PASSED  \] [1-9][0-9]* tests?\.' "${log}" ||
      ! grep -Eq 'entries=2 bins=[0-9]+ fusedBins=1 maxBinEntries=2' "${log}" ||
      grep -Fq '[  SKIPPED ]' "${log}"; then
-    echo "basic_api_test_mpi [mixed communicator groups, PACKWINDOW] did not prove group fusion." >&2
+    echo "basic_api_test_mpi [mixed communicator groups, PACK] did not prove group fusion." >&2
     cat "${log}"
     rm -f "${log}"
     return 1
@@ -308,22 +308,22 @@ case "${NCCL_M2N_MPI_TEST_PROFILE}" in
   four_rank)
     runCase "ring, all APIs" --algorithm ring --api all --lb-mode uniform
     runCase "direct, all APIs" --algorithm direct --api all --lb-mode uniform
-    runCase "packwindow, default API" --algorithm ring --api default \
-      --copy-algorithm packwindow --lb-mode uniform
+    runCase "pack, default API" --algorithm ring --api default \
+      --copy-algorithm pack --lb-mode uniform
     NCCL_RESHARD_STAGING_CHANNEL_SIZE=4194304 \
       runCase "staging slot pressure" --filter staging_slot_pressure \
       --algorithm ring --api default --lb-mode uniform
-    runPackWindowSplitCase split_tiny_contribution
-    runPackWindowSplitCase split_reverse_mesh
+    runPackSplitCase split_tiny_contribution
+    runPackSplitCase split_reverse_mesh
     ;;
   eight_rank)
     runCase "all algorithms, source parity" --algorithm all --lb-mode uniform
     runEightRankDefaultMatrix
     runCase "cross-dimension regressions" --filter cross_dim_regression \
       --algorithm all --api all --lb-mode uniform
-    runPackWindowSplitCase split_tiny_contribution
-    runPackWindowSplitCase split_reverse_mesh
-    runPackWindowGroupCase
+    runPackSplitCase split_tiny_contribution
+    runPackSplitCase split_reverse_mesh
+    runPackGroupCase
     for algorithm in ring direct; do
       for dstShardDim in 0 1; do
         runBenchmark "${algorithm}, dst shard ${dstShardDim}" \

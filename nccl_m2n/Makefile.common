@@ -144,7 +144,7 @@ LIB_CC_SRCS := $(SRCDIR)/m2n_config.cc \
                $(SRCDIR)/reshard_loadbalance.cc \
                $(SRCDIR)/reshard_prepare.cc \
                $(SRCDIR)/reshard_split_prepare.cc \
-               $(SRCDIR)/packwindow_staging.cc \
+               $(SRCDIR)/pack_staging.cc \
                $(SRCDIR)/m2n_init.cc \
                $(SRCDIR)/staging_buffer.cc \
                $(SRCDIR)/staging_profile.cc \

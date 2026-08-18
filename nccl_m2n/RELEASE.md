@@ -102,7 +102,7 @@ Existing binaries must be rebuilt against the updated header.
   - `ncclReshard` adds internally managed copy/staging transfers alongside the
     caller-provided user-window path.
   - `NCCL_RESHARD_COPY_ALGORITHM` selects the staging copy algorithm. `DIRECT`
-    and `PACKWINDOW` are supported; `PACKWINDOW` remains the default and packs each destination's bytes contiguously
+    and `PACK` are supported; `PACK` remains the default and packs each destination's bytes contiguously
     with CUDA copy engines, transfers them through the hierarchical user-window
     path, then unpacks them. Other values are rejected rather than silently ignored.
   - Every communicator rank participates and provides both descriptors. Active
@@ -116,12 +116,12 @@ Existing binaries must be rebuilt against the updated header.
     but must be rank-uniform. The default cached pool is 256 MiB per
     communicator (4 channels times 64 MiB); the configured 1 MiB chunk is kept
     when safe and otherwise reduced uniformly from shared geometry.
-  - PACKWINDOW now always uses a bounded best-fit staging pool. The legacy
+  - PACK now always uses a bounded best-fit staging pool. The legacy
     per-communicator fallback and staging watermark are removed.
     `NCCL_RESHARD_PACK_BUFFSIZES` configures `size[:slots]` buckets; invalid
     profiles retain the built-in `2147483648:4` default and slots allocate
     individually on first assignment.
-  - `ncclReshard` supports split communicators on the `PACKWINDOW`, `RING`,
+  - `ncclReshard` supports split communicators on the `PACK`, `RING`,
     `NODE_AWARE` path. The library collectively forms a FULL communicator for
     source injection and a RAIL communicator for destination forwarding; the
     caller still invokes the operation collectively on the parent communicator
@@ -240,7 +240,7 @@ This preview is experimental.
 | **Limited QA coverage**           | Functional matrix is the C-level basic_api suite × {RING, DIRECT} × dtype mix. Large multi-node coverage is still cluster-limited and workload-specific. |
 | **Tensor rank ≤ 3**               | `NCCL_RESHARD_MAX_TENSOR_DIMS = 3`. 4-D and higher are not supported. |
 | **Multiple SHARD axes unsupported** | At most one SHARD axis per side; REPLICATE on all other axes. |
-| **Window transport selection** | Providing a window does not guarantee zero-copy execution; the configured transport may use library-managed PACKWINDOW staging. |
+| **Window transport selection** | Providing a window does not guarantee zero-copy execution; the configured transport may use library-managed PACK staging. |
 | **Legacy algorithm selector is dormant** | `NCCL_RESHARD_ALGORITHM` remains accepted for compatibility, but the current public path selects its transport through `NCCL_RESHARD_COPY_ALGORITHM`. |
 | **Single in-flight reshard per `(comm, effective stream)`** | The internal DevComm/window/staging caches are designed for sequential use on a comm. Use separate communicators for concurrent transfers, as in `reshard_batch_bench_user_window --num-comms`. |
 | **Not thread-safe — process-wide single-thread access** | The init-time globals and the internal caches (DevComm cache, window cache, stream pool) are process-wide shared state. Caller is responsible for serializing every lifecycle call and every `ncclReshardWithWindow` / `ncclReshard` call on the host side — including calls on different `ncclComm_t` handles. Device-side concurrency (issuing successive reshards on separate CUDA streams from a single host thread) is supported. |

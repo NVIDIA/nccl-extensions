@@ -529,10 +529,10 @@ static void printUsage(const char* prog) {
   printf("                                  'window' calls ncclReshardWithWindow with\n");
   printf("                                  caller-window setup.\n");
   printf("  --copy-algorithm <a>            Advanced staging override: "
-         "'packwindow'\n");
-  printf("                                  or 'direct' (default: packwindow)\n");
-  printf("  --lb-mode <uniform|node>        Load balance mode (default: "
-         "uniform)\n");
+         "'pack',\n");
+  printf("                                  'pipe', or 'direct' (default: pack).\n");
+  printf("  --lb-mode <node|uniform>        Load balance mode (default: "
+         "node)\n");
   printf("  --no-dedup              Disable param deduplication\n");
   printf("  --validate              Validate correctness after warmup\n");
   printf("  --validate-iterations <N>  Validation iterations (default: 3)\n");
@@ -586,8 +586,8 @@ int main(int argc, char* argv[]) {
           "ERROR: unknown --algorithm '%s' (use 'auto', 'ring', or 'direct')\n")
       .apiMode("--api", &apiMode)
       .enumValue("--copy-algorithm", &copyAlgorithm,
-          {{"direct", "DIRECT"}, {"packwindow", "PACKWINDOW"}},
-          "ERROR: unknown --copy-algorithm '%s' (use 'direct' or 'packwindow')\n")
+          {{"direct", "DIRECT"}, {"pack", "PACK"}, {"pipe", "PIPE"}},
+          "ERROR: unknown --copy-algorithm '%s' (use 'direct', 'pack', or 'pipe')\n")
       .enumValue("--lb-mode", &lbMode, {{"node", "NODE_AWARE"}, {"uniform", "UNIFORM"}},
           "ERROR: unknown --lb-mode '%s' (use 'uniform' or 'node')\n")
       .help(printUsage);

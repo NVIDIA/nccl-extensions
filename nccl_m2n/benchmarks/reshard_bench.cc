@@ -49,10 +49,10 @@ static void printUsage(const char* prog) {
          "(default) or 'direct'\n");
   printf("  --api <window|default>           Public entry point (default: default)\n");
   printf("  --copy-algorithm <a>             Advanced staging override: "
-         "'packwindow'\n");
-  printf("                                   or 'direct' (default: packwindow)\n");
-  printf("  --lb-mode <uniform|node>         Load balancing: 'uniform' "
-         "(default) or 'node'\n");
+         "'pack',\n");
+  printf("                                   'pipe', or 'direct' (default: pack)\n");
+  printf("  --lb-mode <node|uniform>         Load balancing: 'node' "
+         "(default) or 'uniform'\n");
   printf("  --verbose                        Enable debug output\n");
   printf("  --print-all-ranks                Print per-rank timing\n");
   printf("  --metrics-output <path>          Write structured rank-max latency samples\n");
@@ -124,11 +124,11 @@ int main(int argc, char* argv[]) {
           "ERROR: Unknown algorithm '%s'. Use 'ring' or 'direct'\n")
       .apiMode("--api", &apiMode)
     .enumValue("--copy-algorithm", &copyAlgorithm,
-               {{"direct", "DIRECT"}, {"packwindow", "PACKWINDOW"}},
-               "ERROR: Unknown copy-algorithm '%s'. Use 'packwindow' or 'direct'\n")
-      .enumValue("--lb-mode", &lbMode, {{"node", "NODE_AWARE"}, {"uniform", "UNIFORM"}},
-          "ERROR: Unknown lb-mode '%s'. Use 'uniform' or 'node'\n")
-      .help(printUsage);
+               {{"direct", "DIRECT"}, {"pack", "PACK"}, {"pipe", "PIPE"}},
+               "ERROR: Unknown copy-algorithm '%s'. Use 'pack', 'pipe', or 'direct'\n")
+    .enumValue("--lb-mode", &lbMode, {{"node", "NODE_AWARE"}, {"uniform", "UNIFORM"}},
+               "ERROR: Unknown lb-mode '%s'. Use 'uniform' or 'node'\n")
+    .help(printUsage);
 
   int parseExit = benchParseExitCode(parser.parse());
   if (parseExit >= 0) {

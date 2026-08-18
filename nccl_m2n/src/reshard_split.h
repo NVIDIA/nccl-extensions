@@ -20,15 +20,17 @@
  *   commB (RAIL only): ALL generator ranks.  Carries the intra-generator
  *         cross-NVL ring forwarding and the LSA fan-out.
  *
- * This is additive and non-destructive: DIRECT, explicit UNIFORM LB, and
- * layout-specific safety fallbacks use the existing single-DevComm path.
+ * This is additive and non-destructive. PACK uses its legacy
+ * node-aware admission; PIPE uses split comms for node-aware destination
+ * replication. Both use the same split communicator construction and
+ * forwarding path after admission.
  *
  * NOTE: the generator NVL-domain size (lsaSize) is topology dependent
  * and is only known after commB is formed and its DevComm is probed.
  * commA's membership (which generator ranks join) is therefore derived
  * AFTER commB exists; the probed lsaSize is broadcast across the parent
- * comm so trainer-only ranks (which are not in commB) agree on commA
- * membership.
+ * comm so trainer-only ranks (which are not in commB) agree on the
+ * eligibility decision and commA membership.
  ************************************************************************/
 
 #ifndef NCCLM2N_RESHARD_SPLIT_H_
@@ -39,9 +41,11 @@
 #include "nccl_m2n.h"
 #include "reshard_types.h"
 
-/* Defined in reshard_internal.h. Only ever passed through by pointer here, so
- * this header does not need the definition. */
+#include <cstddef>
+#include <cstdint>
+
 struct ReshardDevCommUse;
+struct ncclDevComm;
 
 /* Rail GIN connection type for the generator-only sub-comm (commB).
  * The rest of the library only ever requests NCCL_GIN_CONNECTION_FULL.
@@ -107,11 +111,81 @@ struct ReshardSplitComms {
   int rankInA;
   int rankInB;
 
-  /* Slot within commB's DevComm, selected by the rank-stable PACKWINDOW
-   * staging-bucket index. */
+  /* Slot within commB's DevComm. */
   int slotIdx;
 
   bool valid; /* internal: entry has been populated */
+};
+
+/* Rank-uniform identity for PIPE persistent control and GIN-resource
+ * slots. The cache is intentionally a small linear table, so use direct
+ * equality rather than a hash: any field that changes rank mapping or the
+ * split topology must select a distinct slot. */
+struct ReshardStagingMeshSignature {
+  int srcStartRank;
+  int srcMeshDims[NCCL_RESHARD_MESH_NDIMS];
+  int srcPlacements[NCCL_RESHARD_MESH_NDIMS];
+  int dstStartRank;
+  int dstMeshDims[NCCL_RESHARD_MESH_NDIMS];
+  int dstPlacements[NCCL_RESHARD_MESH_NDIMS];
+  int srcGpusPerDomain;
+  int dstGpusPerDomain;
+  int loadBalanceMode;
+  bool splitStrided;
+  int splitNumInjectionDomains;
+  int splitDomainsPerRep;
+
+  bool operator==(const ReshardStagingMeshSignature& other) const {
+    if (srcStartRank != other.srcStartRank || dstStartRank != other.dstStartRank ||
+        srcGpusPerDomain != other.srcGpusPerDomain || dstGpusPerDomain != other.dstGpusPerDomain ||
+        loadBalanceMode != other.loadBalanceMode || splitStrided != other.splitStrided ||
+        splitNumInjectionDomains != other.splitNumInjectionDomains || splitDomainsPerRep != other.splitDomainsPerRep) {
+      return false;
+    }
+    for (int d = 0; d < NCCL_RESHARD_MESH_NDIMS; d++) {
+      if (srcMeshDims[d] != other.srcMeshDims[d] || srcPlacements[d] != other.srcPlacements[d] ||
+          dstMeshDims[d] != other.dstMeshDims[d] || dstPlacements[d] != other.dstPlacements[d]) {
+        return false;
+      }
+    }
+    return true;
+  }
+};
+
+/* Resolved partition of a mesh's canonical peer graph. This intentionally
+ * contains no peer identity or tensor layout: those belong to the mesh and
+ * tensor signatures respectively. A different active channel count changes
+ * the meaning of channel-indexed persistent counters. */
+struct ReshardStagingChannelSignature {
+  int activeChannelCount;
+
+  bool operator==(const ReshardStagingChannelSignature& other) const {
+    return activeChannelCount == other.activeChannelCount;
+  }
+};
+
+/* Tensor-local identity for immutable PIPE plans.  It intentionally omits
+ * mesh and split topology, which belong exclusively to ReshardStagingMeshSignature. */
+struct ReshardStagingTensorSignature {
+  int srcNdims;
+  ncclDataType_t srcDtype;
+  size_t srcLocalShape[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  int dstNdims;
+  ncclDataType_t dstDtype;
+  size_t dstLocalShape[NCCL_RESHARD_MAX_TENSOR_DIMS];
+
+  bool operator==(const ReshardStagingTensorSignature& other) const {
+    if (srcNdims != other.srcNdims || srcDtype != other.srcDtype || dstNdims != other.dstNdims ||
+        dstDtype != other.dstDtype) {
+      return false;
+    }
+    for (int d = 0; d < NCCL_RESHARD_MAX_TENSOR_DIMS; d++) {
+      if (srcLocalShape[d] != other.srcLocalShape[d] || dstLocalShape[d] != other.dstLocalShape[d]) {
+        return false;
+      }
+    }
+    return true;
+  }
 };
 
 /* ======================================================================
@@ -204,7 +278,7 @@ typedef struct {
 
   /* Debug: when nonzero, the split kernel emits per-rank device printf at
    * the commB (Phase B) barrier/waitSignal boundaries to localize hangs.
-   * Set from NCCL_RESHARD_SPLIT_KERNEL_TRACE in reshardLaunchPackWindowSplit. */
+   * Set from NCCL_RESHARD_SPLIT_KERNEL_TRACE in reshardLaunchPackSplit. */
   int kernelTrace;
 } ncclReshardParamsSplit;
 
@@ -212,35 +286,44 @@ typedef struct {
  * reshard_split_comm.cc — sub-comm formation / teardown
  * ====================================================================*/
 
-/* Collectively form (or fetch the cached) commA/commB for `comm`. MUST be
- * called by EVERY rank of `comm` (it performs collective ncclCommSplit /
- * ncclAllReduce). On fallback, sets out->active = false and the caller should
- * use the existing single-DevComm path. `stream` is used for the lsaSize
- * broadcast collective. */
+/* PIPE uses split comms only for node-aware destination replication. */
+bool reshardShouldAttemptPipeSplitComms(const ncclDistTensor_t* srcTensor, const ncclDistTensor_t* dstTensor);
+
 ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* srcMesh, const ncclMesh_t* dstMesh,
                                           int srcRepCount, int dstRepCount, bool dstRepStrided, int numCtas,
                                           cudaStream_t stream, ReshardSplitComms* out);
+
+/* Split and parent PIPE launches share one reusable staging allocation per
+ * parent communicator.  A (mesh, channel) signature owns a unique control
+ * slice in that allocation.  The mesh signature records split topology, so
+ * an active split path cannot alias the parent path. */
+int reshardGetPersistentControlSlotCount();
+ncclResult_t reshardGetOrCreatePersistentControlSlot(ncclComm_t parentComm,
+                                                     const ReshardStagingMeshSignature& meshSignature,
+                                                     const ReshardStagingChannelSignature& channelSignature, int rank,
+                                                     int* outSlot);
 
 /* Ensure (and cache) the per-staging-buffer windows + sized DevComms on
  * the split sub-comms: windowA/devCommA (FULL) on commA and
  * windowB/devCommB (RAIL) on commB.  Collective over the respective
  * sub-comms; safe to call every reshard.
  *
- * commA's DevComm is cached by its rank-uniform resource requirements.
- * commB's DevComm is created once per parent communicator and mesh geometry,
- * then reused across streams. */
+ * commA and commB use the shared event-ordered DevComm cache. commB's RAIL
+ * entries include its slot-partitioned resource requirements, so differing
+ * PACK and PIPE layouts never replace an in-flight DevComm. */
 ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stagingBuffer, size_t stagingCapacity,
-                                         int numCtas, int ginSignalCountA, int signalsPerSlotB, int ctxPerSlotB,
-                                         int maxConcurrency, cudaStream_t stream, ncclWindow_t* outWindowA,
-                                         ncclWindow_t* outWindowB, ncclDevComm* outDevCommA,
-                                         ReshardDevCommUse* outDevCommAUse, ncclDevComm* outDevCommB);
+                                         int numCtas, int ginSignalCountA, int ginCounterCountA, int signalsPerSlotB,
+                                         int countersPerSlotB, int ctxPerSlotB, int maxConcurrency, cudaStream_t stream,
+                                         ncclWindow_t* outWindowA, ncclWindow_t* outWindowB, ncclDevComm* outDevCommA,
+                                         ReshardDevCommUse* outDevCommAUse, ncclDevComm* outDevCommB,
+                                         ReshardDevCommUse* outDevCommBUse);
 
 /* ======================================================================
  * reshard_split_prepare.cc — cross-comm RING param builder
  * ====================================================================*/
 
 /* Translate a parent-comm-relative ncclReshardParams (as built by
- * prepareReshardParams, including any PACKWINDOW contiguous-plan rewrite)
+ * prepareReshardParams, including any PACK contiguous-plan rewrite)
  * into a ncclReshardParamsSplit whose peers are commA/commB-relative
  * and whose signal bases are per-sub-comm.  windowA/windowB are the
  * staging windows registered on commA/commB. */
@@ -248,11 +331,11 @@ void buildSplitReshardParams(const ncclReshardParams* base, const ReshardSplitCo
                              ncclWindow_t windowA, ncclWindow_t windowB, ncclReshardParamsSplit* out);
 
 /* ======================================================================
- * reshard_split_user_window.cu — dual-DevComm RING kernel + PACKWINDOW
+ * reshard_split_user_window.cu — dual-DevComm RING kernel + PACK
  * split dispatch.
  * ====================================================================*/
 
-/* PACKWINDOW split launch.  Called from reshardCopyPackWindowNormalized after the
+/* PACK split launch.  Called from reshardCopyPackNormalized after the
  * (split-domain-sized) base params + pack + contiguous rewrite are built,
  * once the caller has already formed the split comms (sc->active == true)
  * and chosen dstGpusPerDomain=commB.lsaSize / srcGpusPerDomain=commA
@@ -260,7 +343,7 @@ void buildSplitReshardParams(const ncclReshardParams* base, const ReshardSplitCo
  * DevComms (FULL / RAIL), builds the split params, and launches the
  * dual-DevComm kernel.  Caller is responsible for the RING + NODE_AWARE +
  * eligibility gating (this function assumes the split is active). */
-ncclResult_t reshardLaunchPackWindowSplit(const ReshardSplitComms* sc, void* stagingBuffer, size_t stagingCapacity,
-                                          const ncclReshardParams* baseParams, int numCtas, cudaStream_t stream);
+ncclResult_t reshardLaunchPackSplit(const ReshardSplitComms* sc, void* stagingBuffer, size_t stagingCapacity,
+                                    const ncclReshardParams* baseParams, int numCtas, cudaStream_t stream);
 
 #endif /* NCCLM2N_RESHARD_SPLIT_H_ */

@@ -49,15 +49,18 @@ bool parseAlgorithmEnv(const char* s, ReshardAlgorithm* out) {
 
 bool parseCopyAlgorithmEnv(const char* s, ReshardCopyAlgorithm* out) {
   if (s == nullptr || out == nullptr) return false;
+  if (strcasecmp(s, "PIPE") == 0) {
+    *out = RESHARD_COPY_ALGO_PIPE;
+    return true;
+  }
   if (strcasecmp(s, "DIRECT") == 0) {
     *out = RESHARD_COPY_ALGO_DIRECT;
     return true;
   }
-  if (strcasecmp(s, "PACKWINDOW") == 0) {
-    *out = RESHARD_COPY_ALGO_PACKWINDOW;
+  if (strcasecmp(s, "PACK") == 0) {
+    *out = RESHARD_COPY_ALGO_PACK;
     return true;
   }
-  /* TMAPULL remains reserved until it has a dispatched implementation. */
   return false;
 }
 
@@ -124,7 +127,7 @@ void resetReshardRuntimeConfig() {
   gReshardDstDomainSize = 0;
   gReshardAlgorithm = RESHARD_ALGO_AUTO;
   gReshardLbMode = RESHARD_LB_UNIFORM;
-  gReshardCopyAlgorithm = RESHARD_COPY_ALGO_PACKWINDOW;
+  gReshardCopyAlgorithm = RESHARD_COPY_ALGO_PACK;
   gReshardAutoUniformBcast = true;
   gReshardAutoUniformBcastSet = false;
   gReshardSplitComm = true;
@@ -141,9 +144,13 @@ void resetReshardRuntimeConfig() {
   gReshardNumCtas = DEFAULT_NUM_CTAS;
   gReshardElementsPerChunk = DEFAULT_ELEMENTS_PER_CHUNK;
   gReshardGinContextCount = DEFAULT_GIN_CONTEXT_COUNT;
+  gReshardPipeGinPeersPerSlot = STAGING_PIPE_GIN_PEERS_PER_SLOT;
+  gReshardPipeGinChannelsPerPeer = STAGING_PIPE_GIN_CHANNELS_PER_PEER;
   gReshardUseInternalStreams = true;
   gReshardChunkSizeBytes = 0;
-  for (int i = 0; i < kMaxStagingBuckets; i++) gReshardStagingBuckets[i] = {};
+  for (int i = 0; i < kMaxStagingBuckets; i++) {
+    gReshardStagingBuckets[i] = {};
+  }
   gReshardStagingBuckets[0] = {kDefaultStagingBucketBytes, kDefaultStagingBucketSlots};
   gReshardStagingBucketCount = 1;
   gReshardStagingBucketsImplicitDefault = true;
@@ -211,7 +218,7 @@ void applyReshardEnv() {
       gReshardCopyAlgorithm = copyAlgo;
     } else {
       RESHARD_WARN(-1,
-                   "NCCL_RESHARD_COPY_ALGORITHM=\"%s\" is not supported; accepted values are DIRECT and PACKWINDOW",
+                   "NCCL_RESHARD_COPY_ALGORITHM=\"%s\" is not supported; accepted values are DIRECT, PIPE, and PACK",
                    copyAlgorithm);
     }
   }
@@ -229,6 +236,12 @@ void applyReshardEnv() {
   }
   if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_GIN_CONTEXT_COUNT"), &n)) {
     gReshardGinContextCount = n;
+  }
+  if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_PIPE_GIN_PEERS_PER_SLOT"), &n)) {
+    gReshardPipeGinPeersPerSlot = n;
+  }
+  if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_PIPE_GIN_CHANNELS_PER_PEER"), &n)) {
+    gReshardPipeGinChannelsPerPeer = n;
   }
 
   if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_SRC_DOMAIN_SIZE"), &n)) gReshardSrcDomainSize = n;
@@ -277,9 +290,11 @@ void applyReshardEnv() {
     gReshardAutoUniformBcastSet = true;
   }
 
-  /* "size[:slots],size[:slots],..."; bare sizes use one slot and sizes accept
-   * bytes or binary K/M suffixes. Invalid explicit profiles retain the
-   * built-in default so PACKWINDOW always has a bounded staging pool. */
+  /* Bucketed staging pool: "size[:slots],size[:slots],...". Bare sizes use
+   * one slot; sizes accept bytes or binary K/M suffixes.
+   * Unset keeps the built-in 2-GiB:4 profile. Invalid explicit values also
+   * retain that default so PACK always has at least one bucket. Parsed
+   * buckets are kept ascending by size so best-fit is a forward scan. */
   const char* buckets = getenv("NCCL_RESHARD_PACK_BUFFSIZES");
   if (buckets == nullptr) {
     RESHARD_INFO(-1, "staging-bucket pool enabled: %d buckets, %d total slots (implicit default)",
@@ -355,9 +370,9 @@ void applyReshardEnv() {
         break;
       }
     }
-    /* Every PACKWINDOW request reserves at least 2 KiB. A profile below that
+    /* Every PACK request reserves at least 2 KiB. A profile below that
      * ceiling can never service a call, so reject it at configuration time. */
-    if (parsedCount == 0 || parsed[parsedCount - 1].size < kMinPackWindowStagingBytes) valid = false;
+    if (parsedCount == 0 || parsed[parsedCount - 1].size < kMinPackStagingBytes) valid = false;
     if (valid) {
       for (int i = 0; i < kMaxStagingBuckets; i++) {
         gReshardStagingBuckets[i] = i < parsedCount ? parsed[i] : ReshardStagingBucketCfg{};

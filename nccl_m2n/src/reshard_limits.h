@@ -70,14 +70,15 @@ constexpr int reshardMapCtaToGinContext(int ctaIdx, int numCtas, int ginContextC
 /* Cache capacities. */
 inline constexpr int MAX_WINDOW_CACHE_ENTRIES = 128;
 inline constexpr int MAX_DEVCOMM_CACHE_ENTRIES = 64;
-inline constexpr int MAX_PACKWINDOW_STAGING_ENTRIES = 16;
+inline constexpr int MAX_PACK_STAGING_ENTRIES = 16;
+
 /* Hard upper bound on staging slots across all configured buckets. */
 inline constexpr int MAX_SPLIT_CONCURRENCY = 64;
 
 /* Staging (copy-based) algorithm sizes. */
-inline constexpr int STAGING_MAX_CHANNELS = 32;
+inline constexpr int STAGING_MAX_CHANNELS = 64;
 inline constexpr int STAGING_DEFAULT_NUM_CHANNELS = 4;
-inline constexpr size_t STAGING_DEFAULT_CHANNEL_SIZE = 64ULL * 1024ULL * 1024ULL;
+inline constexpr size_t STAGING_DEFAULT_CHANNEL_SIZE = 8ULL * 1024ULL * 1024ULL;
 inline constexpr size_t STAGING_DEFAULT_CHUNK_SIZE = 1ULL * 1024ULL * 1024ULL;
 
 inline constexpr size_t STAGING_CTRL_ENTRY_SIZE = 128;
@@ -85,12 +86,18 @@ inline constexpr int STAGING_MAX_REMOTES = 32;
 inline constexpr int STAGING_LOCAL_FC_BASE = STAGING_MAX_REMOTES;
 inline constexpr int STAGING_CTRL_ENTRIES = STAGING_MAX_REMOTES + MAX_TARGETS;
 inline constexpr size_t STAGING_CTRL_REGION_SIZE = (size_t)STAGING_CTRL_ENTRIES * STAGING_CTRL_ENTRY_SIZE;
-inline constexpr int STAGING_LSA_FANOUT_MAX_FOLLOWERS = 32;
+inline constexpr int STAGING_DEFAULT_CONTROL_SLOTS = 1;
+inline constexpr int STAGING_PIPE_CONTROL_SLOTS = 16;
+inline constexpr int STAGING_PIPE_GIN_PEERS_PER_SLOT = 16;
+inline constexpr int STAGING_PIPE_GIN_CHANNELS_PER_PEER = 8;
+inline constexpr int STAGING_LSA_FANOUT_MAX_FOLLOWERS = MAX_TARGETS;
 
 inline constexpr size_t CTRL_FIELD_RDMA_TAIL = 0;
 inline constexpr size_t CTRL_FIELD_RDMA_HEAD = 8;
 inline constexpr size_t CTRL_FIELD_LSA_TAIL = 16;
 inline constexpr size_t CTRL_FIELD_LSA_HEAD = 24;
+inline constexpr size_t CTRL_FIELD_CURSOR_TAIL = 32;
+inline constexpr size_t CTRL_FIELD_CURSOR_HEAD = 40;
 
 inline constexpr int MAX_STAGING_BUFFER_ENTRIES = 16;
 

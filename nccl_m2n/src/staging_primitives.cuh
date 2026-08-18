@@ -200,6 +200,16 @@ __device__ __forceinline__ void lsa_rdma_wait_for_credits(ncclGin& gin, StagingF
   }
 }
 
+__device__ __forceinline__ uint64_t staging_cursor_load(StagingRegion& region, size_t offset) {
+  char* staging_base = (char*)ncclGetLocalPointer(region.window, 0);
+  return ld_acquire_gpu((const uint64_t*)(staging_base + offset));
+}
+
+__device__ __forceinline__ void staging_cursor_store(StagingRegion& region, size_t offset, uint64_t value) {
+  char* staging_base = (char*)ncclGetLocalPointer(region.window, 0);
+  st_release_gpu((uint64_t*)(staging_base + offset), value);
+}
+
 // ----------------------------------------------------------------------------
 // 2b. signal — Producer notifies consumer that a new chunk is ready (tail++)
 // ----------------------------------------------------------------------------
@@ -241,7 +251,9 @@ __device__ __forceinline__ void rdma_signal(ncclGin& gin, ncclTeam world, Stagin
 __device__ __forceinline__ void lsa_signal(StagingRegion& region, StagingFlowCtrl& fc) {
   fc.shadowTail++;
 
-  // Wire write goes out as base + delta.
+  // Wire write goes out as base + delta.  With lsaTailBase==0 (the
+  // default for all paths except PIPE's LSA T6) this reduces to
+  // today's absolute write of fc.shadowTail.
   uint64_t wire_val = fc.lsaTailBase + fc.shadowTail;
 
   if (fc.isLocal) {
@@ -399,7 +411,9 @@ __device__ __forceinline__ void lsa_release(StagingRegion& region, StagingFlowCt
     return;
   }
 
-  // Wire write goes out as base + delta.
+  // Wire write goes out as base + delta.  With lsaHeadBase==0 (the
+  // default for all paths except PIPE's LSA T7) this reduces to
+  // today's absolute write of fc.lastTailVal.
   uint64_t wire_val = fc.lsaHeadBase + fc.lastTailVal;
 
   if (fc.isLocal) {
@@ -851,6 +865,214 @@ __device__ __forceinline__ void staging_copy(StagingCopyMode mode, char* dst, co
     staging_copy_unpack(dst, src, plan, byte_start, num_bytes, warp_group_threads, thread_in_group);
     break;
   }
+}
+
+// ============================================================================
+// Layer 4: TMA (Tensor Memory Accelerator) Bulk Copy Primitives
+// ============================================================================
+//
+// Async bulk copy via DMA engine — does not occupy warps during transfer.
+// Requires sm_90+ (Hopper/Blackwell).
+//
+// Pattern:
+//   1. staging_tma_mbarrier_init(mbar, 1)     — once per mbarrier
+//   2. staging_tma_load(smem, gmem, mbar, N)  — async global→shared
+//   3. staging_tma_mbarrier_expect(mbar, N)    — register expected bytes
+//   4. staging_tma_mbarrier_wait(mbar, phase)  — block until load done
+//   5. staging_tma_store(smem, gmem, N)        — async shared→global
+//   6. staging_tma_store_wait<0>()             — block until store done
+//
+// These are standalone primitives — they do NOT modify existing staging_copy_*
+// functions. Use them as drop-in replacements for staging_copy_contig when
+// the copy is between global memory and shared memory.
+// ============================================================================
+
+#define STAGING_TMA_TILE_SIZE (32 * 1024) // 32KB default tile for TMA
+
+// Cache hint constants for L2
+__device__ static constexpr uint64_t kTmaEvictFirst = 0x12f0000000000000ULL;
+__device__ static constexpr uint64_t kTmaEvictNormal = 0x1000000000000000ULL;
+
+/* All TMA primitives below assemble PTX (mbarrier.*, cp.async.bulk.*,
+ * fence.mbarrier_init) that ptxas only accepts when targeting sm_90 or
+ * higher.  We still want sm_80 in NVCC_GENCODE so the default + direct
+ * staging kernels work on Ampere — so the bodies become no-ops on older
+ * archs (the Pipe launcher refuses to dispatch on those archs). */
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#define STAGING_TMA_AVAILABLE 1
+#else
+#define STAGING_TMA_AVAILABLE 0
+#endif
+
+// Initialize an mbarrier in shared memory.
+// Must be called by exactly one thread per mbarrier.
+__device__ __forceinline__ void staging_tma_mbarrier_init(uint64_t* mbar_ptr, uint32_t arrive_count) {
+#if STAGING_TMA_AVAILABLE
+  uint32_t mbar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
+  asm volatile("mbarrier.init.shared::cta.b64 [%1], %0;" ::"r"(arrive_count), "r"(mbar_smem));
+#else
+  (void)mbar_ptr;
+  (void)arrive_count;
+#endif
+}
+
+// Fence after mbarrier init (required before first use).
+__device__ __forceinline__ void staging_tma_fence_init() {
+#if STAGING_TMA_AVAILABLE
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+#endif
+}
+
+// Async bulk load: global memory → shared memory.
+// Issues cp.async.bulk and links completion to the mbarrier.
+__device__ __forceinline__ void staging_tma_load(void* smem_dst, const void* gmem_src, uint64_t* mbar_ptr,
+                                                 int num_bytes) {
+#if STAGING_TMA_AVAILABLE
+  uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+  uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
+  asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint "
+               "[%0], [%1], %2, [%3], %4;\n" ::"r"(smem_addr),
+               "l"(gmem_src), "r"(num_bytes), "r"(mbar_addr), "l"(kTmaEvictFirst)
+               : "memory");
+#else
+  (void)smem_dst;
+  (void)gmem_src;
+  (void)mbar_ptr;
+  (void)num_bytes;
+#endif
+}
+
+// Register expected transaction bytes on the mbarrier.
+// Call after staging_tma_load to tell the mbarrier how many bytes to expect.
+__device__ __forceinline__ void staging_tma_mbarrier_expect(uint64_t* mbar_ptr, int num_bytes) {
+#if STAGING_TMA_AVAILABLE
+  uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0;\n" ::"r"(num_bytes), "r"(mbar_addr));
+#else
+  (void)mbar_ptr;
+  (void)num_bytes;
+#endif
+}
+
+// Wait for mbarrier completion (parity-based).
+// Blocks until all expected bytes have arrived. Toggles phase.
+// Uses %= for unique asm labels to avoid collisions in loops.
+__device__ __forceinline__ void staging_tma_mbarrier_wait(uint64_t* mbar_ptr, uint32_t& phase) {
+#if STAGING_TMA_AVAILABLE
+  uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
+  asm volatile("{\n\t"
+               ".reg .pred P1;\n\t"
+               "WAIT_LOOP_%=:\n\t"
+               "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1, %2;\n\t"
+               "@P1 bra WAIT_DONE_%=;\n\t"
+               "bra WAIT_LOOP_%=;\n\t"
+               "WAIT_DONE_%=:\n\t"
+               "}\n" ::"r"(mbar_addr),
+               "r"(phase), "r"(0x989680));
+  phase ^= 1;
+#else
+  (void)mbar_ptr;
+  (void)phase;
+#endif
+}
+
+// Async bulk store: shared memory → global memory.
+// Issues cp.async.bulk and commits the transaction group.
+__device__ __forceinline__ void staging_tma_store(const void* smem_src, void* gmem_dst, int num_bytes) {
+#if STAGING_TMA_AVAILABLE
+  uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_src));
+  asm volatile("cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint "
+               "[%0], [%1], %2, %3;\n" ::"l"(gmem_dst),
+               "r"(smem_addr), "r"(num_bytes), "l"(kTmaEvictFirst)
+               : "memory");
+  asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+#else
+  (void)smem_src;
+  (void)gmem_dst;
+  (void)num_bytes;
+#endif
+}
+
+// Wait for outstanding TMA store transactions to complete.
+// N = number of transactions that may still be pending (0 = wait for all).
+template <int N>
+__device__ __forceinline__ void staging_tma_store_wait() {
+#if STAGING_TMA_AVAILABLE
+  asm volatile("cp.async.bulk.wait_group.read %0;\n" ::"n"(N) : "memory");
+#endif
+}
+
+// Async bulk store WITHOUT commit — for batching multiple stores into one group.
+// Call staging_tma_store_commit() after issuing all stores, then
+// staging_tma_store_wait<0>() to drain.
+__device__ __forceinline__ void staging_tma_store_nocommit(const void* smem_src, void* gmem_dst, int num_bytes) {
+#if STAGING_TMA_AVAILABLE
+  uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_src));
+  asm volatile("cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint "
+               "[%0], [%1], %2, %3;\n" ::"l"(gmem_dst),
+               "r"(smem_addr), "r"(num_bytes), "l"(kTmaEvictFirst)
+               : "memory");
+#else
+  (void)smem_src;
+  (void)gmem_dst;
+  (void)num_bytes;
+#endif
+}
+
+// Commit all pending (uncommitted) bulk stores into one tracking group.
+__device__ __forceinline__ void staging_tma_store_commit() {
+#if STAGING_TMA_AVAILABLE
+  asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+#endif
+}
+
+// ============================================================================
+// Layer 5: TMA-based strided unpack  (smem → scattered global)
+// ============================================================================
+//
+// Replaces staging_copy_unpack for the TMA path: walks inner transfers in
+// the transfer plan and issues one cp.async.bulk per inner transfer, then
+// commits + waits once.  Called by a single thread (root warp lane 0).
+//
+// Use when innerSize >= STAGING_TMA_STORE_THRESHOLD; for smaller inner
+// sizes the warp-level staging_copy_unpack_parallel is more efficient.
+
+#define STAGING_TMA_STORE_THRESHOLD 2048
+
+__device__ __forceinline__ void staging_tma_unpack(char* dst_user_buffer, const char* smem_staging,
+                                                   const StagingTransferPlan& plan, size_t byte_start,
+                                                   size_t num_bytes) {
+  const size_t inner = plan.innerSize;
+  size_t first_iter = byte_start / inner;
+  size_t first_offset = byte_start % inner;
+
+  size_t src_read_offset = 0;
+  size_t bytes_remaining = num_bytes;
+  size_t iter = first_iter;
+
+  while (bytes_remaining > 0) {
+    size_t dst_offset = plan.dstBaseOffset;
+    size_t tmp = iter;
+    for (int d = plan.numOuterLoops - 1; d >= 0; d--) {
+      size_t idx = tmp % plan.outerCounts[d];
+      tmp /= plan.outerCounts[d];
+      dst_offset += idx * plan.outerDstStrides[d];
+    }
+
+    size_t iter_start = (iter == first_iter) ? first_offset : 0;
+    size_t avail = inner - iter_start;
+    size_t iter_bytes = (avail < bytes_remaining) ? avail : bytes_remaining;
+
+    staging_tma_store_nocommit(smem_staging + src_read_offset, dst_user_buffer + dst_offset + iter_start,
+                               (int)iter_bytes);
+
+    src_read_offset += iter_bytes;
+    bytes_remaining -= iter_bytes;
+    iter++;
+  }
+
+  staging_tma_store_commit();
+  staging_tma_store_wait<0>();
 }
 
 #endif // NCCL_STAGING_PRIMITIVES_CUH

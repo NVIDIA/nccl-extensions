@@ -56,7 +56,7 @@ static inline void benchConfigureCopyAlgorithm(const char* copyAlgorithm) {
 static inline const char* benchResolvedCopyAlgorithm() {
   // NOLINTNEXTLINE(concurrency-mt-unsafe) — benchmark configuration is resolved before worker threads start.
   const char* copyAlgorithm = getenv("NCCL_RESHARD_COPY_ALGORITHM");
-  return copyAlgorithm != nullptr ? copyAlgorithm : "PACKWINDOW";
+  return copyAlgorithm != nullptr ? copyAlgorithm : "PACK";
 }
 
 static inline bool benchArgIs(const char* value, const char* expected) {

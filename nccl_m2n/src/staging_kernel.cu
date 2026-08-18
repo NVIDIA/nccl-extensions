@@ -6,20 +6,13 @@
  ************************************************************************/
 
 /*************************************************************************
- * Staging Reshard Kernel — Multi-Warp Implementation
+ * Staging Reshard kernels.
  *
- * This file contains the pure-RDMA DIRECT kernel and launch wrapper.
- *
- * Source warps pack into local staging memory and issue RDMA puts. Destination
- * warps poll the staging slots and unpack into the user buffer. A rank that is
- * both source and destination executes those phases sequentially.
- *
- * Dependencies:
- *   staging_buffer.h      — StagingKernelParams, StagingFlowCtrl, etc.
- *   staging_primitives.cuh — lsa_rdma_wait_for_credits, rdma_wait_for_credits,
- *                            rdma_signal, staging_poll, rdma_release,
- *                            staging_copy_*
- *   nccl.h / nccl_device.h — ncclGin, ncclDevComm, ncclBarrierSession
+ * This file contains the DIRECT staging kernel and the role-specialized
+ * PIPE persistent-counter kernels.  PIPE source ranks launch a trainer
+ * kernel, destination ranks launch a generator kernel, and mixed generator
+ * ranks can split RDMA-receive/fanout and LSA-pull work across CTA phases
+ * inside the same generator launch.
  ************************************************************************/
 
 #include "nccl.h"
@@ -31,11 +24,14 @@
 #include "staging_primitives.cuh"
 
 #include <cstdio>
+#include <mutex>
+#include <utility>
 
 // ============================================================================
 // Error-check macros (host-side only)
 // ============================================================================
 
+#define SK_NCCLCHECK NCCL_M2N_CHECK
 #define SK_CUDACHECK_IMPL(cmd, errorVar)                                                                        \
   do {                                                                                                          \
     cudaError_t errorVar = (cmd);                                                                               \
@@ -45,6 +41,122 @@
   } while (0)
 #define SK_CUDACHECK(cmd) SK_CUDACHECK_IMPL(cmd, NCCL_M2N_UNIQUE(skCudaError_))
 
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12030
+#define NCCLM2N_PIPE_HAS_LAUNCH_COMPLETION_EVENT 1
+#else
+#define NCCLM2N_PIPE_HAS_LAUNCH_COMPLETION_EVENT 0
+#endif
+
+#if NCCLM2N_PIPE_HAS_LAUNCH_COMPLETION_EVENT
+namespace {
+
+/* Persistent PIPE grids can occupy enough CTA admission capacity to keep a
+ * peer grid only partially launched. Keep one reusable launch-completion event
+ * per CUDA device, rather than per communicator or stream. A stream wait
+ * captures the previous record before the next launch re-records the event.
+ * This orders launch admission, not kernel completion, and kernels may still
+ * execute concurrently. */
+constexpr int kPipeLaunchOrderMaxDevices = 64;
+constexpr int kPipeLaunchCompletionMinDriverVersion = 12030;
+
+struct PipeLaunchOrderState {
+  int cudaDev = -1;
+  cudaEvent_t launchComplete = nullptr;
+};
+
+std::mutex gPipeLaunchOrderMutex;
+PipeLaunchOrderState gPipeLaunchOrder[kPipeLaunchOrderMaxDevices];
+int gPipeLaunchOrderCount = 0;
+
+bool pipeLaunchCompletionEventSupported() {
+  static std::once_flag once;
+  static bool supported = false;
+  std::call_once(once, [] {
+    int driverVersion = 0;
+    supported =
+      cudaDriverGetVersion(&driverVersion) == cudaSuccess && driverVersion >= kPipeLaunchCompletionMinDriverVersion;
+  });
+  return supported;
+}
+
+PipeLaunchOrderState* getPipeLaunchOrderState(int cudaDev) {
+  for (int i = 0; i < gPipeLaunchOrderCount; i++) {
+    if (gPipeLaunchOrder[i].cudaDev == cudaDev) {
+      return &gPipeLaunchOrder[i];
+    }
+  }
+  if (gPipeLaunchOrderCount >= kPipeLaunchOrderMaxDevices) {
+    return nullptr;
+  }
+  PipeLaunchOrderState* state = &gPipeLaunchOrder[gPipeLaunchOrderCount++];
+  state->cudaDev = cudaDev;
+  state->launchComplete = nullptr;
+  return state;
+}
+
+template <typename KernelFunc, typename... Args>
+static ncclResult_t launchPipeKernelOrdered(dim3 grid, dim3 block, size_t dynamicSmemBytes, cudaStream_t stream,
+                                            KernelFunc kernel, Args&&... args) {
+  int cudaDev = -1;
+  SK_CUDACHECK(cudaGetDevice(&cudaDev));
+
+  std::lock_guard<std::mutex> lock(gPipeLaunchOrderMutex);
+  PipeLaunchOrderState* state = getPipeLaunchOrderState(cudaDev);
+  NCCL_M2N_CHECK_ARG(state != nullptr, -1, "PIPE launch-order state exhausted (%d CUDA devices)",
+                     kPipeLaunchOrderMaxDevices);
+
+  if (state->launchComplete == nullptr) {
+    SK_CUDACHECK(cudaEventCreateWithFlags(&state->launchComplete, cudaEventDisableTiming));
+  } else {
+    SK_CUDACHECK(cudaStreamWaitEvent(stream, state->launchComplete, 0));
+  }
+
+  cudaLaunchAttribute attr{};
+  attr.id = cudaLaunchAttributeLaunchCompletionEvent;
+  attr.val.launchCompletionEvent.event = state->launchComplete;
+  attr.val.launchCompletionEvent.flags = cudaEventRecordDefault;
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = dynamicSmemBytes;
+  config.stream = stream;
+  config.attrs = &attr;
+  config.numAttrs = 1;
+
+  cudaError_t launchResult = cudaLaunchKernelEx(&config, kernel, std::forward<Args>(args)...);
+  if (launchResult != cudaSuccess) {
+    NCCL_M2N_FAIL(ncclInternalError, -1, "CUDA operation cudaLaunchKernelEx failed: %s",
+                  cudaGetErrorString(launchResult));
+  }
+  return ncclSuccess;
+}
+
+} // namespace
+#endif
+
+void stagingPipeLaunchCompletionFinalize() {
+#if NCCLM2N_PIPE_HAS_LAUNCH_COMPLETION_EVENT
+  std::lock_guard<std::mutex> lock(gPipeLaunchOrderMutex);
+  int savedCudaDev = -1;
+  cudaError_t getDeviceResult = cudaGetDevice(&savedCudaDev);
+  for (int i = 0; i < gPipeLaunchOrderCount; i++) {
+    if (gPipeLaunchOrder[i].launchComplete != nullptr) {
+      if (getDeviceResult == cudaSuccess && gPipeLaunchOrder[i].cudaDev >= 0) {
+        NCCL_M2N_CUDACHECK_WARN(cudaSetDevice(gPipeLaunchOrder[i].cudaDev));
+      }
+      NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(gPipeLaunchOrder[i].launchComplete));
+      gPipeLaunchOrder[i].launchComplete = nullptr;
+    }
+    gPipeLaunchOrder[i].cudaDev = -1;
+  }
+  if (getDeviceResult == cudaSuccess && savedCudaDev >= 0) {
+    NCCL_M2N_CUDACHECK_WARN(cudaSetDevice(savedCudaDev));
+  }
+  gPipeLaunchOrderCount = 0;
+#endif
+}
+
 // Named barrier for a subset of threads within a CTA.
 // __barrier_sync(id) syncs ALL CTA threads; to sync only `count` threads
 // we need the PTX "bar.sync id, count" instruction directly.
@@ -53,10 +165,13 @@ __device__ __forceinline__ void barrier_sync_subset(int id, int count) {
 }
 
 // ============================================================================
-// Direct-Algorithm Kernel — StagingReshardKernel_Direct
+// Direct-Algorithm Kernel - StagingReshardKernel_Direct
 // ============================================================================
 //
-// Pure RDMA with no LSA fan-out or ring forwarding.
+// Stripped-down kernel for the direct algorithm (pure RDMA, no LSA, no ring).
+// Eliminates: LSA fan-out (Type 6 fwd), ring forwarding, Type 7 (LSA recv),
+// and all associated state, reducing register pressure and
+// stack frame size compared to the PIPE kernel.
 //
 // Warp layout:
 //   Source side: Type 1 (pack) + Type 4 (RDMA send)
@@ -402,10 +517,8 @@ __global__ __launch_bounds__(DIRECT_TOTAL_WARPS * 32, 1) void StagingReshardKern
 // Host-Side Launch Wrapper — Direct Algorithm
 // ============================================================================
 
-ncclResult_t launchStagingReshardDirect(const StagingKernelParams* hostParams, StagingKernelParams* devParams,
-                                        struct ncclDevComm* devComm, int numCtas, cudaStream_t stream, bool verbose) {
-  SK_CUDACHECK(cudaMemcpyAsync(devParams, hostParams, sizeof(StagingKernelParams), cudaMemcpyHostToDevice, stream));
-
+ncclResult_t launchStagingReshardDirect(StagingKernelParams* devParams, struct ncclDevComm* devComm, int numCtas,
+                                        cudaStream_t stream, bool verbose) {
   const int threads_per_cta = DIRECT_TOTAL_WARPS * 32;
 
   if (verbose) {
@@ -426,4 +539,1233 @@ ncclResult_t launchStagingReshardDirect(const StagingKernelParams* hostParams, S
   }
 
   return ncclSuccess;
+}
+
+__device__ __forceinline__ int pipe_gin_context(const struct ncclDevComm& devComm, int channel_id, int context_base,
+                                                int context_count) {
+  int available = (int)devComm.ginContextCount - context_base;
+  if (available <= 0 || context_count <= 0) {
+    return 0;
+  }
+  int span = min(context_count, available);
+  return context_base + (channel_id % span);
+}
+
+__device__ __forceinline__ bool staging_peer_uses_split_b(const StagingPeerInfo& peer) {
+  return peer.rdmaTransport == STAGING_RDMA_TRANSPORT_SPLIT_B;
+}
+
+__device__ __forceinline__ ncclWindow_t staging_peer_rdma_window(const StagingKernelParams* params,
+                                                                 const StagingPeerInfo& peer) {
+  return staging_peer_uses_split_b(peer) ? params->rdmaWindowB : params->rdmaWindow;
+}
+
+__device__ __forceinline__ bool staging_peer_active(const StagingPeerInfo& peer) {
+  return peer.active && peer.channelCount > 0;
+}
+
+__device__ __forceinline__ bool pipe_edge_active(const StagingPipePeerEdge& edge) {
+  return edge.active;
+}
+
+__device__ __forceinline__ bool pipe_edge_uses_split_b(const StagingPipePeerEdge& edge) {
+  return edge.rdmaTransport == STAGING_RDMA_TRANSPORT_SPLIT_B;
+}
+
+__device__ __forceinline__ ncclWindow_t pipe_edge_rdma_window(const StagingKernelParams* params,
+                                                              const StagingPipePeerEdge& edge) {
+  return pipe_edge_uses_split_b(edge) ? params->rdmaWindowB : params->rdmaWindow;
+}
+
+__device__ __forceinline__ void staging_peer_chunk_range(const StagingPeerInfo& peer, size_t chunkSize,
+                                                         size_t* chunkStart, size_t* chunkEnd) {
+  (void)chunkSize;
+  *chunkStart = peer.chunkStart;
+  *chunkEnd = peer.chunkEnd;
+}
+
+__device__ __forceinline__ void pipe_edge_chunk_range(const StagingPipePeerEdge& edge, size_t chunkSize,
+                                                      size_t* chunkStart, size_t* chunkEnd) {
+  (void)chunkSize;
+  *chunkStart = edge.chunkStart;
+  *chunkEnd = edge.chunkEnd;
+}
+
+#ifdef STAGING_KERNEL_TRACE
+__device__ __forceinline__ void pipe_trace_spin(StagingKernelParams* params, uint64_t epoch, int channel_id,
+                                                const char* label, int peer, size_t progress,
+                                                unsigned long long start_clock, bool* reported) {
+  unsigned long long elapsed = clock64() - start_clock;
+  if (!*reported && elapsed > 2000000000ULL) {
+    printf("[PIPEDBG] rank=%d epoch=%llu ch=%d spin label=%s peer=%d progress=%llu elapsed_cycles=%llu\n",
+           params->myRank, (unsigned long long)epoch, channel_id, label, peer, (unsigned long long)progress, elapsed);
+    *reported = true;
+  }
+  if (elapsed > 20000000000ULL) {
+    printf("[PIPEDBG] rank=%d epoch=%llu ch=%d trap label=%s peer=%d progress=%llu elapsed_cycles=%llu\n",
+           params->myRank, (unsigned long long)epoch, channel_id, label, peer, (unsigned long long)progress, elapsed);
+    asm volatile("trap;");
+  }
+}
+
+#define PIPE_SPIN_INIT(name) \
+  unsigned long long name##_spin_start = clock64(); \
+  bool name##_spin_reported = false
+#define PIPE_SPIN_CHECK(name, params, epoch, channel_id, peer, progress) \
+  pipe_trace_spin((params), (epoch), (channel_id), #name, (peer), (size_t)(progress), name##_spin_start, \
+                  &name##_spin_reported)
+
+__device__ __forceinline__ void pipe_rdma_wait_for_credits_debug(ncclGin& gin, StagingRegion& region,
+                                                                 StagingFlowCtrl& fc, StagingKernelParams* params,
+                                                                 uint64_t epoch, int channel_id, int peer,
+                                                                 size_t progress) {
+  PIPE_SPIN_INIT(rdma_credit_wait);
+  if (fc.isLocal) {
+    char* staging_base = (char*)ncclGetLocalPointer(region.window, 0);
+    uint64_t* local_head_ptr = (uint64_t*)(staging_base + fc.localHeadOffset);
+    while ((fc.shadowTail - ld_acquire_gpu(local_head_ptr)) >= (uint64_t)fc.peerNumSlots) {
+      PIPE_SPIN_CHECK(rdma_credit_wait, params, epoch, channel_id, peer, progress);
+    }
+  } else {
+    while ((fc.shadowTail - (gin.readSignal(fc.localHeadSignal) - fc.headSignalBase)) >= (uint64_t)fc.peerNumSlots) {
+      PIPE_SPIN_CHECK(rdma_credit_wait, params, epoch, channel_id, peer, progress);
+    }
+  }
+}
+
+__device__ __forceinline__ void pipe_lsa_wait_for_credits_debug(StagingRegion& region, StagingFlowCtrl& fc,
+                                                                StagingKernelParams* params, uint64_t epoch,
+                                                                int channel_id, int peer, size_t progress) {
+  PIPE_SPIN_INIT(lsa_credit_wait);
+  char* staging_base = (char*)ncclGetLocalPointer(region.window, 0);
+  uint64_t* local_head_ptr = (uint64_t*)(staging_base + fc.localHeadOffset);
+  while ((fc.shadowTail - (ld_acquire(local_head_ptr, fc.isLocal) - fc.lsaHeadBase)) >= (uint64_t)fc.peerNumSlots) {
+    PIPE_SPIN_CHECK(lsa_credit_wait, params, epoch, channel_id, peer, progress);
+  }
+}
+
+__device__ __forceinline__ void pipe_lsa_rdma_wait_for_credits_debug(ncclGin& gin, StagingFlowCtrl& fc,
+                                                                     uint64_t baseOffset, StagingKernelParams* params,
+                                                                     uint64_t epoch, int channel_id, int peer,
+                                                                     size_t progress) {
+  PIPE_SPIN_INIT(lsa_rdma_credit_wait);
+  while ((fc.shadowTail - gin.readCounter(fc.localPutCounter) - baseOffset) >= (uint64_t)fc.peerNumSlots) {
+    PIPE_SPIN_CHECK(lsa_rdma_credit_wait, params, epoch, channel_id, peer, progress);
+  }
+}
+#else
+#define PIPE_SPIN_INIT(name) ((void)0)
+#define PIPE_SPIN_CHECK(name, params, epoch, channel_id, peer, progress) ((void)0)
+#define pipe_rdma_wait_for_credits_debug(gin, region, fc, params, epoch, channel_id, peer, progress) \
+  rdma_wait_for_credits((gin), (region), (fc))
+#define pipe_lsa_wait_for_credits_debug(region, fc, params, epoch, channel_id, peer, progress) \
+  lsa_wait_for_credits((region), (fc))
+#define pipe_lsa_rdma_wait_for_credits_debug(gin, fc, baseOffset, params, epoch, channel_id, peer, progress) \
+  lsa_rdma_wait_for_credits((gin), (fc), (baseOffset))
+#endif
+
+// ============================================================================
+// PIPE kernels — role-specialized persistent-counter staging path
+// ============================================================================
+//
+// The supported PIPE path uses a cached host/device transfer plan and
+// persistent per-edge cursors.  It launches one trainer kernel on source ranks
+// and one generator kernel on destination ranks; generator behavior is selected
+// by compile-time role booleans at launch.
+// ============================================================================
+
+/* Per-CTA thread layout for source/trainer ranks.
+ *   warp 0       : control path. It consumes locally packed chunks and issues
+ *                  RDMA puts/signals to generator peers.
+ *   warps 1..16  : pack path. They gather from the user source tensor into the
+ *                  local staging FIFO and publish local tails to warp 0. */
+#define PIPE_TRAINER_CONTROL_WARPS 1
+#define PIPE_TRAINER_PACK_WARPS 16
+#define PIPE_TRAINER_PACK_WARP_START PIPE_TRAINER_CONTROL_WARPS
+#define PIPE_TRAINER_TOTAL_WARPS (PIPE_TRAINER_CONTROL_WARPS + PIPE_TRAINER_PACK_WARPS)
+#define PIPE_TRAINER_THREADS (PIPE_TRAINER_TOTAL_WARPS * 32)
+#define PIPE_TRAINER_PACK_THREADS (PIPE_TRAINER_PACK_WARPS * 32)
+#define PIPE_TRAINER_PACK_BARRIER_ID 1
+
+/* Per-CTA thread layout for destination/generator ranks.
+ *   warp 0       : control path. It polls RDMA/LSA tails, optionally forwards
+ *                  to ring/LSA peers, drives TMA pulls, and releases credits.
+ *   warps 1..16  : unpack path. They scatter staged/TMA-pulled payload into
+ *                  the user destination tensor. */
+#define PIPE_GENERATOR_CONTROL_WARPS 1
+#define PIPE_GENERATOR_UNPACK_WARPS 16
+#define PIPE_GENERATOR_UNPACK_WARP_START PIPE_GENERATOR_CONTROL_WARPS
+#define PIPE_GENERATOR_TOTAL_WARPS (PIPE_GENERATOR_CONTROL_WARPS + PIPE_GENERATOR_UNPACK_WARPS)
+#define PIPE_GENERATOR_THREADS (PIPE_GENERATOR_TOTAL_WARPS * 32)
+#define PIPE_GENERATOR_UNPACK_THREADS (PIPE_GENERATOR_UNPACK_WARPS * 32)
+#define PIPE_GENERATOR_UNPACK_BARRIER_ID 1
+#ifndef PIPE_GENERATOR_QUEUE_DEPTH
+#define PIPE_GENERATOR_QUEUE_DEPTH 2
+#endif
+#define PIPE_GENERATOR_DEFAULT_TMA_TILE_SIZE (64 * 1024)
+
+constexpr int kPipeGeneratorRdmaPhase = 0;
+constexpr int kPipeGeneratorLsaPhase = 1;
+
+struct PipeQueueDesc {
+  /* Control warp -> unpack warps handoff.  Queue entries describe either an
+   * RDMA staging slot or one TMA tile staged in shared memory. */
+  size_t staging_offset;
+  size_t byte_start;
+  size_t bytes;
+  int tile_buf;
+  int last_tile;
+};
+
+struct PipeChunkRange {
+  size_t start;
+  size_t end;
+  size_t count;
+};
+
+struct PipeGeneratorLaunchMap {
+  int channel_id;
+  int phase;
+};
+
+__device__ __forceinline__ PipeChunkRange pipe_chunk_range(const StagingPipePeerEdge& edge, size_t chunkSize) {
+  PipeChunkRange range{0, 0, 0};
+  if (pipe_edge_active(edge)) {
+    pipe_edge_chunk_range(edge, chunkSize, &range.start, &range.end);
+    range.count = range.end - range.start;
+  }
+  return range;
+}
+
+__device__ __forceinline__ int pipe_slot_from_offset(const StagingFlowCtrl& fc, size_t offset) {
+  return (fc.peerChunkSize > 0) ? (int)((offset - fc.peerDataOffset) / fc.peerChunkSize) : 0;
+}
+
+__device__ __forceinline__ int pipe_clip_batch(int polled, size_t remaining_chunks) {
+  return ((size_t)polled > remaining_chunks) ? (int)remaining_chunks : polled;
+}
+
+__device__ __forceinline__ size_t pipe_min_size(size_t a, size_t b) {
+  return (a < b) ? a : b;
+}
+
+template <bool DoRdmaSources, bool DoLsaSources, bool SplitMixedRoleCtas>
+__device__ __forceinline__ PipeGeneratorLaunchMap pipe_generator_launch_map(const StagingPipeDevicePlan* pipe_plan,
+                                                                            int launch_cta) {
+  PipeGeneratorLaunchMap map{launch_cta, kPipeGeneratorRdmaPhase};
+  if constexpr (SplitMixedRoleCtas && DoRdmaSources && DoLsaSources) {
+    const int rdma_launch_channels = pipe_plan->numGeneratorRdmaLaunchChannels;
+    const int lsa_launch_channels = pipe_plan->numGeneratorLsaLaunchChannels;
+    if (launch_cta < rdma_launch_channels) {
+      map.channel_id = pipe_plan->generatorRdmaLaunchChannels[launch_cta];
+      map.phase = kPipeGeneratorRdmaPhase;
+    } else if (launch_cta < rdma_launch_channels + lsa_launch_channels) {
+      map.channel_id = pipe_plan->generatorLsaLaunchChannels[launch_cta - rdma_launch_channels];
+      map.phase = kPipeGeneratorLsaPhase;
+    } else {
+      map.channel_id = -1;
+    }
+  } else if constexpr (DoRdmaSources && !DoLsaSources) {
+    map.channel_id = (launch_cta < pipe_plan->numGeneratorRdmaLaunchChannels) ?
+                       pipe_plan->generatorRdmaLaunchChannels[launch_cta] :
+                       -1;
+  } else if constexpr (!DoRdmaSources && DoLsaSources) {
+    map.channel_id =
+      (launch_cta < pipe_plan->numGeneratorLsaLaunchChannels) ? pipe_plan->generatorLsaLaunchChannels[launch_cta] : -1;
+    map.phase = kPipeGeneratorLsaPhase;
+  }
+  return map;
+}
+
+__device__ __forceinline__ size_t pipe_layout_offset(const StagingPipeCopyLayout& layout, size_t iter) {
+  size_t offset = layout.baseOffset;
+  size_t tmp = iter;
+  for (int d = layout.numOuterLoops - 1; d >= 0; d--) {
+    size_t idx = tmp % layout.outerCounts[d];
+    tmp /= layout.outerCounts[d];
+    offset += idx * layout.outerStrides[d];
+  }
+  return offset;
+}
+
+__device__ __forceinline__ void pipe_copy_aligned(char* dst, const char* src, size_t bytes) {
+  uintptr_t align = (uintptr_t)src | (uintptr_t)dst;
+  if ((align & 0xF) == 0 && bytes >= 16) {
+    size_t n16 = bytes / 16;
+    uint4* d = (uint4*)dst;
+    const uint4* s = (const uint4*)src;
+    for (size_t p = 0; p < n16; p++) {
+      d[p] = s[p];
+    }
+    for (size_t b = n16 * 16; b < bytes; b++) {
+      dst[b] = src[b];
+    }
+  } else if ((align & 0x3) == 0 && bytes >= 4) {
+    size_t n4 = bytes / 4;
+    uint32_t* d = (uint32_t*)dst;
+    const uint32_t* s = (const uint32_t*)src;
+    for (size_t p = 0; p < n4; p++) {
+      d[p] = s[p];
+    }
+    for (size_t b = n4 * 4; b < bytes; b++) {
+      dst[b] = src[b];
+    }
+  } else {
+    for (size_t b = 0; b < bytes; b++) {
+      dst[b] = src[b];
+    }
+  }
+}
+
+__device__ __forceinline__ void pipe_copy_pack_layout(char* dst_staging, const char* src_user_buffer,
+                                                      const StagingPipeCopyLayout& layout, size_t byte_start,
+                                                      size_t num_bytes, int warp_group_threads, int thread_in_group) {
+  const size_t inner = layout.innerSize;
+  size_t first_iter = byte_start / inner;
+  size_t first_offset = byte_start % inner;
+  size_t dst_write_offset = 0;
+  size_t bytes_remaining = num_bytes;
+  size_t iter = first_iter;
+
+  while (bytes_remaining > 0) {
+    size_t src_offset = pipe_layout_offset(layout, iter);
+    size_t iter_start = (iter == first_iter) ? first_offset : 0;
+    size_t avail = inner - iter_start;
+    size_t iter_bytes = pipe_min_size(avail, bytes_remaining);
+    staging_memcpy(dst_staging + dst_write_offset, src_user_buffer + src_offset + iter_start, iter_bytes,
+                   warp_group_threads, thread_in_group);
+    dst_write_offset += iter_bytes;
+    bytes_remaining -= iter_bytes;
+    iter++;
+  }
+}
+
+__device__ __forceinline__ void pipe_copy_unpack_layout(char* dst_user_buffer, const char* src_staging,
+                                                        const StagingPipeCopyLayout& layout, size_t byte_start,
+                                                        size_t num_bytes, int warp_group_threads, int thread_in_group) {
+  const size_t inner = layout.innerSize;
+  size_t first_iter = byte_start / inner;
+  size_t first_offset = byte_start % inner;
+  size_t src_read_offset = 0;
+  size_t bytes_remaining = num_bytes;
+  size_t iter = first_iter;
+
+  while (bytes_remaining > 0) {
+    size_t dst_offset = pipe_layout_offset(layout, iter);
+    size_t iter_start = (iter == first_iter) ? first_offset : 0;
+    size_t avail = inner - iter_start;
+    size_t iter_bytes = pipe_min_size(avail, bytes_remaining);
+    staging_memcpy(dst_user_buffer + dst_offset + iter_start, src_staging + src_read_offset, iter_bytes,
+                   warp_group_threads, thread_in_group);
+    src_read_offset += iter_bytes;
+    bytes_remaining -= iter_bytes;
+    iter++;
+  }
+}
+
+__device__ __forceinline__ void pipe_copy_pack_layout_parallel(char* dst_staging, const char* src_user_buffer,
+                                                               const StagingPipeCopyLayout& layout, size_t byte_start,
+                                                               size_t num_bytes, int warp_group_threads,
+                                                               int thread_in_group) {
+  const size_t inner = layout.innerSize;
+  if (inner == 0) {
+    return;
+  }
+
+  size_t first_iter = byte_start / inner;
+  size_t last_byte = byte_start + num_bytes;
+  size_t last_iter = (last_byte + inner - 1) / inner;
+  size_t num_iters = last_iter - first_iter;
+
+  for (size_t i = (size_t)thread_in_group; i < num_iters; i += (size_t)warp_group_threads) {
+    size_t iter = first_iter + i;
+    size_t src_offset = pipe_layout_offset(layout, iter);
+    size_t iter_byte_start = iter * inner;
+    size_t iter_byte_end = iter_byte_start + inner;
+    size_t copy_start = (iter_byte_start >= byte_start) ? 0 : (byte_start - iter_byte_start);
+    size_t copy_end = (iter_byte_end <= last_byte) ? inner : (last_byte - iter_byte_start);
+    size_t copy_len = copy_end - copy_start;
+    const char* src_ptr = src_user_buffer + src_offset + copy_start;
+    char* dst_ptr = dst_staging + (iter_byte_start + copy_start - byte_start);
+    pipe_copy_aligned(dst_ptr, src_ptr, copy_len);
+  }
+}
+
+__device__ __forceinline__ void pipe_copy_unpack_layout_parallel(char* dst_user_buffer, const char* src_staging,
+                                                                 const StagingPipeCopyLayout& layout, size_t byte_start,
+                                                                 size_t num_bytes, int warp_group_threads,
+                                                                 int thread_in_group) {
+  const size_t inner = layout.innerSize;
+  if (inner == 0) {
+    return;
+  }
+
+  size_t first_iter = byte_start / inner;
+  size_t last_byte = byte_start + num_bytes;
+  size_t last_iter = (last_byte + inner - 1) / inner;
+  size_t num_iters = last_iter - first_iter;
+
+  for (size_t i = (size_t)thread_in_group; i < num_iters; i += (size_t)warp_group_threads) {
+    size_t iter = first_iter + i;
+    size_t dst_offset = pipe_layout_offset(layout, iter);
+    size_t iter_byte_start = iter * inner;
+    size_t iter_byte_end = iter_byte_start + inner;
+    size_t copy_start = (iter_byte_start >= byte_start) ? 0 : (byte_start - iter_byte_start);
+    size_t copy_end = (iter_byte_end <= last_byte) ? inner : (last_byte - iter_byte_start);
+    size_t copy_len = copy_end - copy_start;
+    const char* src_ptr = src_staging + (iter_byte_start + copy_start - byte_start);
+    char* dst_ptr = dst_user_buffer + dst_offset + copy_start;
+    pipe_copy_aligned(dst_ptr, src_ptr, copy_len);
+  }
+}
+
+__device__ __forceinline__ void pipe_pack_chunk(char* staging_dst, const char* user_src,
+                                                const StagingPipeCopyLayout& layout, size_t byte_start, size_t bytes,
+                                                int threads, int thread_in_group) {
+  if (layout.isContiguous) {
+    staging_copy_contig(staging_dst, user_src + layout.baseOffset + byte_start, bytes, threads, thread_in_group);
+  } else if (layout.innerSize < (size_t)threads * STAGING_PARALLEL_INNER_THRESHOLD) {
+    pipe_copy_pack_layout_parallel(staging_dst, user_src, layout, byte_start, bytes, threads, thread_in_group);
+  } else {
+    pipe_copy_pack_layout(staging_dst, user_src, layout, byte_start, bytes, threads, thread_in_group);
+  }
+}
+
+__device__ __forceinline__ void pipe_unpack_chunk(char* user_dst, const char* staging_src,
+                                                  const StagingPipeCopyLayout& layout, size_t byte_start, size_t bytes,
+                                                  int threads, int thread_in_group) {
+  if (layout.isContiguous) {
+    staging_copy_contig(user_dst + layout.baseOffset + byte_start, staging_src, bytes, threads, thread_in_group);
+  } else if (layout.innerSize < (size_t)threads * STAGING_PARALLEL_INNER_THRESHOLD) {
+    pipe_copy_unpack_layout_parallel(user_dst, staging_src, layout, byte_start, bytes, threads, thread_in_group);
+  } else {
+    pipe_copy_unpack_layout(user_dst, staging_src, layout, byte_start, bytes, threads, thread_in_group);
+  }
+}
+
+__global__ __launch_bounds__(PIPE_TRAINER_THREADS, 1) void StagingReshardKernel_PipeTrainer(
+  StagingKernelParams* params, const StagingPipeDevicePlan* pipe_plan, StagingPipeCallParams call,
+  struct ncclDevComm devCommA, struct ncclDevComm devCommB) {
+  /* One active CTA owns one logical staging channel.  The launch map skips
+   * idle channels so blockIdx.x is compact while channel_id remains stable. */
+  int channel_id = -1;
+  const int launch_cta = (int)blockIdx.x;
+  if (launch_cta < pipe_plan->numTrainerRdmaLaunchChannels) {
+    channel_id = pipe_plan->trainerRdmaLaunchChannels[launch_cta];
+  }
+
+  const int warp_id = threadIdx.x / 32;
+  const int lane_id = threadIdx.x % 32;
+  __shared__ int pack_slot;
+
+  if (!params->isSource || params->numRdmaTargets <= 0 || channel_id < 0 || channel_id >= params->numChannels) {
+    return;
+  }
+
+  ncclGin ginA{devCommA, pipe_gin_context(devCommA, channel_id, 0, (int)devCommA.ginContextCount)};
+  const int ctxPerSlotB = call.splitComm ? call.splitCommBContextCount : (int)devCommB.ginContextCount;
+  ncclGin ginB{devCommB, pipe_gin_context(devCommB, channel_id, call.splitCommBContextBase, ctxPerSlotB)};
+  ncclTeam worldA = ncclTeamWorld(devCommA);
+  ncclTeam worldB = ncclTeamWorld(devCommB);
+  StagingRegion rdma_region = params->rdmaRegions[channel_id];
+  const size_t chunkSize = params->chunkSize;
+#ifdef STAGING_KERNEL_TRACE
+  const uint64_t trace_epoch = call.epoch;
+#endif
+
+  __syncthreads();
+
+  /* Trainer stage A: control warp.
+   *
+   * Lane 0 waits for each locally packed staging slot, posts an RDMA put to
+   * the generator FIFO and increments the remote tail. The reusable staging
+   * pool orders the next call after these DMA puts have completed. */
+  if (warp_id == 0) {
+    if (lane_id == 0) {
+      for (int t = 0; t < params->numRdmaTargets; t++) {
+        const StagingPipeTrainerEdge& target_edge = pipe_plan->rdmaTargets[channel_id][t];
+        const StagingPipePeerEdge& target = target_edge.peer;
+        if (!pipe_edge_active(target)) {
+          continue;
+        }
+
+        StagingFlowCtrl local_fc = target_edge.localFc;
+        ncclGin& target_gin = pipe_edge_uses_split_b(target) ? ginB : ginA;
+        ncclTeam target_world = pipe_edge_uses_split_b(target) ? worldB : worldA;
+        ncclWindow_t target_window = pipe_edge_rdma_window(params, target);
+        const uint64_t local_tail = staging_cursor_load(rdma_region, local_fc.localTailOffset);
+        local_fc.shadowTail = local_tail;
+        local_fc.lastTailVal = local_tail;
+        uint64_t local_put_counter_base = target_gin.readCounter(local_fc.localPutCounter);
+
+        StagingFlowCtrl rdma_fc = target.fc;
+        rdma_fc.shadowTail = staging_cursor_load(rdma_region, rdma_fc.cursorTailOffset);
+        rdma_fc.headSignalBase = 0;
+
+        const PipeChunkRange chunks = pipe_chunk_range(target, chunkSize);
+
+        size_t chunks_done = 0;
+        while (chunks_done < chunks.count) {
+          size_t first_recv_offset = 0;
+          int num_new = 0;
+          while ((num_new = staging_poll(rdma_region, local_fc, &first_recv_offset)) == 0) {
+          }
+          int batch = pipe_clip_batch(num_new, chunks.count - chunks_done);
+          int first_slot = pipe_slot_from_offset(local_fc, first_recv_offset);
+
+          for (int bi = 0; bi < batch; bi++) {
+            int this_slot = (first_slot + bi) % local_fc.peerNumSlots;
+            size_t local_recv_offset = local_fc.peerDataOffset + (size_t)this_slot * local_fc.peerChunkSize;
+            size_t byte_start = (chunks.start + chunks_done + (size_t)bi) * chunkSize;
+            size_t remaining = target.totalBytes - byte_start;
+            size_t chunk_bytes = pipe_min_size(chunkSize, remaining);
+            pipe_rdma_wait_for_credits_debug(target_gin, rdma_region, rdma_fc, params, trace_epoch, channel_id, t,
+                                             chunks_done + (size_t)bi);
+            int remote_slot = (int)(rdma_fc.shadowTail % (uint64_t)rdma_fc.peerNumSlots);
+            size_t remote_offset = rdma_fc.peerDataOffset + (size_t)remote_slot * rdma_fc.peerChunkSize;
+            target_gin.put(target_world, target.peerWorldRank, target_window, remote_offset, target_window,
+                           local_recv_offset, chunk_bytes, ncclGin_None{},
+                           ncclGin_CounterInc{local_fc.localPutCounter});
+            rdma_signal(target_gin, target_world, rdma_region, rdma_fc);
+            staging_cursor_store(rdma_region, rdma_fc.cursorTailOffset, rdma_fc.shadowTail);
+          }
+          chunks_done += (size_t)batch;
+        }
+        if (chunks.count > 0) {
+          uint64_t counter_done = local_put_counter_base + (uint64_t)chunks.count;
+          while (target_gin.readCounter(local_fc.localPutCounter) < counter_done) {
+          }
+        }
+      }
+    }
+  }
+
+  /* Trainer stage B: pack warps.
+   *
+   * The pack group waits for local FIFO credit, gathers one logical chunk from
+   * the source tensor into local staging memory, then publishes the local tail
+   * consumed by the control warp above. */
+  if (warp_id >= PIPE_TRAINER_PACK_WARP_START && warp_id < PIPE_TRAINER_PACK_WARP_START + PIPE_TRAINER_PACK_WARPS) {
+    const int pack_warp = warp_id - PIPE_TRAINER_PACK_WARP_START;
+    const int thread_in_group = pack_warp * 32 + lane_id;
+    const bool is_root_warp = (pack_warp == 0);
+
+    for (int t = 0; t < params->numRdmaTargets; t++) {
+      const StagingPipeTrainerEdge& target_edge = pipe_plan->rdmaTargets[channel_id][t];
+      const StagingPipePeerEdge& target = target_edge.peer;
+      if (!pipe_edge_active(target)) {
+        continue;
+      }
+
+      StagingFlowCtrl fc = target_edge.localFc;
+      ncclGin& target_gin = pipe_edge_uses_split_b(target) ? ginB : ginA;
+      ncclTeam target_world = pipe_edge_uses_split_b(target) ? worldB : worldA;
+      uint64_t local_counter_base_offset = 0;
+      if (is_root_warp) {
+        fc.shadowTail = staging_cursor_load(rdma_region, fc.localTailOffset);
+        fc.lastTailVal = fc.shadowTail;
+        local_counter_base_offset = fc.shadowTail - target_gin.readCounter(fc.localPutCounter);
+      }
+
+      const PipeChunkRange chunks = pipe_chunk_range(target, chunkSize);
+
+      for (size_t chunk = 0; chunk < chunks.count; chunk++) {
+        size_t global_chunk = chunks.start + chunk;
+        if (is_root_warp && lane_id == 0) {
+          uint64_t baseOffset = local_counter_base_offset;
+          pipe_lsa_rdma_wait_for_credits_debug(target_gin, fc, baseOffset, params, trace_epoch, channel_id, t, chunk);
+          pack_slot = (int)(fc.shadowTail % (uint64_t)fc.peerNumSlots);
+        }
+        barrier_sync_subset(PIPE_TRAINER_PACK_BARRIER_ID, PIPE_TRAINER_PACK_THREADS);
+
+        char* staging_base = (char*)ncclGetLocalPointer(rdma_region.window, 0);
+        char* staging_dst = staging_base + fc.peerDataOffset + (size_t)pack_slot * fc.peerChunkSize;
+        const char* user_src = (const char*)call.srcBuffer;
+        size_t byte_start = global_chunk * chunkSize;
+        size_t remaining = target.totalBytes - byte_start;
+        size_t this_bytes = pipe_min_size(chunkSize, remaining);
+        const StagingPipeCopyLayout& target_layout = pipe_plan->rdmaTargetLayouts[channel_id][target.copyLayoutIndex];
+        pipe_pack_chunk(staging_dst, user_src, target_layout, byte_start, this_bytes, PIPE_TRAINER_PACK_THREADS,
+                        thread_in_group);
+        barrier_sync_subset(PIPE_TRAINER_PACK_BARRIER_ID, PIPE_TRAINER_PACK_THREADS);
+        if (is_root_warp && lane_id == 0) {
+          rdma_signal(target_gin, target_world, rdma_region, fc);
+        }
+      }
+    }
+  }
+
+  __syncthreads();
+  ginA.flush(ncclCoopCta());
+  if (call.splitComm) {
+    ginB.flush(ncclCoopCta());
+  }
+  __syncthreads();
+}
+
+/* Generator template knobs:
+ *   TmaTileSize        : shared-memory tile size for LSA/TMA pulls.
+ *   DoRdmaSources      : enable trainer/ring RDMA receive + unpack.
+ *   DoRingForward      : forward RDMA-received chunks to another RDMA peer.
+ *   DoLsaForward       : publish RDMA-received chunks to local LSA followers.
+ *   DoLsaSources       : enable LSA/TMA pull + unpack from an in-domain leader.
+ *   SplitMixedRoleCtas : for ranks with both RDMA and LSA inputs, launch
+ *                        separate compact CTA sets for the two phases. */
+template <int TmaTileSize, bool DoRdmaSources, bool DoRingForward, bool DoLsaForward, bool DoLsaSources,
+          bool SplitMixedRoleCtas>
+__global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKernel_PipeGenerator(
+  StagingKernelParams* params, const StagingPipeDevicePlan* pipe_plan, StagingPipeCallParams call,
+  struct ncclDevComm devCommA, struct ncclDevComm devCommB) {
+  /* Generator CTAs can be role-specialized at launch:
+   *   RDMA phase: poll trainer/ring input and unpack/forward it.
+   *   LSA phase : TMA-pull from an in-domain leader and unpack it.
+   * Mixed roles use separate compact launch maps so one CTA does not have to
+   * carry both RDMA and LSA work when the rank has both edge types. */
+  const int num_channels = params->numChannels;
+  const bool split_mixed_role_ctas = SplitMixedRoleCtas && DoRdmaSources && DoLsaSources;
+  const PipeGeneratorLaunchMap launch_map =
+    pipe_generator_launch_map<DoRdmaSources, DoLsaSources, SplitMixedRoleCtas>(pipe_plan, (int)blockIdx.x);
+  const int channel_id = launch_map.channel_id;
+  const int phase = launch_map.phase;
+  const bool run_rdma_sources = DoRdmaSources && (!split_mixed_role_ctas || phase == kPipeGeneratorRdmaPhase);
+  const bool run_lsa_sources = DoLsaSources && (!split_mixed_role_ctas || phase == kPipeGeneratorLsaPhase);
+  const int warp_id = threadIdx.x / 32;
+  const int lane_id = threadIdx.x % 32;
+  const bool is_control = (warp_id == 0);
+  const bool is_unpack = (warp_id >= PIPE_GENERATOR_UNPACK_WARP_START &&
+                          warp_id < PIPE_GENERATOR_UNPACK_WARP_START + PIPE_GENERATOR_UNPACK_WARPS);
+  const int unpack_warp = warp_id - PIPE_GENERATOR_UNPACK_WARP_START;
+  const int unpack_thread = unpack_warp * 32 + lane_id;
+  const bool is_unpack_leader = is_unpack && unpack_thread == 0;
+
+  __shared__ volatile unsigned int q_tail;
+  __shared__ volatile unsigned int q_done;
+  __shared__ volatile unsigned int q_done_chunks;
+  __shared__ PipeQueueDesc q_desc[PIPE_GENERATOR_QUEUE_DEPTH];
+  __shared__ PipeQueueDesc cur_desc;
+  __shared__ int rdma_ctrl_batch;
+  __shared__ int rdma_ctrl_first_slot;
+  __shared__ __align__(8) uint64_t tma_mbar[PIPE_GENERATOR_QUEUE_DEPTH];
+  extern __shared__ char tma_tile_smem[];
+  char* tma_tile_base = (char*)(((uintptr_t)tma_tile_smem + 127ULL) & ~127ULL);
+
+  if (!params->isDest || channel_id < 0 || channel_id >= num_channels) {
+    return;
+  }
+
+  if constexpr (DoLsaSources) {
+    /* Only LSA-source CTAs use TMA.  Their control warp fills shared-memory
+     * tiles, and unpack warps wait on these mbarriers before scattering. */
+    if (threadIdx.x < PIPE_GENERATOR_QUEUE_DEPTH) {
+      staging_tma_mbarrier_init(&tma_mbar[threadIdx.x], 1);
+    }
+    if (threadIdx.x == 0) {
+      staging_tma_fence_init();
+    }
+  }
+  __syncthreads();
+
+  StagingRegion rdma_region = params->rdmaRegions[channel_id];
+  StagingRegion lsa_region = params->lsaRegions[channel_id];
+  char* rdma_staging_base = (char*)ncclGetLocalPointer(rdma_region.window, 0);
+  char* user_dst = (char*)call.dstBuffer;
+  const size_t chunkSize = params->chunkSize;
+#ifdef STAGING_KERNEL_TRACE
+  const uint64_t trace_epoch = call.epoch;
+#endif
+
+  if constexpr (DoRdmaSources) {
+    if (run_rdma_sources) {
+      ncclGin ginA{devCommA, pipe_gin_context(devCommA, channel_id, 0, (int)devCommA.ginContextCount)};
+      const int ctxPerSlotB = call.splitComm ? call.splitCommBContextCount : (int)devCommB.ginContextCount;
+      ncclGin ginB{devCommB, pipe_gin_context(devCommB, channel_id, call.splitCommBContextBase, ctxPerSlotB)};
+      ncclTeam worldA = ncclTeamWorld(devCommA);
+      ncclTeam worldB = ncclTeamWorld(devCommB);
+
+      for (int s = 0; s < params->numRdmaSources; s++) {
+        const StagingPipePeerEdge& source = pipe_plan->rdmaSources[channel_id][s];
+        const bool active = pipe_edge_active(source);
+        ncclGin& source_gin = pipe_edge_uses_split_b(source) ? ginB : ginA;
+        ncclTeam source_world = pipe_edge_uses_split_b(source) ? worldB : worldA;
+        const PipeChunkRange chunks = pipe_chunk_range(source, chunkSize);
+
+        if (threadIdx.x == 0) {
+          q_tail = 0;
+          q_done = 0;
+          rdma_ctrl_batch = 0;
+          rdma_ctrl_first_slot = 0;
+        }
+        __syncthreads();
+
+        if (active && chunks.count > 0 && is_control) {
+          /* Generator RDMA stage A: control warp.
+           *
+           * Poll a trainer/ring producer tail, enqueue received staging slots
+           * for unpack, optionally forward the same slot to the next ring peer
+           * or LSA followers, then release producer credits after unpack and
+           * forwarding have caught up. */
+          StagingFlowCtrl poll_fc = source.fc;
+          StagingFlowCtrl release_fc = source.fc;
+          uint64_t rdma_release_head_base = staging_cursor_load(rdma_region, source.fc.cursorHeadOffset);
+          poll_fc.tailSignalBase = 0;
+          poll_fc.lastTailVal = rdma_release_head_base;
+          poll_fc.localHeadVal = rdma_release_head_base;
+          release_fc.tailSignalBase = 0;
+          release_fc.lastTailVal = rdma_release_head_base;
+          release_fc.localHeadVal = rdma_release_head_base;
+
+          const int fwd_start = s * params->numLsaFollowers;
+
+          const int ring_start = params->numRdmaTargets - params->numRingTargets;
+          const int ring_idx = ring_start + s;
+          StagingFlowCtrl ring_fc;
+          uint64_t ring_counter_val = 0;
+          int ring_target_rank = -1;
+          const bool ring_active = DoRingForward && (params->numRingTargets > 0) && ring_idx >= 0 &&
+                                   ring_idx < params->numRdmaTargets &&
+                                   pipe_edge_active(pipe_plan->rdmaTargets[channel_id][ring_idx].peer);
+          if (lane_id == 0 && ring_active) {
+            const StagingPipePeerEdge& ring_target = pipe_plan->rdmaTargets[channel_id][ring_idx].peer;
+            ring_fc = ring_target.fc;
+            ncclGin& ring_gin = pipe_edge_uses_split_b(ring_target) ? ginB : ginA;
+            ring_fc.shadowTail = staging_cursor_load(rdma_region, ring_fc.cursorTailOffset);
+            ring_fc.headSignalBase = 0;
+            ring_counter_val = ring_gin.readCounter(ring_fc.localPutCounter);
+            ring_target_rank = ring_target.peerWorldRank;
+          }
+
+          size_t chunks_done = 0;
+          while (chunks_done < chunks.count) {
+            if (lane_id == 0) {
+              size_t first_recv_offset = 0;
+              int num_new = 0;
+              PIPE_SPIN_INIT(rdma_poll_wait);
+              while ((num_new = rdma_poll(source_gin, rdma_region, poll_fc, &first_recv_offset)) == 0) {
+                PIPE_SPIN_CHECK(rdma_poll_wait, params, trace_epoch, channel_id, s, chunks_done);
+              }
+              int batch = pipe_clip_batch(num_new, chunks.count - chunks_done);
+              rdma_ctrl_batch = batch;
+              rdma_ctrl_first_slot = pipe_slot_from_offset(poll_fc, first_recv_offset);
+            }
+            __syncwarp();
+
+            int batch = rdma_ctrl_batch;
+            int first_slot = rdma_ctrl_first_slot;
+            for (int bi = 0; bi < batch; bi++) {
+              size_t logical_chunk = chunks_done + (size_t)bi;
+              if (lane_id == 0) {
+                PIPE_SPIN_INIT(rdma_queue_wait);
+                while ((q_tail - q_done) >= (unsigned int)PIPE_GENERATOR_QUEUE_DEPTH) {
+                  PIPE_SPIN_CHECK(rdma_queue_wait, params, trace_epoch, channel_id, s, logical_chunk);
+                }
+                unsigned int q_idx = q_tail % (unsigned int)PIPE_GENERATOR_QUEUE_DEPTH;
+                int this_slot = (first_slot + bi) % poll_fc.peerNumSlots;
+                size_t recv_offset = poll_fc.peerDataOffset + (size_t)this_slot * poll_fc.peerChunkSize;
+                size_t global_chunk = chunks.start + logical_chunk;
+                size_t byte_start = global_chunk * chunkSize;
+                size_t remaining = source.totalBytes - byte_start;
+                size_t this_bytes = pipe_min_size(chunkSize, remaining);
+                q_desc[q_idx].staging_offset = recv_offset;
+                q_desc[q_idx].byte_start = byte_start;
+                q_desc[q_idx].bytes = this_bytes;
+                q_desc[q_idx].tile_buf = -1;
+                q_desc[q_idx].last_tile = 1;
+                __threadfence_block();
+                q_tail = q_tail + 1;
+
+                if (ring_active) {
+                  const StagingPipePeerEdge& ring_target = pipe_plan->rdmaTargets[channel_id][ring_idx].peer;
+                  ncclGin& ring_gin = pipe_edge_uses_split_b(ring_target) ? ginB : ginA;
+                  ncclTeam ring_world = pipe_edge_uses_split_b(ring_target) ? worldB : worldA;
+                  ncclWindow_t ring_window = pipe_edge_rdma_window(params, ring_target);
+                  pipe_rdma_wait_for_credits_debug(ring_gin, rdma_region, ring_fc, params, trace_epoch, channel_id,
+                                                   ring_idx, logical_chunk);
+                  int remote_slot = (int)(ring_fc.shadowTail % (uint64_t)ring_fc.peerNumSlots);
+                  size_t remote_offset = ring_fc.peerDataOffset + (size_t)remote_slot * ring_fc.peerChunkSize;
+                  ring_gin.put(ring_world, ring_target_rank, ring_window, remote_offset, ring_window, recv_offset,
+                               this_bytes, ncclGin_None{}, ncclGin_CounterInc{ring_fc.localPutCounter});
+                  rdma_signal(ring_gin, ring_world, rdma_region, ring_fc);
+                  staging_cursor_store(rdma_region, ring_fc.cursorTailOffset, ring_fc.shadowTail);
+                  ring_counter_val++;
+                }
+              }
+
+              /* Publish each received RDMA chunk to LSA followers immediately,
+               * allowing in-domain forwarding to overlap subsequent receives. */
+              if constexpr (DoLsaForward) {
+                for (int fwd_lane = lane_id; fwd_lane < params->numLsaFollowers; fwd_lane += 32) {
+                  const int fwd_tgt_idx = fwd_start + fwd_lane;
+                  if (fwd_tgt_idx >= params->numLsaTargets) {
+                    continue;
+                  }
+                  const StagingPipePeerEdge& fwd_target = pipe_plan->lsaTargets[channel_id][fwd_tgt_idx];
+                  if (!pipe_edge_active(fwd_target)) {
+                    continue;
+                  }
+                  StagingFlowCtrl my_fwd_fc = fwd_target.fc;
+                  my_fwd_fc.lsaHeadBase = 0;
+                  my_fwd_fc.lsaTailBase = 0;
+                  my_fwd_fc.shadowTail = staging_cursor_load(lsa_region, my_fwd_fc.cursorTailOffset);
+                  my_fwd_fc.lastTailVal = my_fwd_fc.shadowTail;
+                  my_fwd_fc.localHeadVal = staging_cursor_load(lsa_region, my_fwd_fc.localHeadOffset);
+                  pipe_lsa_wait_for_credits_debug(lsa_region, my_fwd_fc, params, trace_epoch, channel_id, fwd_tgt_idx,
+                                                  chunks_done + (size_t)bi);
+                  lsa_signal(lsa_region, my_fwd_fc);
+                  staging_cursor_store(lsa_region, my_fwd_fc.cursorTailOffset, my_fwd_fc.shadowTail);
+                }
+              }
+              __syncwarp();
+            }
+            chunks_done += (size_t)batch;
+
+            /* Do not release producer RDMA slots until the unpack group and all
+             * LSA followers have consumed this batch. */
+            if (lane_id == 0) {
+              PIPE_SPIN_INIT(rdma_q_done_wait);
+              while (q_done < (unsigned int)chunks_done) {
+                PIPE_SPIN_CHECK(rdma_q_done_wait, params, trace_epoch, channel_id, s, chunks_done);
+              }
+            }
+            if constexpr (DoLsaForward) {
+              for (int fwd_lane = lane_id; fwd_lane < params->numLsaFollowers; fwd_lane += 32) {
+                const int fwd_tgt_idx = fwd_start + fwd_lane;
+                if (fwd_tgt_idx >= params->numLsaTargets) {
+                  continue;
+                }
+                const StagingPipePeerEdge& fwd_target = pipe_plan->lsaTargets[channel_id][fwd_tgt_idx];
+                if (!pipe_edge_active(fwd_target)) {
+                  continue;
+                }
+                StagingFlowCtrl my_fwd_fc = fwd_target.fc;
+                my_fwd_fc.lsaHeadBase = 0;
+                const uint64_t desired_tail = staging_cursor_load(lsa_region, my_fwd_fc.cursorTailOffset);
+                char* lsa_staging = (char*)ncclGetLocalPointer(lsa_region.window, 0);
+                uint64_t* head_ptr = (uint64_t*)(lsa_staging + my_fwd_fc.localHeadOffset);
+                PIPE_SPIN_INIT(rdma_fwd_head_wait);
+                while ((ld_acquire(head_ptr, my_fwd_fc.isLocal) - my_fwd_fc.lsaHeadBase) < desired_tail) {
+                  PIPE_SPIN_CHECK(rdma_fwd_head_wait, params, trace_epoch, channel_id, fwd_tgt_idx, chunks_done);
+                }
+              }
+            }
+            __syncwarp();
+            if (lane_id == 0) {
+              if (ring_active) {
+                PIPE_SPIN_INIT(rdma_ring_counter_wait);
+                const StagingPipePeerEdge& ring_target = pipe_plan->rdmaTargets[channel_id][ring_idx].peer;
+                ncclGin& ring_gin = pipe_edge_uses_split_b(ring_target) ? ginB : ginA;
+                while (ring_gin.readCounter(ring_fc.localPutCounter) < ring_counter_val) {
+                  PIPE_SPIN_CHECK(rdma_ring_counter_wait, params, trace_epoch, channel_id, ring_idx, chunks_done);
+                }
+              }
+              release_fc.lastTailVal = rdma_release_head_base + (uint64_t)chunks_done;
+              rdma_release_flush(source_gin, source_world, rdma_region, release_fc);
+              staging_cursor_store(rdma_region, release_fc.cursorHeadOffset, release_fc.localHeadVal);
+            }
+          }
+        }
+
+        if (active && chunks.count > 0 && is_unpack) {
+          /* Generator RDMA stage B: unpack warps.
+           *
+           * A single unpack leader consumes queue descriptors from the control
+           * warp; the full unpack group scatters each staged chunk into the
+           * destination tensor and advances q_done for credit release. */
+          for (size_t chunk = 0; chunk < chunks.count; chunk++) {
+            if (is_unpack_leader) {
+              PIPE_SPIN_INIT(rdma_unpack_queue_wait);
+              while (q_tail <= (unsigned int)chunk) {
+                PIPE_SPIN_CHECK(rdma_unpack_queue_wait, params, trace_epoch, channel_id, s, chunk);
+              }
+              __threadfence_block();
+              cur_desc = q_desc[chunk % (unsigned int)PIPE_GENERATOR_QUEUE_DEPTH];
+            }
+            /* Publish the control warp's queue descriptor to every unpack warp. */
+            barrier_sync_subset(PIPE_GENERATOR_UNPACK_BARRIER_ID, PIPE_GENERATOR_UNPACK_THREADS);
+            const char* staging_src = rdma_staging_base + cur_desc.staging_offset;
+            const StagingPipeCopyLayout& source_layout =
+              pipe_plan->rdmaSourceLayouts[channel_id][source.copyLayoutIndex];
+            pipe_unpack_chunk(user_dst, staging_src, source_layout, cur_desc.byte_start, cur_desc.bytes,
+                              PIPE_GENERATOR_UNPACK_THREADS, unpack_thread);
+            /* Do not advance q_done until the full unpack group has consumed the slot. */
+            barrier_sync_subset(PIPE_GENERATOR_UNPACK_BARRIER_ID, PIPE_GENERATOR_UNPACK_THREADS);
+            if (is_unpack_leader) {
+              __threadfence_block();
+              q_done = (unsigned int)(chunk + 1);
+            }
+          }
+        }
+        __syncthreads();
+
+        if (active) {
+          source_gin.flush(ncclCoopCta());
+          if (call.splitComm) {
+            ginB.flush(ncclCoopCta());
+          }
+          __syncthreads();
+        }
+      }
+    }
+  }
+
+  if constexpr (DoLsaSources) {
+    if (run_lsa_sources) {
+      uint32_t tma_consumer_phase[PIPE_GENERATOR_QUEUE_DEPTH];
+#pragma unroll
+      for (int i = 0; i < PIPE_GENERATOR_QUEUE_DEPTH; i++) {
+        tma_consumer_phase[i] = 0;
+      }
+      for (int s = 0; s < params->numLsaSources; s++) {
+        const StagingPipePeerEdge& source = pipe_plan->lsaSources[channel_id][s];
+        const bool active = pipe_edge_active(source);
+        const PipeChunkRange chunks = pipe_chunk_range(source, chunkSize);
+        const int leader_local_rank = source.peerLocalRank;
+
+        if (threadIdx.x == 0) {
+          q_tail = 0;
+          q_done = 0;
+          q_done_chunks = 0;
+        }
+        __syncthreads();
+
+        if (active && chunks.count > 0 && is_control && lane_id == 0) {
+          /* Generator LSA stage A: control warp lane 0.
+           *
+           * Poll the local NVLink-domain leader FIFO, issue TMA loads from the
+           * leader's staging window into shared-memory tiles, enqueue each tile
+           * for unpack, and release LSA credits chunk by chunk. */
+          StagingFlowCtrl poll_fc = source.fc;
+          StagingFlowCtrl release_fc = source.fc;
+          const uint64_t head_base = staging_cursor_load(lsa_region, source.fc.cursorHeadOffset);
+          poll_fc.lsaTailBase = 0;
+          poll_fc.lsaHeadBase = 0;
+          poll_fc.shadowTail = 0;
+          poll_fc.lastTailVal = head_base;
+          poll_fc.localHeadVal = head_base;
+          release_fc.lsaTailBase = 0;
+          release_fc.lsaHeadBase = 0;
+          release_fc.shadowTail = 0;
+          release_fc.lastTailVal = head_base;
+          release_fc.localHeadVal = head_base;
+          const uint64_t release_head_base = release_fc.localHeadVal;
+
+          size_t chunks_done = 0;
+          while (chunks_done < chunks.count) {
+            size_t first_recv_offset = 0;
+            int num_new = 0;
+            PIPE_SPIN_INIT(lsa_poll_wait);
+            while ((num_new = staging_poll(lsa_region, poll_fc, &first_recv_offset)) == 0) {
+              PIPE_SPIN_CHECK(lsa_poll_wait, params, trace_epoch, channel_id, s, chunks_done);
+            }
+            int batch = pipe_clip_batch(num_new, chunks.count - chunks_done);
+            int first_slot = pipe_slot_from_offset(poll_fc, first_recv_offset);
+
+            for (int bi = 0; bi < batch; bi++) {
+              size_t logical_chunk = chunks_done + (size_t)bi;
+              int this_slot = (first_slot + bi) % poll_fc.peerNumSlots;
+              size_t staging_slot_offset = poll_fc.peerDataOffset + (size_t)this_slot * poll_fc.peerChunkSize;
+              size_t global_chunk = chunks.start + logical_chunk;
+              size_t byte_start = global_chunk * chunkSize;
+              size_t remaining = source.totalBytes - byte_start;
+              size_t this_bytes = pipe_min_size(chunkSize, remaining);
+              const char* remote_src =
+                (const char*)ncclGetLsaPointer(lsa_region.window, staging_slot_offset, leader_local_rank);
+
+              size_t tile_offset = 0;
+              while (tile_offset < this_bytes) {
+                PIPE_SPIN_INIT(lsa_queue_wait);
+                while ((q_tail - q_done) >= (unsigned int)PIPE_GENERATOR_QUEUE_DEPTH) {
+                  PIPE_SPIN_CHECK(lsa_queue_wait, params, trace_epoch, channel_id, s, logical_chunk);
+                }
+                unsigned int q_idx = q_tail % (unsigned int)PIPE_GENERATOR_QUEUE_DEPTH;
+                size_t tile_bytes = pipe_min_size((size_t)TmaTileSize, this_bytes - tile_offset);
+                char* tma_tile_buf = tma_tile_base + (size_t)q_idx * (size_t)TmaTileSize;
+                staging_tma_load(tma_tile_buf, remote_src + tile_offset, &tma_mbar[q_idx], (int)tile_bytes);
+                staging_tma_mbarrier_expect(&tma_mbar[q_idx], (int)tile_bytes);
+
+                q_desc[q_idx].staging_offset = 0;
+                q_desc[q_idx].byte_start = byte_start + tile_offset;
+                q_desc[q_idx].bytes = tile_bytes;
+                q_desc[q_idx].tile_buf = (int)q_idx;
+                q_desc[q_idx].last_tile = (tile_offset + tile_bytes == this_bytes) ? 1 : 0;
+                __threadfence_block();
+                q_tail = q_tail + 1;
+                tile_offset += tile_bytes;
+              }
+            }
+            chunks_done += (size_t)batch;
+
+            PIPE_SPIN_INIT(lsa_done_chunks_wait);
+            while (q_done_chunks < (unsigned int)chunks_done) {
+              PIPE_SPIN_CHECK(lsa_done_chunks_wait, params, trace_epoch, channel_id, s, chunks_done);
+            }
+            release_fc.lastTailVal = release_head_base + (uint64_t)chunks_done;
+            lsa_release_flush(lsa_region, release_fc);
+            staging_cursor_store(lsa_region, release_fc.cursorHeadOffset, release_fc.localHeadVal);
+          }
+        }
+
+        if (active && chunks.count > 0 && is_unpack) {
+          /* Generator LSA stage B: unpack warps.
+           *
+           * The unpack leader waits for the queued TMA tile mbarrier, then the
+           * unpack group scatters the tile to destination memory.  The last tile
+           * of each logical chunk advances q_done_chunks for LSA credit release. */
+          size_t tiles_done = 0;
+          size_t chunks_done = 0;
+          while (chunks_done < chunks.count) {
+            if (is_unpack_leader) {
+              PIPE_SPIN_INIT(lsa_unpack_queue_wait);
+              while (q_tail <= (unsigned int)tiles_done) {
+                PIPE_SPIN_CHECK(lsa_unpack_queue_wait, params, trace_epoch, channel_id, s, tiles_done);
+              }
+              __threadfence_block();
+              cur_desc = q_desc[tiles_done % (unsigned int)PIPE_GENERATOR_QUEUE_DEPTH];
+              staging_tma_mbarrier_wait(&tma_mbar[cur_desc.tile_buf], tma_consumer_phase[cur_desc.tile_buf]);
+            }
+            /* Publish the completed TMA tile descriptor to every unpack warp. */
+            barrier_sync_subset(PIPE_GENERATOR_UNPACK_BARRIER_ID, PIPE_GENERATOR_UNPACK_THREADS);
+            const char* tile_src = tma_tile_base + (size_t)cur_desc.tile_buf * (size_t)TmaTileSize;
+            const StagingPipeCopyLayout& source_layout =
+              pipe_plan->lsaSourceLayouts[channel_id][source.copyLayoutIndex];
+            pipe_unpack_chunk(user_dst, tile_src, source_layout, cur_desc.byte_start, cur_desc.bytes,
+                              PIPE_GENERATOR_UNPACK_THREADS, unpack_thread);
+            /* Keep the tile queued until the full unpack group has consumed it. */
+            barrier_sync_subset(PIPE_GENERATOR_UNPACK_BARRIER_ID, PIPE_GENERATOR_UNPACK_THREADS);
+            const int last_tile = cur_desc.last_tile;
+            tiles_done++;
+            if (last_tile) {
+              chunks_done++;
+            }
+            if (is_unpack_leader) {
+              if (last_tile) {
+                q_done_chunks = (unsigned int)chunks_done;
+              }
+              __threadfence_block();
+              q_done = (unsigned int)tiles_done;
+            }
+          }
+        }
+        __syncthreads();
+      }
+    }
+  }
+}
+
+// ============================================================================
+// Host-Side Launch Wrapper — Pipe
+// ============================================================================
+
+static int pipeCountGeneratorRdmaLaunchChannels(const StagingKernelParams* params) {
+  if (params == nullptr) return 0;
+  int count = 0;
+  for (int ch = 0; ch < params->numChannels && ch < STAGING_MAX_CHANNELS; ch++) {
+    bool active = false;
+    for (int s = 0; s < params->numRdmaSources && s < MAX_SOURCES; s++) {
+      active = active || params->rdmaSources[ch][s].active;
+    }
+    count += active ? 1 : 0;
+  }
+  return count;
+}
+
+static int pipeCountGeneratorLsaLaunchChannels(const StagingKernelParams* params) {
+  if (params == nullptr) return 0;
+  int count = 0;
+  for (int ch = 0; ch < params->numChannels && ch < STAGING_MAX_CHANNELS; ch++) {
+    bool active = false;
+    for (int s = 0; s < params->numLsaSources && s < MAX_SOURCES; s++) {
+      active = active || params->lsaSources[ch][s].active;
+    }
+    count += active ? 1 : 0;
+  }
+  return count;
+}
+
+static int pipeCountTrainerRdmaLaunchChannels(const StagingKernelParams* params) {
+  if (params == nullptr) return 0;
+  int count = 0;
+  for (int ch = 0; ch < params->numChannels && ch < STAGING_MAX_CHANNELS; ch++) {
+    bool active = false;
+    for (int t = 0; t < params->numRdmaTargets && t < MAX_TARGETS; t++) {
+      active = active || params->rdmaTargets[ch][t].active;
+    }
+    count += active ? 1 : 0;
+  }
+  return count;
+}
+
+static int pipeCountGeneratorLaunchChannels(const StagingKernelParams* params) {
+  if (params == nullptr) return 0;
+  const int rdmaChannels = pipeCountGeneratorRdmaLaunchChannels(params);
+  const int lsaChannels = pipeCountGeneratorLsaLaunchChannels(params);
+  if (params->numRdmaSources > 0 && params->numLsaSources > 0) {
+    return rdmaChannels + lsaChannels;
+  }
+  if (params->numRdmaSources > 0) {
+    return rdmaChannels;
+  }
+  if (params->numLsaSources > 0) {
+    return lsaChannels;
+  }
+  return 0;
+}
+
+template <int TmaTileSize, bool DoRdmaSources, bool DoRingForward, bool DoLsaForward, bool DoLsaSources,
+          bool SplitMixedRoleCtas = false>
+static ncclResult_t launchPipeGeneratorSpecialized(const StagingKernelParams* hostParams,
+                                                   StagingKernelParams* devParams, StagingPipeDevicePlan* devPipePlan,
+                                                   const StagingPipeCallParams& call, struct ncclDevComm* devCommA,
+                                                   struct ncclDevComm* devCommB, int numCtas, cudaStream_t stream) {
+  constexpr int dynamic_smem_bytes = DoLsaSources ? (PIPE_GENERATOR_QUEUE_DEPTH * TmaTileSize + 127) : 0;
+  int grid = numCtas;
+  if constexpr (SplitMixedRoleCtas) {
+    grid = pipeCountGeneratorRdmaLaunchChannels(hostParams) + pipeCountGeneratorLsaLaunchChannels(hostParams);
+  } else if constexpr (DoRdmaSources && !DoLsaSources) {
+    grid = pipeCountGeneratorRdmaLaunchChannels(hostParams);
+  } else if constexpr (!DoRdmaSources && DoLsaSources) {
+    grid = pipeCountGeneratorLsaLaunchChannels(hostParams);
+  }
+  if (grid <= 0) {
+    return ncclSuccess;
+  }
+  /* The template booleans below strip unused generator stages from the kernel
+   * body.  That keeps RDMA-only, LSA-only, and mixed generator roles on the
+   * same data-flow path without carrying every stage's live state. */
+  if constexpr (DoLsaSources) {
+    SK_CUDACHECK(
+      cudaFuncSetAttribute(StagingReshardKernel_PipeGenerator<TmaTileSize, DoRdmaSources, DoRingForward, DoLsaForward,
+                                                              DoLsaSources, SplitMixedRoleCtas>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_smem_bytes));
+  }
+#if NCCLM2N_PIPE_HAS_LAUNCH_COMPLETION_EVENT
+  if (pipeLaunchCompletionEventSupported()) {
+    SK_NCCLCHECK(
+      (launchPipeKernelOrdered(dim3(grid), dim3(PIPE_GENERATOR_THREADS), dynamic_smem_bytes, stream,
+                               StagingReshardKernel_PipeGenerator<TmaTileSize, DoRdmaSources, DoRingForward,
+                                                                  DoLsaForward, DoLsaSources, SplitMixedRoleCtas>,
+                               devParams, devPipePlan, call, *devCommA, *devCommB)));
+  } else
+#endif
+  {
+    StagingReshardKernel_PipeGenerator<TmaTileSize, DoRdmaSources, DoRingForward, DoLsaForward, DoLsaSources,
+                                       SplitMixedRoleCtas>
+      <<<grid, PIPE_GENERATOR_THREADS, dynamic_smem_bytes, stream>>>(devParams, devPipePlan, call, *devCommA,
+                                                                     *devCommB);
+  }
+  SK_CUDACHECK(cudaGetLastError());
+  return ncclSuccess;
+}
+
+template <int TmaTileSize>
+static ncclResult_t launchPipeGeneratorForRole(const StagingKernelParams* hostParams, StagingKernelParams* devParams,
+                                               StagingPipeDevicePlan* devPipePlan, const StagingPipeCallParams& call,
+                                               struct ncclDevComm* devCommA, struct ncclDevComm* devCommB, int numCtas,
+                                               cudaStream_t stream) {
+  const bool has_rdma_source = hostParams->numRdmaSources > 0;
+  const bool has_lsa_source = hostParams->numLsaSources > 0;
+  const bool has_ring_forward = hostParams->numRingTargets > 0;
+  const bool has_lsa_forward = hostParams->numLsaTargets > 0 && hostParams->numLsaFollowers > 0;
+
+  /* Pick the smallest generator kernel variant that can express this rank's
+   * graph.  The fallback keeps all stages compiled in only for unexpected
+   * combinations. */
+  if (has_rdma_source && !has_lsa_source && !has_ring_forward && !has_lsa_forward) {
+    return launchPipeGeneratorSpecialized<TmaTileSize, true, false, false, false>(
+      hostParams, devParams, devPipePlan, call, devCommA, devCommB, numCtas, stream);
+  }
+  if (has_rdma_source && !has_lsa_source && has_ring_forward && !has_lsa_forward) {
+    return launchPipeGeneratorSpecialized<TmaTileSize, true, true, false, false>(
+      hostParams, devParams, devPipePlan, call, devCommA, devCommB, numCtas, stream);
+  }
+  if (has_rdma_source && !has_lsa_source && !has_ring_forward && has_lsa_forward) {
+    return launchPipeGeneratorSpecialized<TmaTileSize, true, false, true, false>(
+      hostParams, devParams, devPipePlan, call, devCommA, devCommB, numCtas, stream);
+  }
+  if (has_rdma_source && has_lsa_source && !has_ring_forward && !has_lsa_forward) {
+    return launchPipeGeneratorSpecialized<TmaTileSize, true, false, false, true, true>(
+      hostParams, devParams, devPipePlan, call, devCommA, devCommB, numCtas, stream);
+  }
+  if (has_rdma_source && has_lsa_source && !has_ring_forward && has_lsa_forward) {
+    return launchPipeGeneratorSpecialized<TmaTileSize, true, false, true, true, true>(
+      hostParams, devParams, devPipePlan, call, devCommA, devCommB, numCtas, stream);
+  }
+  if (has_rdma_source && has_lsa_source && has_ring_forward && !has_lsa_forward) {
+    return launchPipeGeneratorSpecialized<TmaTileSize, true, true, false, true, true>(
+      hostParams, devParams, devPipePlan, call, devCommA, devCommB, numCtas, stream);
+  }
+  if (has_rdma_source && has_lsa_source && has_ring_forward && has_lsa_forward) {
+    return launchPipeGeneratorSpecialized<TmaTileSize, true, true, true, true, true>(
+      hostParams, devParams, devPipePlan, call, devCommA, devCommB, numCtas, stream);
+  }
+  if (!has_rdma_source && has_lsa_source) {
+    return launchPipeGeneratorSpecialized<TmaTileSize, false, false, false, true>(
+      hostParams, devParams, devPipePlan, call, devCommA, devCommB, numCtas, stream);
+  }
+
+  return launchPipeGeneratorSpecialized<TmaTileSize, true, true, true, true>(hostParams, devParams, devPipePlan, call,
+                                                                             devCommA, devCommB, numCtas, stream);
+}
+
+ncclResult_t launchStagingReshardPipeSplit(const StagingKernelParams* hostParams, const StagingPipeCallParams* call,
+                                           StagingKernelParams* devParams, StagingPipeDevicePlan* devPipePlan,
+                                           struct ncclDevComm* devCommA, struct ncclDevComm* devCommB, int numCtas,
+                                           int tmaTileSize, cudaStream_t stream) {
+  if (hostParams == nullptr || call == nullptr || devParams == nullptr || devPipePlan == nullptr) {
+    return ncclInvalidArgument;
+  }
+  if (devCommA == nullptr || devCommB == nullptr) {
+    return ncclInvalidArgument;
+  }
+
+  const bool launch_trainer = hostParams->isSource && hostParams->numRdmaTargets > 0;
+  const bool launch_generator = hostParams->isDest && (hostParams->numRdmaSources > 0 || hostParams->numLsaSources > 0);
+  const int trainer_grid = launch_trainer ? pipeCountTrainerRdmaLaunchChannels(hostParams) : 0;
+  const int generator_grid = launch_generator ? pipeCountGeneratorLaunchChannels(hostParams) : 0;
+
+  if (launch_trainer && trainer_grid > 0) {
+#if NCCLM2N_PIPE_HAS_LAUNCH_COMPLETION_EVENT
+    if (pipeLaunchCompletionEventSupported()) {
+      SK_NCCLCHECK((launchPipeKernelOrdered(dim3(trainer_grid), dim3(PIPE_TRAINER_THREADS), 0, stream,
+                                            StagingReshardKernel_PipeTrainer, devParams, devPipePlan, *call, *devCommA,
+                                            *devCommB)));
+    } else
+#endif
+    {
+      StagingReshardKernel_PipeTrainer<<<trainer_grid, PIPE_TRAINER_THREADS, 0, stream>>>(devParams, devPipePlan, *call,
+                                                                                          *devCommA, *devCommB);
+    }
+    SK_CUDACHECK(cudaGetLastError());
+  }
+  if (launch_generator && generator_grid > 0) {
+    switch (tmaTileSize) {
+    case 8 * 1024:
+      SK_NCCLCHECK((launchPipeGeneratorForRole<8 * 1024>(hostParams, devParams, devPipePlan, *call, devCommA, devCommB,
+                                                         numCtas, stream)));
+      break;
+    case 32 * 1024:
+      SK_NCCLCHECK((launchPipeGeneratorForRole<32 * 1024>(hostParams, devParams, devPipePlan, *call, devCommA, devCommB,
+                                                          numCtas, stream)));
+      break;
+    case 64 * 1024:
+      SK_NCCLCHECK((launchPipeGeneratorForRole<64 * 1024>(hostParams, devParams, devPipePlan, *call, devCommA, devCommB,
+                                                          numCtas, stream)));
+      break;
+    case 16 * 1024:
+      SK_NCCLCHECK((launchPipeGeneratorForRole<16 * 1024>(hostParams, devParams, devPipePlan, *call, devCommA, devCommB,
+                                                          numCtas, stream)));
+      break;
+    default:
+      SK_NCCLCHECK((launchPipeGeneratorForRole<PIPE_GENERATOR_DEFAULT_TMA_TILE_SIZE>(
+        hostParams, devParams, devPipePlan, *call, devCommA, devCommB, numCtas, stream)));
+      break;
+    }
+  }
+  return ncclSuccess;
+}
+
+ncclResult_t launchStagingReshardPipe(const StagingKernelParams* hostParams, const StagingPipeCallParams* call,
+                                      StagingKernelParams* devParams, StagingPipeDevicePlan* devPipePlan,
+                                      struct ncclDevComm* devComm, int numCtas, int tmaTileSize, cudaStream_t stream) {
+  return launchStagingReshardPipeSplit(hostParams, call, devParams, devPipePlan, devComm, devComm, numCtas, tmaTileSize,
+                                       stream);
 }

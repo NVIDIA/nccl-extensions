@@ -346,7 +346,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
             "public reshard helper once per iteration"
         ),
     )
-    parser.add_argument("--copy-algorithm", choices=("direct", "tmapull"))
+    parser.add_argument("--copy-algorithm", choices=("direct", "pack", "pipe"))
     parser.add_argument("--lb-mode", choices=("uniform", "node"), default="uniform")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--print-all-ranks", action="store_true")
@@ -423,7 +423,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif "NCCL_RESHARD_COPY_ALGORITHM" not in os.environ:
             os.environ["NCCL_RESHARD_COPY_ALGORITHM"] = (
-                "DIRECT" if args.algorithm == "direct" else "TMAPULL"
+                "DIRECT" if args.algorithm == "direct" else "PIPE"
             )
 
     src_shape = _local_shape(global_shape, args.src_shard_dim, src_mesh_dims[1])
@@ -499,7 +499,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.python_api == "reshard":
                 print("Using: nccl.m2n.reshard (public Python API)")
             elif args.api == "default":
-                ca = os.environ.get("NCCL_RESHARD_COPY_ALGORITHM", "TMAPULL")
+                ca = os.environ.get("NCCL_RESHARD_COPY_ALGORITHM", "PIPE")
                 print(
                     "Using: nccl.m2n.Handle.reshard "
                     f"(default API, copy-algorithm={ca})"

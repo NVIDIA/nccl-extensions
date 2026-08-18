@@ -106,7 +106,7 @@ struct MpiParam {
 }
 
 static BasicApiCliArgs gCli;
-static const char* gResolvedCopyAlgorithm = "PACKWINDOW";
+static const char* gResolvedCopyAlgorithm = "PACK";
 static std::vector<TestCase> gCases;
 static int gWorldRank = 0;
 static int gWorldSize = 0;
@@ -525,12 +525,12 @@ TEST(M2nGroupMpiTest, OverlappingCommunicatorsPreserveBucketOrder) {
   MPICHECK(MPI_Barrier(testMpiWorld()));
 }
 
-TEST(PackWindowMpiTest, ReducedBucketWaitsForDelayedRemoteConsumer) {
-  if (gCli.filter == nullptr || strcmp(gCli.filter, "packwindow_reduced_bucket") != 0) {
+TEST(PackMpiTest, ReducedBucketWaitsForDelayedRemoteConsumer) {
+  if (gCli.filter == nullptr || strcmp(gCli.filter, "pack_reduced_bucket") != 0) {
 #if defined(GTEST_SKIP)
-    GTEST_SKIP() << "needs --filter packwindow_reduced_bucket";
+    GTEST_SKIP() << "needs --filter pack_reduced_bucket";
 #else
-    recordFallbackSkip("needs --filter packwindow_reduced_bucket");
+    recordFallbackSkip("needs --filter pack_reduced_bucket");
     return;
 #endif
   }
@@ -584,12 +584,12 @@ TEST(PackWindowMpiTest, ReducedBucketWaitsForDelayedRemoteConsumer) {
   MPICHECK(MPI_Barrier(testMpiWorld()));
 }
 
-TEST(PackWindowMpiTest, ReducedBucketWorksWithoutExternalPhaseBarriers) {
-  if (gCli.filter == nullptr || strcmp(gCli.filter, "packwindow_reduced_bucket") != 0) {
+TEST(PackMpiTest, ReducedBucketWorksWithoutExternalPhaseBarriers) {
+  if (gCli.filter == nullptr || strcmp(gCli.filter, "pack_reduced_bucket") != 0) {
 #if defined(GTEST_SKIP)
-    GTEST_SKIP() << "needs --filter packwindow_reduced_bucket";
+    GTEST_SKIP() << "needs --filter pack_reduced_bucket";
 #else
-    recordFallbackSkip("needs --filter packwindow_reduced_bucket");
+    recordFallbackSkip("needs --filter pack_reduced_bucket");
     return;
 #endif
   }
@@ -687,7 +687,7 @@ TEST_P(BasicApiMpiTest, Reshard) {
   env.copyBuffer = gCopyBuffer;
   env.copyBufferBytes = gCopyBufferBytes;
   env.apiKind = param.api;
-  env.expectPackWindow = strcmp(gResolvedCopyAlgorithm, "PACKWINDOW") == 0;
+  env.expectPack = strcmp(gResolvedCopyAlgorithm, "PACK") == 0;
   env.verbose = gCli.verbose;
   env.barrier = mpiBarrier;
   env.allreduceMinInt = mpiAllreduceMinInt;

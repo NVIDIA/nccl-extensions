@@ -68,6 +68,13 @@ ncclResult_t reshardGetOrCreateDevComm(ncclComm_t comm, int numCtas, int ginSign
                                        ReshardDevCommBarrierKind barrierKind, int ginContextCount, cudaStream_t stream,
                                        ncclDevComm* activeDevComm, ReshardDevCommUse* use);
 
+/* General cache path for split comms whose logical grid size and DevComm
+ * barrier count differ. ginConnectionType is part of the cache identity. */
+ncclResult_t reshardGetOrCreateDevCommWithRequirements(ncclComm_t comm, int barrierCount, int ginSignalCount,
+                                                       int ginCounterCount, ReshardDevCommBarrierKind barrierKind,
+                                                       int ginContextCount, int ginConnectionType, cudaStream_t stream,
+                                                       ncclDevComm* activeDevComm, ReshardDevCommUse* use);
+
 static inline ncclResult_t reshardRejectGraphCapture(const char* apiName, cudaStream_t stream) {
   cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
   NCCL_M2N_CUDACHECK(cudaStreamIsCapturing(stream, &captureStatus));

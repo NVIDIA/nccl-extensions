@@ -99,7 +99,7 @@ find_package(MPI)
 # ─── basic_api_test_local (no MPI) ────────────────────────────────────────────
 add_executable(basic_api_test_local
     basic_api_test_local.cc
-    packwindow_staging_pool_test.cc
+    pack_staging_pool_test.cc
     test_helpers.cu
     ${SRCS}
 )
@@ -186,8 +186,8 @@ endif()
 add_test(NAME basic_api_test_local
          COMMAND basic_api_test_local
          WORKING_DIRECTORY "${NCCL_M2N_RUNTIME_DIR}")
-add_test(NAME basic_api_packwindow_local
-         COMMAND basic_api_test_local --api default --copy-algorithm packwindow
+add_test(NAME basic_api_pack_local
+         COMMAND basic_api_test_local --api default --copy-algorithm pack
          WORKING_DIRECTORY "${NCCL_M2N_RUNTIME_DIR}")
 # basic_api_test_mpi is launched under mpirun, not registered as a plain
 # ctest entry.

@@ -40,10 +40,12 @@ typedef enum {
 } ReshardLoadBalanceMode;
 
 typedef enum {
-  /* Reserved for a future implementation; not currently supported. */
-  RESHARD_COPY_ALGO_TMAPULL = 0,
+  RESHARD_COPY_ALGO_PIPE = 0,
   RESHARD_COPY_ALGO_DIRECT = 1,
-  RESHARD_COPY_ALGO_PACKWINDOW = 2
+  /* Pack each destination's bytes contiguously into the staging buffer
+   * (CE cudaMemcpy3D), transfer with the hierarchical user-window kernel
+   * (reshardKernelUserWindow) over contiguous plans, then unpack. */
+  RESHARD_COPY_ALGO_PACK = 2
 } ReshardCopyAlgorithm;
 
 /* ncclDevComm is defined in nccl_device.h; only TUs that need the
@@ -102,9 +104,10 @@ typedef struct {
   bool isContiguous;
   size_t totalBytes;
 
-  /* Source shard index that produced this entry. PACKWINDOW uses it to compute
-   * a rank-independent contiguous staging offset -- the cumulative bytes of the
-   * smaller source shards feeding this destination shard. -1 when unused. */
+  /* Source shard index that produced this entry.  Used by the
+   * PACK copy mode to compute a rank-independent contiguous
+   * staging offset (cumulative bytes of smaller src shards feeding
+   * this dst shard).  -1 when unused. */
   int srcShardIdx;
 } ncclReshardSourceInfo;
 
@@ -274,10 +277,17 @@ typedef struct {
  * Cache entry types (used by reshard_cache.cc)
  * ====================================================================*/
 
+enum ReshardInternalWindowKind {
+  RESHARD_INTERNAL_WINDOW_PACK,
+  RESHARD_INTERNAL_WINDOW_STAGING,
+  RESHARD_INTERNAL_WINDOW_SPLIT,
+};
+
 struct WindowCacheEntry {
   ncclComm_t comm;
   void* windowBuffer;
   size_t windowSize;
+  ReshardInternalWindowKind kind;
   ncclWindow_t window;
   bool valid;
 };
@@ -299,9 +309,13 @@ struct StagingBufferState;
 
 struct StagingBufferPoolEntry {
   ncclComm_t comm;
+  uint64_t poolKey;
   StagingBufferState* state;
   cudaStream_t stream;
   cudaEvent_t event;
+  int capacityChannels;
+  bool reserved;
+  bool poisoned;
   bool allocated;
 };
 

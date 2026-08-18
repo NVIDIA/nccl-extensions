@@ -266,8 +266,13 @@ static void benchPrintUsage(const char* prog) {
   printf("  --validate                             Check data correctness\n");
   printf("  --algorithm <ring|direct>              Legacy compatibility setting "
          "(default: ring)\n");
-  printf("  --lb-mode <uniform|node>               Load balance (default: "
-         "uniform)\n");
+  printf("  --api <default|window>                 Public entry point (default: default)\n");
+  printf("  --copy-algorithm <a>                   Advanced staging override: "
+         "'pack',\n");
+  printf("                                           'pipe', or 'direct' "
+         "(default: pack)\n");
+  printf("  --lb-mode <node|uniform>               Load balance (default: "
+         "node)\n");
   printf("  --print-all-ranks                      Per-rank timing\n");
   printf("  --verbose                              Debug output\n");
   printf("\nExample:\n");
@@ -328,24 +333,28 @@ int main(int argc, char* argv[]) {
 
   BenchArgParser parser(argc, argv, mpiRank);
   parser.integer("--num-comms", "--num-comms", &numComms)
-      .integer("--num-tensors", "--num-tensors", &numTensors)
-      .value("--tensor-dims", parseTensorCfgs)
-      .meshDims("--src-mesh-dims", srcMdims)
-      .meshDims("--dst-mesh-dims", dstMdims)
-      .value("--src-shard-dims", parseShardDims("--src-shard-dims", &srcSdRaw))
-      .value("--src-shard-dim", parseShardDims("--src-shard-dim", &srcSdRaw))
-      .value("--dst-shard-dims", parseShardDims("--dst-shard-dims", &dstSdRaw))
-      .value("--dst-shard-dim", parseShardDims("--dst-shard-dim", &dstSdRaw))
-      .integer("--iterations", "--iterations", &iterations)
-      .integer("--warmup", "--warmup", &warmup)
-      .flag("--validate", [&] { bValidate = true; })
-      .flag("--verbose", [&] { bVerbose = true; })
-      .flag("--print-all-ranks", [&] { bPrintAllRanks = true; })
-      .enumValue("--algorithm", &algorithm, {{"direct", "DIRECT"}, {"ring", "RING"}},
-          "ERROR: unknown algorithm '%s' (use 'ring' or 'direct')\n")
-      .enumValue("--lb-mode", &lbMode, {{"node", "NODE_AWARE"}, {"uniform", "UNIFORM"}},
-          "ERROR: unknown --lb-mode '%s' (use 'uniform' or 'node')\n")
-      .help(benchPrintUsage);
+    .integer("--num-tensors", "--num-tensors", &numTensors)
+    .value("--tensor-dims", parseTensorCfgs)
+    .meshDims("--src-mesh-dims", srcMdims)
+    .meshDims("--dst-mesh-dims", dstMdims)
+    .value("--src-shard-dims", parseShardDims("--src-shard-dims", &srcSdRaw))
+    .value("--src-shard-dim", parseShardDims("--src-shard-dim", &srcSdRaw))
+    .value("--dst-shard-dims", parseShardDims("--dst-shard-dims", &dstSdRaw))
+    .value("--dst-shard-dim", parseShardDims("--dst-shard-dim", &dstSdRaw))
+    .integer("--iterations", "--iterations", &iterations)
+    .integer("--warmup", "--warmup", &warmup)
+    .flag("--validate", [&] { bValidate = true; })
+    .flag("--verbose", [&] { bVerbose = true; })
+    .flag("--print-all-ranks", [&] { bPrintAllRanks = true; })
+    .enumValue("--algorithm", &algorithm, {{"direct", "DIRECT"}, {"ring", "RING"}},
+               "ERROR: unknown algorithm '%s' (use 'ring' or 'direct')\n")
+    .apiMode("--api", &apiMode)
+    .enumValue("--copy-algorithm", &copyAlgorithm,
+               {{"direct", "DIRECT"}, {"pack", "PACK"}, {"pipe", "PIPE"}},
+               "ERROR: unknown --copy-algorithm '%s' (use 'pack', 'pipe', or 'direct')\n")
+    .enumValue("--lb-mode", &lbMode, {{"node", "NODE_AWARE"}, {"uniform", "UNIFORM"}},
+               "ERROR: unknown --lb-mode '%s' (use 'uniform' or 'node')\n")
+    .help(benchPrintUsage);
 
   int parseExit = benchParseExitCode(parser.parse());
   if (parseExit >= 0) {

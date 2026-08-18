@@ -8,7 +8,7 @@
 /*************************************************************************
  * Tensor Reshard — Split-Comm RING Kernel (QP-scalability path)
  *
- * Dual-DevComm variant of reshardKernelUserWindow used by the PACKWINDOW
+ * Dual-DevComm variant of reshardKernelUserWindow used by the PACK
  * copy mode when the split path is active (RING + NODE_AWARE, generator
  * spanning >= 2 NVL domains).  It replaces the single full all-to-all
  * DevComm with two narrower ones:
@@ -18,8 +18,8 @@
  *   commB (RAIL): all generator ranks.  Carries the cross-NVL ring forward
  *                 and the intra-domain LSA fan-out.
  *
- * Because PACKWINDOW always stages contiguously (Stage G in
- * reshardCopyPackWindowNormalized sets isContiguous=true on every target/source),
+ * Because PACK always stages contiguously (Stage G in
+ * reshardCopyPackNormalized sets isContiguous=true on every target/source),
  * this kernel only implements the contiguous branches of the original
  * RING kernel — there is no strided plan path here.
  *
@@ -64,7 +64,7 @@
 #endif
 
 // ============================================================================
-// Dual-DevComm RING kernel (contiguous PACKWINDOW staging only).
+// Dual-DevComm RING kernel (contiguous PACK staging only).
 // ============================================================================
 __global__ __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void reshardKernelUserWindowSplit(
   ncclReshardParamsSplit params, struct ncclDevComm devCommA, struct ncclDevComm devCommB) {
@@ -355,12 +355,12 @@ __global__ __launch_bounds__(DEFAULT_KERNEL_MAX_NTHREADS, 1) void reshardKernelU
 }
 
 // ============================================================================
-// Host: PACKWINDOW split launch (split comms already formed + active).
+// Host: PACK split launch (split comms already formed + active).
 // ============================================================================
-ncclResult_t reshardLaunchPackWindowSplit(const ReshardSplitComms* sc, void* stagingBuffer, size_t stagingCapacity,
-                                          const ncclReshardParams* baseParams, int numCtas, cudaStream_t stream) {
+ncclResult_t reshardLaunchPackSplit(const ReshardSplitComms* sc, void* stagingBuffer, size_t stagingCapacity,
+                                    const ncclReshardParams* baseParams, int numCtas, cudaStream_t stream) {
   NCCL_M2N_CHECK_ARG(sc != nullptr && baseParams != nullptr && sc->active, -1,
-                     "reshardLaunchPackWindowSplit: active split state and base parameters are required");
+                     "reshardLaunchPackSplit: active split state and base parameters are required");
 
   // Signal-space sizing:
   //   commA: trainers send to first-domain leaders, index = trainerRankInA
@@ -380,17 +380,18 @@ ncclResult_t reshardLaunchPackWindowSplit(const ReshardSplitComms* sc, void* sta
   // Defensive: the per-tensor commB signal footprint must fit one slot.
   if (sc->inB && baseParams->srcShardCount * numCtas > signalsPerSlotB) {
     NCCL_M2N_FAIL(ncclInvalidArgument, sc->parentRank,
-                  "reshardLaunchPackWindowSplit: commB signal overflow: srcShardCount=%d numCtas=%d exceeds "
+                  "reshardLaunchPackSplit: commB signal overflow: srcShardCount=%d numCtas=%d exceeds "
                   "signalsPerSlotB=%d; reduce NCCL_RESHARD_NUM_CTAS or increase the signal allocation",
                   baseParams->srcShardCount, numCtas, signalsPerSlotB);
   }
 
   ncclWindow_t windowA = nullptr, windowB = nullptr;
   ncclDevComm devCommA, devCommB;
-  ReshardDevCommUse devCommAUse;
+  ReshardDevCommUse devCommAUse, devCommBUse;
   SUW_NCCLCHECK(reshardSplitEnsureResources(sc, stagingBuffer, stagingCapacity, numCtas, ginSignalCountA,
-                                            signalsPerSlotB, ctxPerSlotB, maxConcurrency, stream, &windowA, &windowB,
-                                            &devCommA, &devCommAUse, &devCommB));
+                                            /*ginCounterCountA=*/0, signalsPerSlotB, /*countersPerSlotB=*/0,
+                                            ctxPerSlotB, maxConcurrency, stream, &windowA, &windowB, &devCommA,
+                                            &devCommAUse, &devCommB, &devCommBUse));
 
   ncclReshardParamsSplit sp;
   buildSplitReshardParams(baseParams, sc, numCtas, windowA, windowB, &sp);
@@ -455,9 +456,12 @@ ncclResult_t reshardLaunchPackWindowSplit(const ReshardSplitComms* sc, void* sta
   reshardKernelUserWindowSplit<<<numCtas, threadsPerCta, 0, stream>>>(sp, devCommA, devCommB);
   cudaError_t launchErr = cudaGetLastError();
   if (launchErr != cudaSuccess) {
-    NCCL_M2N_FAIL(ncclSystemError, sc->parentRank, "reshardLaunchPackWindowSplit kernel launch failed: %s [numCtas=%d]",
+    NCCL_M2N_FAIL(ncclSystemError, sc->parentRank, "reshardLaunchPackSplit kernel launch failed: %s [numCtas=%d]",
                   cudaGetErrorString(launchErr), numCtas);
   }
+  NCCL_M2N_CHECK(reshardRecordDevCommUse(&devCommAUse, stream));
+  NCCL_M2N_CHECK(reshardRecordDevCommUse(&devCommBUse, stream));
+
   RESHARD_INFO(sc->parentRank,
                "split-launch: inA=%d inB=%d rankInA=%d rankInB=%d srcLsa=%d genLsa=%d numGenDomains=%d "
                "sigA=%d sigPerSlotB=%d slot=%d/%d ctxPerSlotB=%d numCtas=%d",

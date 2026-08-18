@@ -81,7 +81,7 @@ struct TestEnv {
   void* copyBuffer;
   size_t copyBufferBytes;
   ApiKind apiKind;
-  bool expectPackWindow;
+  bool expectPack;
   bool verbose;
 
   void (*barrier)(TestEnv* env);
@@ -162,9 +162,9 @@ static void basicApiPrintUsage(const char* prog, const char* usageFmt, bool allo
          "rank tier)\n");
   printf("  --algorithm ring|direct%s  Legacy scenario label (default: ring%s)\n", allowAlgorithmAll ? "|all" : "   ",
          allowAlgorithmAll ? "; 'all' registers one gtest case per label" : "");
-  printf("  --copy-algorithm direct|packwindow\n");
+  printf("  --copy-algorithm direct|pack\n");
   printf("                               Copy transport for every selected API\n");
-  printf("                               (default: PACKWINDOW for ring, DIRECT for direct)\n");
+  printf("                               (default: PACK for ring, DIRECT for direct)\n");
   printf("  --api  window|default|all    Reshard API surface (default: "
          "window;\n");
   printf("                               'all' runs both window and default)\n");
@@ -224,8 +224,8 @@ static BasicApiCliArgs basicApiParseCli(int argc, char** argv, const char* usage
       }
     } else if (strcmp(k, "--copy-algorithm") == 0) {
       a.copyAlgorithm = basicApiRequireValue(argc, argv, &i);
-      if (strcmp(a.copyAlgorithm, "direct") != 0 && strcmp(a.copyAlgorithm, "packwindow") != 0) {
-        fprintf(stderr, "Unknown copy algorithm '%s'. Use 'direct' or 'packwindow'\n", a.copyAlgorithm);
+      if (strcmp(a.copyAlgorithm, "direct") != 0 && strcmp(a.copyAlgorithm, "pack") != 0) {
+        fprintf(stderr, "Unknown copy algorithm '%s'. Use 'direct' or 'pack'\n", a.copyAlgorithm);
         _Exit(2);
       }
     } else if (strcmp(k, "--api") == 0) {
@@ -764,13 +764,13 @@ static void emitSplitRegressions(std::vector<TestCase>& cases) {
   }
 }
 
-static void emitPackWindowRegressions(std::vector<TestCase>& cases) {
+static void emitPackRegressions(std::vector<TestCase>& cases) {
   /* Minimal forward-order source/destination pair for the single-LSA host-RMA
    * activation gate. Two element sizes make the focused local run reuse the
-   * same communicator and PACKWINDOW staging state across consecutive tests. */
+   * same communicator and PACK staging state across consecutive tests. */
   for (size_t elementSize : {2UL, 1UL}) {
     TestCase tc{};
-    tc.group = "packwindow_lsa_hput";
+    tc.group = "pack_lsa_hput";
     tc.ndims = 1;
     tc.globalDims[0] = 4096;
     tc.globalDims[1] = 1;
@@ -789,12 +789,12 @@ static void emitPackWindowRegressions(std::vector<TestCase>& cases) {
     cases.push_back(std::move(tc));
   }
 
-  /* The non-split PACKWINDOW producer and consumer must use the same
+  /* The non-split PACK producer and consumer must use the same
    * source-relative GIN signal bank. With two source shards, source rank 1
    * uses the second bank instead of aliasing source rank 0. The tiny transfer
    * also leaves trailing CTAs idle, which verifies that each still signals. */
   TestCase tc{};
-  tc.group = "packwindow_signal_bank";
+  tc.group = "pack_signal_bank";
   tc.ndims = 1;
   tc.globalDims[0] = 4;
   tc.globalDims[1] = 1;
@@ -934,7 +934,7 @@ static std::vector<TestCase> buildAllTestCases() {
   emitStreamChurn(cases);
   emitStreamOrdering(cases);
   emitSplitRegressions(cases);
-  emitPackWindowRegressions(cases);
+  emitPackRegressions(cases);
   return cases;
 }
 
@@ -1168,7 +1168,7 @@ static size_t computeMaxBufferBytes(const std::vector<TestCase>& cases, int worl
     if (need > mx) mx = need;
   }
 #ifdef NCCL_M2N_TESTING
-  /* Keep two disjoint tensor regions for the PACKWINDOW fusion assertion. */
+  /* Keep two disjoint tensor regions for the PACK fusion assertion. */
   mx *= 2;
 #endif
   /* Round up to 4 KiB. */
@@ -1279,19 +1279,19 @@ static const char* basicApiConfigureReshardEnv(const BasicApiCliArgs& cli, const
     // NOLINTNEXTLINE(concurrency-mt-unsafe) — serialized test configuration
     const char* copyAlgorithmEnv = getenv("NCCL_RESHARD_COPY_ALGORITHM");
     if (copyAlgorithmEnv != nullptr) {
-      inheritedCopyAlgorithm = strcasecmp(copyAlgorithmEnv, "DIRECT") == 0 ? "DIRECT" : "PACKWINDOW";
+      inheritedCopyAlgorithm = strcasecmp(copyAlgorithmEnv, "DIRECT") == 0 ? "DIRECT" : "PACK";
     }
     inheritedCopyAlgorithmCaptured = true;
   }
 
   const char* copyAlgorithm = nullptr;
   if (cli.copyAlgorithm != nullptr) {
-    copyAlgorithm = strcmp(cli.copyAlgorithm, "packwindow") == 0 ? "PACKWINDOW" : "DIRECT";
+    copyAlgorithm = strcmp(cli.copyAlgorithm, "pack") == 0 ? "PACK" : "DIRECT";
     testSetEnv("NCCL_RESHARD_COPY_ALGORITHM", copyAlgorithm);
   } else if (inheritedCopyAlgorithm != nullptr) {
     copyAlgorithm = inheritedCopyAlgorithm;
   } else {
-    copyAlgorithm = strcmp(algorithmEnv, "DIRECT") == 0 ? "DIRECT" : "PACKWINDOW";
+    copyAlgorithm = strcmp(algorithmEnv, "DIRECT") == 0 ? "DIRECT" : "PACK";
     testSetEnv("NCCL_RESHARD_COPY_ALGORITHM", copyAlgorithm);
   }
   testSetEnv("NCCL_RESHARD_LB_MODE", strcmp(cli.lbMode, "node") == 0 ? "NODE_AWARE" : "UNIFORM");
@@ -1395,11 +1395,11 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
    * issues a grouped pair through the selected entry point. The window entry
    * point is a compatibility alias for the default one, so it must fuse the
    * same way -- that is what this MR claims, so both kinds run the scenario. */
-  const bool testPackWindowFusion = env->expectPackWindow && !asyncOrdering;
+  const bool testPackFusion = env->expectPack && !asyncOrdering;
 #else
-  const bool testPackWindowFusion = false;
+  const bool testPackFusion = false;
 #endif
-  const size_t tensorRegionBytes = testPackWindowFusion ? activeBufferBytes / 2 : activeBufferBytes;
+  const size_t tensorRegionBytes = testPackFusion ? activeBufferBytes / 2 : activeBufferBytes;
   if (myBytes > tensorRegionBytes) {
     return makeSkip("local buffer exceeds preallocated max");
   }
@@ -1419,7 +1419,7 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     int sc = (tc.srcShardDim >= 0) ? srcShardCount : 1;
     testInitSourceData((char*)activeBuffer, srcLocalBytesDims, tc.ndims, sd, srcShardIdx, sc, env->stream);
 #ifdef NCCL_M2N_TESTING
-    if (testPackWindowFusion) {
+    if (testPackFusion) {
       testInitSourceData((char*)activeBuffer + tensorRegionBytes, srcLocalBytesDims, tc.ndims, sd, srcShardIdx, sc,
                          env->stream);
     }
@@ -1522,7 +1522,7 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
       }
     }
 #ifdef NCCL_M2N_TESTING
-  } else if (testPackWindowFusion) {
+  } else if (testPackFusion) {
     /* Both entries go through reshardTensors, so the window kind submits two
      * grouped ncclReshardWithWindow calls and the assertion below observes the
      * alias fusing rather than the default entry point standing in for it. */
@@ -1557,13 +1557,13 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
    * deadlock rather than report the failure. Record and report after. */
   const char* instrumentationFailure = nullptr;
 #ifdef NCCL_M2N_TESTING
-  if (testPackWindowFusion) {
+  if (testPackFusion) {
     if (reshardGetFusedSubmissionCountForTest() != 1) {
-      instrumentationFailure = "compatible grouped tensors did not produce exactly one fused PACKWINDOW submission";
+      instrumentationFailure = "compatible grouped tensors did not produce exactly one fused PACK submission";
     }
-  } else if (!asyncOrdering && env->expectPackWindow &&
-             reshardGetLastCompletedCopyAlgorithmForTest() != RESHARD_COPY_ALGO_PACKWINDOW) {
-    instrumentationFailure = "selected API did not execute the selected PACKWINDOW path";
+  } else if (!asyncOrdering && env->expectPack &&
+             reshardGetLastCompletedCopyAlgorithmForTest() != RESHARD_COPY_ALGO_PACK) {
+    instrumentationFailure = "selected API did not execute the selected PACK path";
   }
 #endif
   env->barrier(env);
@@ -1577,7 +1577,7 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     bool ok = testValidateDestData((const char*)activeBuffer, dstLocalBytesDims, tc.ndims, sd, dstShardIdx, sc,
                                    env->rank, env->stream, nullptr);
 #ifdef NCCL_M2N_TESTING
-    if (testPackWindowFusion) {
+    if (testPackFusion) {
       ok = ok && testValidateDestData((const char*)activeBuffer + tensorRegionBytes, dstLocalBytesDims, tc.ndims, sd,
                                       dstShardIdx, sc, env->rank, env->stream, nullptr);
     }

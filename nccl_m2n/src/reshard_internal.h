@@ -122,7 +122,7 @@ inline int gReshardSrcDomainSize = 0;
 inline int gReshardDstDomainSize = 0;
 inline ReshardAlgorithm gReshardAlgorithm = RESHARD_ALGO_AUTO;
 inline ReshardLoadBalanceMode gReshardLbMode = RESHARD_LB_UNIFORM;
-inline ReshardCopyAlgorithm gReshardCopyAlgorithm = RESHARD_COPY_ALGO_PACKWINDOW;
+inline ReshardCopyAlgorithm gReshardCopyAlgorithm = RESHARD_COPY_ALGO_PACK;
 
 /* When set (default), a transfer whose src AND dst are both fully replicated
  * (a pure broadcast, no Shard dim on either side) is auto-routed to UNIFORM
@@ -168,6 +168,10 @@ inline size_t gReshardElementsPerChunk = DEFAULT_ELEMENTS_PER_CHUNK;
  * NCCL_RESHARD_GIN_CONTEXT_COUNT at first init. */
 inline int gReshardGinContextCount = DEFAULT_GIN_CONTEXT_COUNT;
 
+/* PIPE reserves a dense remote-RDMA signal bank per persistent-control slot.
+ * Local LSA fanout uses staging-buffer cursors and does not consume GIN space. */
+inline int gReshardPipeGinPeersPerSlot = STAGING_PIPE_GIN_PEERS_PER_SLOT;
+inline int gReshardPipeGinChannelsPerPeer = STAGING_PIPE_GIN_CHANNELS_PER_PEER;
 /* Stream execution mode populated at first ncclM2nInit from
  * NCCL_RESHARD_USE_INTERNAL_STREAMS. Internal streams are the default; false
  * keeps work on caller streams with ordered DevComm reuse. */
@@ -181,11 +185,11 @@ inline bool gReshardUseInternalStreams = true;
 inline size_t gReshardChunkSizeBytes = 0;
 
 /* Enables the split-comm (commA FULL + commB RAIL) RING path for QP
- * scalability. Takes effect for PACKWINDOW RING + NODE_AWARE. Parsed once from
- * NCCL_RESHARD_SPLIT_COMM at first init. Default on for that path. */
+ * scalability. Takes effect for PACK RING + NODE_AWARE. Parsed once
+ * from NCCL_RESHARD_SPLIT_COMM at first init. Default on for that path. */
 inline bool gReshardSplitComm = true;
 
-/* Bounded PACKWINDOW staging pool (env NCCL_RESHARD_PACK_BUFFSIZES =
+/* Bounded PACK staging pool (env NCCL_RESHARD_PACK_BUFFSIZES =
  * "size[:slots],size[:slots],..."; sizes accept bytes or binary K/M suffixes,
  * and omitted slots default to one). The built-in profile is one 2-GiB bucket
  * with four slots, allocated lazily as selected. Explicit profiles replace the
@@ -195,7 +199,7 @@ struct ReshardStagingBucketCfg {
   int numSlots;
 };
 inline constexpr int kMaxStagingBuckets = 8;
-inline constexpr size_t kMinPackWindowStagingBytes = 2048;
+inline constexpr size_t kMinPackStagingBytes = 2048;
 inline constexpr size_t kDefaultStagingBucketBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
 inline constexpr int kDefaultStagingBucketSlots = 4;
 inline ReshardStagingBucketCfg gReshardStagingBuckets[kMaxStagingBuckets] = {
@@ -271,6 +275,12 @@ inline ReshardCopyAlgorithm reshardGetCopyAlgorithm() {
 inline int reshardGetGinContextCount() {
   return gReshardGinContextCount;
 }
+inline int reshardGetPipeGinPeersPerSlot() {
+  return gReshardPipeGinPeersPerSlot;
+}
+inline int reshardGetPipeGinChannelsPerPeer() {
+  return gReshardPipeGinChannelsPerPeer;
+}
 inline bool reshardGetSplitCommEnabled() {
   return gReshardAdaptiveCallConfigValid ? gReshardAdaptiveCallConfig.splitComm : gReshardSplitComm;
 }
@@ -284,6 +294,10 @@ inline bool reshardGetCommBForceRail() {
 inline int reshardGetSplitAutoParentThreshold() {
   return gReshardSplitAutoParentThreshold;
 }
+
+/* Resolve per-call defaults. splitCapable is true for the reshard paths that
+ * can use commA/commB; explicit env settings remain visible on every path,
+ * but unsupported paths never dispatch split comm. */
 inline void reshardResolveAdaptiveScaleConfig(int parentCommSize, bool splitCapable) {
   const bool large = parentCommSize > gReshardSplitAutoParentThreshold;
   gReshardAdaptiveCallConfig.splitComm = gReshardSplitCommSet ? gReshardSplitComm : splitCapable;
@@ -377,16 +391,17 @@ enum ReshardDevCommBarrierKind {
  * part of the key: a DevComm is a communicator resource, not a stream resource. */
 struct ReshardDevCommCacheKey {
   ncclComm_t comm;
-  int numCtas;
+  int barrierCount;
   int ginSignalCount;
   int ginCounterCount;
   int ginContextCount;
+  int ginConnectionType;
   ReshardDevCommBarrierKind barrierKind;
 
   bool operator==(const ReshardDevCommCacheKey& other) const {
-    return comm == other.comm && numCtas == other.numCtas && ginSignalCount == other.ginSignalCount &&
+    return comm == other.comm && barrierCount == other.barrierCount && ginSignalCount == other.ginSignalCount &&
            ginCounterCount == other.ginCounterCount && ginContextCount == other.ginContextCount &&
-           barrierKind == other.barrierKind;
+           ginConnectionType == other.ginConnectionType && barrierKind == other.barrierKind;
   }
 };
 
@@ -471,9 +486,11 @@ void reshardFailNextCompletionEventRecordForTest(bool bFailStreamSynchronize = f
 void reshardFailNextCacheEventSynchronizeForTest();
 #endif
 
-ncclWindow_t* findCachedInternalWindowByPtr(ncclComm_t comm, void* buffer, size_t size);
+ncclWindow_t* findCachedInternalWindowByPtr(ncclComm_t comm, void* buffer, size_t size,
+                                            ReshardInternalWindowKind kind);
 
-ncclResult_t cacheInternalWindow(ncclComm_t comm, void* buffer, size_t size, ncclWindow_t window);
+ncclResult_t cacheInternalWindow(ncclComm_t comm, void* buffer, size_t size, ReshardInternalWindowKind kind,
+                                 ncclWindow_t window);
 
 /* Acquire a library-owned (stream, ready event, done event) tuple for callers that pass
  * the default stream (nullptr / cudaStreamLegacy / cudaStreamPerThread).
@@ -493,6 +510,7 @@ void cacheFinalize();
 /* reshard_split_comm.cu — tear down all cached split sub-comms / probe
  * DevComms. */
 void reshardSplitCommFinalize();
+void stagingPipeLaunchCompletionFinalize();
 
 /* ======================================================================
  * reshard_mesh.cc — Mesh analysis helpers
@@ -689,28 +707,45 @@ ncclResult_t validateReshardPlanLimits(int worldRank, const ncclDistTensor_t* sr
                                        size_t elementsPerChunk, ReshardAlgorithm algo, int dstGpusPerDomain);
 
 /* ======================================================================
- * packwindow_staging.cc — PACKWINDOW staging-buffer pool
+ * pack_staging.cc — PACK staging-buffer pool
  * ====================================================================*/
 
-ncclResult_t ensurePackWindowStagingBuffer(ncclComm_t comm, size_t requiredBytes, cudaStream_t stream);
-void* getPackWindowStagingBuffer(ncclComm_t comm);
-size_t getPackWindowStagingCapacity(ncclComm_t comm);
-/* Rank-stable staging bucket index for the calling thread's in-flight reshard. */
+ncclResult_t ensurePackStagingBuffer(ncclComm_t comm, size_t requiredBytes, cudaStream_t stream);
+void* getPackStagingBuffer(ncclComm_t comm);
+size_t getPackStagingCapacity(ncclComm_t comm);
+ncclResult_t getPackRmaWarmed(ncclComm_t comm, bool* warmed);
+ncclResult_t setPackRmaWarmed(ncclComm_t comm, bool warmed);
+void packStagingSynchronize();
+void packStagingFinalize();
+ncclResult_t packStagingRecordEvent(ncclComm_t comm, cudaStream_t stream);
+#ifdef NCCL_M2N_TESTING
+void packStagingFailNextEventRecordForTest(bool bFailStreamSynchronize = false);
+void packStagingFailNextEventSynchronizeForTest();
+int packStagingAllocationCountForTest();
+#endif
+
+/* Rank-stable bucket partition for the calling thread's in-flight reshard. */
 int getStagingBucketIndex(ncclComm_t comm);
-ncclResult_t getPackWindowRmaWarmed(ncclComm_t comm, bool* warmed);
-ncclResult_t setPackWindowRmaWarmed(ncclComm_t comm, bool warmed);
-void packWindowStagingSynchronize();
-void packWindowStagingFinalize();
-ncclResult_t packWindowStagingRecordEvent(ncclComm_t comm, cudaStream_t stream);
+
+/* Test-only entry point for exercising a collective section while the API
+ * lock is held. */
 #ifdef NCCL_M2N_TESTING
 ncclResult_t reshardTestBroadcastMaxInt(ncclComm_t comm, cudaStream_t stream, int localValue, int* out);
-int packWindowStagingAllocationCountForTest();
 #endif
 
 /* ======================================================================
- * reshard_user_window.cu -- PACKWINDOW copy mode entry.
+ * reshard_user_window.cu — PACK copy mode entry.
+ *
+ * Pack each destination's bytes contiguously into the reused transfer buffer
+ * via CE cudaMemcpy3D, transfer with host RMA for an eligible forward-ordered
+ * single-LSA communicator (otherwise use the existing user-window kernel),
+ * then unpack.
+ * Used by ncclReshard when copyAlgo == RESHARD_COPY_ALGO_PACK.
+ * Both src/dst descriptors must be the normalized, privately owned copies in a
+ * live ReshardTensorSetup prepared by reshardPrepareTensorSetup. This function
+ * performs no descriptor validation or normalization.
  * ====================================================================*/
-ncclResult_t reshardCopyPackWindowNormalized(ncclComm_t comm, const ncclDistTensor_t* src,
+ncclResult_t reshardCopyPackNormalized(ncclComm_t comm, const ncclDistTensor_t* src,
                                              const ncclDistTensor_t* dst, cudaStream_t workStream);
 #ifdef NCCL_M2N_TESTING
 void reshardResetFusedSubmissionCountForTest();
@@ -723,14 +758,38 @@ size_t reshardGetFusedSubmissionCountForTest();
 
 struct StagingTransferDescriptor;
 struct StagingKernelParams;
+struct StagingPipeCallParams;
+struct StagingPipeDevicePlan;
 
-ncclResult_t launchStagingReshardDirect(const StagingKernelParams* hostParams, StagingKernelParams* devParams,
-                                        ncclDevComm* devComm, int numCtas, cudaStream_t stream, bool verbose);
+ncclResult_t launchStagingReshardDirect(StagingKernelParams* devParams, ncclDevComm* devComm, int numCtas,
+                                        cudaStream_t stream, bool verbose);
+
+ncclResult_t launchStagingReshardPipe(const StagingKernelParams* hostParams,
+                                         const StagingPipeCallParams* call, StagingKernelParams* devParams,
+                                         StagingPipeDevicePlan* devPipePlan, ncclDevComm* devComm,
+                                         int numCtas, int tmaTileSize, cudaStream_t stream);
+
+ncclResult_t launchStagingReshardPipeSplit(const StagingKernelParams* hostParams,
+                                              const StagingPipeCallParams* call, StagingKernelParams* devParams,
+                                              StagingPipeDevicePlan* devPipePlan, ncclDevComm* devCommA,
+                                              ncclDevComm* devCommB, int numCtas, int tmaTileSize,
+                                              cudaStream_t stream);
 
 ncclResult_t validateStagingPlanLimits(int worldRank, const ncclDistTensor_t* srcTensor,
                                        const size_t* srcTensorDims, const ncclDistTensor_t* dstTensor,
-                                       const size_t* dstTensorDims, ReshardCopyAlgorithm copyAlgo, int gpusPerDomain,
-                                       size_t* maxPeerGroupSize = nullptr);
+                                       const size_t* dstTensorDims, ReshardCopyAlgorithm copyAlgo,
+                                       int gpusPerDomain, size_t* maxPeerGroupSize = nullptr,
+                                       bool splitStrided = false, int splitNumInjectionDomains = 0,
+                                       int splitDomainsPerRep = 1, bool nodeAnchorAtMeshStart = false);
+
+
+ncclResult_t buildStagingTransferDescriptor(ncclComm_t globalComm, void* srcBuffer, const size_t* srcTensorDims,
+                                            int ndims, const ncclDistTensor_t* srcTensor, void* dstBuffer,
+                                            const size_t* dstTensorDims, const ncclDistTensor_t* dstTensor,
+                                            int srcGpusPerDomain, int dstGpusPerDomain, int nodeLocalRank,
+                                            StagingTransferDescriptor* desc, bool splitStrided = false,
+                                            int splitNumInjectionDomains = 0, int splitDomainsPerRep = 1,
+                                            bool nodeAnchorAtMeshStart = false);
 
 ncclResult_t buildStagingDirectTransferDescriptor(ncclComm_t globalComm, void* srcBuffer, const size_t* srcTensorDims,
                                                   int ndims, const ncclDistTensor_t* srcTensor, void* dstBuffer,
@@ -744,9 +803,11 @@ ncclResult_t buildStagingDirectTransferDescriptor(ncclComm_t globalComm, void* s
 
 struct StagingBufferState;
 
-ncclResult_t ensureStagingBufferPool(ncclComm_t comm, cudaStream_t stream, StagingBufferState** outState);
+ncclResult_t ensureStagingBufferPool(ncclComm_t comm, uint64_t poolKey, cudaStream_t stream, int activeChannels,
+                                     int capacityChannels, int controlSlotCount, StagingBufferState** outState);
 
-ncclResult_t stagingBufferPoolRecordEvent(ncclComm_t comm, cudaStream_t stream);
+ncclResult_t stagingBufferPoolRecordEvent(ncclComm_t comm, uint64_t poolKey, cudaStream_t stream);
+void stagingPipeControlSlotCacheReset();
 
 void stagingBufferPoolFinalize();
 

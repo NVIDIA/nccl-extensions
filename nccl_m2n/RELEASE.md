@@ -25,6 +25,11 @@ API-breaking cleanup for NCCL M2N naming, descriptors, and runtime ownership.
 `NCCL_M2N_API_VERSION` is bumped from `1u` to `2u` for this API transition.
 Existing binaries must be rebuilt against the updated header.
 
+- **Mesh and tensor descriptors:** `ncclMesh_t` and `ncclDistTensor_t` now use
+  size/version headers and borrowed pointer-backed arrays. This release accepts
+  native 1-D and 2-D meshes; grouped calls snapshot caller-owned arrays.
+  Rebuild C/C++ and generated-binding consumers with the public initializers.
+
 - **NCCL compatibility:** NCCL 2.30.5 or newer is required to build and use
   this release.
 - **Release version macros:** `nccl_m2n.h` publishes `NCCL_M2N_MAJOR`,
@@ -66,13 +71,14 @@ Existing binaries must be rebuilt against the updated header.
   without submitting their recorded calls. Group submission stops at the first
   error and bounds the indexed diagnostic to the thread-local error buffer.
 - **Public C API cleanup:**
-  - `ncclMesh_t` carries topology only (`dims[]`, `startRank`).
+  - `ncclMesh_t` carries topology only (`ndims`, `dims`, `startRank`).
   - Tensor placement moves from `mesh.placement[]` to
     `ncclDistTensor_t::placements[]`, so one mesh topology can describe
     multiple tensor layouts.
   - Placement helpers are `NCCL_RESHARD_REPLICATE` and
     `NCCL_RESHARD_SHARD(d)`.
-  - `NCCL_RESHARD_MESH_NDIMS` is the mesh-axis array size, and
+  - `NCCL_RESHARD_MAX_MESH_DIMS` is the implementation mesh-rank cap;
+    `NCCL_RESHARD_MESH_NDIMS` remains a compatibility alias, and
     `NCCL_RESHARD_MAX_TENSOR_DIMS` is the tensor-rank cap.
 - **Configuration and lifecycle:**
   - `ncclM2nConfig_t` is the library configuration descriptor.
@@ -233,7 +239,7 @@ This preview is experimental.
 |---|---|
 | **Limited QA coverage**           | Functional matrix is the C-level basic_api suite × {RING, DIRECT} × dtype mix. Large multi-node coverage is still cluster-limited and workload-specific. |
 | **Tensor rank ≤ 3**               | `NCCL_RESHARD_MAX_TENSOR_DIMS = 3`. 4-D and higher are not supported. |
-| **Both-REPLICATE meshes unsupported** | `placement = {REPLICATE, REPLICATE}` falls into a degenerate prepare-time branch that the test suite does not exercise. Encode full replication as a 1-shard layout (mesh axis of size 1). |
+| **Multiple SHARD axes unsupported** | At most one SHARD axis per side; REPLICATE on all other axes. |
 | **Window transport selection** | Providing a window does not guarantee zero-copy execution; the configured transport may use library-managed PACKWINDOW staging. |
 | **Legacy algorithm selector is dormant** | `NCCL_RESHARD_ALGORITHM` remains accepted for compatibility, but the current public path selects its transport through `NCCL_RESHARD_COPY_ALGORITHM`. |
 | **Single in-flight reshard per `(comm, effective stream)`** | The internal DevComm/window/staging caches are designed for sequential use on a comm. Use separate communicators for concurrent transfers, as in `reshard_batch_bench_user_window --num-comms`. |

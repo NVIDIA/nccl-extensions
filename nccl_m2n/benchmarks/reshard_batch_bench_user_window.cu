@@ -476,8 +476,13 @@ int main(int argc, char* argv[]) {
   // Sweep: shard pattern × tensor size
   // ------------------------------------------------------------------------
   for (auto& sc : shardCfgs) {
-    ncclMesh_t srcMesh = {.dims = {srcMdims[0], srcMdims[1]}, .startRank = 0};
-    ncclMesh_t dstMesh = {.dims = {dstMdims[0], dstMdims[1]}, .startRank = srcTotal};
+    ncclMesh_t srcMesh = NCCL_M2N_MESH_INITIALIZER;
+    srcMesh.ndims = 2;
+    srcMesh.dims = srcMdims;
+    ncclMesh_t dstMesh = NCCL_M2N_MESH_INITIALIZER;
+    dstMesh.ndims = 2;
+    dstMesh.dims = dstMdims;
+    dstMesh.startRank = srcTotal;
     const char* pattern = (sc.srcSd == sc.dstSd) ? "same-dim" : "cross-dim";
 
     for (auto& tc : tensorCfgs) {
@@ -516,23 +521,27 @@ int main(int argc, char* argv[]) {
 
       // --- one reshard for tensor i on stream s, comm[i % numComms]
       auto oneTransfer = [&](int i, cudaStream_t s) {
-        ncclDistTensor_t srcT = {};
+        size_t srcLocalShape[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
+        int srcPlacements[] = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(sc.srcSd)};
+        ncclDistTensor_t srcT = NCCL_M2N_DIST_TENSOR_INITIALIZER;
+        srcT.localShape = srcLocalShape;
         srcT.ndims = tc.nDims;
         srcT.dtype = ncclInt8; // bench validates byte patterns
         srcT.mesh = &srcMesh;
-        srcT.placements[0] = NCCL_RESHARD_REPLICATE;
-        srcT.placements[1] = NCCL_RESHARD_SHARD(sc.srcSd);
+        srcT.placements = srcPlacements;
         srcT.dataPtr = bIsSource ? bufs[i] : nullptr;
         for (int d = 0; d < tc.nDims; d++) {
           srcT.localShape[d] = srcLocal[d];
         }
 
-        ncclDistTensor_t dstT = {};
+        size_t dstLocalShape[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
+        int dstPlacements[] = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(sc.dstSd)};
+        ncclDistTensor_t dstT = NCCL_M2N_DIST_TENSOR_INITIALIZER;
+        dstT.localShape = dstLocalShape;
         dstT.ndims = tc.nDims;
         dstT.dtype = ncclInt8;
         dstT.mesh = &dstMesh;
-        dstT.placements[0] = NCCL_RESHARD_REPLICATE;
-        dstT.placements[1] = NCCL_RESHARD_SHARD(sc.dstSd);
+        dstT.placements = dstPlacements;
         dstT.dataPtr = bIsDest ? bufs[i] : nullptr;
         for (int d = 0; d < tc.nDims; d++) {
           dstT.localShape[d] = dstLocal[d];

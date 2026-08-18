@@ -190,7 +190,10 @@ def _check_arg(value: object | None, name: str, api: str) -> object:
 
 def _mesh_ndim(mesh: object) -> int | None:
     if isinstance(mesh, Mesh):
-        return None if mesh.dims[1] == 1 else MESH_NDIMS
+        # Preserve the existing permissive placement input for the padded
+        # size-1 form, including native 1-D meshes' compatibility view.
+        active_dims = mesh.dims[: mesh.ndims]
+        return None if all(dim == 1 for dim in active_dims[1:]) else mesh.ndims
     return None
 
 
@@ -244,13 +247,13 @@ def _placements_to_m2n(
     tensor_ndim: int,
     name: str,
     api: str,
-) -> tuple[int, int]:
+) -> tuple[int, ...]:
     values = _check_arg(placements, f"{name}_placements", api)
     if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
         raise TypeError(f"{name}_placements must be a sequence")
-    if len(values) not in (1, MESH_NDIMS):
+    if not 1 <= len(values) <= MESH_NDIMS:
         raise ValueError(
-            f"{name}_placements must have length 1 or {MESH_NDIMS}, got {len(values)}"
+            f"{name}_placements must have length 1..{MESH_NDIMS}, got {len(values)}"
         )
     if mesh_ndim is not None and len(values) != mesh_ndim:
         raise ValueError(
@@ -261,12 +264,10 @@ def _placements_to_m2n(
     normalized = tuple(
         _placement_to_m2n(placement, tensor_ndim, name) for placement in values
     )
-    if len(normalized) == 1:
-        normalized = (normalized[0], REPLICATE)
-    return normalized
+    return normalized + (REPLICATE,) * (MESH_NDIMS - len(normalized))
 
 
-def _placement_objects(values: tuple[int, int]) -> tuple[object, object]:
+def _placement_objects(values: tuple[int, ...]) -> tuple[object, ...]:
     return tuple(
         Replicate() if value == REPLICATE else Shard(value) for value in values
     )
@@ -274,7 +275,7 @@ def _placement_objects(values: tuple[int, int]) -> tuple[object, object]:
 
 def _shard_factors(
     mesh: Mesh,
-    placements: tuple[int, int],
+    placements: tuple[int, ...],
     tensor_ndim: int,
     name: str,
 ) -> tuple[int, ...]:
@@ -294,7 +295,7 @@ def _shard_factors(
 def _global_shape_from_local(
     local_shape: tuple[int, ...],
     mesh: Mesh,
-    placements: tuple[int, int],
+    placements: tuple[int, ...],
     name: str,
 ) -> tuple[int, ...]:
     factors = _shard_factors(mesh, placements, len(local_shape), name)
@@ -304,7 +305,7 @@ def _global_shape_from_local(
 def _local_shape_from_global(
     global_shape: tuple[int, ...],
     mesh: Mesh,
-    placements: tuple[int, int],
+    placements: tuple[int, ...],
     name: str,
     api: str,
 ) -> tuple[int, ...]:

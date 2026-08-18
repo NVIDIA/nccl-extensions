@@ -5,6 +5,7 @@
  * See LICENSE.txt for more license information.
  ************************************************************************/
 
+#include <algorithm>
 #include <cstdio>
 #include <new>
 #include <utility>
@@ -25,10 +26,22 @@ struct M2nGroupEntry {
   bool hasDst = false;
   bool hasSrcMesh = false;
   bool hasDstMesh = false;
+  bool hasSrcMeshDims = false;
+  bool hasDstMeshDims = false;
+  bool hasSrcLocalShape = false;
+  bool hasDstLocalShape = false;
+  bool hasSrcPlacements = false;
+  bool hasDstPlacements = false;
   ncclDistTensor_t src{};
   ncclDistTensor_t dst{};
   ncclMesh_t srcMesh{};
   ncclMesh_t dstMesh{};
+  size_t srcLocalShape[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
+  size_t dstLocalShape[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
+  int srcMeshDims[NCCL_RESHARD_MAX_MESH_DIMS] = {};
+  int dstMeshDims[NCCL_RESHARD_MAX_MESH_DIMS] = {};
+  int srcPlacements[NCCL_RESHARD_MAX_MESH_DIMS] = {};
+  int dstPlacements[NCCL_RESHARD_MAX_MESH_DIMS] = {};
 };
 
 struct M2nGroupState {
@@ -57,6 +70,34 @@ ncclResult_t failGroup(ncclResult_t result, const char* detail) {
   return result;
 }
 
+ncclResult_t validateGroupDescriptorHeader(const char* field, const ncclDistTensor_t* tensor) {
+  if (tensor->size < sizeof(ncclDistTensor_t)) {
+    char detail[M2N_LAST_ERROR_BYTES];
+    (void)snprintf(detail, sizeof(detail), "ncclM2n group %s tensor descriptor is too small", field);
+    return failGroup(ncclInvalidArgument, detail);
+  }
+  if (tensor->version != NCCL_M2N_API_VERSION) {
+    char detail[M2N_LAST_ERROR_BYTES];
+    (void)snprintf(detail, sizeof(detail), "ncclM2n group %s tensor descriptor ABI version %u is unsupported", field,
+                   tensor->version);
+    return failGroup(ncclInvalidArgument, detail);
+  }
+  if (tensor->mesh != nullptr) {
+    if (tensor->mesh->size < sizeof(ncclMesh_t)) {
+      char detail[M2N_LAST_ERROR_BYTES];
+      (void)snprintf(detail, sizeof(detail), "ncclM2n group %s mesh descriptor is too small", field);
+      return failGroup(ncclInvalidArgument, detail);
+    }
+    if (tensor->mesh->version != NCCL_M2N_API_VERSION) {
+      char detail[M2N_LAST_ERROR_BYTES];
+      (void)snprintf(detail, sizeof(detail), "ncclM2n group %s mesh descriptor ABI version %u is unsupported", field,
+                     tensor->mesh->version);
+      return failGroup(ncclInvalidArgument, detail);
+    }
+  }
+  return ncclSuccess;
+}
+
 cudaStream_t normalizeGroupStream(cudaStream_t stream) {
   return stream == nullptr || stream == cudaStreamLegacy ? nullptr : stream;
 }
@@ -71,8 +112,12 @@ ncclResult_t indexGroupError(ncclResult_t result, size_t originalIndex, size_t g
   char currentDetail[M2N_LAST_ERROR_BYTES];
   (void)snprintf(currentDetail, sizeof(currentDetail), "%s", detail != nullptr ? detail : "");
   char indexedDetail[M2N_LAST_ERROR_BYTES];
-  (void)snprintf(indexedDetail, sizeof(indexedDetail), "ncclM2nGroupEnd: entry %zu of %zu failed: %s", originalIndex,
-                 groupSize, currentDetail);
+  const int prefixLength = snprintf(indexedDetail, sizeof(indexedDetail),
+                                    "ncclM2nGroupEnd: entry %zu of %zu failed: ", originalIndex, groupSize);
+  size_t used = prefixLength > 0 ? static_cast<size_t>(prefixLength) : 0;
+  used = std::min(used, sizeof(indexedDetail) - 1);
+  const size_t remaining = sizeof(indexedDetail) - used;
+  (void)snprintf(indexedDetail + used, remaining, "%.*s", static_cast<int>(remaining - 1), currentDetail);
   m2nSetLastError(indexedDetail);
   return result;
 }
@@ -100,7 +145,7 @@ ncclResult_t partitionGroupEntries(std::vector<M2nGroupEntry>&& entries,
   return ncclSuccess;
 }
 
-ncclResult_t executeGroupBucket(const std::vector<M2nGroupEntry>& entries, size_t groupSize) {
+ncclResult_t executeGroupBucket(std::vector<M2nGroupEntry>& entries, size_t groupSize) {
   bool canFuse = entries.size() > 1 && entries.size() <= kM2nGroupMaxFusionEntries;
   for (const M2nGroupEntry& entry : entries) {
     canFuse = canFuse && entry.hasSrc && entry.hasDst;
@@ -108,10 +153,14 @@ ncclResult_t executeGroupBucket(const std::vector<M2nGroupEntry>& entries, size_
   if (canFuse) {
     std::vector<ncclDistTensor_t> srcs;
     std::vector<ncclDistTensor_t> dsts;
+    std::vector<ncclMesh_t> srcMeshes;
+    std::vector<ncclMesh_t> dstMeshes;
     std::vector<size_t> originalIndices;
     try {
       srcs.resize(entries.size());
       dsts.resize(entries.size());
+      srcMeshes.resize(entries.size());
+      dstMeshes.resize(entries.size());
       originalIndices.resize(entries.size());
     } catch (const std::bad_alloc&) {
       return failGroup(ncclSystemError, "ncclM2n group failed to allocate fusion descriptor storage");
@@ -119,9 +168,17 @@ ncclResult_t executeGroupBucket(const std::vector<M2nGroupEntry>& entries, size_
     for (size_t i = 0; i < entries.size(); i++) {
       srcs[i] = entries[i].src;
       dsts[i] = entries[i].dst;
+      srcs[i].localShape = entries[i].hasSrcLocalShape ? entries[i].srcLocalShape : nullptr;
+      dsts[i].localShape = entries[i].hasDstLocalShape ? entries[i].dstLocalShape : nullptr;
+      srcMeshes[i] = entries[i].srcMesh;
+      dstMeshes[i] = entries[i].dstMesh;
+      srcMeshes[i].dims = entries[i].hasSrcMeshDims ? entries[i].srcMeshDims : nullptr;
+      dstMeshes[i].dims = entries[i].hasDstMeshDims ? entries[i].dstMeshDims : nullptr;
+      srcs[i].placements = entries[i].hasSrcPlacements ? entries[i].srcPlacements : nullptr;
+      dsts[i].placements = entries[i].hasDstPlacements ? entries[i].dstPlacements : nullptr;
+      srcs[i].mesh = entries[i].hasSrcMesh ? &srcMeshes[i] : nullptr;
+      dsts[i].mesh = entries[i].hasDstMesh ? &dstMeshes[i] : nullptr;
       originalIndices[i] = entries[i].originalIndex;
-      srcs[i].mesh = entries[i].hasSrcMesh ? &entries[i].srcMesh : nullptr;
-      dsts[i].mesh = entries[i].hasDstMesh ? &entries[i].dstMesh : nullptr;
     }
 
     bool handled = false;
@@ -137,11 +194,19 @@ ncclResult_t executeGroupBucket(const std::vector<M2nGroupEntry>& entries, size_
     }
   }
 
-  for (const M2nGroupEntry& entry : entries) {
+  for (M2nGroupEntry& entry : entries) {
     ncclDistTensor_t src = entry.src;
     ncclDistTensor_t dst = entry.dst;
-    src.mesh = entry.hasSrcMesh ? &entry.srcMesh : nullptr;
-    dst.mesh = entry.hasDstMesh ? &entry.dstMesh : nullptr;
+    src.localShape = entry.hasSrcLocalShape ? entry.srcLocalShape : nullptr;
+    dst.localShape = entry.hasDstLocalShape ? entry.dstLocalShape : nullptr;
+    ncclMesh_t srcMesh = entry.srcMesh;
+    ncclMesh_t dstMesh = entry.dstMesh;
+    srcMesh.dims = entry.hasSrcMeshDims ? entry.srcMeshDims : nullptr;
+    dstMesh.dims = entry.hasDstMeshDims ? entry.dstMeshDims : nullptr;
+    src.placements = entry.hasSrcPlacements ? entry.srcPlacements : nullptr;
+    dst.placements = entry.hasDstPlacements ? entry.dstPlacements : nullptr;
+    src.mesh = entry.hasSrcMesh ? &srcMesh : nullptr;
+    dst.mesh = entry.hasDstMesh ? &dstMesh : nullptr;
     const ncclDistTensor_t* srcPtr = entry.hasSrc ? &src : nullptr;
     const ncclDistTensor_t* dstPtr = entry.hasDst ? &dst : nullptr;
     ncclResult_t result = ncclReshard(entry.handle, entry.comm, srcPtr, dstPtr, entry.stream);
@@ -174,18 +239,57 @@ ncclResult_t m2nGroupEnqueueReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   entry.stream = stream;
   entry.hasSrc = src != nullptr;
   entry.hasDst = dst != nullptr;
+
   if (entry.hasSrc) {
+    NCCL_M2N_CHECK(validateGroupDescriptorHeader("source", src));
     entry.src = *src;
+    entry.hasSrcLocalShape = src->localShape != nullptr;
+    if (entry.hasSrcLocalShape && src->ndims >= 1 && src->ndims <= NCCL_RESHARD_MAX_TENSOR_DIMS) {
+      for (int d = 0; d < src->ndims; d++) {
+        entry.srcLocalShape[d] = src->localShape[d];
+      }
+    }
     entry.hasSrcMesh = src->mesh != nullptr;
+    entry.hasSrcPlacements = src->placements != nullptr;
     if (entry.hasSrcMesh) {
       entry.srcMesh = *src->mesh;
+      entry.hasSrcMeshDims = src->mesh->dims != nullptr;
+      if (src->mesh->ndims >= 1 && src->mesh->ndims <= NCCL_RESHARD_MAX_MESH_DIMS) {
+        for (int d = 0; d < src->mesh->ndims; d++) {
+          if (entry.hasSrcMeshDims) {
+            entry.srcMeshDims[d] = src->mesh->dims[d];
+          }
+          if (entry.hasSrcPlacements) {
+            entry.srcPlacements[d] = src->placements[d];
+          }
+        }
+      }
     }
   }
   if (entry.hasDst) {
+    NCCL_M2N_CHECK(validateGroupDescriptorHeader("destination", dst));
     entry.dst = *dst;
+    entry.hasDstLocalShape = dst->localShape != nullptr;
+    if (entry.hasDstLocalShape && dst->ndims >= 1 && dst->ndims <= NCCL_RESHARD_MAX_TENSOR_DIMS) {
+      for (int d = 0; d < dst->ndims; d++) {
+        entry.dstLocalShape[d] = dst->localShape[d];
+      }
+    }
     entry.hasDstMesh = dst->mesh != nullptr;
+    entry.hasDstPlacements = dst->placements != nullptr;
     if (entry.hasDstMesh) {
       entry.dstMesh = *dst->mesh;
+      entry.hasDstMeshDims = dst->mesh->dims != nullptr;
+      if (dst->mesh->ndims >= 1 && dst->mesh->ndims <= NCCL_RESHARD_MAX_MESH_DIMS) {
+        for (int d = 0; d < dst->mesh->ndims; d++) {
+          if (entry.hasDstMeshDims) {
+            entry.dstMeshDims[d] = dst->mesh->dims[d];
+          }
+          if (entry.hasDstPlacements) {
+            entry.dstPlacements[d] = dst->placements[d];
+          }
+        }
+      }
     }
   }
 
@@ -239,7 +343,7 @@ extern "C" ncclResult_t ncclM2nGroupEnd(void) {
   reshardResetFusedSubmissionCountForTest();
 #endif
   NCCL_M2N_CHECK(partitionGroupEntries(std::move(entries), &buckets));
-  for (const std::vector<M2nGroupEntry>& bucket : buckets) {
+  for (std::vector<M2nGroupEntry>& bucket : buckets) {
     NCCL_M2N_CHECK(executeGroupBucket(bucket, groupSize));
   }
   return ncclSuccess;

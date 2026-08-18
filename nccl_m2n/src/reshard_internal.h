@@ -22,6 +22,7 @@
 #include <limits>
 #include <memory>
 
+#include "m2n_checked_math.h"
 #include "m2n_checks.h"
 #include "m2n_handle.h"
 #include "m2n_log.h"
@@ -247,7 +248,7 @@ inline bool reshardGetAutoUniformBcastEnabled() {
                                          : gReshardAutoUniformBcast;
 }
 inline bool reshardTensorFullyReplicated(const ncclDistTensor_t* tensor) {
-  for (int i = 0; i < NCCL_RESHARD_MESH_NDIMS; i++) {
+  for (int i = 0; i < tensor->mesh->ndims; i++) {
     if (tensor->placements[i] != NCCL_RESHARD_REPLICATE && tensor->mesh->dims[i] > 1) {
       return false;
     }
@@ -516,10 +517,17 @@ ncclResult_t validateReshardMeshBounds(const ncclMesh_t* srcMesh, const ncclMesh
                                       int logRank);
 
 inline bool reshardRankInMesh(const ncclMesh_t* mesh, int worldRank) {
-  if (mesh == nullptr || mesh->dims[0] <= 0 || mesh->dims[1] <= 0 || mesh->startRank < 0 || worldRank < 0) {
+  if (mesh == nullptr || mesh->dims == nullptr || mesh->ndims < 1 ||
+      mesh->ndims > NCCL_RESHARD_MAX_MESH_DIMS || mesh->startRank < 0 || worldRank < 0) {
     return false;
   }
-  const int64_t meshSize = static_cast<int64_t>(mesh->dims[0]) * static_cast<int64_t>(mesh->dims[1]);
+  int64_t meshSize = 1;
+  for (int d = 0; d < mesh->ndims; d++) {
+    if (mesh->dims[d] <= 0 || meshSize > std::numeric_limits<int64_t>::max() / mesh->dims[d]) {
+      return false;
+    }
+    meshSize *= mesh->dims[d];
+  }
   const int64_t meshEnd = static_cast<int64_t>(mesh->startRank) + meshSize;
   return static_cast<int64_t>(worldRank) >= static_cast<int64_t>(mesh->startRank) &&
          static_cast<int64_t>(worldRank) < meshEnd;
@@ -531,19 +539,16 @@ inline ncclResult_t computeReshardMeshSize(const ncclMesh_t* mesh, int logRank, 
   if (mesh == nullptr || outMeshSize == nullptr) {
     NCCL_M2N_FAIL(ncclInvalidArgument, logRank, "reshard: computeReshardMeshSize called with null argument");
   }
-  if (mesh->dims[0] <= 0 || mesh->dims[1] <= 0) {
-    NCCL_M2N_FAIL(ncclInvalidArgument, logRank, "reshard: mesh dims must be positive, got [%d, %d]", mesh->dims[0],
-                  mesh->dims[1]);
+  NCCL_M2N_CHECK_ARG(mesh->ndims >= 1 && mesh->ndims <= NCCL_RESHARD_MAX_MESH_DIMS, logRank,
+                     "reshard: mesh ndims=%d must be in [1, %d]", mesh->ndims, NCCL_RESHARD_MAX_MESH_DIMS);
+  NCCL_M2N_CHECK_ARG(mesh->dims != nullptr, logRank, "reshard: mesh dims must be non-null");
+  size_t meshSize = 1;
+  for (int d = 0; d < mesh->ndims; d++) {
+    NCCL_M2N_CHECK_ARG(mesh->dims[d] > 0, logRank, "reshard: mesh dims[%d]=%d must be positive", d, mesh->dims[d]);
+    NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(meshSize, static_cast<size_t>(mesh->dims[d]), &meshSize), logRank,
+                       "reshard: mesh size overflows at dims[%d]=%d", d, mesh->dims[d]);
   }
-
-  size_t dim0 = static_cast<size_t>(mesh->dims[0]);
-  size_t dim1 = static_cast<size_t>(mesh->dims[1]);
-  if (dim0 > std::numeric_limits<size_t>::max() / dim1) {
-    NCCL_M2N_FAIL(ncclInvalidArgument, logRank, "reshard: mesh size overflows size_t for dims [%d, %d]",
-                  mesh->dims[0], mesh->dims[1]);
-  }
-
-  *outMeshSize = dim0 * dim1;
+  *outMeshSize = meshSize;
   return ncclSuccess;
 }
 

@@ -39,16 +39,22 @@ rank to match the destination layout.
 
 **Mesh** (`ncclMesh_t`) — describes one side's rank topology only (no
 per-tensor placement, matching PyTorch DTensor's `DeviceMesh` / JAX's `Mesh`).
-It is always 2-axis:
+The descriptor carries its rank explicitly; this release accepts 1-D and 2-D
+meshes:
 
 ```c
-#define NCCL_RESHARD_MESH_NDIMS 2
-
 typedef struct {
-    int dims[NCCL_RESHARD_MESH_NDIMS];  // axis-0 size × axis-1 size = number of ranks on this side
+    size_t size;
+    unsigned int version;
+    int ndims;         // currently 1 or 2
+    int* dims;         // caller-owned host array with ndims positive entries
     int startRank;     // first global rank that belongs to this mesh
 } ncclMesh_t;
 ```
+
+A logical 1-D mesh can therefore be written directly as `ndims = 1`,
+`dims = {N}`. Existing explicit 2-D forms such as `{N, 1}` and `{1, N}` remain
+valid when `ndims = 2`.
 
 **Placement** lives on the distributed tensor (`ncclDistTensor_t::placements[]`),
 not on the mesh. Each entry is one of:
@@ -56,10 +62,12 @@ not on the mesh. Each entry is one of:
 - `NCCL_RESHARD_REPLICATE` — the mesh axis replicates the tensor.
 - `NCCL_RESHARD_SHARD(d)`  — the mesh axis shards along tensor dim `d`.
 
-Exactly **one** axis per side should be a SHARD (the other a REPLICATE) for a
-sharded layout. For full replication, encode it as a 1-shard layout (mesh axis
-of size 1) — both `REPLICATE` is a degenerate case not exercised by the test
-suite.
+Exactly **one** axis per side should be a SHARD (the other axes REPLICATE) for a
+sharded layout. For full replication, use REPLICATE on every active axis.
+
+`dims`, `localShape`, and `placements` are borrowed host arrays. Keep them valid
+until the reshard call returns; grouped calls copy the arrays while the call is
+recorded, so they need not remain valid until `ncclM2nGroupEnd`.
 
 **Roles** — by convention, ranks `[0 .. src_total)` belong to the source mesh
 (`startRank = 0`) and ranks `[src_total .. world_size)` belong to the
@@ -147,14 +155,16 @@ ncclResult_t r = ncclM2nInit(&m2nHandle, &cfg);
 if (r != ncclSuccess) { /* handle */ }
 
 // Describe the two layouts. Example: 8 ranks split 4 src / 4 dst, both
-// 1×4 1-D meshes that shard the outer tensor dim.
-ncclMesh_t srcMesh = {};
-srcMesh.dims[0] = 1;
-srcMesh.dims[1] = 4;
+// native 1-D meshes that shard the outer tensor dim.
+int srcMeshDims[] = {4};
+ncclMesh_t srcMesh = NCCL_M2N_MESH_INITIALIZER;
+srcMesh.ndims = 1;
+srcMesh.dims = srcMeshDims;
 srcMesh.startRank = 0;
-ncclMesh_t dstMesh = {};
-dstMesh.dims[0] = 1;
-dstMesh.dims[1] = 4;
+int dstMeshDims[] = {4};
+ncclMesh_t dstMesh = NCCL_M2N_MESH_INITIALIZER;
+dstMesh.ndims = 1;
+dstMesh.dims = dstMeshDims;
 dstMesh.startRank = 4;
 
 // Pack the per-side tensor descriptors. localShape entries are in
@@ -162,24 +172,24 @@ dstMesh.startRank = 4;
 // NULL on the side this rank doesn't participate in (mirroring PyTorch
 // DTensor's size-0 local tensor for non-participating ranks).  mesh and
 // placements are always required.
-ncclDistTensor_t src = {};
+int srcPlacements[] = {NCCL_RESHARD_SHARD(0)};
+size_t srcLocalShape[] = {256, 1024};
+ncclDistTensor_t src = NCCL_M2N_DIST_TENSOR_INITIALIZER;
 src.dataPtr = is_source ? buffer : nullptr;
-src.localShape[0] = 256;
-src.localShape[1] = 1024;
+src.localShape = srcLocalShape;
 src.ndims = 2;
 src.dtype = ncclFloat32;
 src.mesh = &srcMesh;
-src.placements[0] = NCCL_RESHARD_REPLICATE;
-src.placements[1] = NCCL_RESHARD_SHARD(0);
-ncclDistTensor_t dst = {};
+src.placements = srcPlacements;
+int dstPlacements[] = {NCCL_RESHARD_SHARD(0)};
+size_t dstLocalShape[] = {256, 1024};
+ncclDistTensor_t dst = NCCL_M2N_DIST_TENSOR_INITIALIZER;
 dst.dataPtr = is_dest ? buffer : nullptr;
-dst.localShape[0] = 256;
-dst.localShape[1] = 1024;
+dst.localShape = dstLocalShape;
 dst.ndims = 2;
 dst.dtype = ncclFloat32;
 dst.mesh = &dstMesh;
-dst.placements[0] = NCCL_RESHARD_REPLICATE;
-dst.placements[1] = NCCL_RESHARD_SHARD(0);
+dst.placements = dstPlacements;
 
 r = ncclReshard(m2nHandle, comm, &src, &dst, stream);
 if (r != ncclSuccess) { /* handle */ }
@@ -220,13 +230,15 @@ mesh in one descriptor.
 
 ```c
 typedef struct {
+    size_t                 size;
+    unsigned int           version;
     void*                  dataPtr;        // local buffer; NULL if this rank
                                             //   doesn't participate on this side
-    size_t                 localShape[NCCL_RESHARD_MAX_TENSOR_DIMS];  // elements
+    size_t*                localShape;     // caller-owned array of ndims entries
     int                    ndims;          // 1..3
     ncclDataType_t         dtype;          // element type
-    const ncclMesh_t*  mesh;           // topology (caller-owned)
-    int                    placements[NCCL_RESHARD_MESH_NDIMS];  // per-mesh-axis placements
+    const ncclMesh_t*      mesh;           // topology (caller-owned)
+    int*                   placements;     // caller-owned array of mesh->ndims entries
 } ncclDistTensor_t;
 ```
 

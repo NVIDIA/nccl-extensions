@@ -1431,14 +1431,15 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   env->barrier(env);
 
   /* ----- 8. resharding call ----- */
-  ncclMesh_t srcMesh{};
-  ncclMesh_t dstMesh{};
-  srcMesh.dims[0] = srcLayout.dims[0];
-  srcMesh.dims[1] = srcLayout.dims[1];
+  int srcMeshDims[NCCL_RESHARD_MAX_MESH_DIMS] = {srcLayout.dims[0], srcLayout.dims[1]};
+  int dstMeshDims[NCCL_RESHARD_MAX_MESH_DIMS] = {dstLayout.dims[0], dstLayout.dims[1]};
+  ncclMesh_t srcMesh = NCCL_M2N_MESH_INITIALIZER;
+  ncclMesh_t dstMesh = NCCL_M2N_MESH_INITIALIZER;
+  srcMesh.ndims = NCCL_RESHARD_MAX_MESH_DIMS;
+  srcMesh.dims = srcMeshDims;
   srcMesh.startRank = srcLayout.startRank;
-
-  dstMesh.dims[0] = dstLayout.dims[0];
-  dstMesh.dims[1] = dstLayout.dims[1];
+  dstMesh.ndims = NCCL_RESHARD_MAX_MESH_DIMS;
+  dstMesh.dims = dstMeshDims;
   dstMesh.startRank = dstLayout.startRank;
 
   /* The harness works at byte granularity, so pass the dtype whose
@@ -1454,23 +1455,23 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   };
   ncclDataType_t dtype = (tc.elementSize <= 8) ? dtype_for_size[tc.elementSize] : ncclBfloat16;
 
-  ncclDistTensor_t srcT = {};
+  int srcPlacements[NCCL_RESHARD_MAX_MESH_DIMS] = {srcLayout.placement[0], srcLayout.placement[1]};
+  int dstPlacements[NCCL_RESHARD_MAX_MESH_DIMS] = {dstLayout.placement[0], dstLayout.placement[1]};
+  ncclDistTensor_t srcT = NCCL_M2N_DIST_TENSOR_INITIALIZER;
   srcT.dataPtr = isSrc ? activeBuffer : nullptr;
+  srcT.localShape = srcLocalDimsElems;
   srcT.ndims = tc.ndims;
   srcT.dtype = dtype;
   srcT.mesh = &srcMesh;
-  srcT.placements[0] = srcLayout.placement[0];
-  srcT.placements[1] = srcLayout.placement[1];
-  for (int d = 0; d < tc.ndims; d++) srcT.localShape[d] = srcLocalDimsElems[d];
+  srcT.placements = srcPlacements;
 
-  ncclDistTensor_t dstT = {};
+  ncclDistTensor_t dstT = NCCL_M2N_DIST_TENSOR_INITIALIZER;
   dstT.dataPtr = isDst ? activeBuffer : nullptr;
+  dstT.localShape = dstLocalDimsElems;
   dstT.ndims = tc.ndims;
   dstT.dtype = dtype;
   dstT.mesh = &dstMesh;
-  dstT.placements[0] = dstLayout.placement[0];
-  dstT.placements[1] = dstLayout.placement[1];
-  for (int d = 0; d < tc.ndims; d++) dstT.localShape[d] = dstLocalDimsElems[d];
+  dstT.placements = dstPlacements;
 
   /* Every call below goes through this one helper, so a scenario that issues
    * several calls stays on the selected entry point for all of them. */

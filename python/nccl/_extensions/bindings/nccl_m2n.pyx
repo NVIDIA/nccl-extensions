@@ -4,7 +4,7 @@
 # This code was automatically generated with version 0.2.0. Do not modify it directly.
 
 cimport cython  # NOQA
-from libc.stdint cimport uint64_t
+from libc.stdint cimport intptr_t, uint64_t
 from libcpp.vector cimport vector
 
 from ._internal.utils cimport (nested_resource, nullable_unique_ptr, get_buffer_pointer,
@@ -74,9 +74,12 @@ cdef __getbuffer(object self, cpython.Py_buffer *buffer, void *ptr, int size, bi
 cdef _get_mesh_dtype_offsets():
     cdef ncclMesh_t pod = ncclMesh_t()
     return _numpy.dtype({
-        'names': ['dims', 'startRank'],
-        'formats': [(_numpy.int32, 2), _numpy.int32],
+        'names': ['size', 'version', 'ndims', 'dims', 'startRank'],
+        'formats': [_numpy.uintp, _numpy.uint32, _numpy.int32, _numpy.intp, _numpy.int32],
         'offsets': [
+            (<intptr_t>&(pod.size)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.version)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.ndims)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.dims)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.startRank)) - (<intptr_t>&pod),
         ],
@@ -94,6 +97,7 @@ cdef class Mesh:
     cdef:
         ncclMesh_t *_ptr
         object _owner
+        object _dims_owner
         bint _owned
         bint _readonly
 
@@ -102,8 +106,11 @@ cdef class Mesh:
         if self._ptr == NULL:
             raise MemoryError("Error allocating Mesh")
         self._owner = None
+        self._dims_owner = None
         self._owned = True
         self._readonly = False
+        self._ptr[0].size = sizeof(ncclMesh_t)
+        self._ptr[0].version = NCCL_M2N_API_VERSION
 
     def __dealloc__(self):
         cdef ncclMesh_t *ptr
@@ -131,7 +138,13 @@ cdef class Mesh:
         if not isinstance(other, Mesh):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclMesh_t)) == 0)
+        return (
+            self._ptr[0].size == other_._ptr[0].size
+            and self._ptr[0].version == other_._ptr[0].version
+            and self._ptr[0].ndims == other_._ptr[0].ndims
+            and self._ptr[0].startRank == other_._ptr[0].startRank
+            and self.dims == other_.dims
+        )
 
     def __getbuffer__(self, Py_buffer *buffer, int flags):
         __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclMesh_t), self._readonly)
@@ -153,16 +166,29 @@ cdef class Mesh:
 
     @property
     def dims(self):
-        return (self._ptr[0].dims[0], self._ptr[0].dims[1])
+        cdef int ndims = self._ptr[0].ndims
+        if self._ptr[0].dims == NULL:
+            return ()
+        if ndims < 1 or ndims > NCCL_RESHARD_MAX_MESH_DIMS:
+            raise ValueError(
+                f"mesh.ndims must be in [1, {NCCL_RESHARD_MAX_MESH_DIMS}], got {ndims}"
+            )
+        return tuple(self._ptr[0].dims[d] for d in range(ndims))
 
     @dims.setter
-    def dims(self, val):
+    def dims(self, values):
         if self._readonly:
             raise ValueError("This Mesh instance is read-only")
-        if len(val) != NCCL_RESHARD_MESH_NDIMS:
-          raise ValueError(f"dims must have length {NCCL_RESHARD_MESH_NDIMS}")
-        self._ptr[0].dims[0] = val[0]
-        self._ptr[0].dims[1] = val[1]
+        if len(values) < 1 or len(values) > NCCL_RESHARD_MAX_MESH_DIMS:
+            raise ValueError(f"dims must have length 1..{NCCL_RESHARD_MAX_MESH_DIMS}")
+        dims = _numpy.ascontiguousarray(values, dtype=_numpy.int32)
+        self._dims_owner = dims
+        self._ptr[0].ndims = len(values)
+        self._ptr[0].dims = <int*><intptr_t>dims.ctypes.data
+
+    @property
+    def ndims(self):
+        return self._ptr[0].ndims
 
     @property
     def startRank(self):
@@ -200,7 +226,11 @@ cdef class Mesh:
         """
         if ptr == 0:
             raise ValueError("ptr must not be null (0)")
+        cdef int d
+        cdef int ndims
+        cdef object dims
         cdef Mesh obj = Mesh.__new__(Mesh)
+        obj._dims_owner = None
         if owner is None:
             obj._ptr = <ncclMesh_t *>malloc(sizeof(ncclMesh_t))
             if obj._ptr == NULL:
@@ -208,6 +238,15 @@ cdef class Mesh:
             memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclMesh_t))
             obj._owner = None
             obj._owned = True
+            ndims = obj._ptr[0].ndims
+            if obj._ptr[0].dims != NULL and 1 <= ndims <= NCCL_RESHARD_MAX_MESH_DIMS:
+                dims = _numpy.empty(ndims, dtype=_numpy.int32)
+                for d in range(ndims):
+                    dims[d] = obj._ptr[0].dims[d]
+                obj._dims_owner = dims
+                obj._ptr[0].dims = <int*><intptr_t>dims.ctypes.data
+            elif ndims < 1 or ndims > NCCL_RESHARD_MAX_MESH_DIMS:
+                obj._ptr[0].dims = NULL
         else:
             obj._ptr = <ncclMesh_t *>ptr
             obj._owner = owner
@@ -391,9 +430,12 @@ cdef class Config:
 cdef _get_dist_tensor_dtype_offsets():
     cdef ncclDistTensor_t pod = ncclDistTensor_t()
     return _numpy.dtype({
-        'names': ['dataPtr', 'localShape', 'ndims', 'dtype', 'mesh', 'placements'],
-        'formats': [_numpy.intp, (_numpy.uint64, 3), _numpy.int32, _numpy.dtype(('V', sizeof(ncclDataType_t))), _numpy.intp, (_numpy.int32, 2)],
+        'names': ['size', 'version', 'dataPtr', 'localShape', 'ndims', 'dtype', 'mesh', 'placements'],
+        'formats': [_numpy.uintp, _numpy.uint32, _numpy.intp, _numpy.intp, _numpy.int32,
+                    _numpy.dtype(('V', sizeof(ncclDataType_t))), _numpy.intp, _numpy.intp],
         'offsets': [
+            (<intptr_t>&(pod.size)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.version)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.dataPtr)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.localShape)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.ndims)) - (<intptr_t>&pod),
@@ -415,6 +457,9 @@ cdef class DistTensor:
     cdef:
         ncclDistTensor_t *_ptr
         object _owner
+        object _local_shape_owner
+        object _mesh_owner
+        object _placements_owner
         bint _owned
         bint _readonly
 
@@ -423,8 +468,13 @@ cdef class DistTensor:
         if self._ptr == NULL:
             raise MemoryError("Error allocating DistTensor")
         self._owner = None
+        self._local_shape_owner = None
+        self._mesh_owner = None
+        self._placements_owner = None
         self._owned = True
         self._readonly = False
+        self._ptr[0].size = sizeof(ncclDistTensor_t)
+        self._ptr[0].version = NCCL_M2N_API_VERSION
 
     def __dealloc__(self):
         cdef ncclDistTensor_t *ptr
@@ -452,7 +502,16 @@ cdef class DistTensor:
         if not isinstance(other, DistTensor):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclDistTensor_t)) == 0)
+        return (
+            self._ptr[0].size == other_._ptr[0].size
+            and self._ptr[0].version == other_._ptr[0].version
+            and self.dataPtr == other_.dataPtr
+            and self.localShape == other_.localShape
+            and self.ndims == other_.ndims
+            and self.dtype == other_.dtype
+            and self.mesh == other_.mesh
+            and self.placements == other_.placements
+        )
 
     def __getbuffer__(self, Py_buffer *buffer, int flags):
         __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclDistTensor_t), self._readonly)
@@ -485,17 +544,25 @@ cdef class DistTensor:
 
     @property
     def localShape(self):
-        return (self._ptr[0].localShape[0], self._ptr[0].localShape[1], self._ptr[0].localShape[2])
+        cdef int ndims = self._ptr[0].ndims
+        if self._ptr[0].localShape == NULL:
+            return ()
+        if ndims < 1 or ndims > NCCL_RESHARD_MAX_TENSOR_DIMS:
+            raise ValueError(
+                f"ndims must be in [1, {NCCL_RESHARD_MAX_TENSOR_DIMS}], got {ndims}"
+            )
+        return tuple(self._ptr[0].localShape[d] for d in range(ndims))
 
     @localShape.setter
-    def localShape(self, val):
+    def localShape(self, values):
         if self._readonly:
             raise ValueError("This DistTensor instance is read-only")
-        if len(val) != NCCL_RESHARD_MAX_TENSOR_DIMS:
-          raise ValueError(f"localShape must have length {NCCL_RESHARD_MAX_TENSOR_DIMS}")
-        self._ptr[0].localShape[0] = val[0]
-        self._ptr[0].localShape[1] = val[1]
-        self._ptr[0].localShape[2] = val[2]
+        if len(values) < 1 or len(values) > NCCL_RESHARD_MAX_TENSOR_DIMS:
+            raise ValueError(f"localShape must have length 1..{NCCL_RESHARD_MAX_TENSOR_DIMS}")
+        local_shape = _numpy.ascontiguousarray(values, dtype=_numpy.uintp)
+        self._local_shape_owner = local_shape
+        self._ptr[0].localShape = <size_t*><intptr_t>local_shape.ctypes.data
+        self._ptr[0].ndims = len(values)
 
     @property
     def ndims(self):
@@ -527,20 +594,34 @@ cdef class DistTensor:
     def mesh(self, val):
         if self._readonly:
             raise ValueError("This DistTensor instance is read-only")
-        self._ptr[0].mesh = <ncclMesh_t*><intptr_t>val
+        self._mesh_owner = None
+        self._ptr[0].mesh = <const ncclMesh_t*><intptr_t>val
 
     @property
     def placements(self):
-        return (self._ptr[0].placements[0], self._ptr[0].placements[1])
+        cdef int mesh_ndims
+        if self._ptr[0].placements == NULL:
+            return ()
+        if self._placements_owner is not None:
+            return tuple(int(value) for value in self._placements_owner)
+        if self._ptr[0].mesh == NULL:
+            return ()
+        mesh_ndims = self._ptr[0].mesh.ndims
+        if mesh_ndims < 1 or mesh_ndims > NCCL_RESHARD_MAX_MESH_DIMS:
+            raise ValueError(
+                f"mesh.ndims must be in [1, {NCCL_RESHARD_MAX_MESH_DIMS}], got {mesh_ndims}"
+            )
+        return tuple(self._ptr[0].placements[d] for d in range(mesh_ndims))
 
     @placements.setter
-    def placements(self, val):
+    def placements(self, values):
         if self._readonly:
             raise ValueError("This DistTensor instance is read-only")
-        if len(val) != NCCL_RESHARD_MESH_NDIMS:
-          raise ValueError(f"placements must have length {NCCL_RESHARD_MESH_NDIMS}")
-        self._ptr[0].placements[0] = val[0]
-        self._ptr[0].placements[1] = val[1]
+        if len(values) < 1 or len(values) > NCCL_RESHARD_MAX_MESH_DIMS:
+            raise ValueError(f"placements must have length 1..{NCCL_RESHARD_MAX_MESH_DIMS}")
+        placements = _numpy.ascontiguousarray(values, dtype=_numpy.int32)
+        self._placements_owner = placements
+        self._ptr[0].placements = <int*><intptr_t>placements.ctypes.data
 
     @staticmethod
     def from_buffer(buffer):
@@ -567,7 +648,16 @@ cdef class DistTensor:
         """
         if ptr == 0:
             raise ValueError("ptr must not be null (0)")
+        cdef int d
+        cdef int tensor_ndims
+        cdef int mesh_ndims
+        cdef Mesh mesh_owner
+        cdef object local_shape
+        cdef object placements
         cdef DistTensor obj = DistTensor.__new__(DistTensor)
+        obj._local_shape_owner = None
+        obj._mesh_owner = None
+        obj._placements_owner = None
         if owner is None:
             obj._ptr = <ncclDistTensor_t *>malloc(sizeof(ncclDistTensor_t))
             if obj._ptr == NULL:
@@ -575,6 +665,30 @@ cdef class DistTensor:
             memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclDistTensor_t))
             obj._owner = None
             obj._owned = True
+            tensor_ndims = obj._ptr[0].ndims
+            if obj._ptr[0].localShape != NULL and 1 <= tensor_ndims <= NCCL_RESHARD_MAX_TENSOR_DIMS:
+                local_shape = _numpy.empty(tensor_ndims, dtype=_numpy.uintp)
+                for d in range(tensor_ndims):
+                    local_shape[d] = obj._ptr[0].localShape[d]
+                obj._local_shape_owner = local_shape
+                obj._ptr[0].localShape = <size_t*><intptr_t>local_shape.ctypes.data
+            elif tensor_ndims < 1 or tensor_ndims > NCCL_RESHARD_MAX_TENSOR_DIMS:
+                obj._ptr[0].localShape = NULL
+            if obj._ptr[0].mesh != NULL:
+                mesh_ndims = obj._ptr[0].mesh.ndims
+                if obj._ptr[0].placements != NULL and 1 <= mesh_ndims <= NCCL_RESHARD_MAX_MESH_DIMS:
+                    placements = _numpy.empty(mesh_ndims, dtype=_numpy.int32)
+                    for d in range(mesh_ndims):
+                        placements[d] = obj._ptr[0].placements[d]
+                    obj._placements_owner = placements
+                    obj._ptr[0].placements = <int*><intptr_t>placements.ctypes.data
+                elif mesh_ndims < 1 or mesh_ndims > NCCL_RESHARD_MAX_MESH_DIMS:
+                    obj._ptr[0].placements = NULL
+                mesh_owner = Mesh.from_ptr(<intptr_t>obj._ptr[0].mesh, readonly, None)
+                obj._mesh_owner = mesh_owner
+                obj._ptr[0].mesh = mesh_owner._ptr
+            else:
+                obj._ptr[0].placements = NULL
         else:
             obj._ptr = <ncclDistTensor_t *>ptr
             obj._owner = owner
@@ -583,7 +697,7 @@ cdef class DistTensor:
         return obj
 
 
-MESH_NDIMS = NCCL_RESHARD_MESH_NDIMS
+MESH_NDIMS = NCCL_RESHARD_MAX_MESH_DIMS
 MAX_TENSOR_DIMS = NCCL_RESHARD_MAX_TENSOR_DIMS
 REPLICATE = NCCL_RESHARD_REPLICATE
 

@@ -13,24 +13,24 @@
 #include "reshard_internal.h"
 #include "m2n_checks.h"
 
-/* Reject non-positive mesh dimensions before any mesh-group math divides by
- * them (computeMeshGroupInfo / getMeshRank divide and mod by dims[1], and the
- * load balancer divides by the per-side rep/shard counts derived from these
- * dims).  A caller-supplied mesh with a zero dim would otherwise be an
- * integer-divide fault on the host.  Host-only — safe to call before any CUDA
- * setup and from unit tests. */
+/* Reject invalid mesh metadata before private call setup canonicalizes it to
+ * two axes. Host-only — safe to call before CUDA setup and from unit tests. */
 ncclResult_t computeReshardMeshInterval(const ncclMesh_t* mesh, int logRank, ReshardMeshInterval* interval) {
   NCCL_M2N_CHECK_ARG(mesh != nullptr && interval != nullptr, logRank,
                      "reshard: mesh and output interval must be non-null");
-  NCCL_M2N_CHECK_ARG(mesh->dims[0] > 0 && mesh->dims[1] > 0, logRank,
-                     "reshard: mesh dims must be positive, got [%d, %d]", mesh->dims[0], mesh->dims[1]);
+  NCCL_M2N_CHECK_ARG(mesh->ndims >= 1 && mesh->ndims <= NCCL_RESHARD_MAX_MESH_DIMS, logRank,
+                     "reshard: mesh ndims=%d must be in [1, %d]", mesh->ndims, NCCL_RESHARD_MAX_MESH_DIMS);
+  NCCL_M2N_CHECK_ARG(mesh->dims != nullptr, logRank, "reshard: mesh dims must be non-null");
   NCCL_M2N_CHECK_ARG(mesh->startRank >= 0, logRank, "reshard: mesh startRank=%d must be non-negative",
                      mesh->startRank);
 
-  size_t meshSize = 0;
-  NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(static_cast<size_t>(mesh->dims[0]), static_cast<size_t>(mesh->dims[1]),
-                                      &meshSize),
-                     logRank, "reshard: mesh size overflows for dims [%d, %d]", mesh->dims[0], mesh->dims[1]);
+  size_t meshSize = 1;
+  for (int d = 0; d < mesh->ndims; d++) {
+    NCCL_M2N_CHECK_ARG(mesh->dims[d] > 0, logRank, "reshard: mesh dims[%d]=%d must be positive", d,
+                       mesh->dims[d]);
+    NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(meshSize, static_cast<size_t>(mesh->dims[d]), &meshSize), logRank,
+                       "reshard: mesh size overflows at dims[%d]=%d", d, mesh->dims[d]);
+  }
   NCCL_M2N_CHECK_ARG(meshSize <= static_cast<size_t>(std::numeric_limits<int>::max()), logRank,
                      "reshard: mesh size %zu exceeds the supported rank range", meshSize);
   NCCL_M2N_CHECK_ARG(mesh->startRank <= std::numeric_limits<int>::max() - static_cast<int>(meshSize), logRank,
@@ -98,7 +98,7 @@ void computeStrides(const size_t dims[], int ndims, size_t strides[]) {
 
 ncclResult_t validateReshardPlacement(const ncclDistTensor_t* tensor, const char* apiName, const char* fieldName) {
   int shardCount = 0;
-  for (int meshDim = 0; meshDim < NCCL_RESHARD_MESH_NDIMS; meshDim++) {
+  for (int meshDim = 0; meshDim < tensor->mesh->ndims; meshDim++) {
     const int placement = tensor->placements[meshDim];
     if (placement == NCCL_RESHARD_REPLICATE) {
       continue;
@@ -130,7 +130,7 @@ void computeMeshGroupInfo(const ncclDistTensor_t* tensor, int worldRank, ncclRes
   info->shardMeshDim = -1;
   info->repMeshDim = -1;
   info->shardTensorDim = -1;
-  for (int d = 0; d < NCCL_RESHARD_MESH_NDIMS; d++) {
+  for (int d = 0; d < tensor->mesh->ndims; d++) {
     if (tensor->placements[d] == NCCL_RESHARD_REPLICATE) {
       info->repMeshDim = d;
     } else if (isShardPlacement(tensor->placements[d])) {

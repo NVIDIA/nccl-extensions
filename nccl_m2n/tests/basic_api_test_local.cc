@@ -173,14 +173,23 @@ static void* callInvalidReshard(void* resultPtr) {
 }
 
 TEST(ReshardMeshValidationTest, RequiresDisjointIntervalsForMultiRankCommunicators) {
-  ncclMesh_t src = {{2, 1}, 0};
-  ncclMesh_t overlappingDst = {{2, 1}, 1};
-  ncclMesh_t disjointDst = {{2, 1}, 2};
+  int multiRankDims[2] = {2, 1};
+  ncclMesh_t src = NCCL_M2N_MESH_INITIALIZER;
+  src.ndims = 2;
+  src.dims = multiRankDims;
+  src.startRank = 0;
+  ncclMesh_t overlappingDst = src;
+  overlappingDst.startRank = 1;
+  ncclMesh_t disjointDst = src;
+  disjointDst.startRank = 2;
 
   EXPECT_EQ(ncclInvalidArgument, validateReshardMeshBounds(&src, &overlappingDst, 4, 0));
   EXPECT_EQ(ncclSuccess, validateReshardMeshBounds(&src, &disjointDst, 4, 0));
 
-  ncclMesh_t self = {{1, 1}, 0};
+  int selfDims[2] = {1, 1};
+  ncclMesh_t self = NCCL_M2N_MESH_INITIALIZER;
+  self.ndims = 2;
+  self.dims = selfDims;
   EXPECT_EQ(ncclSuccess, validateReshardMeshBounds(&self, &self, 1, 0));
 }
 
@@ -206,9 +215,22 @@ TEST(M2nGroupTest, DeferredValidationReportsOriginalEntryIndex) {
 }
 
 TEST(M2nGroupTest, MixedContextsCanBeRecordedAndAborted) {
-  ncclMesh_t mesh{};
-  ncclDistTensor_t src{};
-  ncclDistTensor_t dst{};
+  int meshDims[1] = {1};
+  size_t localShape[1] = {1};
+  int placements[1] = {NCCL_RESHARD_REPLICATE};
+  ncclMesh_t mesh = NCCL_M2N_MESH_INITIALIZER;
+  mesh.ndims = 1;
+  mesh.dims = meshDims;
+  ncclDistTensor_t src = NCCL_M2N_DIST_TENSOR_INITIALIZER;
+  ncclDistTensor_t dst = NCCL_M2N_DIST_TENSOR_INITIALIZER;
+  src.localShape = localShape;
+  dst.localShape = localShape;
+  src.ndims = 1;
+  dst.ndims = 1;
+  src.dtype = ncclUint8;
+  dst.dtype = ncclUint8;
+  src.placements = placements;
+  dst.placements = placements;
   src.mesh = &mesh;
   dst.mesh = &mesh;
 

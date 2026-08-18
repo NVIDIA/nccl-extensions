@@ -24,8 +24,9 @@ struct ReshardWorkStream {
   cudaEvent_t doneEvent;
 };
 
-/* Owns the mesh storage referenced by srcTensor and dstTensor. Initialize in
- * place with reshardPrepareTensorSetup and keep it alive for the whole call. */
+/* Owns the shape, mesh-dimension, and placement storage referenced by
+ * srcTensor and dstTensor. Public 1-D/2-D descriptors are canonicalized to
+ * private 2-D layouts here. Keep the setup alive for the whole call. */
 struct ReshardTensorSetup {
   ReshardTensorSetup() = default;
   ReshardTensorSetup(const ReshardTensorSetup&) = delete;
@@ -33,12 +34,18 @@ struct ReshardTensorSetup {
   ReshardTensorSetup(ReshardTensorSetup&&) = delete;
   ReshardTensorSetup& operator=(ReshardTensorSetup&&) = delete;
 
-  ncclMesh_t srcMesh;
-  ncclMesh_t dstMesh;
-  ncclDistTensor_t srcTensor;
-  ncclDistTensor_t dstTensor;
-  int ndims;
-  size_t elementSize;
+  size_t srcLocalShape[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
+  size_t dstLocalShape[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
+  int srcMeshDims[NCCL_RESHARD_MAX_MESH_DIMS] = {};
+  int dstMeshDims[NCCL_RESHARD_MAX_MESH_DIMS] = {};
+  int srcPlacements[NCCL_RESHARD_MAX_MESH_DIMS] = {};
+  int dstPlacements[NCCL_RESHARD_MAX_MESH_DIMS] = {};
+  ncclMesh_t srcMesh = NCCL_M2N_MESH_INITIALIZER;
+  ncclMesh_t dstMesh = NCCL_M2N_MESH_INITIALIZER;
+  ncclDistTensor_t srcTensor = NCCL_M2N_DIST_TENSOR_INITIALIZER;
+  ncclDistTensor_t dstTensor = NCCL_M2N_DIST_TENSOR_INITIALIZER;
+  int ndims = 0;
+  size_t elementSize = 0;
 };
 
 static inline bool reshardAcquiredPoolSlot(const ReshardWorkStream* work) {

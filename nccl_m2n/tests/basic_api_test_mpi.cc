@@ -433,21 +433,26 @@ TEST(M2nGroupMpiTest, OverlappingCommunicatorsPreserveBucketOrder) {
     TEST_NCCLCHECK(ncclMemAlloc(&gGroupBufferB, 4096));
   }
 
-  ncclMesh_t srcMesh{};
-  srcMesh.dims[0] = 1;
-  srcMesh.dims[1] = 1;
+  int meshDims[NCCL_RESHARD_MAX_MESH_DIMS] = {1, 1};
+  ncclMesh_t srcMesh = NCCL_M2N_MESH_INITIALIZER;
+  srcMesh.ndims = NCCL_RESHARD_MAX_MESH_DIMS;
+  srcMesh.dims = meshDims;
   srcMesh.startRank = 0;
   ncclMesh_t dstMesh = srcMesh;
   dstMesh.startRank = 1;
   auto makeTensor = [](void* data, ncclMesh_t* mesh) {
-    ncclDistTensor_t tensor{};
+    static size_t localShape[1] = {32};
+    static int placements[NCCL_RESHARD_MAX_MESH_DIMS] = {
+      NCCL_RESHARD_REPLICATE,
+      NCCL_RESHARD_REPLICATE,
+    };
+    ncclDistTensor_t tensor = NCCL_M2N_DIST_TENSOR_INITIALIZER;
     tensor.dataPtr = data;
-    tensor.localShape[0] = 32;
+    tensor.localShape = localShape;
     tensor.ndims = 1;
     tensor.dtype = ncclUint8;
     tensor.mesh = mesh;
-    tensor.placements[0] = NCCL_RESHARD_REPLICATE;
-    tensor.placements[1] = NCCL_RESHARD_REPLICATE;
+    tensor.placements = placements;
     return tensor;
   };
   std::array<ncclDistTensor_t, 2> srcA{};

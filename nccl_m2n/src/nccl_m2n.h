@@ -33,6 +33,9 @@
 // Packed version code: MAJOR*10000 + MINOR*100 + PATCH. Mirrors NCCL_VERSION_CODE.
 #define NCCL_M2N_VERSION_CODE (NCCL_M2N_MAJOR * 10000 + NCCL_M2N_MINOR * 100 + NCCL_M2N_PATCH)
 
+/** NCCL M2N public struct ABI version. Not the library release version. */
+#define NCCL_M2N_API_VERSION 2u
+
 /** Oldest NCCL release supported by this NCCL M2N API and implementation. */
 #define NCCL_M2N_MIN_NCCL_VERSION_CODE NCCL_VERSION(2, 30, 5)
 
@@ -54,25 +57,48 @@ extern "C" {
  * Mesh Specification
  * ====================================================================*/
 
-/** Number of mesh axes accepted by ncclMesh_t and
- * ncclDistTensor_t::placements[]. */
-#define NCCL_RESHARD_MESH_NDIMS 2
+/** Maximum mesh rank accepted by this implementation. The public descriptors
+ * use pointer-backed arrays so this implementation limit can grow without
+ * another struct-layout change. */
+#define NCCL_RESHARD_MAX_MESH_DIMS 2
+
+/** Compatibility alias for code that used the former fixed array extent. */
+#define NCCL_RESHARD_MESH_NDIMS NCCL_RESHARD_MAX_MESH_DIMS
 
 /**
- * 2-D mesh descriptor for one side of a reshard — pure topology, no
+ * N-D mesh descriptor for one side of a reshard — pure topology, no
  * tensor placement.  Analogous to PyTorch DTensor's `DeviceMesh` or
  * JAX's `Mesh` (the per-tensor placement spec lives on the distributed
  * tensor, see ncclDistTensor_t::placements[]).  The mesh owns ranks
- * [startRank, startRank + dims[0] * dims[1]).
+ * [startRank, startRank + product(dims[0..ndims))).
+ *
+ * dims is borrowed host memory. It must remain valid until the reshard call
+ * returns. Grouped calls copy it while the entry is recorded, so it need not
+ * remain valid until ncclM2nGroupEnd().
  */
 typedef struct ncclMesh_v2 {
-  /** 2-D mesh dimensions.  Each entry must be positive.  The product is the
-   * number of ranks on this side and must fit in the communicator rank range. */
-  int dims[NCCL_RESHARD_MESH_NDIMS];
+  /** Struct size; initialized by NCCL_M2N_MESH_INITIALIZER. */
+  size_t size;
+  /** NCCL M2N public struct ABI version. */
+  unsigned int version;
+  /** Number of active entries in dims (currently 1 or 2). */
+  int ndims;
+  /** Caller-owned positive mesh dimensions; host array of length ndims. */
+  int* dims;
   /** First world rank in this side's contiguous rank interval.  Must be
    * non-negative, and the interval end must not exceed the communicator. */
   int startRank;
 } ncclMesh_t;
+
+/** Static initializer for a caller-owned mesh descriptor. */
+#define NCCL_M2N_MESH_INITIALIZER \
+  {                               \
+    sizeof(ncclMesh_t),           \
+    NCCL_M2N_API_VERSION,         \
+    0,                            \
+    NULL,                         \
+    0,                            \
+  }
 
 /** Placement helper for replicated ncclDistTensor_t::placements[] entries. */
 #define NCCL_RESHARD_REPLICATE (-1)
@@ -95,13 +121,17 @@ typedef struct ncclMesh_v2 {
  * placements[] describes how the global tensor maps onto mesh axes.
  */
 typedef struct ncclDistTensor_v2 {
+  /** Struct size; initialized by NCCL_M2N_DIST_TENSOR_INITIALIZER. */
+  size_t size;
+  /** NCCL M2N public struct ABI version. */
+  unsigned int version;
   /** Local buffer for this rank.  Must be non-NULL when this rank belongs to
    * this side's mesh; may be NULL when it does not participate as this side. */
   void* dataPtr;
-  /** Per-axis element count on this rank.  Only the first `ndims` entries are
-   * read.  Inactive ranks must still provide the side's local shape metadata
-   * so every rank derives identical transfer geometry. */
-  size_t localShape[NCCL_RESHARD_MAX_TENSOR_DIMS];
+  /** Per-axis element count on this rank. This is borrowed host memory with
+   * `ndims` entries. Inactive ranks must still provide the side's local shape
+   * metadata so every rank derives identical transfer geometry. */
+  size_t* localShape;
   /** Number of tensor dimensions (1, 2, or 3). */
   int ndims;
   /** Element data type.  Supported: ncclInt8, ncclUint8, ncclFloat8e4m3,
@@ -112,13 +142,29 @@ typedef struct ncclDistTensor_v2 {
    * including ranks where dataPtr is NULL: the library uses both meshes
    * everywhere to compute who-talks-to-whom. */
   const ncclMesh_t* mesh;
-  /** Per-mesh-axis tensor placements; required on every rank.
+  /** Per-mesh-axis tensor placements; required on every rank. This is
+   * borrowed host memory with mesh->ndims entries and the same lifetime as
+   * mesh->dims.
    * placements[i] is one of:
    *     NCCL_RESHARD_REPLICATE   Axis replicates the tensor slice.
    *     NCCL_RESHARD_SHARD(d)    Axis shards tensor dimension d.
-   * Exactly one axis per side should be a SHARD. */
-  int placements[NCCL_RESHARD_MESH_NDIMS];
+   * A sharded layout must have exactly one SHARD axis.  A fully replicated
+   * layout uses REPLICATE on every active axis. */
+  int* placements;
 } ncclDistTensor_t;
+
+/** Static initializer for a caller-owned distributed-tensor descriptor. */
+#define NCCL_M2N_DIST_TENSOR_INITIALIZER \
+  {                                      \
+    sizeof(ncclDistTensor_t),            \
+    NCCL_M2N_API_VERSION,                \
+    NULL,                                \
+    NULL,                                \
+    0,                                   \
+    (ncclDataType_t)0,                   \
+    NULL,                                \
+    NULL,                                \
+  }
 
 /* ======================================================================
  * Library Configuration
@@ -129,10 +175,6 @@ typedef struct ncclDistTensor_v2 {
 
 /** ABI guard value set by NCCL_M2N_CONFIG_INITIALIZER. */
 #define NCCL_M2N_API_MAGIC 0x4d324e32u /* 'M2N2' */
-
-/** NCCL M2N public struct ABI version. Not the library release version —
- * see NCCL_M2N_MAJOR / MINOR / PATCH at the top of this header. */
-#define NCCL_M2N_API_VERSION 2u
 
 /**
  * Modeled after ncclConfig_t.  Callers fill an ncclM2nConfig_t with

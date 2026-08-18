@@ -58,13 +58,11 @@ def _placement_to_int(placement: object) -> int:
     )
 
 
-def normalize_placements(placements: Iterable[object]) -> tuple[int, int]:
+def normalize_placements(placements: Iterable[object]) -> tuple[int, ...]:
     values = tuple(_placement_to_int(p) for p in placements)
-    if len(values) == 1:
-        values = (values[0], REPLICATE)
-    if len(values) != MESH_NDIMS:
-        raise ValueError(f"expected 1 or {MESH_NDIMS} placements, got {len(values)}")
-    return values
+    if not 1 <= len(values) <= MESH_NDIMS:
+        raise ValueError(f"expected 1..{MESH_NDIMS} placements, got {len(values)}")
+    return values + (REPLICATE,) * (MESH_NDIMS - len(values))
 
 
 __all__ = ["Replicate", "Shard", "normalize_placements"]

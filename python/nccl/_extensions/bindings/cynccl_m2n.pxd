@@ -18,6 +18,7 @@ cdef extern from *:
     #include <limits.h>
     enum {
       NCCL_RESHARD_MESH_NDIMS = 2,
+      NCCL_RESHARD_MAX_MESH_DIMS = 2,
       NCCL_RESHARD_MAX_TENSOR_DIMS = 3,
       NCCL_RESHARD_REPLICATE = -1,
       NCCL_M2N_CONFIG_UNDEF_INT = INT_MIN,
@@ -27,6 +28,7 @@ cdef extern from *:
     """
     enum:
         NCCL_RESHARD_MESH_NDIMS
+        NCCL_RESHARD_MAX_MESH_DIMS
         NCCL_RESHARD_MAX_TENSOR_DIMS
         NCCL_RESHARD_REPLICATE
         NCCL_M2N_CONFIG_UNDEF_INT
@@ -49,7 +51,10 @@ cdef extern from *:
 ctypedef void* ncclM2nHandle_t 'ncclM2nHandle_t'
 
 ctypedef struct ncclMesh_t 'ncclMesh_t':
-    int dims[2]
+    size_t size
+    unsigned int version
+    int ndims
+    int* dims
     int startRank
 
 ctypedef struct ncclM2nConfig_t 'ncclM2nConfig_t':
@@ -59,12 +64,14 @@ ctypedef struct ncclM2nConfig_t 'ncclM2nConfig_t':
     int maxCta
 
 ctypedef struct ncclDistTensor_t 'ncclDistTensor_t':
+    size_t size
+    unsigned int version
     void* dataPtr
-    size_t localShape[3]
+    size_t* localShape
     int ndims
     ncclDataType_t dtype
-    ncclMesh_t* mesh
-    int placements[2]
+    const ncclMesh_t* mesh
+    int* placements
 
 
 ###############################################################################

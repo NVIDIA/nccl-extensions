@@ -441,8 +441,8 @@ static std::map<std::string, ParamInfo> deduplicateParamsPP(
 // ncclMesh_t / ncclDistTensor_t Construction from Placements
 //
 // The ncclReshard API splits topology (mesh) from per-tensor placements:
-//   ncclMesh_t       :  dims[NCCL_RESHARD_MESH_NDIMS], startRank
-//   ncclDistTensor_t :  ..., placements[NCCL_RESHARD_MESH_NDIMS]
+//   ncclMesh_t       :  ndims, dims pointer, startRank
+//   ncclDistTensor_t :  ..., placements pointer (mesh.ndims entries)
 //
 // Convention used here:
 //   dims[0] = replicated count (product of non-sharding mesh axes)
@@ -919,36 +919,46 @@ int main(int argc, char* argv[]) {
     void* buffer = tbe.buffer;
     ncclWindow_t win = tbe.window;
 
-    ncclMesh_t srcMesh;
-    srcMesh.dims[0] = td.srcMesh.repCount;
-    srcMesh.dims[1] = td.srcMesh.shardCount;
+    int srcMeshDims[] = {td.srcMesh.repCount, td.srcMesh.shardCount};
+    ncclMesh_t srcMesh = NCCL_M2N_MESH_INITIALIZER;
+    srcMesh.ndims = 2;
+    srcMesh.dims = srcMeshDims;
     srcMesh.startRank = 0;
 
-    ncclMesh_t dstMesh;
-    dstMesh.dims[0] = td.dstMesh.repCount;
-    dstMesh.dims[1] = td.dstMesh.shardCount;
+    int dstMeshDims[] = {td.dstMesh.repCount, td.dstMesh.shardCount};
+    ncclMesh_t dstMesh = NCCL_M2N_MESH_INITIALIZER;
+    dstMesh.ndims = 2;
+    dstMesh.dims = dstMeshDims;
     dstMesh.startRank = trainStageSize;
 
     bool rankIsTrainInComm = (commIt->second.localRank < trainStageSize);
 
-    ncclDistTensor_t srcTensor = {};
+    int srcPlacements[] = {
+      NCCL_RESHARD_REPLICATE,
+      (td.srcMesh.shardTensorDim >= 0) ? NCCL_RESHARD_SHARD(td.srcMesh.shardTensorDim) : NCCL_RESHARD_REPLICATE,
+    };
+    size_t srcLocalShape[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
+    ncclDistTensor_t srcTensor = NCCL_M2N_DIST_TENSOR_INITIALIZER;
     srcTensor.dataPtr = rankIsTrainInComm ? buffer : nullptr;
+    srcTensor.localShape = srcLocalShape;
     srcTensor.ndims = td.ndims;
     srcTensor.dtype = getNcclDtype(td.param.dtype);
     srcTensor.mesh = &srcMesh;
-    srcTensor.placements[0] = NCCL_RESHARD_REPLICATE;
-    srcTensor.placements[1] =
-      (td.srcMesh.shardTensorDim >= 0) ? NCCL_RESHARD_SHARD(td.srcMesh.shardTensorDim) : NCCL_RESHARD_REPLICATE;
+    srcTensor.placements = srcPlacements;
     for (int d = 0; d < td.ndims; d++) srcTensor.localShape[d] = td.srcLocalShape[d];
 
-    ncclDistTensor_t dstTensor = {};
+    int dstPlacements[] = {
+      NCCL_RESHARD_REPLICATE,
+      (td.dstMesh.shardTensorDim >= 0) ? NCCL_RESHARD_SHARD(td.dstMesh.shardTensorDim) : NCCL_RESHARD_REPLICATE,
+    };
+    size_t dstLocalShape[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
+    ncclDistTensor_t dstTensor = NCCL_M2N_DIST_TENSOR_INITIALIZER;
     dstTensor.dataPtr = rankIsTrainInComm ? nullptr : buffer;
+    dstTensor.localShape = dstLocalShape;
     dstTensor.ndims = td.ndims;
     dstTensor.dtype = getNcclDtype(td.param.dtype);
     dstTensor.mesh = &dstMesh;
-    dstTensor.placements[0] = NCCL_RESHARD_REPLICATE;
-    dstTensor.placements[1] =
-      (td.dstMesh.shardTensorDim >= 0) ? NCCL_RESHARD_SHARD(td.dstMesh.shardTensorDim) : NCCL_RESHARD_REPLICATE;
+    dstTensor.placements = dstPlacements;
     for (int d = 0; d < td.ndims; d++) dstTensor.localShape[d] = td.dstLocalShape[d];
 
     if (apiMode == ReshardApiMode::Default) {

@@ -282,8 +282,13 @@ int main(int argc, char* argv[]) {
 
   // Setup mesh structures (topology only).  Per-tensor placement is
   // set on the DistTensor below.
-  ncclMesh_t srcMesh = {.dims = {srcMeshDims[0], srcMeshDims[1]}, .startRank = 0};
-  ncclMesh_t dstMesh = {.dims = {dstMeshDims[0], dstMeshDims[1]}, .startRank = srcTotal};
+  ncclMesh_t srcMesh = NCCL_M2N_MESH_INITIALIZER;
+  srcMesh.ndims = 2;
+  srcMesh.dims = srcMeshDims;
+  ncclMesh_t dstMesh = NCCL_M2N_MESH_INITIALIZER;
+  dstMesh.ndims = 2;
+  dstMesh.dims = dstMeshDims;
+  dstMesh.startRank = srcTotal;
 
   // Create CUDA stream
   cudaStream_t stream;
@@ -312,24 +317,28 @@ int main(int argc, char* argv[]) {
 
   // Build src/dst descriptors once. dataPtr=NULL is the role signal;
   // localShape metadata is still required on inactive sides.
-  ncclDistTensor_t srcTensor = {};
+  size_t srcLocalShape[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
+  int srcPlacements[] = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(srcShardDim)};
+  ncclDistTensor_t srcTensor = NCCL_M2N_DIST_TENSOR_INITIALIZER;
   srcTensor.dataPtr = isSource ? buffer : nullptr;
+  srcTensor.localShape = srcLocalShape;
   srcTensor.ndims = ndims;
   srcTensor.dtype = ncclInt8; // bench validates byte patterns
   srcTensor.mesh = &srcMesh;
-  srcTensor.placements[0] = NCCL_RESHARD_REPLICATE;
-  srcTensor.placements[1] = NCCL_RESHARD_SHARD(srcShardDim);
+  srcTensor.placements = srcPlacements;
   for (int d = 0; d < ndims; d++) {
     srcTensor.localShape[d] = srcLocalDims[d];
   }
 
-  ncclDistTensor_t dstTensor = {};
+  size_t dstLocalShape[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
+  int dstPlacements[] = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_SHARD(dstShardDim)};
+  ncclDistTensor_t dstTensor = NCCL_M2N_DIST_TENSOR_INITIALIZER;
   dstTensor.dataPtr = isDest ? buffer : nullptr;
+  dstTensor.localShape = dstLocalShape;
   dstTensor.ndims = ndims;
   dstTensor.dtype = ncclInt8;
   dstTensor.mesh = &dstMesh;
-  dstTensor.placements[0] = NCCL_RESHARD_REPLICATE;
-  dstTensor.placements[1] = NCCL_RESHARD_SHARD(dstShardDim);
+  dstTensor.placements = dstPlacements;
   for (int d = 0; d < ndims; d++) {
     dstTensor.localShape[d] = dstLocalDims[d];
   }

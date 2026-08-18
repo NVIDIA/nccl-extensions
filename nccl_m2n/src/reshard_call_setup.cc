@@ -9,7 +9,52 @@
 
 #include <limits>
 
-static ncclResult_t reshardFixFullyReplicated(ncclMesh_t* mesh, int placements[NCCL_RESHARD_MESH_NDIMS]) {
+static ncclResult_t validateDescriptorHeader(const char* apiName, const char* fieldName, size_t size,
+                                             unsigned int version, size_t expectedSize) {
+  NCCL_M2N_CHECK_ARG(size >= expectedSize, -1, "%s: %s descriptor size %zu is smaller than required size %zu", apiName,
+                     fieldName, size, expectedSize);
+  NCCL_M2N_CHECK_ARG(version == NCCL_M2N_API_VERSION, -1,
+                     "%s: %s descriptor ABI version %u does not match library version %u", apiName, fieldName, version,
+                     NCCL_M2N_API_VERSION);
+  return ncclSuccess;
+}
+
+static ncclResult_t reshardCopyPublicTensor(const char* apiName, const char* fieldName, const ncclDistTensor_t* input,
+                                            size_t* localShape, ncclMesh_t* mesh, int* meshDims,
+                                            ncclDistTensor_t* tensor, int* placements) {
+  NCCL_M2N_CHECK(validateDescriptorHeader(apiName, fieldName, input->size, input->version, sizeof(ncclDistTensor_t)));
+  NCCL_M2N_CHECK_ARG(input->ndims >= 1 && input->ndims <= NCCL_RESHARD_MAX_TENSOR_DIMS, -1,
+                     "%s: %s->ndims (%d) must be in [1, %d]", apiName, fieldName, input->ndims,
+                     NCCL_RESHARD_MAX_TENSOR_DIMS);
+  NCCL_M2N_CHECK_ARG(input->localShape != nullptr, -1, "%s: %s->localShape must be non-null", apiName, fieldName);
+  NCCL_M2N_CHECK_ARG(input->mesh != nullptr, -1, "%s: %s->mesh must be non-null on every rank", apiName, fieldName);
+  NCCL_M2N_CHECK(validateDescriptorHeader(apiName, "mesh", input->mesh->size, input->mesh->version,
+                                          sizeof(ncclMesh_t)));
+  NCCL_M2N_CHECK_ARG(input->mesh->ndims >= 1 && input->mesh->ndims <= NCCL_RESHARD_MAX_MESH_DIMS, -1,
+                     "%s: %s->mesh->ndims (%d) must be in [1, %d]", apiName, fieldName, input->mesh->ndims,
+                     NCCL_RESHARD_MAX_MESH_DIMS);
+  NCCL_M2N_CHECK_ARG(input->mesh->dims != nullptr, -1, "%s: %s->mesh->dims must be non-null", apiName, fieldName);
+  NCCL_M2N_CHECK_ARG(input->placements != nullptr, -1, "%s: %s->placements must be non-null", apiName, fieldName);
+
+  *mesh = *input->mesh;
+  mesh->ndims = NCCL_RESHARD_MAX_MESH_DIMS;
+  mesh->dims = meshDims;
+  for (int d = 0; d < NCCL_RESHARD_MAX_MESH_DIMS; d++) {
+    meshDims[d] = (d < input->mesh->ndims) ? input->mesh->dims[d] : 1;
+    placements[d] = (d < input->mesh->ndims) ? input->placements[d] : NCCL_RESHARD_REPLICATE;
+  }
+
+  *tensor = *input;
+  for (int d = 0; d < input->ndims; d++) {
+    localShape[d] = input->localShape[d];
+  }
+  tensor->localShape = localShape;
+  tensor->mesh = mesh;
+  tensor->placements = placements;
+  return ncclSuccess;
+}
+
+static ncclResult_t reshardFixFullyReplicated(ncclMesh_t* mesh, int* placements) {
   if (placements[0] == NCCL_RESHARD_REPLICATE && placements[1] == NCCL_RESHARD_REPLICATE) {
     ReshardMeshInterval interval{};
     NCCL_M2N_CHECK(computeReshardMeshInterval(mesh, -1, &interval));
@@ -22,28 +67,25 @@ static ncclResult_t reshardFixFullyReplicated(ncclMesh_t* mesh, int placements[N
 
 ncclResult_t reshardPrepareTensorSetup(const char* apiName, const ncclDistTensor_t* src, const ncclDistTensor_t* dst,
                                        ReshardTensorSetup* setup) {
-  NCCL_M2N_CHECK_ARG(src->mesh != nullptr && dst->mesh != nullptr, -1,
-                     "%s: src->mesh and dst->mesh must both be non-null on every rank", apiName);
-  NCCL_M2N_CHECK(validateReshardMeshDims(src->mesh, dst->mesh));
-  NCCL_M2N_CHECK_ARG(src->ndims == dst->ndims, -1, "%s: src->ndims (%d) and dst->ndims (%d) must match", apiName,
-                     src->ndims, dst->ndims);
-  NCCL_M2N_CHECK_ARG(src->dtype == dst->dtype, -1, "%s: src->dtype (%d) and dst->dtype (%d) must match", apiName,
-                     (int)src->dtype, (int)dst->dtype);
-  NCCL_M2N_CHECK_ARG(src->ndims >= 1 && src->ndims <= NCCL_RESHARD_MAX_TENSOR_DIMS, -1,
-                     "%s: ndims (%d) out of range [1, %d]", apiName, src->ndims, NCCL_RESHARD_MAX_TENSOR_DIMS);
-
-  setup->ndims = src->ndims;
-  setup->elementSize = getNcclDtSize(src->dtype);
+  NCCL_M2N_CHECK_ARG(src != nullptr && dst != nullptr && setup != nullptr, -1,
+                     "%s: src, dst, and setup must be non-null", apiName);
+  NCCL_M2N_CHECK(reshardCopyPublicTensor(apiName, "src", src, setup->srcLocalShape, &setup->srcMesh, setup->srcMeshDims,
+                                         &setup->srcTensor, setup->srcPlacements));
+  NCCL_M2N_CHECK(reshardCopyPublicTensor(apiName, "dst", dst, setup->dstLocalShape, &setup->dstMesh, setup->dstMeshDims,
+                                         &setup->dstTensor, setup->dstPlacements));
+  NCCL_M2N_CHECK(validateReshardMeshDims(&setup->srcMesh, &setup->dstMesh));
+  NCCL_M2N_CHECK_ARG(setup->srcTensor.ndims == setup->dstTensor.ndims, -1,
+                     "%s: src->ndims (%d) and dst->ndims (%d) must match", apiName, setup->srcTensor.ndims,
+                     setup->dstTensor.ndims);
+  NCCL_M2N_CHECK_ARG(setup->srcTensor.dtype == setup->dstTensor.dtype, -1,
+                     "%s: src->dtype (%d) and dst->dtype (%d) must match", apiName, (int)setup->srcTensor.dtype,
+                     (int)setup->dstTensor.dtype);
+  setup->ndims = setup->srcTensor.ndims;
+  setup->elementSize = getNcclDtSize(setup->srcTensor.dtype);
   NCCL_M2N_CHECK_ARG(setup->elementSize != 0, -1, "%s: unsupported data type %d", apiName, (int)src->dtype);
 
-  setup->srcMesh = *src->mesh;
-  setup->dstMesh = *dst->mesh;
-  setup->srcTensor = *src;
-  setup->dstTensor = *dst;
-  setup->srcTensor.mesh = &setup->srcMesh;
-  setup->dstTensor.mesh = &setup->dstMesh;
-  NCCL_M2N_CHECK(reshardFixFullyReplicated(&setup->srcMesh, setup->srcTensor.placements));
-  NCCL_M2N_CHECK(reshardFixFullyReplicated(&setup->dstMesh, setup->dstTensor.placements));
+  NCCL_M2N_CHECK(reshardFixFullyReplicated(&setup->srcMesh, setup->srcPlacements));
+  NCCL_M2N_CHECK(reshardFixFullyReplicated(&setup->dstMesh, setup->dstPlacements));
   NCCL_M2N_CHECK(validateReshardPlacement(&setup->srcTensor, apiName, "src"));
   NCCL_M2N_CHECK(validateReshardPlacement(&setup->dstTensor, apiName, "dst"));
   return ncclSuccess;

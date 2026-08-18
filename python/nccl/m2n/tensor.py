@@ -228,7 +228,7 @@ class DistTensor:
         return self._mesh
 
     @property
-    def placements(self) -> tuple[int, int]:
+    def placements(self) -> tuple[int, ...]:
         return self._placements
 
     @property
@@ -237,14 +237,15 @@ class DistTensor:
 
     def as_binding(self) -> _PreparedDistTensor:
         mesh_struct = self._mesh.to_binding()
-        local_shape = list(self._local_shape) + [1] * (MAX_TENSOR_DIMS - self.ndims)
         struct = _m2n_bindings.DistTensor()
         struct.dataPtr = int(self._data_ptr)
-        struct.localShape = tuple(local_shape)
+        struct.localShape = self._local_shape
         struct.ndims = self.ndims
         struct.dtype = int(self._dtype)
         struct.mesh = int(mesh_struct.ptr)
-        struct.placements = tuple(int(p) for p in self._placements)
+        struct.placements = tuple(
+            int(p) for p in self._placements[: self._mesh.ndims]
+        )
         return _PreparedDistTensor(mesh=mesh_struct, struct=struct)
 
     def __repr__(self) -> str:

@@ -636,7 +636,7 @@ __forceinline__ __device__ void copyRecvTokenData(
 // Templated on the wire dtype (kTokenDtype) like combine/HT. All element widths come
 // from size_u8<kTokenDtype>(); the read stride is the input element width whether or
 // not the output is FP8 (so FP32-input quantization reads the correct stride too).
-template <ncclEpDispQuant_t kRecipe, int kHidden, ncclEpLayout_t kLayout, bool kNvlinkOnly,
+template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumTopk, ncclEpLayout_t kLayout, bool kNvlinkOnly,
           typename TopkIdxT, ncclDataType_t kTokenDtype, typename ScaleT>
 __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
   const void* inData,
@@ -650,12 +650,15 @@ __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
   int* rankCountersBase, int* rankDone, int nextRecvCntBufSize, int* recvStats, int64_t* waitStats,
   LowLatencyEpochState* epochState, size_t payloadSlotStride, size_t signalSlotStride,
   // CONFIG
-  int numTokens, int scalesPerToken, int maxTokensPerRank, int numTopk, int numExperts, int currRank, int numRanks,
+  int numTokens, int scalesPerToken, int maxTokensPerRank, int numExperts, int currRank, int numRanks,
   int numWarpGroups, int numWarpsPerGroup, bool roundScale, ncclEpExpertIdKind_t recvTopkIdxKind, int phases,
   int numComms, ncclDevComm* devComms, const ncclWindow_t* windows, unsigned signalsBase, uint64_t timeoutCycles,
   // Zero-copy dispatch output (rank-major + nvlinkOnly): each available token
   // or QUANT_FWD scale window is written directly to its peer output.
   ncclWindow_t recvDataWindow, size_t recvDataOffset, ncclWindow_t rcvScalesWin, size_t rcvScalesOffs) {
+    EP_STATIC_ASSERT(kNumTopk > 0 && kNumTopk <= combine_smem::kWarpSize - kLlDispatchControlWarps,
+                     "LL dispatch top-k must leave one control warp");
+    constexpr int numTopk = kNumTopk;
     const auto smId = static_cast<int>(blockIdx.x);
     const auto threadId = static_cast<int>(threadIdx.x);
     const auto warpId = threadId / 32, laneId = get_lane_id();
@@ -704,7 +707,7 @@ __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
     EP_DEVICE_ASSERT(numBytesPerMsg % sizeof(int4) == 0);
 
     // Rank counts
-    constexpr int kNumMaxWarpGroups = 32;
+    constexpr int kNumMaxWarpGroups = kLlDispatchMaxWarpGroups;
     __shared__ int sharedNumTokensSentPerRank[kNumMaxWarpGroups];
 
     // Sending phase
@@ -986,7 +989,7 @@ LOW_LATENCY_DISPATCH_RECV:
 
         // Wait tokens to arrive
         int numRecvTokens;
-        EP_DEVICE_ASSERT(numWarpsPerGroup > 1 and numWarpGroups < 15);
+        EP_DEVICE_ASSERT(numWarpsPerGroup > 1 and numWarpGroups <= kLlDispatchMaxWarpGroups);
         if (subWarpId == 1 and laneId == 0) {
             numRecvTokens = waitForRecvTokensRelaxed(
                 srcRank,
@@ -1894,7 +1897,7 @@ __device__ __forceinline__ void decodeAndAccumulateNvfp4(
     }
 }
 
-template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, ncclEpLayout_t kLayout, typename TopkIdxT, ncclDataType_t kTokenDtype,
+template <bool kUseLogFMT, int kHidden, int kNumTopk, int kNumMaxUnrolls, ncclEpLayout_t kLayout, typename TopkIdxT, ncclDataType_t kTokenDtype,
           ncclEpCombQuant_t kRecipe>
 __device__ __forceinline__ void combine_kernel_impl( // INPUT
   const void* inData, const float* inGlobalScales, const int* srcInfo, const int64_t* layoutRange, const TopkIdxT* inTopkIdx,
@@ -1906,7 +1909,7 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
   int* atomicCleanFlag, int nextRecvCntBufSize, int64_t* waitStats,
   LowLatencyEpochState* epochState, size_t payloadSlotStride, size_t signalSlotStride,
   // CONFIG
-  int numCombinedTokens, int hidden, int numTopk, int maxTokensPerRank, int numExperts, int currRank, int numRanks,
+  int numCombinedTokens, int hidden, int maxTokensPerRank, int numExperts, int currRank, int numRanks,
   int numWarpGroups, int numWarpsPerGroup, int phases, bool zeroCopy, int numComms, ncclDevComm* devComms,
   const ncclWindow_t* windows, unsigned signalsBase, uint64_t timeoutCycles) {
 #if !defined(__CUDA_ARCH_FAMILY_SPECIFIC__) || \
@@ -1917,6 +1920,7 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
         return;
     }
 #endif
+    constexpr int numTopk = kNumTopk;
     // Token dtype derivations
     constexpr int kElemBytes = (kTokenDtype == ncclFloat32) ? 4 : 2;
 
@@ -2313,7 +2317,7 @@ LOW_LATENCY_COMBINE_RECV:
 
         int stageIdx = 0, topkIdxByLane = 0;
         EP_STATIC_ASSERT(
-            kNumMaxTopk <= kWarpSize,
+            kNumTopk <= kWarpSize,
             "numTopk must not exceed warp size: warpMarkFirstOccurrence relies on active "
             "lanes (0..numTopk-1) having lower IDs than inactive lanes (numTopk..31)");
 

@@ -23,15 +23,15 @@ namespace jit {
 
 constexpr const char* kLlCombineJitEntryName = "nccl_ep_jit_ll_combine_kernel";
 
-// Compile-time bounds the combine kernel is specialized on: the maximum topk
-// it supports and the inner-loop unroll factor.
-constexpr int kLlCombineMaxTopk = 9;
+// The inner-loop unroll factor is compile-time fixed; top-k is passed to the
+// source generator so each handle receives an exact specialization.
 constexpr int kLlCombineMaxUnrolls = 4;
 
 inline std::string ll_combine_jit_source(
     bool useLogFmt,
     const char* recipe_literal,
     int hidden,
+    int num_topk,
     ncclEpLayout_t layout,
     bool topkIdxIsInt64,
     ncclDataType_t tokenDtype) {
@@ -48,7 +48,7 @@ inline std::string ll_combine_jit_source(
         << "  nccl_ep::ll::combine_kernel_impl<\n"
         << "      " << ::nccl_ep::jit::bool_literal(useLogFmt) << ",\n"
         << "      " << hidden << ",\n"
-        << "      " << kLlCombineMaxTopk << ",\n"
+        << "      " << num_topk << ",\n"
         << "      " << kLlCombineMaxUnrolls << ",\n"
         << "      " << layout_literal << ",\n"
         << "      " << topk_type << ",\n"
@@ -61,7 +61,7 @@ inline std::string ll_combine_jit_source(
         << "      p.sendOff, p.recvOff, p.recvFlagOff,\n"
         << "      p.atomicCleanFlag, p.nextRecvCntBufSize,\n"
         << "      p.waitStats, p.epochState, p.payloadSlotStride, p.signalSlotStride,\n"
-        << "      p.numCombinedTokens, p.hidden, p.numTopk, p.maxTokensPerRank,\n"
+        << "      p.numCombinedTokens, p.hidden, p.maxTokensPerRank,\n"
         << "      p.numExperts, p.currRank, p.numRanks,\n"
         << "      p.numWarpGroups, p.numWarpsPerGroup,\n"
         << "      p.phases, p.zeroCopy, p.numComms,\n"
@@ -78,6 +78,7 @@ inline ncclResult_t launch_ll_combine(
     ncclEpLayout_t layout,
     bool topkIdxIsInt64,
     ncclDataType_t tokenDtype,
+    int num_topk,
     int numSms,
     int numWarps,
     int dynamic_smem_bytes,
@@ -93,13 +94,15 @@ inline ncclResult_t launch_ll_combine(
         std::ostringstream name;
         name << "ll_combine"
              << "_hdim" << hidden << ::nccl_ep::jit::layout_name_tag(layout)
+             << "_topk" << num_topk
              << (useLogFmt ? "_logfmt" : "")
              << (topkIdxIsInt64 ? "_topk64" : "_topk32")
              << ::nccl_ep::jit::token_dtype_name_tag(tokenDtype)
              << (qrecipe == NCCL_EP_COMB_QUANT_NVFP4 ? "_nvfp4" : "");
         return name.str();
     }();
-    const std::string source = ll_combine_jit_source(useLogFmt, recipe_literal, hidden, layout, topkIdxIsInt64, tokenDtype);
+    const std::string source =
+        ll_combine_jit_source(useLogFmt, recipe_literal, hidden, num_topk, layout, topkIdxIsInt64, tokenDtype);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ll_combine";

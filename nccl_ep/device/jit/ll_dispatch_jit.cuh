@@ -27,6 +27,7 @@ constexpr const char* kLlDispatchJitEntryName = "nccl_ep_jit_ll_dispatch_kernel"
 inline std::string ll_dispatch_jit_source(
     const DispatchKernelSpec& kernel_spec,
     int hidden,
+    int num_topk,
     ncclEpLayout_t layout,
     bool nvlinkOnly,
     bool topkIdxIsInt64,
@@ -48,6 +49,7 @@ inline std::string ll_dispatch_jit_source(
         << "  nccl_ep::ll::dispatch_kernel_impl<\n"
         << "      " << kernel_spec.recipe_source_literal << ",\n"
         << "      " << hidden << ",\n"
+        << "      " << num_topk << ",\n"
         << "      " << layout_literal << ",\n"
         << "      " << ::nccl_ep::jit::bool_literal(nvlinkOnly) << ",\n"
         << "      " << topk_type << ",\n"
@@ -63,7 +65,7 @@ inline std::string ll_dispatch_jit_source(
         << "      p.sendOff, p.recvOff, p.recvCntOff,\n"
         << "      p.rankCountersBase, p.rankDone, p.nextRecvCntBufSize,\n"
         << "      p.recvStats, p.waitStats, p.epochState, p.payloadSlotStride, p.signalSlotStride,\n"
-        << "      p.numTokens, p.scalesPerToken, p.maxTokensPerRank, p.numTopk, p.numExperts,\n"
+        << "      p.numTokens, p.scalesPerToken, p.maxTokensPerRank, p.numExperts,\n"
         << "      p.currRank, p.numRanks,\n"
         << "      p.numWarpGroups, p.numWarpsPerGroup,\n"
         << "      p.roundScale, p.recvTopkIdxKind, p.phases, p.numComms,\n"
@@ -80,6 +82,7 @@ inline ncclResult_t launch_ll_dispatch(
     bool topkIdxIsInt64,
     const DispatchKernelSpec& kernel_spec,
     ncclDataType_t tokenDtype,
+    int num_topk,
     int numSms,
     int numWarps,
     const dispatch_kernel_args_t& args,
@@ -89,6 +92,7 @@ inline ncclResult_t launch_ll_dispatch(
         std::ostringstream name;
         name << "ll_dispatch"
              << "_hdim" << hidden << ::nccl_ep::jit::layout_name_tag(layout)
+             << "_topk" << num_topk
              << "_recipe" << kernel_spec.recipe_cache_tag
              << "_payload" << kernel_spec.payload_cache_tag
              << "_scale" << kernel_spec.scale_cache_tag
@@ -98,7 +102,7 @@ inline ncclResult_t launch_ll_dispatch(
         return name.str();
     }();
     const std::string source = ll_dispatch_jit_source(
-        kernel_spec, hidden, layout, nvlinkOnly, topkIdxIsInt64, tokenDtype);
+        kernel_spec, hidden, num_topk, layout, nvlinkOnly, topkIdxIsInt64, tokenDtype);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ll_dispatch";

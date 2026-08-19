@@ -118,7 +118,6 @@ struct dispatch_kernel_args_t {
     // Derived from validated inputs->scales->sizes[1].
     int scalesPerToken;
     int maxTokensPerRank;
-    int numTopk;
     int numExperts;
     int currRank;
     int numRanks;
@@ -166,7 +165,6 @@ struct combine_kernel_args_t {
     // CONFIG
     int numCombinedTokens;
     int hidden;
-    int numTopk;
     int maxTokensPerRank;
     int numExperts;
     int currRank;

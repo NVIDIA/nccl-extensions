@@ -35,15 +35,21 @@ ncclResult_t call_dispatch(
     const DispatchParams& params,
     ncclEpDispQuant_t recipe,
     cudaStream_t stream) {
-    constexpr int kNumMaxTopK = 9;
+    if (params.numTopk <= 0 || params.numTopk > MAX_NUM_TOPK) {
+        std::fprintf(stderr, "ncclEpDispatch: LL top-k %d is outside [1, %d]\n", params.numTopk, MAX_NUM_TOPK);
+        return ncclInvalidArgument;
+    }
     const int numWarpGroups = ceil_div(params.numExperts, params.numDeviceSms);
-    const int numWarpsPerGroup = 32 / numWarpGroups;
-    EP_HOST_ASSERT(numWarpGroups > 0 and numWarpsPerGroup > 0);
-    EP_HOST_ASSERT(kNumMaxTopK + 1 <= numWarpGroups * numWarpsPerGroup);
+    const int numWarpsPerGroup = combine_smem::kWarpSize / numWarpGroups;
+    if (numWarpGroups <= 0 || numWarpsPerGroup <= 0) return ncclInvalidUsage;
 
     const int numWarps = numWarpGroups * numWarpsPerGroup;
     const int numSms = ceil_div(params.numExperts, numWarpGroups);
-    EP_HOST_ASSERT(params.numTopk <= kNumMaxTopK);
+    if (params.numTopk + kLlDispatchControlWarps > numWarps) {
+        std::fprintf(stderr, "ncclEpDispatch: LL top-k %d needs %d forwarding/control warps, geometry provides %d\n",
+                     params.numTopk, params.numTopk + kLlDispatchControlWarps, numWarps);
+        return ncclInvalidUsage;
+    }
 
     // Workspace: [rankSentCnt | rankArrivedCnt | rankDone(=expertDone)].
     auto rankCountersBase = static_cast<int*>(params.workspace);
@@ -80,7 +86,6 @@ ncclResult_t call_dispatch(
     args.numTokens = params.numTokens;
     args.scalesPerToken = params.scalesPerToken;
     args.maxTokensPerRank = params.maxTokensPerRank;
-    args.numTopk = params.numTopk;
     args.numExperts = params.numExperts;
     args.currRank = params.currRank;
     args.numRanks = params.numRanks;
@@ -113,6 +118,7 @@ ncclResult_t call_dispatch(
         params.topkIdxIsInt64,
         kernel_spec,
         params.tokenDtype,
+        params.numTopk,
         numSms,
         numWarps,
         args,
@@ -134,8 +140,12 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
             params.numDeviceSms, params.numExperts, params.numCombinedTokens);
         return ncclInvalidArgument;
     }
+    if (params.numTopk <= 0 || params.numTopk > MAX_NUM_TOPK || params.numTopk > combine_smem::kWarpSize) {
+        std::fprintf(stderr, "ncclEpCombine: LL top-k %d is outside [1, %d]\n", params.numTopk, MAX_NUM_TOPK);
+        return ncclInvalidArgument;
+    }
     const int numWarpGroups = ceil_div(params.numExperts, params.numDeviceSms);
-    const int requestedWarpsPerGroup = 32 / numWarpGroups;
+    const int requestedWarpsPerGroup = combine_smem::kWarpSize / numWarpGroups;
     const int numRecvPerSm = ceil_div(params.numCombinedTokens, params.numDeviceSms);
     if (numWarpGroups <= 0 || requestedWarpsPerGroup <= 0 || numRecvPerSm < 0) {
         std::fprintf(
@@ -177,13 +187,6 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
             sizeof(int), NUM_WORKSPACE_BYTES, params.workspace);
         return ncclInvalidArgument;
     }
-    if (params.numTopk < 0 || params.numTopk > jit::kLlCombineMaxTopk) {
-        std::fprintf(
-            stderr,
-            "[nccl_ep] LL combine top-k is unsupported: num_topk=%d, maximum=%d.\n",
-            params.numTopk, jit::kLlCombineMaxTopk);
-        return ncclInvalidArgument;
-    }
     if (params.zeroCopy && params.useLogFmt) {
         std::fprintf(stderr, "[nccl_ep] LL combine does not support zero-copy with LogFMT.\n");
         return ncclInvalidArgument;
@@ -216,7 +219,6 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
     args.signalSlotStride = params.signalSlotStride;
     args.numCombinedTokens = params.numCombinedTokens;
     args.hidden = hidden;
-    args.numTopk = params.numTopk;
     args.maxTokensPerRank = params.maxTokensPerRank;
     args.numExperts = params.numExperts;
     args.currRank = params.currRank;
@@ -239,6 +241,7 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
         params.layout,
         params.topkIdxIsInt64,
         params.tokenDtype,
+        params.numTopk,
         numSms,
         numWarps,
         smem_size,

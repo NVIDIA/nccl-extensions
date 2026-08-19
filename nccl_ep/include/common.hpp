@@ -125,6 +125,12 @@ constexpr int kDsFp8E3M4ElementsPerScale = 128;
 // low-latency kernels
 namespace ll {
 
+// LL dispatch/send maps one 32-thread warp to each forwarding top-k entry and
+// reserves one control warp. For send/recv phase synchronization, its warps
+// split into groups of at least two; named barriers currently limit this to 14.
+constexpr int kLlDispatchControlWarps = 1;
+constexpr int kLlDispatchMaxWarpGroups = 14;
+
 // Helper function for alignment (host/device compatible)
 template <typename dtype_t>
 __host__ __device__ constexpr dtype_t align(dtype_t a, dtype_t b) {

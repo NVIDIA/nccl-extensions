@@ -118,6 +118,21 @@ run_ep_bench_layout_size_sweep low-latency em rm
 # not the size axis — already swept above).
 run_ep_bench_variants low-latency 128
 
+# Exact LL top-k specialization at the dispatch geometry boundary (31 forwarding
+# warps plus one control warp). Keep this targeted smoke test at the canonical
+# small-batch BF16 configuration rather than multiplying the full layout × batch
+# × dtype sweep.
+for layout in em rm; do
+  run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+    --algorithm low-latency --layout "$layout" \
+    --tokens 128 --hidden 7168 --top-k 31 --experts 256 --validate
+done
+# LL accepts both routing-index widths; exercise the non-default ABI path for
+# the new top-k specialization as well.
+run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+  --algorithm low-latency --layout em \
+  --tokens 128 --hidden 7168 --top-k 31 --experts 256 --topk-idx-int32 --validate
+
 # Experimental NVFP4 combine requires FP4-capable hardware. Pre-Tyche enables this one
 # end-to-end integration case; unit tests carry the detailed layout coverage.
 if [[ "${NCCL_EP_BENCH_NVFP4:-0}" == "1" ]]; then

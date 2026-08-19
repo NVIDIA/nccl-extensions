@@ -1762,7 +1762,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         if (in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
             // This reflects the current limitation of the LL backend
             // TODO: validate that the limitation is valid and if need - relax it in a follow-up fix
-            constexpr int llMaxWarpGroupsLimit = 14;
+            constexpr int llMaxWarpGroupsLimit = nccl_ep::ll::kLlDispatchMaxWarpGroups;
             const int numWarpGroups = (in_config->num_experts + (in_config->max_num_sms - 1)) / in_config->max_num_sms;
             if (numWarpGroups > llMaxWarpGroupsLimit) {
                 const int required_sms = (in_config->num_experts + (llMaxWarpGroupsLimit - 1)) / llMaxWarpGroupsLimit;
@@ -2592,9 +2592,38 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
     return ncclSuccess;
 }
 
+static ncclResult_t validate_ll_geometry(const ncclEpGroup_t ep_group, int num_topk) {
+    if (num_topk <= 0 || num_topk > ep_group->config.num_experts || num_topk > MAX_NUM_TOPK) {
+        fprintf(stderr,
+                "ncclEpInitHandle: LL top-k %d must be in [1, min(num_experts=%u, MAX_NUM_TOPK=%d)]\n",
+                num_topk, ep_group->config.num_experts, MAX_NUM_TOPK);
+        return ncclInvalidArgument;
+    }
+
+    const int num_device_sms = static_cast<int>(ep_group->comm_num_sms);
+    if (num_device_sms <= 0) return ncclInvalidUsage;
+    const int num_warp_groups = (ep_group->config.num_experts + num_device_sms - 1) / num_device_sms;
+    if (num_warp_groups <= 0 || num_warp_groups > nccl_ep::ll::kLlDispatchMaxWarpGroups) {
+        fprintf(stderr, "ncclEpInitHandle: LL warp-group geometry is unsupported: num_experts=%u, comm_sms=%d, warp_groups=%d\n",
+                ep_group->config.num_experts, num_device_sms, num_warp_groups);
+        return ncclInvalidUsage;
+    }
+    const int num_warps_per_group = nccl_ep::ll::combine_smem::kWarpSize / num_warp_groups;
+    const int num_warps = num_warp_groups * num_warps_per_group;
+    if (num_warps_per_group <= 0 || num_topk + nccl_ep::ll::kLlDispatchControlWarps > num_warps) {
+        fprintf(stderr,
+                "ncclEpInitHandle: LL top-k geometry is unsupported: top-k=%d, num_experts=%u, comm_sms=%d, "
+                "warp_groups=%d, launched_warps=%d, forwarding_warps=%d\n",
+                num_topk, ep_group->config.num_experts, num_device_sms, num_warp_groups, num_warps,
+                std::max(0, num_warps - nccl_ep::ll::kLlDispatchControlWarps));
+        return ncclInvalidUsage;
+    }
+    return ncclSuccess;
+}
+
 static ncclResult_t
 ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor_t* handle_mem, int num_topk) {
-    assert(num_topk > 0 && "LL mode requires num_topk > 0 (pass top_k to ncclEpInitHandle)");
+    NCCLCHECK(validate_ll_geometry(ep_group, num_topk));
 
     auto layout = nccl_ep::LowLatencyLayout(
         ep_group->config.max_dispatch_tokens_per_rank,

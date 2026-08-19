@@ -2595,9 +2595,6 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
 static ncclResult_t
 ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor_t* handle_mem, int num_topk) {
     assert(num_topk > 0 && "LL mode requires num_topk > 0 (pass top_k to ncclEpInitHandle)");
-    assert(
-        (ep_group->config.max_dispatch_tokens_per_rank * ep_group->num_local_experts) % 4 == 0 &&
-        "TMA requires the number of tokens to be multiple of 4");
 
     auto layout = nccl_ep::LowLatencyLayout(
         ep_group->config.max_dispatch_tokens_per_rank,

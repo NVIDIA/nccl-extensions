@@ -2075,10 +2075,12 @@ static void preReduceRankMajor(
     unsigned int top_k,
     int nRanks,
     ncclDataType_t token_dtype = ncclBfloat16) {
+    // size_t: nRanks * max_tpr * hidden passes 2^32 at the large batch sizes, and a 32-bit
+    // product here under-allocates eo_host while the loop below still walks the full extent.
     const size_t* out0_sizes = dispatch_outputs.tokens->sizes;
-    const unsigned int max_tpr = out0_sizes[1];
-    const unsigned int hidden = out0_sizes[2];
-    const unsigned int total_slots = out0_sizes[0] * max_tpr;
+    const size_t max_tpr = out0_sizes[1];
+    const size_t hidden = out0_sizes[2];
+    const size_t total_slots = out0_sizes[0] * max_tpr;
     size_t eb = tokenElemBytes(token_dtype);
 
     void *out1_data, *out2_data, *local0_data;
@@ -2095,25 +2097,37 @@ static void preReduceRankMajor(
 
     void* eo_data;
     NCCLCHECK(epGetTensorData(alloc, combine_inputs.tokens, &eo_data));
-    char* eo_host = new char[total_slots * hidden * eb];
-    CUDACHECK(cudaMemcpy(eo_host, eo_data, total_slots * hidden * eb, cudaMemcpyDeviceToHost));
+    const size_t data_bytes = total_slots * hidden * eb;
+    char* eo_host = new char[data_bytes];
+    CUDACHECK(cudaMemcpy(eo_host, eo_data, data_bytes, cudaMemcpyDeviceToHost));
 
     for (int r = 0; r < nRanks; r++) {
+        // A count past max_tpr would take slot beyond total_slots and walk off eo_host.
+        if (recv_cnt[r] < 0 || static_cast<size_t>(recv_cnt[r]) > max_tpr) {
+            printf(
+                "Failed: src_rank_counters[%d]=%d exceeds %zu slots per rank %s:%d\n",
+                r,
+                recv_cnt[r],
+                max_tpr,
+                __FILE__,
+                __LINE__);
+            exit(EXIT_FAILURE);
+        }
         for (int s = 0; s < recv_cnt[r]; s++) {
-            unsigned int slot = (unsigned)r * max_tpr + (unsigned)s;
+            const size_t slot = static_cast<size_t>(r) * max_tpr + static_cast<size_t>(s);
             float weight_sum = 0.0f;
             for (unsigned int k = 0; k < top_k; k++) {
                 if (recv_idx[slot * top_k + k] >= 0) weight_sum += recv_wgt[slot * top_k + k];
             }
-            for (unsigned int h = 0; h < hidden; h++) {
-                size_t idx = static_cast<size_t>(slot) * hidden + h;
+            for (size_t h = 0; h < hidden; h++) {
+                const size_t idx = slot * hidden + h;
                 float val = tokenElemToFloat(eo_host, idx, token_dtype);
                 floatToTokenElem(eo_host, idx, val * weight_sum, token_dtype);
             }
         }
     }
 
-    CUDACHECK(cudaMemcpy(eo_data, eo_host, total_slots * hidden * eb, cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(eo_data, eo_host, data_bytes, cudaMemcpyHostToDevice));
 
     delete[] eo_host;
     delete[] recv_cnt;

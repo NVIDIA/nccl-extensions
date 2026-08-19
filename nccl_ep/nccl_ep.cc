@@ -890,6 +890,29 @@ struct ncclEpGroup {
           num_dispatch_signals(0), clean_barrier_signal_base(0), ht_buffers{}, eager_mode(false) {}
 };
 
+// The intra-LSA mega buffer is the one allocation sized directly by the resolved
+// per-rank recv budget. With max_recv_tokens_per_rank=NCCL_EP_AUTO that budget is
+// the theoretical worst case, so a failure here is usually the budget rather than
+// a genuinely undersized device.
+static void epWarnMegaBufferAllocFailed(ncclEpGroup_t group, size_t bytes) {
+    fprintf(
+        stderr,
+        "NCCL EP: failed to allocate the HT intra-LSA staging buffer (%.2f MiB) for a recv "
+        "budget of %u slots per rank\n",
+        static_cast<double>(bytes) / (1024.0 * 1024.0),
+        group->config.max_recv_tokens_per_rank);
+    if (!group->eager_mode) return;
+    fprintf(
+        stderr,
+        "NCCL EP: that budget was derived from max_recv_tokens_per_rank=NCCL_EP_AUTO as "
+        "nRanks * max_dispatch_tokens_per_rank * max(num_topk, 1) = %d * %u * %u, the worst "
+        "case in which every rank routes every token to this rank. If your routing never "
+        "reaches that bound, set max_recv_tokens_per_rank explicitly to a measured peak.\n",
+        group->nRanks,
+        group->config.max_dispatch_tokens_per_rank,
+        group->config.num_topk > 0 ? group->config.num_topk : 1u);
+}
+
 // For tensors w/o external window, lazily bind the internal GIN window and offset.
 // Tensors created from a user window already carry their own window; resolve
 // their local data pointer here once a group/comm is available.
@@ -1054,7 +1077,11 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
 
     size_t mega_sz = dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned + combine_token_aligned +
                      combine_prob_aligned;
-    NCCL_CHECK_RESULT(ncclMemAlloc(&ep_group->ht_buffers.ipc_mega_buffer, mega_sz));
+    {
+        ncclResult_t mega_res = ncclMemAlloc(&ep_group->ht_buffers.ipc_mega_buffer, mega_sz);
+        if (mega_res != ncclSuccess) epWarnMegaBufferAllocFailed(ep_group, mega_sz);
+        NCCL_CHECK_RESULT(mega_res);
+    }
     ep_group->ht_buffers.ipc_mega_buffer_size = mega_sz;
 
     uint8_t* mega_base = static_cast<uint8_t*>(ep_group->ht_buffers.ipc_mega_buffer);

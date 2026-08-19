@@ -4,14 +4,16 @@
 # Requires NCCL to be built first (see the vendored submodule at
 # ../third_party/nccl, or point NCCL_HOME at your own build).
 
-# NCCL_SUBMODULE_HOME points at the vendored NCCL checkout (see
-# third_party/nccl at the repo root), used both for NCCL's shared build
-# helpers (common.mk) and as the default NCCL_HOME below.
-NCCL_SUBMODULE_HOME := $(abspath ../third_party/nccl)
-
-# std::optional and other C++17 features used in nccl_moe.cc
+# Keep the host compiler defaults aligned with NCCL without loading build
+# helpers from the submodule itself.
+NCCL_EXTENSIONS_ROOT := $(abspath ..)
+NCCL_SUBMODULE_HOME := $(NCCL_EXTENSIONS_ROOT)/third_party/nccl
 CXXSTD := -std=c++17
-include $(NCCL_SUBMODULE_HOME)/makefiles/common.mk
+include ../makefiles/common.mk
+
+NCCL_HOME ?= $(NCCL_SUBMODULE_HOME)/build
+NCCL_INCDIR := $(NCCL_HOME)/include
+NCCL_LIBDIR := $(NCCL_HOME)/lib
 
 # NVCC_CXX_COMPILER: nvcc -ccbin; from CXX if one token, else g++
 ifeq ($(words $(CXX)),1)
@@ -42,25 +44,20 @@ ifeq ($(origin NVCC_GENCODE),file)
   endif
 endif
 
-.PHONY: all clean lib ep_test ep_bench nccl-submodule
+.PHONY: all build clean lib ep_test ep_bench
 
 # Build layout:
-#   NCCL_HOME          — input: NCCL core headers + libnccl.so
-#   NCCL_EP_BUILDDIR   — output: NCCL EP artifacts
-# Defaults to the vendored NCCL submodule's build output; override NCCL_HOME
-# (and optionally BUILDDIR) to point at your own from-source NCCL build.
+#   NCCL_HOME — input: NCCL core headers + libnccl.so
+#   BUILDDIR  — output: NCCL EP artifacts
+# NCCL_HOME defaults to the vendored NCCL build; BUILDDIR defaults to this
+# repository's shared build directory. They can be overridden independently.
 
-BUILDDIR ?= $(NCCL_SUBMODULE_HOME)/build
-NCCL_HOME ?= $(BUILDDIR)
-NCCL_EP_BUILDDIR ?= $(BUILDDIR)
+BUILDDIR ?= $(NCCL_EXTENSIONS_ROOT)/build
 
-NCCL_INCDIR := $(NCCL_HOME)/include
-NCCL_LIBDIR := $(NCCL_HOME)/lib
-
-OBJDIR := $(NCCL_EP_BUILDDIR)/obj/nccl_ep
-LIBDIR := $(NCCL_EP_BUILDDIR)/lib
-INCDIR := $(NCCL_EP_BUILDDIR)/include
-DST_DIR := $(NCCL_EP_BUILDDIR)/test/nccl_ep
+OBJDIR := $(BUILDDIR)/obj/nccl_ep
+LIBDIR := $(BUILDDIR)/lib
+INCDIR := $(BUILDDIR)/include
+DST_DIR := $(BUILDDIR)/test/nccl_ep
 JIT_DIR := $(INCDIR)/nccl_ep
 JIT_CONFIG_HEADER := $(JIT_DIR)/config.h
 
@@ -98,7 +95,7 @@ NCCL_EP_DEVICE_INCFLAGS = $(NCCL_EP_BASE_INCFLAGS) -I.
 # CUDA code MUST use -fvisibility=hidden for kernel registration to work correctly.
 # The ncclEp* API is in nccl_ep.cc (compiled with CXXFLAGS), so it still gets exported.
 NVCUFLAGS := $(NVCC_GENCODE) --extended-lambda $(NCCL_EP_DEVICE_INCFLAGS) --expt-relaxed-constexpr --compiler-options "-fPIC -fvisibility=hidden" -ccbin $(NVCC_CXX_COMPILER) $(CXXSTD)
-CXXFLAGS += $(INCFLAGS) $(NCCL_EP_JIT_DEFS) -I$(CUDA_INC) -I$(CUDA_INC)/cccl -fPIC -fvisibility=default
+CXXFLAGS += $(INCFLAGS) $(NCCL_EP_JIT_DEFS) -fvisibility=default
 
 # Optional warp-level timing instrumentation (adds cudaMalloc + cudaMemcpy per kernel launch).
 # Usage: make WARP_TIMING=1
@@ -154,16 +151,7 @@ HEADERS := include/nccl_ep.h
 HEADER_TARGETS := $(HEADERS:include/%=$(INCDIR)/%)
 # Build targets
 all: lib ep_test ep_bench
-
-# One-time: build the vendored NCCL submodule so the default NCCL_HOME
-# (third_party/nccl/build) has artifacts. Not a prerequisite of all/lib —
-# building NCCL is a deliberate, separate step.
-nccl-submodule:
-	@if [ ! -f $(NCCL_SUBMODULE_HOME)/makefiles/version.mk ]; then \
-		echo "error: $(NCCL_SUBMODULE_HOME) is empty. Run: git submodule update --init third_party/nccl" >&2; \
-		exit 1; \
-	fi
-	$(MAKE) -C $(NCCL_SUBMODULE_HOME) -j src.build
+build: lib
 
 lib: $(LIBTARGET) $(SOLIBTARGET) $(SOLIBLINKS) $(HEADER_TARGETS) $(NCCL_EP_JIT_HEADER_TARGETS)
 
@@ -219,7 +207,7 @@ $(JIT_CONFIG_HEADER):
 	@mkdir -p $(dir $@)
 	@printf '%s\n' '#pragma once' > $@
 	@printf '#define NCCL_EP_JIT_SOURCE_DIR "%s"\n' "$(abspath $(JIT_DIR))" >> $@
-	@printf '#define NCCL_EP_JIT_BUILD_INCLUDE_DIR "%s"\n' "$(abspath $(INCDIR))" >> $@
+	@printf '#define NCCL_EP_JIT_BUILD_INCLUDE_DIR "%s"\n' "$(abspath $(NCCL_INCDIR))" >> $@
 	@printf '#define NCCL_EP_JIT_CUDA_INCLUDE_DIR "%s"\n' "$(abspath $(CUDA_INC))" >> $@
 
 # Staged top-level headers (common.hpp, ep_enums.h) from include/

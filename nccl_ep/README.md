@@ -253,8 +253,7 @@ This repo vendors a compatible NCCL build via git submodule at
 `third_party/nccl`. Build it once:
 
 ```bash
-git submodule update --init --recursive third_party/nccl third_party/googletest
-make -C nccl_ep nccl-submodule   # -> third_party/nccl/build/{include,lib}
+make nccl-submodule   # -> third_party/nccl/build/{include,lib}
 ```
 
 The EP unit tests use the independently pinned GoogleTest submodule at
@@ -278,11 +277,14 @@ make -C nccl_ep MPI=1 \
 ```
 
 Once `make` command is successfuly completed, the following files will be created:
-- `${NCCL_HOME}/lib/libnccl_ep.a` - Static library
-- `${NCCL_HOME}/lib/libnccl_ep.so` - Shared library (for Python bindings)
-- `${NCCL_HOME}/include/nccl_ep.h` - C API header
-- `${NCCL_HOME}/test/nccl_ep/ep_test` - Test application for both Low-Latency and High-Throughput modes
-- `${NCCL_HOME}/test/nccl_ep/ep_bench` - Benchmark application for both Low-Latency and High-Throughput modes
+- `${BUILDDIR}/lib/libnccl_ep.a` - Static library
+- `${BUILDDIR}/lib/libnccl_ep.so` - Shared library (for Python bindings)
+- `${BUILDDIR}/include/nccl_ep.h` - C API header
+- `${BUILDDIR}/test/nccl_ep/ep_test` - Test application for both Low-Latency and High-Throughput modes
+- `${BUILDDIR}/test/nccl_ep/ep_bench` - Benchmark application for both Low-Latency and High-Throughput modes
+
+`BUILDDIR` defaults to `<repo>/build`. Set `BUILDDIR=/path/to/build` to place
+all NCCL EP outputs elsewhere.
 
 ## Running
 

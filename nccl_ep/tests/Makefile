@@ -2,21 +2,21 @@
 #
 # Build:  make -C contrib/nccl_ep/tests [BUILDDIR=<path>]
 # Run:    bash run_tests.sh
-#   or:   NCCL_HOME=<build> NCCL_EP_BUILDDIR=<build> bash run_tests.sh
+#   or:   NCCL_HOME=<nccl-build> NCCL_EP_BUILDDIR=<ep-build> bash run_tests.sh
 
-BUILDDIR ?= $(abspath ../../../build)
-NCCL_HOME ?= $(BUILDDIR)
-NCCL_EP_BUILDDIR ?= $(BUILDDIR)
+NCCL_EXTENSIONS_ROOT := $(abspath ../..)
+NCCL_HOME ?= $(NCCL_EXTENSIONS_ROOT)/third_party/nccl/build
+BUILDDIR ?= $(NCCL_EXTENSIONS_ROOT)/build
 
 NCCL_INCDIR := $(NCCL_HOME)/include
 NCCL_LIBDIR := $(NCCL_HOME)/lib
-NCCL_EP_INCDIR := $(NCCL_EP_BUILDDIR)/include
-NCCL_EP_LIBDIR := $(NCCL_EP_BUILDDIR)/lib
+NCCL_EP_INCDIR := $(BUILDDIR)/include
+NCCL_EP_LIBDIR := $(BUILDDIR)/lib
 NCCL_EP_SRCDIR := $(abspath ..)
-DST_DIR := $(NCCL_EP_BUILDDIR)/test/nccl_ep
+DST_DIR := $(BUILDDIR)/test/nccl_ep
 
 GTEST_DIR  ?= $(abspath ../../third_party/googletest/googletest)
-GTEST_OBJDIR := $(NCCL_EP_BUILDDIR)/test
+GTEST_OBJDIR := $(BUILDDIR)/test
 GTEST_LIBS := $(GTEST_OBJDIR)/gtest.a $(GTEST_OBJDIR)/gtest_main.a
 
 NVCC         ?= $(shell which nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc)

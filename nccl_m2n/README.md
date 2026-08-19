@@ -88,17 +88,16 @@ as a git submodule (`third_party/nccl`); `NCCL_HOME` defaults to its build
 output automatically. To use a different NCCL build instead, set
 `NCCL_HOME` explicitly (see below).
 
-Two build paths are shipped side-by-side — pick either; both produce the
-same artifacts under `build/lib/` and `build/bin/`.
+Two build paths are shipped side-by-side — pick either. Make defaults to
+`build/`; CMake writes to the directory passed with `-B`.
 
 ```bash
 git clone <repo-url> nccl-m2n
 cd nccl-m2n
 
-# 0. One-time: build the vendored NCCL submodule (skip if you set NCCL_HOME
-#    below to point at your own build)
-git submodule update --init third_party/nccl
-make -C nccl_m2n nccl-submodule
+# 0. One-time: initialize and build the vendored NCCL submodule (skip if you
+#    set NCCL_HOME below to point at your own build)
+make nccl-submodule
 
 # 1. Point at the NCCL build. Make defaults to the submodule's build output
 #    above, so this is optional for Make and required for CMake.
@@ -403,7 +402,7 @@ Both Make and CMake are supported; pick the one that fits your toolchain.
 | `make bench reshard`            | Equivalent to `make reshard`                | Sub-name picker, see `make help`. |
 | `make tests`                    | `basic_api_test_{mpi,local}`                | C-level functional matrix. |
 | `make install`                  | Copies `lib` + `nccl_m2n.h` to `$PREFIX`  | Defaults `PREFIX=/usr/local`. |
-| `make clean`                    | `rm -rf build/`                             | |
+| `make clean`                    | Removes M2N artifacts from `build/`         | Preserves other libraries' artifacts. |
 
 ### CMake targets
 
@@ -439,7 +438,7 @@ cmake --build build -j [--target <name>]
 | `PREFIX` | `CMAKE_INSTALL_PREFIX` | `/usr/local` | `install` destination. |
 | `NVCC_GENCODE` | `CMAKE_CUDA_ARCHITECTURES` | `sm_80, sm_90, sm_100` (Make) / `80;90;100` (CMake) | Target GPU arch. |
 | `DEBUG=1` / `DEBUG=full` | `-DCMAKE_BUILD_TYPE=Debug` (+ `-DCMAKE_CUDA_FLAGS_DEBUG=...`) | unset / Release | Line info / device debug. |
-| `BUILDDIR` | `cmake -B <dir>` | `build/` | Output directory. |
+| `BUILDDIR` | `cmake -B <dir>` | `build/` | Make output directory. |
 
 ---
 
@@ -853,7 +852,7 @@ have identical effective values on every rank in the communicator.
 |---|---|
 | `ncclInvalidArgument` from `ncclReshardWithWindow` / `ncclReshard` | One of the preconditions failed: NULL comm/descriptor/mesh, mismatched `ndims`/dtype, `ndims` outside 1..3, or an unsupported dtype. |
 | Validation fails with destination still containing the pre-call bytes | The kernel did not write to dest. Re-run with `NCCL_RESHARD_LOG_LEVEL=DEBUG` to see the prepared plan, then file an issue with the `reshard_bench` command line that reproduces the failure. |
-| `nccl_device.h: No such file or directory` at compile time | `NCCL_HOME` points at a binary install rather than a from-source build. Build NCCL from source or point at one, or build the vendored default: `git submodule update --init third_party/nccl && make -C third_party/nccl -j src.build`. |
+| `nccl_device.h: No such file or directory` at compile time | `NCCL_HOME` points at a binary install rather than a from-source build. Build NCCL from source or point at one, or run `make nccl-submodule` from the repository root. |
 | Fast-but-wrong: `make` succeeds yet runtime crashes with "illegal instruction" | Often a downstream symptom of a kernel that completed with corrupt state on the previous reshard call. Re-run with `NCCL_RESHARD_LOG_LEVEL=DEBUG` to see the prepared plan. |
 
 ---

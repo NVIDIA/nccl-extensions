@@ -26,7 +26,7 @@
 # usable source root is third_party/googletest/googletest.
 GTEST_SUBMODULE := $(abspath $(NCCL_RESHARD_ROOT)/../third_party/googletest/googletest)
 GTEST_VENDORED := $(TESTSDIR)/googletest
-GTEST_OBJDIR := $(BUILDDIR)/gtest
+GTEST_OBJDIR := $(OBJDIR)/gtest
 
 # GTEST_DIR may already be set by the caller. Honor that path as-is.
 ifeq ($(origin GTEST_DIR),undefined)

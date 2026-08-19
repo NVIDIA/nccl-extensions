@@ -7,13 +7,14 @@
 # in test_common.h::exchange_uid). No MPI runtime required.
 #
 # Usage:
-#   NCCL_HOME=/path/to/nccl/build NCCL_EP_BUILDDIR=/path/to/nccl_ep/build bash run_tests.sh [num_gpus]
+#   NCCL_HOME=/path/to/nccl/build NCCL_EP_BUILDDIR=/path/to/build bash run_tests.sh [num_gpus]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NCCL_HOME="${NCCL_HOME:-$(cd "${SCRIPT_DIR}/../../../build" && pwd)}"
-NCCL_EP_BUILDDIR="${NCCL_EP_BUILDDIR:-${NCCL_HOME}}"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+NCCL_HOME="${NCCL_HOME:-${REPO_ROOT}/third_party/nccl/build}"
+NCCL_EP_BUILDDIR="${NCCL_EP_BUILDDIR:-${REPO_ROOT}/build}"
 NUM_GPUS="${1:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
 
 export LD_LIBRARY_PATH="${NCCL_EP_BUILDDIR}/lib:${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
@@ -30,7 +31,7 @@ run_suite() {
 
     if [[ ! -x "${TEST_BIN}" ]]; then
         echo "ERROR: binary not found: ${TEST_BIN}"
-        echo "Build first:  make -C ${SCRIPT_DIR} NCCL_HOME=${NCCL_HOME} NCCL_EP_BUILDDIR=${NCCL_EP_BUILDDIR}"
+        echo "Build first:  make -C ${SCRIPT_DIR} NCCL_HOME=${NCCL_HOME} BUILDDIR=${NCCL_EP_BUILDDIR}"
         return 1
     fi
 

@@ -2710,7 +2710,8 @@ __forceinline__ __device__ void combine_RED_intra_warp(
 
         // Per-token stride scaled into uint16_t units (HIDDEN_DIM for BF16/FP16, 2*HIDDEN_DIM for FP32).
         uint16_t* red_token_base =
-            combine_gin_RED_tokens + gin_RED_slot * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
+            combine_gin_RED_tokens
+            + static_cast<size_t>(gin_RED_slot) * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
         float* red_prob_base = nullptr;
         if constexpr (BACKWARD_COMBINE) {
             red_prob_base = combine_gin_RED_prob + gin_RED_slot * prob_dim;
@@ -3113,7 +3114,8 @@ __forceinline__ __device__ g2s_src_t combine_g2s_resolve_rdma_source(
     int lteam_sz) {
     const int rdma_row = tile_id * MAX_NUM_OF_TOKENS_PER_RANK + flat_token_id;
     const uint16_t* token_src =
-        combine_gin_G2S_tokens + rdma_row * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
+        combine_gin_G2S_tokens
+        + static_cast<size_t>(rdma_row) * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
     const float* prob_src = nullptr;
     if constexpr (BACKWARD_COMBINE) {
         prob_src = combine_gin_G2S_prob + rdma_row * (experts_per_rank * lteam_sz);

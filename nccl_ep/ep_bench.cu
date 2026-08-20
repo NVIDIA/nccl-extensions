@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <random>
@@ -444,7 +445,15 @@ static ncclResult_t epGetTensorData(const BenchmarkAllocState& alloc, const nccl
 static uint16_t floatToBf16(float f) {
     uint32_t bits;
     memcpy(&bits, &f, sizeof(bits));
-    return static_cast<uint16_t>(bits >> 16);
+    const uint32_t exponent = bits & 0x7f800000u;
+    if (exponent == 0x7f800000u) {
+        uint16_t upper = static_cast<uint16_t>(bits >> 16);
+        if ((bits & 0x007fffffu) != 0) upper |= 0x0040u;
+        return upper;
+    }
+    // Match CUDA's default FP32-to-BF16 round-to-nearest-even conversion.
+    const uint32_t rounding_bias = 0x7fffu + ((bits >> 16) & 1u);
+    return static_cast<uint16_t>((bits + rounding_bias) >> 16);
 }
 
 static float bf16ToFloat(uint16_t bf16) {
@@ -1021,8 +1030,10 @@ static_assert(
     DS_FP8E3M4_ELEMENTS_PER_SCALE > DsFp8E3M4IdentityPattern::kPayloadPatternElements,
     "DS_FP8E3M4 blocks must be longer than one complete identity payload pattern");
 
-// Combine-validation thresholds for the cosine-similarity discrepancy metric.
-// HT is looser to absorb reduction-order noise at high topk.
+// LL references model the output dtype conversions, so validate every element.
+static constexpr double kCombineLLAtol = 1e-4;
+static constexpr double kCombineLLBf16Rtol = 1e-2;
+static constexpr double kCombineLLOtherRtol = 1e-3;
 static constexpr double kCombineLLThreshold = 1e-5;
 static constexpr double kCombineHTThreshold = 2.5e-5;
 
@@ -1179,6 +1190,7 @@ struct ValidationResult {
     int errors;
     double max_diff;
     std::string message;
+    bool warning = false;
 };
 
 // When true, generateRandomTopkIndicesLL() skips the random -1 masking that
@@ -2892,8 +2904,11 @@ static void initializeNvfp4ValidationScales(
     CUDACHECK(cudaMemcpy(scale_data, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice));
 }
 
-// LL combine applies weighted sum: combined[t] = x[t] * sum(valid weights)
-// Compared using calc_diff in double precision against kCombineLLThreshold.
+// LL combine applies a weighted sum. Expert-major applies every routing weight in
+// the combine kernel. Rank-major first reduces weights per destination rank in
+// FP32, narrows every per-rank contribution to the token dtype, then combines
+// those narrowed contributions in FP32. NVFP4 applies the same layout-specific
+// weighting around per-row quantization. The reference mirrors each path.
 ValidationResult validateCombineOutputLL(
     const BenchmarkAllocState& alloc,
     const ncclEpCombineOutputs_t& combine_outputs,
@@ -2908,9 +2923,6 @@ ValidationResult validateCombineOutputLL(
     bool expert_major,
     ncclDataType_t token_dtype,
     ncclEpCombQuant_t combine_quantization) {
-    (void)num_experts;
-    (void)nRanks;
-
     ValidationResult result = {true, 0, 0.0, ""};
 
     size_t output_size = num_tokens * hidden;
@@ -2937,15 +2949,46 @@ ValidationResult validateCombineOutputLL(
     double* ref = new double[num_elements];
     double* actual = new double[num_elements];
     size_t idx = 0;
+    unsigned int worst_token = 0, worst_hidden = 0;
+    double worst_ref = 0.0, worst_actual = 0.0, worst_abs_error = -1.0;
+    double worst_error_ratio = -1.0;
+    uint32_t worst_expected_bits = 0, worst_actual_bits = 0;
+    const bool require_exact = combine_quantization != NCCL_EP_COMB_QUANT_NVFP4;
+    const bool verbose_validation = getenv("NCCL_EP_BENCH_VERBOSE_VALIDATION") != nullptr;
+    // NVFP4 encoding uses device-only rcp.approx.ftz.f32, so its CPU reference
+    // cannot be byte-exact. All unquantized paths mirror the kernel numerics and must be exact.
+    const double atol = require_exact ? 0.0 : kCombineLLAtol;
+    const double rtol = require_exact ? 0.0
+                                      : (token_dtype == ncclBfloat16 ? kCombineLLBf16Rtol : kCombineLLOtherRtol);
+    std::vector<unsigned int> failing_tokens;
 
-    bool has_nan = false;
     for (unsigned int t = 0; t < num_tokens; t++) {
         int nv = countValidExperts(topk_idx_host, t, top_k);
         if (nv == 0) continue;
 
-        double weight_sum = 0;
-        for (unsigned int k = 0; k < top_k; k++) {
-            if (topk_idx_host[t * top_k + k] >= 0) weight_sum += static_cast<double>(topk_weights_host[t * top_k + k]);
+        std::vector<float> rank_weight_sums;
+        std::vector<bool> rank_seen;
+        // CPU equivalent of warpMarkFirstOccurrence(): each top-k slot contains
+        // its destination rank only when it is that rank's first occurrence.
+        std::vector<int> first_rank_by_topk;
+        const unsigned int num_local_experts = num_experts / static_cast<unsigned int>(nRanks);
+        if (!expert_major) {
+            rank_weight_sums.assign(nRanks, 0.0f);
+            rank_seen.assign(nRanks, false);
+            first_rank_by_topk.assign(top_k, -1);
+        }
+        for (unsigned int k = 0; k < top_k; ++k) {
+            const int64_t expert = topk_idx_host[t * top_k + k];
+            if (expert < 0) continue;
+            const float weight = topk_weights_host[t * top_k + k];
+            if (!expert_major) {
+                const int rank = static_cast<int>(expert / num_local_experts);
+                rank_weight_sums[rank] += weight;
+                if (!rank_seen[rank]) {
+                    rank_seen[rank] = true;
+                    first_rank_by_topk[k] = rank;
+                }
+            }
         }
 
         // Round-trip through wire dtype to match precision of encoded data
@@ -2962,59 +3005,207 @@ ValidationResult validateCombineOutputLL(
             return column == hidden - TOKEN_ID_COLS ? token_hi_val : token_lo_val;
         };
 
-        float nvfp4_input_weight = 1.f;
-        double output_weight = weight_sum;
-        float nvfp4_global_scale = 1.f;
-#if NCCL_EP_BENCH_HAS_CUDA_FP4_TYPES
-        if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4) {
-            // Rank-major applies weights before quantization; expert-major applies them after decode.
-            nvfp4_input_weight = expert_major ? 1.f : static_cast<float>(weight_sum);
-            output_weight = expert_major ? weight_sum : 1.0;
-            float row_amax = 0.f;
-            for (unsigned int column = 0; column < hidden; ++column) {
-                row_amax = std::max(row_amax,
-                                    std::abs(static_cast<float>(input_value(column)) * nvfp4_input_weight));
+        // Expert-major combine visits valid contributions in their original top-k
+        // order and performs one FP32 multiply-accumulate for each of them.
+        auto accumulate_expert_major = [&](float value, float contribution_scale = 1.f) {
+            float combined = 0.f;
+            for (unsigned int k = 0; k < top_k; ++k) {
+                if (topk_idx_host[t * top_k + k] < 0) continue;
+                const float factor = contribution_scale * topk_weights_host[t * top_k + k];
+                combined = std::fma(value, factor, combined);
             }
-            nvfp4_global_scale = row_amax == 0.f ? 0.f : 2688.f / row_amax;
+            return combined;
+        };
+
+#if NCCL_EP_BENCH_HAS_CUDA_FP4_TYPES
+        std::vector<float> nvfp4_block_scales;
+        std::vector<float> nvfp4_global_reciprocals;
+        if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4) {
+            // EM quantizes identical expert rows and applies weights after decode. RM
+            // preReduceRankMajor() first creates one BF16-narrowed row per destination
+            // rank; each row then gets its own global and 16-element block scales.
+            constexpr unsigned int kNvfp4BlockSize = 16;
+            const unsigned int num_blocks = (hidden + kNvfp4BlockSize - 1) / kNvfp4BlockSize;
+            const size_t num_contributions = expert_major ? 1 : static_cast<size_t>(nRanks);
+            nvfp4_block_scales.resize(num_contributions * num_blocks);
+            nvfp4_global_reciprocals.resize(num_contributions);
+            for (unsigned int k = 0; k < (expert_major ? 1u : top_k); ++k) {
+                const int rank = expert_major ? -1 : first_rank_by_topk[k];
+                if (!expert_major && rank < 0) continue;
+                const size_t contribution = expert_major ? 0 : static_cast<size_t>(rank);
+                auto contribution_value = [&](unsigned int column) {
+                    if (expert_major) return static_cast<float>(input_value(column));
+                    char value_tmp[4];
+                    const float weighted =
+                        static_cast<float>(input_value(column)) * rank_weight_sums[rank];
+                    floatToTokenElem(value_tmp, 0, weighted, token_dtype);
+                    return tokenElemToFloat(value_tmp, 0, token_dtype);
+                };
+
+                float row_amax = 0.f;
+                std::vector<float> block_maxima(num_blocks, 0.f);
+                for (unsigned int column = 0; column < hidden; ++column) {
+                    const float magnitude = std::abs(contribution_value(column));
+                    row_amax = std::max(row_amax, magnitude);
+                    block_maxima[column / kNvfp4BlockSize] =
+                        std::max(block_maxima[column / kNvfp4BlockSize], magnitude);
+                }
+                const float global_scale = row_amax == 0.f ? 0.f : 2688.f / row_amax;
+                nvfp4_global_reciprocals[contribution] = global_scale == 0.f ? 0.f : 1.f / global_scale;
+
+                for (unsigned int block = 0; block < num_blocks; ++block) {
+                    const __nv_fp8_e4m3 block_scale(global_scale * (block_maxima[block] / 6.f));
+                    nvfp4_block_scales[contribution * num_blocks + block] = static_cast<float>(block_scale);
+                }
+            }
         }
 #endif
 
+        bool token_failed = false;
         for (unsigned int h = 0; h < hidden; h++) {
-            double orig = input_value(h) * nvfp4_input_weight;
+            double orig = input_value(h);
 #if NCCL_EP_BENCH_HAS_CUDA_FP4_TYPES
             if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4) {
-                // NVFP4 uses one scale for each 16-element input block.
                 constexpr unsigned int kNvfp4BlockSize = 16;
-                const unsigned int block_start = h / kNvfp4BlockSize * kNvfp4BlockSize;
-                float block_max = 0.f;
-                for (unsigned int column = block_start; column < block_start + kNvfp4BlockSize; ++column) {
-                    block_max = std::max(block_max,
-                                         std::abs(static_cast<float>(input_value(column)) * nvfp4_input_weight));
+                const unsigned int num_blocks = (hidden + kNvfp4BlockSize - 1) / kNvfp4BlockSize;
+                const unsigned int block = h / kNvfp4BlockSize;
+                if (expert_major) {
+                    const float contribution_scale =
+                        nvfp4_block_scales[block] * nvfp4_global_reciprocals[0];
+                    const __nv_fp4_e2m1 quantized(
+                        contribution_scale != 0.f ? static_cast<float>(orig) / contribution_scale : 0.f);
+                    ref[idx] = accumulate_expert_major(static_cast<float>(quantized), contribution_scale);
+                } else {
+                    float combined = 0.f;
+                    for (unsigned int k = 0; k < top_k; ++k) {
+                        const int rank = first_rank_by_topk[k];
+                        if (rank < 0) continue;
+                        const size_t contribution = static_cast<size_t>(rank);
+                        char value_tmp[4];
+                        const float weighted = static_cast<float>(orig) * rank_weight_sums[rank];
+                        floatToTokenElem(value_tmp, 0, weighted, token_dtype);
+                        const float partial = tokenElemToFloat(value_tmp, 0, token_dtype);
+                        const float contribution_scale =
+                            nvfp4_block_scales[contribution * num_blocks + block] *
+                            nvfp4_global_reciprocals[contribution];
+                        const __nv_fp4_e2m1 quantized(
+                            contribution_scale != 0.f ? partial / contribution_scale : 0.f);
+                        combined = std::fma(static_cast<float>(quantized), contribution_scale, combined);
+                    }
+                    ref[idx] = combined;
                 }
-                const __nv_fp8_e4m3 block_scale(nvfp4_global_scale * (block_max / 6.f));
-                const float narrowed_scale =
-                    nvfp4_global_scale == 0.f ? 0.f : static_cast<float>(block_scale) / nvfp4_global_scale;
-                const __nv_fp4_e2m1 quantized(narrowed_scale != 0.f ? static_cast<float>(orig) / narrowed_scale : 0.f);
-                orig = static_cast<float>(quantized) * narrowed_scale;
-            }
+            } else
 #endif
-            ref[idx] = orig * output_weight;
-            float actual_f = tokenElemToFloat(combined_data, t * hidden + h, token_dtype);
+            if (expert_major) {
+                ref[idx] = accumulate_expert_major(static_cast<float>(orig));
+            } else if (combine_quantization != NCCL_EP_COMB_QUANT_NVFP4) {
+                // The RM benchmark pre-reduction stores BF16/FP16 values into
+                // combine_inputs.tokens. Model that intermediate narrowing before
+                // reproducing the combine kernel's FP32 accumulation and final store.
+                float combined = 0.0f;
+                char tmp[4];
+                for (unsigned int k = 0; k < top_k; ++k) {
+                    const int rank = first_rank_by_topk[k];
+                    if (rank < 0) continue;
+                    float partial = static_cast<float>(input_value(h)) * rank_weight_sums[rank];
+                    floatToTokenElem(tmp, 0, partial, token_dtype);
+                    combined += tokenElemToFloat(tmp, 0, token_dtype);
+                }
+                floatToTokenElem(tmp, 0, combined, token_dtype);
+                ref[idx] = static_cast<double>(tokenElemToFloat(tmp, 0, token_dtype));
+            }
+            floatToTokenElem(tmp, 0, static_cast<float>(ref[idx]), token_dtype);
+            ref[idx] = static_cast<double>(tokenElemToFloat(tmp, 0, token_dtype));
+            const size_t output_idx = static_cast<size_t>(t) * hidden + h;
+            const bool exact_match = memcmp(tmp, combined_data + output_idx * eb, eb) == 0;
+            float actual_f = tokenElemToFloat(combined_data, output_idx, token_dtype);
             actual[idx] = static_cast<double>(actual_f);
-            if (std::isnan(actual_f)) has_nan = true;
+            const double abs_error = std::abs(ref[idx] - actual[idx]);
+            const double tolerance = atol + rtol * std::abs(ref[idx]);
+            const double error_ratio = require_exact
+                                           ? (exact_match ? 0.0
+                                                          : std::max(abs_error,
+                                                                     std::numeric_limits<double>::denorm_min()))
+                                           : abs_error / tolerance;
+            if (!std::isfinite(actual_f) || (require_exact ? !exact_match : abs_error > tolerance)) {
+                ++result.errors;
+                token_failed = true;
+            }
+            if (!std::isfinite(actual_f) || error_ratio > worst_error_ratio) {
+                worst_token = t;
+                worst_hidden = h;
+                worst_ref = ref[idx];
+                worst_actual = actual[idx];
+                worst_abs_error = abs_error;
+                worst_error_ratio = error_ratio;
+                memcpy(&worst_expected_bits, tmp, eb);
+                memcpy(&worst_actual_bits, combined_data + output_idx * eb, eb);
+            }
             idx++;
         }
+        if (token_failed) failing_tokens.push_back(t);
     }
 
-    double diff = calc_diff(ref, actual, num_elements);
-    result.max_diff = diff;
-    result.passed = (diff < kCombineLLThreshold) && !has_nan;
+    const double legacy_diff = calc_diff(ref, actual, num_elements);
+    const double legacy_threshold = kCombineLLThreshold;
+    const bool legacy_passed = std::isfinite(legacy_diff) && legacy_diff < legacy_threshold;
+    result.max_diff = legacy_diff;
+    // Elementwise validation is authoritative. Keep the legacy cosine metric
+    // in diagnostics, but do not let its shape-dependent threshold reject valid rounding.
+    result.passed = result.errors == 0;
 
-    if (!result.passed) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "LL combine: calc_diff=%.6e (threshold=%.2e)%s", diff, kCombineLLThreshold,
-                 has_nan ? ", NaN detected" : "");
+    if (result.passed && verbose_validation) {
+        char buf[384];
+        snprintf(buf,
+                 sizeof(buf),
+                 "LL combine diagnostic (%s): cosine_diff=%.6e; worst[t=%u, h=%u]: expected=%.7g (0x%08x) actual=%.7g (0x%08x) abs=%.7g rel=%.7g tolerance_ratio=%.7g",
+                 require_exact ? "byte-exact" : "NVFP4 tolerance",
+                 legacy_diff,
+                 worst_token,
+                 worst_hidden,
+                 worst_ref,
+                 worst_expected_bits,
+                 worst_actual,
+                 worst_actual_bits,
+                 worst_abs_error,
+                 worst_abs_error / std::max(kCombineLLAtol, std::abs(worst_ref)),
+                 worst_error_ratio);
         result.message = buf;
+        result.warning = true;
+    } else if (result.passed && !legacy_passed) {
+        char buf[256];
+        snprintf(buf,
+                 sizeof(buf),
+                 "LL combine elementwise validation passed; legacy cosine_diff=%.6e exceeds threshold=%.1e",
+                 legacy_diff,
+                 legacy_threshold);
+        result.message = buf;
+        result.warning = true;
+    } else if (!result.passed) {
+        char buf[512];
+        snprintf(buf,
+                 sizeof(buf),
+                 "LL combine (%s): %d/%zu elements failed (atol=%.1e, rtol=%.1e); cosine_diff=%.6e (diagnostic, previous threshold=%.1e); worst[t=%u, h=%u]: expected=%.7g (0x%08x) actual=%.7g (0x%08x) abs=%.7g rel=%.7g tolerance_ratio=%.7g",
+                 require_exact ? "byte-exact" : "NVFP4 tolerance",
+                 result.errors,
+                 num_elements,
+                 atol,
+                 rtol,
+                 legacy_diff,
+                 legacy_threshold,
+                 worst_token,
+                 worst_hidden,
+                 worst_ref,
+                 worst_expected_bits,
+                 worst_actual,
+                 worst_actual_bits,
+                 worst_abs_error,
+                 worst_abs_error / std::max(kCombineLLAtol, std::abs(worst_ref)),
+                 worst_error_ratio);
+        result.message = buf;
+        result.message += "; failing tokens:";
+        if (failing_tokens.empty()) result.message += " none";
+        for (unsigned int token : failing_tokens) result.message += " " + std::to_string(token);
     }
 
     delete[] ref;
@@ -5713,22 +5904,20 @@ int main(int argc, char* argv[]) {
                 combine_quantization);
         }
 
-        // Print validation results (rank 0 only to avoid clutter)
-        if (myRank == 0) {
-            printf("Dispatch validation: %s", dispatch_valid.passed ? "PASSED" : "FAILED");
-            if (!dispatch_valid.passed) {
-                printf(" (%s)", dispatch_valid.message.c_str());
-            }
-            printf("\n");
-
-            if (!dispatch_only) {
-                printf("Combine validation:  %s", combine_valid.passed ? "PASSED" : "FAILED");
-                if (!combine_valid.passed) {
-                    printf(" (%s)", combine_valid.message.c_str());
-                }
-                printf(" (calc_diff=%.6e)\n", combine_valid.max_diff);
-            }
-            fflush(stdout);
+        // Emit the local discrepancy for any rank validation failure.
+        if (!dispatch_valid.passed || (!dispatch_only && !combine_valid.passed)) {
+            const std::string& detail = !dispatch_valid.passed ? dispatch_valid.message : combine_valid.message;
+            fprintf(stderr,
+                    "Rank %d validation failure: Dispatch=%s, Combine=%s, %s\n",
+                    myRank,
+                    dispatch_valid.passed ? "PASSED" : "FAILED",
+                    dispatch_only || combine_valid.passed ? "PASSED" : "FAILED",
+                    detail.c_str());
+            fflush(stderr);
+        }
+        if (!dispatch_only && combine_valid.warning) {
+            fprintf(stderr, "Rank %d validation warning: %s\n", myRank, combine_valid.message.c_str());
+            fflush(stderr);
         }
 
         // Collect validation results across all ranks

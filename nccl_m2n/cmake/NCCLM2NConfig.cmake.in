@@ -27,6 +27,32 @@ if(NOT TARGET NCCL::nccl)
       NAMES nccl
       HINTS ${_NCCL_M2N_NCCL_ROOTS}
       PATH_SUFFIXES lib lib64)
+  if(NOT NCCL_M2N_NCCL_LIBRARY)
+    # NCCL_HOME may have only a versioned SONAME; find_library() needs
+    # the unversioned symlink. Fall back to it directly: stop at the
+    # first root with a match, and prefer the shortest suffix (the
+    # canonical SONAME over a longer patch-version file it may point to).
+    foreach(_root IN LISTS _NCCL_M2N_NCCL_ROOTS)
+      file(GLOB _NCCL_M2N_NCCL_LIBRARY_CANDIDATES
+          "${_root}/lib/libnccl.so.*"
+          "${_root}/lib64/libnccl.so.*")
+      if(_NCCL_M2N_NCCL_LIBRARY_CANDIDATES)
+        list(SORT _NCCL_M2N_NCCL_LIBRARY_CANDIDATES COMPARE STRING)
+        set(NCCL_M2N_NCCL_LIBRARY "")
+        foreach(_candidate IN LISTS _NCCL_M2N_NCCL_LIBRARY_CANDIDATES)
+          string(LENGTH "${_candidate}" _candidate_len)
+          if(NCCL_M2N_NCCL_LIBRARY STREQUAL "")
+            set(NCCL_M2N_NCCL_LIBRARY "${_candidate}")
+            set(_NCCL_M2N_NCCL_LIBRARY_LEN "${_candidate_len}")
+          elseif(_candidate_len LESS _NCCL_M2N_NCCL_LIBRARY_LEN)
+            set(NCCL_M2N_NCCL_LIBRARY "${_candidate}")
+            set(_NCCL_M2N_NCCL_LIBRARY_LEN "${_candidate_len}")
+          endif()
+        endforeach()
+        break()
+      endif()
+    endforeach()
+  endif()
   if(NOT NCCL_M2N_NCCL_INCLUDE_DIR OR NOT NCCL_M2N_NCCL_LIBRARY)
     set(NCCLM2N_FOUND FALSE)
     set(NCCLM2N_NOT_FOUND_MESSAGE

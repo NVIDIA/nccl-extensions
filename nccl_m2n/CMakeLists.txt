@@ -67,8 +67,8 @@ option(NCCL_M2N_BUILD_TESTS "Build nccl_m2n tests (needs GTest)" OFF)
 
 # NCCL dependency. Parent mode consumes the existing target and discovers its
 # generated include tree from the target's build interface. Standalone mode
-# requires a from-source NCCL build with the Device API headers and shared
-# library present.
+# requires an NCCL_HOME with the Device API headers and shared library
+# present.
 set(_NCCL_M2N_NCCL_INCLUDES "")
 if(TARGET nccl)
   set(_NCCL_M2N_NCCL_TARGET nccl)
@@ -117,41 +117,43 @@ if(TARGET nccl)
   endif()
 else()
   set(NCCL_HOME "$ENV{NCCL_HOME}" CACHE PATH
-      "Path to a from-source NCCL build with Device API headers")
+      "Path to an NCCL install with Device API headers")
   if(NOT NCCL_HOME)
     message(FATAL_ERROR
         "NCCL_HOME is required for a standalone build. Pass "
-        "-DNCCL_HOME=/path/to/nccl/build; the directory must contain "
-        "include/nccl.h, include/nccl_device.h, include/nccl_device/, and "
-        "lib/libnccl.so (or lib64/libnccl.so).")
+        "-DNCCL_HOME=/path/to/nccl.")
   endif()
   if(NOT IS_DIRECTORY "${NCCL_HOME}")
-    message(FATAL_ERROR
-        "NCCL_HOME=${NCCL_HOME} is not a directory. Point NCCL_HOME at a "
-        "completed from-source NCCL build.")
+    message(FATAL_ERROR "NCCL_HOME=${NCCL_HOME} is not a directory.")
   endif()
   foreach(_required_header IN ITEMS nccl.h nccl_device.h)
     if(NOT EXISTS "${NCCL_HOME}/include/${_required_header}")
       message(FATAL_ERROR
-          "NCCL_HOME=${NCCL_HOME} is missing include/${_required_header}. "
-          "Point NCCL_HOME at a completed from-source NCCL build, not a "
-          "binary-only installation.")
+          "NCCL_HOME=${NCCL_HOME} is missing include/${_required_header}.")
     endif()
   endforeach()
   if(NOT IS_DIRECTORY "${NCCL_HOME}/include/nccl_device")
     message(FATAL_ERROR
-        "NCCL_HOME=${NCCL_HOME} is missing include/nccl_device/. Build NCCL "
-        "from source so the complete Device API header tree is staged.")
+        "NCCL_HOME=${NCCL_HOME} is missing include/nccl_device/.")
   endif()
   find_library(_NCCL_M2N_NCCL_LIBRARY
       NAMES nccl
       HINTS "${NCCL_HOME}/lib" "${NCCL_HOME}/lib64"
       NO_DEFAULT_PATH)
   if(NOT _NCCL_M2N_NCCL_LIBRARY)
+    # NCCL_HOME may have only a versioned SONAME; find_library() needs
+    # the unversioned symlink. Fall back to the versioned file.
+    file(GLOB _NCCL_M2N_NCCL_LIBRARY_CANDIDATES
+        "${NCCL_HOME}/lib/libnccl.so.*"
+        "${NCCL_HOME}/lib64/libnccl.so.*")
+    if(_NCCL_M2N_NCCL_LIBRARY_CANDIDATES)
+      list(GET _NCCL_M2N_NCCL_LIBRARY_CANDIDATES 0 _NCCL_M2N_NCCL_LIBRARY)
+    endif()
+  endif()
+  if(NOT _NCCL_M2N_NCCL_LIBRARY)
     message(FATAL_ERROR
-        "NCCL_HOME=${NCCL_HOME} does not contain libnccl.so under lib/ or "
-        "lib64/. Complete the NCCL shared-library build before configuring "
-        "NCCL M2N.")
+        "NCCL_HOME=${NCCL_HOME} does not contain libnccl.so or a versioned "
+        "libnccl.so.<N> under lib/ or lib64/.")
   endif()
 
   if(NOT TARGET NCCL::nccl)

@@ -33,10 +33,19 @@ SKIP_DEP_CHECK := $(if $(MAKECMDGOALS),$(if $(filter-out $(NO_DEPS_GOALS),$(MAKE
 
 ifeq ($(SKIP_DEP_CHECK),)
 ifeq ($(wildcard $(NCCL_HOME)/include/nccl_device.h),)
-$(error NCCL_HOME=$(NCCL_HOME) does not contain include/nccl_device.h. NCCL must be built from source; if using the vendored submodule, run: make -C $(NCCL_EXTENSIONS_ROOT) nccl-submodule)
+$(error NCCL_HOME=$(NCCL_HOME) does not contain include/nccl_device.h. Point NCCL_HOME at an NCCL install that ships the Device API headers)
 endif
 ifeq ($(wildcard $(NVCC)),)
 $(error NVCC not found at $(NVCC). Set CUDA_HOME correctly.)
+endif
+# NCCL_HOME may have only a versioned SONAME, not the libnccl.so that
+# -lnccl needs. Resolve the real file so both layouts link.
+NCCL_LIB_FILE := $(firstword $(wildcard $(NCCL_HOME)/lib/libnccl.so) \
+                             $(wildcard $(NCCL_HOME)/lib64/libnccl.so) \
+                             $(wildcard $(NCCL_HOME)/lib/libnccl.so.*) \
+                             $(wildcard $(NCCL_HOME)/lib64/libnccl.so.*))
+ifeq ($(NCCL_LIB_FILE),)
+$(error NCCL_HOME=$(NCCL_HOME) does not contain libnccl.so or a versioned libnccl.so.<N> under lib/ or lib64/)
 endif
 endif
 
@@ -101,7 +110,10 @@ else ifeq ($(DEBUG),1)
 endif
 
 # ── Linker flags ───────────────────────────────────────────────────────────
-LIB_LDFLAGS := -L$(NCCL_HOME)/lib -lnccl \
+# Link NCCL_LIB_FILE by path rather than -lnccl (needs an unversioned .so
+# we may not have). -Xlinker skips nvcc's own file-type sniffing, which
+# rejects a versioned libnccl.so.<N> outright.
+LIB_LDFLAGS := -Xlinker $(NCCL_LIB_FILE) \
                -L$(CUDA_HOME)/lib64 -lcudart -lcuda
 M2N_LIB_LDFLAGS := $(LIB_LDFLAGS) -Xlinker -rpath -Xlinker '$$ORIGIN'
 

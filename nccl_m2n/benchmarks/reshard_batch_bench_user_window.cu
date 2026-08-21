@@ -303,6 +303,8 @@ int main(int argc, char* argv[]) {
   bool bVerbose = false;
   bool bPrintAllRanks = false;
   const char* algorithm = "RING";
+  ReshardApiMode apiMode = ReshardApiMode::Default;
+  const char* copyAlgorithm = nullptr;
   const char* lbMode = "UNIFORM";
 
   std::vector<TensorCfg> tensorCfgs;
@@ -368,6 +370,7 @@ int main(int argc, char* argv[]) {
     MPI_Finalize();
     return 1;
   }
+  benchConfigureCopyAlgorithm(copyAlgorithm);
 
   if (srcMdims[0] <= 0 || srcMdims[1] <= 0 || dstMdims[0] <= 0 || dstMdims[1] <= 0 || tensorCfgs.empty() ||
       srcSdRaw.empty() || dstSdRaw.empty()) {
@@ -453,9 +456,15 @@ int main(int argc, char* argv[]) {
   std::vector<void*> bufs(numTensors);
   std::vector<ncclWindow_t> windows(numTensors, nullptr);
   for (int i = 0; i < numTensors; i++) {
-    NCCLCHECK(ncclMemAlloc(&bufs[i], maxAlloc));
+    if (apiMode == ReshardApiMode::Default) {
+      CUDACHECK(cudaMalloc(&bufs[i], maxAlloc));
+    } else if (apiMode == ReshardApiMode::Window) {
+      NCCLCHECK(ncclMemAlloc(&bufs[i], maxAlloc));
+    }
     CUDACHECK(cudaMemset(bufs[i], 0xDE, maxAlloc));
-    NCCLCHECK(ncclCommWindowRegister(comms[i % numComms], bufs[i], maxAlloc, &windows[i], NCCL_WIN_COLL_SYMMETRIC));
+    if (apiMode == ReshardApiMode::Window) {
+      NCCLCHECK(ncclCommWindowRegister(comms[i % numComms], bufs[i], maxAlloc, &windows[i], NCCL_WIN_COLL_SYMMETRIC));
+    }
   }
 
   std::vector<cudaStream_t> streams(numTensors);
@@ -556,7 +565,11 @@ int main(int argc, char* argv[]) {
           dstT.localShape[d] = dstLocal[d];
         }
 
-        NCCLCHECK(ncclReshardWithWindow(m2nHandle, comms[i % numComms], windows[i], &srcT, &dstT, s));
+        if (apiMode == ReshardApiMode::Default) {
+          NCCLCHECK(ncclReshard(m2nHandle, comms[i % numComms], &srcT, &dstT, s));
+        } else {
+          NCCLCHECK(ncclReshardWithWindow(m2nHandle, comms[i % numComms], windows[i], &srcT, &dstT, s));
+        }
       };
 
       auto runSequential = [&]() {
@@ -670,9 +683,19 @@ int main(int argc, char* argv[]) {
   // ------------------------------------------------------------------------
   CUDACHECK(cudaStreamSynchronize(seqStream));
   for (auto& s : streams) CUDACHECK(cudaStreamSynchronize(s));
-  for (int i = 0; i < numTensors; i++) ncclCommWindowDeregister(comms[i % numComms], windows[i]);
+  if (apiMode == ReshardApiMode::Window) {
+    for (int i = 0; i < numTensors; i++) {
+      NCCLCHECK(ncclCommWindowDeregister(comms[i % numComms], windows[i]));
+    }
+  }
   NCCLCHECK(ncclM2nFinalize(m2nHandle));
-  for (auto& b : bufs) NCCLCHECK(ncclMemFree(b));
+  for (auto& b : bufs) {
+    if (apiMode == ReshardApiMode::Default) {
+      CUDACHECK(cudaFree(b));
+    } else if (apiMode == ReshardApiMode::Window) {
+      NCCLCHECK(ncclMemFree(b));
+    }
+  }
   for (auto& s : streams) CUDACHECK(cudaStreamDestroy(s));
   CUDACHECK(cudaStreamDestroy(seqStream));
   for (auto& c : comms) ncclCommDestroy(c);

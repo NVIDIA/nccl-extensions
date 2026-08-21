@@ -24,6 +24,7 @@
 #include <vector>
 #include <mpi.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_profiler_api.h>
 #ifdef HAVE_CUPTI
@@ -1032,8 +1033,6 @@ static_assert(
 
 // LL references model the output dtype conversions, so validate every element.
 static constexpr double kCombineLLAtol = 1e-4;
-static constexpr double kCombineLLBf16Rtol = 1e-2;
-static constexpr double kCombineLLOtherRtol = 1e-3;
 static constexpr double kCombineLLThreshold = 1e-5;
 static constexpr double kCombineHTThreshold = 2.5e-5;
 
@@ -2867,6 +2866,174 @@ int countValidExperts(const int64_t* topk_idx_host, unsigned int token_idx, unsi
     return count;
 }
 
+#if NCCL_EP_BENCH_HAS_CUDA_FP4_TYPES
+// Keep the device-only FP4 instructions out of the host reference.
+__device__ __forceinline__ float nvfp4ValidationRcp(float value) {
+    float reciprocal;
+    asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(reciprocal) : "f"(value));
+    return reciprocal;
+}
+
+__device__ __forceinline__ uint32_t nvfp4ValidationPack(float (&v)[8]) {
+    uint32_t out = 0;
+    for (int pair = 0; pair < 4; ++pair) {
+        const float2 values = make_float2(v[2 * pair], v[2 * pair + 1]);
+        const __nv_fp4x2_storage_t packed =
+            __nv_cvt_float2_to_fp4x2(values, __NV_E2M1, cudaRoundNearest);
+        out |= static_cast<uint32_t>(packed) << (8 * pair);
+    }
+    return out;
+}
+
+__device__ __forceinline__ void nvfp4ValidationUnpack(uint32_t in, float (&v)[8]) {
+    for (int pair = 0; pair < 4; ++pair) {
+        const __nv_fp4x2_storage_t packed =
+            static_cast<__nv_fp4x2_storage_t>(in >> (8 * pair));
+        const __half2_raw raw = __nv_cvt_fp4x2_to_halfraw2(packed, __NV_E2M1);
+        __half2 values;
+        memcpy(&values, &raw, sizeof(values));
+        const float2 decoded = __half22float2(values);
+        v[2 * pair] = decoded.x;
+        v[2 * pair + 1] = decoded.y;
+    }
+}
+
+// One thread per 16-value block: BF16 -> FP4 -> BF16, with production rcp instructions.
+__global__ void nvfp4ValidationRoundTripKernel(
+    const nv_bfloat16* input,
+    const float* global_scales,
+    nv_bfloat16* decoded_values,
+    float* decode_factors,
+    size_t rows,
+    unsigned int hidden) {
+    const size_t blocks_per_row = hidden / 16;
+    const size_t block = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (block >= rows * blocks_per_row) return;
+    const size_t row = block / blocks_per_row;
+    const unsigned int first = (block % blocks_per_row) * 16;
+    const nv_bfloat16* source = input + row * hidden + first;
+    float max_value = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        max_value = fmaxf(max_value, fabsf(static_cast<float>(source[i])));
+    }
+    const float global = global_scales[row];
+    // The production send and receive paths intentionally use different
+    // reciprocals. Quantization uses rcp.approx, while decode uses ordinary
+    // FP32 division before accumulating the unpacked FP4 values.
+    const float send_global_rcp = global == 0.0f ? 0.0f : nvfp4ValidationRcp(global);
+    const float decode_global_rcp = global == 0.0f ? 1.0f : 1.0f / global;
+    const __nv_fp8_e4m3 scale(global * (max_value * nvfp4ValidationRcp(6.0f)));
+    const float send_factor = static_cast<float>(scale) * send_global_rcp;
+    decode_factors[block] = static_cast<float>(scale) * decode_global_rcp;
+    for (int vec = 0; vec < 2; ++vec) {
+        float values[8];
+        const float inverse =
+            static_cast<float>(scale) == 0.0f ? 0.0f : nvfp4ValidationRcp(send_factor);
+        for (int i = 0; i < 8; ++i) {
+            values[i] = static_cast<float>(source[vec * 8 + i]) * inverse;
+        }
+        nvfp4ValidationUnpack(nvfp4ValidationPack(values), values);
+        for (int i = 0; i < 8; ++i) {
+            decoded_values[row * hidden + first + vec * 8 + i] = __float2bfloat16(values[i]);
+        }
+    }
+}
+
+struct Nvfp4ValidationReference {
+    std::vector<nv_bfloat16> decoded_values;
+    std::vector<float> decode_factors;
+    unsigned int rows_per_token;
+};
+
+static Nvfp4ValidationReference buildNvfp4ValidationReference(
+    const float* weights,
+    unsigned int tokens,
+    unsigned int hidden,
+    unsigned int experts,
+    unsigned int top_k,
+    int rank,
+    int ranks,
+    const int64_t* indices,
+    bool expert_major) {
+    const unsigned int rows_per_token = expert_major ? 1 : ranks;
+    const unsigned int local_experts = experts / ranks;
+    const size_t rows = static_cast<size_t>(tokens) * rows_per_token;
+    const size_t blocks_per_row = hidden / 16;
+    // CPU: prepare the per-rank BF16 contributions and their global scales.
+    std::vector<nv_bfloat16> bf16_contributions(rows * hidden);
+    std::vector<float> global_scales(rows);
+
+    for (unsigned int t = 0; t < tokens; ++t) {
+        std::vector<float> rank_weight_sums(ranks, 0.0f);
+        for (unsigned int k = 0; k < top_k; ++k) {
+            if (indices[t * top_k + k] >= 0) {
+                rank_weight_sums[indices[t * top_k + k] / local_experts] += weights[t * top_k + k];
+            }
+        }
+
+        for (unsigned int r = 0; r < rows_per_token; ++r) {
+            const size_t row = t * rows_per_token + r;
+            float amax = 0.0f;
+            for (unsigned int h = 0; h < hidden; ++h) {
+                const float value =
+                    h < hidden - TOKEN_ID_COLS
+                        ? static_cast<float>(rank - RANK_OFFSET)
+                        : static_cast<float>(h == hidden - TOKEN_ID_COLS ? t / 256 : t % 256);
+                const float contribution = expert_major ? value : value * rank_weight_sums[r];
+                bf16_contributions[row * hidden + h] = __float2bfloat16(contribution);
+                amax = std::max(amax, std::abs(static_cast<float>(bf16_contributions[row * hidden + h])));
+            }
+            global_scales[row] = amax == 0.0f ? 0.0f : 2688.0f / amax;
+        }
+    }
+
+    // GPU: run only the device-specific FP4 pack/unpack path.
+    Nvfp4ValidationReference ref{{}, {}, rows_per_token};
+    ref.decoded_values.resize(rows * hidden);
+    ref.decode_factors.resize(rows * blocks_per_row);
+
+    nv_bfloat16* d_bf16_contributions;
+    nv_bfloat16* d_decoded_values;
+    float* d_global_scales;
+    float* d_decode_factors;
+    CUDACHECK(cudaMalloc(
+        &d_bf16_contributions, bf16_contributions.size() * sizeof(*d_bf16_contributions)));
+    CUDACHECK(cudaMalloc(&d_decoded_values, ref.decoded_values.size() * sizeof(*d_decoded_values)));
+    CUDACHECK(cudaMalloc(&d_global_scales, global_scales.size() * sizeof(*d_global_scales)));
+    CUDACHECK(cudaMalloc(&d_decode_factors, ref.decode_factors.size() * sizeof(*d_decode_factors)));
+
+    CUDACHECK(cudaMemcpy(
+        d_bf16_contributions,
+        bf16_contributions.data(),
+        bf16_contributions.size() * sizeof(*d_bf16_contributions),
+        cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(
+        d_global_scales,
+        global_scales.data(),
+        global_scales.size() * sizeof(*d_global_scales),
+        cudaMemcpyHostToDevice));
+    nvfp4ValidationRoundTripKernel<<<(ref.decode_factors.size() + 255) / 256, 256>>>(
+        d_bf16_contributions, d_global_scales, d_decoded_values, d_decode_factors, rows, hidden);
+    CUDACHECK(cudaGetLastError());
+    CUDACHECK(cudaMemcpy(
+        ref.decoded_values.data(),
+        d_decoded_values,
+        ref.decoded_values.size() * sizeof(*d_decoded_values),
+        cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(
+        ref.decode_factors.data(),
+        d_decode_factors,
+        ref.decode_factors.size() * sizeof(*d_decode_factors),
+        cudaMemcpyDeviceToHost));
+
+    CUDACHECK(cudaFree(d_decode_factors));
+    CUDACHECK(cudaFree(d_global_scales));
+    CUDACHECK(cudaFree(d_decoded_values));
+    CUDACHECK(cudaFree(d_bf16_contributions));
+    return ref;
+}
+#endif
+
 // Validate combine output for Low Latency mode.
 // For NVFP4, validation mirrors the transport quantization: derive one global scale
 // per post-expert row, quantize/dequantize each 16-element block with its E4M3
@@ -2953,14 +3120,18 @@ ValidationResult validateCombineOutputLL(
     double worst_ref = 0.0, worst_actual = 0.0, worst_abs_error = -1.0;
     double worst_error_ratio = -1.0;
     uint32_t worst_expected_bits = 0, worst_actual_bits = 0;
-    const bool require_exact = combine_quantization != NCCL_EP_COMB_QUANT_NVFP4;
+    const bool require_exact = true;
     const bool verbose_validation = getenv("NCCL_EP_BENCH_VERBOSE_VALIDATION") != nullptr;
-    // NVFP4 encoding uses device-only rcp.approx.ftz.f32, so its CPU reference
-    // cannot be byte-exact. All unquantized paths mirror the kernel numerics and must be exact.
-    const double atol = require_exact ? 0.0 : kCombineLLAtol;
-    const double rtol = require_exact ? 0.0
-                                      : (token_dtype == ncclBfloat16 ? kCombineLLBf16Rtol : kCombineLLOtherRtol);
+    const double atol = 0.0;
+    const double rtol = 0.0;
     std::vector<unsigned int> failing_tokens;
+#if NCCL_EP_BENCH_HAS_CUDA_FP4_TYPES
+    Nvfp4ValidationReference nvfp4_reference;
+    if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4) {
+        nvfp4_reference = buildNvfp4ValidationReference(
+            topk_weights_host, num_tokens, hidden, num_experts, top_k, myRank, nRanks, topk_idx_host, expert_major);
+    }
+#endif
 
     for (unsigned int t = 0; t < num_tokens; t++) {
         int nv = countValidExperts(topk_idx_host, t, top_k);
@@ -3017,50 +3188,6 @@ ValidationResult validateCombineOutputLL(
             return combined;
         };
 
-#if NCCL_EP_BENCH_HAS_CUDA_FP4_TYPES
-        std::vector<float> nvfp4_block_scales;
-        std::vector<float> nvfp4_global_reciprocals;
-        if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4) {
-            // EM quantizes identical expert rows and applies weights after decode. RM
-            // preReduceRankMajor() first creates one BF16-narrowed row per destination
-            // rank; each row then gets its own global and 16-element block scales.
-            constexpr unsigned int kNvfp4BlockSize = 16;
-            const unsigned int num_blocks = (hidden + kNvfp4BlockSize - 1) / kNvfp4BlockSize;
-            const size_t num_contributions = expert_major ? 1 : static_cast<size_t>(nRanks);
-            nvfp4_block_scales.resize(num_contributions * num_blocks);
-            nvfp4_global_reciprocals.resize(num_contributions);
-            for (unsigned int k = 0; k < (expert_major ? 1u : top_k); ++k) {
-                const int rank = expert_major ? -1 : first_rank_by_topk[k];
-                if (!expert_major && rank < 0) continue;
-                const size_t contribution = expert_major ? 0 : static_cast<size_t>(rank);
-                auto contribution_value = [&](unsigned int column) {
-                    if (expert_major) return static_cast<float>(input_value(column));
-                    char value_tmp[4];
-                    const float weighted =
-                        static_cast<float>(input_value(column)) * rank_weight_sums[rank];
-                    floatToTokenElem(value_tmp, 0, weighted, token_dtype);
-                    return tokenElemToFloat(value_tmp, 0, token_dtype);
-                };
-
-                float row_amax = 0.f;
-                std::vector<float> block_maxima(num_blocks, 0.f);
-                for (unsigned int column = 0; column < hidden; ++column) {
-                    const float magnitude = std::abs(contribution_value(column));
-                    row_amax = std::max(row_amax, magnitude);
-                    block_maxima[column / kNvfp4BlockSize] =
-                        std::max(block_maxima[column / kNvfp4BlockSize], magnitude);
-                }
-                const float global_scale = row_amax == 0.f ? 0.f : 2688.f / row_amax;
-                nvfp4_global_reciprocals[contribution] = global_scale == 0.f ? 0.f : 1.f / global_scale;
-
-                for (unsigned int block = 0; block < num_blocks; ++block) {
-                    const __nv_fp8_e4m3 block_scale(global_scale * (block_maxima[block] / 6.f));
-                    nvfp4_block_scales[contribution * num_blocks + block] = static_cast<float>(block_scale);
-                }
-            }
-        }
-#endif
-
         bool token_failed = false;
         for (unsigned int h = 0; h < hidden; h++) {
             double orig = input_value(h);
@@ -3070,27 +3197,18 @@ ValidationResult validateCombineOutputLL(
                 const unsigned int num_blocks = (hidden + kNvfp4BlockSize - 1) / kNvfp4BlockSize;
                 const unsigned int block = h / kNvfp4BlockSize;
                 if (expert_major) {
-                    const float contribution_scale =
-                        nvfp4_block_scales[block] * nvfp4_global_reciprocals[0];
-                    const __nv_fp4_e2m1 quantized(
-                        contribution_scale != 0.f ? static_cast<float>(orig) / contribution_scale : 0.f);
-                    ref[idx] = accumulate_expert_major(static_cast<float>(quantized), contribution_scale);
+                    const size_t row = static_cast<size_t>(t) * nvfp4_reference.rows_per_token;
+                    const float decoded = static_cast<float>(nvfp4_reference.decoded_values[row * hidden + h]);
+                    ref[idx] = accumulate_expert_major(
+                        decoded, nvfp4_reference.decode_factors[row * num_blocks + block]);
                 } else {
                     float combined = 0.f;
                     for (unsigned int k = 0; k < top_k; ++k) {
                         const int rank = first_rank_by_topk[k];
                         if (rank < 0) continue;
-                        const size_t contribution = static_cast<size_t>(rank);
-                        char value_tmp[4];
-                        const float weighted = static_cast<float>(orig) * rank_weight_sums[rank];
-                        floatToTokenElem(value_tmp, 0, weighted, token_dtype);
-                        const float partial = tokenElemToFloat(value_tmp, 0, token_dtype);
-                        const float contribution_scale =
-                            nvfp4_block_scales[contribution * num_blocks + block] *
-                            nvfp4_global_reciprocals[contribution];
-                        const __nv_fp4_e2m1 quantized(
-                            contribution_scale != 0.f ? partial / contribution_scale : 0.f);
-                        combined = std::fma(static_cast<float>(quantized), contribution_scale, combined);
+                        const size_t row = static_cast<size_t>(t) * nvfp4_reference.rows_per_token + rank;
+                        combined = std::fma(static_cast<float>(nvfp4_reference.decoded_values[row * hidden + h]),
+                                            nvfp4_reference.decode_factors[row * num_blocks + block], combined);
                     }
                     ref[idx] = combined;
                 }

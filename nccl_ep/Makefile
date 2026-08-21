@@ -27,8 +27,10 @@ endif
 # with the following values.
 NCCL_EP_CUDA12_GENCODE   = -gencode=arch=compute_90,code=sm_90
 NCCL_EP_CUDA12_8_GENCODE = -gencode=arch=compute_100,code=sm_100 \
+                           -gencode=arch=compute_100a,code=sm_100a \
                            -gencode=arch=compute_120,code=sm_120
-NCCL_EP_CUDA13_GENCODE   = -gencode=arch=compute_110,code=sm_110
+NCCL_EP_CUDA13_GENCODE   = -gencode=arch=compute_103a,code=sm_103a \
+                           -gencode=arch=compute_110,code=sm_110
 NCCL_EP_CUDA12_PTX       = -gencode=arch=compute_90,code=compute_90
 NCCL_EP_CUDA13_PTX       = -gencode=arch=compute_120,code=compute_120
 

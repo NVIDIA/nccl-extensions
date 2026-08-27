@@ -4574,7 +4574,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                         ncclCoopWarp(),
                         param.dcomms[0],
                         ncclTeamTagLsa(),
-                        (uint32_t)NCCL_EP_HT_DISPATCH_BLOCKS);
+                        (uint32_t)NBLOCKS);
                     bar.sync(ncclCoopWarp(), cuda::memory_order_relaxed);
                 }
             }

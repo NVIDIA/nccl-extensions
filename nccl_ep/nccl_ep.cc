@@ -1352,7 +1352,10 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         ep_group->gin_config.num_dcomms = 1;
         ep_group->gin_config.dcomms = new ncclDevComm_t[1];
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-        reqs.lsaBarrierCount = NCCL_EP_HT_DISPATCH_BLOCKS + 1; // dispatch per-block [0,NB) + elected combine [NB]
+        // Dispatch uses one LSA barrier session per launched CTA. Keep the
+        // compile-time combine-tail session available when fewer CTAs are requested.
+        reqs.lsaBarrierCount =
+            std::max<int>(ep_group->comm_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
         CUDACHECK_RET(cudaMalloc(
             reinterpret_cast<void**>(&ep_group->gin_config.d_dcomms),
@@ -1552,9 +1555,10 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         reqs.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
         reqs.ginContextCount = ep_group->gin_config.qps_per_rank; // reserved + data contexts
         reqs.ginQueueDepth = 3 * ht_tokens_per_chunk + 1;
-        // LSA barriers for the HT sync-guard: per-block dispatch [0, NUM_OF_BLOCKS) + one
-        // for the elected combine-tail block [NUM_OF_BLOCKS]. NUM_OF_BLOCKS <= NCCL_EP_HT_DISPATCH_BLOCKS.
-        reqs.lsaBarrierCount = NCCL_EP_HT_DISPATCH_BLOCKS + 1; // dispatch per-block [0,NB) + elected combine [NB]
+        // One session per launched dispatch CTA plus the combine-tail session.
+        // This must follow the resolved SM count, not just the default grid size.
+        reqs.lsaBarrierCount =
+            std::max<int>(ep_group->comm_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
     }
 

@@ -3920,7 +3920,8 @@ PairedBenchResult runPairedBenchmark(
     size_t dispatch_bytes,
     size_t combine_bytes,
     KernelTimer& ktimer,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    bool use_cuda_graph) {
     // Warmup with paired dispatch+combine
     // Note: cudaStreamSynchronize between dispatch and combine is required for HT mode
     // MPI_Barrier at end of each iteration ensures all ranks stay in sync (critical for HT mode)
@@ -3933,18 +3934,86 @@ PairedBenchResult runPairedBenchmark(
         MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     }
 
+    // Capture dispatch and combine as child graphs, then compose one executable
+    // parent graph with embedded events so per-phase GPU timings remain available.
+    // The warmup above primes JIT kernels and lazy/cached state; update_fn stays
+    // outside the measured path.
+    cudaGraph_t dispatch_phase_graph = nullptr;
+    cudaGraph_t combine_phase_graph = nullptr;
+    cudaGraph_t replay_graph = nullptr;
+    cudaGraphExec_t replay_graph_exec = nullptr;
+    cudaEvent_t captured_dispatch_start = nullptr;
+    cudaEvent_t captured_dispatch_end = nullptr;
+    cudaEvent_t captured_combine_start = nullptr;
+    cudaEvent_t captured_combine_end = nullptr;
+    const bool has_combine = combine_bytes != 0;
+    if (use_cuda_graph) {
+        CUDACHECK(cudaEventCreate(&captured_dispatch_start));
+        CUDACHECK(cudaEventCreate(&captured_dispatch_end));
+        CUDACHECK(cudaEventCreate(&captured_combine_start));
+        CUDACHECK(cudaEventCreate(&captured_combine_end));
+
+        CUDACHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+        dispatch_fn();
+        CUDACHECK(cudaStreamEndCapture(stream, &dispatch_phase_graph));
+        if (has_combine) {
+            CUDACHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+            combine_fn();
+            CUDACHECK(cudaStreamEndCapture(stream, &combine_phase_graph));
+        }
+
+        // Compose one executable parent graph from the captured phase graphs.
+        // Explicit event-record nodes retain phase timing without adding a
+        // host synchronization boundary between dispatch and combine.
+        cudaGraphNode_t dispatch_start_node;
+        cudaGraphNode_t dispatch_node;
+        cudaGraphNode_t dispatch_end_node;
+        cudaGraphNode_t combine_start_node;
+        cudaGraphNode_t combine_node;
+        cudaGraphNode_t combine_end_node;
+        CUDACHECK(cudaGraphCreate(&replay_graph, 0));
+        CUDACHECK(cudaGraphAddEventRecordNode(
+            &dispatch_start_node, replay_graph, nullptr, 0, captured_dispatch_start));
+        CUDACHECK(cudaGraphAddChildGraphNode(
+            &dispatch_node, replay_graph, &dispatch_start_node, 1, dispatch_phase_graph));
+        CUDACHECK(cudaGraphAddEventRecordNode(
+            &dispatch_end_node, replay_graph, &dispatch_node, 1, captured_dispatch_end));
+        CUDACHECK(cudaGraphAddEventRecordNode(
+            &combine_start_node, replay_graph, &dispatch_end_node, 1, captured_combine_start));
+        if (has_combine) {
+            CUDACHECK(cudaGraphAddChildGraphNode(
+                &combine_node, replay_graph, &combine_start_node, 1, combine_phase_graph));
+        } else {
+            combine_node = combine_start_node;
+        }
+        CUDACHECK(cudaGraphAddEventRecordNode(
+            &combine_end_node, replay_graph, &combine_node, 1, captured_combine_end));
+        CUDACHECK(cudaGraphInstantiate(&replay_graph_exec, replay_graph, nullptr, nullptr, 0));
+
+        // Graph construction can finish at different times on different ranks.
+        // Do not let an early rank enter a communication graph while peers are
+        // still capturing or instantiating theirs.
+        MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+    }
+
     // Create events for dispatch, combine, and total timing
     std::vector<cudaEvent_t> dispatch_start(num_iters);
     std::vector<cudaEvent_t> dispatch_end(num_iters);
     std::vector<cudaEvent_t> combine_start(num_iters);
     std::vector<cudaEvent_t> combine_end(num_iters);
 
-    for (int i = 0; i < num_iters; i++) {
-        CUDACHECK(cudaEventCreate(&dispatch_start[i]));
-        CUDACHECK(cudaEventCreate(&dispatch_end[i]));
-        CUDACHECK(cudaEventCreate(&combine_start[i]));
-        CUDACHECK(cudaEventCreate(&combine_end[i]));
+    if (!use_cuda_graph) {
+        for (int i = 0; i < num_iters; i++) {
+            CUDACHECK(cudaEventCreate(&dispatch_start[i]));
+            CUDACHECK(cudaEventCreate(&dispatch_end[i]));
+            CUDACHECK(cudaEventCreate(&combine_start[i]));
+            CUDACHECK(cudaEventCreate(&combine_end[i]));
+        }
     }
+
+    std::vector<float> dispatch_times(num_iters);
+    std::vector<float> combine_times(num_iters);
+    std::vector<float> total_times(num_iters);
 
     // Start CUPTI kernel timer
     ktimer.start();
@@ -3955,6 +4024,19 @@ PairedBenchResult runPairedBenchmark(
     // MPI_Barrier at end of each iteration ensures all ranks stay in sync (critical for HT mode)
     // update_fn() is excluded from timed iters; its cost is reported by the UpdateHandle micro-bench.
     for (int i = 0; i < num_iters; i++) {
+        if (use_cuda_graph) {
+            CUDACHECK(cudaGraphLaunch(replay_graph_exec, stream));
+            CUDACHECK(cudaStreamSynchronize(stream));
+            CUDACHECK(cudaEventElapsedTime(
+                &dispatch_times[i], captured_dispatch_start, captured_dispatch_end));
+            CUDACHECK(cudaEventElapsedTime(
+                &combine_times[i], captured_combine_start, captured_combine_end));
+            CUDACHECK(cudaEventElapsedTime(
+                &total_times[i], captured_dispatch_start, captured_combine_end));
+            MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+            continue;
+        }
+
         CUDACHECK(cudaEventRecord(dispatch_start[i], stream));
         dispatch_fn();
         CUDACHECK(cudaEventRecord(dispatch_end[i], stream));    // Record before sync
@@ -3969,24 +4051,31 @@ PairedBenchResult runPairedBenchmark(
     // Stop CUPTI kernel timer
     ktimer.stop();
 
-    // Collect times
-    std::vector<float> dispatch_times(num_iters);
-    std::vector<float> combine_times(num_iters);
-    std::vector<float> total_times(num_iters);
+    // Collect times recorded outside the graph. CUDA graph timings were
+    // collected per replay above before the reusable event nodes were overwritten.
+    if (!use_cuda_graph) {
+        for (int i = 0; i < num_iters; i++) {
+            CUDACHECK(cudaEventElapsedTime(&dispatch_times[i], dispatch_start[i], dispatch_end[i]));
+            CUDACHECK(cudaEventElapsedTime(&combine_times[i], combine_start[i], combine_end[i]));
+            CUDACHECK(cudaEventElapsedTime(&total_times[i], dispatch_start[i], combine_end[i]));
+        }
 
-    for (int i = 0; i < num_iters; i++) {
-        CUDACHECK(cudaEventElapsedTime(&dispatch_times[i], dispatch_start[i], dispatch_end[i]));
-        CUDACHECK(cudaEventElapsedTime(&combine_times[i], combine_start[i], combine_end[i]));
-        CUDACHECK(cudaEventElapsedTime(&total_times[i], dispatch_start[i], combine_end[i]));
+        for (int i = 0; i < num_iters; i++) {
+            CUDACHECK(cudaEventDestroy(dispatch_start[i]));
+            CUDACHECK(cudaEventDestroy(dispatch_end[i]));
+            CUDACHECK(cudaEventDestroy(combine_start[i]));
+            CUDACHECK(cudaEventDestroy(combine_end[i]));
+        }
     }
 
-    // Cleanup events
-    for (int i = 0; i < num_iters; i++) {
-        CUDACHECK(cudaEventDestroy(dispatch_start[i]));
-        CUDACHECK(cudaEventDestroy(dispatch_end[i]));
-        CUDACHECK(cudaEventDestroy(combine_start[i]));
-        CUDACHECK(cudaEventDestroy(combine_end[i]));
-    }
+    if (replay_graph_exec != nullptr) CUDACHECK(cudaGraphExecDestroy(replay_graph_exec));
+    if (replay_graph != nullptr) CUDACHECK(cudaGraphDestroy(replay_graph));
+    if (combine_phase_graph != nullptr) CUDACHECK(cudaGraphDestroy(combine_phase_graph));
+    if (dispatch_phase_graph != nullptr) CUDACHECK(cudaGraphDestroy(dispatch_phase_graph));
+    if (captured_dispatch_start != nullptr) CUDACHECK(cudaEventDestroy(captured_dispatch_start));
+    if (captured_dispatch_end != nullptr) CUDACHECK(cudaEventDestroy(captured_dispatch_end));
+    if (captured_combine_start != nullptr) CUDACHECK(cudaEventDestroy(captured_combine_start));
+    if (captured_combine_end != nullptr) CUDACHECK(cudaEventDestroy(captured_combine_end));
 
     // Helper to calculate stats from times vector (skip first iteration if we have more than 1)
     auto calc_stats = [](const std::vector<float>& times, size_t data_bytes) -> BenchResult {
@@ -4866,6 +4955,7 @@ void printUsage(const char* programName, int myRank) {
         printf("  --experts <num>         Total number of experts (default: 256)\n");
         printf("  --warmup <num>          Warmup iterations (default: 10)\n");
         printf("  --iters <num>           Benchmark iterations (default: 50)\n");
+        printf("  --cuda-graph            Replay one graph containing dispatch+combine during measurement\n");
         printf("  --user-handle-mem       Use caller-owned buffer via ncclEpInitHandle+ncclEpUpdateHandle\n");
         printf("  --profile               Enable NVTX profiling mode (use with nsys)\n");
         printf("  --disable-nvlink        Disable NVLink, force RDMA for intranode communication (LL only)\n");
@@ -4944,6 +5034,7 @@ int main(int argc, char* argv[]) {
     unsigned int num_experts = 256;
     int num_warmup = 10;
     int num_iters = 50;
+    bool use_cuda_graph = false;  // Replay one captured dispatch+combine graph during measurement
     bool profile_mode = false;  // Enable NVTX profiling with nsys
     bool disable_nvlink = false;  // Force RDMA instead of NVLink
     bool user_handle_mem = false;  // Use caller-owned buffer via ncclEpInitHandle+ncclEpUpdateHandle
@@ -4995,6 +5086,7 @@ int main(int argc, char* argv[]) {
         {"warmup", required_argument, 0, 'w'},
         {"iters", required_argument, 0, 'i'},
         {"profile", no_argument, 0, 'p'},
+        {"cuda-graph", no_argument, 0, 1009},
         {"disable-nvlink", no_argument, 0, 'n'},
         {"user-handle-mem", no_argument, 0, 'U'},
         {"validate", no_argument, 0, 'V'},
@@ -5255,6 +5347,9 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             break;
+        case 1009:  // --cuda-graph
+            use_cuda_graph = true;
+            break;
         case 1001:  // --disable-token-dropping
             g_disable_token_dropping = true;
             break;
@@ -5337,6 +5432,16 @@ int main(int argc, char* argv[]) {
     if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4 && !kNvfp4BenchmarkSupported) {
         if (myRank == 0) {
             printf("Error: NVFP4 combine requires CUDA 12.9+ with cuda_fp4.h.\n");
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    if (use_cuda_graph && algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
+        max_recv_tokens_per_rank == NCCL_EP_AUTO) {
+        if (myRank == 0) {
+            printf("Error: --cuda-graph cannot be combined with HT eager receive sizing "
+                   "(--max-recv-token-slots-per-rank 0); use a fixed receive-slot budget.\n");
         }
         MPI_Finalize();
         return 1;
@@ -5543,6 +5648,8 @@ int main(int argc, char* argv[]) {
         printf("  Experts:         %u (local: %u)\n", num_experts, num_local_experts);
         printf("  Warmup iters:    %d\n", num_warmup);
         printf("  Benchmark iters: %d\n", num_iters);
+        printf("  CUDA Graph:      %s\n",
+               use_cuda_graph ? "enabled (paired dispatch/combine replay)" : "disabled");
         printf("  Dispatch recipe: %s\n", dispatchRecipeName(dispatch_quantization));
         const ncclDataType_t printed_token_dtype =
             dispatchTokenDtype(dispatch_quantization, token_dtype, scales_forward_token_dtype);
@@ -6387,7 +6494,8 @@ int main(int argc, char* argv[]) {
             dispatch_data_bytes,
             combine_data_bytes,
             kt,
-            stream);
+            stream,
+            use_cuda_graph);
     };
 
     PairedBenchResult paired_result = run_paired_pass(ktimer, update_fn);

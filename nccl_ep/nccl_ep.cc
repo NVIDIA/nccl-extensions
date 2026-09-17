@@ -563,9 +563,9 @@ static ncclResult_t validateCombineRecipe(
                 output_tokens->datatype != ncclBfloat16) {
                 return fail("NVFP4 requires BF16 input and output tokens");
             }
-            if (requires_input &&
-                (scales == nullptr || scales->datatype != ncclFloat32 || scales->ndim != 3)) {
-                return fail("NVFP4 requires FP32 3D inputs->scales global scales");
+            if (requires_input && scales != nullptr &&
+                (scales->datatype != ncclFloat32 || scales->ndim != 3)) {
+                return fail("NVFP4 optional inputs->scales must be FP32 and 3D");
             }
             return ncclSuccess;
         case NCCL_EP_COMB_QUANT_MXFP8: {
@@ -7424,20 +7424,30 @@ ncclResult_t ncclEpCombine(
                 kNvfp4WarpSize * nvfp4_send_unrolls * kNvfp4ElementsPerInt4;
             const size_t expected_slots = static_cast<size_t>(num_ranks) * num_max_dispatch_tokens_per_rank;
             const bool expert_major_scales =
-                global_scales != nullptr && global_scales->ndim == 3 &&
+                global_scales != nullptr && global_scales->ndim == 3 && global_scales->datatype == ncclFloat32 &&
                 global_scales->sizes[0] == static_cast<size_t>(num_experts / num_ranks) &&
-                global_scales->sizes[1] == expected_slots;
+                global_scales->sizes[1] == expected_slots && global_scales->sizes[2] == 1;
             const bool rank_major_scales =
-                global_scales != nullptr && global_scales->ndim == 3 &&
+                global_scales != nullptr && global_scales->ndim == 3 && global_scales->datatype == ncclFloat32 &&
                 global_scales->sizes[0] == static_cast<size_t>(num_ranks) &&
-                global_scales->sizes[1] == static_cast<size_t>(num_max_dispatch_tokens_per_rank);
+                global_scales->sizes[1] == static_cast<size_t>(num_max_dispatch_tokens_per_rank) &&
+                global_scales->sizes[2] == 1;
             const bool valid_scales = handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR
                 ? expert_major_scales : rank_major_scales;
-            if (hidden % nvfp4_send_iteration_elements != 0 ||
-                global_scales->sizes[2] != 1 || !valid_scales) {
-                fprintf(stderr, "NCCL EP: LL NVFP4 combine requires a hidden dimension with whole send iterations and FP32 scales "
-                                "[local_experts, recv_slots, 1] (expert-major) or [ranks, max_tokens, 1] (rank-major)\n");
+            if (hidden % nvfp4_send_iteration_elements != 0 || (global_scales != nullptr && !valid_scales)) {
+                fprintf(stderr, "NCCL EP: LL NVFP4 combine requires a hidden dimension with whole send iterations; "
+                                "optional legacy FP32 scales must be [local_experts, recv_slots, 1] (expert-major) "
+                                "or [ranks, max_tokens, 1] (rank-major)\n");
                 return ncclInvalidArgument;
+            }
+            if (global_scales != nullptr) {
+                static std::once_flag legacy_scales_warning;
+                std::call_once(legacy_scales_warning, []() {
+                    fprintf(stderr,
+                            "NCCL EP warning: passing global scales via inputs->scales to NVFP4 combine is deprecated; "
+                            "set inputs->scales to NULL to derive global scales internally. "
+                            "Caller-provided scales are still honored for compatibility.\n");
+                });
             }
         }
 

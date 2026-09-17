@@ -12,6 +12,7 @@
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 class QuantizationRecipeTest : public EpTestBase {};
@@ -145,23 +146,39 @@ TEST(NvFp4SupportTest, MapsDocumentedFamilyTargets) {
     EXPECT_EQ(nccl_ep::host_device_fp4_target_arch(121), "sm_120f");
 }
 
-// These are exact E2M1 values. Every 16-element block contains +/-6, so the
-// per-row global scale below follows the NVFP4 contract exactly.
+// These are exact E2M1 values, scaled per token by a power of two. Every
+// nonzero 16-element block contains its row's maximum, so both global and
+// block scales are exact. Zero rows exercise the amax == 0 path.
 // Keeping the reference in an exactly representable subset makes it independent
 // of the implementation's reciprocal approximation and rounding details.
 static float nvfp4_test_value(int token, int channel) {
     constexpr float kValues[] = {
         -6.f, -4.f, -3.f, -2.f, -1.5f, -1.f, -0.5f, 0.f,
         0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -6.f};
-    return kValues[(token * 5 + channel) % (sizeof(kValues) / sizeof(kValues[0]))];
+    if (token == 0) return 0.f;
+    // Distinguish 1024-element TMA chunks so replaying a stale stage fails.
+    const int index = token * 5 + channel + (channel / 1024) * 3;
+    return kValues[index % (sizeof(kValues) / sizeof(kValues[0]))] * (1 << (token % 3));
 }
 
-static float nvfp4_test_global_scale(int token, int hidden) {
-    float amax = 0.f;
-    for (int channel = 0; channel < hidden; ++channel) {
-        amax = std::max(amax, std::abs(nvfp4_test_value(token, channel)));
+// Dispatch compacts/reorders rows in both layouts. Derive compatibility scales
+// from the actual post-dispatch activations, not from receive-slot indices.
+static void fill_nvfp4_test_scales(
+    const nv_bfloat16* expert_tokens, float* global_scales, size_t rows, int hidden) {
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+    std::vector<nv_bfloat16> tokens(rows * hidden);
+    CUDA_ASSERT(cudaMemcpy(tokens.data(), expert_tokens,
+                           tokens.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+    std::vector<float> scales(rows, 0.f);
+    for (size_t row = 0; row < rows; ++row) {
+        float amax = 0.f;
+        for (int channel = 0; channel < hidden; ++channel) {
+            amax = std::max(amax, std::abs(__bfloat162float(tokens[row * hidden + channel])));
+        }
+        scales[row] = amax == 0.f ? 0.f : 2688.f / amax;
     }
-    return amax == 0.f ? 0.f : 2688.f / amax;
+    CUDA_ASSERT(cudaMemcpy(global_scales, scales.data(),
+                           scales.size() * sizeof(float), cudaMemcpyHostToDevice));
 }
 
 static void fill_nvfp4_test_tokens(std::vector<nv_bfloat16>* tokens, int hidden) {
@@ -1739,9 +1756,15 @@ TEST_F(QuantizationRecipeTest, NvFp4CombineRejectsHighThroughput) {
     NCCL_ASSERT(ncclEpHandleDestroy(handle));
 }
 
-TEST_F(QuantizationRecipeTest, NvFp4CombineExpertMajorProducesWeightedBf16) {
+// For BF16 tokens these hidden sizes span one, two, three, and four TMA
+// chunks: below, at, and beyond the three-stage shared-memory ring capacity.
+class NvFp4CombineTest : public QuantizationRecipeTest,
+                         public ::testing::WithParamInterface<std::tuple<int, bool>> {};
+
+TEST_P(NvFp4CombineTest, ExpertMajorProducesWeightedBf16) {
     if (!nvfp4_supported()) GTEST_SKIP() << "NVFP4 combine requires E2M1 FP4 support";
-    constexpr int kNvFp4Hidden = 4096;
+    const int kNvFp4Hidden = std::get<0>(GetParam());
+    const bool supplied_scales = std::get<1>(GetParam());
     ASSERT_EQ(kNumExperts % g_nranks, 0);
     const int local_experts = kNumExperts / g_nranks;
     const int recv_slots = g_nranks * kNumTokens;
@@ -1764,19 +1787,15 @@ TEST_F(QuantizationRecipeTest, NvFp4CombineExpertMajorProducesWeightedBf16) {
     int* d_expert_counters = nullptr;
     CUDA_ASSERT(cudaMalloc(&d_input, static_cast<size_t>(kNumTokens) * kNvFp4Hidden * sizeof(nv_bfloat16)));
     CUDA_ASSERT(cudaMalloc(&d_expert, expert_elems * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMemset(d_expert, 0, expert_elems * sizeof(nv_bfloat16)));
     CUDA_ASSERT(cudaMalloc(&d_combined, static_cast<size_t>(kNumTokens) * kNvFp4Hidden * sizeof(nv_bfloat16)));
     CUDA_ASSERT(cudaMalloc(&d_global_scales, static_cast<size_t>(local_experts) * recv_slots * sizeof(float)));
     CUDA_ASSERT(cudaMalloc(&d_topk_weights, static_cast<size_t>(kNumTokens) * kTopK * sizeof(float)));
     CUDA_ASSERT(cudaMalloc(&d_expert_counters, local_experts * sizeof(int)));
     std::vector<nv_bfloat16> h_input(static_cast<size_t>(kNumTokens) * kNvFp4Hidden);
-    std::vector<float> h_scales(static_cast<size_t>(local_experts) * recv_slots);
     std::vector<float> h_weights(static_cast<size_t>(kNumTokens) * kTopK, 1.f);
     fill_nvfp4_test_tokens(&h_input, kNvFp4Hidden);
-    for (size_t slot = 0; slot < h_scales.size(); ++slot) {
-        h_scales[slot] = nvfp4_test_global_scale(static_cast<int>(slot % kNumTokens), kNvFp4Hidden);
-    }
     CUDA_ASSERT(cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
-    CUDA_ASSERT(cudaMemcpy(d_global_scales, h_scales.data(), h_scales.size() * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_ASSERT(cudaMemcpy(d_topk_weights, h_weights.data(), h_weights.size() * sizeof(float), cudaMemcpyHostToDevice));
 
     ncclEpTensor_t *input = nullptr, *expert = nullptr, *combined = nullptr, *scales = nullptr, *weights = nullptr, *counters = nullptr;
@@ -1794,10 +1813,15 @@ TEST_F(QuantizationRecipeTest, NvFp4CombineExpertMajorProducesWeightedBf16) {
     dispatch_inputs.tokens = input; dispatch_outputs.tokens = expert; layout_info.expert_counters = counters;
     ASSERT_EQ(ncclEpDispatch(handle, &dispatch_inputs, &dispatch_outputs, &layout_info, nullptr, g_stream), ncclSuccess);
     ASSERT_EQ(ncclEpComplete(handle, nullptr, g_stream), ncclSuccess);
+    if (supplied_scales) {
+        ASSERT_NO_FATAL_FAILURE(fill_nvfp4_test_scales(
+            d_expert, d_global_scales, static_cast<size_t>(local_experts) * recv_slots, kNvFp4Hidden));
+    }
     ncclEpCombineInputs_t combine_inputs = NCCL_EP_COMBINE_INPUTS_INIT;
     ncclEpCombineOutputs_t combine_outputs = NCCL_EP_COMBINE_OUTPUTS_INIT;
     ncclEpCombineConfig_t combine_config = NCCL_EP_COMBINE_CONFIG_INIT;
-    combine_inputs.tokens = expert; combine_inputs.scales = scales;
+    combine_inputs.tokens = expert;
+    combine_inputs.scales = supplied_scales ? scales : nullptr;
     combine_outputs.tokens = combined; combine_outputs.topk_weights = weights;
     combine_config.quant_recipe = NCCL_EP_COMB_QUANT_NVFP4;
     ASSERT_EQ(ncclEpCombine(handle, &combine_inputs, &combine_outputs, &combine_config, g_stream), ncclSuccess);
@@ -1818,9 +1842,10 @@ TEST_F(QuantizationRecipeTest, NvFp4CombineExpertMajorProducesWeightedBf16) {
     NCCL_ASSERT(ncclEpGroupDestroy(group));
 }
 
-TEST_F(QuantizationRecipeTest, NvFp4CombineRankMajorProducesBf16) {
+TEST_P(NvFp4CombineTest, RankMajorProducesBf16) {
     if (!nvfp4_supported()) GTEST_SKIP() << "NVFP4 combine requires E2M1 FP4 support";
-    constexpr int kNvFp4Hidden = 4096;
+    const int kNvFp4Hidden = std::get<0>(GetParam());
+    const bool supplied_scales = std::get<1>(GetParam());
     constexpr int kRmTopK = 2;
     const int recv_slots = g_nranks * kNumTokens;
     ncclEpGroupConfig_t group_config = NCCL_EP_GROUP_CONFIG_INIT;
@@ -1842,6 +1867,7 @@ TEST_F(QuantizationRecipeTest, NvFp4CombineRankMajorProducesBf16) {
     int *d_recv_topk_idx = nullptr, *d_src_rank_counters = nullptr;
     CUDA_ASSERT(cudaMalloc(&d_input, static_cast<size_t>(kNumTokens) * kNvFp4Hidden * sizeof(nv_bfloat16)));
     CUDA_ASSERT(cudaMalloc(&d_expert, static_cast<size_t>(recv_slots) * kNvFp4Hidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMemset(d_expert, 0, static_cast<size_t>(recv_slots) * kNvFp4Hidden * sizeof(nv_bfloat16)));
     CUDA_ASSERT(cudaMalloc(&d_combined, static_cast<size_t>(kNumTokens) * kNvFp4Hidden * sizeof(nv_bfloat16)));
     CUDA_ASSERT(cudaMalloc(&d_global_scales, static_cast<size_t>(recv_slots) * sizeof(float)));
     CUDA_ASSERT(cudaMalloc(&d_topk, static_cast<size_t>(kNumTokens) * kRmTopK * sizeof(int64_t)));
@@ -1850,14 +1876,10 @@ TEST_F(QuantizationRecipeTest, NvFp4CombineRankMajorProducesBf16) {
     CUDA_ASSERT(cudaMalloc(&d_recv_topk_idx, static_cast<size_t>(recv_slots) * kRmTopK * sizeof(int)));
     CUDA_ASSERT(cudaMalloc(&d_src_rank_counters, g_nranks * sizeof(int)));
     std::vector<nv_bfloat16> h_input(static_cast<size_t>(kNumTokens) * kNvFp4Hidden);
-    std::vector<float> h_scales(recv_slots);
     std::vector<int64_t> h_topk(static_cast<size_t>(kNumTokens) * kRmTopK);
     std::vector<float> h_weights(static_cast<size_t>(kNumTokens) * kRmTopK, 1.f);
     const int local_experts = kNumExperts / g_nranks;
     fill_nvfp4_test_tokens(&h_input, kNvFp4Hidden);
-    for (int slot = 0; slot < recv_slots; ++slot) {
-        h_scales[slot] = nvfp4_test_global_scale(static_cast<int>(slot % kNumTokens), kNvFp4Hidden);
-    }
     for (int token = 0; token < kNumTokens; ++token) {
         const int first = expert_for_token(token);
         h_topk[token * kRmTopK] = first;
@@ -1866,7 +1888,6 @@ TEST_F(QuantizationRecipeTest, NvFp4CombineRankMajorProducesBf16) {
     }
     CUDA_ASSERT(cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
     CUDA_ASSERT(cudaMemcpy(d_topk, h_topk.data(), h_topk.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
-    CUDA_ASSERT(cudaMemcpy(d_global_scales, h_scales.data(), h_scales.size() * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_ASSERT(cudaMemcpy(d_topk_weights, h_weights.data(), h_weights.size() * sizeof(float), cudaMemcpyHostToDevice));
 
     ncclEpTensor_t *input = nullptr, *expert = nullptr, *combined = nullptr, *scales = nullptr;
@@ -1890,12 +1911,16 @@ TEST_F(QuantizationRecipeTest, NvFp4CombineRankMajorProducesBf16) {
     layout_info.src_rank_counters = src_counters;
     ASSERT_EQ(ncclEpDispatch(handle, &dispatch_inputs, &dispatch_outputs, &layout_info, nullptr, g_stream), ncclSuccess);
     ASSERT_EQ(ncclEpComplete(handle, nullptr, g_stream), ncclSuccess);
+    if (supplied_scales) {
+        ASSERT_NO_FATAL_FAILURE(fill_nvfp4_test_scales(
+            d_expert, d_global_scales, recv_slots, kNvFp4Hidden));
+    }
 
     ncclEpCombineInputs_t combine_inputs = NCCL_EP_COMBINE_INPUTS_INIT;
     ncclEpCombineOutputs_t combine_outputs = NCCL_EP_COMBINE_OUTPUTS_INIT;
     ncclEpCombineConfig_t combine_config = NCCL_EP_COMBINE_CONFIG_INIT;
     combine_inputs.tokens = expert;
-    combine_inputs.scales = scales;
+    combine_inputs.scales = supplied_scales ? scales : nullptr;
     combine_outputs.tokens = combined;
     combine_config.quant_recipe = NCCL_EP_COMB_QUANT_NVFP4;
     ASSERT_EQ(ncclEpCombine(handle, &combine_inputs, &combine_outputs, &combine_config, g_stream), ncclSuccess);
@@ -1916,6 +1941,14 @@ TEST_F(QuantizationRecipeTest, NvFp4CombineRankMajorProducesBf16) {
     cudaFree(d_topk); cudaFree(d_topk_weights); cudaFree(d_recv_topk_weights); cudaFree(d_recv_topk_idx); cudaFree(d_src_rank_counters);
     NCCL_ASSERT(ncclEpGroupDestroy(group));
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    HiddenAndScales, NvFp4CombineTest,
+    ::testing::Combine(::testing::Values(1024, 2048, 3072, 4096), ::testing::Bool()),
+    [](const ::testing::TestParamInfo<NvFp4CombineTest::ParamType>& info) {
+        return "Hidden" + std::to_string(std::get<0>(info.param)) +
+            (std::get<1>(info.param) ? "SuppliedScales" : "NullScales");
+    });
 
 int main(int argc, char* argv[]) {
     if (!ep_bootstrap(argc, argv, "te_ep_quantization_recipe_uid")) return 0;

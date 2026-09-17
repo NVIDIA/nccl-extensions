@@ -1547,6 +1547,75 @@ struct CombineRecipeSendOps<NCCL_EP_COMB_QUANT_NVFP4> {
     }
 };
 
+// Return a supplied global scale or derive one with a reverse TMA scan.
+// Derivation leaves the first stages resident in SMEM; report that count so
+// the common forward pipeline can skip their loads and barrier waits.
+template <
+    int kHidden,
+    int kNumSendUnrolls,
+    int kNumStages,
+    typename TmaBuffersT,
+    typename FullBarriersT,
+    typename TmaLoadAndArriveT,
+    typename GetNumTmaBytesT>
+__forceinline__ __device__ float getGlobalScale(
+    const int4* src,
+    const float* globalScales,
+    int globalScaleIndex,
+    TmaBuffersT tmaBuffers,
+    FullBarriersT fullBarriers,
+    uint32_t& tmaPhase,
+    TmaLoadAndArriveT& tmaLoadAndArrive,
+    GetNumTmaBytesT& getNumTmaBytes,
+    int laneId,
+    int* numPreloadedStages) {
+    constexpr int kElementsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
+    constexpr int kChunkInt4 = 32 * kNumSendUnrolls;
+    constexpr int kNumIters = kHidden / (kElementsPerInt4 * kChunkInt4);
+    constexpr int kMaxPreloadedStages = kNumIters < kNumStages ? kNumIters : kNumStages;
+
+    if (globalScales != nullptr) {
+        *numPreloadedStages = 0;
+        return __ldg(globalScales + globalScaleIndex);
+    }
+    *numPreloadedStages = kMaxPreloadedStages;
+    float localAmax = 0.f;
+
+    constexpr int kFirstIter = kNumIters - 1;
+    constexpr int kFirstOffset = kFirstIter * kChunkInt4;
+    if (elect_one_sync()) {
+        tmaLoadAndArrive(kFirstIter % kNumStages, src + kFirstOffset, getNumTmaBytes(kFirstOffset));
+    }
+    __syncwarp();
+#pragma unroll
+    for (int iter = kFirstIter; iter >= 0; --iter) {
+        const int stage = iter % kNumStages;
+        if (iter > 0 && elect_one_sync()) {
+            const int nextIter = iter - 1;
+            const int nextOffset = nextIter * kChunkInt4;
+            tmaLoadAndArrive(nextIter % kNumStages, src + nextOffset, getNumTmaBytes(nextOffset));
+        }
+        __syncwarp();
+        mbarrier_wait<true>(fullBarriers[stage], tmaPhase, stage);
+        const auto* smemData = reinterpret_cast<const int4*>(tmaBuffers[stage]);
+#pragma unroll
+        for (int q = 0; q < kNumSendUnrolls; ++q) {
+            const int4& packed = smemData[laneId + 32 * q];
+            const auto* pairs = reinterpret_cast<const nv_bfloat162*>(&packed);
+#pragma unroll
+            for (int pair = 0; pair < kElementsPerInt4 / 2; ++pair) {
+                const float2 values = __bfloat1622float2(pairs[pair]);
+                localAmax = fmaxf(localAmax, fabsf(values.x));
+                localAmax = fmaxf(localAmax, fabsf(values.y));
+            }
+        }
+        __syncwarp();
+    }
+
+    const float rowAmax = warp_reduce_max<32>(localAmax);
+    return rowAmax == 0.f ? 0.f : 2688.f / rowAmax;
+}
+
 // Process and send a single token with TMA copy and optional RDMA
 template <
     bool kUseLogFMT,
@@ -1561,7 +1630,8 @@ template <
     typename GetNumTmaBytesT>
 __forceinline__ __device__ void processAndSendToken(
     int tokenIdx,
-    float globalScale,
+    const float* globalScales,
+    int globalScaleIndex,
     const int4* srcDataInt4Ptr,
     int4* sendBufInt4Ptr,
     uint64_t recvPtr,
@@ -1592,16 +1662,34 @@ __forceinline__ __device__ void processAndSendToken(
     EP_STATIC_ASSERT(kRecipe != NCCL_EP_COMB_QUANT_NVFP4 || !kUseLogFMT,
                      "NVFP4 combine does not support LogFMT");
     constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
+    // Match the copy loop's padded, datatype-aware extent (FP32 uses twice the BF16 bytes).
     const int kNumIters = hiddenBf16Int4Pad / (32 * kNumSendUnrolls);
-
     if (not zeroCopy or dstP2pPtr != 0) {
         // Read from `copySrcPtr` and copy into `copyDstPtr`
         const auto copySrcPtr = zeroCopy ? sendBufInt4Ptr : srcDataInt4Ptr;
         const auto copyDstPtr = dstP2pPtr == 0 ? sendBufInt4Ptr : reinterpret_cast<int4*>(dstP2pPtr);
 
-        // Prefetch
-        if (elect_one_sync()) tmaLoadAndArrive(0, copySrcPtr, getNumTmaBytes(0));
-        __syncwarp();
+        float globalScale = 1.f;
+        int numPreloadedStages = 0;
+        if constexpr (kRecipe == NCCL_EP_COMB_QUANT_NVFP4) {
+            globalScale = getGlobalScale<kHidden, kNumSendUnrolls, kNumStages>(
+                copySrcPtr,
+                globalScales,
+                globalScaleIndex,
+                tmaBuffers,
+                fullBarriers,
+                tmaPhase,
+                tmaLoadAndArrive,
+                getNumTmaBytes,
+                laneId,
+                &numPreloadedStages);
+        }
+        if (numPreloadedStages == 0) {
+            if (elect_one_sync()) {
+                tmaLoadAndArrive(0, copySrcPtr, getNumTmaBytes(0));
+            }
+            __syncwarp();
+        }
 
         int tmaOffsetBytes = kNumMetaBytes;
 #pragma unroll
@@ -1610,7 +1698,8 @@ __forceinline__ __device__ void processAndSendToken(
             // Load the next iteration
             const int& stageIdx = iterIdx % kNumStages;
             const int& nextStageIdx = (iterIdx + 1) % kNumStages;
-            if (iterIdx + 1 < kNumIters and elect_one_sync()) {
+            const bool loadNext = iterIdx + 1 < kNumIters && iterIdx + 1 >= numPreloadedStages;
+            if (loadNext && elect_one_sync()) {
                 tma_store_wait<kNumStages - kNumPrefetch - 1>();
                 const auto offsetInt4 = i + 32 * kNumSendUnrolls;
                 tmaLoadAndArrive(nextStageIdx, copySrcPtr + offsetInt4, getNumTmaBytes(offsetInt4));
@@ -1619,7 +1708,13 @@ __forceinline__ __device__ void processAndSendToken(
 
             // Wait the current TMA arrival
             EP_STATIC_ASSERT(kNumStages < 32, "Too many stages");
-            mbarrier_wait<true>(fullBarriers[stageIdx], tmaPhase, stageIdx);
+            if constexpr (kRecipe == NCCL_EP_COMB_QUANT_NVFP4) {
+                if (iterIdx >= numPreloadedStages) {
+                    mbarrier_wait<true>(fullBarriers[stageIdx], tmaPhase, stageIdx);
+                }
+            } else {
+                mbarrier_wait<true>(fullBarriers[stageIdx], tmaPhase, stageIdx);
+            }
 
             if constexpr (kRecipe != NCCL_EP_COMB_QUANT_NONE) {
                 const bool lastIter = iterIdx + 1 == kNumIters;
@@ -1978,12 +2073,10 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
                     const auto expectedDstOffset = recvOff + rcvTokenOffset;
                     const auto dstP2pPtr =
                         ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComm);
-                    const float globalScale =
-                        kRecipe == NCCL_EP_COMB_QUANT_NVFP4 ? __ldg(inGlobalScales + offset) : 1.f;
-
                     processAndSendToken<kUseLogFMT, kRecipe, kHidden, kNumSendUnrolls, kNumStages, kNumPrefetch>(
                         tokenIdx,
-                        globalScale,
+                        inGlobalScales,
+                        offset,
                         srcDataInt4Ptr,
                         sendBufInt4,
                         recvPtr,
@@ -2041,12 +2134,10 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
                     const auto expectedDstOffset = recvOff + rcvTokenOffset;
                     const auto dstP2pPtr =
                         ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComm);
-                    const float globalScale =
-                        kRecipe == NCCL_EP_COMB_QUANT_NVFP4 ? __ldg(inGlobalScales + slot) : 1.f;
-
                     processAndSendToken<kUseLogFMT, kRecipe, kHidden, kNumSendUnrolls, kNumStages, kNumPrefetch>(
                         tokenIdx,
-                        globalScale,
+                        inGlobalScales,
+                        slot,
                         srcDataInt4Ptr,
                         sendBufPtr,
                         recvPtr,

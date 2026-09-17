@@ -57,13 +57,12 @@ The current usage API is temporary and **will likely change in the future**.
 The hidden dimension must be a multiple of 512; multiples of 1024 additionally
 enable a wider send unroll.
 
-**Pre-requisites**: Before calling Combine, the application must calculate global scales (a single value per token) as `2688 / amax(abs(token))`, using `0` when `amax` is `0`.
-
 To enable NVFP4 quantization:
 * set `combine_config.quant_recipe = NCCL_EP_COMB_QUANT_NVFP4`
-* pass global scales via `combine_inputs.scales` as a FP32 3D
-tensor with the same leading dimensions as `combine_inputs.tokens` and a final
-dimension of one (`[*][*][1]`).
+* pass BF16 expert outputs in `combine_inputs.tokens`; when `combine_inputs.scales`
+  is null, the fused combine kernel derives each per-row global scale directly
+  from the token; when it is non-null, combine uses the supplied FP32
+  `2688 / amax(abs(token))` values (or `0` for an all-zero token)
 * combine produces no scale output: NCCL EP performs the quantization internally and returns tokens in the BF16 format.
 
 ## Sizing of NCCL EP staging buffers (`max_token_bytes`)

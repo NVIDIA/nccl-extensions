@@ -537,11 +537,9 @@ typedef struct {
     ncclEpTensor_t* topk_weights; // optional; HT backward combine only:
   //   2D [num_recv_tokens, top_k], ncclFloat32
     // Optional; recipe-dependent:
-    // - NCCL_EP_COMB_QUANT_NONE / NCCL_EP_COMB_QUANT_MXFP8: must be NULL
-    //   (MXFP8 generates its E8M0 block scales internally).
-    // - NCCL_EP_COMB_QUANT_NVFP4 (experimental): FP32 per-expert-token global quantization
-    //   scales. For each valid token row, pass 2688 / amax(abs(tokens[row, :])); use 0 when
-    //   amax is 0. Computed from the post-expert activation before ncclEpCombine.
+    // - NCCL_EP_COMB_QUANT_NONE / NCCL_EP_COMB_QUANT_MXFP8 / NCCL_EP_COMB_QUANT_NVFP4:
+    //   must be NULL. MXFP8 generates E8M0 block scales internally; NVFP4 derives its
+    //   per-row global scales internally.
     ncclEpTensor_t* scales;
 } ncclEpCombineInputs_t;
 
@@ -894,8 +892,8 @@ typedef enum {
     NCCL_EP_COMB_QUANT_NONE = 0,
     // EXPERIMENTAL: LL-only BF16 expert-output transport. Its API contract,
     // supported shapes, and numerical behavior may change before graduation.
-    // The caller supplies FP32 global scales through combine inputs->scales;
-    // the kernel follows the DeepEP-LL NVFP4 pack/dequantize contract.
+    // Leave combine inputs->scales NULL to derive FP32 global scales internally.
+    // The kernel follows the DeepEP-LL NVFP4 pack/dequantize contract.
     NCCL_EP_COMB_QUANT_NVFP4 = 1,
     // MXFP8: inputs->tokens are BF16 and inputs->scales must be NULL. The library
     // quantizes to FP8 E4M3 + per-block E8M0 block scales (block 32) internally,

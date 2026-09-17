@@ -3649,38 +3649,6 @@ static Nvfp4ValidationReference buildNvfp4ValidationReference(
 // per post-expert row, quantize/dequantize each 16-element block with its E4M3
 // scale, then apply routing weights and compare against the combined BF16 output.
 // DeepEP formula: check = combined / is_token_in_rank.sum()
-// Populate the NVFP4 per-row global quantization scale from post-expert activations.
-// This matches the DeepEP contract: global_scale = 448 * 6 / row_amax.
-static void initializeNvfp4ValidationScales(
-    const BenchmarkAllocState& alloc, ncclEpCombineInputs_t& combine_inputs) {
-    const size_t* sizes = combine_inputs.tokens->sizes;
-    const int ndim = combine_inputs.tokens->ndim;
-    const unsigned int hidden = static_cast<unsigned int>(sizes[ndim - 1]);
-    size_t rows = 1;
-    for (int dim = 0; dim < ndim - 1; ++dim) rows *= sizes[dim];
-
-    const ncclDataType_t dtype = combine_inputs.tokens->datatype;
-    const size_t elem_bytes = tokenElemBytes(dtype);
-    std::vector<char> tokens(rows * hidden * elem_bytes);
-    void* token_data;
-    NCCLCHECK(epGetTensorData(alloc, combine_inputs.tokens, &token_data));
-    CUDACHECK(cudaMemcpy(tokens.data(), token_data, tokens.size(), cudaMemcpyDeviceToHost));
-
-    std::vector<float> scales(rows, 0.f);
-    for (size_t row = 0; row < rows; ++row) {
-        float amax = 0.f;
-        for (unsigned int h = 0; h < hidden; ++h) {
-            const float value = tokenElemToFloat(tokens.data(), row * hidden + h, dtype);
-            if (std::isfinite(value)) amax = std::max(amax, std::abs(value));
-        }
-        scales[row] = amax == 0.f ? 0.f : 2688.f / amax;
-    }
-
-    void* scale_data;
-    NCCLCHECK(epGetTensorData(alloc, combine_inputs.scales, &scale_data));
-    CUDACHECK(cudaMemcpy(scale_data, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice));
-}
-
 // LL combine applies a weighted sum. Expert-major applies every routing weight in
 // the combine kernel. Rank-major first reduces weights per destination rank in
 // FP32, narrows every per-rank contribution to the token dtype, then combines
@@ -6802,15 +6770,6 @@ int main(int argc, char* argv[]) {
         fflush(stdout);
     }
 
-    if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4) {
-        const unsigned int scale_rows = layout == NCCL_EP_LAYOUT_EXPERT_MAJOR
-            ? num_local_experts : static_cast<unsigned int>(nRanks);
-        const unsigned int scale_slots = layout == NCCL_EP_LAYOUT_EXPERT_MAJOR
-            ? static_cast<unsigned int>(nRanks) * max_tokens_per_rank : max_tokens_per_rank;
-        NCCLCHECK(epMakeTensor(
-            &combine_inputs.scales, 3, ncclFloat32, scale_rows, scale_slots, 1));
-    }
-
     // Apply the CLI-selected recv_topk_idx numbering. The kind only matters for
     // layouts that populate recv_topk_idx (LL rank-major, HT FLAT); other layouts
     // ignore it. Setting the field on dispatch_layout_info is safe even when the
@@ -7343,11 +7302,6 @@ int main(int argc, char* argv[]) {
                         nRanks,
                         token_dtype);
                 }
-            }
-
-            if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4) {
-                // The production caller supplies these post-expert row scales before combine.
-                initializeNvfp4ValidationScales(alloc, combine_inputs);
             }
 
             // Run combine

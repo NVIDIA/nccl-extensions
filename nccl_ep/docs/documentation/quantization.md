@@ -59,10 +59,9 @@ enable a wider send unroll.
 
 To enable NVFP4 quantization:
 * set `combine_config.quant_recipe = NCCL_EP_COMB_QUANT_NVFP4`
-* pass BF16 expert outputs in `combine_inputs.tokens`; when `combine_inputs.scales`
-  is null, the fused combine kernel derives each per-row global scale directly
-  from the token; when it is non-null, combine uses the supplied FP32
-  `2688 / amax(abs(token))` values (or `0` for an all-zero token)
+* pass BF16 expert outputs in `combine_inputs.tokens` and leave
+  `combine_inputs.scales` null; the fused combine kernel derives each per-row
+  global scale directly from the token
 * combine produces no scale output: NCCL EP performs the quantization internally and returns tokens in the BF16 format.
 
 ## Sizing of NCCL EP staging buffers (`max_token_bytes`)

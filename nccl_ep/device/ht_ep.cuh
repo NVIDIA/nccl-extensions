@@ -4104,6 +4104,9 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     long long _wt_start = 0;
     if (threadIdx.x % 32 == 0) _wt_start = clock64();
 #endif
+    // LSA-only dispatch has no chunk arrival signals. Use one aligned routing
+    // vector per work tile instead of the grid-scaled transport/combine chunk.
+    constexpr int DISPATCH_TILE_TOKENS = LSA_TEAMS == 1 ? sizeof(uint4) : TOKENS_PER_CHUNK;
     constexpr bool HAS_SF = (kRecipe == NCCL_EP_DISP_QUANT_FWD);
     int threadIdx_x_int = (int)threadIdx.x;
     if (threadIdx_x_int < GIN_GROUP::size()) {
@@ -4131,7 +4134,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
         }
     } else if (threadIdx_x_int < GIN_GROUP::size() + LSA_G2S_GROUP::size()) {
 #define DISPATCH_G2S_TEMPLATE \
-        dispatch_G2S_warp<LSA_G2S_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_STAGES, TOKENS_PER_CHUNK, \
+        dispatch_G2S_warp<LSA_G2S_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_STAGES, DISPATCH_TILE_TOKENS, \
                             MAX_TOKENS_PER_RANK, LSA_TEAMS, LSA_TEAM_SZ, NBLOCKS, NUM_PIPELINES, \
                             FORWARD_DISPATCH, HAS_SF>
         DISPATCH_G2S_TEMPLATE(
@@ -4157,7 +4160,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
         threadIdx_x_int < GIN_GROUP::size() + LSA_G2S_GROUP::size() + LSA_S2G_GROUP::size()) {
 #define DISPATCH_S2G_TEMPLATE \
         dispatch_S2G_warp<LSA_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_STAGES, \
-                            IN_FLIGHT_S2G, TOKENS_PER_CHUNK, LSA_TEAMS, LSA_TEAM_SZ, NBLOCKS, NUM_PIPELINES, \
+                            IN_FLIGHT_S2G, DISPATCH_TILE_TOKENS, LSA_TEAMS, LSA_TEAM_SZ, NBLOCKS, NUM_PIPELINES, \
                             FORWARD_DISPATCH, HAS_SF, kLayout>
         DISPATCH_S2G_TEMPLATE(
             param.rdma_to_attn_map,

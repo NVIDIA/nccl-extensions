@@ -118,6 +118,8 @@ struct TestCase {
   int worldDivisor; /* skip if worldSize % this != 0 */
 
   int srcRatioNum, dstRatioNum; /* (0,0) ⇒ even split */
+  bool legacyReplication; /* exercise the historical singleton-shard encoding */
+  bool oneDimReplication; /* use one active public mesh axis */
   bool dstFirst; /* place destination mesh before source mesh in parent rank order */
   bool bAsyncOrdering; /* keep source fill and destination validation on the caller stream */
   bool bGraphCapture;
@@ -313,34 +315,32 @@ static std::string buildCaseName(const TestCase& tc) {
  * ====================================================================*/
 
 static void emitFullReplication(std::vector<TestCase>& cases) {
-  /*  test_basic_api_full_replication
-   *  - 1D mesh per side, both Replicate()
-   *  - Tensor (200, 200), dtypes fp32 / bf16 / uint8
-   *  - Pytest skips world < 8; we only need world >= 4 (2 src + 2 dst)
-   *    since the C kernel has no inherent 8-rank requirement.
-   */
-  const size_t esz_list[] = {
-    4, /* fp32 (size table) */
-    2, /* bf16 (size table) */
-    1, /* uint8 (size table default for esz=1) */
-  };
-  for (size_t esz : esz_list) {
-    TestCase tc{};
-    tc.group = "full_replication";
-    tc.ndims = 2;
-    tc.globalDims[0] = 200;
-    tc.globalDims[1] = 200;
-    tc.srcDim0 = 0; /* 1D mesh */
-    tc.dstDim0 = 0;
-    tc.srcShardDim = -1;
-    tc.dstShardDim = -1;
-    tc.srcPl = PL_REPL;
-    tc.dstPl = PL_REPL;
-    tc.elementSize = esz;
-    tc.worldMin = 4;
-    tc.worldDivisor = 2;
-    tc.name = buildCaseName(tc);
-    cases.push_back(std::move(tc));
+  for (size_t esz : {size_t(4), size_t(2), size_t(1)}) {
+    for (int layout = 0; layout < 5; layout++) {
+      for (int direction = 0; direction < 3; direction++) {
+        for (bool dstFirst : {false, true}) {
+          TestCase tc{};
+          tc.group = "full_replication";
+          tc.ndims = 2;
+          tc.globalDims[0] = 200;
+          tc.globalDims[1] = 200;
+          tc.srcPl = direction == 2 ? PL_RS : PL_REPL;
+          tc.dstPl = direction == 1 ? PL_RS : PL_REPL;
+          tc.srcShardDim = direction == 2 ? 0 : -1;
+          tc.dstShardDim = direction == 1 ? 0 : -1;
+          tc.elementSize = esz;
+          tc.worldMin = layout == 4 ? 8 : 4;
+          tc.worldDivisor = layout == 4 ? 8 : 2;
+          tc.dstFirst = dstFirst;
+          tc.legacyReplication = layout == 0;
+          tc.oneDimReplication = layout == 1;
+          tc.srcDim0 = layout == 3 ? 1 : (layout == 4 ? 2 : 0);
+          tc.dstDim0 = tc.srcDim0;
+          tc.name = buildCaseName(tc) + "[layout=" + std::to_string(layout) + "]";
+          cases.push_back(std::move(tc));
+        }
+      }
+    }
   }
 }
 
@@ -1023,15 +1023,8 @@ static void buildMesh(MeshLayout* out, PlacementKind pl, int shardDim, int dim0,
   out->startRank = startRank;
   out->shardDim = (pl == PL_REPL) ? -1 : shardDim;
   if (pl == PL_REPL) {
-    /* Encode "full replication" as a 1-shard PL_RS layout: every
-     * rank still owns the full tensor, shardCount = 1 keeps the
-     * expected global-range math simple, and the kernel goes through
-     * the well-tested sharded path. A {REPLICATE, REPLICATE} mesh
-     * lands in a degenerate prepare branch that the test suite does
-     * not currently exercise.
-     */
     out->placement[0] = NCCL_RESHARD_REPLICATE;
-    out->placement[1] = NCCL_RESHARD_SHARD(0);
+    out->placement[1] = NCCL_RESHARD_REPLICATE;
     out->shardCount = 1;
   } else if (pl == PL_RS) {
     out->placement[0] = NCCL_RESHARD_REPLICATE;
@@ -1114,7 +1107,7 @@ static bool caseFeasibleAt(const TestCase& tc, int w, CaseShape* shape = nullptr
   if (srcTotal + dstTotal != w || srcTotal == 0 || dstTotal == 0) return fail("ratio yields empty side");
 
   int srcDim0, srcDim1, dstDim0, dstDim1;
-  if (tc.srcPl == PL_REPL) {
+  if (tc.srcPl == PL_REPL && tc.srcDim0 == 0) {
     srcDim0 = srcTotal;
     srcDim1 = 1;
   } else {
@@ -1122,7 +1115,7 @@ static bool caseFeasibleAt(const TestCase& tc, int w, CaseShape* shape = nullptr
     if (srcTotal % srcDim0 != 0) return fail("srcTotal not divisible by srcDim0");
     srcDim1 = srcTotal / srcDim0;
   }
-  if (tc.dstPl == PL_REPL) {
+  if (tc.dstPl == PL_REPL && tc.dstDim0 == 0) {
     dstDim0 = dstTotal;
     dstDim1 = 1;
   } else {
@@ -1438,6 +1431,11 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   buildMesh(&dstLayout, tc.dstPl, tc.dstShardDim, dstDim0, dstDim1,
             /*startRank=*/dstStart);
 
+  if (tc.legacyReplication) {
+    if (tc.srcPl == PL_REPL) srcLayout.placement[1] = NCCL_RESHARD_SHARD(0);
+    if (tc.dstPl == PL_REPL) dstLayout.placement[1] = NCCL_RESHARD_SHARD(0);
+  }
+
   /* ----- 3. determine role and per-rank local dims (in elements) ----- */
   bool isSrc = (env->rank >= srcStart && env->rank < srcStart + srcTotal);
   bool isDst = (env->rank >= dstStart && env->rank < dstStart + dstTotal);
@@ -1517,10 +1515,10 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   int dstMeshDims[NCCL_RESHARD_MAX_MESH_DIMS] = {dstLayout.dims[0], dstLayout.dims[1]};
   ncclMesh_t srcMesh = NCCL_M2N_MESH_INITIALIZER;
   ncclMesh_t dstMesh = NCCL_M2N_MESH_INITIALIZER;
-  srcMesh.ndims = NCCL_RESHARD_MAX_MESH_DIMS;
+  srcMesh.ndims = tc.oneDimReplication && tc.srcPl == PL_REPL ? 1 : NCCL_RESHARD_MAX_MESH_DIMS;
   srcMesh.dims = srcMeshDims;
   srcMesh.startRank = srcLayout.startRank;
-  dstMesh.ndims = NCCL_RESHARD_MAX_MESH_DIMS;
+  dstMesh.ndims = tc.oneDimReplication && tc.dstPl == PL_REPL ? 1 : NCCL_RESHARD_MAX_MESH_DIMS;
   dstMesh.dims = dstMeshDims;
   dstMesh.startRank = dstLayout.startRank;
 

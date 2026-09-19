@@ -4942,6 +4942,13 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (validate_data && dispatch_quantization == NCCL_EP_DISP_QUANT_NONE && hidden <= TOKEN_ID_COLS) {
+        if (myRank == 0)
+            printf("Error: NONE validation requires hidden > %d to encode rank and token ID\n", TOKEN_ID_COLS);
+        MPI_Finalize();
+        return 1;
+    }
+
     // Packed FP4 uses Uint8 scales by default unless the caller
     // explicitly selects another compile-time scale type.
     if (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD &&

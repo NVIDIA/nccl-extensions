@@ -67,6 +67,7 @@ JIT_CONFIG_HEADER := $(JIT_DIR)/config.h
 NCCL_EP_JIT_HEADERS := \
     device/ht_ep.cuh \
     device/device_primitives.cuh \
+    device/lsa_completion.cuh \
     device/ht_ep_configs.cuh \
     device/cuda_compat_shims.cuh \
     device/scan_kernel.cuh \

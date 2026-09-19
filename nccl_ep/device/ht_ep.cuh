@@ -14,6 +14,7 @@
 #include "nccl_ep.h"
 #include "common.hpp"
 #include "device_primitives.cuh"
+#include "lsa_completion.cuh"
 #include "ht_ep_configs.cuh"
 #include <assert.h>
 #include <cooperative_groups.h>
@@ -4214,12 +4215,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             // (local_dup defers that bump to its own tail).
             if (tail_tid == 0) {
                 const uint32_t expected_val = *param.expected_lsa_flag_val;
-                nccl_ep::red_add_release_sys_global(param.lsa_S2G_flags, 1u);
-                uint32_t flag_data;
-                do {
-                    flag_data = nccl_ep::ld_relaxed_sys_global(param.lsa_S2G_flags);
-                } while (flag_data != expected_val);
-                nccl_ep::memory_fence();
+                nccl_ep::publish_lsa_completion(param.lsa_S2G_flags + param.local_rank, expected_val);
+                nccl_ep::wait_lsa_completion(param.lsa_S2G_flags, expected_val, param.ranks_per_lsa_team);
                 atomicExch((unsigned int*)param.dispatch_grid_barrier_counter, 0u);
                 if (!param.local_dup_enabled)
                     *param.expected_lsa_flag_val += static_cast<uint32_t>(param.ranks_per_lsa_team);
@@ -4340,14 +4337,11 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
             _wt_head_start = clock64();
 #endif
-            // Inter-rank completion barrier: block 0 signals (red.release orders prior stores), every block polls.
-            if (blockIdx.x == 0) nccl_ep::red_add_release_sys_global(param.lsa_S2G_flags, 1u);
+            // Block 0 publishes this rank's input readiness; every block waits for all peers.
             const uint32_t expected_val = *param.expected_lsa_flag_val;
-            uint32_t flag_data;
-            do {
-                flag_data = nccl_ep::ld_relaxed_sys_global(param.lsa_S2G_flags);
-            } while (flag_data != expected_val);
-            nccl_ep::memory_fence();
+            if (blockIdx.x == 0)
+                nccl_ep::publish_lsa_completion(param.lsa_S2G_flags + param.local_rank, expected_val);
+            nccl_ep::wait_lsa_completion(param.lsa_S2G_flags, expected_val, param.ranks_per_lsa_team);
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
             _wt_head_end = clock64();
             param.block_timing[blockIdx.x].head_sync_start_clock = _wt_head_start;
@@ -4628,17 +4622,9 @@ inline int local_dup_dynamic_smem_bytes(
 template <typename T, int HIDDEN_DIM, int PIPE_DEPTH, bool FORWARD_DISPATCH,
           ncclEpDispQuant_t kRecipe = NCCL_EP_DISP_QUANT_NONE>
 __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_param_t<T>& p) {
-    // Wait until all peers have signaled S2G completion on this rank's recv buffer.
-    // Use >= rather than == so a future code path that overshoots the counter
-    // (e.g. extra peer arrivals) doesn't hang.
-    if (threadIdx.x == 0) {
-        const uint32_t expected_val = *p.expected_lsa_flag_val;
-        uint32_t v;
-        do {
-            v = nccl_ep::ld_relaxed_sys_global(p.lsa_S2G_flag);
-        } while (v < expected_val);
-        nccl_ep::memory_fence();
-    }
+    // Dispatch defers the expected-epoch advance until local duplication finishes.
+    if (threadIdx.x == 0)
+        nccl_ep::wait_lsa_completion(p.lsa_S2G_flag, *p.expected_lsa_flag_val, p.ranks_per_lsa_team);
     __syncthreads();
 
     constexpr int kTokenBytes = HIDDEN_DIM * sizeof(T);

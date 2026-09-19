@@ -86,6 +86,11 @@ run_suite() {
     rm -rf "${LOG_DIR}"
 }
 
+# This primitive test manages both devices in one process and needs no NCCL bootstrap.
+if [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == test_ht_lsa_completion ]]; then
+    "${NCCL_EP_BUILDDIR}/test/nccl_ep/test_ht_lsa_completion" ${GTEST_ARGS} || OVERALL_FAIL=1
+fi
+
 # Suite list: bin|description|em_affected.
 # em_affected suites are re-run under every HT-EM mode.
 SUITES=(

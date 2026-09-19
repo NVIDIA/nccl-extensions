@@ -1155,10 +1155,10 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
 
     // Merged completion flags: allocate on all ranks as we will window register is collective
     NCCL_CHECK_RESULT(
-        ncclMemAlloc(reinterpret_cast<void**>(&ep_group->ht_buffers.completion_flags_base), 2 * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemsetAsync(ep_group->ht_buffers.completion_flags_base, 0, 2 * sizeof(uint32_t), stream));
+        ncclMemAlloc(reinterpret_cast<void**>(&ep_group->ht_buffers.completion_flags_base), 2 * lsa_ranks * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemsetAsync(ep_group->ht_buffers.completion_flags_base, 0, 2 * lsa_ranks * sizeof(uint32_t), stream));
     ep_group->ht_buffers.dispatch_lsa_S2G_flags = ep_group->ht_buffers.completion_flags_base;
-    ep_group->ht_buffers.combine_lsa_S2G_flags = ep_group->ht_buffers.completion_flags_base + 1;
+    ep_group->ht_buffers.combine_lsa_S2G_flags = ep_group->ht_buffers.completion_flags_base + lsa_ranks;
 
     // Per-rank (not IPC-shared) device counter block. Layout (offsets in bytes):
     //   [ 0..8)  dispatch_expected_gin_flag_val  (uint64_t)
@@ -1211,7 +1211,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     NCCL_CHECK_RESULT(ncclCommWindowRegister(
         comm,
         ep_group->ht_buffers.completion_flags_base,
-        2 * sizeof(uint32_t),
+        2 * lsa_ranks * sizeof(uint32_t),
         &ep_group->ht_buffers.completion_flags_window,
         NCCL_WIN_COLL_SYMMETRIC));
 
@@ -1247,14 +1247,14 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         }
     }
 
-    // Merged completion flags: resolve rank0 pointer from window.
+    // Two arrays of single-writer epochs, one slot per LSA rank; resolve rank 0 storage.
     if (lsa_rank != 0) {
         int lsa_rank0_global = ncclTeamRankToWorld(comm, lsa_team, 0);
         void* ptr = nullptr;
         NCCL_CHECK_RESULT(
             ncclGetPeerDevicePointer(ep_group->ht_buffers.completion_flags_window, 0, lsa_rank0_global, &ptr));
         ep_group->ht_buffers.dispatch_lsa_S2G_flags = static_cast<uint32_t*>(ptr);
-        ep_group->ht_buffers.combine_lsa_S2G_flags = static_cast<uint32_t*>(ptr) + 1;
+        ep_group->ht_buffers.combine_lsa_S2G_flags = static_cast<uint32_t*>(ptr) + lsa_ranks;
     }
 
     ep_group->ht_buffers.initialized = true;

@@ -3,7 +3,13 @@
 set -euo pipefail
 bench=${1:?usage: test_bench_validation.sh /path/to/ep_bench}
 export HWLOC_COMPONENTS=-gl,-opencl
-for hidden in 0 127 128 129 256 4096; do
+for hidden in -1 0 4294967296 18446744073709551616 256x ''; do
+    rc=0
+    output=$("$bench" --hidden "$hidden" 2>&1) || rc=$?
+    [[ $rc == 1 && $output == *'hidden must be a positive unsigned integer'* ]]
+    echo "PASS rejected hidden='$hidden'"
+done
+for hidden in 127 128 129 256 4096 4294967295; do
     # This incompatible option supplies a second parser error after the width
     # check, so supported widths can be checked without initializing CUDA.
     rc=0

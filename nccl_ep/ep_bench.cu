@@ -4844,7 +4844,7 @@ int main(int argc, char* argv[]) {
         {"disable-token-dropping", no_argument, 0, 1001},
         {"fused-meta-dispatch", no_argument, 0, 1005},
         {"backward", no_argument, 0, 'B'},
-        {"overflow-drop", no_argument, 0, 1006},
+        {"overflow-drop", no_argument, 0, 1008},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
@@ -5079,7 +5079,7 @@ int main(int argc, char* argv[]) {
         case 1001:  // --disable-token-dropping
             g_disable_token_dropping = true;
             break;
-        case 1006:  // --overflow-drop
+        case 1008:  // --overflow-drop
             overflow_drop = true;
             break;
         case 1005:  // --fused-meta-dispatch

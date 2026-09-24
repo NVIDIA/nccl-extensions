@@ -5,6 +5,7 @@
  */
 // Throughput and validation methodology aligned with DeepEP (https://github.com/deepseek-ai/DeepEP).
 
+#include <errno.h>
 #include <getopt.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -4889,9 +4890,19 @@ int main(int argc, char* argv[]) {
         case 't':
             max_tokens_per_rank = static_cast<unsigned int>(atoi(optarg));
             break;
-        case 'd':
-            hidden = static_cast<unsigned int>(atoi(optarg));
+        case 'd': {
+            char* end;
+            errno = 0;
+            const long long width = strtoll(optarg, &end, 10);
+            if (errno == ERANGE || end == optarg || *end != '\0' || width <= 0 ||
+                width > std::numeric_limits<unsigned int>::max()) {
+                if (myRank == 0) printf("Error: hidden must be a positive unsigned integer\n");
+                MPI_Finalize();
+                return 1;
+            }
+            hidden = static_cast<unsigned int>(width);
             break;
+        }
         case 'k':
             top_k = static_cast<unsigned int>(atoi(optarg));
             break;
@@ -5094,6 +5105,13 @@ int main(int argc, char* argv[]) {
             MPI_Finalize();
             return 1;
         }
+    }
+
+    if (validate_data && dispatch_quantization == NCCL_EP_DISP_QUANT_NONE && hidden <= TOKEN_ID_COLS) {
+        if (myRank == 0)
+            printf("Error: NONE validation requires hidden > %d to encode rank and token ID\n", TOKEN_ID_COLS);
+        MPI_Finalize();
+        return 1;
     }
 
     // Packed FP4 uses Uint8 scales by default unless the caller

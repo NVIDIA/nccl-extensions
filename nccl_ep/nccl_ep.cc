@@ -2264,6 +2264,21 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz_int, cudaDevAttrClockRate, dev));
         uint64_t clock_khz = static_cast<uint64_t>(clock_khz_int);
 
+        // Device waits expire only when elapsed > timeoutCycles. Cap at half
+        // the counter range to leave ample time to observe expiry before wrap.
+        constexpr uint64_t max_timeout_cycles = UINT64_MAX / 2;
+        auto mul_sat = [max_timeout_cycles](uint64_t a, uint64_t b) -> uint64_t {
+            return (a == 0 || b <= max_timeout_cycles / a) ? a * b : max_timeout_cycles;
+        };
+        // Split ns at the ms boundary to retain sub-ms precision without
+        // overflowing ns * kHz. The remainder is < 1e6 and kHz comes from a
+        // CUDA int attribute, so their product fits in uint64_t.
+        auto ns_to_cycles = [&mul_sat, max_timeout_cycles](uint64_t khz, uint64_t ns) -> uint64_t {
+            const uint64_t whole = mul_sat(ns / 1000000ULL, khz);
+            const uint64_t frac  = (ns % 1000000ULL) * khz / 1000000ULL;
+            return (whole > max_timeout_cycles - frac) ? max_timeout_cycles : whole + frac;
+        };
+
         uint64_t resolved = NUM_TIMEOUT_CYCLES;
         const char* source = "compile-time default";
         const uint64_t env_ms = static_cast<uint64_t>(ep_group->env.timeout_ms.value.ul);
@@ -2271,24 +2286,41 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         const bool have_env_ms = ep_group->env.timeout_ms.is_set && env_ms > 0;
 
         if (have_env_ms) {
-            resolved = clock_khz * 1000ULL * env_ms / 1000ULL;
+            resolved = mul_sat(env_ms, clock_khz);  // ms * kHz == cycles, exactly
             source = "NCCL_EP_TIMEOUT_MS env var";
             if (ep_group->config.timeout_ns != 0 && ep_group->rank == 0)
                 fprintf(stderr, "NCCL EP: NCCL_EP_TIMEOUT_MS=%lu overrides config.timeout_ns=%lu\n",
                         (unsigned long)env_ms, (unsigned long)ep_group->config.timeout_ns);
         } else if (ep_group->config.timeout_ns != 0) {
-            resolved = clock_khz * 1000ULL * (ep_group->config.timeout_ns / 1000000ULL) / 1000ULL;
+            resolved = ns_to_cycles(clock_khz, ep_group->config.timeout_ns);
             source = "config.timeout_ns";
+        }
+
+        if (resolved == 0) {
+            fprintf(stderr,
+                    "NCCL EP: warning: the requested timeout resolves to 0 GPU clock cycles "
+                    "(config.timeout_ns=%llu, NCCL_EP_TIMEOUT_MS=%s, clock=%llu kHz); "
+                    "using 1 cycle.\n",
+                    (unsigned long long)ep_group->config.timeout_ns,
+                    have_env_ms ? "set" : "unset", (unsigned long long)clock_khz);
+            resolved = 1;
         }
 
         ep_group->timeout_cycles = resolved;
         if (ep_group->rank == 0) {
-            uint64_t timeout_ms = resolved / (clock_khz * 1000ULL / 1000ULL);
+            // Reported in MICROSECONDS: a sub-millisecond budget is legal and
+            // would print as 0 ms.
+            const uint64_t cycles_per_us = clock_khz / 1000ULL;
+            const unsigned long long timeout_us =
+                cycles_per_us == 0 ? 0ULL : (unsigned long long)(resolved / cycles_per_us);
             char env_str[32];
             if (have_env_ms) snprintf(env_str, sizeof(env_str), "%llu", (unsigned long long)env_ms);
             else snprintf(env_str, sizeof(env_str), "unset");
-            fprintf(stderr, "NCCL EP: using timeout=%llums (env=%s, config.timeout_ns=%llu, source=%s)\n",
-                    (unsigned long long)timeout_ms, env_str, (unsigned long long)ep_group->config.timeout_ns, source);
+            fprintf(stderr,
+                    "NCCL EP: using timeout=%lluus (%llu cycles at %llu kHz, env=%s, "
+                    "config.timeout_ns=%llu, source=%s)\n",
+                    timeout_us, (unsigned long long)resolved, (unsigned long long)clock_khz,
+                    env_str, (unsigned long long)ep_group->config.timeout_ns, source);
         }
     }
 

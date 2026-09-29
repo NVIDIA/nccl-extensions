@@ -6,6 +6,8 @@
 
 #include "nccl_ep_env.h"
 
+#include <cerrno>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <strings.h>  // strcasecmp
@@ -40,6 +42,24 @@ void parse_ulong(ncclEpEnvVar& var) {
     var.value.ul = std::strtoul(v, nullptr, 10);
 }
 
+// Reject invalid timeout settings instead of turning negative or overflowing
+// values into huge unsigned timeout budgets.
+void parse_timeout_ms(ncclEpEnvVar& var) {
+    const char* v = std::getenv(var.name);
+    if (v == nullptr || v[0] == '\0') return;  // unset/empty -> not set
+    const char* number = v;
+    while (std::isspace(static_cast<unsigned char>(*number))) ++number;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long parsed = std::strtoul(number, &end, 10);
+    if (*number == '-' || end == number || *end != '\0' || errno == ERANGE) {
+        std::fprintf(stderr, "[nccl_ep] %s=%s ignored (expected an unsigned long integer)\n", var.name, v);
+        return;
+    }
+    var.is_set = true;
+    var.value.ul = parsed;
+}
+
 }  // namespace
 
 void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
@@ -57,9 +77,10 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_flag(cfg->ht_em_count_unfused);
     parse_flag(cfg->disable_guard);
 
+    parse_timeout_ms(cfg->timeout_ms);
+
     // Numeric (ulong) vars: is_set means present, value.ul holds the raw integer
     // (no range checks here — consumers in nccl_ep.cc validate per their needs).
-    parse_ulong(cfg->timeout_ms);
     parse_ulong(cfg->comm_num_sms);
     parse_ulong(cfg->dispatch_num_sms);
     parse_ulong(cfg->combine_num_sms);

@@ -1610,7 +1610,9 @@ static ncclResult_t commAllocHost(ncclComm_t comm, ncclDevComm_t** outDevComm, s
     NCCLCHECK(ncclCommQueryProperties(comm, &props));
     *outBytes = props.devCommRuntimeVersionSize;
 #else
-    *outBytes = sizeof(ncclDevComm_t);
+    // Add DevComm padding for backward compatibility when NCCL_DEV_API_JIT selects a newer runtime layout.
+    constexpr size_t kDevCommBackwardCompatPadding = 128;
+    *outBytes = sizeof(ncclDevComm_t) + kDevCommBackwardCompatPadding;
 #endif
 
     *outDevComm = static_cast<ncclDevComm_t*>(calloc(1, *outBytes));

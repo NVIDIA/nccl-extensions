@@ -330,6 +330,21 @@ export NCCL_EP_JIT_LOG=1      # Runtime kernel-compilation diagnostics (see docs
 > containers, and read-only filesystems do. See
 > [JIT Kernel Compilation](docs/documentation/jit.md) for every knob, including `NCCL_EP_HOME`.
 
+#### NCCL EP compatibility with newer NCCL runtimes
+
+- Builds compiled against NCCL >= 2.31 use the runtime-reported DevComm size directly.
+- Builds compiled against NCCL >= 2.30.5 and < 2.31 must enable
+  `NCCL_DEV_API_JIT` when running with a newer NCCL runtime.
+- Builds compiled against NCCL < 2.30.5 do not support this compatibility path.
+
+```bash
+export NCCL_HOME=/path/to/nccl-2.31
+export LD_LIBRARY_PATH="${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
+export NCCL_DEV_API_JIT=1
+```
+
+> The runtime lib and headers must come from the same NCCL installation; mixing Device API layouts is unsupported.
+
 ### High-Throughput tuning
 
 ```bash

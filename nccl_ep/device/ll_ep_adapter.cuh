@@ -19,6 +19,21 @@
 namespace nccl_ep {
 namespace ll {
 
+// Keep shared-quantization eligibility identical in the host geometry, JIT
+// launch bounds, and device staging allocation.
+// Tuning-derived cutoff: shared staging was validated through H=16384 on
+// GB200. This is not a correctness limit; capacity is checked separately.
+constexpr int kLlDsFp8SharedHiddenLimit = 16384;
+constexpr int kLlDsFp8CompactWarps = 16;
+
+// Conservative allowance for epoch scratch and static-allocation alignment.
+// Staging is static shared memory, so do not use the opt-in budget above 48 KiB.
+inline bool ll_dispatch_stage_quant(int hidden, int max_shared_bytes) {
+    if (hidden <= 0 || hidden > kLlDsFp8SharedHiddenLimit) return false;
+    const int required = hidden + (hidden / 128) * sizeof(float) + 32;
+    return required <= std::min(max_shared_bytes, 48 * 1024);
+}
+
 // LL combine uses dynamic shared memory for independent send and receive
 // phases. Keep this host-side accounting next to the launch parameters so it
 // can be checked before configuring a JIT kernel.
@@ -205,6 +220,7 @@ struct clean_low_latency_buffer_kernel_args_t {
 // ============================================================================
 
 struct DispatchParams {
+    int maxDynamicSmem = 0; // Cached device capacity; also honors the test override.
     // User inputs
     const void* inData;
     const void* inScalesBuf = nullptr;     // non-null for QUANT_FWD; runtime-typed storage

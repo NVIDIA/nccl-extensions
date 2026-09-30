@@ -78,6 +78,7 @@ NCCL_EP_JIT_HEADERS := \
     device/ll_ep_adapter.cuh \
     device/ll_ep_smem.cuh \
     device/ll/ll_common.cuh \
+    device/ll/ll_dispatch_recipe.cuh \
     device/ll/ll_gin.cuh \
     device/ll/ll_lsa_primitives.cuh \
     device/ll/ll_mask.cuh \

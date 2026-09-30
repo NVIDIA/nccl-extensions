@@ -1927,6 +1927,169 @@ static ValidationResult validateDispatchOutputLLExpertMajDsFp8E3M4(
     return result;
 }
 
+// ==================== LL rank-major DS_FP8E3M4 validation ====================
+// Rank-major keeps one compacted row per (source rank, token). Decode the source
+// identity from the first four generated scales, validate every FP8 payload byte
+// and scale, then verify the rank-major routing metadata against the regenerated
+// source top-k table.
+static ValidationResult validateDispatchOutputLLRankMajDsFp8E3M4(
+    const BenchmarkAllocState& alloc,
+    const ncclEpDispatchOutputs_t& dispatch_outputs,
+    const ncclEpLayoutInfo_t& dispatch_layout_info,
+    unsigned int max_tokens_per_rank,
+    const unsigned int* num_tokens_per_rank,
+    unsigned int hidden,
+    unsigned int top_k,
+    unsigned int num_experts,
+    unsigned int num_local_experts,
+    int myRank,
+    int nRanks) {
+    ValidationResult result = {true, 0, 0.0, ""};
+    ErrorReporter rep;
+    const size_t max_tpr = dispatch_outputs.tokens->sizes[1];
+    const size_t total_slots = dispatch_outputs.tokens->sizes[0] * max_tpr;
+    const unsigned int num_scales = hidden / DS_FP8E3M4_ELEMENTS_PER_SCALE;
+    if (num_scales < DsFp8E3M4IdentityPattern::kIdentityScaleCount) {
+        return {false, 1, 0.0, "LL rank-major DS_FP8E3M4 has too few scales to decode identity"};
+    }
+
+    std::vector<uint8_t> recv_tokens(total_slots * hidden);
+    std::vector<float> recv_scales(total_slots * num_scales);
+    std::vector<float> recv_weights(total_slots * top_k);
+    std::vector<int32_t> recv_indices(total_slots * top_k);
+    std::vector<int32_t> recv_counts(nRanks);
+    void *tokens = nullptr, *scales = nullptr, *weights = nullptr, *indices = nullptr, *counters = nullptr;
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.tokens, &tokens));
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.scales, &scales));
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.topk_weights, &weights));
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.topk_idx, &indices));
+    NCCLCHECK(epGetTensorData(alloc, dispatch_layout_info.src_rank_counters, &counters));
+    CUDACHECK(cudaMemcpy(recv_tokens.data(), tokens, recv_tokens.size(), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_scales.data(), scales,
+                         recv_scales.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_weights.data(), weights,
+                         recv_weights.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_indices.data(), indices,
+                         recv_indices.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_counts.data(), counters,
+                         recv_counts.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+
+    ncclEpExpertIdKind_t kind = dispatch_layout_info.recv_topk_idx_kind;
+    if (kind == NCCL_EP_EXPERT_ID_AUTO) kind = NCCL_EP_EXPERT_ID_LOCAL;
+    std::vector<int64_t> source_topk(static_cast<size_t>(max_tokens_per_rank) * top_k);
+    std::vector<float> source_weights(static_cast<size_t>(max_tokens_per_rank) * top_k);
+
+    for (int source_rank = 0; source_rank < nRanks; ++source_rank) {
+        generateRandomTopkIndicesLL(source_topk.data(), num_tokens_per_rank[source_rank],
+                                    num_experts, top_k, source_rank);
+        generateTopkWeights(source_weights.data(),
+                            static_cast<size_t>(num_tokens_per_rank[source_rank]) * top_k,
+                            source_rank);
+        std::set<int> expected;
+        for (unsigned int token = 0; token < num_tokens_per_rank[source_rank]; ++token) {
+            for (unsigned int k = 0; k < top_k; ++k) {
+                const int64_t expert = source_topk[token * top_k + k];
+                if (expert >= 0 && expert / static_cast<int>(num_local_experts) == myRank) {
+                    expected.insert(static_cast<int>(token));
+                    break;
+                }
+            }
+        }
+
+        const int count = recv_counts[source_rank];
+        if (count != static_cast<int>(expected.size())) {
+            rep.error("[Rank %d] LL RM DS_FP8E3M4: source rank %d count=%d expected=%zu\n",
+                      myRank, source_rank, count, expected.size());
+        }
+        if (count < 0 || static_cast<size_t>(count) > max_tpr) continue;
+
+        std::set<int> found;
+        for (int slot = 0; slot < count; ++slot) {
+            const size_t row = static_cast<size_t>(source_rank) * max_tpr + slot;
+            const uint8_t* token_row = recv_tokens.data() + row * hidden;
+            const float* scale_row = recv_scales.data() + row * num_scales;
+            const float* weight_row = recv_weights.data() + row * top_k;
+            const int32_t* index_row = recv_indices.data() + row * top_k;
+
+            int identity_bytes[DsFp8E3M4IdentityPattern::kIdentityScaleCount];
+            bool valid_identity_prefix = true;
+            for (unsigned int byte = 0; byte < DsFp8E3M4IdentityPattern::kIdentityScaleCount; ++byte) {
+                identity_bytes[byte] = dsFp8E3M4DecodeIdentityByteFromScale(scale_row[byte]);
+                valid_identity_prefix &= identity_bytes[byte] >= 0;
+            }
+            if (!valid_identity_prefix) {
+                rep.error("[Rank %d] LL RM DS_FP8E3M4: source rank %d slot %d has invalid identity scales\n",
+                          myRank, source_rank, slot);
+                continue;
+            }
+            const uint32_t encoded_identity =
+                static_cast<uint32_t>(identity_bytes[0]) |
+                (static_cast<uint32_t>(identity_bytes[1]) << 8) |
+                (static_cast<uint32_t>(identity_bytes[2]) << 16) |
+                (static_cast<uint32_t>(identity_bytes[3]) << 24);
+            const uint32_t source_identity = DsFp8E3M4IdentityPattern::decodeIdentity(encoded_identity);
+            const int decoded_rank = static_cast<int>(source_identity & 0xffffu);
+            const int decoded_token = static_cast<int>(source_identity >> 16);
+            if (decoded_rank != source_rank || decoded_token < 0 ||
+                decoded_token >= static_cast<int>(num_tokens_per_rank[source_rank]) ||
+                expected.find(decoded_token) == expected.end()) {
+                rep.error("[Rank %d] LL RM DS_FP8E3M4: source rank %d slot %d has unexpected source (%d, %d)\n",
+                          myRank, source_rank, slot, decoded_rank, decoded_token);
+                continue;
+            }
+            if (!found.insert(decoded_token).second) {
+                rep.error("[Rank %d] LL RM DS_FP8E3M4: source rank %d has duplicate token %d\n",
+                          myRank, source_rank, decoded_token);
+            }
+
+            for (unsigned int scale = 0; scale < num_scales; ++scale) {
+                const float expected_scale =
+                    dsFp8E3M4ScaleValue(source_rank, decoded_token, scale, num_scales);
+                if (std::abs(scale_row[scale] - expected_scale) >
+                    DsFp8E3M4IdentityPattern::kScaleTolerance) {
+                    rep.error("[Rank %d] LL RM DS_FP8E3M4: rank %d slot %d scale %u mismatch\n",
+                              myRank, source_rank, slot, scale);
+                }
+                if (!validateDsFp8E3M4PayloadIdentity(
+                        token_row + scale * DS_FP8E3M4_ELEMENTS_PER_SCALE,
+                        scale_row[scale], source_rank, decoded_token, scale)) {
+                    rep.error("[Rank %d] LL RM DS_FP8E3M4: rank %d slot %d block %u payload mismatch\n",
+                              myRank, source_rank, slot, scale);
+                }
+            }
+
+            for (unsigned int k = 0; k < top_k; ++k) {
+                const int64_t expert = source_topk[static_cast<size_t>(decoded_token) * top_k + k];
+                int32_t expected_idx = -1;
+                if (expert >= 0 && expert / static_cast<int>(num_local_experts) == myRank) {
+                    expected_idx = kind == NCCL_EP_EXPERT_ID_GLOBAL
+                        ? static_cast<int32_t>(expert)
+                        : static_cast<int32_t>(expert % num_local_experts);
+                }
+                if (index_row[k] != expected_idx) {
+                    rep.error("[Rank %d] LL RM DS_FP8E3M4: rank %d token %d topk[%u] idx=%d expected=%d\n",
+                              myRank, source_rank, decoded_token, k, index_row[k], expected_idx);
+                }
+                const float expected_weight =
+                    source_weights[static_cast<size_t>(decoded_token) * top_k + k];
+                if (std::abs(weight_row[k] - expected_weight) > 1e-5f * expected_weight) {
+                    rep.error("[Rank %d] LL RM DS_FP8E3M4: rank %d token %d weight[%u] mismatch\n",
+                              myRank, source_rank, decoded_token, k);
+                }
+            }
+        }
+        if (found != expected) {
+            rep.error("[Rank %d] LL RM DS_FP8E3M4: source rank %d received token set differs\n",
+                      myRank, source_rank);
+        }
+    }
+
+    result.errors = rep.errors;
+    result.passed = result.errors == 0;
+    if (!result.passed) result.message = "LL rank-major DS_FP8E3M4 dispatch validation failed";
+    return result;
+}
+
 // ==================== LL rank-major QUANT_FWD validation ====================
 // Rank-major stores received rows contiguously by source rank.  The recipe is
 // pure byte forwarding, so validate both the packed token row and opaque scale
@@ -3028,12 +3191,18 @@ ValidationResult validateDispatchOutput(
                 max_tokens_per_rank, num_tokens_per_rank,
                 hidden, top_k, num_experts, num_local_experts, myRank, nRanks);
         case NCCL_EP_DISP_QUANT_DS_FP8E3M4:
-            if (is_ht_mode || !is_expert_major) {
+            if (is_ht_mode) {
                 fprintf(stderr,
-                        "NCCL EP benchmark warning: DS_FP8E3M4 validation is implemented only for LL expert-major output.\n");
-                return {true, 0, 0.0, "skipped (DS_FP8E3M4 validation unavailable for this layout)"};
+                        "NCCL EP benchmark warning: DS_FP8E3M4 validation is unavailable for HT output.\n");
+                return {true, 0, 0.0, "skipped (DS_FP8E3M4 validation unavailable for HT)"};
             }
-            return validateDispatchOutputLLExpertMajDsFp8E3M4(
+            if (is_expert_major) {
+                return validateDispatchOutputLLExpertMajDsFp8E3M4(
+                    alloc, dispatch_outputs, dispatch_layout_info,
+                    max_tokens_per_rank, num_tokens_per_rank,
+                    hidden, top_k, num_experts, num_local_experts, myRank, nRanks);
+            }
+            return validateDispatchOutputLLRankMajDsFp8E3M4(
                 alloc, dispatch_outputs, dispatch_layout_info,
                 max_tokens_per_rank, num_tokens_per_rank,
                 hidden, top_k, num_experts, num_local_experts, myRank, nRanks);

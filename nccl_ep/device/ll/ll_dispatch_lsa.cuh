@@ -10,16 +10,16 @@
 #include "nccl_device.h"
 #include "../ll_ep_adapter.cuh"
 #include "ll_common.cuh"
+#include "ll_dispatch_recipe.cuh"
 #include "ll_lsa_primitives.cuh"
 #include "ll_mask.cuh"
 
-// LSA-only, unquantized (NCCL_EP_DISP_QUANT_NONE-equivalent) LL dispatch. Every
+// LSA-only LL dispatch for unquantized and fused DS-FP8E3M4 payloads. Every
 // destination is assumed NVLink-reachable (same LSA team) -- there is no RDMA/GIN
 // fallback anywhere in this file, unlike the general dispatch_kernel_impl in
-// ll_ep.cuh. This is a prototyping base for exploring TRT-LLM-style changes
-// (e.g. one-CTA-per-token) without the quant-recipe/RDMA-fallback complexity of
-// the general kernel. No scale payload, no castAndWriteToSendBuf recipe
-// branching, no scale window plumbing.
+// ll_ep.cuh. Keeping the supported recipe set deliberately narrow lets this path
+// retain its single-signal completion protocol without carrying QUANT_FWD,
+// zero-copy scale-window, or RDMA-fallback plumbing.
 
 #define SYNC_DISP_LSA_SEND_COPY 1
 
@@ -30,6 +30,31 @@ namespace ll {
 __forceinline__ __device__ void cleanNextRecvCntBufLsa(int* nextRecvCntBuf, int nextRecvCntBufSize, int offset, int stride) {
 #pragma unroll
     for (int i = offset; i < nextRecvCntBufSize; i += stride) nextRecvCntBuf[i] = 0;
+}
+
+// Copy the split-layout routing header and return the peer payload slot.
+// Both send paths use the same per-source-rank addressing and header stores.
+__forceinline__ __device__ uint8_t* sendTokenHeaderLsa(
+    uint64_t dstSrcRankP2pPtr,
+    const int4* sendDataInt4,
+    int slotIdx,
+    size_t numBytesPerMsg,
+    size_t dispatch_hdr_sz,
+    int maxTokensPerRank,
+    int laneId) {
+    const size_t hdrSectionBytes = static_cast<size_t>(maxTokensPerRank) * dispatch_hdr_sz;
+    const size_t payloadBytes = numBytesPerMsg - dispatch_hdr_sz;
+    const int numHdrInt4 = static_cast<int>(dispatch_hdr_sz / sizeof(int4));
+
+    auto* dstSrcRankBase = reinterpret_cast<uint8_t*>(dstSrcRankP2pPtr);
+    auto* dstHdrSlot = dstSrcRankBase + slotIdx * dispatch_hdr_sz;
+    auto* dstPayloadSlot = dstSrcRankBase + hdrSectionBytes + slotIdx * payloadBytes;
+
+    int4* dstHdrInt4 = reinterpret_cast<int4*>(dstHdrSlot);
+    for (int i = laneId; i < numHdrInt4; i += 32) {
+        st_na_global(dstHdrInt4 + i, sendDataInt4[i]);
+    }
+    return dstPayloadSlot;
 }
 
 // Intra-LSA dispatch send (NVLink direct path, split layout, unquantized): header
@@ -53,20 +78,9 @@ __forceinline__ __device__ void sendTokenLsa(
     ncclWindow_t recvDataWindow,
     size_t recvDataOffset,
     int laneId) {
-    const size_t hdrSectionBytes = static_cast<size_t>(maxTokensPerRank) * dispatch_hdr_sz;
-    const size_t payloadBytes = numBytesPerMsg - dispatch_hdr_sz;
-    const int numHdrInt4 = static_cast<int>(dispatch_hdr_sz / sizeof(int4));
-
-    auto* dstSrcRankBase = reinterpret_cast<uint8_t*>(dstSrcRankP2pPtr);
-    auto* dstHdrSlot = dstSrcRankBase + slotIdx * dispatch_hdr_sz;
-    auto* dstPayloadSlot = dstSrcRankBase + hdrSectionBytes + slotIdx * payloadBytes;
-
-    int4* dstHdrInt4 = reinterpret_cast<int4*>(dstHdrSlot);
-    for (int i = laneId; i < numHdrInt4; i += 32) {
-        st_na_global(dstHdrInt4 + i, sendDataInt4[i]);
-    }
-
-    void* payloadDst = dstPayloadSlot;
+    void* payloadDst = sendTokenHeaderLsa(
+        dstSrcRankP2pPtr, sendDataInt4, slotIdx, numBytesPerMsg,
+        dispatch_hdr_sz, maxTokensPerRank, laneId);
     if (recvDataWindow != ncclWindow_t{}) {
         const size_t recvSlot = static_cast<size_t>(currRank) * maxTokensPerRank + slotIdx;
         payloadDst = ncclGetPeerPointer(recvDataWindow, recvDataOffset + recvSlot * hiddenBytes, dstRank);
@@ -79,13 +93,64 @@ __forceinline__ __device__ void sendTokenLsa(
     }
 }
 
-// Copies received token data only (no scale payload).
+// DS-FP8 NVLink send. Reuse the prequantized CTA payload when supplied;
+// otherwise quantize BF16 input directly into the peer slot.
+__forceinline__ __device__ void sendTokenDsFp8Lsa(
+    uint64_t dstSrcRankP2pPtr,
+    const int4* sendDataInt4,
+    const int4* srcData,
+    int slotIdx,
+    size_t numBytesPerMsg,
+    size_t dispatch_hdr_sz,
+    size_t hiddenBytes,
+    size_t inputHiddenInt4,
+    int scaleBytes,
+    int maxTokensPerRank,
+    bool roundScale,
+    int laneId,
+    const int2* quantized,
+    const float* quantizedScales) {
+    auto* dstPayloadSlot = sendTokenHeaderLsa(
+        dstSrcRankP2pPtr, sendDataInt4, slotIdx, numBytesPerMsg,
+        dispatch_hdr_sz, maxTokensPerRank, laneId);
+    constexpr int kElementsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
+    EP_STATIC_ASSERT(kElementsPerRead * 32 / kDsFp8E3M4ElementsPerScale == 2,
+                     "Invalid DS_FP8E3M4 vectorization");
+    auto* dstDataVec = reinterpret_cast<int2*>(dstPayloadSlot);
+    auto* dstScales = reinterpret_cast<float*>(dstPayloadSlot + hiddenBytes);
+    EP_DEVICE_ASSERT(scaleBytes ==
+                     static_cast<int>(inputHiddenInt4 * kElementsPerRead /
+                                      kDsFp8E3M4ElementsPerScale * sizeof(float)));
+
+    if (quantized != nullptr) {
+        // Payload slots and shared staging are 16-byte aligned. Copy two
+        // quantization vectors at a time without changing the wire layout.
+        auto* dstDataInt4 = reinterpret_cast<int4*>(dstPayloadSlot);
+        const auto* quantizedInt4 = reinterpret_cast<const int4*>(quantized);
+        for (int i = laneId; i < static_cast<int>(hiddenBytes / sizeof(int4)); i += 32) {
+            dstDataInt4[i] = quantizedInt4[i];
+        }
+        for (int i = laneId; i < scaleBytes / static_cast<int>(sizeof(float)); i += 32) {
+            dstScales[i] = quantizedScales[i];
+        }
+    } else {
+        castAndWriteToSendBuf<NCCL_EP_DISP_QUANT_DS_FP8E3M4, float>(
+            srcData, dstDataVec, dstScales, laneId, 32, laneId,
+            static_cast<int>(inputHiddenInt4), roundScale);
+    }
+}
+
+// Copies a received token and, for DS_FP8E3M4, its generated FP32 scales.
+template <ncclEpDispQuant_t kRecipe>
 __forceinline__ __device__ void copyRecvTokenDataLsa(
     const uint8_t* recvBufUint8,
     int recvIdx,
     int tokenIdx,
     int4* outDataInt4,
+    void* outScales,
     int hiddenInt4,
+    int hiddenBytes,
+    int scaleBytes,
     int numBytesPerMsg,
     int dispatch_hdr_sz,
     int maxTokensPerRank,
@@ -95,6 +160,15 @@ __forceinline__ __device__ void copyRecvTokenDataLsa(
     const auto recvDataInt4 = reinterpret_cast<const int4*>(recvPayloadPtr);
     const auto outDataInt4Ptr = outDataInt4 + tokenIdx * hiddenInt4;
     UNROLLED_WARP_COPY(7, laneId, hiddenInt4, outDataInt4Ptr, recvDataInt4, ld_nc_global, st_na_global);
+
+    if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
+        const int numScales = scaleBytes / sizeof(float);
+        const auto* recvScales = reinterpret_cast<const float*>(recvPayloadPtr + hiddenBytes);
+        auto* outScalesTyped = static_cast<float*>(outScales) + tokenIdx * numScales;
+        for (int scaleIdx = laneId; scaleIdx < numScales; scaleIdx += 32) {
+            outScalesTyped[scaleIdx] = ld_nc_global(recvScales + scaleIdx);
+        }
+    }
 }
 
 // LSA-only peer token-count publish: every destination is NVLink-reachable,
@@ -320,6 +394,7 @@ __forceinline__ __device__ void syncAndRecvCounts(
 // syncAndRecvCounts above), no more per-channel wait or rankArrivedCnt
 // rendezvous. Rank-major only: hardcodes DispatchHdr<NCCL_EP_LAYOUT_RANK_MAJOR>,
 // matching every dispatch_kernel_impl_*_rm_lsa caller.
+template <ncclEpDispQuant_t kRecipe>
 __forceinline__ __device__ void recordRecvTokensLsa(
     int responsibleExpertIdx,
     int numExperts,
@@ -334,6 +409,8 @@ __forceinline__ __device__ void recordRecvTokensLsa(
     size_t numBytesPerMsg,
     size_t dispatch_hdr_sz,
     size_t hiddenInt4,
+    size_t hiddenBytes,
+    int scaleBytes,
     int* rankMask,
     const int* recvCntBuf,
     const void* recvBuf,
@@ -342,6 +419,7 @@ __forceinline__ __device__ void recordRecvTokensLsa(
     int32_t* outRecvTopkIdx,
     float* outRecvTopkWeights,
     void* outDataBuf,
+    void* outScalesBuf,
     ncclEpExpertIdKind_t recvTopkIdxKind,
     ncclWindow_t recvDataWindow) {
     if (responsibleExpertIdx >= numExperts) return;
@@ -403,10 +481,11 @@ __forceinline__ __device__ void recordRecvTokensLsa(
         }
 
         auto* outDataInt4 = static_cast<int4*>(outDataBuf);
-        const bool zeroCopy = recvDataWindow != ncclWindow_t{};
+        const bool zeroCopy = kRecipe == NCCL_EP_DISP_QUANT_NONE && recvDataWindow != ncclWindow_t{};
         if (!zeroCopy) {
-            copyRecvTokenDataLsa(
-                recvBufUint8, i, slot, outDataInt4, static_cast<int>(hiddenInt4),
+            copyRecvTokenDataLsa<kRecipe>(
+                recvBufUint8, i, slot, outDataInt4, outScalesBuf, static_cast<int>(hiddenInt4),
+                static_cast<int>(hiddenBytes), scaleBytes,
                 static_cast<int>(numBytesPerMsg), static_cast<int>(dispatch_hdr_sz), maxTokensPerRank, laneId);
         }
     }
@@ -415,8 +494,8 @@ __forceinline__ __device__ void recordRecvTokensLsa(
 // Send-phase per-token body used by dispatch_kernel_impl_2sided_rm_lsa:
 // stages the routing header, dedups by destination rank (one send per
 // (token, destRank) pair, elected via the lowest topk slot targeting that
-// rank), and sends the header+payload via sendTokenLsa.
-template <typename TopkIdxT>
+// rank), and selects the unquantized or DS-FP8 send helper.
+template <ncclEpDispQuant_t kRecipe, int kHidden, typename TopkIdxT, ncclDataType_t kTokenDtype, bool kUseSharedQuant>
 __forceinline__ __device__ void dispatchSendTokenLsa(
     const dispatch_kernel_args_t& args,
     int tokenIdx,
@@ -428,17 +507,24 @@ __forceinline__ __device__ void dispatchSendTokenLsa(
     size_t numBytesPerMsg,
     size_t dispatch_hdr_sz,
     size_t hiddenBytes,
-    size_t hiddenInt4,
+    size_t inputHiddenInt4,
+    int scaleBytes,
     void* sendBuf,
     void* recvBuf,
     size_t recvOff,
     int* rankSentCnt,
     int numWritingThreads) {
-    const auto srcDataInt4 = static_cast<const int4*>(args.inData) + tokenIdx * hiddenInt4;
+    const auto srcDataInt4 = static_cast<const int4*>(args.inData) + tokenIdx * inputHiddenInt4;
+    // Quantize once per token across the forwarding warps, then reuse the
+    // result for every destination. Bound static shared memory; larger rows
+    // retain direct per-peer quantization.
+    constexpr bool kStageQuant =
+        kUseSharedQuant && kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4 && kHidden <= kLlDsFp8SharedHiddenLimit;
+    __shared__ __align__(16) int2 quantized[kStageQuant ? kHidden / 8 : 1];
+    __shared__ float quantizedScales[kStageQuant ? kHidden / kDsFp8E3M4ElementsPerScale : 1];
 
-    // Local staging slot. Header is always written here; unquantized
-    // LSA-only never reads the RDMA-path staging payload, so only the
-    // header is set up.
+    // The local global-memory staging slot holds only the routing header.
+    // Payload is read from input or CTA shared memory, never RDMA staging.
     auto* sendBufBase = static_cast<uint8_t*>(sendBuf) + tokenIdx * numBytesPerMsg;
 
     // Each expert is handled by a different warp in the SM.
@@ -458,7 +544,12 @@ __forceinline__ __device__ void dispatchSendTokenLsa(
         sendBufHdr->rtr[warpId].topk_weight = __ldg(args.inTopkWeights + tokenIdx * numTopk + warpId);
     }
 
-    // Make sure that all working warps in the SM have completed the header writing.
+    if constexpr (kStageQuant) {
+        castAndWriteToSendBuf<kRecipe, float>(
+            srcDataInt4, quantized, quantizedScales, warpId * 32 + laneId,
+            numWritingThreads, laneId, static_cast<int>(inputHiddenInt4), args.roundScale);
+    }
+    // Publish the routing header and any shared payload to the sending warps.
     syncSmGroup(SYNC_DISP_LSA_SEND_COPY, numWritingThreads);
 
     // Do filtering to avoid duplicate sending of tokens to the same rank.
@@ -489,23 +580,26 @@ __forceinline__ __device__ void dispatchSendTokenLsa(
                 args.devComm);
             if (!isRankMasked<true>(args.rankMask, dstRank)) {
                 EP_DEVICE_ASSERT(dstSrcRankP2pPtr != 0);
-                sendTokenLsa(
-                    dstSrcRankP2pPtr,
-                    sendBufInt4,
-                    srcDataInt4,
-                    slotIdx,
-                    numBytesPerMsg,
-                    dispatch_hdr_sz,
-                    hiddenBytes,
-                    hiddenInt4,
-                    args.maxTokensPerRank,
-                    dstRank,
-                    args.currRank,
-                    args.recvDataWindow,
-                    args.recvDataOffset,
-                    laneId);
+                if constexpr (kRecipe == NCCL_EP_DISP_QUANT_NONE) {
+                    sendTokenLsa(
+                        dstSrcRankP2pPtr, sendBufInt4, srcDataInt4, slotIdx,
+                        numBytesPerMsg, dispatch_hdr_sz, hiddenBytes, inputHiddenInt4,
+                        args.maxTokensPerRank, dstRank, args.currRank,
+                        args.recvDataWindow, args.recvDataOffset, laneId);
+                } else {
+                    sendTokenDsFp8Lsa(
+                        dstSrcRankP2pPtr, sendBufInt4, srcDataInt4, slotIdx,
+                        numBytesPerMsg, dispatch_hdr_sz, hiddenBytes, inputHiddenInt4,
+                        scaleBytes, args.maxTokensPerRank, args.roundScale, laneId,
+                        kStageQuant ? quantized : nullptr,
+                        kStageQuant ? quantizedScales : nullptr);
+                }
             }
         }
+    }
+    if constexpr (kStageQuant) {
+        // All peer copies must finish before the next token overwrites CTA storage.
+        syncSmGroup(SYNC_DISP_LSA_SEND_COPY, numWritingThreads);
     }
 }
 
@@ -515,7 +609,7 @@ __forceinline__ __device__ void dispatchSendTokenLsa(
 // epoch. Callers still call syncAndSendCounts themselves right after this
 // returns -- that's the SEND/RECV synchronization handoff, kept visible at
 // the kernel top level rather than folded in here.
-template <int kHidden, typename TopkIdxT, ncclDataType_t kTokenDtype>
+template <ncclEpDispQuant_t kRecipe, int kHidden, typename TopkIdxT, ncclDataType_t kTokenDtype, bool kUseSharedQuant>
 __forceinline__ __device__ void dispatchSendPhaseLsa(
     const dispatch_kernel_args_t& args,
     int smId,
@@ -528,7 +622,8 @@ __forceinline__ __device__ void dispatchSendPhaseLsa(
     size_t numBytesPerMsg,
     size_t dispatch_hdr_sz,
     size_t hiddenBytes,
-    size_t hiddenInt4,
+    size_t inputHiddenInt4,
+    int scaleBytes,
     void* sendBuf,
     void* recvBuf,
     size_t recvOff,
@@ -540,14 +635,19 @@ __forceinline__ __device__ void dispatchSendPhaseLsa(
     if (warpId < numWarps - 1) {
         constexpr int kNumElemsPerRead = sizeof(int4) / size_u8<kTokenDtype>();
         EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerRead) == 0, "Invalid hidden");
+        if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
+            EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kDsFp8E3M4ElementsPerScale == 0,
+                             "Invalid DS_FP8E3M4 vectorization");
+        }
         const auto numWritingThreads = (numWarps - 1) * 32;
         const size_t srcRankRegionBytes = static_cast<size_t>(args.maxTokensPerRank) * numBytesPerMsg;
 
         // Split token processing across SMs
         for (int tokenIdx = smId; tokenIdx < args.numTokens; tokenIdx += numSms) {
-            dispatchSendTokenLsa<TopkIdxT>(
+            dispatchSendTokenLsa<kRecipe, kHidden, TopkIdxT, kTokenDtype, kUseSharedQuant>(
                 args, tokenIdx, warpId, laneId, numTopk, numLocalExperts, srcRankRegionBytes, numBytesPerMsg,
-                dispatch_hdr_sz, hiddenBytes, hiddenInt4, sendBuf, recvBuf, recvOff, rankSentCnt, numWritingThreads);
+                dispatch_hdr_sz, hiddenBytes, inputHiddenInt4, scaleBytes, sendBuf, recvBuf, recvOff, rankSentCnt,
+                numWritingThreads);
         }
     } else if (warpId == numWarps - 1) {
         // Rank-major: clear every routing entry while sends are in flight, so
@@ -564,18 +664,24 @@ __forceinline__ __device__ void dispatchSendPhaseLsa(
     }
 }
 
-// LSA-only, unquantized LL dispatch entry point. Every destination is assumed
+// LSA-only NONE/DS_FP8E3M4 LL dispatch entry point. Every destination is assumed
 // NVLink-reachable; there is no GIN/RDMA runtime code path anywhere in this
 // function. Rank-major output only (EXPERT_MAJOR is not supported here -- see
 // ll_ep.cuh's general dispatch_kernel_impl for that layout), which is also
 // the only layout that supports zero-copy direct-to-peer-window output.
 // Faithful (behavior-preserving) simplification of
-// nccl_ep::ll::dispatch_kernel_impl in ll_ep.cuh with kRecipe = NONE,
+// nccl_ep::ll::dispatch_kernel_impl in ll_ep.cuh with a supported kRecipe,
 // kNvlinkOnly = true, and kLayout = NCCL_EP_LAYOUT_RANK_MAJOR baked in, as a
 // base for further (e.g. CTA-per-token) prototyping.
-template <int kHidden, int kNumTopk, typename TopkIdxT, ncclDataType_t kTokenDtype>
+template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumTopk, typename TopkIdxT, ncclDataType_t kTokenDtype, bool kUseSharedQuant>
 __device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa(const dispatch_kernel_args_t& args) {
     static constexpr ncclEpLayout_t kLayout = NCCL_EP_LAYOUT_RANK_MAJOR;
+    EP_STATIC_ASSERT(
+        kRecipe == NCCL_EP_DISP_QUANT_NONE || kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4,
+        "Unsupported LSA dispatch recipe");
+    EP_STATIC_ASSERT(
+        kRecipe != NCCL_EP_DISP_QUANT_DS_FP8E3M4 || kTokenDtype == ncclBfloat16,
+        "DS_FP8E3M4 requires BF16 input");
     EP_STATIC_ASSERT(kNumTopk > 0 && kNumTopk <= combine_smem::kWarpSize - kLlDispatchControlWarps,
                      "LL dispatch top-k must leave one control warp");
     constexpr int numTopk = kNumTopk;
@@ -605,12 +711,20 @@ __device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa(const dispatc
 
     auto rankSentCnt = args.rankSentCnt;
 
-    const size_t hiddenBytes = static_cast<size_t>(kHidden) * size_u8<kTokenDtype>();
+    const size_t inputHiddenBytes = static_cast<size_t>(kHidden) * size_u8<kTokenDtype>();
+    const size_t inputHiddenInt4 = inputHiddenBytes / sizeof(int4);
+    const size_t hiddenBytes = kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4
+        ? static_cast<size_t>(kHidden) * sizeof(uint8_t)
+        : inputHiddenBytes;
     const size_t hiddenInt4 = hiddenBytes / sizeof(int4);
+    const int numScales = kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4
+        ? kHidden / kDsFp8E3M4ElementsPerScale
+        : 0;
+    const int scaleBytes = numScales * sizeof(float);
 
-    // Message package: header + token data (no scale payload, unquantized).
+    // Message package: header + recipe-specific token data and scales.
     const size_t dispatch_hdr_sz = get_dispatch_hdr_sz<kLayout>(numTopk);
-    const size_t numBytesPerMsg = dispatch_hdr_sz + hiddenBytes;
+    const size_t numBytesPerMsg = dispatch_hdr_sz + hiddenBytes + scaleBytes;
 
     EP_DEVICE_ASSERT(numBytesPerMsg % sizeof(int4) == 0);
 
@@ -625,9 +739,9 @@ __device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa(const dispatc
         goto LOW_LATENCY_DISPATCH_LSA_RECV;
     }
 
-    dispatchSendPhaseLsa<kHidden, TopkIdxT, kTokenDtype>(
+    dispatchSendPhaseLsa<kRecipe, kHidden, TopkIdxT, kTokenDtype, kUseSharedQuant>(
         args, smId, warpId, laneId, numSms, numWarps, numTopk, numLocalExperts, numBytesPerMsg, dispatch_hdr_sz,
-        hiddenBytes, hiddenInt4, sendBuf, recvBuf, recvOff, nextRecvCntBuf, rankSentCnt);
+        hiddenBytes, inputHiddenInt4, scaleBytes, sendBuf, recvBuf, recvOff, nextRecvCntBuf, rankSentCnt);
 
     isLastCta = syncAndSendCounts(
         warpId, numWarps, laneId, args.rankDone, numSms, args.numRanks, rankSentCnt, args.currRank, recvCntBuf,
@@ -655,11 +769,12 @@ LOW_LATENCY_DISPATCH_LSA_RECV:
     syncAndRecvCounts(
         threadId, args.numRanks, args.rankMask, recvCntBuf, args.timeoutCycles, args.currRank, args.asyncErrorFlag);
 
-    recordRecvTokensLsa(
+    recordRecvTokensLsa<kRecipe>(
         responsibleExpertIdx, args.numExperts, numLocalExperts, laneId, subWarpId, args.numWarpsPerGroup, numTopk,
-        args.numRanks, args.currRank, args.maxTokensPerRank, numBytesPerMsg, dispatch_hdr_sz, hiddenInt4,
+        args.numRanks, args.currRank, args.maxTokensPerRank, numBytesPerMsg, dispatch_hdr_sz, hiddenInt4, hiddenBytes,
+        scaleBytes,
         args.rankMask, recvCntBuf, recvBuf, args.outSrcInfo, args.outRecvRankCounter, args.outRecvTopkIdx,
-        args.outRecvTopkWeights, args.outDataBuf, args.recvTopkIdxKind, args.recvDataWindow);
+        args.outRecvTopkWeights, args.outDataBuf, args.outScalesBuf, args.recvTopkIdxKind, args.recvDataWindow);
 }
 
 } // namespace ll

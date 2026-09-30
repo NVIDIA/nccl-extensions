@@ -20,6 +20,22 @@
 #include "../nccl_ep_test_internal.h"
 #include "../device/ll_ep_adapter.cuh"
 
+TEST(LlDispatchSmem, StagingRespectsCapacityAndHiddenLimit) {
+    using nccl_ep::ll::ll_dispatch_stage_quant;
+    constexpr int required = 7168 + 56 * sizeof(float) + 32;
+    EXPECT_TRUE(ll_dispatch_stage_quant(7168, required));
+    EXPECT_FALSE(ll_dispatch_stage_quant(7168, required - 1));
+    EXPECT_FALSE(ll_dispatch_stage_quant(7168, 0));
+    EXPECT_FALSE(ll_dispatch_stage_quant(7168, -1));
+    EXPECT_TRUE(ll_dispatch_stage_quant(512, 1024));
+    EXPECT_TRUE(ll_dispatch_stage_quant(8192, 48 * 1024));
+    constexpr int largest_required = 16384 + 128 * sizeof(float) + 32;
+    EXPECT_TRUE(ll_dispatch_stage_quant(16384, largest_required));
+    EXPECT_FALSE(ll_dispatch_stage_quant(16384, largest_required - 1));
+    EXPECT_FALSE(ll_dispatch_stage_quant(16640, 1024 * 1024));
+    EXPECT_FALSE(ll_dispatch_stage_quant(0, 48 * 1024));
+}
+
 TEST(LlCombineSmem, PreservesRequestedParallelismWhenItFits) {
     const auto config = nccl_ep::ll::choose_combine_smem_config(
         /*hidden=*/4096,

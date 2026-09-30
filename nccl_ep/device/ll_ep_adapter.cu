@@ -40,7 +40,20 @@ ncclResult_t call_dispatch(
         return ncclInvalidArgument;
     }
     const int numWarpGroups = ceil_div(params.numExperts, params.numDeviceSms);
-    const int numWarpsPerGroup = combine_smem::kWarpSize / numWarpGroups;
+    int numWarpsPerGroup = combine_smem::kWarpSize / numWarpGroups;
+    const bool stageQuant = params.nvlinkOnly && params.layout == NCCL_EP_LAYOUT_RANK_MAJOR &&
+        recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4 &&
+        ll_dispatch_stage_quant(params.hidden, params.maxDynamicSmem);
+    if (stageQuant) {
+        // Shared quantization needs fewer forwarding warps than the direct
+        // per-peer path. Keep at least two receive warps per expert group and
+        // enough forwarding warps for every top-k slot plus the control warp.
+        const int compactWarpsPerGroup = kLlDsFp8CompactWarps / numWarpGroups;
+        if (compactWarpsPerGroup >= 2 &&
+            compactWarpsPerGroup * numWarpGroups >= params.numTopk + kLlDispatchControlWarps) {
+            numWarpsPerGroup = compactWarpsPerGroup;
+        }
+    }
     if (numWarpGroups <= 0 || numWarpsPerGroup <= 0) return ncclInvalidUsage;
 
     const int numWarps = numWarpGroups * numWarpsPerGroup;
@@ -117,6 +130,7 @@ ncclResult_t call_dispatch(
         params.numTopk,
         numSms,
         numWarps,
+        stageQuant,
         args,
         stream);
 }

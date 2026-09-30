@@ -313,6 +313,91 @@ TEST_F(QuantizationRecipeTest, ScalesForwardDispatchCompletes) {
     cudaFree(d_recv_topk_idx);
 }
 
+TEST_F(QuantizationRecipeTest, DsFp8OneTokenCapacityFallbackMatchesStaging) {
+    constexpr int hidden = 7168;
+    constexpr int scales = hidden / 128;
+    ncclEpGroupConfig_t gc = NCCL_EP_GROUP_CONFIG_INIT;
+    gc.algorithm = NCCL_EP_ALGO_LOW_LATENCY;
+    gc.num_experts = kNumExperts;
+    gc.max_dispatch_tokens_per_rank = 1;
+    gc.max_recv_tokens_per_rank = 1;
+    gc.max_token_bytes = hidden * sizeof(nv_bfloat16);
+    gc.rdma_buffer_size = NCCL_EP_AUTO;
+    gc.num_qp_per_rank = kNumExperts / g_nranks;
+    gc.num_channels = NCCL_EP_AUTO;
+    ncclEpGroup_t group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&group, g_comm, &gc));
+    std::vector<ncclEpTensor_t*> tensors;
+    auto alloc = [&](ncclDataType_t dtype, size_t bytes, std::vector<size_t> dims) {
+        ncclEpTensor_t* t = nullptr;
+        EXPECT_EQ(ncclEpTensorAlloc(&t, dims.size(), dtype, dims.data(), nullptr), ncclSuccess);
+        EXPECT_EQ(cudaMalloc(&t->data, bytes), cudaSuccess);
+        tensors.push_back(t);
+        return t;
+    };
+    auto* idx = alloc(ncclInt64, sizeof(int64_t), {1, 1});
+    auto* tokens = alloc(ncclBfloat16, hidden * sizeof(nv_bfloat16), {1, hidden});
+    auto* weights = alloc(ncclFloat32, sizeof(float), {1, 1});
+    auto* recv = alloc(ncclFloat8e4m3, g_nranks * hidden, {size_t(g_nranks), 1, hidden});
+    auto* recv_scales = alloc(ncclFloat32, g_nranks * scales * sizeof(float), {size_t(g_nranks), 1, scales});
+    auto* recv_idx = alloc(ncclInt32, g_nranks * sizeof(int), {size_t(g_nranks), 1, 1});
+    auto* recv_weights = alloc(ncclFloat32, g_nranks * sizeof(float), {size_t(g_nranks), 1, 1});
+    auto* counts = alloc(ncclInt32, g_nranks * sizeof(int), {size_t(g_nranks)});
+    // One incoming token on each rank; most CTAs have no token to send.
+    const int64_t expert = ((g_rank + 1) % g_nranks) * (kNumExperts / g_nranks);
+    const float weight = 1.0f;
+    std::vector<nv_bfloat16> input(hidden);
+    for (int i = 0; i < hidden; ++i) input[i] = __float2bfloat16(float((i % 127) - 63 + g_rank));
+    CUDA_ASSERT(cudaMemcpy(idx->data, &expert, sizeof(expert), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(tokens->data, input.data(), hidden * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(weights->data, &weight, sizeof(weight), cudaMemcpyHostToDevice));
+    ncclEpHandle_t handle = nullptr;
+    NCCL_ASSERT(ncclEpCreateHandle(&handle, group, NCCL_EP_LAYOUT_RANK_MAJOR, idx, nullptr, nullptr, g_stream));
+    ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpLayoutInfo_t layout = NCCL_EP_LAYOUT_INFO_INIT;
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    inputs.tokens = tokens;
+    inputs.topk_weights = weights;
+    outputs.tokens = recv;
+    outputs.scales = recv_scales;
+    outputs.topk_idx = recv_idx;
+    outputs.topk_weights = recv_weights;
+    layout.src_rank_counters = counts;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_DS_FP8E3M4;
+    std::vector<uint8_t> reference(hidden), actual(hidden);
+    std::vector<float> reference_scales(scales), actual_scales(scales);
+    const int source = (g_rank + g_nranks - 1) % g_nranks;
+    // Switch both ways on one handle to exercise the JIT cache identity and epochs.
+    for (int budget : {48 * 1024, 1024, 48 * 1024}) {
+        NCCL_ASSERT(ncclEpGroup_test_setMaxDynamicSmem(group, budget));
+        NCCL_ASSERT(ncclEpDispatch(handle, &inputs, &outputs, &layout, &config, g_stream));
+        NCCL_ASSERT(ncclEpComplete(handle, nullptr, g_stream));
+        CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+        std::vector<int> received(g_nranks);
+        CUDA_ASSERT(cudaMemcpy(received.data(), counts->data, g_nranks * sizeof(int), cudaMemcpyDeviceToHost));
+        for (int r = 0; r < g_nranks; ++r) EXPECT_EQ(received[r], r == source ? 1 : 0);
+        CUDA_ASSERT(cudaMemcpy(actual.data(), static_cast<uint8_t*>(recv->data) + source * hidden,
+                               hidden, cudaMemcpyDeviceToHost));
+        CUDA_ASSERT(cudaMemcpy(actual_scales.data(), static_cast<float*>(recv_scales->data) + source * scales,
+                               scales * sizeof(float), cudaMemcpyDeviceToHost));
+        if (reference_scales[0] == 0) {
+            reference = actual;
+            reference_scales = actual_scales;
+            EXPECT_TRUE(has_nonzero_scales(reference_scales));
+        } else {
+            EXPECT_EQ(actual, reference);
+            EXPECT_EQ(actual_scales, reference_scales);
+        }
+    }
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
+    for (auto* t : tensors) {
+        CUDA_ASSERT(cudaFree(t->data));
+        NCCL_ASSERT(ncclEpTensorDestroy(t));
+    }
+}
+
 TEST_F(QuantizationRecipeTest, DsFp8E3M4DispatchCompletes) {
     constexpr int kDsHidden = 512;
     constexpr int kDsScalesPerToken = kDsHidden / 128;

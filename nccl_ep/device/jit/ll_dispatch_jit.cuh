@@ -33,8 +33,8 @@ constexpr const char* kLlDispatchJitEntryName = "nccl_ep_jit_ll_dispatch_kernel"
 //                 recipe/layout combination isn't eligible for the LSA-only
 //                 kernel below.
 //   k2SidedRmLsa: LSA-only rank-major kernel that stages payload through
-//                 RDMA buffers. Selected for every LSA-only, NONE-recipe,
-//                 rank-major call. Still writes each token's payload
+//                 RDMA buffers. Selected for every LSA-only rank-major call
+//                 using NONE or fused DS_FP8E3M4. NONE still writes each token's payload
 //                 directly into the peer's registered output window instead
 //                 of staging through RDMA whenever the EP group's zero-copy
 //                 flag (ncclEpGroupConfig_t::zero_copy) is ON and a window
@@ -45,8 +45,9 @@ enum class LlDispatchAlgo { kDefault, k2SidedRmLsa };
 // Picks the most performant kernel based on the configuration
 inline LlDispatchAlgo ll_dispatch_select_algo(
     bool nvlinkOnly, ncclEpDispQuant_t recipe, ncclEpLayout_t layout) {
-    const bool lsaEligible =
-        nvlinkOnly && recipe == NCCL_EP_DISP_QUANT_NONE && layout == NCCL_EP_LAYOUT_RANK_MAJOR;
+    const bool lsaRecipe =
+        recipe == NCCL_EP_DISP_QUANT_NONE || recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
+    const bool lsaEligible = nvlinkOnly && lsaRecipe && layout == NCCL_EP_LAYOUT_RANK_MAJOR;
     return lsaEligible ? LlDispatchAlgo::k2SidedRmLsa : LlDispatchAlgo::kDefault;
 }
 
@@ -58,7 +59,9 @@ inline std::string ll_dispatch_jit_source(
     bool nvlinkOnly,
     bool topkIdxIsInt64,
     ncclDataType_t tokenDtype,
-    LlDispatchAlgo algo) {
+    LlDispatchAlgo algo,
+    bool compactQuant,
+    bool stageQuant) {
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
     const char* topk_type = topkIdxIsInt64 ? "int64_t" : "int32_t";
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(tokenDtype);
@@ -71,7 +74,9 @@ inline std::string ll_dispatch_jit_source(
     src << "#include \"device/ll_ep.cuh\"\n"
         << "#include \"device/ll_ep_adapter.cuh\"\n"
         << "\n"
-        << "extern \"C\" __launch_bounds__(1024, 1)\n"
+        << "extern \"C\" __launch_bounds__("
+        << (compactQuant ? kLlDsFp8CompactWarps * 32 : 1024)
+        << ", 1)\n"
         << "__global__ void " << kLlDispatchJitEntryName << "(\n"
         << "    const __grid_constant__ nccl_ep::ll::dispatch_kernel_args_t p) {\n";
     if (algo == LlDispatchAlgo::k2SidedRmLsa) {
@@ -80,10 +85,11 @@ inline std::string ll_dispatch_jit_source(
         // arg struct -- no layout template argument, no positional arg list,
         // here.
         src << "  nccl_ep::ll::dispatch_kernel_impl_2sided_rm_lsa<\n"
+            << "      " << kernel_spec.recipe_source_literal << ",\n"
             << "      " << hidden << ",\n"
             << "      " << num_topk << ",\n"
             << "      " << topk_type << ",\n"
-            << "      " << token_dtype_literal << ">(p);\n";
+            << "      " << token_dtype_literal << ", " << (stageQuant ? "true" : "false") << ">(p);\n";
     } else {
         src << "  nccl_ep::ll::dispatch_kernel_impl<\n"
             << "      " << kernel_spec.recipe_source_literal << ",\n"
@@ -110,10 +116,14 @@ inline ncclResult_t launch_ll_dispatch(
     int num_topk,
     int numSms,
     int numWarps,
+    bool stageQuant,
     const dispatch_kernel_args_t& args,
     cudaStream_t stream) {
     const LlDispatchAlgo algo = ll_dispatch_select_algo(nvlinkOnly, recipe, layout);
     const bool twoSidedRmLsa = algo == LlDispatchAlgo::k2SidedRmLsa;
+    // Keep the compact thread limit with a one-block launch bound: repeated
+    // single- and multi-node tuning did not favor the tighter register budget.
+    const bool compactQuant = stageQuant && numWarps <= kLlDsFp8CompactWarps;
 
     static const int variant_identity_default = 0;
     static const int variant_identity_2sided_rm_lsa = 0;
@@ -133,6 +143,8 @@ inline ncclResult_t launch_ll_dispatch(
     key = ::nccl_ep::jit::runtime_key_mix(key, kernel_spec.scale_cache_tag);
     key = ::nccl_ep::jit::runtime_key_mix(key, (nvlinkOnly ? 1u : 0u) | (topkIdxIsInt64 ? 2u : 0u));
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(tokenDtype));
+    key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(compactQuant));
+    key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(stageQuant));
     variant.runtime_key = key;
     variant.num_blocks = numSms;
     variant.block_dim = numWarps * 32;
@@ -165,11 +177,14 @@ inline ncclResult_t launch_ll_dispatch(
              << "_scale" << kernel_spec.scale_cache_tag
              << (nvlinkOnly ? "_nvlinkonly" : "")
              << (twoSidedRmLsa ? "_2sidedrmlsa" : "")
+             << (compactQuant ? "_compact" : "")
+             << (stageQuant ? "_staged" : "")
              << (topkIdxIsInt64 ? "_topk64" : "_topk32")
              << ::nccl_ep::jit::token_dtype_name_tag(tokenDtype);
         variant_name = name.str();
         const std::string source = ll_dispatch_jit_source(
-            kernel_spec, hidden, num_topk, layout, nvlinkOnly, topkIdxIsInt64, tokenDtype, algo);
+            kernel_spec, hidden, num_topk, layout, nvlinkOnly, topkIdxIsInt64, tokenDtype, algo,
+            compactQuant, stageQuant);
         variant.variant_name = variant_name;
         variant.source = source;
         status = ::nccl_ep::jit::launch_jit_kernel(

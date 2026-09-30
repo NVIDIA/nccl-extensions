@@ -2435,7 +2435,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     //   non zero_copy               -> kLocalPermute (FLAT dispatch + permute kernels)
     //   zero_copy, multiple teams   -> kNvlinkDup    (sender duplicates per-expert over NVLink)
     //   zero_copy, single team      -> kLocalDup     (receiver-side fan-out via local_dup)
-    {
+    // LL groups ignore HT mode overrides and their compatibility checks.
+    if (ht_mode) {
         const bool want_local_dup = nccl_ep_env_flag_on(ep_group->env.ht_em_local_dup);
         const bool want_nvlink_dup = nccl_ep_env_flag_on(ep_group->env.ht_em_nvlink_dup);
         const bool want_pull_push = nccl_ep_env_flag_on(ep_group->env.ht_em_pull_push);
@@ -3681,7 +3682,8 @@ ncclResult_t ncclEpInitHandle(
     // Pull dispatch + push combine only stages expert-major traffic; its shared
     // intra-LSA buffers are sized for that path, so reject FLAT handles up-front.
     EP_HOST_ASSERT(
-        !(ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush &&
+        !(ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
+          ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush &&
           layout != NCCL_EP_LAYOUT_EXPERT_MAJOR) &&
         "ncclEpInitHandle: NCCL_EP_HT_EM_PULL_PUSH requires expert-major layout");
     EP_HOST_ASSERT(
@@ -4604,6 +4606,7 @@ ncclResult_t ncclEpDispatch(
                     (recipe == NCCL_EP_DISP_QUANT_FWD)
                     ? static_cast<const uint8_t*>(in_scales_outer->data) : nullptr;
                 nccl_ep::ll::DispatchParams params{};
+                params.maxDynamicSmem = handle->group->max_dynamic_smem;
                 params.inData = x_data;
                 params.inScalesBuf = in_scales_data;
                 params.inTopkIdx = topk_idx_data;

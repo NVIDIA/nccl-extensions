@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -2000,12 +2001,75 @@ static void showVersion() {
     });
 }
 
+static constexpr int kNcclBuildVersion = NCCL_VERSION_CODE;
+
+static ncclResult_t reportNcclVersionError(int runtime_version, const char* requirement) {
+    fprintf(
+        stderr,
+        "NCCL EP: build NCCL %d.%d.%d and runtime NCCL %d.%d.%d are incompatible. %s\n",
+        kNcclBuildVersion / 10000,
+        (kNcclBuildVersion / 100) % 100,
+        kNcclBuildVersion % 100,
+        runtime_version / 10000,
+        (runtime_version / 100) % 100,
+        runtime_version % 100,
+        requirement);
+    return ncclInvalidUsage;
+}
+
+static bool isDevApiJitEnabled(const char* value) {
+    if (value == nullptr) {
+        return false;
+    }
+    char* end = nullptr;
+    errno = 0;
+    long long parsed = std::strtoll(value, &end, 0);
+    return errno == 0 && end != value && *end == '\0' && parsed == 1;
+}
+
+static ncclResult_t validateNcclRuntimeVersion() {
+    int runtime_version = 0;
+    NCCLCHECK(ncclGetVersion(&runtime_version));
+    if (runtime_version == kNcclBuildVersion) {
+        return ncclSuccess;
+    }
+
+    if (runtime_version > kNcclBuildVersion) {
+        if (kNcclBuildVersion >= NCCL_VERSION(2, 31, 0)) {
+            return ncclSuccess;
+        }
+
+        if (kNcclBuildVersion >= NCCL_VERSION(2, 30, 5)) {
+            const char* dev_api_jit = std::getenv("NCCL_DEV_API_JIT");
+            if (dev_api_jit == nullptr) {
+                if (setenv("NCCL_DEV_API_JIT", "1", 0) != 0) {
+                    fprintf(stderr, "NCCL EP: failed to set NCCL_DEV_API_JIT=1: %s\n", std::strerror(errno));
+                    return ncclSystemError;
+                }
+                return ncclSuccess;
+            }
+            if (isDevApiJitEnabled(dev_api_jit)) {
+                return ncclSuccess;
+            }
+        }
+    }
+
+    return reportNcclVersionError(
+        runtime_version,
+        "Supported combinations are: "
+        "(1) runtime NCCL equals build-time NCCL; "
+        "(2) build-time NCCL >= 2.31 with a newer runtime; "
+        "(3) build-time NCCL >= 2.30.5 and < 2.31 with a newer runtime and NCCL_DEV_API_JIT enabled.");
+}
+
 // Print the version banner when libnccl_ep.so is loaded (respects NCCL_EP_DEBUG).
 __attribute__((constructor)) static void nccl_ep_lib_init() {
     showVersion();
 }
 
 ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, const ncclEpGroupConfig_t* in_config) {
+    NCCLCHECK(validateNcclRuntimeVersion());
+
     // Parameter validation
     assert(out_ep_group != nullptr);
     int nRanks;

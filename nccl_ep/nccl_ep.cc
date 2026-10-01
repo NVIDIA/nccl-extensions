@@ -911,7 +911,8 @@ struct ncclEpGroup {
         struct CountScratch {
         // Per-expert EM permute write cursors; zeroed and consumed within a single dispatch.
             int32_t* em_permute_cursors = nullptr;
-        // FLAT recv-slot weights (EM local-permute only). Sized by kEpCountMaxTopk.
+        // FLAT recv-slot weights (EM local-permute only). Inner stride is the configured
+        // num_topk (or kEpCountMaxTopk when unset).
             float* recv_topk_weights_flat = nullptr;
         } count_scratch;
 
@@ -1118,6 +1119,15 @@ buildIntranodePtrArray(const ncclEpGroup_t group, const ncclEpTensor_t* tensor, 
 static bool em_staging_indexed_by_em_slot(ncclEpGroup_t group);
 static ncclResult_t ht_query_num_recv_tokens(ncclEpHandle_t handle, cudaStream_t stream, unsigned int* num_recv_tokens);
 
+// Physical flat recv-token capacity (before the per-token num_topk fan-out). Caps the
+// EM-expanded recv budget and bounds all flat-indexed recv scratch.
+static size_t ht_max_flat_recv_tokens(ncclEpGroup_t ep_group) {
+    return std::min<size_t>(
+        static_cast<size_t>(ep_group->max_recv_tokens),
+        static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) *
+            ep_group->lsa_team_size * ep_group->rdma_team_size);
+}
+
 // Allocate group-shared count-mode / EM local-permute scratch buffers.
 static void alloc_ht_count_scratch(ncclEpGroup_t ep_group) {
     // +1 trailing int: DROP-mode phantom-row fixup's grid arrival counter (see
@@ -1125,11 +1135,18 @@ static void alloc_ht_count_scratch(ncclEpGroup_t ep_group) {
     CUDA_CHECK(ep_group->alloc.alloc_fn(
         reinterpret_cast<void**>(&ep_group->ht_buffers.count_scratch.em_permute_cursors),
         static_cast<size_t>(ep_group->num_local_experts + 1) * sizeof(int32_t), ep_group->alloc.context));
-    // FLAT recv-slot weights only exist for EM local-permute; sized by the fixed cap.
+    // FLAT recv-slot weights only exist for EM local-permute. Indexed by flat recv token
+    // (token * top_k + pos), so the row count is the flat recv capacity, not the EM-expanded
+    // recv budget (which carries an extra num_topk factor in eager mode). The inner stride is
+    // the configured num_topk upper bound (handle num_topk is validated <= it in ht_init_handle);
+    // groups that do not set num_topk fall back to the kEpCountMaxTopk cap.
     if (ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalPermute) {
+        const size_t topk_stride = ep_group->config.num_topk > 0
+                                       ? static_cast<size_t>(ep_group->config.num_topk)
+                                       : nccl_ep::ht::kEpCountMaxTopk;
         CUDA_CHECK(ep_group->alloc.alloc_fn(
             reinterpret_cast<void**>(&ep_group->ht_buffers.count_scratch.recv_topk_weights_flat),
-            static_cast<size_t>(ep_group->max_recv_tokens) * nccl_ep::ht::kEpCountMaxTopk * sizeof(float),
+            ht_max_flat_recv_tokens(ep_group) * topk_stride * sizeof(float),
             ep_group->alloc.context));
     }
 }
@@ -1176,7 +1193,19 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // pad slack (alignment is per-handle, unknown here). A dup-mode routing whose
     // padded total exceeds it traps at the scan instead of overrunning staging.
     const size_t flat_slots = static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * ep_group->nRanks;
-    size_t token_staging_slots = em_staging_indexed_by_em_slot(ep_group) ? max_output_slots : flat_slots;
+    // kLocalPermute FLAT staging holds one compacted row per received token; the dispatch
+    // scan/count clamp the recv slot to min(max_recv budget, nRanks * max_dispatch) =
+    // ht_max_flat_recv_tokens, so cap the row count there. kPullPush push-combine staging is
+    // indexed at a padded per-expert stride that can exceed the flat recv cap, so it keeps the
+    // full nRanks * max_dispatch fan-out. Dup modes stay at the EM-slot budget.
+    size_t token_staging_slots;
+    if (em_staging_indexed_by_em_slot(ep_group)) {
+        token_staging_slots = max_output_slots;
+    } else if (ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush) {
+        token_staging_slots = flat_slots;
+    } else {
+        token_staging_slots = ht_max_flat_recv_tokens(ep_group);
+    }
     ep_group->ht_buffers.token_staging_slots = token_staging_slots;
     // kPullPush (expert-major only) sizes the dispatch token + prob staging to just per-rank
     // capacity: both back the non-window pull fallback (token rows and forward topk_weights that
@@ -1184,9 +1213,12 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     const bool pull_push = ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush;
     const size_t per_rank_tokens = static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank);
     size_t expert_output_token_sz = (pull_push ? per_rank_tokens : token_staging_slots) * max_token_bytes;
+    // Dense prob staging shares the per-token slot index with the token staging above, so it
+    // takes the same token_staging_slots row count (flat recv capacity for permute/FLAT,
+    // max_output_slots for the em_slot dup modes).
     size_t expert_output_prob_sz = pull_push
         ? per_rank_tokens * MAX_NUM_TOPK * sizeof(float)
-        : max_output_slots * num_local_experts * lsa_ranks * sizeof(float);
+        : token_staging_slots * num_local_experts * lsa_ranks * sizeof(float);
     // Push-combine (kPullPush) writes at a padded per-row stride (anti-camping pad plus a
     // co-located backward prob row), so size its staging to match. Other EM modes index at
     // the natural row_bytes and never touch the pad, so they keep the unpadded size.
@@ -1196,7 +1228,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
                   : token_staging_slots * max_token_bytes;
     size_t expert_input_prob_sz = pull_push
         ? 0
-        : max_output_slots * num_local_experts * lsa_ranks * sizeof(float);
+        : token_staging_slots * num_local_experts * lsa_ranks * sizeof(float);
 
     // zero_copy elides both token regions (windowed tensors required). Under kPullPush the token
     // staging still backs the non-window pull fallback (input windowing is opt-in independently of
@@ -3111,7 +3143,6 @@ struct HtBlockLayout {
         const int lsa_team_size = ep_group->lsa_team_size;
         const int rdma_team_size = ep_group->rdma_team_size;
         const int experts_per_rank = ep_group->num_local_experts;
-        const int max_recv_tokens = ep_group->max_recv_tokens;
         const int padded_max_tokens = ((max_tokens + 15) / 16) * 16;
         const bool has_expert_major = (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
         const bool em_permute = em_local_permute_enabled(ep_group, layout);
@@ -3132,10 +3163,16 @@ struct HtBlockLayout {
         // Count mode persists LERM as a packed bitmap (ceil(epr/64) u64 words per slot); scan
         // mode as one bool per expert. Per-handle so combine reads a private copy (the FWD
         // permute writes it here from the sender-written IPC landing zone).
+        // Row capacity: count mode and em-permute scan index LERM by flat recv slot, so the flat
+        // recv capacity suffices; kNvlinkDup/kLocalDup index it by em_slot (up to the EM recv
+        // budget), so those keep max_recv_tokens.
+        const size_t ler_rows = em_staging_indexed_by_em_slot(ep_group)
+                                    ? static_cast<size_t>(ep_group->max_recv_tokens)
+                                    : ht_max_flat_recv_tokens(ep_group);
         L.sz_ler = count_mode_capable ?
-                       align256(static_cast<size_t>(ep_group->max_recv_tokens) *
+                       align256(ht_max_flat_recv_tokens(ep_group) *
                                 nccl_ep::bit_words(experts_per_rank) * sizeof(uint64_t)) :
-                       align256(static_cast<size_t>(ep_group->max_recv_tokens) * experts_per_rank * sizeof(bool));
+                       align256(ler_rows * experts_per_rank * sizeof(bool));
         L.sz_ntfe = align256(sizeof(int32_t));
         // S2D inner_dim: num_topk for nvlink_dup/local_dup EM (packed rank/slot); lsa_team_size
         // for FLAT and for EM-permute (unified FLAT-shape s2d — em_scan_kernel's
@@ -3182,18 +3219,14 @@ struct HtBlockLayout {
         // num_topk fan-out. Eager mode sizes max_recv_tokens to the EM-copy capacity
         // (a num_topk factor larger), so the pull token-indexed maps cap at the token
         // count to avoid an extra num_topk factor.
-        const size_t max_flat_recv_tokens =
-            std::min<size_t>(static_cast<size_t>(max_recv_tokens),
-                             static_cast<size_t>(max_tokens) * lsa_team_size * rdma_team_size);
+        const size_t max_flat_recv_tokens = ht_max_flat_recv_tokens(ep_group);
         // EM-permute scratch: flat2em is per-handle for scan, count, and pull. recv-slot
-        // weights are group-shared (ht_buffers.count_scratch.recv_topk_weights_flat). pull-push caps rows
-        // at the recv-token count; the other EM paths keep full max_recv_tokens sizing.
-        // TODO(em-local-permute): baseline over-sizes by a num_topk factor; cap at
-        // max_flat_recv_tokens once its flat2em indexing is confirmed recv-token-bounded.
+        // weights are group-shared (ht_buffers.count_scratch.recv_topk_weights_flat). flat2em is
+        // indexed by flat recv token (token * top_k), so cap rows at the flat recv capacity for
+        // all EM paths rather than the EM-expanded recv budget (an extra num_topk factor in eager).
         L.sz_flat2em_slot_map =
             (em_permute && num_topk > 0)
-                ? align256((needs_pull_buffers ? max_flat_recv_tokens : static_cast<size_t>(max_recv_tokens)) *
-                           num_topk * sizeof(int32_t))
+                ? align256(max_flat_recv_tokens * num_topk * sizeof(int32_t))
                 : 0;
         // [num_total_attn_tokens] FLAT recv slot per global attention token, filled by
         // scan_impl_flat (scan and pull paths; count never runs the scan that fills it).
@@ -3511,8 +3544,9 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
         return ncclInvalidUsage;
     }
     if (em_local_permute_enabled(ep_group, handle->layout)) {
-        // EM local-permute packs each received token's top-k into a fixed-width row and the
-        // group recv_topk_weights_flat is sized by kEpCountMaxTopk; a larger num_topk overruns it.
+        // EM local-permute packs each received token's top-k into a fixed-width row. When the
+        // group sets num_topk the check above already bounds the handle to that allocated inner
+        // stride; otherwise recv_topk_weights_flat falls back to the kEpCountMaxTopk cap.
         if (num_topk > static_cast<int>(nccl_ep::ht::kEpCountMaxTopk)) {
             fprintf(stderr,
                 "NCCL EP: HT Expert-Major local-permute requires num_topk <= %d\n",
@@ -5357,9 +5391,10 @@ ncclResult_t ncclEpDispatch(
             }
 
             // Non-permute paths write the caller buffer, so bound the row count to
-            // recv_copy_rows. The em-permute path writes internal scratch here and
-            // the caller buffer later in launch_dispatch_permute.
-            int num_recv_tokens = em_permute_active ? static_cast<int>(group->max_recv_tokens)
+            // recv_copy_rows. The em-permute path writes the FLAT recv_topk_weights_flat
+            // scratch here (sized by flat recv capacity) and the caller buffer later in
+            // launch_dispatch_permute, so bound its rows to that same flat capacity.
+            int num_recv_tokens = em_permute_active ? static_cast<int>(ht_max_flat_recv_tokens(group))
                                                     : static_cast<int>(recv_copy_rows);
             int experts_per_lsa_team = group->num_local_experts * group->lsa_team_size;
             // recv_topk_idx numbering selector (matches LL rank-major path).
@@ -6328,7 +6363,13 @@ ncclResult_t ncclEpCombine(
             // For backward combine, convert sparse input weights to dense format for HT kernel
             if (backward_combine) {
                 int experts_per_lsa_team = group->num_local_experts * group->lsa_team_size;
-                size_t dense_prob_size = static_cast<size_t>(num_tokens) * experts_per_lsa_team * sizeof(float);
+                // em-permute scatters FLAT recv weights keyed by the FLAT LERM, both indexed by
+                // flat recv token, so bound the conversion by the flat recv capacity rather than
+                // the padded EM row count (num_tokens). Other EM modes stay EM-indexed.
+                const int conv_rows = em_permute_combine
+                    ? static_cast<int>(ht_max_flat_recv_tokens(group))
+                    : num_tokens;
+                size_t dense_prob_size = static_cast<size_t>(conv_rows) * experts_per_lsa_team * sizeof(float);
 
                 // Zero-initialize the dense prob buffer before scattering
                 CUDA_CHECK(cudaMemsetAsync(
@@ -6353,7 +6394,7 @@ ncclResult_t ncclEpCombine(
                     prob_input,
                     lerm_for_combine,
                     group->ht_buffers.combine_expert_input_prob_buffer_ptrs[group->lsa_rank],
-                    num_tokens,
+                    conv_rows,
                     prob_stride,
                     group->num_local_experts, // experts_per_rank
                     experts_per_lsa_team,

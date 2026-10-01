@@ -6515,6 +6515,12 @@ constexpr int kPullMapBarrierId = 1;
 // staging + async H2D would race across back-to-back calls.
 constexpr int kPullMaxLsaRanks = 128;
 
+// Per-rank stride of a peer's published metadata row (counts + topk snapshot).
+__device__ __forceinline__ size_t pull_meta_stride(int topk_off_bytes, int tokens_per_rank) {
+    return nccl_ep::align<size_t>(
+        static_cast<size_t>(topk_off_bytes) + static_cast<size_t>(tokens_per_rank) * MAX_NUM_TOPK * sizeof(uint16_t), 16);
+}
+
 // Decode a packed global token id into its (LSA rank, local token) within the team:
 // g == src_rank * tokens_per_rank + src_token (mod the team span).
 struct decoded_src_t {
@@ -6537,6 +6543,19 @@ struct lsa_tail_sync_param_t {
     ncclDevComm_t* dcomm;
     uint32_t* grid_barrier_counter;
     uint32_t* head_sync_flag;
+};
+
+// Standalone fused pull-count metadata publish, run ahead of the unfused head gate.
+struct lsa_map_publish_param_t {
+    const int32_t* own_row;
+    const uint16_t* own_topk_snapshot;
+    const uint8_t* meta_ptrs[kPullMaxLsaRanks];
+    int topk_off_bytes;
+    int tokens_per_rank;
+    int top_k;
+    int my_rank;
+    int lsa_team_size;
+    int32_t* layout_ready;
 };
 
 // ready: the value the head gate publishes/waits for. Fused pull-count publishes its
@@ -7039,9 +7058,7 @@ __device__ __forceinline__ void dispatch_pull(
     constexpr int kMapWarps = FusedMap ? kPullDispatchMapWarps : 0;
     constexpr int kPayloadWarps = PullWarps - kMapWarps;
     static_assert(kPayloadWarps > 0, "dispatch requires a payload warp");
-    const size_t meta_stride = nccl_ep::align<size_t>(
-        static_cast<size_t>(topk_off_bytes) + static_cast<size_t>(tokens_per_rank) * MAX_NUM_TOPK * sizeof(uint16_t),
-        16);
+    const size_t meta_stride = pull_meta_stride(topk_off_bytes, tokens_per_rank);
     using ScalePolicy = PullTmaStage<kScaleTma ? ScaleTmaRowBytes : 16>;
 
     const int warp_id = threadIdx.x / kPullDispatchThreadsPerSlot;
@@ -7196,12 +7213,15 @@ __device__ __forceinline__ void dispatch_pull(
     };
 
     if constexpr (kFusedMap) {
-        // Reset the layout flag before publication and the fresh peer head gate.
-        if (blockIdx.x == 0 && threadIdx.x == 0) *layout_ready = 0;
-        dispatch_pull_map_publish(cached_cnt_rows ? nullptr : own_row, own_topk_snapshot, meta_ptrs, meta_stride,
-            topk_off_bytes, tokens_per_rank, top_k, my_rank, lsa_team_size);
-        __syncthreads();
-        lsa_grid_head_gate(dcomm, head_sync_flag, 2);
+        // When unfused, a standalone publish kernel and head-sync kernel already did this.
+        if (!unfused_sync) {
+            // Reset the layout flag before publication and the fresh peer head gate.
+            if (blockIdx.x == 0 && threadIdx.x == 0) *layout_ready = 0;
+            dispatch_pull_map_publish(cached_cnt_rows ? nullptr : own_row, own_topk_snapshot, meta_ptrs, meta_stride,
+                topk_off_bytes, tokens_per_rank, top_k, my_rank, lsa_team_size);
+            __syncthreads();
+            lsa_grid_head_gate(dcomm, head_sync_flag, 2);
+        }
     } else if (!unfused_sync) {
         lsa_grid_head_gate(dcomm, head_sync_flag);
     }

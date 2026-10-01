@@ -235,4 +235,19 @@ unset NCCL_EP_HT_EM_PULL_PUSH
 unset NCCL_EP_HT_EM_AG_SCAN_MODE
 unset NCCL_LSA_TEAM_SIZE
 
+# Pull-push unfused-sync rerun: same suites, pull-count default (no AG_SCAN_MODE), with the
+# head/tail LSA sync split into standalone kernels instead of fused into dispatch/combine.
+export NCCL_EP_HT_EM_PULL_PUSH=1
+export NCCL_EP_HT_UNFUSED_SYNC=1
+export NCCL_LSA_TEAM_SIZE="${NUM_GPUS}"
+for entry in "${SUITES[@]}"; do
+    IFS='|' read -r bin desc _ <<<"${entry}"
+    [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "${bin}" ]] || continue
+    [[ " ${PULL_PUSH_SUITES} " == *" ${bin} "* ]] || continue
+    run_suite "${bin}" "${desc} (Pull-Push, Unfused Sync)"
+done
+unset NCCL_EP_HT_EM_PULL_PUSH
+unset NCCL_EP_HT_UNFUSED_SYNC
+unset NCCL_LSA_TEAM_SIZE
+
 exit "${OVERALL_FAIL}"

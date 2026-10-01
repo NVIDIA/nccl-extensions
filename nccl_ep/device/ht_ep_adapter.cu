@@ -2066,6 +2066,40 @@ void launch_dispatch_permute(
     ::nccl_ep::ht::jit::launch_local_permute_dup(static_cast<int>(grid), p, recipe, stream);
 }
 
+// Fused pull-count metadata publish, standalone ahead of the unfused head-sync kernel.
+__global__ void lsa_map_publish_kernel(::ht_ep::lsa_map_publish_param_t p) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) *p.layout_ready = 0;
+    const size_t meta_stride = ::ht_ep::pull_meta_stride(p.topk_off_bytes, p.tokens_per_rank);
+    ::ht_ep::dispatch_pull_map_publish(p.own_row, p.own_topk_snapshot, p.meta_ptrs, meta_stride,
+        p.topk_off_bytes, p.tokens_per_rank, p.top_k, p.my_rank, p.lsa_team_size);
+}
+
+void launch_lsa_map_publish(
+    const int32_t* own_row,
+    const uint16_t* own_topk_snapshot,
+    const uint8_t* const* meta_ptrs,
+    int topk_off_bytes,
+    int tokens_per_rank,
+    int top_k,
+    int my_rank,
+    int lsa_team_size,
+    int32_t* layout_ready,
+    int num_blocks,
+    cudaStream_t stream) {
+    assert(lsa_team_size <= ::ht_ep::kPullMaxLsaRanks);
+    ::ht_ep::lsa_map_publish_param_t p{};
+    p.own_row = own_row;
+    p.own_topk_snapshot = own_topk_snapshot;
+    for (int i = 0; i < lsa_team_size; i++) p.meta_ptrs[i] = meta_ptrs[i];
+    p.topk_off_bytes = topk_off_bytes;
+    p.tokens_per_rank = tokens_per_rank;
+    p.top_k = top_k;
+    p.my_rank = my_rank;
+    p.lsa_team_size = lsa_team_size;
+    p.layout_ready = layout_ready;
+    lsa_map_publish_kernel<<<num_blocks, 256, 0, stream>>>(p);
+}
+
 ncclResult_t launch_dispatch_pull(
     void* recv_x_em,
     float* recv_topk_weights_em,
@@ -2180,7 +2214,13 @@ ncclResult_t launch_dispatch_pull(
         p.caller_out_is_int64 = caller_out_is_int64;
     }
 
-    if (unfused_sync) NCCLCHECK(jit::launch_lsa_head_sync(dcomm, head_sync_flag, stream));
+    if (unfused_sync) {
+        if (layout_ready != nullptr) {
+            launch_lsa_map_publish(own_row, own_topk_snapshot, meta_ptrs, topk_off_bytes, tokens_per_rank,
+                top_k, my_rank, lsa_team_size, layout_ready, static_cast<int>(grid), stream);
+        }
+        NCCLCHECK(jit::launch_lsa_head_sync(dcomm, head_sync_flag, stream));
+    }
     const ncclResult_t status = ::nccl_ep::ht::jit::launch_dispatch_pull(static_cast<int>(grid), p, recipe, stream);
     if (status != ncclSuccess) return status; // skip the tail sync: the kernel never launched
     if (unfused_sync) {

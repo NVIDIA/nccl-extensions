@@ -137,8 +137,10 @@ be made separately.
 ### Memory
 
 `ON` elides both token staging regions in the intra-LSA buffer — the dispatch and
-combine token regions are simply not allocated. The scale region and the
-per-expert probability regions are not elided.
+combine token regions are simply not allocated. There is no dedicated scale
+region: `QUANT_FWD` scales are carved from each token slot's tail slack, so when
+the token regions are elided the caller must window `outputs->scales` too. The
+per-expert probability regions are still allocated.
 
 ## Debugging
 

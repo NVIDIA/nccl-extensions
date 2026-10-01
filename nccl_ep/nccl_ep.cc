@@ -869,6 +869,9 @@ struct ncclEpGroup {
     // Host arrays for population and cleanup
         void** dispatch_expert_output_token_buffer_ptrs;
         float** dispatch_expert_output_prob_buffer_ptrs;
+    // Unlike its siblings above (fixed group-config offsets, set once below and stable for the
+    // group's lifetime), this one's offset depends on this call's hidden/dtype, not group config,
+    // so ncclEpDispatch recomputes every entry before use; the init below is a placeholder.
         void** dispatch_expert_output_scaling_factor_buffer_ptrs;
         uint16_t** combine_expert_input_token_buffer_ptrs;
         float** combine_expert_input_prob_buffer_ptrs;
@@ -879,7 +882,6 @@ struct ncclEpGroup {
     // Local buffers (owned by this rank)
         void* expert_output_token;
         float* expert_output_prob;
-        void* expert_output_scaling_factor;
         uint8_t* expert_output_meta_tables;
         uint16_t* expert_input_token;
         float* expert_input_prob;
@@ -945,7 +947,6 @@ struct ncclEpGroup {
         ncclWindow_t intranode_mega_window = {};
         size_t ipc_dispatch_token_offset = 0;
         size_t ipc_dispatch_prob_offset = 0;
-        size_t ipc_dispatch_scaling_factor_offset = 0;  // QUANT_FWD per-block output-scales region in the mega buffer
         size_t ipc_dispatch_meta_tables_offset = 0;   // count-mode receiver EM tables: [LERM meta] + published count rows
         size_t published_offset = 0; // sender-published count rows offset within the tables region
         size_t ipc_combine_token_offset = 0;
@@ -1197,18 +1198,18 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         ? 0
         : max_output_slots * num_local_experts * lsa_ranks * sizeof(float);
 
-    // Output scale byte storage, sized for the largest QUANT_FWD row that
-    // the group's token-byte budget permits.
-    size_t expert_output_scaling_factor_sz = (pull_push ? per_rank_tokens : max_output_slots) * max_token_bytes;
-
     // zero_copy elides both token regions (windowed tensors required). Under kPullPush the token
     // staging still backs the non-window pull fallback (input windowing is opt-in independently of
     // zero_copy, which only requires the output window), so keep it.
     const bool zero_copy = ep_group->config.zero_copy == NCCL_EP_ZERO_COPY_ON;
     const bool skip_token_staging = zero_copy && !pull_push;
+
+    // QUANT_FWD scales are carved from each token slot's tail slack at dispatch (push staging and
+    // kPullPush pull fallback alike), never a dedicated region. When token staging is elided
+    // (skip_token_staging, zero_copy=ON), the caller must window outputs->scales too, so no
+    // scratch is needed at all.
     size_t dispatch_token_aligned = skip_token_staging ? 0 : align_ipc(expert_output_token_sz);
     size_t dispatch_prob_aligned = align_ipc(expert_output_prob_sz);
-    size_t dispatch_sf_aligned = align_ipc(expert_output_scaling_factor_sz);
     // Count-mode receiver EM tables: LERM bitmap rows, then one [cnt_rank | cnt_expert] row
     // per sender. Single-LSA-team only; per-token weights are receiver-local and stay out
     // of this IPC region.
@@ -1272,7 +1273,6 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     const StagingSegment staging_segments[] = {
         {"dispatch token", dispatch_token_aligned},
         {"dispatch probability", dispatch_prob_aligned},
-        {"dispatch scaling factor", dispatch_sf_aligned},
         {"combine token", combine_token_aligned},
         {"combine probability", combine_prob_aligned},
     };
@@ -1287,7 +1287,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         }
     }
 
-    size_t mega_sz = dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned +
+    size_t mega_sz = dispatch_token_aligned + dispatch_prob_aligned +
                      dispatch_meta_tables_aligned + combine_token_aligned + combine_prob_aligned +
                      pull_meta_aligned;
     {
@@ -1315,14 +1315,9 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     ep_group->ht_buffers.expert_output_prob =
         reinterpret_cast<float*>(mega_base + ep_group->ht_buffers.ipc_dispatch_prob_offset);
 
-    // QUANT_FWD output-scales region (after token+prob; shifts combine offsets by dispatch_sf_aligned).
-    ep_group->ht_buffers.ipc_dispatch_scaling_factor_offset =
-        ep_group->ht_buffers.ipc_dispatch_prob_offset + dispatch_prob_aligned;
-    ep_group->ht_buffers.expert_output_scaling_factor =
-        mega_base + ep_group->ht_buffers.ipc_dispatch_scaling_factor_offset;
-
+    // No dedicated scale region: QUANT_FWD scales are carved from the token slot tails at dispatch.
     ep_group->ht_buffers.ipc_dispatch_meta_tables_offset =
-        ep_group->ht_buffers.ipc_dispatch_scaling_factor_offset + dispatch_sf_aligned;
+        ep_group->ht_buffers.ipc_dispatch_prob_offset + dispatch_prob_aligned;
     ep_group->ht_buffers.expert_output_meta_tables =
         mega_base + ep_group->ht_buffers.ipc_dispatch_meta_tables_offset;
     // One-time zero of the count landing rows (bootstrap only; overwritten per round).
@@ -1342,7 +1337,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         reinterpret_cast<float*>(mega_base + ep_group->ht_buffers.ipc_combine_prob_offset);
 
     ep_group->ht_buffers.ipc_pull_meta_offset =
-        dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned +
+        dispatch_token_aligned + dispatch_prob_aligned +
         dispatch_meta_tables_aligned + combine_token_aligned + combine_prob_aligned;
     ep_group->ht_buffers.pull_meta_staging =
         group_pull_count_capable ? mega_base + ep_group->ht_buffers.ipc_pull_meta_offset : nullptr;
@@ -1462,8 +1457,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         if (i == lsa_rank) {
             ep_group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[i] = ep_group->ht_buffers.expert_output_token;
             ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[i] = ep_group->ht_buffers.expert_output_prob;
-            ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[i] =
-                ep_group->ht_buffers.expert_output_scaling_factor;
+            ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[i] = nullptr;
             ep_group->ht_buffers.dispatch_push_count_meta_table_ptrs[i] = ep_group->ht_buffers.expert_output_meta_tables;
             ep_group->ht_buffers.pull_meta_ptrs[i] = ep_group->ht_buffers.pull_meta_staging;
             ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i] = ep_group->ht_buffers.expert_input_token;
@@ -1486,8 +1480,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
                 skip_token_staging ? nullptr : pb + ep_group->ht_buffers.ipc_dispatch_token_offset;
             ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[i] =
                 reinterpret_cast<float*>(pb + ep_group->ht_buffers.ipc_dispatch_prob_offset);
-            ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[i] =
-                pb + ep_group->ht_buffers.ipc_dispatch_scaling_factor_offset;
+            ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[i] = nullptr;
             ep_group->ht_buffers.dispatch_push_count_meta_table_ptrs[i] =
                 pb + ep_group->ht_buffers.ipc_dispatch_meta_tables_offset;
             ep_group->ht_buffers.pull_meta_ptrs[i] =
@@ -1535,7 +1528,6 @@ static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
         ep_group->ht_buffers.ipc_mega_buffer_size = 0;
         ep_group->ht_buffers.expert_output_token = nullptr;
         ep_group->ht_buffers.expert_output_prob = nullptr;
-        ep_group->ht_buffers.expert_output_scaling_factor = nullptr;
         ep_group->ht_buffers.expert_output_meta_tables = nullptr;
         ep_group->ht_buffers.expert_input_token = nullptr;
         ep_group->ht_buffers.expert_input_prob = nullptr;
@@ -4980,6 +4972,24 @@ ncclResult_t ncclEpDispatch(
             params.expert_output_token_ptrs = group->ht_buffers.dispatch_expert_output_token_buffer_ptrs;
         }
         params.expert_output_prob_ptrs = group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs;
+        // QUANT_FWD scales are carved from each token slot's tail slack, at an offset that
+        // depends on this call's hidden/dtype (not fixed group config, so group init can't
+        // precompute it); recompute dispatch_expert_output_scaling_factor_buffer_ptrs here every
+        // call. Skipped when token staging is elided (zero_copy=ON, non pull-push): outputs->scales
+        // must be windowed then, so rcv_scales_zcopy below always resolves true and skips this
+        // array too.
+        if (recipe == NCCL_EP_DISP_QUANT_FWD && group->ht_buffers.expert_output_token != nullptr) {
+            const size_t token_region_slots = (group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush)
+                ? static_cast<size_t>(group->config.max_dispatch_tokens_per_rank)
+                : group->ht_buffers.token_staging_slots;
+            const size_t sf_carve_offset =
+                token_region_slots * static_cast<size_t>(hidden) * ncclTypeSize(x->datatype);
+            for (int i = 0; i < group->lsa_team_size; ++i) {
+                group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[i] =
+                    static_cast<uint8_t*>(group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[i]) +
+                    sf_carve_offset;
+            }
+        }
         std::vector<void*> dispatch_output_sf_ptrs;
         const bool rcv_scales_zcopy =
             recipe == NCCL_EP_DISP_QUANT_FWD &&
@@ -5526,12 +5536,14 @@ ncclResult_t ncclEpDispatch(
                         peer_w = group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs;
                     }
                     if (recipe == NCCL_EP_DISP_QUANT_FWD && scales != nullptr) {
-                        // Stage input scales into the (pull-unused) FLAT scale output buffer.
-                        assert(group->ht_buffers.expert_output_scaling_factor != nullptr);
+                        // Stage input scales into this rank's carved scale slack for peers to pull.
+                        void* scale_staging =
+                            group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[group->lsa_rank];
+                        assert(scale_staging != nullptr);
                         const int send_scale_row_bytes =
                             static_cast<int>(scales->sizes[1]) * ncclTypeSize(scales->datatype);
                         CUDA_CHECK(cudaMemcpyAsync(
-                            group->ht_buffers.expert_output_scaling_factor, scales->data,
+                            scale_staging, scales->data,
                             static_cast<size_t>(handle->num_tokens) * send_scale_row_bytes,
                             cudaMemcpyDeviceToDevice, stream));
                     }

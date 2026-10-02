@@ -1136,11 +1136,9 @@ static void alloc_ht_count_scratch(ncclEpGroup_t ep_group) {
     CUDA_CHECK(ep_group->alloc.alloc_fn(
         reinterpret_cast<void**>(&ep_group->ht_buffers.count_scratch.em_permute_cursors),
         static_cast<size_t>(ep_group->num_local_experts + 1) * sizeof(int32_t), ep_group->alloc.context));
-    // FLAT recv-slot weights only exist for EM local-permute. Indexed by flat recv token
-    // (token * top_k + pos), so the row count is the flat recv capacity, not the EM-expanded
-    // recv budget (which carries an extra num_topk factor in eager mode). The inner stride is
-    // the configured num_topk upper bound (handle num_topk is validated <= it in ht_init_handle);
-    // groups that do not set num_topk fall back to the kEpCountMaxTopk cap.
+    // In FLAT layout, each token is represented only once. Because of that,
+    // ep_group->max_recv_tokens (which accounts for token duplication) is overkill here;
+    // allocate only the minimally required space via ht_max_flat_recv_tokens(ep_group).
     if (ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalPermute) {
         const size_t topk_stride = ep_group->config.num_topk > 0
                                        ? static_cast<size_t>(ep_group->config.num_topk)
@@ -1201,10 +1199,13 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // full nRanks * max_dispatch fan-out. Dup modes stay at the EM-slot budget.
     size_t token_staging_slots;
     if (em_staging_indexed_by_em_slot(ep_group)) {
+        // kNvlinkDup / kLocalDup: EM-slot indexed, full EM recv budget.
         token_staging_slots = max_output_slots;
     } else if (ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush) {
+        // kPullPush: padded per-expert stride, full nRanks * max_dispatch fan-out.
         token_staging_slots = flat_slots;
     } else {
+        // kLocalPermute (and any other flat-indexed mode): capped at the flat recv capacity.
         token_staging_slots = ht_max_flat_recv_tokens(ep_group);
     }
     ep_group->ht_buffers.token_staging_slots = token_staging_slots;
@@ -3139,7 +3140,7 @@ static size_t ll_handle_mem_size(ncclEpGroup_t ep_group, int num_topk) {
 struct HtBlockLayout {
     // global_routing_map is group-scoped (ep_group->ht_buffers); not part of this block.
     size_t sz_r2a, sz_a2r, sz_ler, sz_ntfe;
-    size_t sz_s2d, sz_rank_mask, sz_scan_tmp, sz_prob;
+    size_t sz_s2d, sz_rank_mask, sz_scan_tmp;
     size_t sz_topk_idx; // cached topk_idx (uint16 under pull-push, int32 expert ids elsewhere)
     size_t sz_pec_active; // EM only
     size_t sz_eto; // EM only
@@ -3183,12 +3184,10 @@ struct HtBlockLayout {
         L.sz_r2a = align256(static_cast<size_t>(rdma_team_size) * padded_max_tokens * sizeof(bool));
         L.sz_a2r =
             (rdma_team_size > 1) ? align256(static_cast<size_t>(max_tokens) * (rdma_team_size - 1) * sizeof(bool)) : 0;
-        // Count mode persists LERM as a packed bitmap (ceil(epr/64) u64 words per slot); scan
-        // mode as one bool per expert. Per-handle so combine reads a private copy (the FWD
-        // permute writes it here from the sender-written IPC landing zone).
-        // Row capacity: count mode and em-permute scan index LERM by flat recv slot, so the flat
-        // recv capacity suffices; kNvlinkDup/kLocalDup index it by em_slot (up to the EM recv
-        // budget), so those keep max_recv_tokens.
+        // LERM: per received token, which local experts it routes to. Count mode packs it as a
+        // bitmap (ceil(epr/64) u64 words/slot), scan mode as one bool/expert. Per-handle private
+        // copy for combine. Row count: EM-slot indexed modes (kNvlinkDup/kLocalDup) need
+        // max_recv_tokens; flat-indexed modes need only the flat recv capacity.
         const size_t ler_rows = em_staging_indexed_by_em_slot(ep_group)
                                     ? static_cast<size_t>(ep_group->max_recv_tokens)
                                     : ht_max_flat_recv_tokens(ep_group);
@@ -3217,9 +3216,6 @@ struct HtBlockLayout {
             nccl_ep::ht::get_preprocessing_scan_tmp_size(
                 static_cast<int>(ep_group->device_sm_count),
                 lsa_team_size));
-        // dense_prob_buffer is group-owned for every topology (internode: GIN mega-buffer;
-        // single team: alloc_ht_count_scratch), so it is never carved from handle mem.
-        L.sz_prob = 0;
         // Pull-push stores a uint16 snapshot for push combine; other modes cache expert ids as
         // int32 (they fit, regardless of the caller's int32/int64 topk_idx) for the FLAT
         // dense-prob rebuild and BWD dense-to-sparse scatter.
@@ -3301,7 +3297,7 @@ struct HtBlockLayout {
                            (ep_group->nRanks + num_experts) * sizeof(int32_t))
                 : 0;
         L.zero_region = L.sz_r2a + L.sz_a2r + L.sz_ler + L.sz_ntfe;
-        L.no_memset_region = L.sz_rank_mask + L.sz_scan_tmp + L.sz_prob + L.sz_topk_idx + L.sz_pec_active + L.sz_eto +
+        L.no_memset_region = L.sz_rank_mask + L.sz_scan_tmp + L.sz_topk_idx + L.sz_pec_active + L.sz_eto +
                              L.sz_emuf_group_buf + L.sz_emuf_group_count + L.sz_flat2em_slot_map +
                              L.sz_token_to_recv_slot + L.sz_count_scratch + L.sz_recv_slot_to_src +
                              L.sz_pull_count_own_row + L.sz_pull_count_cached_rows +
@@ -3630,9 +3626,6 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     offset += L.sz_rank_mask;
     handle->ht.preprocessing_scan_tmp = (L.sz_scan_tmp > 0) ? reinterpret_cast<void*>(ptr + offset) : nullptr;
     offset += L.sz_scan_tmp;
-    // dense_prob_buffer is group-owned (wired below); handle mem carves nothing (sz_prob == 0).
-    handle->ht.dense_prob_buffer = nullptr;
-    offset += L.sz_prob;
     handle->ht.topk_idx = (L.sz_topk_idx > 0) ? reinterpret_cast<void*>(ptr + offset) : nullptr;
     offset += L.sz_topk_idx;
     // EM remap counts/offsets live in handle_mem (EM only; FLAT must not read them).

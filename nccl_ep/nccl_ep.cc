@@ -5405,12 +5405,18 @@ ncclResult_t ncclEpDispatch(
                 return ncclInvalidArgument;
             }
 
-            // Non-permute paths write the caller buffer, so bound the row count to
-            // recv_copy_rows. The em-permute path writes the FLAT recv_topk_weights_flat
-            // scratch here (sized by flat recv capacity) and the caller buffer later in
-            // launch_dispatch_permute, so bound its rows to that same flat capacity.
-            int num_recv_tokens = em_permute_active ? static_cast<int>(ht_max_flat_recv_tokens(group))
-                                                    : static_cast<int>(recv_copy_rows);
+            // FLAT prob/LERM staging is sized to the flat recv capacity, so clamp the row count
+            // there; any extra caller rows under a larger recv budget are undefined padding the
+            // consumer skips via the routed recv count. EM-slot dup modes keep the full recv
+            // budget. em-permute writes the flat recv_topk_weights_flat scratch (also flat cap)
+            // here and the caller buffer later in launch_dispatch_permute.
+            const size_t flat_recv_cap = ht_max_flat_recv_tokens(group);
+            int num_recv_tokens =
+                em_permute_active
+                    ? static_cast<int>(flat_recv_cap)
+                    : static_cast<int>(em_staging_indexed_by_em_slot(group)
+                                           ? static_cast<size_t>(recv_copy_rows)
+                                           : std::min<size_t>(recv_copy_rows, flat_recv_cap));
             int experts_per_lsa_team = group->num_local_experts * group->lsa_team_size;
             // recv_topk_idx numbering selector (matches LL rank-major path).
             // The normalized layout_info supplies AUTO when the caller did not
@@ -6378,12 +6384,13 @@ ncclResult_t ncclEpCombine(
             // For backward combine, convert sparse input weights to dense format for HT kernel
             if (backward_combine) {
                 int experts_per_lsa_team = group->num_local_experts * group->lsa_team_size;
-                // em-permute scatters FLAT recv weights keyed by the FLAT LERM, both indexed by
-                // flat recv token, so bound the conversion by the flat recv capacity rather than
-                // the padded EM row count (num_tokens). Other EM modes stay EM-indexed.
+                // Dense prob staging has token_staging_slots rows and the combine kernel reads only
+                // valid recv slots, so clamp the scatter there: flat recv capacity for FLAT and
+                // em-permute, full recv budget for the EM-slot dup modes.
                 const int conv_rows = em_permute_combine
                     ? static_cast<int>(ht_max_flat_recv_tokens(group))
-                    : num_tokens;
+                    : static_cast<int>(std::min<size_t>(
+                          static_cast<size_t>(num_tokens), group->ht_buffers.token_staging_slots));
                 size_t dense_prob_size = static_cast<size_t>(conv_rows) * experts_per_lsa_team * sizeof(float);
 
                 // Zero-initialize the dense prob buffer before scattering

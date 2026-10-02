@@ -59,6 +59,7 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
 
 // Forward declarations used by mega-buffer sizing (definitions live later in this file).
 static bool is_internode_available(ncclEpGroup_t ep_group);
+static inline bool dispatch_push_count_capable(ncclEpGroup_t group, ncclEpLayout_t layout);
 
 // Define NCCL_CHECK_RESULT macro for NCCL error checking
 #ifndef NCCL_CHECK_RESULT
@@ -2519,8 +2520,19 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
 
     ep_group->rdma_buffer = nullptr;
 
-    CUDA_CHECK(ep_group->alloc.alloc_fn(&ep_group->ep_workspace, NUM_WORKSPACE_BYTES, ep_group->alloc.context));
-    CUDA_CHECK(cudaMemsetAsync(ep_group->ep_workspace, 0, NUM_WORKSPACE_BYTES, stream));
+    // ep_workspace backs the dispatch/combine counter region and the EM preprocessing-scan
+    // gscratch. Count-capable HT groups rebuild the recv tables from a device-side histogram
+    // (no scan) and their FLAT handles pass a null gscratch, so they only need the small counter
+    // region; everyone else keeps the full scan workspace.
+    const size_t counter_region_bytes =
+        (static_cast<size_t>(2) * ep_group->nRanks + ep_group->config.num_experts + 1) * sizeof(int);
+    const bool ht_count_only =
+        ht_mode && dispatch_push_count_capable(ep_group, NCCL_EP_LAYOUT_EXPERT_MAJOR);
+    const size_t workspace_bytes = ht_count_only
+                                       ? ((counter_region_bytes + 255) & ~size_t(255))
+                                       : static_cast<size_t>(NUM_WORKSPACE_BYTES);
+    CUDA_CHECK(ep_group->alloc.alloc_fn(&ep_group->ep_workspace, workspace_bytes, ep_group->alloc.context));
+    CUDA_CHECK(cudaMemsetAsync(ep_group->ep_workspace, 0, workspace_bytes, stream));
 
     // Initialize dedicated LL counter regions
     {
@@ -2532,7 +2544,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         ep_group->ws_dispatch_rankDone = ep_group->ws_dispatch_rankArrivedCnt + numRanks;
         ep_group->ws_combine_sync = ep_group->ws_dispatch_rankDone + numExperts;
         const size_t total_ints = static_cast<size_t>(2) * numRanks + numExperts + 1;
-        EP_HOST_ASSERT(total_ints * sizeof(int) <= static_cast<size_t>(NUM_WORKSPACE_BYTES));
+        EP_HOST_ASSERT(total_ints * sizeof(int) <= workspace_bytes);
     }
 
     ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
@@ -3199,13 +3211,15 @@ struct HtBlockLayout {
         L.sz_s2d = needs_pull_buffers
                        ? 0
                        : align256(static_cast<size_t>(rdma_team_size) * max_tokens * s2d_inner_dim * sizeof(int32_t));
-        L.sz_rank_mask = align256(
+        // rank_mask and scan_tmp back the preprocessing scan only; count mode rebuilds the recv
+        // tables from a device-side histogram and never runs it, so skip both for count handles.
+        L.sz_rank_mask = count_mode_capable ? 0 : align256(
             static_cast<size_t>(rdma_team_size) * max_tokens * lsa_team_size *
             nccl_ep::ht::get_rank_mask_elem_size(lsa_team_size));
         // Size for device_sm_count blocks: the upper bound on the preprocessing
         // scan's block count (ep_group->preprocess_num_sms, incl. any
         // NCCL_EP_PREPROCESS_NUM_SMS override) so the buffer always fits.
-        L.sz_scan_tmp = align256(
+        L.sz_scan_tmp = count_mode_capable ? 0 : align256(
             nccl_ep::ht::get_preprocessing_scan_tmp_size(
                 static_cast<int>(ep_group->device_sm_count),
                 lsa_team_size));
@@ -3617,9 +3631,9 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     handle->ht.sparse_to_dense_map = (L.sz_s2d > 0) ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
     offset += L.sz_s2d;
     // --- end of s2d region (memset 0xFF) ---
-    handle->ht.token_rank_mask = ptr + offset;
+    handle->ht.token_rank_mask = (L.sz_rank_mask > 0) ? ptr + offset : nullptr;
     offset += L.sz_rank_mask;
-    handle->ht.preprocessing_scan_tmp = reinterpret_cast<void*>(ptr + offset);
+    handle->ht.preprocessing_scan_tmp = (L.sz_scan_tmp > 0) ? reinterpret_cast<void*>(ptr + offset) : nullptr;
     offset += L.sz_scan_tmp;
     // dense_prob_buffer is group-owned (wired below); handle mem carves nothing (sz_prob == 0).
     handle->ht.dense_prob_buffer = nullptr;

@@ -1720,6 +1720,18 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
             &ep_group->gin_config.dcomm,
             dcomm_bytes,
             &ep_group->gin_config.d_dcomm));
+        // No GIN mega-buffer in this topology (nothing below carves one), so dense_prob
+        // staging gets its own small allocation here instead. Rebuilt per dispatch/
+        // backward-combine, so group-scoping stays PP-safe. Freed in destroy_ht_internode.
+        // kPullPush writes backward weights straight to the caller tensor and never touches
+        // this buffer, so skip it there.
+        if (ep_group->ht_em_mode != ncclEpGroup::HtEmMode::kPullPush) {
+            CUDA_CHECK(ep_group->alloc.alloc_fn(
+                reinterpret_cast<void**>(&ep_group->ht_buffers.dense_prob_buffer),
+                static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) *
+                    ep_group->config.num_experts * sizeof(float),
+                ep_group->alloc.context));
+        }
         ep_group->ht_buffers.internode_initialized = true;
         return ncclSuccess;
     }
@@ -1982,6 +1994,11 @@ static ncclResult_t destroy_ht_internode(ncclEpGroup_t ep_group) {
         ep_group->ht_buffers.dispatch_gin_G2S_flags = nullptr;
         ep_group->ht_buffers.combine_gin_G2S_flags = nullptr;
         ep_group->ht_buffers.token_staging_buffer = nullptr;
+        ep_group->ht_buffers.dense_prob_buffer = nullptr;
+    } else if (ep_group->ht_buffers.dense_prob_buffer != nullptr) {
+        // Single-LSA-team: dense_prob_buffer was a standalone alloc (see the rdma_team_size
+        // <= 1 branch above), not carved from gin_base_ptr.
+        ep_group->alloc.free_fn(ep_group->ht_buffers.dense_prob_buffer, ep_group->alloc.context);
         ep_group->ht_buffers.dense_prob_buffer = nullptr;
     }
 
@@ -3192,12 +3209,9 @@ struct HtBlockLayout {
             nccl_ep::ht::get_preprocessing_scan_tmp_size(
                 static_cast<int>(ep_group->device_sm_count),
                 lsa_team_size));
-        // dense_prob_buffer: unused under pull dispatch + push combine (dispatch
-        // pulls weights per source token; push combine uses sparse-direct prob
-        // staging). Single-node non-pull only.
-        L.sz_prob = (!is_internode_available(ep_group) && !needs_pull_buffers) ?
-                        align256(static_cast<size_t>(max_tokens) * num_experts * sizeof(float)) :
-                        0;
+        // dense_prob_buffer is group-owned for every topology (internode: GIN mega-buffer;
+        // single team: alloc_ht_count_scratch), so it is never carved from handle mem.
+        L.sz_prob = 0;
         // Pull-push stores a uint16 snapshot for push combine; other modes cache the native
         // int32/int64 for the FLAT dense-prob rebuild and BWD dense-to-sparse scatter.
         const size_t topk_idx_elem = needs_pull_buffers ? sizeof(uint16_t) : sizeof(int64_t);
@@ -3607,9 +3621,8 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     offset += L.sz_rank_mask;
     handle->ht.preprocessing_scan_tmp = reinterpret_cast<void*>(ptr + offset);
     offset += L.sz_scan_tmp;
-    // Null unless allocated (internode uses the group buffer, wired below; pull
-    // drops it). Guard on the region size so the offset math stays consistent.
-    handle->ht.dense_prob_buffer = (L.sz_prob > 0) ? reinterpret_cast<float*>(ptr + offset) : nullptr;
+    // dense_prob_buffer is group-owned (wired below); handle mem carves nothing (sz_prob == 0).
+    handle->ht.dense_prob_buffer = nullptr;
     offset += L.sz_prob;
     handle->ht.topk_idx = (L.sz_topk_idx > 0) ? reinterpret_cast<void*>(ptr + offset) : nullptr;
     offset += L.sz_topk_idx;
@@ -3674,6 +3687,10 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
         handle->ht.dense_prob_buffer = ep_group->ht_buffers.dense_prob_buffer;
         handle->ht.token_staging_buffer = ep_group->ht_buffers.token_staging_buffer;
     } else {
+        // Single LSA team: point at the group-owned dense_prob staging (rebuilt per
+        // dispatch/combine). Pull dispatch + push combine derive prob presence locally.
+        if (!em_pull_enabled(ep_group, handle->layout))
+            handle->ht.dense_prob_buffer = ep_group->ht_buffers.dense_prob_buffer;
         handle->ht.token_staging_buffer = nullptr;
     }
     return ncclSuccess;

@@ -38,7 +38,7 @@ template <typename TopkIdxT>
 __global__ void convert_topk_to_routing_map_kernel(
     const TopkIdxT* __restrict__ topk_idx,    // [num_tokens, num_topk]
     uint8_t* __restrict__ routing_bitmap,     // [max_tokens, row_bytes] (byte-padded per team)
-    TopkIdxT* __restrict__ cached_topk_idx,   // [num_tokens, num_topk]; nullable
+    int32_t* __restrict__ cached_topk_idx,    // [num_tokens, num_topk]; nullable (expert ids fit int32)
     int num_tokens,
     int max_tokens,                           // tail-zero bound (>= num_tokens)
     int num_topk,
@@ -59,10 +59,10 @@ __global__ void convert_topk_to_routing_map_kernel(
     for (int b = 0; b < row_bytes; b++) row[b] = 0;
     if (token >= num_tokens) return;
     const TopkIdxT* in_row = topk_idx + token * num_topk;
-    TopkIdxT* out_row = cached_topk_idx ? cached_topk_idx + token * num_topk : nullptr;
+    int32_t* out_row = cached_topk_idx ? cached_topk_idx + token * num_topk : nullptr;
     for (int k = 0; k < num_topk; k++) {
         TopkIdxT expert = in_row[k];
-        if (out_row) out_row[k] = expert;
+        if (out_row) out_row[k] = static_cast<int32_t>(expert);
         if (expert >= 0) {
             // Global expert id = team * experts_per_lsa_team + within-team local id.
             const int team = static_cast<int>(expert) / experts_per_lsa_team;
@@ -79,7 +79,7 @@ template <typename TopkIdxT>
 void convert_topk_to_routing_map(
     const TopkIdxT* topk_idx,
     uint8_t* routing_bitmap,
-    TopkIdxT* cached_topk_idx,
+    int32_t* cached_topk_idx,
     int num_tokens,
     int max_tokens,
     int num_topk,
@@ -105,7 +105,7 @@ void convert_topk_to_routing_map(
 template void
 convert_topk_to_routing_map<int32_t>(const int32_t*, uint8_t*, int32_t*, int, int, int, int, int, int, cudaStream_t);
 template void
-convert_topk_to_routing_map<int64_t>(const int64_t*, uint8_t*, int64_t*, int, int, int, int, int, int, cudaStream_t);
+convert_topk_to_routing_map<int64_t>(const int64_t*, uint8_t*, int32_t*, int, int, int, int, int, int, cudaStream_t);
 
 // ============================================================================
 // Count-exchange path: per-destination-rank send-count histogram
@@ -117,7 +117,7 @@ convert_topk_to_routing_map<int64_t>(const int64_t*, uint8_t*, int64_t*, int, in
 template <typename TopkIdxT>
 void build_count_metadata(
     const TopkIdxT* topk_idx,
-    int64_t* cached_topk_idx,
+    int32_t* cached_topk_idx,
     int num_tokens,
     int num_topk,
     int experts_per_rank,
@@ -174,10 +174,10 @@ void build_count_metadata(
 }
 
 template void build_count_metadata<int32_t>(
-    const int32_t*, int64_t*, int, int, int, int, int, int32_t*, int32_t*, int, int32_t*, int, int,
+    const int32_t*, int32_t*, int, int, int, int, int, int32_t*, int32_t*, int, int32_t*, int, int,
     uint64_t*, int32_t*, int, bool*, int, int, cudaStream_t);
 template void build_count_metadata<int64_t>(
-    const int64_t*, int64_t*, int, int, int, int, int, int32_t*, int32_t*, int, int32_t*, int, int,
+    const int64_t*, int32_t*, int, int, int, int, int, int32_t*, int32_t*, int, int32_t*, int, int,
     uint64_t*, int32_t*, int, bool*, int, int, cudaStream_t);
 
 // ============================================================================

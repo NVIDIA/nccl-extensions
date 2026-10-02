@@ -2996,7 +2996,7 @@ struct ncclEpHandle {
             int emuf_max_groups;
 
             // Cached per-rank topk_idx [max_tokens, num_topk], persists across dispatch/combine.
-            // Width: int32/int64 (native) outside kPullPush; uint16 snapshot under kPullPush
+            // Width: int32 expert ids outside kPullPush; uint16 snapshot under kPullPush
             // so push combine reads a handle-private slot instead of ht_buffers.global_topk_idx.
             void* topk_idx;
 
@@ -3066,12 +3066,6 @@ static inline bool dispatch_push_count_capable(ncclEpGroup_t group, ncclEpLayout
 }
 static inline bool dispatch_push_count_active(ncclEpGroup_t group, ncclEpHandle_t handle) {
     return dispatch_push_count_capable(group, handle->layout);
-}
-
-// handle->ht.topk_idx mirrors the caller's native width on the scan path, but count mode's
-// cache (build_count_metadata) is always widened to int64.
-static inline bool topk_idx_cache_is_int32(ncclEpGroup_t group, ncclEpHandle_t handle) {
-    return handle->topk_idx.datatype == ncclInt32 && !dispatch_push_count_active(group, handle);
 }
 
 // Pull EM dispatch: a variant of em_permute that pulls source rows over NVLink
@@ -3146,7 +3140,7 @@ struct HtBlockLayout {
     // global_routing_map is group-scoped (ep_group->ht_buffers); not part of this block.
     size_t sz_r2a, sz_a2r, sz_ler, sz_ntfe;
     size_t sz_s2d, sz_rank_mask, sz_scan_tmp, sz_prob;
-    size_t sz_topk_idx; // cached topk_idx (uint16 under pull-push, native int64 elsewhere)
+    size_t sz_topk_idx; // cached topk_idx (uint16 under pull-push, int32 expert ids elsewhere)
     size_t sz_pec_active; // EM only
     size_t sz_eto; // EM only
     // Local-dup local-fanout scratch.
@@ -3226,9 +3220,10 @@ struct HtBlockLayout {
         // dense_prob_buffer is group-owned for every topology (internode: GIN mega-buffer;
         // single team: alloc_ht_count_scratch), so it is never carved from handle mem.
         L.sz_prob = 0;
-        // Pull-push stores a uint16 snapshot for push combine; other modes cache the native
-        // int32/int64 for the FLAT dense-prob rebuild and BWD dense-to-sparse scatter.
-        const size_t topk_idx_elem = needs_pull_buffers ? sizeof(uint16_t) : sizeof(int64_t);
+        // Pull-push stores a uint16 snapshot for push combine; other modes cache expert ids as
+        // int32 (they fit, regardless of the caller's int32/int64 topk_idx) for the FLAT
+        // dense-prob rebuild and BWD dense-to-sparse scatter.
+        const size_t topk_idx_elem = needs_pull_buffers ? sizeof(uint16_t) : sizeof(int32_t);
         L.sz_topk_idx = (num_topk > 0) ? align256(static_cast<size_t>(max_tokens) * num_topk * topk_idx_elem) : 0;
         L.sz_pec_active = has_expert_major ? align256(static_cast<size_t>(experts_per_rank) * sizeof(int32_t)) : 0;
         // [experts_per_rank + 1]: em_scan_kernel publishes the EM-padded total at `experts_per_rank` index.
@@ -3819,11 +3814,11 @@ static ncclResult_t ht_update_handle_count_mode(
                  reinterpret_cast<const uint8_t*>(chunk_rank_own)) +
         count_row_ints * sizeof(int32_t);
     CUDA_CHECK(cudaMemsetAsync(chunk_rank_own, 0, count_zero_bytes, stream));
-    // topk_idx is read in its caller-native width; the cache it writes is always int64.
+    // topk_idx is read in its caller-native width; the cache it writes is int32 (expert ids fit).
     if (handle->topk_idx.datatype == ncclInt32) {
         nccl_ep::ht::build_count_metadata(
             static_cast<const int32_t*>(handle->topk_idx.data),
-            static_cast<int64_t*>(handle->ht.topk_idx),
+            static_cast<int32_t*>(handle->ht.topk_idx),
             handle->num_tokens, handle->num_topk, experts_per_rank, ep_group->nRanks,
             num_experts, cnt_rank_pub, cnt_expert_pub,
             tokens_per_chunk, chunk_rank_own,
@@ -3835,7 +3830,7 @@ static ncclResult_t ht_update_handle_count_mode(
     } else {
         nccl_ep::ht::build_count_metadata(
             static_cast<const int64_t*>(handle->topk_idx.data),
-            static_cast<int64_t*>(handle->ht.topk_idx),
+            static_cast<int32_t*>(handle->ht.topk_idx),
             handle->num_tokens, handle->num_topk, experts_per_rank, ep_group->nRanks,
             num_experts, cnt_rank_pub, cnt_expert_pub,
             tokens_per_chunk, chunk_rank_own,
@@ -4094,7 +4089,7 @@ ncclResult_t ncclEpUpdateHandle(
         // Pass max_tokens so the kernel zeroes the tail rows in the local send slot;
         // ncclAllGather below ships max_tokens rows and stale tail bits would otherwise
         // be interpreted as live routing by peers.
-        // Cache the idx in the caller's native width (int32 or int64).
+        // Read topk_idx in the caller's native width; cache it as int32 (expert ids fit int32).
         if (handle->topk_idx.datatype == ncclInt32) {
             nccl_ep::ht::convert_topk_to_routing_map(
                 static_cast<const int32_t*>(handle->topk_idx.data),
@@ -4111,7 +4106,7 @@ ncclResult_t ncclEpUpdateHandle(
             nccl_ep::ht::convert_topk_to_routing_map(
                 static_cast<const int64_t*>(handle->topk_idx.data),
                 local_routing_send_ptr,
-                static_cast<int64_t*>(handle->ht.topk_idx),
+                static_cast<int32_t*>(handle->ht.topk_idx),
                 handle->num_tokens,
                 max_tokens,
                 handle->num_topk,
@@ -4131,7 +4126,7 @@ ncclResult_t ncclEpUpdateHandle(
             stream));
     }
     // Count mode caches topk_idx inside build_count_metadata, so no separate copy here.
-    // The cache is always widened to int64 regardless of the caller's native width.
+    // The cache stores expert ids as int32 regardless of the caller's native width.
     // TODO: narrow to int16 once the device receiver read is width-parametrized.
 
     // Pull dispatch: produce + gather the order-preserving uint16 topk map (row stride =
@@ -4981,11 +4976,7 @@ ncclResult_t ncclEpDispatch(
                     group->config.num_experts,
                     stream);
             };
-            if (topk_idx_cache_is_int32(group, handle)) {
-                build_dense_prob(static_cast<const int32_t*>(handle->ht.topk_idx));
-            } else {
-                build_dense_prob(static_cast<const int64_t*>(handle->ht.topk_idx));
-            }
+            build_dense_prob(static_cast<const int32_t*>(handle->ht.topk_idx));
         }
 
         /* ===== Build DispatchParams ===== */
@@ -5177,7 +5168,7 @@ ncclResult_t ncclEpDispatch(
             params.dispatch_push_count.s2d_out = handle->ht.sparse_to_dense_map;
             params.dispatch_push_count.published_offset = group->ht_buffers.published_offset;
             params.dispatch_push_count.per_src_lteam_chunk_rank = handle->ht.dispatch_push_count.own_chunk_rank;
-            params.dispatch_push_count.cached_topk_idx = static_cast<const int64_t*>(handle->ht.topk_idx);
+            params.dispatch_push_count.cached_topk_idx = static_cast<const int32_t*>(handle->ht.topk_idx);
             params.dispatch_push_count.num_recv_out = handle->ht.num_tokens_for_experts;
             params.dispatch_push_count.per_src_lteam_num_tokens = handle->ht.dispatch_push_count.per_src_lteam_num_tokens;
             params.dispatch_push_count.num_topk = handle->num_topk;
@@ -6584,11 +6575,7 @@ ncclResult_t ncclEpCombine(
                     group->config.num_experts,
                     stream);
             };
-            if (topk_idx_cache_is_int32(group, handle)) {
-                gather_sparse(static_cast<const int32_t*>(handle->ht.topk_idx));
-            } else {
-                gather_sparse(static_cast<const int64_t*>(handle->ht.topk_idx));
-            }
+            gather_sparse(static_cast<const int32_t*>(handle->ht.topk_idx));
         }
 
         handle->cached_mode = true;

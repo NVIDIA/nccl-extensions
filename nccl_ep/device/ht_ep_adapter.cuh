@@ -48,12 +48,13 @@ constexpr int kEpCountMaxTopk = 64;
 // NCCL API uses sparse format: topk_idx[token][k] = expert_id
 // HT uses bitmap format, byte-padded per LSA-team: each team's experts occupy
 // their own ceil(experts_per_lsa_team/8)-byte block within the row.
-// cached_topk_idx mirrors topk_idx in its native width (int32 or int64).
+// cached_topk_idx stores expert ids as int32 (narrower than any caller int64 topk_idx; expert
+// ids always fit int32).
 template <typename TopkIdxT>
 void convert_topk_to_routing_map(
     const TopkIdxT* topk_idx,
     uint8_t* routing_bitmap,
-    TopkIdxT* cached_topk_idx,  // nullable; when non-null, mirrors topk_idx in the same pass
+    int32_t* cached_topk_idx,  // nullable; when non-null, caches the row in the same pass
     int num_tokens,
     int max_tokens,            // tail bound; rows [num_tokens, max_tokens) are zeroed
     int num_topk,
@@ -69,11 +70,11 @@ void convert_topk_to_routing_map(
 // ============================================================================
 
 // Count-exchange path: per-destination-rank and per-expert send-count histogram from topk_idx.
-// topk_idx is read in its native width; cached_topk_idx is always widened to int64.
+// topk_idx is read in its native width; cached_topk_idx stores expert ids as int32.
 template <typename TopkIdxT>
 void build_count_metadata(
     const TopkIdxT* topk_idx,
-    int64_t* cached_topk_idx,  // [num_tokens, num_topk] cache copy for prob rebuild + combine, nullable
+    int32_t* cached_topk_idx,  // [num_tokens, num_topk] cache copy for prob rebuild + combine, nullable
     int num_tokens,
     int num_topk,
     int experts_per_rank,
@@ -568,7 +569,7 @@ struct DispatchPushCountParams {
     int32_t* s2d_out = nullptr;                             // writable s2d [max_tokens, lsa_team_size], host-set 0xFF
     size_t published_offset = 0;                            // count rows offset in the peer table regions
     const int32_t* per_src_lteam_chunk_rank = nullptr;       // [num_chunks, lsa_team_size] per-chunk send counts
-    const int64_t* cached_topk_idx = nullptr;               // cached sender topk_idx [max_tokens, num_topk]
+    const int32_t* cached_topk_idx = nullptr;               // cached sender topk_idx [max_tokens, num_topk] (int32 expert ids)
     int32_t* num_recv_out = nullptr;                        // FLAT recv count (num_tokens_for_experts)
     const int32_t* per_src_lteam_num_tokens = nullptr;       // [1] real token count for the sender's stream
     int num_topk = 0;

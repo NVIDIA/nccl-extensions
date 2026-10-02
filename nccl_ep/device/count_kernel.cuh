@@ -14,7 +14,7 @@ namespace ht_ep {
 // per-token divisions fold to compile-time shifts/masks. Single-LSA-team only.
 struct build_count_metadata_param_t {
     const void* topk_idx;                               // [num_tokens, num_topk], native int32/int64 (see TopkIdxT)
-    int64_t* cached_topk_idx;                           // [num_tokens, num_topk] cache copy, always widened to int64
+    int32_t* cached_topk_idx;                           // [num_tokens, num_topk] cache copy; expert ids fit int32
     int32_t* cnt_rank;                                  // [num_world_dst_ranks], pre-zeroed
     int32_t* cnt_expert;                                // [num_experts], pre-zeroed
     int32_t* own_chunk_rank;                            // own-LSA-team slice [num_chunks, lsa_team_size]
@@ -36,7 +36,7 @@ __device__ void build_count_metadata_impl(const build_count_metadata_param_t& p)
     const int NUM_DST_RANKS = NUM_LSA_TEAMS * LSA_TEAM_SZ;
 
     const TopkIdxT* __restrict__ topk_idx = static_cast<const TopkIdxT*>(p.topk_idx);
-    int64_t* __restrict__ cached_topk_idx = p.cached_topk_idx;
+    int32_t* __restrict__ cached_topk_idx = p.cached_topk_idx;
     const int num_tokens = p.num_tokens;
     const int num_topk = p.num_topk;
     int32_t* __restrict__ cnt_rank = p.cnt_rank;
@@ -65,7 +65,7 @@ __device__ void build_count_metadata_impl(const build_count_metadata_param_t& p)
         for (int k = 0; k < num_topk; k++) {
             TopkIdxT e = row[k];
             // Cache the topk row for the sender-side dense-prob rebuild in dispatch and the BWD combine scatter.
-            cached_topk_idx[(size_t)token * num_topk + k] = static_cast<int64_t>(e);
+            cached_topk_idx[(size_t)token * num_topk + k] = static_cast<int32_t>(e);
             // Masked/unassigned slots use a negative sentinel; cache it but skip all counting
             // (matches the scan reference and the receiver LERM build).
             if (e < 0) continue;

@@ -1043,7 +1043,7 @@ struct dispatch_push_count_kparams_t {
     // inside each peer's count-table region; written by the histogram, read after the head barrier.
     size_t published_offset = 0;
     const int32_t* per_src_lteam_chunk_rank = nullptr;       // [num_chunks, lsa_team_size] per-chunk send counts
-    const int64_t* cached_topk_idx = nullptr;               // cached sender topk_idx [max_tokens, num_topk]
+    const int32_t* cached_topk_idx = nullptr;               // cached sender topk_idx [max_tokens, num_topk] (int32 expert ids)
     int32_t* num_recv_out = nullptr;                        // FLAT recv count for this rank (num_tokens_for_experts)
     const int32_t* per_src_lteam_num_tokens = nullptr;       // [1] real token count for the sender's stream
     int num_topk = 0;
@@ -4352,7 +4352,7 @@ __device__ __forceinline__ void warp_rdma_guard_publish(
 // dispatch_push_map_publish_outputs live in dispatch_push_map_publish_ctx_t instead, so they
 // don't sit live in registers across the build_s2d/build_lerm phases that run before it.
 struct dispatch_push_map_ctx_t {
-    const int64_t* topk_idx;
+    const int32_t* topk_idx;
     int32_t* s2d;
     const int32_t* per_src_lteam_chunk_rank;
     const uint64_t* token_dst_rank_bitmap;
@@ -4623,7 +4623,7 @@ __device__ __forceinline__ void dispatch_push_map_build_lerm(
     const int experts_per_lsa_team = ctx.experts_per_lsa_team;
     const int expert_off = ctx.expert_off;
     const int num_topk = ctx.num_topk;
-    const int64_t* topk_idx = ctx.topk_idx;
+    const int32_t* topk_idx = ctx.topk_idx;
     int32_t* s2d = ctx.s2d;
     uint8_t* const* recv_tables_ptrs = ctx.recv_tables_ptrs;
     const int* per_src_lteam_num_tokens = ctx.per_src_lteam_num_tokens;
@@ -4660,7 +4660,7 @@ __device__ __forceinline__ void dispatch_push_map_build_lerm(
             uint64_t touched_mask[kRankListCap][MASK_WORDS];
             int nrank = 0;
             // Derive each token's per-dest-rank expert mask from its topk row.
-            const int64_t* row = topk_idx + (size_t)t * num_topk;
+            const int32_t* row = topk_idx + (size_t)t * num_topk;
             for (int k = 0; k < num_topk; k++) {
                 const int32_t ge = map_topk_ge(row, k);
                 if (ge < 0) continue;

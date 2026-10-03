@@ -28,6 +28,7 @@
 enum class ncclEpEnvType {
     flag,   // boolean toggle stored in value.flag
     ulong,  // unsigned long integer stored in value.ul
+    choice, // index into the variable's choices stored in value.ul
 };
 
 // A single environment variable bound to its name and type (both set at
@@ -39,6 +40,7 @@ enum class ncclEpEnvType {
 struct ncclEpEnvVar {
     const char* name;
     ncclEpEnvType type;
+    const char* const* choices = nullptr; // Null-terminated names for choice variables.
     bool is_set = false;
     union {
         unsigned long ul = 0;
@@ -62,6 +64,8 @@ struct ncclEpEnvConfig {
     // Count mode fuses the recv layout into dispatch by default; set to force the unfused
     // AllGather + compute_layout_info path (used to compare fused vs. unfused performance).
     ncclEpEnvVar ht_em_count_unfused{"NCCL_EP_HT_EM_COUNT_UNFUSED", ncclEpEnvType::flag};
+    static constexpr const char* dispatch_copy_modes[] = {"CE", "SIMT", "TMA", nullptr};
+    ncclEpEnvVar dispatch_copy_mode{"NCCL_EP_DISPATCH_COPY_MODE", ncclEpEnvType::choice, dispatch_copy_modes};
     ncclEpEnvVar disable_guard{"NCCL_EP_DISABLE_GUARD", ncclEpEnvType::flag};
     ncclEpEnvVar timeout_ms{"NCCL_EP_TIMEOUT_MS", ncclEpEnvType::ulong};
     ncclEpEnvVar comm_num_sms{"NCCL_EP_COMM_SMS", ncclEpEnvType::ulong};

@@ -60,6 +60,22 @@ void parse_timeout_ms(ncclEpEnvVar& var) {
     var.value.ul = parsed;
 }
 
+void parse_choice(ncclEpEnvVar& var) {
+    const char* v = std::getenv(var.name);
+    if (v == nullptr || v[0] == '\0') return;
+    for (unsigned long index = 0; var.choices[index] != nullptr; ++index) {
+        if (strcasecmp(v, var.choices[index]) == 0) {
+            var.is_set = true;
+            var.value.ul = index;
+            return;
+        }
+    }
+    std::fprintf(stderr, "[nccl_ep] %s=%s ignored (expected", var.name, v);
+    for (const char* const* name = var.choices; *name != nullptr; ++name)
+        std::fprintf(stderr, "%s%s", name == var.choices ? " " : ", ", *name);
+    std::fprintf(stderr, "); using default\n");
+}
+
 }  // namespace
 
 void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
@@ -78,6 +94,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_flag(cfg->disable_guard);
 
     parse_timeout_ms(cfg->timeout_ms);
+    parse_choice(cfg->dispatch_copy_mode);
 
     // Numeric (ulong) vars: is_set means present, value.ul holds the raw integer
     // (no range checks here — consumers in nccl_ep.cc validate per their needs).
@@ -106,6 +123,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.ht_unfused_sync,
         &cfg.ht_em_ag_scan_mode,
         &cfg.ht_em_count_unfused,
+        &cfg.dispatch_copy_mode,
         &cfg.disable_guard,
         &cfg.timeout_ms,
         &cfg.comm_num_sms,
@@ -133,6 +151,9 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
             break;
         case ncclEpEnvType::ulong:
             std::fprintf(stderr, "[nccl_ep][env]   %-28s = %lu\n", v->name, v->value.ul);
+            break;
+        case ncclEpEnvType::choice:
+            std::fprintf(stderr, "[nccl_ep][env]   %-28s = %s\n", v->name, v->choices[v->value.ul]);
             break;
         }
     }

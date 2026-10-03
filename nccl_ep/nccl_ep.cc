@@ -827,6 +827,7 @@ struct ncclEpGroup {
     size_t device_smem_optin;
     unsigned int dispatch_num_sms; // Resolved dispatch SM budget.
     unsigned int combine_num_sms;  // Resolved combine SM budget.
+    nccl_ep::ht::DispatchCopyMode dispatch_copy_mode;
     unsigned int shuffle_sms; // Resolved SM count for the shuffle kernels (local_dup, local_reduce, push-combine reduce).
     unsigned int
         preprocess_num_sms; // Resolved SM count for the preprocessing scan kernels (NCCL_EP_PREPROCESS_NUM_SMS).
@@ -978,7 +979,8 @@ struct ncclEpGroup {
           cuda_device_id(0), lsa_team_size(0),
           lsa_rank(0), rdma_team_size(0), rdma_rank(0), rdma_buffer(nullptr), rdma_buffer_size_alloc(0), config{},
           num_local_experts(0), max_recv_tokens(0), device_sm(0), device_sm_count(0), max_dynamic_smem(0),
-          last_ll_combine_warps_per_group(0), device_smem_optin(0), dispatch_num_sms(0), combine_num_sms(0), shuffle_sms(0),
+          last_ll_combine_warps_per_group(0), device_smem_optin(0), dispatch_num_sms(0), combine_num_sms(0),
+          dispatch_copy_mode(nccl_ep::ht::DispatchCopyMode::kTma), shuffle_sms(0),
           preprocess_num_sms(0), ht_em_mode(HtEmMode::kLocalPermute), alloc{}, gpus_per_node(0), rank_in_node(0),
           node_id(0), num_nccl_comms(0), nccl_comms{}, nccl_dev_comm(nullptr), nccl_wins(nullptr),
           num_dispatch_signals(0), clean_barrier_signal_base(0), ht_buffers{}, eager_mode(false) {}
@@ -2274,6 +2276,10 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     apply_sms_override(ep_group->env.combine_num_sms, ep_group->combine_num_sms);
     apply_sms_override(ep_group->env.shuffle_sms, ep_group->shuffle_sms);
     apply_sms_override(ep_group->env.preprocess_num_sms, ep_group->preprocess_num_sms);
+    const auto& copy_mode = ep_group->env.dispatch_copy_mode;
+    if (copy_mode.is_set) {
+        ep_group->dispatch_copy_mode = static_cast<nccl_ep::ht::DispatchCopyMode>(copy_mode.value.ul);
+    }
 
     // LL warp-group bound applies independently to both operation grids.
     if (in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
@@ -2328,6 +2334,17 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     //   factor. Eager relies on TRAP semantics, so DROP requires a fixed budget.
     //   LL AUTO/0: nRanks * max_dispatch_tokens_per_rank (layout-agnostic).
     ep_group->eager_mode = ht_mode && (ep_group->config.max_recv_tokens_per_rank == NCCL_EP_AUTO);
+    if (ht_mode && !ep_group->eager_mode &&
+        ep_group->dispatch_copy_mode == nccl_ep::ht::DispatchCopyMode::kTma) {
+        const ncclResult_t status = nccl_ep::ht::configure_dispatch_copy_tma();
+        if (status == ncclInvalidUsage) {
+            ep_group->dispatch_copy_mode = nccl_ep::ht::DispatchCopyMode::kCe;
+            if (ep_group->rank == 0)
+                fprintf(stderr, "[nccl_ep] TMA dispatch copy unavailable; using CE\n");
+        } else {
+            NCCLCHECK(status);
+        }
+    }
     if (ep_group->eager_mode) {
         EP_HOST_ASSERT(
             ep_group->config.overflow_policy != NCCL_EP_OVERFLOW_DROP &&
@@ -5076,20 +5093,32 @@ ncclResult_t ncclEpDispatch(
                 static_cast<int>(rcv_scales_zcopy));
         }
 
-        bool zcopy_only = rcv_x_zcopy;
-        if (recipe != NCCL_EP_DISP_QUANT_NONE) {
-            zcopy_only = zcopy_only && rcv_scales_zcopy;
+        const bool copy_tokens = !rcv_x_zcopy && !em_permute_active;
+        const bool copy_scales = recipe == NCCL_EP_DISP_QUANT_FWD && !rcv_scales_zcopy && !em_permute_active;
+        auto copy_mode = group->dispatch_copy_mode;
+        if (!group->eager_mode && copy_mode == nccl_ep::ht::DispatchCopyMode::kTma) {
+            const auto aligned = [](const void* src, const void* dst, size_t row_bytes) {
+                return ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst) | row_bytes) & 15) == 0;
+            };
+            if ((copy_tokens && !aligned(
+                    group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->lsa_rank],
+                    recv_x->data, recv_x->sizes[1] * ncclTypeSize(recv_x->datatype))) ||
+                (copy_scales && !aligned(
+                    group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[group->lsa_rank],
+                    recv_scales->data, recv_scales->sizes[1] * ncclTypeSize(recv_scales->datatype)))) {
+                copy_mode = nccl_ep::ht::DispatchCopyMode::kCe;
+            }
         }
-        const bool need_recv_counts = !is_capturing && !em_permute_active && !zcopy_only;
+        const bool use_sm_copy = !group->eager_mode && copy_mode != nccl_ep::ht::DispatchCopyMode::kCe;
+        const bool need_recv_counts = !use_sm_copy && !is_capturing && (copy_tokens || copy_scales);
 
-        // Required caller recv capacity (full budget in fixed mode, routed count in eager).
+        // CE copies use actual rows outside capture and bounded capacity during capture.
         unsigned int recv_copy_rows = static_cast<unsigned int>(group->max_recv_tokens);
         if (em_permute_active) {
             // EM: kernels read the routed count from device, so recv_x's own row count is the
             // caller capacity here and no device->host sync is needed.
             recv_copy_rows = static_cast<unsigned int>(recv_x->sizes[0]);
         } else if (group->eager_mode || need_recv_counts) {
-            // FLAT: the routed count drives the dense->sparse copy below, so query it.
             NCCLCHECK(ht_query_num_recv_tokens(handle, stream, &recv_copy_rows));
             if (recv_x->sizes[0] < recv_copy_rows) {
                 fprintf(
@@ -5356,7 +5385,25 @@ ncclResult_t ncclEpDispatch(
         // permute kernel uses that table to map FLAT slots to EM zones.
         assert(recv_x->ndim == 2);
         const int caller_num_recv_tokens = static_cast<int>(recv_x->sizes[0]);
-        if (!rcv_x_zcopy && !em_permute_active) {
+        if (use_sm_copy && (copy_tokens || copy_scales)) {
+            if (recv_x->sizes[0] < recv_copy_rows) return ncclInvalidArgument;
+            const bool em = handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR;
+            const unsigned int copy_sms = copy_mode == nccl_ep::ht::DispatchCopyMode::kTma
+                ? nccl_ep::ht::dispatch_copy_tma_sms(group->device_sm, group->device_sm_count)
+                : group->shuffle_sms;
+            nccl_ep::ht::launch_dispatch_copy_epilogue(
+                em ? nullptr : handle->ht.num_tokens_for_experts,
+                em ? handle->ht.expert_token_offsets + group->num_local_experts : nullptr,
+                recv_copy_rows, group->ht_buffers.token_staging_slots,
+                copy_tokens ? group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->lsa_rank] : nullptr,
+                copy_tokens ? recv_x->data : nullptr,
+                recv_x->sizes[1] * ncclTypeSize(recv_x->datatype),
+                copy_scales ? group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[group->lsa_rank] : nullptr,
+                copy_scales ? recv_scales->data : nullptr,
+                copy_scales ? recv_scales->sizes[1] * ncclTypeSize(recv_scales->datatype) : 0,
+                copy_sms, copy_mode, stream);
+            CUDA_CHECK(cudaGetLastError());
+        } else if (copy_tokens) {
             if (recv_x->sizes[0] < recv_copy_rows) {
                 return ncclInvalidArgument;
             }
@@ -5455,6 +5502,7 @@ ncclResult_t ncclEpDispatch(
                         dsp_topk_weights,
                         dsp_topk_idx,
                         num_recv_tokens,
+                        handle->ht.num_tokens_for_experts,
                         handle->num_topk,
                         group->num_local_experts,
                         experts_per_lsa_team,
@@ -5783,7 +5831,7 @@ ncclResult_t ncclEpDispatch(
 
         // QUANT_FWD output scales (async D2D, sized by caller). On the EM-permute
         // path the scales are already relocated into EM order by local_permute_dup above.
-        if (recipe == NCCL_EP_DISP_QUANT_FWD && !em_permute_active) {
+        if (copy_scales && !use_sm_copy) {
             assert(recv_scales->ndim == 2);
             if (!rcv_scales_zcopy) {
                 if (recv_scales->sizes[0] < recv_copy_rows) {

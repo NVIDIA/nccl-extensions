@@ -534,6 +534,7 @@ __global__ void dense_to_sparse_prob_kernel(
     float* __restrict__ recv_topk_weights,             // EM: [N]; FLAT/RM: [N, topk]
     int64_t* __restrict__ recv_topk_idx,               // [num_recv_tokens, topk]; nullptr under EM
     int num_recv_tokens,
+    const int32_t* num_recv_tokens_dev,
     int topk,
     int experts_per_rank,
     int experts_per_lsa_team,
@@ -543,7 +544,7 @@ __global__ void dense_to_sparse_prob_kernel(
     bool expert_major,
     bool lerm_bitmap) {
     int token = blockIdx.x * blockDim.x + threadIdx.x;
-    if (token >= num_recv_tokens) return;
+    if (token >= num_recv_tokens || token >= *num_recv_tokens_dev) return;
 
     // Count mode packs LERM as ceil(epr/64) u64 words per token; scan mode is one bool per expert.
     const int lerm_words = nccl_ep::bit_words(experts_per_rank);
@@ -660,6 +661,7 @@ void dense_to_sparse_prob(
     float* recv_topk_weights,
     int64_t* recv_topk_idx,
     int num_recv_tokens,
+    const int32_t* num_recv_tokens_dev,
     int topk,
     int experts_per_rank,
     int experts_per_lsa_team,
@@ -679,6 +681,7 @@ void dense_to_sparse_prob(
         recv_topk_weights,
         recv_topk_idx,
         num_recv_tokens,
+        num_recv_tokens_dev,
         topk,
         experts_per_rank,
         experts_per_lsa_team,
@@ -2002,6 +2005,141 @@ static inline unsigned int local_permute_grid(int sm_count, unsigned int shuffle
     return grid;
 }
 
+__device__ __forceinline__ void dispatch_copy_segment(
+    const void* src, void* dst, size_t bytes) {
+    if (src == nullptr) return;
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    const uintptr_t alignment = reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst) | bytes;
+    if ((alignment & (sizeof(uint4) - 1)) == 0) {
+        const auto* input = static_cast<const uint4*>(src);
+        auto* output = static_cast<uint4*>(dst);
+        for (size_t i = tid; i < bytes / sizeof(uint4); i += stride) output[i] = input[i];
+    } else {
+        const auto* input = static_cast<const uint8_t*>(src);
+        auto* output = static_cast<uint8_t*>(dst);
+        for (size_t i = tid; i < bytes; i += stride) output[i] = input[i];
+    }
+}
+
+__global__ void dispatch_copy_epilogue_kernel(
+    const int32_t* flat_count, const int64_t* em_count,
+    size_t capacity, size_t staging_capacity,
+    const void* token_src, void* token_dst, size_t token_row_bytes,
+    const void* scale_src, void* scale_dst, size_t scale_row_bytes) {
+    const int64_t count = em_count != nullptr ? *em_count : *flat_count;
+    const bool valid = count >= 0 && static_cast<size_t>(count) <= capacity &&
+                       static_cast<size_t>(count) <= staging_capacity;
+    if (!valid) {
+        if (blockIdx.x == 0 && threadIdx.x == 0) EP_DEVICE_ASSERT(valid);
+        return;
+    }
+    dispatch_copy_segment(token_src, token_dst, static_cast<size_t>(count) * token_row_bytes);
+    dispatch_copy_segment(scale_src, scale_dst, static_cast<size_t>(count) * scale_row_bytes);
+}
+
+#ifndef DISABLE_SM90_FEATURES
+constexpr int kDispatchCopyStages = 8;
+constexpr size_t kDispatchCopyTileBytes = 16384;
+
+__device__ void dispatch_copy_segment_tma(
+    const void* src, void* dst, size_t bytes, uint8_t* tiles, uint64_t* barriers) {
+    if (src == nullptr || bytes == 0) return;
+    EP_DEVICE_ASSERT(((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst) | bytes) & 15) == 0);
+    if (threadIdx.x != 0) return;
+    const size_t stride = static_cast<size_t>(gridDim.x) * kDispatchCopyTileBytes;
+    size_t offset = static_cast<size_t>(blockIdx.x) * kDispatchCopyTileBytes;
+    if (offset >= bytes) return;
+    uint32_t phase[kDispatchCopyStages] = {};
+    for (int s = 0; s < kDispatchCopyStages; ++s) mbarrier_init(barriers + s, 1);
+    fence_barrier_init();
+    auto load_tile = [&](int slot, size_t pos) {
+        const int n = static_cast<int>(min(kDispatchCopyTileBytes, bytes - pos));
+        mbarrier_arrive_and_expect_tx(barriers + slot, n);
+        tma_load_1d(tiles + slot * kDispatchCopyTileBytes, static_cast<const uint8_t*>(src) + pos,
+                    barriers + slot, n, false);
+    };
+    for (int s = 0; s < kDispatchCopyStages && offset + s * stride < bytes; ++s)
+        load_tile(s, offset + s * stride);
+    size_t iteration = 0;
+    for (; offset < bytes; offset += stride, ++iteration) {
+        const int slot = iteration % kDispatchCopyStages;
+        mbarrier_wait(barriers + slot, phase[slot]);
+        const int n = static_cast<int>(min(kDispatchCopyTileBytes, bytes - offset));
+        tma_store_1d(tiles + slot * kDispatchCopyTileBytes, static_cast<uint8_t*>(dst) + offset, n, false);
+        // Refill older tiles while newer stores remain in flight.
+        constexpr int pending = 3;
+        if (iteration >= pending) {
+            tma_store_wait<pending>();
+            const size_t next = offset + (kDispatchCopyStages - pending) * stride;
+            if (next < bytes) load_tile((iteration - pending) % kDispatchCopyStages, next);
+        }
+    }
+    tma_store_wait_complete<0>();
+    for (int s = 0; s < kDispatchCopyStages; ++s) mbarrier_inval(barriers + s);
+}
+
+__global__ void dispatch_copy_epilogue_tma_kernel(
+    const int32_t* flat_count, const int64_t* em_count,
+    size_t capacity, size_t staging_capacity,
+    const void* token_src, void* token_dst, size_t token_row_bytes,
+    const void* scale_src, void* scale_dst, size_t scale_row_bytes) {
+    extern __shared__ __align__(128) uint8_t tiles[];
+    __shared__ __align__(8) uint64_t barriers[kDispatchCopyStages];
+    const int64_t count = em_count != nullptr ? *em_count : *flat_count;
+    const bool valid = count >= 0 && static_cast<size_t>(count) <= capacity &&
+                       static_cast<size_t>(count) <= staging_capacity;
+    if (!valid) {
+        if (blockIdx.x == 0 && threadIdx.x == 0) EP_DEVICE_ASSERT(valid);
+        return;
+    }
+    dispatch_copy_segment_tma(token_src, token_dst, static_cast<size_t>(count) * token_row_bytes, tiles, barriers);
+    dispatch_copy_segment_tma(scale_src, scale_dst, static_cast<size_t>(count) * scale_row_bytes, tiles, barriers);
+}
+#endif
+
+ncclResult_t configure_dispatch_copy_tma() {
+#ifndef DISABLE_SM90_FEATURES
+    const cudaError_t status = cudaFuncSetAttribute(
+        dispatch_copy_epilogue_tma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        kDispatchCopyStages * kDispatchCopyTileBytes);
+    if (status == cudaErrorInvalidValue || status == cudaErrorNotSupported) {
+        (void)cudaGetLastError(); // Clear the recoverable opt-in error before CE fallback.
+        return ncclInvalidUsage;
+    }
+    return status == cudaSuccess ? ncclSuccess : ncclUnhandledCudaError;
+#else
+    return ncclInvalidUsage;
+#endif
+}
+
+void launch_dispatch_copy_epilogue(
+    const int32_t* flat_count, const int64_t* em_count,
+    size_t capacity, size_t staging_capacity,
+    const void* token_src, void* token_dst, size_t token_row_bytes,
+    const void* scale_src, void* scale_dst, size_t scale_row_bytes,
+    unsigned int copy_sms, DispatchCopyMode mode, cudaStream_t stream) {
+    assert((flat_count != nullptr) != (em_count != nullptr));
+    assert((token_src == nullptr) == (token_dst == nullptr));
+    assert((scale_src == nullptr) == (scale_dst == nullptr));
+    assert(token_src != nullptr || scale_src != nullptr);
+    assert(capacity > 0 && staging_capacity > 0);
+    assert(token_src == nullptr || token_row_bytes <= SIZE_MAX / capacity);
+    assert(scale_src == nullptr || scale_row_bytes <= SIZE_MAX / capacity);
+    assert(copy_sms > 0 && mode != DispatchCopyMode::kCe);
+#ifndef DISABLE_SM90_FEATURES
+    if (mode == DispatchCopyMode::kTma) {
+        dispatch_copy_epilogue_tma_kernel<<<copy_sms, 32, kDispatchCopyStages * kDispatchCopyTileBytes, stream>>>(
+            flat_count, em_count, capacity, staging_capacity,
+            token_src, token_dst, token_row_bytes, scale_src, scale_dst, scale_row_bytes);
+        return;
+    }
+#endif
+    dispatch_copy_epilogue_kernel<<<copy_sms, 1024, 0, stream>>>(
+        flat_count, em_count, capacity, staging_capacity,
+        token_src, token_dst, token_row_bytes, scale_src, scale_dst, scale_row_bytes);
+}
+
 void launch_dispatch_permute(
     void* recv_x_em,
     float* recv_topk_weights_em,
@@ -2405,4 +2543,3 @@ ncclResult_t launch_combine_reduce_stage(
 
 } // namespace ht
 } // namespace nccl_ep
-

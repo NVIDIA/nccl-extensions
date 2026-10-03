@@ -206,6 +206,7 @@ void dense_to_sparse_prob(
     float* recv_topk_weights, // EM: [N]; FLAT/RM: [N, topk]
     int64_t* recv_topk_idx, // [num_recv_tokens, topk] - LOCAL or GLOBAL expert id (see kind); nullptr under EM
     int num_recv_tokens,
+    const int32_t* num_recv_tokens_dev, // Flat rows, or padded extent for direct EM.
     int topk,
     int experts_per_rank,
     int experts_per_lsa_team, // = experts_per_rank * ranks_per_lsa_team
@@ -343,6 +344,20 @@ void launch_build_em_tables(
 // The size of gscratch (ep_workspace) consumed by the EM scan
 size_t get_em_scan_gscratch_size(int lsa_team_size, int experts_per_rank,
                                  int num_sms, bool is_local_permute);
+
+// Copy only device-counted rows from dispatch staging.
+enum class DispatchCopyMode : unsigned int { kCe = 0, kSimt = 1, kTma = 2 };
+constexpr unsigned int dispatch_copy_tma_sms(unsigned int device_sm, unsigned int device_sm_count) {
+    const unsigned int sms = (device_sm == 100 || device_sm == 103) ? 96u : 128u;
+    return device_sm_count < sms ? device_sm_count : sms;
+}
+ncclResult_t configure_dispatch_copy_tma();
+void launch_dispatch_copy_epilogue(
+    const int32_t* flat_count, const int64_t* em_count,
+    size_t capacity, size_t staging_capacity,
+    const void* token_src, void* token_dst, size_t token_row_bytes,
+    const void* scale_src, void* scale_dst, size_t scale_row_bytes,
+    unsigned int copy_sms, DispatchCopyMode mode, cudaStream_t stream);
 
 // Scatter FLAT staging rows into EM zones using flat2em_slot_map (written by
 // em_scan_kernel during UpdateHandle); zero-fill per-expert pad rows.

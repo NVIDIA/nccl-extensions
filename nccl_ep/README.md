@@ -549,6 +549,14 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
 
 ### Eager mode
 
+In fixed-capacity mode, staged HT dispatch can copy device-counted token and forwarded-scale rows without host count readback. Set `NCCL_EP_DISPATCH_COPY_MODE` before group creation to `CE`, `SIMT`, or `TMA` (default), case-insensitively. Unset or empty selects TMA. Invalid values warn and use TMA. TMA uses 96 CTAs on Blackwell SM100/SM103 and 128 on other architectures, including Rubin, bounded by the device SM count. It uses 32 threads per CTA with one issuer and 128 KiB of shared memory per CTA. If a staged copy's addresses or row size are not 16-byte aligned, that dispatch uses CE instead. The group's selected mode is unchanged. Explicit SIMT mode uses the shuffle grid.
+
+The TMA copy kernel requires a 128 KiB dynamic shared-memory allocation per CTA, in addition to its static barrier storage. If the device cannot satisfy that opt-in, dispatch falls back to host-issued CE copies, not SIMT, with a warning. This includes SM120/SM121, whose per-CTA shared-memory limit is 99 KiB. The same fallback applies if TMA is compiled out or the opt-in is unsupported. Other CUDA setup errors are returned to the caller.
+
+CE mode synchronously reads back the count outside graph capture and copies the bounded capacity during capture, so unused output rows may be overwritten. Both SM modes leave token and forwarded-scale rows beyond the device count untouched. Output tensors must cover the configured receive budget under every policy. Eager mode below, registered-window zero-copy, LL, and expert-major local permutation are unchanged.
+
+HT forward metadata conversion reads the device count under every copy policy. Routing weights and indices beyond that extent remain untouched. Direct expert-major conversion includes alignment padding, while local permutation retains its own padding handling.
+
 A group normally commits to a fixed per-rank recv budget, and every dispatch recv
 tensor is sized to it. Creating the group with
 `max_recv_tokens_per_rank = NCCL_EP_AUTO` selects *eager mode* instead, where the

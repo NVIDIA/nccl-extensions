@@ -19,6 +19,10 @@ Experimental library for resharding a tensor between two disjoint groups of
 GPU processes (e.g. trainer and inference ranks) in a single, zero-copy call,
 built on NCCL's window API.
 
+### [`nccl_nd/`](nccl_nd/) — Tensor-Axis All-to-All
+Experimental all-to-all for Ulysses sequence/head redistribution, using CUDA
+pitched copies with NCCL memory windows and device-side barriers.
+
 ### [`python/`](python/) — Python bindings
 Python package (`nccl-extensions`) providing Pythonic wrappers for `nccl_ep`
 and `nccl_m2n` as `nccl.ep` and `nccl.m2n`. See
@@ -83,27 +87,30 @@ make nccl-submodule
 ```
 
 By default, NCCL keeps its native `third_party/nccl/build` output, while NCCL
-EP and NCCL M2N place libraries under `build/lib` and headers under
+EP, NCCL M2N and NCCL ND place libraries under `build/lib` and headers under
 `build/include` at the repository root.
 
-Build either extension from the repository root. Both targets install their
+Build all extensions or select one from the repository root. The targets place
 artifacts into the shared build tree:
 
 ```bash
+make                # build all extensions
 make nccl_ep.build   # build/{lib,include,...}
 make nccl_m2n.build  # build/{lib,include,...}
+make nccl_nd.build   # build/{lib,include,...}
 ```
 
 Unless `NCCL_HOME` is set, plain `make` initializes and builds the vendored
-NCCL before building both extension libraries. `make clean` cleans both
-extensions without touching NCCL. Each library has an independent build-root
-override, while `BUILDDIR` changes the shared default for both extensions:
+NCCL before building all extension libraries. `make clean` cleans all extensions
+without touching NCCL. Each library has an independent build-root override,
+while `BUILDDIR` changes the shared default for all extensions:
 
 ```bash
 make nccl-submodule NCCL_BUILDDIR=/path/to/nccl/build
 make BUILDDIR=/path/to/extensions/build
 make nccl_ep.build NCCL_EP_BUILDDIR=/path/to/nccl-ep/build
 make nccl_m2n.build NCCL_M2N_BUILDDIR=/path/to/nccl-m2n/build
+make nccl_nd.build NCCL_ND_BUILDDIR=/path/to/nccl-nd/build
 ```
 
 The root Makefile passes `NCCL_BUILDDIR` to NCCL as its native `BUILDDIR`

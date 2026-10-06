@@ -7,7 +7,7 @@
 
 .DEFAULT_GOAL := all
 
-EXTENSIONS := nccl_ep nccl_m2n
+EXTENSIONS := nccl_ep nccl_m2n nccl_nd
 
 .PHONY: all clean nccl-submodule
 
@@ -23,10 +23,12 @@ endif
 NCCL_HOME ?= $(NCCL_BUILDDIR)
 NCCL_EP_BUILDDIR ?= $(BUILDDIR)
 NCCL_M2N_BUILDDIR ?= $(BUILDDIR)
+NCCL_ND_BUILDDIR ?= $(BUILDDIR)
 
 ABS_NCCL_BUILDDIR := $(abspath $(NCCL_BUILDDIR))
 ABS_NCCL_EP_BUILDDIR := $(abspath $(NCCL_EP_BUILDDIR))
 ABS_NCCL_M2N_BUILDDIR := $(abspath $(NCCL_M2N_BUILDDIR))
+ABS_NCCL_ND_BUILDDIR := $(abspath $(NCCL_ND_BUILDDIR))
 ABS_NCCL_HOME := $(abspath $(NCCL_HOME))
 
 all: $(EXTENSIONS:%=%.build)
@@ -43,6 +45,11 @@ nccl_m2n.%:
 	$(MAKE) -C $(REPO_ROOT)/nccl_m2n $* \
 		NCCL_HOME=$(ABS_NCCL_HOME) \
 		BUILDDIR=$(ABS_NCCL_M2N_BUILDDIR)
+
+nccl_nd.%:
+	$(MAKE) -C $(REPO_ROOT)/nccl_nd $* \
+		NCCL_HOME=$(ABS_NCCL_HOME) \
+		BUILDDIR=$(ABS_NCCL_ND_BUILDDIR)
 
 nccl-submodule:
 	@if [ ! -e "$(NCCL_SUBMODULE_HOME)/.git" ]; then \

@@ -69,6 +69,7 @@ NCCL_EP_JIT_HEADERS := \
     device/mxfp8_quant.cuh \
     device/quant_recipe.cuh \
     device/device_primitives.cuh \
+    device/lsa_completion.cuh \
     device/ht_ep_configs.cuh \
     device/cuda_compat_shims.cuh \
     device/scan_kernel.cuh \

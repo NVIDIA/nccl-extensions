@@ -6761,12 +6761,16 @@ ncclResult_t ncclEpCombine(
             params.lsa_S2G_flags = group->ht_buffers.combine_lsa_S2G_flags;
             params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
             params.combine_barrier_offset = group->dispatch_num_sms;
+            // A rank with no local expert input can still relay RED results
+            // produced by an LSA peer. Empty tensors have no window binding;
+            // those network writes source the registered internal RED buffer.
+            const bool use_internal_red_window = combine_x_uses_external_window || tensorIsEmpty(x);
             const ncclWindow_t combine_token_window =
-                !combine_x_uses_external_window ? x->win_hdl : group->gin_config.nccl_window;
+                use_internal_red_window ? group->gin_config.nccl_window : x->win_hdl;
             const size_t combine_token_offset =
                 is_lsa_only ? 0 :
-                                 (!combine_x_uses_external_window ? static_cast<size_t>(x->win_offset) :
-                                                                    group->gin_config.combine_red_token_offset);
+                                 (use_internal_red_window ? group->gin_config.combine_red_token_offset :
+                                                            static_cast<size_t>(x->win_offset));
             // Pass device communicators and windows
             // Always pass the devComm (single-LSA-team too): the HT LSA sync-guard now uses the
             // NCCL LSA barrier (needs comm.lsaBarrier). RDMA paths stay if-constexpr-gated.

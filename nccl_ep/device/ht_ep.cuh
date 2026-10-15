@@ -1766,8 +1766,22 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     ncclGin net(dcomm, ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
     ncclTeam rail = ncclTeamRail(dcomm);
 
-    for (int cidx = blockIdx.x * N2N_WARPS + n2n_warp_id; cidx < MAX_CHUNKS_PER_RANK;
-         cidx += NBLOCKS * N2N_WARPS) {
+    // At most GIN_WINDOW chunks per rail peer in flight. Compiled in only when it can engage: the mere
+    // presence of wait/flushAsync in this loop slows posting.
+    constexpr int GIN_WINDOW = NCCL_EP_HT_DISPATCH_GIN_WINDOW;
+    constexpr int CHUNK_STRIDE = NBLOCKS * N2N_WARPS;
+    constexpr bool USE_WINDOW = MAX_CHUNKS_PER_RANK > GIN_WINDOW * CHUNK_STRIDE;
+    const int n_mine = nccl_ep::ceil_div(MAX_CHUNKS_PER_RANK - global_channel, CHUNK_STRIDE);
+    ncclGinRequest_t chunk_done[GIN_WINDOW][NUM_REMOTE_LSA];
+    int n_posted = 0;
+
+    for (int cidx = global_channel; cidx < MAX_CHUNKS_PER_RANK; cidx += CHUNK_STRIDE, ++n_posted) {
+        if constexpr (USE_WINDOW) {
+            if (n_posted >= GIN_WINDOW) {
+                for (int j = 0; j < NUM_REMOTE_LSA; ++j)
+                    net.wait(chunk_done[n_posted % GIN_WINDOW][j], ncclCoopWarp());
+            }
+        }
         int chunk_first_token_idx = cidx * TOKENS_PER_CHUNK;
         int csize = 0;
         if (cidx < num_of_chunks_per_rank) {
@@ -1853,6 +1867,10 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                 cuda::thread_scope_thread,
                 cuda::thread_scope_thread,
                 ncclGinOptFlagsDefault);
+            if constexpr (USE_WINDOW) {
+                if (n_posted + GIN_WINDOW < n_mine)
+                    net.flushAsync(rail, remote_lteam_id, &chunk_done[n_posted % GIN_WINDOW][j], ncclCoopWarp());
+            }
         }
     }
     // GIN flush with coopWarp includes syncwarp at the end

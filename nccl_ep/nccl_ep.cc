@@ -2056,7 +2056,12 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         reqs.ginSignalCount = ep_group->gin_config.num_total_signals;
         reqs.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
         reqs.ginContextCount = ep_group->gin_config.qps_per_rank; // reserved + data contexts
-        reqs.ginQueueDepth = 3 * ht_combine_tokens_per_chunk + 1;
+        // N2N window: up to GIN_WINDOW chunks of (3 WQEs/token + signal) per peer. Dispatch chunk == combine
+        // chunk with several LSA teams.
+        const int chunks_per_channel =
+            nccl_ep::ceil_div<int>(max_chunks_per_rank, ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
+        reqs.ginQueueDepth =
+            std::min(chunks_per_channel, NCCL_EP_HT_DISPATCH_GIN_WINDOW) * (3 * ht_combine_tokens_per_chunk + 1);
         // Dispatch uses sessions [0, dispatch_num_sms); all combine CTAs rendezvous
         // through one tail CTA at session dispatch_num_sms. Therefore
         // combine_num_sms does not affect this resource count.

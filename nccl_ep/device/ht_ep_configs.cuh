@@ -29,6 +29,8 @@
 #define NCCL_EP_HT_DISPATCH_BLOCKS NCCL_EP_HT_DFLT_NUM_SMS
 #define NCCL_EP_HT_DISPATCH_PIPELINES 2
 #define NCCL_EP_HT_DISPATCH_N2N_WARPS 2
+// Chunks a dispatch N2N channel keeps in flight per rail peer; the GIN queue depth is sized for it.
+#define NCCL_EP_HT_DISPATCH_GIN_WINDOW 8
 // Maximum consecutive tokens batched into a single RDMA put in dispatch N2N.
 // Larger batches reduce NIC doorbell overhead but may delay first-byte latency.
 #define NCCL_EP_HT_DISPATCH_RDMA_BATCH_SIZE 4

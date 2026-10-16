@@ -878,7 +878,9 @@ int main(int argc, char* argv[]) {
     } else {
       NCCLCHECK(ncclMemAlloc(&tbe.buffer, bufSize));
       CUDACHECK(cudaMemset(tbe.buffer, 0, bufSize));
-      NCCLCHECK(ncclCommWindowRegister(commEntry.comm, tbe.buffer, bufSize, &tbe.window, NCCL_WIN_COLL_SYMMETRIC));
+      NCCLCHECK(benchWaitCommReady(commEntry.comm));
+      NCCLCHECK(ncclCommWindowRegister(commEntry.comm, tbe.buffer, bufSize, &tbe.window,
+                                                   NCCL_WIN_COLL_SYMMETRIC));
     }
 
     if (verbose) {
@@ -904,6 +906,13 @@ int main(int argc, char* argv[]) {
     auto& pg = patternGroups[pattern];
     pg.baseName = pattern;
     pg.transferIndices.push_back(i);
+  }
+
+  // Finish registration before transfers read the window handles.
+  if (apiMode == ReshardApiMode::Window) {
+    for (auto& [key, entry] : ppComms) {
+      if (entry.participates) NCCLCHECK(benchWaitCommReady(entry.comm));
+    }
   }
 
   // ========================================================================
@@ -1296,22 +1305,37 @@ int main(int argc, char* argv[]) {
   }
   NCCLCHECK(ncclM2nFinalize(m2nHandle));
 
-  for (size_t i = 0; i < allTransfers.size(); i++) {
-    auto& tbe = transferBuffers[i];
+  if (apiMode == ReshardApiMode::Window) {
+    for (size_t i = 0; i < allTransfers.size(); i++) {
+      auto& tbe = transferBuffers[i];
+      if (!tbe.buffer) continue;
+      auto key = std::make_pair(allTransfers[i].trainStage, allTransfers[i].genStage);
+      auto commIt = ppComms.find(key);
+      if (commIt != ppComms.end() && commIt->second.comm) {
+        NCCLCHECK(benchWaitCommReady(commIt->second.comm));
+        NCCLCHECK(ncclCommWindowDeregister(commIt->second.comm, tbe.window));
+      }
+    }
+    // Complete deregistration before releasing the buffers.
+    for (auto& [key, entry] : ppComms) {
+      if (entry.participates) NCCLCHECK(benchWaitCommReady(entry.comm));
+    }
+  }
+  for (auto& tbe : transferBuffers) {
     if (!tbe.buffer) continue;
     if (apiMode == ReshardApiMode::Default) {
       CUDACHECK(cudaFree(tbe.buffer));
     } else {
-      auto key = std::make_pair(allTransfers[i].trainStage, allTransfers[i].genStage);
-      auto commIt = ppComms.find(key);
-      if (commIt != ppComms.end() && commIt->second.comm) ncclCommWindowDeregister(commIt->second.comm, tbe.window);
       NCCLCHECK(ncclMemFree(tbe.buffer));
     }
   }
 
   for (auto& [key, entry] : ppComms) {
     if (entry.stream) CUDACHECK(cudaStreamDestroy(entry.stream));
-    if (entry.comm) ncclCommDestroy(entry.comm);
+    if (entry.comm) {
+      NCCLCHECK(benchWaitCommReady(entry.comm));
+      NCCLCHECK(ncclCommDestroy(entry.comm));
+    }
   }
 
   MPICHECK(MPI_Finalize());

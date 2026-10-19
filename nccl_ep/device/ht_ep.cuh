@@ -1778,8 +1778,9 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     for (int cidx = global_channel; cidx < MAX_CHUNKS_PER_RANK; cidx += CHUNK_STRIDE, ++n_posted) {
         if constexpr (USE_WINDOW) {
             if (n_posted >= GIN_WINDOW) {
-                for (int j = 0; j < NUM_REMOTE_LSA; ++j)
+                for (int j = 0; j < NUM_REMOTE_LSA; ++j) {
                     net.wait(chunk_done[n_posted % GIN_WINDOW][j], ncclCoopWarp());
+                }
             }
         }
         int chunk_first_token_idx = cidx * TOKENS_PER_CHUNK;
@@ -1868,8 +1869,9 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                 cuda::thread_scope_thread,
                 ncclGinOptFlagsDefault);
             if constexpr (USE_WINDOW) {
-                if (n_posted + GIN_WINDOW < n_mine)
+                if (n_posted + GIN_WINDOW < n_mine) {
                     net.flushAsync(rail, remote_lteam_id, &chunk_done[n_posted % GIN_WINDOW][j], ncclCoopWarp());
+                }
             }
         }
     }

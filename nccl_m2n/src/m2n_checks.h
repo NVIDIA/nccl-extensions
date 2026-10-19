@@ -26,8 +26,8 @@ inline void m2nWarnNonblockingComm() {
   static std::atomic<bool> warned{false};
   if (warned.load(std::memory_order_relaxed) || reshardGetLogLevel() < RESHARD_LOG_WARN) return;
   if (warned.exchange(true, std::memory_order_relaxed)) return;
-  RESHARD_WARN(-1, "NCCL non-blocking operations may add host submission overhead for M2N, "
-                   "especially on NVLink/LSA paths. Consider a blocking communicator if your application permits it.");
+  RESHARD_WARN(-1, "NCCL non-blocking operations may add host submission overhead for M2N. "
+                   "Consider a blocking communicator if your application permits it.");
 }
 
 // Keep this large enough for actionable details after ncclM2nGroupEnd adds its indexed prefix.

@@ -2250,9 +2250,10 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     NCCLCHECK(validateNcclRuntimeVersion());
 
     // Parameter validation
-    assert(out_ep_group != nullptr);
-    int nRanks;
-    assert(comm != nullptr && ncclCommCount(comm, &nRanks) == ncclSuccess && nRanks > 0);
+    if (out_ep_group == nullptr || comm == nullptr) return ncclInvalidArgument;
+    int nRanks = 0;
+    NCCLCHECK(ncclCommCount(comm, &nRanks));
+    if (nRanks <= 0) return ncclInvalidArgument;
     EP_VALIDATE_STRUCT(in_config, NCCL_EP_GROUP_CONFIG);
 
     // Decode the caller-owned object into current library storage. A future

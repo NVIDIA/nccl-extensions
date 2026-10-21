@@ -24,6 +24,29 @@
 namespace nccl_ep {
 namespace ht {
 
+// Selects which HT kernel implementation gets JIT-compiled.
+//   kOrdered:   device/ht_ep.cuh, namespace ht_ep. The default.
+//   kUnordered: device/ht/ht_gin_unordered.cuh, namespace ht_gin_unordered.
+// Honoured by the dispatch and combine entry points only; see the
+// NCCL_EP_HT_GIN_PROTOCOL section of README.md for the scope.
+enum class HtKernelImpl { kOrdered, kUnordered };
+
+inline HtKernelImpl ht_select_kernel_impl(const ncclEpEnvConfig* env) {
+    // Index into nccl_ep_env.h's ht_gin_protocols: 0 = ORDERED, 1 = UNORDERED.
+    const bool unordered = env != nullptr && env->ht_gin_protocol.is_set && env->ht_gin_protocol.value.ul == 1;
+    return unordered ? HtKernelImpl::kUnordered : HtKernelImpl::kOrdered;
+}
+
+// Path of the implementation header, as the JIT -I roots resolve it.
+inline const char* ht_impl_header(HtKernelImpl impl) {
+    return impl == HtKernelImpl::kUnordered ? "device/ht/ht_gin_unordered.cuh" : "device/ht_ep.cuh";
+}
+
+// Namespace enclosing the kernel templates in that header.
+inline const char* ht_impl_namespace(HtKernelImpl impl) {
+    return impl == HtKernelImpl::kUnordered ? "ht_gin_unordered" : "ht_ep";
+}
+
 // Source-token granularity of flat fused metadata. Each chunk carries one
 // deduplicated count per destination rank; payload width does not affect it.
 constexpr int kFlatMetadataChunkTokens = 256;

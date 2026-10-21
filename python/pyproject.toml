@@ -88,6 +88,7 @@ include = ["nccl._extensions*", "nccl.ep*", "nccl.m2n*"]
     "include/nccl_ep/*.h",
     "include/nccl_ep/*.hpp",
     "include/nccl_ep/device/*.cuh",
+    "include/nccl_ep/device/ht/*.cuh",
     "include/nccl_ep/device/ll/*.cuh",
 ]
 "nccl.m2n" = [

@@ -6,7 +6,8 @@
 # The selected profile keeps C API coverage proportional to its rank count.
 # The four-rank profile runs the core matrix. The eight-rank profile also runs
 # the cross-dimension regressions, PACK split/group gates, and the
-# benchmark validation matrix.
+# benchmark validation matrix. Multi-dimensional placement sweeps run in both
+# profiles; the eight-rank profile exercises two nontrivial shard axes.
 
 set -euo pipefail
 
@@ -37,6 +38,11 @@ splitReverseMeshActivated=0
 binary="${NCCL_HOME}/bin/basic_api_test_mpi"
 if [[ ! -x "${binary}" ]]; then
   echo "Missing executable basic MPI API test: ${binary}" >&2
+  exit 1
+fi
+multiDimBinary="${NCCL_HOME}/bin/multi_dim_test_mpi"
+if [[ ! -x "${multiDimBinary}" ]]; then
+  echo "Missing executable multi-dimensional MPI test: ${multiDimBinary}" >&2
   exit 1
 fi
 benchmark="${NCCL_HOME}/bin/reshard_bench"
@@ -197,6 +203,8 @@ runNonBlockingCoverage() {
     --filter tiny_contribution --algorithm ring --api default --copy-algorithm pack --lb-mode uniform
   runNonBlockingCase "nonblocking PACK/window API" \
     --filter tiny_contribution --algorithm ring --api window --copy-algorithm pack --lb-mode uniform
+  NCCL_RESHARD_PIPE_NET_MODE=HOST_RMA runNonBlockingCase "nonblocking PIPE host-RMA/default API" \
+    --filter tiny_contribution --algorithm ring --api default --copy-algorithm pipe --lb-mode uniform
   if [[ "${NCCL_M2N_MPI_TEST_PROFILE}" == eight_rank ]]; then
     NCCL_COMM_BLOCKING=0 runPackGroupCase
   fi
@@ -234,6 +242,61 @@ runPackGroupCase() {
   fi
   rm -f "${log}"
 }
+
+runMultiDimCase() {
+  local api="$1"
+  local grouped="$2"
+  local nonblocking="$3"
+  local args=(--src-rows 2 --dst-rows 2)
+  local log
+  local meshCols=$((expectedRanks / 4))
+  local expected="MULTI_DIM_GPU_PASS cases=356 api=${api} grouped=${grouped} nonblocking=${nonblocking} src=2x${meshCols} dst=2x${meshCols}"
+  if [[ "${api}" == window ]]; then args+=(--window); fi
+  if [[ "${grouped}" -eq 1 ]]; then args+=(--grouped); fi
+  if [[ "${nonblocking}" -eq 1 ]]; then args+=(--nonblocking); fi
+  log="$(mktemp)"
+  echo "=== multi_dim_test_mpi: copy=${NCCL_RESHARD_COPY_ALGORITHM} algorithm=${NCCL_RESHARD_ALGORITHM} lb=${NCCL_RESHARD_LB_MODE} api=${api} grouped=${grouped} nonblocking=${nonblocking} ==="
+  if runMpiProgram "${multiDimBinary}" "${log}" "${args[@]}"; then
+    :
+  else
+    local rc=$?
+    echo "multi_dim_test_mpi failed with exit code ${rc}." >&2
+    rm -f "${log}"
+    return "${rc}"
+  fi
+  if ! grep -Fxq "${expected}" "${log}"; then
+    echo "multi_dim_test_mpi did not complete all 356 cases with the expected API and meshes: ${expected}" >&2
+    rm -f "${log}"
+    return 1
+  fi
+  rm -f "${log}"
+}
+
+runMultiDimCoverage() {
+  if [[ "${NCCL_M2N_MPI_TEST_PROFILE}" == four_rank ]]; then
+    NCCL_RESHARD_COPY_ALGORITHM=DIRECT NCCL_RESHARD_ALGORITHM=RING NCCL_RESHARD_LB_MODE=UNIFORM \
+      runMultiDimCase default 0 0
+    NCCL_RESHARD_COPY_ALGORITHM=PACK NCCL_RESHARD_ALGORITHM=RING NCCL_RESHARD_LB_MODE=NODE_AWARE \
+      runMultiDimCase window 1 0
+    return
+  fi
+
+  local copy algorithm
+  for copy in DIRECT PACK; do
+    for algorithm in RING DIRECT; do
+      NCCL_RESHARD_COPY_ALGORITHM="${copy}" NCCL_RESHARD_ALGORITHM="${algorithm}" NCCL_RESHARD_LB_MODE=UNIFORM \
+        runMultiDimCase default 0 0
+      NCCL_RESHARD_COPY_ALGORITHM="${copy}" NCCL_RESHARD_ALGORITHM="${algorithm}" NCCL_RESHARD_LB_MODE=NODE_AWARE \
+        runMultiDimCase window 1 0
+    done
+  done
+  NCCL_RESHARD_COPY_ALGORITHM=PACK NCCL_RESHARD_ALGORITHM=RING NCCL_RESHARD_LB_MODE=NODE_AWARE \
+    runMultiDimCase default 0 1
+  NCCL_RESHARD_COPY_ALGORITHM=PACK NCCL_RESHARD_ALGORITHM=RING NCCL_RESHARD_LB_MODE=NODE_AWARE \
+    runMultiDimCase window 0 1
+}
+
+runMultiDimCoverage
 
 runCase "mixed communicator groups" --filter group_mixed_context \
   --algorithm ring --api default --lb-mode uniform

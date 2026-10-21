@@ -30,11 +30,13 @@
  ************************************************************************/
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "cuda_runtime.h"
 #include "nccl.h"
@@ -92,15 +94,33 @@ bool reshardShouldAttemptPipeSplitComms(const ncclDistTensor_t* srcTensor, const
 
 namespace {
 
-/* commB (RAIL, all generator ranks) state. A parent-relative mesh range does
- * not identify the same physical ranks across independent communicators, so
- * the parent communicator and exact mesh geometry form the cache key. */
+struct CommBGroupFingerprint {
+  uint64_t lo;
+  uint64_t hi;
+
+  bool operator==(const CommBGroupFingerprint& other) const {
+    return lo == other.lo && hi == other.hi;
+  }
+};
+
+/* commB (RAIL, all generator ranks) state. Every parent keeps an alias entry,
+ * while the first generator-side entry for an ordered generator group owns
+ * the reusable communicator, probe DevComm, and resource-lane fences. */
 struct CommBSharedEntry {
   ncclComm_t parent;
   int srcStart;
   int dstStart;
   int dstSize;
   int srcSize;
+  int resourceLane;
+  int resourceLaneCount;
+  int poolOwnerIndex;
+  CommBGroupFingerprint groupFingerprint;
+  int pipeNamespaceId;
+  int pipeNamespaceCapacity;
+  ReshardPipeNamespacePool pipeNamespaces; /* populated only in the owner */
+  ReshardCommBResourcePlan pipeResourcePlan;
+  bool pipeResourcePlanValid;
 
   ncclComm_t commB;         /* NULL when this rank is not a generator rank */
   ncclDevComm probeDevComm; /* RAIL probe DevComm on commB used to read gen lsaSize (rail-local QPs only) */
@@ -109,6 +129,12 @@ struct CommBSharedEntry {
   int numGenDomains; /* number of NVL domains the generator spans */
   int rankInB;       /* this rank's id within commB; -1 if not a gen rank */
   bool isDst;        /* whether THIS rank is a generator rank */
+  bool pooled;
+  bool ownsCommB;
+
+  cudaEvent_t laneCompletion[MAX_SPLIT_CONCURRENCY];
+  bool laneCompletionRecorded[MAX_SPLIT_CONCURRENCY];
+  bool lanePoisoned[MAX_SPLIT_CONCURRENCY];
 
   bool used;
 };
@@ -127,6 +153,11 @@ struct CommBParentEntry {
   int srcSize;
   bool isDst;
   int rankInB;
+  int resourceLane;
+  int resourceLaneCount;
+  int poolOwnerIndex;
+  int pipeNamespaceId;
+  int pipeNamespaceCapacity;
   bool used;
 };
 
@@ -168,6 +199,8 @@ constexpr int kMaxPersistentControlSlotEntries = kMaxPersistentControlPools * kP
 /* Protected by the documented single-host-thread reshard contract. */
 CommBSharedEntry gCommBShared[kMaxSplitCommEntries];
 int gCommBSharedCount = 0;
+int gCommBCreateCount = 0;
+int gCommBReuseCount = 0;
 CommBParentEntry gCommBParent[kMaxSplitCommEntries];
 int gCommBParentCount = 0;
 CommACacheEntry gCommACache[kMaxSplitCommEntries];
@@ -185,6 +218,33 @@ int gSplitBroadcastScratchCount = 0;
 /* Protect scratch-cache mutation only. A collective must not hold this mutex:
  * other local ranks need to enter the same collective concurrently. */
 std::mutex gSplitBroadcastScratchMutex;
+
+struct CommBParticipantMetadata {
+  uint64_t deviceUuidLo;
+  uint64_t deviceUuidHi;
+  int resourceLane;
+  int isDst;
+};
+
+/* Exchanged only when installing a new parent alias. Trainers contribute no
+ * namespace proposal; every rank observes generator agreement or failure. */
+struct PipeNamespaceMetadata {
+  int id;
+  int capacity;
+  int lanes;
+  int peersPerControl;
+  int channelsPerPeer;
+  int contextsPerLane;
+};
+
+struct SplitMetadataScratch {
+  int cudaDev;
+  unsigned char* dev;
+  size_t capacityBytes;
+};
+
+SplitMetadataScratch gSplitMetadataScratch[kSplitBroadcastScratchMaxDevices];
+int gSplitMetadataScratchCount = 0;
 
 ncclResult_t getSplitBroadcastScratch(int** out) {
   NCCL_M2N_CHECK_ARG(out != nullptr, -1, "split broadcast scratch requires output pointer");
@@ -206,6 +266,35 @@ ncclResult_t getSplitBroadcastScratch(int** out) {
   return ncclSuccess;
 }
 
+ncclResult_t getSplitMetadataScratch(size_t requiredBytes, unsigned char** out) {
+  NCCL_M2N_CHECK_ARG(out != nullptr && requiredBytes > 0, -1,
+                     "split metadata scratch requires a positive size and output pointer");
+  *out = nullptr;
+  int cudaDev = -1;
+  NCCL_M2N_CUDACHECK(cudaGetDevice(&cudaDev));
+  for (int i = 0; i < gSplitMetadataScratchCount; i++) {
+    SplitMetadataScratch& s = gSplitMetadataScratch[i];
+    if (s.cudaDev != cudaDev) continue;
+    if (s.capacityBytes < requiredBytes) {
+      if (s.dev != nullptr) NCCL_M2N_CUDACHECK(cudaFree(s.dev));
+      s.dev = nullptr;
+      NCCL_M2N_CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&s.dev), requiredBytes));
+      s.capacityBytes = requiredBytes;
+    }
+    *out = s.dev;
+    return ncclSuccess;
+  }
+  NCCL_M2N_CHECK_ARG(gSplitMetadataScratchCount < kSplitBroadcastScratchMaxDevices, -1,
+                     "split metadata scratch cache exhausted (%d CUDA devices)", kSplitBroadcastScratchMaxDevices);
+  SplitMetadataScratch& s = gSplitMetadataScratch[gSplitMetadataScratchCount++];
+  s = {};
+  s.cudaDev = cudaDev;
+  NCCL_M2N_CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&s.dev), requiredBytes));
+  s.capacityBytes = requiredBytes;
+  *out = s.dev;
+  return ncclSuccess;
+}
+
 void freeSplitBroadcastScratch() {
   std::lock_guard<std::mutex> guard(gSplitBroadcastScratchMutex);
   int savedCudaDev = -1;
@@ -220,10 +309,105 @@ void freeSplitBroadcastScratch() {
     }
     s = {};
   }
+  for (int i = 0; i < gSplitMetadataScratchCount; i++) {
+    SplitMetadataScratch& s = gSplitMetadataScratch[i];
+    if (s.dev != nullptr) {
+      if (getDeviceResult == cudaSuccess && s.cudaDev >= 0) {
+        NCCL_M2N_CUDACHECK_WARN(cudaSetDevice(s.cudaDev));
+      }
+      NCCL_M2N_CUDACHECK_WARN(cudaFree(s.dev));
+    }
+    s = {};
+  }
   if (getDeviceResult == cudaSuccess && savedCudaDev >= 0) {
     NCCL_M2N_CUDACHECK_WARN(cudaSetDevice(savedCudaDev));
   }
   gSplitBroadcastScratchCount = 0;
+  gSplitMetadataScratchCount = 0;
+}
+
+static void commBHashBytes(CommBGroupFingerprint* hash, const void* data, size_t bytes) {
+  const unsigned char* p = static_cast<const unsigned char*>(data);
+  for (size_t i = 0; i < bytes; i++) {
+    hash->lo ^= static_cast<uint64_t>(p[i]);
+    hash->lo *= 1099511628211ULL;
+    hash->hi ^= static_cast<uint64_t>(p[i] + 0x9dU);
+    hash->hi *= 14029467366897019727ULL;
+  }
+}
+
+template <typename Metadata>
+static ncclResult_t gatherSplitMetadata(ncclComm_t comm, int parentSize, int parentRank, const Metadata& local,
+                                        cudaStream_t stream, std::vector<Metadata>* metadata) {
+  NCCL_M2N_CHECK_ARG(metadata != nullptr && parentSize > 0, parentRank,
+                     "split commB metadata gather requires a positive parent size and output");
+  metadata->assign(parentSize, {});
+  const size_t sendBytes = sizeof(local);
+  const size_t recvBytes = static_cast<size_t>(parentSize) * sendBytes;
+  unsigned char* scratch = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(gSplitBroadcastScratchMutex);
+    NCCL_M2N_CHECK(getSplitMetadataScratch(sendBytes + recvBytes, &scratch));
+  }
+  unsigned char* send = scratch;
+  unsigned char* recv = scratch + sendBytes;
+
+  M2nApiUnlock apiUnlock;
+  cudaError_t cerr = cudaMemcpyAsync(send, &local, sendBytes, cudaMemcpyHostToDevice, stream);
+  ncclResult_t rc = ncclSuccess;
+  if (cerr == cudaSuccess) {
+    rc = ncclAllGather(send, recv, sendBytes, ncclUint8, comm, stream);
+    if (rc == ncclSuccess || rc == ncclInProgress) rc = m2nWaitCommReady(comm);
+  }
+  if (cerr == cudaSuccess && rc == ncclSuccess) {
+    cerr = cudaMemcpyAsync(metadata->data(), recv, recvBytes, cudaMemcpyDeviceToHost, stream);
+  }
+  if (cerr == cudaSuccess && rc == ncclSuccess) cerr = cudaStreamSynchronize(stream);
+  if (rc != ncclSuccess) {
+    NCCL_M2N_FAIL(rc, parentRank, "NCCL allgather for split commB metadata failed: %s", ncclGetErrorString(rc));
+  }
+  if (cerr != cudaSuccess) {
+    NCCL_M2N_FAIL(ncclSystemError, parentRank, "CUDA error in split commB metadata gather: %s",
+                  cudaGetErrorString(cerr));
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t gatherCommBParticipantMetadata(ncclComm_t comm, int parentSize, int parentRank, bool isDst,
+                                                    int resourceLane, cudaStream_t stream,
+                                                    std::vector<CommBParticipantMetadata>* metadata) {
+  int cudaDev = -1;
+  NCCL_M2N_CUDACHECK(cudaGetDevice(&cudaDev));
+  cudaDeviceProp deviceProp{};
+  NCCL_M2N_CUDACHECK(cudaGetDeviceProperties(&deviceProp, cudaDev));
+  CommBParticipantMetadata local{};
+  memcpy(&local.deviceUuidLo, deviceProp.uuid.bytes, sizeof(local.deviceUuidLo));
+  memcpy(&local.deviceUuidHi, deviceProp.uuid.bytes + sizeof(local.deviceUuidLo), sizeof(local.deviceUuidHi));
+  local.resourceLane = resourceLane;
+  local.isDst = isDst ? 1 : 0;
+  return gatherSplitMetadata(comm, parentSize, parentRank, local, stream, metadata);
+}
+
+static bool deriveCommBPoolKey(const std::vector<CommBParticipantMetadata>& metadata, int dstStart, int dstSize,
+                               bool physicalLane, int* resourceLane, CommBGroupFingerprint* fingerprint) {
+  if (resourceLane == nullptr || fingerprint == nullptr || dstStart < 0 || dstSize <= 0 ||
+      dstStart + dstSize > static_cast<int>(metadata.size())) {
+    return false;
+  }
+  *resourceLane = metadata[dstStart].resourceLane;
+  if (physicalLane && *resourceLane < 0) return false;
+  *fingerprint = {1469598103934665603ULL, 1609587929392839161ULL};
+  for (int rank = 0; rank < static_cast<int>(metadata.size()); rank++) {
+    const bool expectedDst = rank >= dstStart && rank < dstStart + dstSize;
+    if ((metadata[rank].isDst != 0) != expectedDst) return false;
+    if (!expectedDst) continue;
+    if (physicalLane && metadata[rank].resourceLane != *resourceLane) return false;
+    commBHashBytes(fingerprint, &metadata[rank].deviceUuidLo, sizeof(metadata[rank].deviceUuidLo));
+    commBHashBytes(fingerprint, &metadata[rank].deviceUuidHi, sizeof(metadata[rank].deviceUuidHi));
+    const int rankInB = rank - dstStart;
+    commBHashBytes(fingerprint, &rankInB, sizeof(rankInB));
+  }
+  return true;
 }
 
 CommBSharedEntry* findCommBShared(ncclComm_t parent, int srcStart, int srcSize, int dstStart, int dstSize) {
@@ -232,6 +416,16 @@ CommBSharedEntry* findCommBShared(ncclComm_t parent, int srcStart, int srcSize, 
         gCommBShared[i].srcSize == srcSize && gCommBShared[i].dstStart == dstStart &&
         gCommBShared[i].dstSize == dstSize) {
       return &gCommBShared[i];
+    }
+  }
+  return nullptr;
+}
+
+CommBSharedEntry* findCommBPoolOwner(int dstSize, const CommBGroupFingerprint& groupFingerprint) {
+  for (int i = 0; i < gCommBSharedCount; i++) {
+    CommBSharedEntry& e = gCommBShared[i];
+    if (e.used && e.pooled && e.ownsCommB && e.dstSize == dstSize && e.groupFingerprint == groupFingerprint) {
+      return &e;
     }
   }
   return nullptr;
@@ -338,20 +532,17 @@ static ncclResult_t broadcastMaxInt(ncclComm_t comm, cudaStream_t stream, int lo
 }
 
 /* Form or fetch commB (RAIL, all generator ranks) and probe its NVL-domain
- * size. commB is keyed by the parent communicator and exact mesh geometry.
- *
- * The split-or-skip decision is made collective-consistent over the parent
- * comm via an existence AllReduce(MAX): generator ranks that already hold
- * this parent's commB contribute 1, while trainer ranks contribute 0. A
- * purely local cache check would therefore disagree across the parent comm
- * and deadlock the collective split.
+ * size. Parents with the same ordered generator group share one commB. PACK
+ * maps the current physical staging slot to a resource lane; PIPE derives
+ * its lane from the agreed persistent parent namespace.
  *
  * MUST be called collectively by every parent-comm rank. It only forms and
  * probes commB; dispatch sites decide whether split comms are needed. */
 ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const ncclMesh_t* dstMesh,
                                cudaStream_t stream, CommBSharedEntry** out) {
-  int parentRank = -1;
+  int parentRank = -1, parentSize = 0;
   NCCL_M2N_CHECK(ncclCommUserRank(comm, &parentRank));
+  NCCL_M2N_CHECK(ncclCommCount(comm, &parentSize));
 
   const int dstStart = dstMesh->startRank;
   const int dstSize = dstMesh->dims[0] * dstMesh->dims[1];
@@ -361,27 +552,56 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
 
   CommBSharedEntry* shared = findCommBShared(comm, srcStart, srcSize, dstStart, dstSize);
 
-  /* Existence broadcast: 1 iff this parent already has a commB. Only its
-   * generator ranks hold a non-null handle, so the MAX makes the cache-hit
-   * decision collective-consistent with its trainer ranks. */
-  const int localHasCommB = (isDst && shared != nullptr && shared->commB != nullptr) ? 1 : 0;
-  int commBExists = 0;
-  NCCL_M2N_CHECK(broadcastMaxInt(comm, stream, localHasCommB, &commBExists));
+  const int resourceLaneCount = reshardGetSplitSlotCount();
+  NCCL_M2N_CHECK_ARG(resourceLaneCount > 0 && resourceLaneCount <= MAX_SPLIT_CONCURRENCY, parentRank,
+                     "split-comm: invalid commB resource-lane count %d", resourceLaneCount);
+  int proposedResourceLane = -1;
+  const bool physicalLane = reshardGetCopyAlgorithm() == RESHARD_COPY_ALGO_PACK;
+  if (physicalLane) {
+    proposedResourceLane = getStagingPhysicalSlotIndex(comm);
+  }
 
-  /* A cached commB must retain the same source membership. Otherwise use the
-   * parent path instead of mixing distinct split topologies in one commB. */
-  const int localSharedSrcSize = (isDst && shared != nullptr) ? shared->srcSize : 0;
-  int sharedSrcSize = 0;
-  if (commBExists) {
-    NCCL_M2N_CHECK(broadcastMaxInt(comm, stream, localSharedSrcSize, &sharedSrcSize));
-    if (sharedSrcSize != srcSize) {
-      RESHARD_INFO(parentRank,
-                   "split-comm: cached commB source size mismatch (cached=%d requested=%d) for gen set [%d,%d); "
-                   "falling back to parent DevComm",
-                   sharedSrcSize, srcSize, dstStart, dstStart + dstSize);
-      *out = nullptr;
-      return ncclSuccess;
+  int resourceLane = -1;
+  CommBGroupFingerprint groupFingerprint{};
+  std::vector<CommBParticipantMetadata> metadata;
+  NCCL_M2N_CHECK(gatherCommBParticipantMetadata(comm, parentSize, parentRank, isDst, proposedResourceLane, stream,
+                                                &metadata));
+  bool poolingEligible = deriveCommBPoolKey(metadata, dstStart, dstSize, physicalLane, &resourceLane,
+                                            &groupFingerprint) &&
+                         (!physicalLane || (resourceLane >= 0 && resourceLane < resourceLaneCount));
+  if (!poolingEligible && parentRank == 0) {
+    RESHARD_WARN(parentRank,
+                 "split-comm: generator resource lanes or participant metadata disagree; "
+                 "falling back to the parent DevComm");
+  }
+  if (!poolingEligible) {
+    *out = nullptr;
+    return ncclSuccess;
+  }
+
+  CommBSharedEntry* reusable = shared;
+  if (reusable == nullptr && poolingEligible && isDst) {
+    reusable = findCommBPoolOwner(dstSize, groupFingerprint);
+    if (reusable != nullptr && reusable->rankInB != parentRank - dstStart) reusable = nullptr;
+  }
+
+  /* Distinguish all-hit, all-miss, and partial-hit states among generator
+   * ranks. A partial hit must not mix independent NCCL communicator handles;
+   * it falls back to the unsplit parent DevComm. */
+  const int localHasCommB = (isDst && reusable != nullptr && reusable->commB != nullptr) ? 1 : 0;
+  const int localMissingCommB = isDst && !localHasCommB ? 1 : 0;
+  int anyHasCommB = 0, anyMissingCommB = 0;
+  NCCL_M2N_CHECK(broadcastMaxInt(comm, stream, localHasCommB, &anyHasCommB));
+  NCCL_M2N_CHECK(broadcastMaxInt(comm, stream, localMissingCommB, &anyMissingCommB));
+  const bool reuseCommB = anyHasCommB != 0 && anyMissingCommB == 0;
+  const bool partialPoolHit = anyHasCommB != 0 && anyMissingCommB != 0;
+  if (partialPoolHit) {
+    if (parentRank == 0) {
+      RESHARD_WARN(parentRank,
+                   "split-comm: partial generator commB pool hit; falling back to the parent DevComm");
     }
+    *out = nullptr;
+    return ncclSuccess;
   }
 
   const int localCacheFull = (shared == nullptr && gCommBSharedCount >= kMaxSplitCommEntries) ? 1 : 0;
@@ -395,20 +615,24 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
   }
 
   ncclComm_t commB = nullptr;
-  ncclDevComm probeDevComm;
+  ncclDevComm probeDevComm{};
   bool probeValid = false;
   int localLsa = 0;
   int rankInB = -1;
+  bool ownsCommB = false;
+  int poolOwnerIndex = -1;
 
-  if (commBExists) {
-    /* Reuse: generator ranks already hold commB + lsaSize in `shared`.
-     * Trainer ranks hold the corresponding cache entry with a null commB. */
-    if (isDst && shared != nullptr) {
-      commB = shared->commB;
-      probeDevComm = shared->probeDevComm;
-      probeValid = shared->probeValid;
-      localLsa = shared->lsaSize;
-      rankInB = shared->rankInB;
+  if (reuseCommB) {
+    /* Only generator ranks own handles; trainer ranks learn the topology from
+     * the lsaSize broadcast below and store a null-handle parent alias. */
+    if (isDst && reusable != nullptr) {
+      commB = reusable->commB;
+      probeDevComm = reusable->probeDevComm;
+      probeValid = reusable->probeValid;
+      localLsa = reusable->lsaSize;
+      rankInB = reusable->rankInB;
+      poolOwnerIndex = reusable->poolOwnerIndex;
+      gCommBReuseCount++;
     }
   } else {
     /* Form commB (all generator ranks) — collective over the parent.
@@ -452,6 +676,9 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
       probeValid = true;
       localLsa = (probeDevComm.lsaSize > 0) ? probeDevComm.lsaSize : 0;
       NCCL_M2N_CHECK(ncclCommUserRank(commB, &rankInB));
+      ownsCommB = true;
+      poolOwnerIndex = gCommBSharedCount;
+      gCommBCreateCount++;
     }
   }
 
@@ -466,10 +693,43 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
     numGenDomains = (dstSize + lsaSize - 1) / lsaSize;
   }
 
-  if (commBExists && shared != nullptr) {
+  if (reuseCommB && shared != nullptr) {
     /* Already cached for this rank; nothing to (re)store. */
     *out = shared;
     return ncclSuccess;
+  }
+
+  int pipeNamespaceId = -1;
+  int pipeNamespaceCapacity = 0;
+  if (reshardGetCopyAlgorithm() == RESHARD_COPY_ALGO_PIPE) {
+    const int capacity = gReshardPipeCommBParentCapacity;
+    PipeNamespaceMetadata local{-1, capacity, resourceLaneCount, reshardGetPipeGinPeersPerSlot(),
+                                reshardGetPipeGinChannelsPerPeer(), reshardGetGinContextCount()};
+    ReshardPipeNamespacePool emptyPool{};
+    if (isDst) {
+      const ReshardPipeNamespacePool& pool = reuseCommB ?
+        gCommBShared[poolOwnerIndex].pipeNamespaces : emptyPool;
+      local.id = pool.propose(reinterpret_cast<uintptr_t>(comm), capacity);
+    }
+    std::vector<PipeNamespaceMetadata> namespaceMetadata;
+    NCCL_M2N_CHECK(gatherSplitMetadata(comm, parentSize, parentRank, local, stream, &namespaceMetadata));
+    const PipeNamespaceMetadata& agreed = namespaceMetadata[dstStart];
+    NCCL_M2N_CHECK_ARG(agreed.id >= 0 && agreed.id < agreed.capacity &&
+                         agreed.capacity <= RESHARD_PIPE_MAX_PARENT_NAMESPACES, parentRank,
+                       "split PIPE commB parent namespace capacity exhausted or invalid (%d); "
+                       "set NCCL_RESHARD_GEN_COMM_PARENT_CAPACITY before runtime initialization", agreed.capacity);
+    for (int rank = 0; rank < parentSize; rank++) {
+      const PipeNamespaceMetadata& peer = namespaceMetadata[rank];
+      const bool generator = rank >= dstStart && rank < dstStart + dstSize;
+      NCCL_M2N_CHECK_ARG((!generator || peer.id == agreed.id) && peer.capacity == agreed.capacity &&
+                           peer.lanes == agreed.lanes &&
+                           peer.peersPerControl == agreed.peersPerControl &&
+                           peer.channelsPerPeer == agreed.channelsPerPeer && peer.contextsPerLane == agreed.contextsPerLane,
+                         parentRank, "split PIPE commB namespace/resource-plan disagreement at parent rank %d", rank);
+    }
+    pipeNamespaceId = agreed.id;
+    pipeNamespaceCapacity = agreed.capacity;
+    resourceLane = reshardPipeResourceLane(pipeNamespaceId, agreed.lanes);
   }
 
   /* Store a new shared entry.  Even trainer-only ranks store one (commB
@@ -482,6 +742,12 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
   e.dstStart = dstStart;
   e.dstSize = dstSize;
   e.srcSize = srcSize;
+  e.resourceLane = resourceLane;
+  e.resourceLaneCount = resourceLaneCount;
+  e.poolOwnerIndex = poolOwnerIndex;
+  e.groupFingerprint = groupFingerprint;
+  e.pipeNamespaceId = pipeNamespaceId;
+  e.pipeNamespaceCapacity = pipeNamespaceCapacity;
   e.commB = commB;
   e.probeDevComm = probeDevComm;
   e.probeValid = probeValid;
@@ -489,11 +755,27 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
   e.numGenDomains = numGenDomains;
   e.rankInB = rankInB;
   e.isDst = isDst;
+  e.pooled = poolingEligible;
+  e.ownsCommB = ownsCommB;
   e.used = true;
 
   gCommBShared[gCommBSharedCount] = e;
+  if (isDst && pipeNamespaceId >= 0) {
+    CommBSharedEntry& owner = gCommBShared[poolOwnerIndex];
+    NCCL_M2N_CHECK_ARG(owner.pipeNamespaces.commit(reinterpret_cast<uintptr_t>(comm), pipeNamespaceCapacity,
+                                                   pipeNamespaceId),
+                       parentRank, "split PIPE commB namespace commit disagrees with verified proposal");
+  }
   *out = &gCommBShared[gCommBSharedCount];
   gCommBSharedCount++;
+  if (parentRank == dstStart) {
+    RESHARD_INFO(parentRank,
+                 "split-comm: commB-pool action=%s pooled=%d resourceLane=%d/%d group=%016llx:%016llx "
+                 "dst=[%d,%d) ownersCreated=%d aliasesReused=%d pipeNamespace=%d/%d",
+                 reuseCommB ? "reuse" : "create", (int)poolingEligible, resourceLane, resourceLaneCount,
+                 (unsigned long long)groupFingerprint.hi, (unsigned long long)groupFingerprint.lo, dstStart,
+                 dstStart + dstSize, gCommBCreateCount, gCommBReuseCount, pipeNamespaceId, pipeNamespaceCapacity);
+  }
   return ncclSuccess;
 }
 
@@ -666,7 +948,14 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
   out->commB = nullptr;
   out->rankInA = -1;
   out->rankInB = -1;
-  out->slotIdx = 0;
+  out->slotIdx = -1;
+  out->commBPoolOwnerIndex = -1;
+
+  // Reject the entire multi-bucket profile before any split setup collective.
+  if (reshardGetCopyAlgorithm() == RESHARD_COPY_ALGO_PACK && gReshardStagingBucketCount > 1) {
+    out->parentComm = comm;
+    return ncclSuccess;
+  }
 
   {
     M2nApiUnlock apiUnlock;
@@ -725,6 +1014,11 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
     e.srcSize = srcSize;
     e.isDst = se->isDst;
     e.rankInB = se->rankInB;
+    e.resourceLane = se->resourceLane;
+    e.resourceLaneCount = se->resourceLaneCount;
+    e.poolOwnerIndex = se->poolOwnerIndex;
+    e.pipeNamespaceId = se->pipeNamespaceId;
+    e.pipeNamespaceCapacity = se->pipeNamespaceCapacity;
     e.used = true;
 
     gCommBParent[gCommBParentCount] = e;
@@ -749,10 +1043,14 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
   r.commB = (se != nullptr) ? se->commB : nullptr;
   r.inB = pe->isDst;
   r.rankInB = pe->rankInB;
-  r.slotIdx = 0;
+  r.slotIdx = pe->resourceLane;
+  r.slotCount = pe->resourceLaneCount;
+  r.commBPoolOwnerIndex = pe->poolOwnerIndex;
+  r.pipeNamespaceId = pe->pipeNamespaceId;
+  r.pipeNamespaceCapacity = pe->pipeNamespaceCapacity;
   r.valid = true;
 
-  const int maxConcurrency = reshardGetSplitSlotCount();
+  const int maxConcurrency = pe->resourceLaneCount;
   if (se == nullptr) {
     RESHARD_INFO(parentRank, "split-comm: missing cached commB shared state; falling back to parent DevComm");
     r.active = false;
@@ -825,10 +1123,9 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
   CommACacheEntry* a = nullptr;
   NCCL_M2N_CHECK(ensureCommA(comm, pe, numInjectionDomains, stream, &a));
 
-  /* PIPE uses outer partition 0; persistent control slots isolate graphs. */
-  const int slotIdx = (reshardGetCopyAlgorithm() == RESHARD_COPY_ALGO_PIPE) ? 0 : getStagingBucketIndex(comm);
+  const int slotIdx = pe->resourceLane;
   if (slotIdx < 0 || slotIdx >= maxConcurrency) {
-    NCCL_M2N_FAIL(ncclInvalidArgument, parentRank, "split-comm: invalid staging bucket index %d for %d partitions",
+    NCCL_M2N_FAIL(ncclInvalidArgument, parentRank, "split-comm: invalid commB resource lane %d for %d partitions",
                   slotIdx, maxConcurrency);
   }
 
@@ -855,8 +1152,8 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
 
 ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stagingBuffer, size_t stagingCapacity,
                                          int barrierCount, ReshardDevCommBarrierKind barrierKind, int ginSignalCountA,
-                                         int ginCounterCountA, int signalsPerSlotB, int countersPerSlotB,
-                                         int ctxPerSlotB, int maxConcurrency, cudaStream_t stream,
+                                         int ginCounterCountA, const ReshardCommBResourcePlan& resourcesB,
+                                         cudaStream_t stream,
                                          ncclWindow_t* outWindowA, ncclWindow_t* outWindowB, ncclDevComm* outDevCommA,
                                          ReshardDevCommUse* outDevCommAUse, ncclDevComm* outDevCommB,
                                          ReshardDevCommUse* outDevCommBUse) {
@@ -882,7 +1179,7 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
       {
         M2nApiUnlock apiUnlock;
         NCCL_M2N_CHECK(ncclCommWindowRegister(sc->commA, stagingBuffer, stagingCapacity, &winA,
-                                               NCCL_WIN_COLL_SYMMETRIC));
+                                               NCCL_WIN_COLL_SYMMETRIC | NCCL_WIN_STRICT_ORDERING));
         NCCL_M2N_CHECK(m2nWaitCommReady(sc->commA));
       }
       NCCL_M2N_CHECK(cacheInternalWindow(sc->commA, stagingBuffer, stagingCapacity, RESHARD_INTERNAL_WINDOW_SPLIT,
@@ -896,13 +1193,14 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
     if (needDevCommA) {
       NCCL_M2N_CHECK(reshardGetOrCreateDevCommWithRequirements(
         sc->commA, barrierCount, ginSignalCountA, ginCounterCountA, barrierKind, reshardGetGinContextCount(),
-        NCCL_GIN_CONNECTION_FULL, stream, outDevCommA, outDevCommAUse));
+        NCCL_GIN_CONNECTION_FULL, stream, outDevCommA, outDevCommAUse,
+        reshardGetCopyAlgorithm() == RESHARD_COPY_ALGO_PIPE));
     }
   }
 
-  /* commB (RAIL): all generator ranks. Its kernel DevComm is cached for this
-   * parent and mesh, sized for the staging-bucket partitions, and reused
-   * across streams. */
+  /* commB (RAIL): all generator ranks. PIPE fixes one kernel resource plan
+   * per owner: namespaces isolate persistent FIFO histories, while lanes
+   * bound execution contexts. PACK retains its requirement-variant behavior. */
   if (sc->inB && sc->commB != nullptr) {
     ncclWindow_t* cw =
       findCachedInternalWindowByPtr(sc->commB, stagingBuffer, stagingCapacity, RESHARD_INTERNAL_WINDOW_SPLIT);
@@ -913,7 +1211,7 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
       {
         M2nApiUnlock apiUnlock;
         NCCL_M2N_CHECK(ncclCommWindowRegister(sc->commB, stagingBuffer, stagingCapacity, &winB,
-                                               NCCL_WIN_COLL_SYMMETRIC));
+                                               NCCL_WIN_COLL_SYMMETRIC | NCCL_WIN_STRICT_ORDERING));
         NCCL_M2N_CHECK(m2nWaitCommReady(sc->commB));
       }
       NCCL_M2N_CHECK(cacheInternalWindow(sc->commB, stagingBuffer, stagingCapacity, RESHARD_INTERNAL_WINDOW_SPLIT,
@@ -921,23 +1219,100 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
     }
     if (outWindowB != nullptr) *outWindowB = winB;
 
-    const int conc = (maxConcurrency > 0) ? maxConcurrency : 1;
-    const int totalSignals = signalsPerSlotB * conc;
-    const int totalCounters = countersPerSlotB * conc;
-    const int totalContexts = ctxPerSlotB * conc;
-    const int totalBarriers = barrierCount * conc;
-
     const bool needDevCommB = outDevCommB != nullptr || outDevCommBUse != nullptr;
     NCCL_M2N_CHECK_ARG(!needDevCommB || (outDevCommB != nullptr && outDevCommBUse != nullptr), sc->parentRank,
                        "reshardSplitEnsureResources: commB DevComm and use outputs must be supplied together");
     if (needDevCommB) {
+      if (reshardGetCopyAlgorithm() == RESHARD_COPY_ALGO_PIPE) {
+        NCCL_M2N_CHECK_ARG(sc->commBPoolOwnerIndex >= 0 && sc->commBPoolOwnerIndex < gCommBSharedCount,
+                           sc->parentRank, "split PIPE resource plan requires a valid commB owner");
+        CommBSharedEntry& owner = gCommBShared[sc->commBPoolOwnerIndex];
+        NCCL_M2N_CHECK_ARG(!owner.pipeResourcePlanValid || owner.pipeResourcePlan == resourcesB,
+                           sc->parentRank, "split PIPE commB resource plan cannot change while FIFO histories are live");
+        owner.pipeResourcePlan = resourcesB;
+        owner.pipeResourcePlanValid = true;
+      }
       NCCL_M2N_CHECK(reshardGetOrCreateDevCommWithRequirements(
-        sc->commB, totalBarriers, totalSignals, totalCounters, barrierKind, totalContexts, NCCLM2N_GIN_RAIL_CONNECTION,
-        stream, outDevCommB, outDevCommBUse));
+        sc->commB, resourcesB.barriers, resourcesB.signals, resourcesB.counters, barrierKind, resourcesB.contexts,
+        NCCLM2N_GIN_RAIL_CONNECTION,
+        stream, outDevCommB, outDevCommBUse, reshardGetCopyAlgorithm() == RESHARD_COPY_ALGO_PIPE));
     }
   }
 
   return ncclSuccess;
+}
+
+ncclResult_t reshardSplitPrepareCommBResourceLane(const ReshardSplitComms* sc, cudaStream_t stream) {
+  NCCL_M2N_CHECK_ARG(sc != nullptr, -1, "commB resource-lane prepare requires split state");
+  if (reshardGetCopyAlgorithm() != RESHARD_COPY_ALGO_PIPE || !sc->active || !sc->inB) return ncclSuccess;
+  NCCL_M2N_CHECK_ARG(sc->slotIdx >= 0 && sc->slotIdx < sc->slotCount, sc->parentRank,
+                     "commB resource-lane prepare received invalid lane %d/%d", sc->slotIdx, sc->slotCount);
+  NCCL_M2N_CHECK_ARG(sc->commBPoolOwnerIndex >= 0 && sc->commBPoolOwnerIndex < gCommBSharedCount, sc->parentRank,
+                     "commB resource-lane prepare has invalid pool owner %d", sc->commBPoolOwnerIndex);
+  CommBSharedEntry& owner = gCommBShared[sc->commBPoolOwnerIndex];
+  NCCL_M2N_CHECK_ARG(owner.used && owner.ownsCommB && owner.commB == sc->commB, sc->parentRank,
+                     "commB resource-lane prepare found an invalid pool owner");
+  NCCL_M2N_CHECK_ARG(!owner.lanePoisoned[sc->slotIdx], sc->parentRank,
+                     "commB resource lane %d is unavailable after its completion stream could not be synchronized",
+                     sc->slotIdx);
+  cudaEvent_t& event = owner.laneCompletion[sc->slotIdx];
+  if (event == nullptr) {
+    NCCL_M2N_CUDACHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+  }
+  if (owner.laneCompletionRecorded[sc->slotIdx]) {
+    NCCL_M2N_CUDACHECK(cudaStreamWaitEvent(stream, event, 0));
+  }
+  return ncclSuccess;
+}
+
+ncclResult_t reshardSplitRecordCommBResourceLane(const ReshardSplitComms* sc, cudaStream_t stream) {
+  NCCL_M2N_CHECK_ARG(sc != nullptr, -1, "commB resource-lane record requires split state");
+  if (reshardGetCopyAlgorithm() != RESHARD_COPY_ALGO_PIPE || !sc->active || !sc->inB) return ncclSuccess;
+  NCCL_M2N_CHECK_ARG(sc->slotIdx >= 0 && sc->slotIdx < sc->slotCount, sc->parentRank,
+                     "commB resource-lane record received invalid lane %d/%d", sc->slotIdx, sc->slotCount);
+  NCCL_M2N_CHECK_ARG(sc->commBPoolOwnerIndex >= 0 && sc->commBPoolOwnerIndex < gCommBSharedCount, sc->parentRank,
+                     "commB resource-lane record has invalid pool owner %d", sc->commBPoolOwnerIndex);
+  CommBSharedEntry& owner = gCommBShared[sc->commBPoolOwnerIndex];
+  cudaEvent_t event = owner.laneCompletion[sc->slotIdx];
+  NCCL_M2N_CHECK_ARG(event != nullptr, sc->parentRank, "commB resource lane %d has no completion event",
+                     sc->slotIdx);
+  const ncclResult_t result =
+    reshardRecordCompletionEvent(event, stream, "commB resource lane", &owner.lanePoisoned[sc->slotIdx]);
+  owner.laneCompletionRecorded[sc->slotIdx] = result == ncclSuccess;
+  return result;
+}
+
+#ifdef NCCL_M2N_TESTING
+void reshardSplitSetLaneCompletionForTest(int lane, cudaEvent_t event) {
+  CommBSharedEntry& e = gCommBShared[0];
+  e.used = e.ownsCommB = true;
+  if (e.resourceLaneCount <= lane) e.resourceLaneCount = lane + 1;
+  e.laneCompletion[lane] = event;
+  e.laneCompletionRecorded[lane] = true;
+  gCommBSharedCount = 1;
+}
+#endif
+
+void reshardSplitSynchronizeCommBLanes() {
+  if (reshardResourcesNeedQuarantine()) return;
+  for (int i = 0; i < gCommBSharedCount; i++) {
+    CommBSharedEntry& e = gCommBShared[i];
+    if (!e.used || !e.ownsCommB) continue;
+    for (int lane = 0; lane < e.resourceLaneCount; lane++) {
+      if (e.lanePoisoned[lane]) {
+        reshardRequireResourceQuarantine();
+        return;
+      }
+      if (!e.laneCompletionRecorded[lane]) continue;
+      const cudaError_t result = cudaEventSynchronize(e.laneCompletion[lane]);
+      if (result != cudaSuccess) {
+        RESHARD_WARN(-1, "Retaining split resources after commB lane %d could not be synchronized: %s", lane,
+                       cudaGetErrorString(result));
+        reshardRequireResourceQuarantine();
+        return;
+      }
+    }
+  }
 }
 
 void reshardSplitCommFinalize() {
@@ -957,6 +1332,8 @@ void reshardSplitCommFinalize() {
       gCommBShared[i] = {};
     }
     gCommBSharedCount = 0;
+    gCommBCreateCount = 0;
+    gCommBReuseCount = 0;
     return;
   }
 
@@ -989,13 +1366,23 @@ void reshardSplitCommFinalize() {
     if (!e.used) {
       continue;
     }
-    if (e.probeValid && e.commB != nullptr) {
+    if (e.ownsCommB && e.probeValid && e.commB != nullptr) {
       NCCL_M2N_CHECK_WARN(ncclDevCommDestroy(e.commB, &e.probeDevComm));
     }
-    if (e.commB != nullptr) {
+    if (e.ownsCommB) {
+      for (int lane = 0; lane < e.resourceLaneCount; lane++) {
+        if (e.laneCompletion[lane] != nullptr) {
+          // Already drained before cacheFinalize() released kernel DevComms.
+          NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(e.laneCompletion[lane]));
+        }
+      }
+    }
+    if (e.ownsCommB && e.commB != nullptr) {
       NCCL_M2N_CHECK_WARN(ncclCommDestroy(e.commB));
     }
     e = {};
   }
   gCommBSharedCount = 0;
+  gCommBCreateCount = 0;
+  gCommBReuseCount = 0;
 }

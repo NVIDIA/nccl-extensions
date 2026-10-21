@@ -377,16 +377,18 @@ __device__ __forceinline__ void write_local_routing(
     // tally below so non-overflowing calls pay nothing extra.
     bool overflow_this_call = false) {
 
+    // A token routed to this rank is counted toward FLAT per-expert hit counts whether or not
+    // it kept a slot (handle-time counts are pre-drop; see ncclEpLayoutInfo_t::expert_counters).
+    const bool lane_counted = (token_out_of_bound == 0) && token_needed_by_local_rank;
     // Protect from writing invalid and overflowing slots
-    bool lane_participates =
-        (token_out_of_bound == 0) && token_needed_by_local_rank && (local_rank_slot >= 0);
+    const bool lane_participates = lane_counted && (local_rank_slot >= 0);
     const uint8_t* local_rank_bitmap_row = nullptr;
     const uint16_t* local_rank_topk_idx_row = nullptr;
     bool* local_expert_routing_map_store_base_addr = nullptr;
     // Global expert id base of this rank's local experts (topk_idx membership).
     const int local_expert_global_base = lsa_team * g.experts_per_lsa_team + local_rank * experts_per_rank;
 
-    if (lane_participates) {
+    if (lane_counted) {
         if constexpr (USE_TOPK_IDX) {
             local_rank_topk_idx_row =
                 reinterpret_cast<const uint16_t*>(input_routing_map) + static_cast<size_t>(current_token_id) * num_topk;
@@ -394,6 +396,8 @@ __device__ __forceinline__ void write_local_routing(
             local_rank_bitmap_row =
                 input_routing_map + current_token_id * g.packed_row_bytes + lsa_team * g.experts_per_lsa_team_packed;
         }
+    }
+    if (lane_participates && local_expert_routing_map != nullptr) {
         local_expert_routing_map_store_base_addr = local_expert_routing_map + local_rank_slot * experts_per_rank;
     }
 
@@ -404,7 +408,7 @@ __device__ __forceinline__ void write_local_routing(
     constexpr int TOPK_HIT_WORDS = (TOPK_HIT_EPR + 63) / 64;
     uint64_t topk_idx_hit[TOPK_HIT_WORDS];
     if constexpr (USE_TOPK_IDX) {
-        if (lane_participates) {
+        if (lane_counted) {
             fold_topk_idx_local_hits<TOPK_HIT_EPR>(
                 local_rank_topk_idx_row, num_topk, local_expert_global_base, topk_idx_hit);
         }
@@ -414,18 +418,27 @@ __device__ __forceinline__ void write_local_routing(
     const int local_expert_bit_base = local_rank * experts_per_rank;
     for (int k = 0; k < experts_per_rank; k++) {
         int expert_bit = local_expert_bit_base + k;
-        bool routed_to_expert = false;
-        if (lane_participates) {
+        // hit: this token names local expert k (pre-drop); routed_to_expert: and it kept a slot.
+        bool hit = false;
+        if (lane_counted) {
             if constexpr (USE_TOPK_IDX) {
-                routed_to_expert = ((topk_idx_hit[k >> 6] >> (k & 63)) & 1ull) != 0;
+                hit = ((topk_idx_hit[k >> 6] >> (k & 63)) & 1ull) != 0;
             } else {
-                routed_to_expert = ((local_rank_bitmap_row[expert_bit / 8] >> (expert_bit % 8)) & 1u) != 0;
+                hit = ((local_rank_bitmap_row[expert_bit / 8] >> (expert_bit % 8)) & 1u) != 0;
             }
-            // Pull dispatch leaves local_expert_routing_map null (LERM unused); skip the store.
-            if (local_expert_routing_map != nullptr)
-                local_expert_routing_map_store_base_addr[k] = routed_to_expert;
+        }
+        const bool routed_to_expert = hit && lane_participates;
+        // Pull dispatch leaves local_expert_routing_map null (LERM unused); skip the store.
+        if (lane_participates && local_expert_routing_map != nullptr) {
+            local_expert_routing_map_store_base_addr[k] = routed_to_expert;
         }
 
+        if constexpr (USE_TOPK_IDX && !ENABLE_EM_PERMUTE) {
+            if (routed_to_expert && srcpos_map != nullptr && em_k < num_topk) {
+                const int pos = topk_idx_find_pos(local_rank_topk_idx_row, num_topk, local_expert_global_base + k);
+                srcpos_map[static_cast<size_t>(local_rank_slot) * num_topk + em_k++] = flat_route_pack(k, pos);
+            }
+        }
         if constexpr (ENABLE_EM_PERMUTE) {
             // Each thread is processing a unique token (assigned to it by the scan geometry)
             // 1. If thread's current token is routed to the local expert k, 
@@ -483,7 +496,9 @@ __device__ __forceinline__ void write_local_routing(
             }
             __syncwarp();  // publish update before the next tile re-reads this slot
         } else if constexpr (ENABLE_PER_EXPERT_COUNTS) {
-            unsigned expert_mask = __ballot_sync(~0u, routed_to_expert);
+            // FLAT per-expert hit counts are pre-drop (same meaning as the count path's
+            // handle-time counts); dropped tokens still count.
+            unsigned expert_mask = __ballot_sync(~0u, hit);
             if (g.lane_id == 0) {
                 int warp_expert_count = __popc(expert_mask);
                 if (warp_expert_count > 0) {
@@ -493,6 +508,13 @@ __device__ __forceinline__ void write_local_routing(
         }
     }
 
+    if constexpr (USE_TOPK_IDX && !ENABLE_EM_PERMUTE) {
+        if (lane_participates && srcpos_map != nullptr) {
+            for (int k = em_k; k < num_topk; ++k) {
+                srcpos_map[static_cast<size_t>(local_rank_slot) * num_topk + k] = -1;
+            }
+        }
+    }
     // Pad trailing flat2em slots with -1 so the copy kernel skips them.
     if constexpr (ENABLE_EM_PERMUTE) {
         if (lane_participates) {
@@ -891,7 +913,14 @@ __device__ __forceinline__ void em_populate_cnt_tensors(
     void* recv_total_counter,
     bool out_is_int64,
     int max_recv_tokens_per_rank,
-    bool allow_overflow_drop) {
+    bool allow_overflow_drop,
+    // Flat count mode (unfused UpdateHandle path): no EM zones, so the per-expert sums feed
+    // only the caller's expert_counters as raw (pre-drop) hit counts, never clamped against a
+    // zone prefix. The recv-budget check and recv_total_counter use flat_recv_total (rank-level
+    // dedup count) instead of the per-expert sum, which can exceed the budget when the real
+    // recv count fits. See ncclEpLayoutInfo_t::expert_counters.
+    bool is_flat,
+    int flat_recv_total) {
     if (threadIdx.x == 0) {
         const int align = (em_alignment > 1) ? em_alignment : 1;
         // Predetermine the overflow verdict (same padded-total computation the main loop
@@ -904,7 +933,9 @@ __device__ __forceinline__ void em_populate_cnt_tensors(
             const int padded = (align > 1 && c > 0) ? ((c + align - 1) / align) * align : c;
             predicted_total += padded;
         }
-        const bool overflow = predicted_total > max_recv_tokens_per_rank;
+        // Flat: the per-expert sum is not a valid overflow signal (see is_flat); the Flat budget
+        // check against flat_recv_total happens at the end.
+        const bool overflow = !is_flat && predicted_total > max_recv_tokens_per_rank;
         int cum = 0;
         for (int k = 0; k < experts_per_rank; k++) {
             const int c = smem.expert_total[k];
@@ -915,7 +946,7 @@ __device__ __forceinline__ void em_populate_cnt_tensors(
                 // (slot assignment) stay unchanged so emit-phase slots still match.
                 int rep_actual = c;
                 int rep_padded = padded;
-                if (allow_overflow_drop) {
+                if (allow_overflow_drop && !is_flat) {
                     const int room = (cum < max_recv_tokens_per_rank) ? (max_recv_tokens_per_rank - cum) : 0;
                     rep_actual = (c < room) ? c : room;
                     rep_padded = (padded < room) ? padded : room;
@@ -952,12 +983,20 @@ __device__ __forceinline__ void em_populate_cnt_tensors(
             // optional user recv_total_counter reports the padded total, and
             // the FLAT branch of assign_recv_slots is suppressed for it.
             if (recv_total_counter) {
+                const int reported_total = is_flat ? flat_recv_total : true_total;
                 if (out_is_int64) {
-                    *static_cast<int64_t*>(recv_total_counter) = static_cast<int64_t>(true_total);
+                    *static_cast<int64_t*>(recv_total_counter) = static_cast<int64_t>(reported_total);
                 } else {
-                    *static_cast<int32_t*>(recv_total_counter) = true_total;
+                    *static_cast<int32_t*>(recv_total_counter) = reported_total;
                 }
             }
+        }
+        if (is_flat && !allow_overflow_drop && flat_recv_total > max_recv_tokens_per_rank) {
+            printf("ncclEp HT Flat count layout (UpdateHandle): recv tokens %d exceed max_recv_tokens_per_rank %d; "
+                   "increase ncclEpGroupConfig_t::max_recv_tokens_per_rank "
+                   "or set overflow_policy = NCCL_EP_OVERFLOW_DROP\n",
+                   flat_recv_total, max_recv_tokens_per_rank);
+            __trap();
         }
         if (overflow && !allow_overflow_drop) {
             printf("scan_impl_flat(em): padded EM slots %d > max_recv_tokens_per_rank %d; "
@@ -987,7 +1026,7 @@ __device__ __forceinline__ void init_warp_expert_prefixes(scan_flat_smem_t& smem
 // FLAT-layout scan, optionally fused with EM-permute. Always produces
 // token_rank_mask, rdma/attn maps, sparse_to_dense (rank-major), and recv-slot
 // prefixes. Two mutually-exclusive add-ons, selected at compile time:
-//   ENABLE_PER_EXPERT_COUNTS -> FLAT per-expert token counts.
+//   ENABLE_PER_EXPERT_COUNTS -> FLAT per-expert hit counts (pre-drop).
 //   ENABLE_EM_PERMUTE           -> em-permute outputs: flat2em_slot_map and the
 //                               [experts_per_rank(+1)] padded zone geometry
 //                               (replaces the standalone em_scan_kernel).
@@ -1123,7 +1162,9 @@ __device__ __forceinline__ void scan_impl_flat(
             recv_total_counter,
             out_is_int64,
             max_recv_tokens_per_rank,
-            allow_overflow_drop);
+            allow_overflow_drop,
+            false,
+            0);
 
         // Seed per-warp expert prefixes: block predecessor prefix + earlier warps.
         init_warp_expert_prefixes<NUM_OF_WARPS_PER_BLOCK>(smem, experts_per_rank);

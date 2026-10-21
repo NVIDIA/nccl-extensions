@@ -809,6 +809,8 @@ ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const Stagi
   params->chunkSize = chunkSize;
   params->ginSignalCount = (int)ginSignalCount;
   params->ginCounterCount = (int)ginCounterCount;
+  params->pipeReadySlotOffset = (size_t)controlSlot * STAGING_CTRL_REGION_SIZE;
+  params->pipeReadyChannelStride = state->adaptiveChannelLayout ? state->controlRegionSize : state->channelSize;
   params->numRdmaTargets = numRdmaTargets;
   params->numLsaTargets = numLsaTargets;
   params->numRdmaSources = numRdmaSources;
@@ -1116,6 +1118,20 @@ ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const Stagi
                              CTRL_FIELD_LSA_TAIL, CTRL_FIELD_LSA_HEAD);
         }
       }
+    }
+
+    if (pipe) {
+      int activeRdmaTargets = 0;
+      int activeRdmaSources = 0;
+      for (int t = 0; t < numRdmaTargets; t++) {
+        activeRdmaTargets += params->rdmaTargets[ch][t].active ? 1 : 0;
+      }
+      for (int s = 0; s < numRdmaSources; s++) {
+        activeRdmaSources += params->rdmaSources[ch][s].active ? 1 : 0;
+      }
+      NCCL_M2N_CHECK_ARG(activeRdmaTargets <= 1 && activeRdmaSources <= 1, R,
+                         "[STAGING] PIPE channel %d has multiple RDMA peers (targets=%d sources=%d)", ch,
+                         activeRdmaTargets, activeRdmaSources);
     }
   }
 

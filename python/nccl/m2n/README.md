@@ -118,6 +118,36 @@ with m2n.init() as handle:
     stream.synchronize()
 ```
 
+## JAX sample
+
+[`reshard_jax.py`](examples/reshard_jax.py) demonstrates a BF16 weight transfer
+from row sharding to column sharding. By default, it uses source ranks 0-1 and
+destination ranks 2-3. It launches one local Python process per rank, uses JAX
+arrays at both framework boundaries, and writes directly into a JAX-owned
+mutable destination Ref before freezing it as a JAX array.
+
+Install GPU-enabled JAX separately. The default layout needs four visible CUDA
+devices, one per rank. Wait for the source JAX array before passing its pointer
+to M2N, and keep it alive until the transfer completes. Keep the destination
+Ref alive and synchronize the M2N CUDA stream before freezing and reading it.
+The raw-pointer write is outside JAX's execution model, so this is eager
+interop with explicit stream ordering, not a JAX FFI integration.
+
+Use `--source-ranks`, `--destination-ranks`, and `--timeout-seconds` to change
+the default `2 + 2` layout and synchronization timeout. The process count is
+the sum of source and destination ranks.
+
+The launcher is intentionally minimal and does not implement production failure
+recovery.
+
+```bash
+python -m nccl.m2n.examples.reshard_jax --shape 4096,4096
+
+# One source rank and three destination ranks.
+python -m nccl.m2n.examples.reshard_jax --shape 8,12 \
+  --source-ranks 1 --destination-ranks 3
+```
+
 ## Benchmark
 
 Install the optional benchmark dependency before running the packaged M2N

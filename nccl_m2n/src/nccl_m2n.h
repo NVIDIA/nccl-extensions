@@ -148,8 +148,12 @@ typedef struct ncclDistTensor_v2 {
    * placements[i] is one of:
    *     NCCL_RESHARD_REPLICATE   Axis replicates the tensor slice.
    *     NCCL_RESHARD_SHARD(d)    Axis shards tensor dimension d.
-   * A sharded layout must have exactly one SHARD axis.  A fully replicated
-   * layout uses REPLICATE on every active axis. */
+   * Any combination of REPLICATE and SHARD is supported. SHARD dimensions
+   * must satisfy 0 <= d < ndims. Mesh axes are applied in array order:
+   * if both axes use SHARD(d), axis 1 subdivides the pieces from axis 0.
+   * All ranks on one side must have the same localShape, with equally sized,
+   * contiguous tiles and globalShape[d] = localShape[d] times the product
+   * of mesh sizes whose placement is SHARD(d). */
   int* placements;
 } ncclDistTensor_t;
 

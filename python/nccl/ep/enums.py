@@ -19,7 +19,9 @@ __all__ = [
     "CombineQuantizationRecipe",
     "DispatchQuantizationRecipe",
     "ExpertIdKind",
+    "HtFlow",
     "Layout",
+    "MetaExchangePolicy",
     "OverflowPolicy",
     "PassDir",
     "ZeroCopyMode",
@@ -136,6 +138,32 @@ class ZeroCopyMode(IntEnum):
     scale windows."""
 
 
+class HtFlow(IntEnum):
+    """HT dispatch/combine flow, mirroring :c:type:`ncclEpHtFlow_t`."""
+
+    AUTO = 0
+    """Use push/pull unless the legacy environment override requests pull/push."""
+
+    PUSH_PULL = 1
+    """Push dispatch followed by pull combine. Supports flat and expert-major layouts."""
+
+    PULL_PUSH = 2
+    """Pull dispatch followed by push combine. Expert-major and one LSA domain only."""
+
+
+class MetaExchangePolicy(IntEnum):
+    """HT metadata exchange policy, mirroring :c:type:`ncclEpMetaExchangePolicy_t`."""
+
+    AUTO = 0
+    """Fuse metadata with dispatch when supported; otherwise use the existing fallback."""
+
+    REQUIRE_FUSED = 1
+    """Reject handles or updates that cannot keep metadata exchange fused with dispatch."""
+
+    FORCE_SCAN = 2
+    """Force the legacy routing-map exchange and scan path."""
+
+
 class ExpertIdKind(IntEnum):
     """Numbering of dispatch's ``recv_topk_idx`` output, mirroring
     :c:type:`ncclEpExpertIdKind_t`.
@@ -207,3 +235,10 @@ class CombineQuantizationRecipe(IntEnum):
     graduation. The caller supplies FP32 global scales through
     :py:attr:`CombineInputs.scales`; the kernel follows the DeepEP-LL
     NVFP4 pack/dequantize contract."""
+
+    MXFP8 = 2
+    """HT expert-major local-permute transport for a single LSA team.
+    The caller supplies BF16 tokens and no scales; NCCL EP internally
+    quantizes to FP8 E4M3 with E8M0 scales (block size 32), transports the
+    packed row over NVLink, and produces BF16 output. Hidden size must be a
+    multiple of 512 and the library must be built with CUDA 12.8 or newer."""

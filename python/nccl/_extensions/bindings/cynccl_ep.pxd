@@ -45,6 +45,16 @@ ctypedef enum ncclEpZeroCopyMode_t "ncclEpZeroCopyMode_t":
     NCCL_EP_ZERO_COPY_OFF "NCCL_EP_ZERO_COPY_OFF"
     NCCL_EP_ZERO_COPY_ON "NCCL_EP_ZERO_COPY_ON"
 
+ctypedef enum ncclEpHtFlow_t "ncclEpHtFlow_t":
+    NCCL_EP_HT_FLOW_AUTO "NCCL_EP_HT_FLOW_AUTO" = 0
+    NCCL_EP_HT_FLOW_PUSH_PULL "NCCL_EP_HT_FLOW_PUSH_PULL"
+    NCCL_EP_HT_FLOW_PULL_PUSH "NCCL_EP_HT_FLOW_PULL_PUSH"
+
+ctypedef enum ncclEpMetaExchangePolicy_t "ncclEpMetaExchangePolicy_t":
+    NCCL_EP_META_EXCHANGE_AUTO "NCCL_EP_META_EXCHANGE_AUTO" = 0
+    NCCL_EP_META_EXCHANGE_REQUIRE_FUSED "NCCL_EP_META_EXCHANGE_REQUIRE_FUSED"
+    NCCL_EP_META_EXCHANGE_FORCE_SCAN "NCCL_EP_META_EXCHANGE_FORCE_SCAN"
+
 ctypedef enum ncclEpExpertIdKind_t "ncclEpExpertIdKind_t":
     NCCL_EP_EXPERT_ID_AUTO "NCCL_EP_EXPERT_ID_AUTO" = 0
     NCCL_EP_EXPERT_ID_LOCAL "NCCL_EP_EXPERT_ID_LOCAL" = 1
@@ -58,6 +68,7 @@ ctypedef enum ncclEpDispQuant_t "ncclEpDispQuant_t":
 ctypedef enum ncclEpCombQuant_t "ncclEpCombQuant_t":
     NCCL_EP_COMB_QUANT_NONE "NCCL_EP_COMB_QUANT_NONE" = 0
     NCCL_EP_COMB_QUANT_NVFP4 "NCCL_EP_COMB_QUANT_NVFP4" = 1
+    NCCL_EP_COMB_QUANT_MXFP8 "NCCL_EP_COMB_QUANT_MXFP8" = 2
 
 
 # types
@@ -98,6 +109,13 @@ ctypedef struct ncclEpHandleConfig_t 'ncclEpHandleConfig_t':
     unsigned int size
     unsigned int magic
     size_t dispatch_output_per_expert_alignment
+
+ctypedef struct ncclEpHandleState_t 'ncclEpHandleState_t':
+    unsigned int size
+    unsigned int magic
+    int num_tokens
+    int num_topk
+    ncclDataType_t topk_idx_datatype
 
 ctypedef struct ncclEpDispatchConfig_t 'ncclEpDispatchConfig_t':
     unsigned int size
@@ -193,6 +211,10 @@ ctypedef struct ncclEpGroupConfig_t 'ncclEpGroupConfig_t':
     unsigned char padding_v2[4]
     unsigned int dispatch_num_sms
     unsigned int combine_num_sms
+    ncclEpHtFlow_t ht_flow
+    ncclEpMetaExchangePolicy_t meta_exchange_policy
+    unsigned int num_attn_ranks
+    unsigned char padding_v4[4]
 
 
 ###############################################################################
@@ -206,6 +228,7 @@ cdef ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* ep_group, ncclComm_t comm, co
 cdef ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclEpHandleMemSize(ncclEpGroup_t ep_group, ncclEpLayout_t layout, const ncclEpHandleConfig_t* config, size_t* size_out, int num_topk) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclEpInitHandle(ncclEpHandle_t* handle, ncclEpGroup_t ep_group, ncclEpLayout_t layout, const ncclEpHandleConfig_t* config, int num_topk, const ncclEpTensor_t* handle_mem) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t ncclEpImportHandle(ncclEpHandle_t* handle, ncclEpGroup_t ep_group, ncclEpLayout_t layout, const ncclEpHandleConfig_t* config, const ncclEpHandleState_t* state, const ncclEpTensor_t* handle_mem) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclEpUpdateHandle(ncclEpHandle_t handle, const ncclEpTensor_t* topk_idx, const ncclEpLayoutInfo_t* layout_info, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclEpCreateHandle(ncclEpHandle_t* handle, ncclEpGroup_t ep_group, ncclEpLayout_t layout, const ncclEpTensor_t* topk_idx, const ncclEpLayoutInfo_t* layout_info, const ncclEpHandleConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclEpHandleDestroy(ncclEpHandle_t handle) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
@@ -217,3 +240,7 @@ cdef ncclResult_t ncclEpMaskUpdate(ncclEpGroup_t ep_group, const int* mask, cuda
 cdef ncclResult_t ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclEpGetAsyncError(ncclEpGroup_t ep_group, int* error_out) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t ncclEpAfDispatch(ncclEpHandle_t handle, const ncclEpDispatchInputs_t* inputs, const ncclEpDispatchOutputs_t* outputs, const ncclEpLayoutInfo_t* layout_info, const ncclEpDispatchConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t ncclEpAfCombine(ncclEpHandle_t handle, const ncclEpCombineInputs_t* inputs, const ncclEpCombineOutputs_t* outputs, const ncclEpCombineConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t ncclEpAfRecv(ncclEpHandle_t handle, const ncclEpDispatchInputs_t* inputs, const ncclEpDispatchOutputs_t* outputs, const ncclEpLayoutInfo_t* layout_info, const ncclEpDispatchConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t ncclEpAfReturn(ncclEpHandle_t handle, const ncclEpCombineInputs_t* inputs, const ncclEpCombineOutputs_t* outputs, const ncclEpCombineConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil

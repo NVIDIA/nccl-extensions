@@ -70,6 +70,26 @@ See [Public API Reference](#public-api-reference) for the full mesh,
 placement, and tensor-descriptor semantics, including rank roles and
 same-dim vs. cross-dim sharding.
 
+Both mesh axes may independently use `REPLICATE` or `SHARD(d)`, where
+`0 <= d < tensor.ndims`. This includes `(SHARD(0), SHARD(1))`, swapped
+placements, and repeated sharding such as `(SHARD(0), SHARD(0))`.
+Mesh axes are applied in placement order: axis 0 partitions the global
+tensor, then axis 1 partitions each resulting piece. For a length-16 tensor
+on a `2 x 2` mesh with `(SHARD(0), SHARD(0))`, mesh coordinates `(0,0)`,
+`(0,1)`, `(1,0)`, `(1,1)` own `[0,4)`, `[4,8)`, `[8,12)`, `[12,16)`.
+
+Each rank holds a contiguous, equally sized local tile. For each tensor
+dimension `d`, its global extent is `localShape[d]` times the product of
+mesh-axis sizes placed at `SHARD(d)`. Source and destination global shapes
+must match. Fully replicated layouts `(REPLICATE, REPLICATE)` are supported.
+Public meshes have one or two axes, and tensors may have 1–3 dimensions.
+These placement semantics apply to both `ncclReshard` and
+`ncclReshardWithWindow`, including grouped calls and Python bindings.
+
+**Reshard geometry** — each source tile sends its intersection with each
+destination tile, including when either side shards multiple dimensions.
+Replicas reuse the existing replication load balancing and forwarding paths.
+
 ---
 
 ## Quick Start
@@ -437,16 +457,19 @@ Apply regardless of the selected copy algorithm.
 | `NCCL_RESHARD_LOG_LEVEL`      | One of `NONE`, `WARN` (default), `INFO`, `DEBUG`, `TRACE`. |
 | `NCCL_RESHARD_COPY_ALGORITHM` | Copy transport for both entry points: `PACK` (default), `DIRECT`, or `PIPE` (beta). |
 | `NCCL_RESHARD_NUM_CTAS`       | Directly overrides the resolved CTA count; invalid values are ignored. |
+| `NCCL_RESHARD_DEVCOMM_CACHE_CAPACITY` | Maximum cached DevComms per process (default 64). A positive integer, captured at runtime initialization; host storage is allocated on first use and DevComms are created lazily. No runtime eviction or automatic growth. Exhaustion fails locally before new DevComm creation; abort the distributed job on error, increase the limit, and restart. No cross-rank admission collective is performed, so peers may otherwise remain waiting in setup. Does not change split-communicator or persistent-control limits. |
 
 ### Algorithm-specific
 
 | Variable | Algorithm | Effect |
 |---|---|---|
-| `NCCL_RESHARD_PACK_BUFFSIZES` | PACK | Bounded staging pool as comma-separated `size[:slots]` buckets (default `2147483648:4`). Sizes accept bytes or binary `k`/`m` suffixes; omitted slots default to one. Invalid profiles retain the built-in default. |
+| `NCCL_RESHARD_PACK_BUFFSIZES` | PACK | Bounded staging pool as comma-separated `size[:slots]` buckets (default `2147483648:4`). Sizes accept bytes or binary `k`/`m` suffixes; omitted slots default to one. Invalid profiles retain the built-in default. Multiple size buckets disable split comm and use the parent DevComm path; one bucket with multiple slots retains split support. |
 | `NCCL_RESHARD_STAGING_NUM_CHANNELS` | DIRECT, PIPE | Channel count for the channelized staging pool (separate from PACK's pool above); default 4, or 8 for PIPE host-RMA. |
 | `NCCL_RESHARD_STAGING_CHANNEL_SIZE` | DIRECT, PIPE | Per-channel data capacity for that pool; default 8 MiB, or 128 MiB for PIPE host-RMA. |
 | `NCCL_RESHARD_STAGING_CHUNK_SIZE` | DIRECT, PIPE | Chunk size within a staging channel; default 1 MiB, or 32 MiB for PIPE host-RMA. |
 | `NCCL_RESHARD_PIPE_NET_MODE` | PIPE (beta) | `DEVICE` (default, persistent CUDA kernel) or `HOST_RMA` (host-initiated NCCL one-sided put/signal). |
+| `NCCL_RESHARD_GEN_COMM_CONCURRENCY` | PACK, PIPE split-comm | Positive execution-concurrency limit, maximum 64, set before runtime initialization. PACK: an explicit value caps active physical slots in each bucket to `min(configured slots, limit)`; commB uses the same effective slot count. If unset, PACK preserves its configured profile, including profiles with more than four slots. PIPE: lane count, default 4; lane = agreed persistent namespace ID modulo concurrency. Parents sharing a lane are event-ordered but retain separate persistent signals/counters, and must be submitted in consistent relative order across generator ranks. No additional collective. |
+| `NCCL_RESHARD_GEN_COMM_PARENT_CAPACITY` | PIPE split-comm | Reserved persistent parent namespaces per shared generator commB (default 8, maximum 64), independent of concurrency. Set before runtime initialization. A parent reuses its namespace across calls; IDs never wrap or recycle during the runtime epoch. Exceeding capacity fails collectively during parent setup. Signals/counters are reserved for all namespaces up front; execution contexts are sized by concurrency. Does not affect PACK. |
 
 ---
 

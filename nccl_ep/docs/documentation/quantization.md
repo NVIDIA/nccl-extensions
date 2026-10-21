@@ -3,6 +3,11 @@
 This document defines the public tensor contracts for NCCL EP quantization
 support. The support is realized via quantization recipes (separate for Dispatch and Combine).
 
+Attention-FFN Disaggregation (AFD, enabled by
+`ncclEpGroupConfig_t::num_attn_ranks > 0`) currently supports unquantized
+communication only. AFD callers must select `NCCL_EP_DISP_QUANT_NONE` for
+dispatch and `NCCL_EP_COMB_QUANT_NONE` for combine.
+
 In the remainder of this document,
 * `B` is the batch size,
 * `H` is the logical hidden dimension, and
@@ -39,6 +44,11 @@ This LL-only recipe performs DeepSeek FP8 E3M4 quantization internally. Supply
 BF16 token inputs and no input scale tensor. Dispatch produces E4M3 token
 bytes and required FP32 output scales, one per 128 token elements. The hidden
 dimension must be divisible by 512.
+
+On an NVLink-only, rank-major group, all three LL dispatch families
+(`NCCL_EP_DISPATCH_LSA=universal|simt|tma`) support writing generated tokens
+and scales directly into their independently registered output windows.
+See [Zero-Copy](zero_copy.md) for window registration and `zero_copy` semantics.
 
 ## `NCCL_EP_COMB_QUANT_NVFP4` (EXPERIMENTAL)
 

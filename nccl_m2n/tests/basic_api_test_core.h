@@ -49,6 +49,10 @@
 #endif
 #include "test_helpers.h"
 
+#ifndef GTEST_SKIP
+#error "nccl_m2n tests require GoogleTest >= 1.10.0 (GTEST_SKIP support)"
+#endif
+
 /* ======================================================================
  * API path selector — both resharding APIs are exercised from the same
  * test matrix.
@@ -1289,35 +1293,6 @@ static void basicApiPrintCaseList(const std::vector<TestCase>& cases, const Basi
   }
 }
 
-static std::string basicApiCurrentGtestName() {
-  const ::testing::TestInfo* info = ::testing::UnitTest::GetInstance()->current_test_info();
-  if (info == nullptr) return "<unknown>";
-
-  std::string name = info->test_case_name();
-  name += ".";
-  name += info->name();
-  return name;
-}
-
-static void basicApiRecordFallbackSkip(int* skippedCases, const char* reason, bool shouldPrint) {
-  if (!shouldPrint) return;
-
-  const char* message = (reason != nullptr) ? reason : "skipped";
-  ++(*skippedCases);
-  ::testing::Test::RecordProperty("skipReason", message);
-  printf("[  SKIPPED ] %s (%s)\n", basicApiCurrentGtestName().c_str(), message);
-  fflush(stdout);
-}
-
-static void basicApiPrintFallbackSkipSummary(int skippedCases, bool shouldPrint) {
-  if (!shouldPrint || skippedCases == 0) return;
-
-  printf("[  SKIPPED ] %d basic_api case%s (vendored gtest reports "
-         "skips as OK)\n",
-         skippedCases, skippedCases == 1 ? "" : "s");
-  fflush(stdout);
-}
-
 static bool basicApiRunAllAlgorithms(const BasicApiCliArgs& cli) {
   return strcmp(cli.algorithm, "all") == 0;
 }
@@ -1403,6 +1378,21 @@ static void basicApiPrintRuntimeSummary(const char* title, int worldSize, int de
  * Returns CaseResult; rank-aggregation happens in the bootstrap loop.
  * ====================================================================*/
 
+static inline CaseResult checkPipeHostRmaSupport(TestEnv* env) {
+  const char* copyAlgorithm = getenv("NCCL_RESHARD_COPY_ALGORITHM");
+  const char* pipeNetMode = getenv("NCCL_RESHARD_PIPE_NET_MODE");
+  if (copyAlgorithm != nullptr && strcasecmp(copyAlgorithm, "PIPE") == 0 && pipeNetMode != nullptr &&
+      (strcasecmp(pipeNetMode, "HOST_RMA") == 0 || strcasecmp(pipeNetMode, "HOST-RMA") == 0 ||
+       strcasecmp(pipeNetMode, "HOSTRMA") == 0)) {
+    int driverVersion = 0;
+    if (cudaDriverGetVersion(&driverVersion) != cudaSuccess) driverVersion = -1;
+    const int minDriverVersion = env->allreduceMinInt(env, driverVersion);
+    if (minDriverVersion < 0) return makeFail("failed to query the CUDA driver version");
+    if (minDriverVersion < 12050) return makeSkip("PIPE host-RMA requires CUDA driver API 12.5 or newer");
+  }
+  return makePass();
+}
+
 static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   const bool asyncOrdering = tc.bAsyncOrdering && env->alternateStream != nullptr;
   /* ----- 1. feasibility check (single source of truth, see
@@ -1422,6 +1412,9 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
     }
     return makeSkip(buf);
   }
+  const CaseResult support = checkPipeHostRmaSupport(env);
+  if (support.status != CASE_PASS) return support;
+
   int srcTotal = shape.srcTotal;
   int dstTotal = shape.dstTotal;
   int srcDim0 = shape.srcDim0, srcDim1 = shape.srcDim1;

@@ -33,6 +33,7 @@ struct StagingSlot {
   cudaEvent_t doneEvent;
   cudaStream_t lastStream;
   int bucketIdx;
+  int physicalSlotIdx;
   bool eventRecorded;
   bool reserved;
   bool poisoned;
@@ -116,6 +117,7 @@ static bool recordCommBucketSlot(StagingDevicePool* pool, ncclComm_t comm, int b
 static void buildStagingPoolMeta(StagingDevicePool* pool) {
   if (pool->built) return;
   pool->bucketCount = gReshardStagingBucketCount;
+  int physicalSlotBase = 0;
   for (int i = 0; i < pool->bucketCount; i++) {
     StagingBucketRT& bucket = pool->buckets[i];
     bucket.size = gReshardStagingBuckets[i].size;
@@ -126,7 +128,9 @@ static void buildStagingPoolMeta(StagingDevicePool* pool) {
       bucket.slots[slot] = {};
       bucket.slots[slot].size = bucket.size;
       bucket.slots[slot].bucketIdx = i;
+      bucket.slots[slot].physicalSlotIdx = physicalSlotBase + slot;
     }
+    physicalSlotBase += bucket.numSlots;
   }
   pool->built = true;
 }
@@ -314,6 +318,12 @@ int getStagingBucketIndex(ncclComm_t comm) {
   return (slot != nullptr) ? slot->bucketIdx : -1;
 }
 
+int getStagingPhysicalSlotIndex(ncclComm_t comm) {
+  std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
+  StagingSlot* slot = (comm == gCurrentStagingComm) ? gCurrentStagingSlot : nullptr;
+  return (slot != nullptr) ? slot->physicalSlotIdx : -1;
+}
+
 ncclResult_t packStagingRecordEvent(ncclComm_t comm, cudaStream_t stream) {
   std::lock_guard<std::mutex> poolLock(gStagingPoolMutex);
   if (comm == gCurrentStagingComm && gCurrentStagingSlot != nullptr) {
@@ -345,7 +355,14 @@ void packStagingSynchronize() {
       if (!bucket.allocated) continue;
       for (int slotIdx = 0; slotIdx < bucket.numSlots; slotIdx++) {
         StagingSlot& slot = bucket.slots[slotIdx];
-        if (slot.eventRecorded) NCCL_M2N_CUDACHECK_WARN(cudaEventSynchronize(slot.doneEvent));
+        if (slot.eventRecorded) {
+          const cudaError_t result = cudaEventSynchronize(slot.doneEvent);
+          if (result != cudaSuccess) {
+            RESHARD_WARN(-1, "Retaining PACK resources after staging slot could not be synchronized: %s",
+                           cudaGetErrorString(result));
+            reshardRequireResourceQuarantine();
+          }
+        }
       }
     }
   }

@@ -10,6 +10,7 @@
 
 #include <sched.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
@@ -19,6 +20,15 @@
 
 void m2nClearLastError();
 void m2nSetLastError(const char* message);
+
+// Called after observing ncclInProgress from NCCL.
+inline void m2nWarnNonblockingComm() {
+  static std::atomic<bool> warned{false};
+  if (warned.load(std::memory_order_relaxed) || reshardGetLogLevel() < RESHARD_LOG_WARN) return;
+  if (warned.exchange(true, std::memory_order_relaxed)) return;
+  RESHARD_WARN(-1, "NCCL non-blocking operations may add host submission overhead for M2N, "
+                   "especially on NVLink/LSA paths. Consider a blocking communicator if your application permits it.");
+}
 
 // Keep this large enough for actionable details after ncclM2nGroupEnd adds its indexed prefix.
 // Grouped errors may truncate the underlying detail to fit.
@@ -140,7 +150,10 @@ static inline bool m2nSameTensorTopology(const ncclDistTensor_t& a, const ncclDi
 inline ncclResult_t m2nWaitCommReady(ncclComm_t comm) {
   ncclResult_t state = ncclSuccess;
   do {
-    if (state == ncclInProgress) sched_yield();
+    if (state == ncclInProgress) {
+      m2nWarnNonblockingComm();
+      sched_yield();
+    }
     const ncclResult_t queryResult = ncclCommGetAsyncError(comm, &state);
     if (queryResult != ncclSuccess) return queryResult;
   } while (state == ncclInProgress);

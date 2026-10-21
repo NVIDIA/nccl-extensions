@@ -70,6 +70,47 @@ and its headers must match the selected CUDA major.
 > there, so that directory resolves only as a namespace portion and these
 > modules become invisible. Always go through the editable install.
 
+## NCCL EP handle lifecycle
+
+`Group.create_handle(...)` remains the fused route. The v0.2 facade also
+exposes the split and imported-handle C APIs, which let applications allocate
+routing memory before CUDA graph capture or restore a prepared HT routing
+buffer:
+
+```python
+import nccl.ep as ep
+from nccl.core.typing import NcclDataType
+
+# device_uint8_buffer must provide at least this many bytes.
+num_bytes = group.handle_mem_size(ep.Layout.EXPERT_MAJOR, num_topk=-1)
+handle_mem = ep.Tensor(device_uint8_buffer)
+
+handle = group.init_handle(
+    ep.Layout.EXPERT_MAJOR,
+    num_topk=-1,
+    handle_mem=handle_mem,
+)
+handle.update(topk_idx, layout_info=layout_info, stream=stream)
+
+# After copying a prepared HT handle buffer, bind the snapshot locally.
+state = ep.HandleState(
+    num_tokens=num_tokens,
+    num_topk=num_topk,
+    topk_idx_datatype=NcclDataType.INT32,
+)
+restored = group.import_handle(
+    ep.Layout.EXPERT_MAJOR,
+    state,
+    restored_handle_mem,
+)
+```
+
+Combine-side MXFP8 is selected with
+`CombineConfig(quantization_recipe=CombineQuantizationRecipe.MXFP8)`. It is an
+HT expert-major, single-LSA-team path; input tokens are BF16 and
+`CombineInputs.scales` must be `None` because NCCL EP generates E8M0 scales
+internally.
+
 ## Generated bindings
 
 Everything under `nccl/_extensions/bindings/` is generated and checked in. Do

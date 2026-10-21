@@ -238,6 +238,11 @@ struct dispatch_config_t {
     int num_pipelines;
     int stages_per_pipeline;
     int sf_bytes_per_token; // total scale bytes per token (pre-computed on host)
+    // Compact FWD payload: original-order FP32 weights plus uint16 expert IDs,
+    // padded to16B. wire_prob_floats measures this opaque row in 4-byte words;
+    // transport copies all words without performing FP arithmetic on the IDs.
+    bool compact_prob;
+    int wire_prob_floats;
 };
 
 struct combine_config_t {
@@ -249,6 +254,10 @@ struct combine_config_t {
     int num_of_blocks;
     bool backward_combine;
     bool device_side_sync;
+    // Compact BWD payload: round_up(top_k,4) FP32 gradients in original top-k
+    // order. No IDs are carried or accumulated by combine.
+    bool compact_prob;
+    int wire_prob_floats;
 };
 
 struct model_config_t {
@@ -258,6 +267,25 @@ struct model_config_t {
     int ranks_per_lsa_team;
     int num_lsa_teams;
 };
+
+// Wire prob row width shared by dispatch and combine: dense has one float per
+// LSA-team expert; compact has a runtime-width token-scoped row. Host validation
+// guarantees a positive width on legs that carry probabilities.
+template <typename Config>
+__host__ __device__ __forceinline__ int
+prob_row_floats(const Config& config, const model_config_t& model) {
+    return config.compact_prob ? config.wire_prob_floats
+                               : model.num_of_experts_per_rank * model.ranks_per_lsa_team;
+}
+
+// Combine wire prob row widths. The staged/reduced row (per LSA team) and the
+// final output row differ under the dense format (output = per-team blocks x
+// num_lsa_teams) but are the same single merged K4 row under the compact format
+// (positions are globally disjoint across teams, so contributions merge).
+__host__ __device__ __forceinline__ int
+combine_prob_out_row_floats(const combine_config_t& config, const model_config_t& model) {
+    return prob_row_floats(config, model) * (config.compact_prob ? 1 : model.num_lsa_teams);
+}
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
 struct dispatch_warp_timing_entry_t {
@@ -519,9 +547,11 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     layout.sparse_to_dense_map_buffer = reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += S2D_MAP_RING_STAGES * num_pipelines * layout.s2d_map_stage_stride;
 
-    // Prob buffer (only if forward dispatch, 16B aligned) -- total stages unchanged
+    // Prob buffer (only if forward dispatch, 16B aligned) -- total stages unchanged.
+    // Width follows the wire format (dense per-LSA-team row or compact top-k row).
+    const int wire_prob_row_floats = prob_row_floats(config, model);
     if (config.forward_dispatch) {
-        layout.prob_buffer_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+        layout.prob_buffer_stage_stride = wire_prob_row_floats * sizeof(float);
         layout.prob_buffer_stage_stride = (layout.prob_buffer_stage_stride + 15) & ~15;
         layout.lsa_prob_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
         offset += config.num_of_stages * layout.prob_buffer_stage_stride;
@@ -605,9 +635,10 @@ static size_t calc_disp_per_stage_smem(const dispatch_config_t& config, const mo
     int token_buffer_stage_stride = model.hidden_dim * kTokenSize;
     token_buffer_stage_stride = (token_buffer_stage_stride + 127) & ~127;
     stage_size += token_buffer_stage_stride;
-    // Prob buffer (16B aligned per stage)
+    // Prob buffer (16B aligned per stage); width follows the wire format.
+    const int wire_prob_row_floats = prob_row_floats(config, model);
     if (config.forward_dispatch) {
-        int prob_buffer_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+        int prob_buffer_stage_stride = wire_prob_row_floats * sizeof(float);
         prob_buffer_stage_stride = (prob_buffer_stage_stride + 15) & ~15;
         stage_size += prob_buffer_stage_stride;
     }
@@ -745,7 +776,12 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     int num_of_stages_s2g,
     int num_of_tokens_per_chunk,
     bool backward_combine,
-    const model_config_t& model) {
+    const model_config_t& model,
+    // Wire prob row widths in floats. Dense: per-team row and per-team x
+    // num_lsa_teams output row. Compact: both are the
+    // same round_up(top_k, 4) merged row.
+    int prob_row_floats,
+    int prob_inter_row_floats) {
     size_t offset = 0;
     const uintptr_t smem_base_addr = reinterpret_cast<uintptr_t>(smem_base);
     auto align_offset = [&](size_t alignment) {
@@ -777,9 +813,9 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     // Both G2S rings carry the same packed row, so they share one stage stride.
     layout.token_G2S_stage_stride = g2s_stage_stride_u16;
     layout.token_S2G_stage_stride = token_stride_u16;
-    layout.prob_G2S_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team;
-    layout.prob_S2G_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team;
-    layout.prob_S2G_inter_stage_stride = layout.prob_S2G_stage_stride * model.num_lsa_teams;
+    layout.prob_G2S_stage_stride = prob_row_floats;
+    layout.prob_S2G_stage_stride = prob_row_floats;
+    layout.prob_S2G_inter_stage_stride = prob_inter_row_floats;
 
     // lsa_token_* buffers (128B aligned, multi-LSA-team only). Stage stride scales
     // with the on-wire element width (2 B for BF16/FP16, 4 B for FP32).
@@ -816,13 +852,13 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
             align_offset(16);
             layout.lsa_prob_G2S_buffer =
                 reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-            offset += num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+            offset += num_of_stages_g2s * prob_row_floats * sizeof(float);
 
             // lsa_prob_S2G_buffer
             align_offset(16);
             layout.lsa_prob_S2G_buffer =
                 reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-            offset += num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+            offset += num_of_stages_s2g * prob_row_floats * sizeof(float);
         } else {
             layout.lsa_prob_G2S_buffer = nullptr;
             layout.lsa_prob_S2G_buffer = nullptr;
@@ -831,13 +867,12 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
         // cross_lsa_prob_G2S_buffer
         align_offset(16);
         layout.cross_lsa_prob_G2S_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-        offset += num_of_stages_g2s * model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+        offset += num_of_stages_g2s * prob_row_floats * sizeof(float);
 
         // cross_lsa_prob_S2G_buffer
         align_offset(16);
         layout.cross_lsa_prob_S2G_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-        offset += num_of_stages_s2g * model.num_of_experts_per_rank * model.ranks_per_lsa_team * model.num_lsa_teams *
-                  sizeof(float);
+        offset += num_of_stages_s2g * prob_inter_row_floats * sizeof(float);
     } else {
         layout.lsa_prob_G2S_buffer = nullptr;
         layout.lsa_prob_S2G_buffer = nullptr;
@@ -925,7 +960,8 @@ static size_t calc_comb_per_g2s_stage_smem(
     // Both G2S rings carry the recipe's packed row, so one stride sizes both.
     int g2s_stage_bytes = Recipe::template packed_bytes<kTokenDtype>(model.hidden_dim);
     g2s_stage_bytes = (g2s_stage_bytes + 127) & ~127;
-    int prob_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+    // Wire prob width (dense per-team row or compact top-k row).
+    int prob_stride = prob_row_floats(config, model) * sizeof(float);
     prob_stride = (prob_stride + 15) & ~15;
     size_t stage_size = 0;
     // Token buffers (128B aligned): cross_lsa always, lsa_* only when multi-team.
@@ -956,9 +992,11 @@ static size_t calc_comb_per_s2g_stage_smem(
     const bool multi_lsa = (num_lsa_teams > 1);
     int token_stride = model.hidden_dim * nccl_ep::size_u8<kTokenDtype>();
     token_stride = (token_stride + 127) & ~127;
-    const int prob_bytes = model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
+    // Wire prob widths: the reduced (per-team) row and the final output row.
+    // Compact collapses both to the same K4 row.
+    const int prob_bytes = prob_row_floats(config, model) * sizeof(float);
     int prob_stride = (prob_bytes + 15) & ~15;
-    int cross_prob_stride = (prob_bytes * num_lsa_teams + 15) & ~15;
+    int cross_prob_stride = (combine_prob_out_row_floats(config, model) * (int)sizeof(float) + 15) & ~15;
     size_t stage_size = 0;
     // Token buffers (128B aligned): cross_lsa always, lsa_* only when multi-team.
     stage_size += token_stride;
@@ -1044,7 +1082,7 @@ struct dispatch_push_count_kparams_t {
     // inside each peer's count-table region; written by the histogram, read after the head barrier.
     size_t published_offset = 0;
     const int32_t* per_src_lteam_chunk_rank = nullptr;       // [num_chunks, lsa_team_size] per-chunk send counts
-    const int64_t* cached_topk_idx = nullptr;               // cached sender topk_idx [max_tokens, num_topk]
+    const int32_t* cached_topk_idx = nullptr;               // cached sender topk_idx [max_tokens, num_topk] (int32 expert ids)
     int32_t* num_recv_out = nullptr;                        // FLAT recv count for this rank (num_tokens_for_experts)
     const int32_t* per_src_lteam_num_tokens = nullptr;       // [1] real token count for the sender's stream
     int num_topk = 0;
@@ -1053,9 +1091,13 @@ struct dispatch_push_count_kparams_t {
     const uint64_t* token_dst_rank_bitmap = nullptr;        // [max_tokens] per-token global dest-rank bitmap
     uint8_t* const* recv_tables_ptrs = nullptr;             // [lsa_team_size] peer count-table regions
     int recv_max_slots = 0;                                 // slots per sub-table in the peer region
-    // When set, the fused meta build clamps published per-expert offsets/counts to
+    // When set, the fused meta build clamps published EM per-expert offsets/counts to
     // recv_max_slots so over-budget tokens drop; the pre-drop total stays in num_recv_out.
     bool allow_overflow_drop = false;
+    // Flat layout: no EM zones. The publish writes only num_recv_out and caller_recv_total
+    // (rank-level dedup count); per-expert caller counts come from the post-dispatch LERM
+    // recount (launch_lerm_flat_copy) and caller_offsets are not written.
+    bool is_flat = false;
     // Receiver EM tables published by block 0 (zone offsets, unpadded counts, caller outputs).
     int64_t* expert_token_offsets_out = nullptr;            // [experts_per_rank + 1]
     int32_t* per_expert_counts_out = nullptr;               // [experts_per_rank] unpadded counts
@@ -1073,6 +1115,11 @@ struct dispatch_kernel_param_base_t {
     int hidden_dim;
     int experts_per_rank;
     int ranks_per_lsa_team;
+    // Compact FWD rows are opaque original-order weights+IDs payloads, with
+    // wire_prob_floats giving their padded width in 4-byte words. Dense rows
+    // remain per-LSA-team FP32 expert arrays.
+    bool compact_prob;
+    int wire_prob_floats;
     // Input buffers. These buffers are local buffers.
     const TOKEN_DATA_TYPE* attn_input_token;
     const float* attn_input_prob; // Needed by expert layer, so only valid in forward dispatch.
@@ -1108,7 +1155,7 @@ struct dispatch_kernel_param_base_t {
     void* gin_base_ptr; // Base pointer for offset calculations
     // Memory Region info
     struct dispatch_memory_region_info_t mr_info;
-    // Grid barrier counter for fused device_sync in dispatch tail (per-rank, not IPC-shared)
+    // Dispatch tail counter followed by its head-sync counter (per-rank, not IPC-shared).
     uint32_t* dispatch_grid_barrier_counter;
     // When true (EM layout with local fanout enabled),
     // sender S2G dedups consecutive same-dest entries; secondary slots are filled
@@ -1141,9 +1188,14 @@ struct dispatch_kernel_param_t : dispatch_kernel_param_base_t<TOKEN_DATA_TYPE> {
 // Fixed-size part of combine kernel parameters. Peer pointer arrays are appended
 // by combine_kernel_param_t<LSA_TEAM_SZ> for JIT-specialized kernels.
 struct combine_kernel_param_base_t {
+    int output_prob_floats; // Compact caller row width; wire rows keep their padded stride
     int hidden_dim;
     int experts_per_rank;
     int ranks_per_lsa_team;
+    // Compact BWD rows carry original-top-k FP32 gradients only; the forward
+    // inline ID bytes never enter the combine reduction.
+    bool compact_prob;
+    int wire_prob_floats;
     // EM unfused-combine: when true, the cross-LSA-team G2S warp group skips local-dup
     // secondary em_slots (primaries already carry the pre-reduced weighted sum
     // written by the local_reduce kernel). Default false => fused fanout.
@@ -1173,7 +1225,7 @@ struct combine_kernel_param_base_t {
     int num_of_tokens_per_rank;
     // Actual token count; gates the cross_lsa_red TMA store.
     int num_real_tokens;
-    // Per-rank grid-barrier counter that elects the last block at the combine tail.
+    // Combine tail counter followed by its head-sync counter.
     uint32_t* combine_grid_barrier_counter;
     // NCCL GIN context
     ncclDevComm_t* dcomm; // Device communicator (device pointer)
@@ -1209,8 +1261,8 @@ struct combine_kernel_param_t : combine_kernel_param_base_t {
 // __syncthreads(); will use the 0 named barriers, so we want to avoid that.
 // We want to use 1 for intra-LSA reduction warp group, >= 2 for cross-LSA-team reduction warp group,
 // RDMA warp group currently only contains 1 warp so does not use named bar yet, if it need to use, it should use 2 + NUM_OF_DATA_PIPELINE_PER_BLOCK.
-__forceinline__ __device__ void arrive_and_wait(uint32_t num_threads, uint32_t barrier_id = 0) {
-    asm volatile("bar.sync %0, %1;" : : "r"(barrier_id), "r"(num_threads));
+__forceinline__ __device__ void arrive_and_wait(uint32_t num_threads, uint32_t barrier_id) {
+    nccl_ep::named_barrier_sync(barrier_id, num_threads);
 }
 
 // Map a data channel onto its GIN context, skipping the reserved contexts.
@@ -1243,7 +1295,8 @@ __forceinline__ __device__ void dispatch_n2n_put_token(
     int token_idx,
     size_t token_bytes,
     size_t prob_bytes,
-    int sf_bytes_per_token) {
+    int sf_bytes_per_token,
+    bool compact_prob) { // compact top-k wire format
     size_t token_src = mr_info->attn_input_token_offset + token_idx * token_bytes;
     net.put(
         rail,
@@ -1261,7 +1314,12 @@ __forceinline__ __device__ void dispatch_n2n_put_token(
         cuda::thread_scope_device,
         ncclGinOptFlagsAggregateRequests);
     if constexpr (FORWARD_DISPATCH) {
-        size_t prob_src = mr_info->attn_input_prob_offset + (token_idx * LSA_TEAMS + remote_lteam_id) * prob_bytes;
+        // Dense rows are laid out [token][lsa_team][experts_per_lsa_team] and
+        // sliced per destination; the compact row is token-scoped (same
+        // original-order weights + IDs for every destination).
+        size_t prob_src = compact_prob
+            ? mr_info->attn_input_prob_offset + token_idx * prob_bytes
+            : mr_info->attn_input_prob_offset + (token_idx * LSA_TEAMS + remote_lteam_id) * prob_bytes;
         net.put(
             rail,
             remote_lteam_id,
@@ -1329,7 +1387,8 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     const uint64_t expected_flag_value,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
-    const int experts_per_rank,
+    const bool compact_prob,
+    const uint32_t prob_bytes,
     const ncclDevComm& dcomm,
     int num_ctx_per_comm,
     void* gin_base_ptr,
@@ -1371,9 +1430,9 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
         int chunk_first_token = cidx * TOKENS_PER_CHUNK;
         src.token_base = attn_input_token + chunk_first_token * HIDDEN_DIM;
         if constexpr (FORWARD_DISPATCH) {
-            // attn_input_prob is laid out per token as LSA_TEAMS blocks of experts_per_lsa_team floats.
-            const int experts_per_lsa_team = experts_per_rank * LSA_TEAM_SZ;
-            const int prob_row_stride = experts_per_lsa_team * LSA_TEAMS;
+            // Compact has one wire row per token; dense has one per LSA team.
+            const size_t prob_row_floats = prob_bytes / sizeof(float);
+            const size_t prob_row_stride = prob_row_floats * (compact_prob ? 1 : LSA_TEAMS);
             src.prob_base = attn_input_prob + chunk_first_token * prob_row_stride;
         }
         if constexpr (HAS_SF) {
@@ -1447,7 +1506,6 @@ template <
     typename TOKEN_DATA_TYPE,
     typename SMEM_TYPE,
     int LSA_TEAMS,
-    int LSA_TEAM_SZ,
     bool FORWARD_DISPATCH,
     bool HAS_SF>
 __forceinline__ __device__ void dispatch_g2s_issue_token(
@@ -1459,12 +1517,12 @@ __forceinline__ __device__ void dispatch_g2s_issue_token(
     const int stage,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
-    const int experts_per_rank,
+    const bool compact_prob,
+    const uint32_t prob_bytes,
     const int my_lteam,
     const struct dispatch_memory_region_info_t* mr_info) {
     uint64_t* mbar = smem_buffer_ptr->get_lsa_mbarrier_producer(pipeline_rank, stage);
     const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE));
-    const uint32_t prob_bytes = (uint32_t)((experts_per_rank * LSA_TEAM_SZ) * sizeof(float));
     const uint32_t sf_bytes = (uint32_t)sf_bytes_per_token;
     uint32_t tx_bytes;
 
@@ -1491,10 +1549,12 @@ __forceinline__ __device__ void dispatch_g2s_issue_token(
         const void* prob_src = nullptr;
         const void* sf_src = nullptr;
         if constexpr (FORWARD_DISPATCH) {
-            // Advance by whole token rows, then pick this LSA team's expert slice within the row.
-            const int experts_per_lsa_team = experts_per_rank * LSA_TEAM_SZ;
-            const int prob_row_stride = experts_per_lsa_team * LSA_TEAMS;
-            prob_src = src.prob_base + cur_tokid * prob_row_stride + my_lteam * experts_per_lsa_team;
+            // Compact uses the same row for every destination; dense selects
+            // this LSA team's slice within the full token row.
+            const size_t prob_row_floats = prob_bytes / sizeof(float);
+            const size_t prob_row = compact_prob ? static_cast<size_t>(cur_tokid)
+                                                : static_cast<size_t>(cur_tokid) * LSA_TEAMS + my_lteam;
+            prob_src = src.prob_base + prob_row * prob_row_floats;
         }
         if constexpr (HAS_SF) {
             sf_src = src.sf_base + cur_tokid * sf_bytes_per_token;
@@ -1596,7 +1656,7 @@ dispatch_s2g_resolve_dest(const int32_t* s2d_row, const int flat_idx, const bool
 }
 
 // TMA-store one token (+prob if FWD, +sf if quantized) from this stage's SMEM to one resolved remote destination.
-template <typename TOKEN_DATA_TYPE, typename SMEM_TYPE, int LSA_TEAM_SIZE, bool FORWARD_DISPATCH, bool HAS_SF>
+template <typename TOKEN_DATA_TYPE, typename SMEM_TYPE, bool FORWARD_DISPATCH, bool HAS_SF>
 __forceinline__ __device__ void dispatch_s2g_issue_token(
     const s2g_dest_t& dst,
     SMEM_TYPE* smem_buffer_ptr,
@@ -1608,9 +1668,8 @@ __forceinline__ __device__ void dispatch_s2g_issue_token(
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
     const int max_recv_tokens_per_rank,
-    const int experts_per_rank) {
+    const uint32_t prob_bytes) {
     const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE));
-    const uint32_t prob_bytes = (uint32_t)((experts_per_rank * LSA_TEAM_SIZE) * sizeof(float));
     const uint32_t sf_bytes = (uint32_t)sf_bytes_per_token;
 
     // Remote fan-out: each field has its own output array, indexed [rank]+slot*stride.
@@ -1624,8 +1683,9 @@ __forceinline__ __device__ void dispatch_s2g_issue_token(
     const void* prob_dst = nullptr;
     const void* sf_dst = nullptr;
     if constexpr (FORWARD_DISPATCH) {
-        prob_dst = remote_expert_output_prob[dst.remote_rank_id] +
-                   (slot * (experts_per_rank * LSA_TEAM_SIZE));
+        // Recv rows use the same width as the wire for either format.
+        const size_t recv_prob_row_floats = prob_bytes / sizeof(float);
+        prob_dst = remote_expert_output_prob[dst.remote_rank_id] + (slot * recv_prob_row_floats);
     }
     if constexpr (HAS_SF) {
         sf_dst = remote_expert_output_scaling_factor[dst.remote_rank_id] + slot * sf_bytes_per_token;
@@ -1665,7 +1725,8 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     const int num_of_tokens_per_rank,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
-    const int experts_per_rank,
+    const bool compact_prob,
+    const uint32_t prob_bytes,
     const ncclDevComm& dcomm,
     int num_ctx_per_comm,
     ncclWindow_t nccl_token_window,
@@ -1696,7 +1757,6 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     constexpr int N2N_WARPS = GIN_GROUP::size() / 32;
     int n2n_warp_id = GIN_GROUP::thread_rank() / 32;
     size_t token_bytes = HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE);
-    size_t prob_bytes = (experts_per_rank * LSA_TEAM_SZ) * sizeof(float);
     constexpr int MAX_CHUNKS_PER_RANK = MAX_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
     constexpr int NUM_REMOTE_LSA = LSA_TEAMS - 1;
 
@@ -1767,7 +1827,8 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                         token_idx,
                         token_bytes,
                         prob_bytes,
-                        sf_bytes_per_token);
+                        sf_bytes_per_token,
+                        compact_prob);
                 }
                 // Advance the compacted base past all written tokens in this word.
                 dense_dst_offset += __popc(need_write_bitmask[word]) * entry_bytes;
@@ -1844,7 +1905,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
     const int num_of_tokens_per_rank,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
-    const int experts_per_rank,
+    const uint32_t prob_bytes,
     const bool local_dup_enabled,
     const int max_recv_tokens_per_rank,
     SMEM_TYPE* smem_buffer_ptr,
@@ -2030,7 +2091,6 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                                     dispatch_s2g_issue_token<
                                         TOKEN_DATA_TYPE,
                                         SMEM_TYPE,
-                                        LSA_TEAM_SZ,
                                         FORWARD_DISPATCH,
                                         HAS_SF>(
                                         dst,
@@ -2043,7 +2103,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                                         HIDDEN_DIM,
                                         sf_bytes_per_token,
                                         max_recv_tokens_per_rank,
-                                        experts_per_rank);
+                                        prob_bytes);
                                 }
                             }
                             // S1: only issuing lanes commit/wait — idle lanes skip the empty pair.
@@ -2110,7 +2170,8 @@ __forceinline__ __device__ void dispatch_G2S_warp(
     const int num_of_tokens_per_rank,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
-    const int experts_per_rank,
+    const bool compact_prob,
+    const uint32_t prob_bytes,
     const uint64_t expected_flag_value,
     const ncclDevComm& dcomm,
     int num_ctx_per_comm,
@@ -2184,7 +2245,8 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                     expected_flag_value,
                     HIDDEN_DIM,
                     sf_bytes_per_token,
-                    experts_per_rank,
+                    compact_prob,
+                    prob_bytes,
                     dcomm,
                     num_ctx_per_comm,
                     gin_base_ptr,
@@ -2222,7 +2284,6 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                                 TOKEN_DATA_TYPE,
                                 SMEM_TYPE,
                                 LSA_TEAMS,
-                                LSA_TEAM_SZ,
                                 FORWARD_DISPATCH,
                                 HAS_SF>(
                                 src,
@@ -2233,7 +2294,8 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                                 stage,
                                 HIDDEN_DIM,
                                 sf_bytes_per_token,
-                                experts_per_rank,
+                                compact_prob,
+                                prob_bytes,
                                 my_lteam,
                                 mr_info);
 
@@ -2380,8 +2442,7 @@ __forceinline__ __device__ void issue_local_g2s_row(
     float* const* remote_expert_input_prob,
     uint32_t token_bytes,
     uint32_t prob_bytes,
-    int experts_per_rank,
-    int ranks_per_lsa_team,
+    int wire_prob_dim, // staged prob row width (dense: epr*team; compact: round_up(top_k,4))
     bool combine_local_reduce_enabled) {
     constexpr int WARP_SIZE = 32;
     int total_valid_count = 0;
@@ -2409,7 +2470,7 @@ __forceinline__ __device__ void issue_local_g2s_row(
             static_cast<const uint8_t*>(remote_expert_input_token[rank_id]) + slot_st * token_bytes;
         const float* prob_src = nullptr;
         if constexpr (BACKWARD_COMBINE) {
-            prob_src = remote_expert_input_prob[rank_id] + (slot_st * (experts_per_rank * ranks_per_lsa_team));
+            prob_src = remote_expert_input_prob[rank_id] + (slot_st * wire_prob_dim);
         }
         issue_g2s_entry<CROSS_LSA, BACKWARD_COMBINE, /*WRITE_LAST_FLAG=*/true>(
             smem_buffer_ptr,
@@ -2508,6 +2569,7 @@ __forceinline__ __device__ void combine_G2S_intra_warp(
     const int my_lteam,
     const int num_of_tokens_per_rank,
     const int experts_per_rank,
+    const int wire_prob_dim, // staged prob row width (dense: epr*team; compact: round_up(top_k,4); 0 = no prob)
     const bool combine_local_reduce_enabled,
     SMEM_TYPE* smem_buffer_ptr) {
     static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
@@ -2527,7 +2589,7 @@ __forceinline__ __device__ void combine_G2S_intra_warp(
     // the RDMA leg carries BF16, so one TMA per token covers values and scales alike.
     using Recipe = nccl_ep::combine_recipe_traits<kCombineRecipe>;
     const uint32_t token_bytes = (uint32_t)Recipe::template packed_bytes<kTokenDtype>(HIDDEN_DIM);
-    const uint32_t prob_bytes = (uint32_t)((experts_per_rank * LSA_TEAM_SZ) * sizeof(float));
+    const uint32_t prob_bytes = (uint32_t)(wire_prob_dim * sizeof(float));
 
     // EM unfused-combine dedup uses __shfl_up_sync(1); requires s2d_inner_dim <= WARP_SIZE.
     if (combine_local_reduce_enabled && lane_id == 0 && smem_buffer_ptr->s2d_inner_dim > WARP_SIZE) {
@@ -2570,8 +2632,7 @@ __forceinline__ __device__ void combine_G2S_intra_warp(
                 remote_expert_input_prob,
                 token_bytes,
                 prob_bytes,
-                experts_per_rank,
-                LSA_TEAM_SZ,
+                wire_prob_dim,
                 combine_local_reduce_enabled);
         }
     }
@@ -2932,6 +2993,7 @@ __forceinline__ __device__ void combine_RED_intra_warp(
     const int my_lteam,
     const int num_of_tokens_per_rank,
     const int experts_per_rank,
+    const int wire_prob_dim, // staged prob row width (dense: epr*team; compact: round_up(top_k,4); 0 = no prob)
     SMEM_TYPE* smem_buffer_ptr) {
     // Routing map is read as vectorized 16B loads; each dst token contributes one bool.
     using routing_loads_t = uint4;
@@ -2947,8 +3009,10 @@ __forceinline__ __device__ void combine_RED_intra_warp(
     constexpr int MAX_CHUNKS_PER_RANK = MAX_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
     constexpr int ACC_ELEM_PER_THRD =
         nccl_ep::ceil_div(BF16X2_ELEMENTS_PER_TOKEN, (int)RED_GROUP::size());
-    // Backward-combine prob vectors stay in float (no BF16 packing).
-    const int prob_dim = experts_per_rank * LSA_TEAM_SZ;
+    // Backward-combine prob vectors stay in float (no BF16 packing). Width
+    // follows the wire format (compact rows are <= the dense row by the
+    // activation guard, so MAX_PROB_ELEM_PER_THRD still bounds the vectors).
+    const int prob_dim = wire_prob_dim;
     const int prob_vec_per_thread = nccl_ep::ceil_div(prob_dim, (int)RED_GROUP::size());
     // Compile-time upper bound sized exactly to this instantiation's LSA team.
     constexpr int MAX_PROB_ELEM_PER_THRD =
@@ -3233,6 +3297,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     const int my_lteam,
     const int num_of_tokens_per_rank,
     const int experts_per_rank,
+    const int wire_prob_dim, // reduced prob row width (dense: epr*team; compact: round_up(top_k,4); 0 = no prob)
     // CONFIG: ncclGin RDMA plumbing
     ncclDevComm_t* dcomm,
     ncclWindow_t nccl_token_window,
@@ -3311,7 +3376,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
                                               MAX_TOKENS_PER_RANK, token_bytes>(
                     net, rail, lteam_id, nccl_token_window, nccl_prob_window, nccl_internal_window, smem_mr_info_ptr,
                     rdma_to_attn_map, chunk_base_token_idx, chunk_id * TOKENS_PER_CHUNK, token_range,
-                    rdma_tile_id, rank_in_remote, experts_per_rank * LSA_TEAM_SZ,
+                    rdma_tile_id, rank_in_remote, wire_prob_dim,
                     (volatile uint32_t*)smem_buffer_ptr->rdma_streaming_counter, cumulative_sent);
             }
 
@@ -3350,7 +3415,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
                                               MAX_TOKENS_PER_RANK, token_bytes>(
                     net, rail, lteam_id, nccl_token_window, nccl_prob_window, nccl_internal_window, smem_mr_info_ptr,
                     rdma_to_attn_map, chunk_base_token_idx, chunk_id * TOKENS_PER_CHUNK, token_range,
-                    rdma_tile_id, rank_in_remote, experts_per_rank * LSA_TEAM_SZ,
+                    rdma_tile_id, rank_in_remote, wire_prob_dim,
                     nullptr, cumulative_sent);
             }
 
@@ -3401,8 +3466,7 @@ __forceinline__ __device__ g2s_src_t combine_g2s_resolve_rdma_source(
     const float* combine_gin_G2S_prob,
     int tile_id,
     int flat_token_id,
-    int experts_per_rank,
-    int lteam_sz) {
+    int wire_prob_dim) {
     const int rdma_row = tile_id * MAX_NUM_OF_TOKENS_PER_RANK + flat_token_id;
     // rdma_bytes is the inter-node row width (dtype-width for NONE), matching the previous
     // HIDDEN_DIM * size_u16<kTokenDtype>() form for every unquantized case.
@@ -3413,7 +3477,8 @@ __forceinline__ __device__ g2s_src_t combine_g2s_resolve_rdma_source(
         static_cast<size_t>(rdma_row) * rdma_wire_stride);
     const float* prob_src = nullptr;
     if constexpr (BACKWARD_COMBINE) {
-        prob_src = combine_gin_G2S_prob + rdma_row * (experts_per_rank * lteam_sz);
+        // Row stride must match the sender's put stride (wire width: dense or compact K4).
+        prob_src = combine_gin_G2S_prob + static_cast<size_t>(rdma_row) * wire_prob_dim;
     }
     return g2s_src_t{token_src, prob_src};
 }
@@ -3444,8 +3509,7 @@ __forceinline__ __device__ void issue_rdma_g2s_row(
     int my_lteam,
     uint32_t token_bytes,
     uint32_t prob_bytes,
-    int experts_per_rank,
-    int lteam_sz) {
+    int wire_prob_dim) {
     static_assert(
         LSA_TEAMS <= 33, "LSA_TEAMS must fit in a single warp pass for RDMA parallelization.");
     // Ensure all local TMAs are committed before RDMA.
@@ -3476,8 +3540,7 @@ __forceinline__ __device__ void issue_rdma_g2s_row(
                     combine_gin_G2S_prob,
                     lane.tile_id,
                     flat_token_id,
-                    experts_per_rank,
-                    lteam_sz);
+                    wire_prob_dim);
             // RDMA tier does not set cross_lsa_flag_G2S_buffer; the RED group reads
             // attn_to_rdma_map to demarcate RDMA entries.
             issue_g2s_entry</*CROSS_LSA=*/true, BACKWARD_COMBINE, /*WRITE_LAST_FLAG=*/false>(
@@ -3533,6 +3596,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     const int my_lteam,
     const int num_of_tokens_per_rank,
     const int experts_per_rank,
+    const int wire_prob_dim, // staged prob row width (dense: epr*team; compact: round_up(top_k,4); 0 = no prob)
     const uint64_t expected_flag_value,
     const bool combine_local_reduce_enabled,
     // CONFIG: ncclGin RDMA plumbing
@@ -3578,7 +3642,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     // prologue emits that layout, so one TMA per token carries values and scales together.
     const uint32_t local_token_bytes =
         (uint32_t)Recipe::template packed_bytes<kTokenDtype>(HIDDEN_DIM);
-    const uint32_t prob_bytes = (uint32_t)((experts_per_rank * LSA_TEAM_SZ) * sizeof(float));
+    const uint32_t prob_bytes = (uint32_t)(wire_prob_dim * sizeof(float));
 
     // EM unfused-combine dedup uses __shfl_up_sync(1), requiring s2d_inner_dim <= WARP_SIZE.
     // combine_local_reduce_enabled is only true under EM unfused combine (no-op for FLAT).
@@ -3657,8 +3721,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
                         remote_expert_input_prob,
                         local_token_bytes,
                         prob_bytes,
-                        experts_per_rank,
-                        LSA_TEAM_SZ,
+                        wire_prob_dim,
                         combine_local_reduce_enabled);
                 }
 
@@ -3694,8 +3757,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
                         my_lteam,
                         rdma_token_bytes,
                         prob_bytes,
-                        experts_per_rank,
-                        LSA_TEAM_SZ);
+                        wire_prob_dim);
                 }
             }
         }
@@ -3878,6 +3940,8 @@ __forceinline__ __device__ void combine_inter_store_token(
     const float* acc_prob_ptr,
     int prob_vec_per_thread,
     int prob_dim,
+    int prob_out_dim, // dense: prob_dim * LSA_TEAMS; compact: caller top-k (unpadded)
+    bool compact_prob,
     int my_lteam,
     uint16_t* attn_output_token_base,
     float* attn_output_prob_base,
@@ -3934,16 +3998,30 @@ __forceinline__ __device__ void combine_inter_store_token(
     }
     if constexpr (BACKWARD_COMBINE) {
         float* store_prob_base_ptr = smem_buffer_ptr->get_cross_lsa_prob_S2G(dst_token_stage);
-        // Gather per-source-LSA-team prob into output LSA-team order (my_lteam, my_lteam-1, ...).
-#pragma unroll
-        for (int n = 0; n < LSA_TEAMS; n++) {
-            int output_lteam_id = (my_lteam - n) >= 0 ? my_lteam - n : my_lteam + LSA_TEAMS - n;
-            int element_base_id = output_lteam_id * prob_dim;
+        if (compact_prob) {
+            // All teams already merged into slot 0. Write the caller's K columns
+            // directly; scalar FP32 stores support rows such as K10 (40 bytes),
+            // which cannot use a 16-byte-aligned TMA row copy.
 #pragma unroll
             for (int m = 0; m < prob_vec_per_thread; m++) {
                 int element_id = thread_rank_within_pipeline + m * THRDS_PER_PIPELINE;
-                if (element_id < prob_dim) {
-                    store_prob_base_ptr[element_base_id + element_id] = acc_prob_ptr[n * prob_vec_per_thread + m];
+                if (element_id < prob_out_dim && absolute_token_id < num_real_tokens) {
+                    attn_output_prob_base[static_cast<size_t>(token_in_chunk) * prob_out_dim + element_id] =
+                        acc_prob_ptr[m];
+                }
+            }
+        } else {
+            // Gather per-source-LSA-team prob into output LSA-team order (my_lteam, my_lteam-1, ...).
+#pragma unroll
+            for (int n = 0; n < LSA_TEAMS; n++) {
+                int output_lteam_id = (my_lteam - n) >= 0 ? my_lteam - n : my_lteam + LSA_TEAMS - n;
+                int element_base_id = output_lteam_id * prob_dim;
+#pragma unroll
+                for (int m = 0; m < prob_vec_per_thread; m++) {
+                    int element_id = thread_rank_within_pipeline + m * THRDS_PER_PIPELINE;
+                    if (element_id < prob_dim) {
+                        store_prob_base_ptr[element_base_id + element_id] = acc_prob_ptr[n * prob_vec_per_thread + m];
+                    }
                 }
             }
         }
@@ -3964,13 +4042,15 @@ __forceinline__ __device__ void combine_inter_store_token(
                 (uint32_t)(HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>())));
 
             if constexpr (BACKWARD_COMBINE) {
-                float* current_prob_addr = attn_output_prob_base + token_in_chunk * (prob_dim * LSA_TEAMS);
-                cuda::ptx::cp_async_bulk(
-                    cuda::ptx::space_global,
-                    cuda::ptx::space_shared,
-                    reinterpret_cast<void*>(current_prob_addr),
-                    reinterpret_cast<const void*>(smem_buffer_ptr->get_cross_lsa_prob_S2G(dst_token_stage)),
-                    (uint32_t)((prob_dim * LSA_TEAMS) * sizeof(float)));
+                if (!compact_prob) {
+                    float* current_prob_addr = attn_output_prob_base + token_in_chunk * prob_out_dim;
+                    cuda::ptx::cp_async_bulk(
+                        cuda::ptx::space_global,
+                        cuda::ptx::space_shared,
+                        reinterpret_cast<void*>(current_prob_addr),
+                        reinterpret_cast<const void*>(smem_buffer_ptr->get_cross_lsa_prob_S2G(dst_token_stage)),
+                        (uint32_t)(prob_out_dim * sizeof(float)));
+                }
             }
             cuda::ptx::cp_async_bulk_commit_group();
         }
@@ -4010,6 +4090,9 @@ __forceinline__ __device__ void combine_RED_inter_warp(
     const int num_of_tokens_per_rank,
     const int num_real_tokens,
     const int experts_per_rank,
+    const int wire_prob_dim, // staged prob row width (dense: epr*team; compact: round_up(top_k,4); 0 = no prob)
+    const bool compact_prob, // compact wire format: all LSA teams merge into ONE row
+    const int output_prob_floats, // compact output omits the wire row's alignment padding
     SMEM_TYPE* smem_buffer_ptr) {
     // The warp group is split into PIPELINES_PER_BLOCK independent pipelines (matching the
     // cross-LSA-team G2S group); each pipeline owns an equal slice of the G2S/S2G FIFOs.
@@ -4038,8 +4121,11 @@ __forceinline__ __device__ void combine_RED_inter_warp(
     constexpr int BF16X2_ELEMS_PER_TOKEN = HIDDEN_DIM / 2;
     constexpr int ACC_ELEMS_PER_THRD =
         nccl_ep::ceil_div(BF16X2_ELEMS_PER_TOKEN, THRDS_PER_PIPELINE);
-    const int prob_dim = experts_per_rank * LSA_TEAM_SZ;
+    const int prob_dim = wire_prob_dim;
     const int prob_vec_per_thread = nccl_ep::ceil_div(prob_dim, THRDS_PER_PIPELINE);
+    // Output row width: dense = per-LSA-team blocks; compact = one merged row
+    // (positions are globally disjoint across teams, so contributions merge).
+    const int prob_out_dim = compact_prob ? output_prob_floats : prob_dim * LSA_TEAMS;
     // Compile-time upper bound sized exactly to this instantiation's LSA team.
     constexpr int MAX_PROB_ELEMS_PER_THRD =
         nccl_ep::ceil_div(NUM_MAX_LOCAL_EXPERTS * LSA_TEAM_SZ, THRDS_PER_PIPELINE);
@@ -4082,8 +4168,7 @@ __forceinline__ __device__ void combine_RED_inter_warp(
             attn_output_token + (size_t)(cidx * TOKENS_PER_CHUNK) * out_token_stride_u16;
         float* attn_output_prob_base = nullptr;
         if constexpr (BACKWARD_COMBINE) {
-            attn_output_prob_base =
-                attn_output_prob + (cidx * TOKENS_PER_CHUNK) * (prob_dim * LSA_TEAMS);
+            attn_output_prob_base = attn_output_prob + (cidx * TOKENS_PER_CHUNK) * prob_out_dim;
         }
 
         // Token groups are striped across blocks; each pipeline handles a round-robin slice of dst tokens.
@@ -4155,27 +4240,56 @@ __forceinline__ __device__ void combine_RED_inter_warp(
                         int lteam_id = my_lteam >= n ? my_lteam - n : my_lteam + LSA_TEAMS - n;
                         int rdma_buffer_tile_id = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
                         if (attn_to_rdma_addr[rdma_buffer_tile_id]) {
-                            combine_inter_consume_src<
-                                THRDS_PER_PIPELINE,
-                                BACKWARD_COMBINE,
-                                HIDDEN_DIM,
-                                /*READ_LAST_FLAG=*/false,
-                                /*ACCUMULATE_PROB=*/false,
-                                kTokenDtype,
-                                kCombineRecipe>(
-                                smem_buffer_ptr,
-                                token_stage,
-                                token_producer_parity,
-                                starting_G2S_index,
-                                ending_G2S_index,
-                                warp_rank_within_pipeline,
-                                thread_rank_within_pipeline,
-                                pipeline_rank,
-                                acc_token_fp32,
-                                acc_prob_ptr,
-                                /*prob_slot=*/n,
-                                prob_vec_per_thread,
-                                prob_dim);
+                            if (compact_prob) {
+                                // Compact: positions are globally disjoint across LSA
+                                // teams and each remote team contributes at most once
+                                // per dst token, so remote rows MERGE (+=) into the
+                                // single slot-0 row instead of landing in per-team
+                                // blocks.
+                                combine_inter_consume_src<
+                                    THRDS_PER_PIPELINE,
+                                    BACKWARD_COMBINE,
+                                    HIDDEN_DIM,
+                                    /*READ_LAST_FLAG=*/false,
+                                    /*ACCUMULATE_PROB=*/true,
+                                    kTokenDtype,
+                                    kCombineRecipe>(
+                                    smem_buffer_ptr,
+                                    token_stage,
+                                    token_producer_parity,
+                                    starting_G2S_index,
+                                    ending_G2S_index,
+                                    warp_rank_within_pipeline,
+                                    thread_rank_within_pipeline,
+                                    pipeline_rank,
+                                    acc_token_fp32,
+                                    acc_prob_ptr,
+                                    /*prob_slot=*/0,
+                                    prob_vec_per_thread,
+                                    prob_dim);
+                            } else {
+                                combine_inter_consume_src<
+                                    THRDS_PER_PIPELINE,
+                                    BACKWARD_COMBINE,
+                                    HIDDEN_DIM,
+                                    /*READ_LAST_FLAG=*/false,
+                                    /*ACCUMULATE_PROB=*/false,
+                                    kTokenDtype,
+                                    kCombineRecipe>(
+                                    smem_buffer_ptr,
+                                    token_stage,
+                                    token_producer_parity,
+                                    starting_G2S_index,
+                                    ending_G2S_index,
+                                    warp_rank_within_pipeline,
+                                    thread_rank_within_pipeline,
+                                    pipeline_rank,
+                                    acc_token_fp32,
+                                    acc_prob_ptr,
+                                    /*prob_slot=*/n,
+                                    prob_vec_per_thread,
+                                    prob_dim);
+                            }
                         }
                     }
                 }
@@ -4200,6 +4314,8 @@ __forceinline__ __device__ void combine_RED_inter_warp(
                     acc_prob_ptr,
                     prob_vec_per_thread,
                     prob_dim,
+                    prob_out_dim,
+                    compact_prob,
                     my_lteam,
                     attn_output_token_base,
                     attn_output_prob_base,
@@ -4288,9 +4404,16 @@ __forceinline__ __device__ void PAD_warp_group_device_function(
         if (count == 0) continue;
         int32_t rem = count % alignment;
         int32_t pad = rem ? (alignment - rem) : 0;
+        if (pad == 0) continue;
+        // DROP may truncate the last kept expert zone before the requested
+        // alignment boundary. The scan publishes capacity-clamped endpoints,
+        // so do not pad past this zone into the next allocation (e.g. prob).
+        const int64_t zone_base = zone_offsets[e];
+        const int64_t pad_room = zone_offsets[e + 1] - zone_base - count;
+        if (pad_room < pad) pad = pad_room > 0 ? static_cast<int32_t>(pad_room) : 0;
         for (int p = 0; p < pad; p++, row_idx++) {
             if ((row_idx % global_stride) == global_id) {
-                void* dst = reinterpret_cast<void*>(local_buf + (zone_offsets[e] + count + p) * hidden_dim);
+                void* dst = reinterpret_cast<void*>(local_buf + (zone_base + count + p) * hidden_dim);
                 cuda::ptx::cp_async_bulk(
                     cuda::ptx::space_global,
                     cuda::ptx::space_shared,
@@ -4302,7 +4425,7 @@ __forceinline__ __device__ void PAD_warp_group_device_function(
                         cuda::ptx::space_global,
                         cuda::ptx::space_shared,
                         local_scale_buf +
-                            static_cast<size_t>(zone_offsets[e] + count + p) * scale_row_bytes,
+                            static_cast<size_t>(zone_base + count + p) * scale_row_bytes,
                         smem->get_pad_tma_slot(),
                         scale_row_bytes);
                 }
@@ -4353,7 +4476,7 @@ __device__ __forceinline__ void warp_rdma_guard_publish(
 // dispatch_push_map_publish_outputs live in dispatch_push_map_publish_ctx_t instead, so they
 // don't sit live in registers across the build_s2d/build_lerm phases that run before it.
 struct dispatch_push_map_ctx_t {
-    const int64_t* topk_idx;
+    const int32_t* topk_idx;
     int32_t* s2d;
     const int32_t* per_src_lteam_chunk_rank;
     const uint64_t* token_dst_rank_bitmap;
@@ -4390,6 +4513,7 @@ struct dispatch_push_map_publish_ctx_t {
     void* caller_recv_total;
     bool caller_out_is_int64;
     int em_alignment;
+    bool is_flat;
 };
 
 // Warp-uniform FLAT slot base per dest rank for one (stream, chunk): the stream
@@ -4576,7 +4700,7 @@ __device__ __forceinline__ void dispatch_push_map_build_s2d(
                         // be consuming earlier-published chunks concurrently) to hit it blind as a
                         // raw assert with no actionable message.
                         if (!ctx.allow_overflow_drop && slot_overflows(slot, ctx.recv_max_slots)) {
-                            printf("ncclEp HT EM count dispatch: recv slot %d exceeds "
+                            printf("ncclEp HT count dispatch: recv slot %d exceeds "
                                    "max_recv_tokens_per_rank %d; increase "
                                    "ncclEpGroupConfig_t::max_recv_tokens_per_rank or set "
                                    "NCCL_EP_OVERFLOW_DROP\n", slot, ctx.recv_max_slots);
@@ -4624,7 +4748,7 @@ __device__ __forceinline__ void dispatch_push_map_build_lerm(
     const int experts_per_lsa_team = ctx.experts_per_lsa_team;
     const int expert_off = ctx.expert_off;
     const int num_topk = ctx.num_topk;
-    const int64_t* topk_idx = ctx.topk_idx;
+    const int32_t* topk_idx = ctx.topk_idx;
     int32_t* s2d = ctx.s2d;
     uint8_t* const* recv_tables_ptrs = ctx.recv_tables_ptrs;
     const int* per_src_lteam_num_tokens = ctx.per_src_lteam_num_tokens;
@@ -4661,7 +4785,7 @@ __device__ __forceinline__ void dispatch_push_map_build_lerm(
             uint64_t touched_mask[kRankListCap][MASK_WORDS];
             int nrank = 0;
             // Derive each token's per-dest-rank expert mask from its topk row.
-            const int64_t* row = topk_idx + (size_t)t * num_topk;
+            const int32_t* row = topk_idx + (size_t)t * num_topk;
             for (int k = 0; k < num_topk; k++) {
                 const int32_t ge = map_topk_ge(row, k);
                 if (ge < 0) continue;
@@ -4721,6 +4845,7 @@ __device__ __forceinline__ void dispatch_push_map_publish_outputs(
     void* caller_counts = pub.caller_counts;
     void* caller_recv_total = pub.caller_recv_total;
     const bool caller_out_is_int64 = pub.caller_out_is_int64;
+    const bool is_flat = pub.is_flat;
     auto cnt_rank_row = [&](int s) -> const int32_t* {
         return ctx.count_rows + (size_t)s * count_row_ints;
     };
@@ -4735,9 +4860,9 @@ __device__ __forceinline__ void dispatch_push_map_publish_outputs(
             // TRAP: over-budget recv count under a non-DROP overflow policy aborts here with an
             // actionable message before the permute reads the FLAT/LERM buffers (scan-mode parity).
             if (!ctx.allow_overflow_drop && tot > ctx.recv_max_slots) {
-                printf("ncclEp HT EM count dispatch: recv tokens %d exceed max_recv_tokens_per_rank "
+                printf("ncclEp HT count dispatch: recv tokens %d exceed max_recv_tokens_per_rank "
                        "%d; increase ncclEpGroupConfig_t::max_recv_tokens_per_rank or set "
-                       "NCCL_EP_OVERFLOW_DROP\n", tot, (int)ctx.recv_max_slots);
+                       "overflow_policy = NCCL_EP_OVERFLOW_DROP\n", tot, static_cast<int>(ctx.recv_max_slots));
                 __trap();
             }
             // DROP: this FLAT recv count drives the permute's per-slot loop over the
@@ -4746,8 +4871,19 @@ __device__ __forceinline__ void dispatch_push_map_publish_outputs(
             if (num_recv_out)
                 *num_recv_out =
                     (ctx.allow_overflow_drop && tot > ctx.recv_max_slots) ? ctx.recv_max_slots : tot;
+            // Flat: recv total is the rank-level dedup count (pre-drop; see is_flat in
+            // dispatch_push_count_kparams_t), not the per-expert sum below.
+            if (caller_recv_total && is_flat) {
+                if (caller_out_is_int64) {
+                    *static_cast<int64_t*>(caller_recv_total) = tot;
+                } else {
+                    *static_cast<int32_t*>(caller_recv_total) = tot;
+                }
+            }
         }
-        if (expert_token_offsets_out) {
+        // EM per-expert zone publish (padded prefix offsets, counts, caller outputs). Flat has
+        // no zones: its per-expert counts are recounted from the LERM after dispatch.
+        if (!is_flat && (expert_token_offsets_out || caller_offsets || caller_counts)) {
             __shared__ int64_t s_pub_off[64 * MASK_WORDS + 1];
             __shared__ int32_t s_raw_cnt[64 * MASK_WORDS];
             const int em_align = (em_alignment > 1) ? em_alignment : 1;
@@ -4774,7 +4910,8 @@ __device__ __forceinline__ void dispatch_push_map_publish_outputs(
                 }
                 s_pub_off[experts_per_rank] = cum;
                 // TRAP: padded EM total over budget under a non-DROP policy (may overflow via
-                // alignment padding even when the FLAT count fits) aborts with scan-mode parity.
+                // alignment padding even when the per-rank count fits) aborts with scan-mode
+                // parity.
                 if (!drop && cum > cap) {
                     printf("ncclEp HT EM count dispatch: padded recv tokens %lld exceed "
                            "max_recv_tokens_per_rank %lld; increase "
@@ -4782,12 +4919,18 @@ __device__ __forceinline__ void dispatch_push_map_publish_outputs(
                            (long long)cum, (long long)cap);
                     __trap();
                 }
-                expert_token_offsets_out[experts_per_rank] = (drop && cum > cap) ? cap : cum;
-                // recv_total_counter reports the pre-drop padded total (unclamped cum);
-                // equals the unpadded FLAT recv total when em_alignment == 1.
-                if (caller_recv_total) {
-                    if (caller_out_is_int64) *static_cast<int64_t*>(caller_recv_total) = cum;
-                    else *static_cast<int32_t*>(caller_recv_total) = (int32_t)cum;
+                if (expert_token_offsets_out) {
+                    expert_token_offsets_out[experts_per_rank] = (drop && cum > cap) ? cap : cum;
+                    // recv_total_counter reports the pre-drop padded EM total (unclamped cum),
+                    // one slot per (token, local-expert) hit. Flat's caller_recv_total is
+                    // written from the rank-level tot above instead -- see that comment.
+                    if (caller_recv_total) {
+                        if (caller_out_is_int64) {
+                            *static_cast<int64_t*>(caller_recv_total) = cum;
+                        } else {
+                            *static_cast<int32_t*>(caller_recv_total) = static_cast<int32_t>(cum);
+                        }
+                    }
                 }
             }
             __syncwarp();
@@ -4800,8 +4943,12 @@ __device__ __forceinline__ void dispatch_push_map_publish_outputs(
                 const int32_t out_actual = drop ? (int32_t)((int64_t)s_raw_cnt[e] < room ? s_raw_cnt[e] : room)
                                                 : s_raw_cnt[e];
                 const int64_t out_padded = drop ? (padded < room ? padded : room) : padded;
-                expert_token_offsets_out[e] = expert_pub_off;
-                if (per_expert_counts_out) per_expert_counts_out[e] = out_actual;
+                if (expert_token_offsets_out) {
+                    expert_token_offsets_out[e] = expert_pub_off;
+                    if (per_expert_counts_out) {
+                        per_expert_counts_out[e] = out_actual;
+                    }
+                }
                 if (caller_offsets) {
                     if (caller_out_is_int64) static_cast<int64_t*>(caller_offsets)[e] = expert_pub_off;
                     else static_cast<int32_t*>(caller_offsets)[e] = (int32_t)expert_pub_off;
@@ -4903,7 +5050,23 @@ __device__ __forceinline__ void dispatch_push_map_warp(
     pub.caller_recv_total = p.caller_recv_total;
     pub.caller_out_is_int64 = p.caller_out_is_int64;
     pub.em_alignment = p.em_alignment;
+    pub.is_flat = p.is_flat;
     dispatch_push_map_publish_outputs<EXPERTS_PER_RANK>(ctx, pub, map_warp);
+}
+
+// Elect the first block to claim *state (result broadcast to all threads in the block).
+__device__ __forceinline__ bool elect_first_block(uint32_t* state, uint32_t claimed_state) {
+    int elected = 0;
+    if (threadIdx.x == 0) elected = atomicCAS(state, 0u, claimed_state) == 0u;
+    return __syncthreads_or(elected);
+}
+
+// Elect the first block to claim *state (result broadcast within the calling warp).
+__device__ __forceinline__ bool elect_first_block_warp(
+    uint32_t* state, uint32_t claimed_state, int lane) {
+    int elected = 0;
+    if (lane == 0) elected = atomicCAS(state, 0u, claimed_state) == 0u;
+    return __shfl_sync(0xffffffffu, elected, 0);
 }
 
 // Elect the last block to arrive at *counter (result broadcast to all threads in the block).
@@ -4968,17 +5131,24 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     d_config.num_pipelines = NUM_PIPELINES;
     d_config.stages_per_pipeline = STAGES_PER_PIPELINE;
     d_config.s2d_inner_dim = param.s2d_inner_dim;
+    d_config.compact_prob = param.compact_prob;
+    d_config.wire_prob_floats = param.wire_prob_floats;
     d_model.hidden_dim = HIDDEN_DIM;
     d_model.max_num_of_tokens_per_rank = MAX_TOKENS_PER_RANK;
     d_model.num_of_experts_per_rank = param.experts_per_rank;
-    d_model.ranks_per_lsa_team = param.ranks_per_lsa_team;
+    d_model.ranks_per_lsa_team = LSA_TEAM_SZ;
     d_model.num_lsa_teams = LSA_TEAMS;
+    // Resolve the payload width once for all dispatch copy paths. Only source
+    // addressing still needs the compact flag; receivers see uniform wire rows.
+    const uint32_t prob_bytes = static_cast<uint32_t>(prob_row_floats(d_config, d_model) * sizeof(float));
     create_dispatch_smem_layout<kLayout, sizeof(TOKEN_DATA_TYPE)>(smem_layout, smem_bytes, d_config, d_model);
     cur_smem_t* smem_buffer_ptr = &smem_layout;
 
     using head_init_warp = warp_group<1, 0>;
     using head_rdma_warp = warp_group<1, 1>;
     using head_lsa_warp = warp_group<1, 2>;
+
+    uint32_t* dispatch_head_sync_counter = param.dispatch_grid_barrier_counter + 1;
 
     // The head phase runs on warps 0, 1, 2 (mbarrier init / RDMA guard / intra-LSA
     // barrier), so the block must always contain at least 3 warps -- even when the
@@ -5017,43 +5187,50 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                     *param.expected_gin_flag_val);
         }
     } else if (head_tid < head_init_warp::size() + head_rdma_warp::size() + head_lsa_warp::size()) {
-        // warp 2: intra-LSA LSA barrier. Fused count mode fans this rank's finished
-        // count row out to every LSA peer first (self slot always written, even for
-        // LSA_TEAM_SZ==1), then runs the barrier with acq_rel so the MAP warps see it
-        // after sync. Unfused mode already has rows local (AllGathered in UpdateHandle),
-        // so it skips the fan-out and uses a plain guard barrier.
-        const bool count_fanout = param.dispatch_push_count.active && param.dispatch_push_count.fused_meta_dispatch;
-        if (count_fanout) {
-            const int lane = head_tid & 31;
-            const int me = my_lteam * LSA_TEAM_SZ + param.local_rank; // global sender-row index
-            const size_t row_ints = (size_t)param.dispatch_push_count.num_src_ranks +
-                                    (size_t)param.experts_per_rank * param.dispatch_push_count.num_src_ranks;
-            // Split by consumer scope: every block ships the cnt_rank prefix (dispatch_push_map_build_rank_base
-            // needs it on every block); only block 0 ships the cnt_expert tail
-            // (dispatch_push_map_publish_outputs is block 0 / MAP warp 0 only). Idempotent-write is
-            // preserved: non-zero blocks write a prefix of what block 0 writes, at identical
-            // addresses.
-            const size_t n_ship = (blockIdx.x == 0) ? row_ints : (size_t)param.dispatch_push_count.num_src_ranks;
-            const int32_t* my_row = param.dispatch_push_count.own_row;
-            for (int p = 0; p < LSA_TEAM_SZ; p++) {
-                int32_t* dst = reinterpret_cast<int32_t*>(
-                    param.dispatch_push_count.recv_tables_ptrs[p] + param.dispatch_push_count.published_offset) + (size_t)me * row_ints;
-                for (int i = lane; i < (int)n_ship; i += 32) dst[i] = my_row[i];
+        // warp 2: one first-admitted block publishes count metadata and runs the
+        // intra-LSA barrier, then releases the other local blocks.
+        const bool count_fanout =
+            param.dispatch_push_count.active && param.dispatch_push_count.fused_meta_dispatch;
+        const bool lsa_head_sync = param.guard_enabled || count_fanout;
+        if (lsa_head_sync) {
+            const int lane = head_lsa_warp::thread_rank();
+            const bool head_lsa_leader =
+                elect_first_block_warp(dispatch_head_sync_counter, 1u, lane);
+            if (head_lsa_leader) {
+                if (count_fanout) {
+                    const int me =
+                        my_lteam * LSA_TEAM_SZ + param.local_rank; // global sender-row index
+                    const size_t row_ints =
+                        (size_t)param.dispatch_push_count.num_src_ranks +
+                        (size_t)param.experts_per_rank *
+                            param.dispatch_push_count.num_src_ranks;
+                    const int32_t* my_row = param.dispatch_push_count.own_row;
+                    for (int p = 0; p < LSA_TEAM_SZ; p++) {
+                        int32_t* dst = reinterpret_cast<int32_t*>(
+                            param.dispatch_push_count.recv_tables_ptrs[p] +
+                            param.dispatch_push_count.published_offset) +
+                            (size_t)me * row_ints;
+                        for (int i = lane; i < (int)row_ints; i += 32) dst[i] = my_row[i];
+                    }
+                    // Order every leader-warp count store before lane 0 publishes readiness.
+                    __syncwarp();
+                }
+                if constexpr (LSA_TEAM_SZ != 1) {
+                    ncclLsaBarrierSession<ncclCoopWarp> bar(
+                        ncclCoopWarp(), *param.dcomm, ncclTeamTagLsa(), 0u);
+                    bar.sync(
+                        ncclCoopWarp(),
+                        count_fanout ? cuda::memory_order_acq_rel : cuda::memory_order_relaxed);
+                }
             }
-            __threadfence_system();
-        }
-        if constexpr (LSA_TEAM_SZ != 1) {
-            // Peer publish/synchronize barrier (a 1-member team needs no barrier; the
-            // __threadfence_system above plus the block __syncthreads order the self write).
-            if (param.guard_enabled || count_fanout) {
-                ncclLsaBarrierSession<ncclCoopWarp> bar(
-                    ncclCoopWarp(),
-                    *param.dcomm,
-                    ncclTeamTagLsa(),
-                    (uint32_t)blockIdx.x);
-                bar.sync(
-                    ncclCoopWarp(),
-                    count_fanout ? cuda::memory_order_acq_rel : cuda::memory_order_relaxed);
+            if (lane == 0) {
+                int* counter = reinterpret_cast<int*>(dispatch_head_sync_counter);
+                if (head_lsa_leader) {
+                    nccl_ep::st_release_gpu_global(counter, 2);
+                } else {
+                    while (nccl_ep::ld_relaxed_gpu_global(dispatch_head_sync_counter) != 2u) {}
+                    (void)nccl_ep::ld_acquire_global(counter);
+                }
             }
         }
     }
@@ -5088,7 +5265,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                 param.num_of_tokens_per_rank,
                 HIDDEN_DIM,
                 SF_BYTES_PER_TOKEN,
-                param.experts_per_rank,
+                param.compact_prob,
+                prob_bytes,
                 *param.dcomm,
                 param.num_ctx_per_comm,
                 param.token_window,
@@ -5107,7 +5285,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             param.rdma_to_attn_map, param.attn_input_token, param.attn_input_prob, \
             param.attn_input_token_scaling_factor, param.gin_G2S_flags, param.local_rank, \
             my_lteam, param.num_of_tokens_per_rank, HIDDEN_DIM, SF_BYTES_PER_TOKEN, \
-            param.experts_per_rank, *param.expected_gin_flag_val, *param.dcomm, \
+            param.compact_prob, prob_bytes, *param.expected_gin_flag_val, *param.dcomm, \
             param.num_ctx_per_comm, param.gin_base_ptr, &param.mr_info, smem_buffer_ptr, \
             param.dispatch_push_count.active ? s_s2d_chunks_ready : nullptr)
         if (param.dispatch_push_count.active) {
@@ -5132,7 +5310,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             param.num_of_tokens_per_rank, \
             HIDDEN_DIM, \
             SF_BYTES_PER_TOKEN, \
-            param.experts_per_rank, \
+            prob_bytes, \
             param.local_dup_enabled, \
             param.max_recv_tokens_per_rank, \
             smem_buffer_ptr, \
@@ -5237,6 +5415,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                 nccl_ep::publish_lsa_completion(param.lsa_S2G_flags + param.local_rank, expected_val);
                 nccl_ep::wait_lsa_completion(param.lsa_S2G_flags, expected_val, param.ranks_per_lsa_team);
                 atomicExch((unsigned int*)param.dispatch_grid_barrier_counter, 0u);
+                atomicExch(dispatch_head_sync_counter, 0u);
                 if (!param.local_dup_enabled)
                     *param.expected_lsa_flag_val += static_cast<uint32_t>(param.ranks_per_lsa_team);
             }
@@ -5335,6 +5514,14 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     c_model.num_of_experts_per_rank = param.experts_per_rank;
     c_model.ranks_per_lsa_team = param.ranks_per_lsa_team;
     c_model.num_lsa_teams = LSA_TEAMS;
+    // Wire prob row widths for this run (used consistently by the SMEM layout
+    // and every prob-touching warp group below).
+    combine_config_t c_wire_cfg{};
+    c_wire_cfg.backward_combine = BACKWARD_COMBINE;
+    c_wire_cfg.compact_prob = param.compact_prob;
+    c_wire_cfg.wire_prob_floats = param.wire_prob_floats;
+    const int wire_prob_dim = prob_row_floats(c_wire_cfg, c_model);
+    const int wire_prob_out_dim = combine_prob_out_row_floats(c_wire_cfg, c_model);
     // Layout derives the element width from kTokenDtype (FP32 doubles the per-stage
     // token-buffer bytes vs BF16/FP16).
     create_combine_smem_layout<kTokenDtype, kCombineRecipe>(
@@ -5344,11 +5531,15 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
         STAGES_S2G,
         TOKENS_PER_CHUNK,
         BACKWARD_COMBINE,
-        c_model);
+        c_model,
+        wire_prob_dim,
+        wire_prob_out_dim);
     smem_layout.s2d_inner_dim = param.s2d_inner_dim;
     cur_smem_t* smem_buffer_ptr = &smem_layout;
 
     // ===== FUSED DEVICE SYNC (combine head) =====
+    uint32_t* combine_head_sync_counter = param.combine_grid_barrier_counter + 1;
+    const bool head_leader = elect_first_block(combine_head_sync_counter, 1u);
     using head_init_warp = warp_group<1, 0>; // warp 0
     using head_rdma_warp = warp_group<1, 1>; // warp 1
     const int head_tid = (int)threadIdx.x;
@@ -5357,9 +5548,9 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
             _wt_head_start = clock64();
 #endif
-            // Block 0 publishes this rank's input readiness; every block waits for all peers.
+            // The first admitted block publishes this rank's input readiness; all blocks wait.
             const uint32_t expected_val = *param.expected_lsa_flag_val;
-            if (blockIdx.x == 0)
+            if (head_leader)
                 nccl_ep::publish_lsa_completion(param.lsa_S2G_flags + param.local_rank, expected_val);
             nccl_ep::wait_lsa_completion(param.lsa_S2G_flags, expected_val, param.ranks_per_lsa_team);
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
@@ -5431,6 +5622,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 my_lteam,
                 param.num_of_tokens_per_rank,
                 param.experts_per_rank,
+                wire_prob_dim,
                 smem_buffer_ptr);
 #undef COMBINE_RED_INTRA_TEMPLATE
         }
@@ -5452,6 +5644,9 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             param.num_of_tokens_per_rank,
             param.num_real_tokens,
             param.experts_per_rank,
+            wire_prob_dim,
+            param.compact_prob,
+            param.output_prob_floats,
             smem_buffer_ptr);
 #undef COMBINE_RED_INTER_TEMPLATE
     } else if (
@@ -5470,6 +5665,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 my_lteam,
                 param.num_of_tokens_per_rank,
                 param.experts_per_rank,
+                wire_prob_dim,
                 param.combine_local_reduce_enabled,
                 smem_buffer_ptr);
 #undef COMBINE_G2S_INTRA_TEMPLATE
@@ -5499,6 +5695,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             my_lteam,
             param.num_of_tokens_per_rank,
             param.experts_per_rank,
+            wire_prob_dim,
             *param.expected_gin_flag_val,
             param.combine_local_reduce_enabled,
             param.dcomm,
@@ -5526,6 +5723,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 my_lteam,
                 param.num_of_tokens_per_rank,
                 param.experts_per_rank,
+                wire_prob_dim,
                 param.dcomm,
                 param.token_window,
                 param.prob_window,
@@ -5562,6 +5760,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             // warp 0: reset the grid counter + bump the intra-LSA round.
             if (tail_tid == 0) {
                 atomicExch((unsigned int*)param.combine_grid_barrier_counter, 0u);
+                atomicExch(combine_head_sync_counter, 0u);
                 *param.expected_lsa_flag_val += static_cast<uint32_t>(param.ranks_per_lsa_team);
             }
         } else if (tail_tid < tail_reset_warp::size() + tail_rdma_warp::size()) {
@@ -5603,7 +5802,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
 template <typename T>
 struct local_dup_kernel_param_t {
     T* expert_output_token; // [max_recv_tokens, hidden]
-    float* expert_output_prob; // [max_recv_tokens, epr * ranks_per_lsa_team]; valid iff FORWARD_DISPATCH
+    float* expert_output_prob; // [max_recv_tokens, prob_row_floats]; opaque on compact FWD
     const int32_t* emuf_group_buf; // [num_groups, group_stride] = [primary, sec0, ..., -1]
     const int32_t* emuf_group_count; // scalar (produced by scan)
     int emuf_group_stride; // = experts_per_rank
@@ -5616,6 +5815,10 @@ struct local_dup_kernel_param_t {
     uint32_t* grid_barrier_counter;
     int experts_per_rank;
     int ranks_per_lsa_team;
+    // Wire row width in 4-byte words: dense FP32 experts or the compact
+    // weights+IDs payload. Primary -> secondary is an opaque byte copy;
+    // BWD dispatch carries no probability row.
+    int prob_row_floats;
     void* expert_output_scale; // QUANT_FWD: per-token scale row; void* (dtype varies by recipe)
     int scale_row_bytes;
 };
@@ -5626,13 +5829,11 @@ inline int local_dup_dynamic_smem_bytes(
     int hidden_dim,
     int pipe_depth,
     bool forward_dispatch,
-    int experts_per_rank,
-    int ranks_per_lsa_team,
+    int prob_row_floats,
     size_t token_elem_bytes,
     int scale_row_bytes) {
     const int token_bytes = hidden_dim * static_cast<int>(token_elem_bytes);
-    const int prob_bytes =
-        forward_dispatch ? experts_per_rank * ranks_per_lsa_team * static_cast<int>(sizeof(float)) : 0;
+    const int prob_bytes = forward_dispatch ? prob_row_floats * static_cast<int>(sizeof(float)) : 0;
     const int rings = pipe_depth * (token_bytes + prob_bytes + scale_row_bytes);
     const int mbar_bytes = pipe_depth * 2 * static_cast<int>(sizeof(uint64_t)) + 8;
     return rings + mbar_bytes;
@@ -5647,7 +5848,7 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
     __syncthreads();
 
     constexpr int kTokenBytes = HIDDEN_DIM * sizeof(T);
-    const int prob_floats = FORWARD_DISPATCH ? (p.experts_per_rank * p.ranks_per_lsa_team) : 0;
+    const int prob_floats = FORWARD_DISPATCH ? p.prob_row_floats : 0;
     const int prob_bytes = prob_floats * static_cast<int>(sizeof(float));
 
     extern __shared__ __align__(16) uint8_t smem_raw[];
@@ -5736,8 +5937,8 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
                     kTokenBytes,
                     &prod_mbar[stage]);
                 if constexpr (FORWARD_DISPATCH) {
-                    const float* src_prob = p.expert_output_prob + static_cast<size_t>(primary_em) *
-                                                                       (p.experts_per_rank * p.ranks_per_lsa_team);
+                    const float* src_prob = p.expert_output_prob +
+                                            static_cast<size_t>(primary_em) * prob_floats;
                     cuda::ptx::cp_async_bulk(
                         cuda::ptx::space_shared,
                         cuda::ptx::space_global,
@@ -5794,7 +5995,7 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
                         kTokenBytes);
                     if constexpr (FORWARD_DISPATCH) {
                         float* dst_prob = p.expert_output_prob +
-                                          static_cast<size_t>(sec) * (p.experts_per_rank * p.ranks_per_lsa_team);
+                                          static_cast<size_t>(sec) * prob_floats;
                         cuda::ptx::cp_async_bulk(
                             cuda::ptx::space_global,
                             cuda::ptx::space_shared,
@@ -5864,6 +6065,9 @@ struct local_reduce_kernel_param_t {
     int emuf_group_stride; // = experts_per_rank
     int experts_per_rank;
     int ranks_per_lsa_team;
+    // Wire prob row width in floats: epr * ranks_per_lsa_team (dense) or
+    // round_up(top_k, 4) (compact). Ignored unless BACKWARD_COMBINE.
+    int prob_dim;
 };
 
 // Dynamic shared-memory bytes required by local_reduce_kernel_impl for the
@@ -5906,7 +6110,7 @@ __device__ __forceinline__ void local_reduce_kernel_impl(const local_reduce_kern
 
     // n_src per group must be <= PIPE_DEPTH (also <= 32 since PIPE_DEPTH <= 32);
     // enforced by __trap in the producer loop once n_src is known.
-    const int PROB_DIM = BACKWARD_COMBINE ? (p.experts_per_rank * p.ranks_per_lsa_team) : 0;
+    const int PROB_DIM = BACKWARD_COMBINE ? p.prob_dim : 0;
 
     // Shmem layout:
     //   s_in[PIPE_DEPTH] x kTokenBytes        (G2S ring)
@@ -6136,27 +6340,68 @@ constexpr int kLocalPermuteThreads =
 constexpr int kLocalPermuteReduceSlotsPerBlock = 8;
 constexpr int kLocalPermuteReduceThreads = 128 * kLocalPermuteReduceSlotsPerBlock;
 constexpr int kLocalPermuteReduceBlocksPerSM = 1;
+// combine_reduce: one warp per attn token; each lane loads kCombineReduceUnroll int4 from each of
+// kCombineReduceRankGroup partials before accumulating.
+constexpr int kCombineReduceSlotsPerBlock = 32;
+constexpr int kCombineReduceThreads = 32 * kCombineReduceSlotsPerBlock;
+constexpr int kCombineReduceUnroll = 2;
+constexpr int kCombineReduceRankGroup = 4;
 // combine_push block-size upper bound for __launch_bounds__ (24 warps). The real block is sized
 // at launch to fit the per-warp smem row buffer (see combine_push_slots_per_block); the kernel
 // reads blockDim.x at runtime.
 constexpr int kCombinePushThreads = 768;
 constexpr int kCombinePushMaxSlots = kCombinePushThreads / 32;  // 24, sizes static metadata smem
-// Dynamic smem = slots * row bytes (one per-warp row buffer each). Static metadata is separate.
-__host__ __device__ constexpr size_t combine_push_dynamic_smem_bytes(int hidden_int4, int slots) {
-    return static_cast<size_t>(slots) * hidden_int4 * 16;
+// Tile geometry of a row: kHiddenVec int4 per lane, 32 lanes per warp, kNTiles tiles per row.
+__host__ __device__ constexpr int combine_push_tile_int4(int hidden_int4) {
+    const int epr = (hidden_int4 + 31) / 32;         // elems per thread
+    return (epr < 4 ? epr : 4) * 32;
 }
-// Largest slot count (<= kCombinePushMaxSlots) whose per-warp row buffer fits smem_cap, reserving
+__host__ __device__ constexpr int combine_push_ntiles(int hidden_int4) {
+    const int tile_int4 = combine_push_tile_int4(hidden_int4);
+    return (hidden_int4 + tile_int4 - 1) / tile_int4;
+}
+// Chunk size in int4: requested is rounded up to whole tiles and clamped to the row; unset (<1)
+// is the whole row (one chunk). Each chunk is reduced into one per-warp smem buffer and pushed
+// with one TMA store.
+__host__ __device__ constexpr int combine_push_chunk_size(int hidden_int4, int requested) {
+    const int tile_int4 = combine_push_tile_int4(hidden_int4);
+    const int row_int4 = combine_push_ntiles(hidden_int4) * tile_int4;
+    if (requested < 1) return row_int4;
+    const int rounded = (requested + tile_int4 - 1) / tile_int4 * tile_int4;
+    return rounded > row_int4 ? row_int4 : rounded;
+}
+__host__ __device__ constexpr int combine_push_num_chunks(int hidden_int4, int chunk_size) {
+    const int size = combine_push_chunk_size(hidden_int4, chunk_size);
+    return (hidden_int4 + size - 1) / size;
+}
+// Per-warp push-buffer width in int4: one chunk, capped at the exact row so a single-chunk
+// (whole-row) push is not padded up to a tile multiple.
+__host__ __device__ constexpr int combine_push_buf_int4(int hidden_int4, int chunk_size) {
+    const int size = combine_push_chunk_size(hidden_int4, chunk_size);
+    return size < hidden_int4 ? size : hidden_int4;
+}
+// Dynamic smem = slots * buffer bytes (one per-warp row/chunk buffer each). Static metadata separate.
+__host__ __device__ constexpr size_t combine_push_dynamic_smem_bytes(
+    int hidden_int4, int slots, int chunk_size) {
+    return static_cast<size_t>(slots) * combine_push_buf_int4(hidden_int4, chunk_size) * 16;
+}
+// Static smem reserved for the max block's metadata: flat2em[MaxTopK<=32] + nvalid + dst ptr +
+// mbarrier, per slot. s_mbar is declared unconditionally (see combine_push) even though only
+// kSingleChunk uses it. Used by combine_push_slots_per_block to find how much of smem_cap is left
+// for the per-warp row/chunk buffer.
+__host__ __device__ constexpr int combine_push_meta_reserve_bytes() {
+    return kCombinePushMaxSlots * (32 * 4 + 4 + 8 + 8) + 256;
+}
+// Largest slot count (<= kCombinePushMaxSlots) whose per-warp buffer fits smem_cap, reserving
 // headroom for the static metadata arrays. At least 1.
-__host__ __device__ constexpr int combine_push_slots_per_block(int hidden_int4, int smem_cap) {
-    const int row_bytes = hidden_int4 * 16;
-    // static smem headroom: flat2em[MaxTopK<=32] + nvalid + dst ptr + mbarrier, per slot.
-    const int meta_reserve = kCombinePushMaxSlots * (32 * 4 + 4 + 8 + 8) + 256;
-    int slots = (smem_cap - meta_reserve) / row_bytes;
+__host__ __device__ constexpr int combine_push_slots_per_block(
+    int hidden_int4, int smem_cap, int chunk_size) {
+    const int row_bytes = combine_push_buf_int4(hidden_int4, chunk_size) * 16;
+    int slots = (smem_cap - combine_push_meta_reserve_bytes()) / row_bytes;
     if (slots > kCombinePushMaxSlots) slots = kCombinePushMaxSlots;
     if (slots < 1) slots = 1;
     return slots;
 }
-
 struct local_permute_dup_param_t {
     void* recv_x_em;
     float* recv_topk_weights_em;
@@ -6178,10 +6423,9 @@ struct local_permute_dup_param_t {
     void* recv_scales_em;
     const void* flat_scale_staging;
     int scale_row_bytes;
-    // Count mode: build the flat2em rows inline from the sender-written LERM rows,
-    // assigning em slots via per-expert atomic cursors (zero-seeded by the host).
-    // All null on the stock path (pre-built flat2em consumed as-is). lerm_out
-    // persists the LERM row into per-handle mem so combine reads a private copy.
+    // Rebuild EM slots with per-expert atomic cursors, from decoded compact IDs
+    // or (dense count mode) the sender-written LERM. Null uses the pre-built map.
+    // Count mode also persists LERM in per-handle memory for later operations.
     int32_t* flat2em_out;
     const bool* lerm_in;
     bool* lerm_out;
@@ -6201,7 +6445,7 @@ struct local_permute_dup_param_t {
 };
 
 template <int HiddenInt4, int HiddenVec,
-          ncclEpDispQuant_t kRecipe = NCCL_EP_DISP_QUANT_NONE>
+          ncclEpDispQuant_t kRecipe, bool kFlatExpertIds>
 __device__ __forceinline__ void local_permute_dup(
     uint8_t* __restrict__ recv_x_em,
     float* __restrict__ recv_topk_weights_em,
@@ -6314,21 +6558,19 @@ __device__ __forceinline__ void local_permute_dup(
         cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
         nccl_ep::fence_proxy_async();
     } else {
-        // Permute warps: warp-strided token permute; count mode builds flat2em inline
-        // below, other modes use the pre-built map.
+        // Permute warps: compact and dense count mode build flat2em inline;
+        // other modes and backward dispatch use the persisted map.
         for (int token = static_cast<int>(blockIdx.x) * kPermuteWarps + warp_id;
              token < num_recv;
              token += kPermuteWarps * static_cast<int>(gridDim.x)) {
             const bool copy_weights =
                 recv_topk_weights_em != nullptr && recv_topk_weights_flat != nullptr;
             if (flat2em_out != nullptr) {
-                // Count mode: assign em slots warp-cooperatively from the LERM row
-                // (ascending local expert, matching the FLAT weights order). The
-                // persisted row keeps dispatch and combine consistent, so any
-                // per-expert slot order is valid.
-                // LERM is a packed bitmap: ceil(epr/64) u64 words per slot.
+                // Build EM slots in the weight row's order: compact uses the decoded
+                // local IDs; dense count mode walks LERM in ascending expert order.
+                // The persisted map is shared by dispatch and backward combine.
                 const int lerm_words = nccl_ep::bit_words(experts_per_rank);
-                const uint64_t* lrow =
+                const uint64_t* lrow = lerm_in == nullptr ? nullptr :
                     reinterpret_cast<const uint64_t*>(lerm_in) + static_cast<size_t>(token) * lerm_words;
                 // Persist the LERM row into per-handle mem for combine (private per dispatch).
                 if (lerm_out != nullptr) {
@@ -6338,26 +6580,48 @@ __device__ __forceinline__ void local_permute_dup(
                 }
                 int32_t* out_row = flat2em_out + static_cast<size_t>(token) * top_k;
                 int c = 0;
-                for (int base = 0; base < experts_per_rank; base += kThreadsPerSlot) {
-                    const int e = base + lane;
-                    const bool hit = (e < experts_per_rank) && nccl_ep::test_bit(lrow, e);
-                    const uint32_t bal = __ballot_sync(0xffffffffu, hit);
-                    if (hit) {
-                        const int pos = c + __popc(bal & ((1u << lane) - 1u));
-                        // Cursor past the (DROP-clamped) per-expert count overflows the recv
-                        // buffer; mark it dropped (-1) so the copy loops and combine skip it.
-                        const int cur = atomicAdd(&em_permute_cursors[e], 1);
-                        const int32_t es = (cur < per_expert_counts_active[e])
-                                               ? static_cast<int32_t>(expert_token_offsets[e]) + cur
-                                               : -1;
-                        if (pos < kMaxActivePerToken) s_active[warp_id][pos] = es;
-                        out_row[pos] = es;
-                        if (copy_weights && es >= 0) {
-                            recv_topk_weights_em[es] =
-                                recv_topk_weights_flat[static_cast<size_t>(token) * top_k + pos];
+                if constexpr (kFlatExpertIds) {
+                    for (int base = 0; base < top_k; base += kThreadsPerSlot) {
+                        const int k = base + lane;
+                        const int e = k < top_k ? out_row[k] : -1;
+                        const bool hit = e >= 0;
+                        const uint32_t bal = __ballot_sync(0xffffffffu, hit);
+                        if (hit) {
+                            EP_DEVICE_ASSERT(e < experts_per_rank);
+                            const int cur = atomicAdd(&em_permute_cursors[e], 1);
+                            const int32_t es = cur < per_expert_counts_active[e]
+                                ? static_cast<int32_t>(expert_token_offsets[e]) + cur : -1;
+                            s_active[warp_id][k] = es;
+                            out_row[k] = es;
+                            if (copy_weights && es >= 0) {
+                                recv_topk_weights_em[es] =
+                                    recv_topk_weights_flat[static_cast<size_t>(token) * top_k + k];
+                            }
                         }
+                        c += __popc(bal);
                     }
-                    c += __popc(bal);
+                } else {
+                    for (int base = 0; base < experts_per_rank; base += kThreadsPerSlot) {
+                        const int e = base + lane;
+                        const bool hit = (e < experts_per_rank) && nccl_ep::test_bit(lrow, e);
+                        const uint32_t bal = __ballot_sync(0xffffffffu, hit);
+                        if (hit) {
+                            const int pos = c + __popc(bal & ((1u << lane) - 1u));
+                            // Cursor past the (DROP-clamped) per-expert count overflows the recv
+                            // buffer; mark it dropped (-1) so the copy loops and combine skip it.
+                            const int cur = atomicAdd(&em_permute_cursors[e], 1);
+                            const int32_t es = (cur < per_expert_counts_active[e])
+                                                   ? static_cast<int32_t>(expert_token_offsets[e]) + cur
+                                                   : -1;
+                            if (pos < kMaxActivePerToken) s_active[warp_id][pos] = es;
+                            out_row[pos] = es;
+                            if (copy_weights && es >= 0) {
+                                recv_topk_weights_em[es] =
+                                    recv_topk_weights_flat[static_cast<size_t>(token) * top_k + pos];
+                            }
+                        }
+                        c += __popc(bal);
+                    }
                 }
                 for (int k = c + lane; k < top_k; k += kThreadsPerSlot) out_row[k] = -1;
                 if (lane == 0) s_count[warp_id] = c;
@@ -6490,12 +6754,20 @@ constexpr int kPullDispatchMaxActive = 32;
 // Fused pull-count: two MAP warps build the recv-slot/EM maps in-kernel. Barrier 0 is
 // reserved for block-wide sync; the MAP warps use barrier 1.
 constexpr int kPullDispatchMapWarps = 2;
+// Static smem of the MAP layout scan; counted in the host smem budget.
+constexpr size_t kPullDispatchMapScanBytes = kPullDispatchMapWarps * sizeof(int);
 constexpr int kPullMapBarrierId = 1;
 
 // Max NVLink single-LSA-team ranks. The peer-pointer arrays live inline in the kernel
 // param struct so they ride the stream-ordered launch marshaling; a persistent host
 // staging + async H2D would race across back-to-back calls.
-constexpr int kPullMaxLsaRanks = 128;
+using ::kPullMaxLsaRanks;
+
+// Per-rank stride of a peer's published metadata row (counts + topk snapshot).
+__device__ __forceinline__ size_t pull_meta_stride(int topk_off_bytes, int tokens_per_rank) {
+    return nccl_ep::align<size_t>(
+        static_cast<size_t>(topk_off_bytes) + static_cast<size_t>(tokens_per_rank) * MAX_NUM_TOPK * sizeof(uint16_t), 16);
+}
 
 // Decode a packed global token id into its (LSA rank, local token) within the team:
 // g == src_rank * tokens_per_rank + src_token (mod the team span).
@@ -6521,12 +6793,23 @@ struct lsa_tail_sync_param_t {
     uint32_t* head_sync_flag;
 };
 
-// ready: the value the head gate publishes/waits for. Fused pull-count publishes its
-// metadata before this gate and signals ready=2 so a straggler that only observed the
-// (unrelated) ready=1 value from a prior dispatch on this flag cannot proceed early.
-__device__ __forceinline__ void lsa_grid_head_gate(ncclDevComm_t* dcomm, uint32_t* head_sync_flag, int ready = 1) {
+// Standalone fused pull-count metadata publish, run ahead of the unfused head gate.
+struct lsa_map_publish_param_t {
+    const int32_t* own_row;
+    const uint16_t* own_topk_snapshot;
+    const uint8_t* meta_ptrs[kPullMaxLsaRanks];
+    int topk_off_bytes;
+    int tokens_per_rank;
+    int top_k;
+    int my_rank;
+    int lsa_team_size;
+    int32_t* layout_ready;
+};
+
+__device__ __forceinline__ void lsa_grid_head_gate_elected(
+    ncclDevComm_t* dcomm, uint32_t* head_sync_flag, bool leader, int ready) {
     int* head_flag = reinterpret_cast<int*>(head_sync_flag);
-    if (blockIdx.x == 0) {
+    if (leader) {
         if (threadIdx.x < 32) {
             ncclLsaBarrierSession<ncclCoopWarp> bar(ncclCoopWarp(), *dcomm, ncclTeamTagLsa(), 0u);
             bar.sync(ncclCoopWarp(), cuda::memory_order_acq_rel);
@@ -6543,6 +6826,12 @@ __device__ __forceinline__ void lsa_grid_head_gate(ncclDevComm_t* dcomm, uint32_
         }
         __syncthreads();
     }
+}
+
+__device__ __forceinline__ void lsa_grid_head_gate(ncclDevComm_t* dcomm, uint32_t* head_sync_flag) {
+    constexpr int kReady = 1;
+    const bool leader = elect_first_block(head_sync_flag, static_cast<uint32_t>(kReady + 1));
+    lsa_grid_head_gate_elected(dcomm, head_sync_flag, leader, kReady);
 }
 
 // Block-uniform LSA grid tail barrier shared by pull dispatch and push combine.
@@ -6564,6 +6853,12 @@ __device__ __forceinline__ void lsa_grid_tail_barrier(
 }
 
 struct dispatch_pull_param_t {
+    // Flat specialization: packed local-expert/source-position entries in srcpos_map.
+    // These fields are unused by EM; layout is specialized in the JIT entry.
+    bool flat;
+    int64_t* recv_topk_idx;
+    int output_expert_base; // 0 for LOCAL IDs, this rank's first global expert for GLOBAL
+    int32_t* retained_slots; // Flat fused DROP destination slots.
     void* recv_x_em;                            // EM output token buffer
     float* recv_topk_weights_em;                // EM 1D weights out (null if not delivered)
     uint8_t* recv_x_scale_em;                   // QUANT_FWD: EM output scale buffer (null for NONE)
@@ -6587,7 +6882,7 @@ struct dispatch_pull_param_t {
     // Intra-LSA head/tail sync: source ready before any peer read, reads done before reuse.
     ncclDevComm_t* dcomm;
     uint32_t* head_sync_flag;                   // grid head gate (idle counter during dispatch)
-    uint32_t* grid_barrier_counter;             // tail elect-last-block
+    uint32_t* grid_barrier_counter;             // head (fused) and tail elect-last-block
     // When set, head/tail sync runs as separate kernels; this kernel skips the inline sync.
     bool unfused_sync;
 
@@ -6606,9 +6901,6 @@ struct dispatch_pull_param_t {
     const int32_t* own_row;             // [lsa_team_size + num_experts]
     const uint16_t* own_topk_snapshot;  // [tokens_per_rank, top_k] this rank's packed topk
     uint8_t* own_meta_staging;          // local inbox with one metadata row per source rank
-    // CTA 0 publishes layout bases for the rest of the grid.
-    int32_t* layout_slot_base;          // [lsa_team_size]
-    int32_t* layout_expert_base;        // [experts_per_rank]
     const int32_t* cached_cnt_rows;     // optional handle-local AllGather from UpdateHandle
     // Caller's dispatch-time layout_info outputs (mirrors dispatch_push_count_kparams_t); null
     // when the caller didn't request them at this ncclEpDispatch call.
@@ -6659,44 +6951,58 @@ __device__ __forceinline__ void dispatch_pull_pad_fill(
     }
 }
 
-// CTA 0 publishes this handle's metadata before the peer head barrier.
-__device__ __forceinline__ void dispatch_pull_map_publish(
+// Grid-strided metadata publish shared by the standalone publish kernel and the fused pull dispatch.
+// Callers order the stores before the head sync.
+__device__ __forceinline__ void dispatch_pull_map_publish_grid(
     const int32_t* __restrict__ own_row, const uint16_t* __restrict__ own_topk,
     const uint8_t* const* __restrict__ meta_ptrs, size_t row_stride, int topk_off_bytes,
     int tokens_per_rank, int top_k, int my_rank, int nRanks) {
-    if (blockIdx.x != 0) return;
-    const int count_ints = own_row ? topk_off_bytes / sizeof(int32_t) : 0;
-    for (int i = threadIdx.x; i < count_ints; i += blockDim.x) {
-        const int32_t v = own_row[i];
-        for (int r = 0; r < nRanks; ++r) {
-            volatile int32_t* dst = reinterpret_cast<volatile int32_t*>(const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride);
-            dst[i] = v;
-        }
+    // Use size_t for grid-flat indices to avoid signed overflow on large (tokens_per_rank * top_k * nRanks) products.
+    const size_t nthreads = static_cast<size_t>(gridDim.x) * blockDim.x;
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t count_ints = own_row ? static_cast<size_t>(topk_off_bytes) / sizeof(int32_t) : 0;
+    for (size_t idx = tid; idx < count_ints * nRanks; idx += nthreads) {
+        const int r = static_cast<int>(idx / count_ints);
+        const int i = static_cast<int>(idx - static_cast<size_t>(r) * count_ints);
+        uint8_t* const row = const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride;
+        reinterpret_cast<volatile int32_t*>(row)[i] = own_row[i];
     }
     const int total = tokens_per_rank * top_k;
+    int tail = 0;
+    // topk section is 16-byte aligned when topk_off_bytes & 15 == 0, enabling uint4 bulk stores.
     if ((topk_off_bytes & 15) == 0) {
-        for (int i = threadIdx.x; i < total / 8; i += blockDim.x) {
-            const uint4 v = reinterpret_cast<const uint4*>(own_topk)[i];
-            for (int r = 0; r < nRanks; ++r) {
-                uint4* dst = reinterpret_cast<uint4*>(const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride + topk_off_bytes);
-                asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};"
-                             :: "l"(dst + i), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+        const size_t chunks = static_cast<size_t>(total) / 8;
+        if (chunks > 0) {
+            for (size_t idx = tid; idx < chunks * nRanks; idx += nthreads) {
+                const int r = static_cast<int>(idx / chunks);
+                const int i = static_cast<int>(idx - static_cast<size_t>(r) * chunks);
+                const uint4 v = reinterpret_cast<const uint4*>(own_topk)[i];
+                int4* dst = reinterpret_cast<int4*>(
+                    const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride + topk_off_bytes);
+                nccl_ep::st_na_relaxed(dst + i, reinterpret_cast<const int4&>(v));
             }
+            tail = static_cast<int>(chunks * 8);
         }
     }
-    const int tail = (topk_off_bytes & 15) == 0 ? (total / 8) * 8 : 0;
-    for (int i = tail + threadIdx.x; i < total; i += blockDim.x) {
-        const uint16_t v = own_topk[i];
-        for (int r = 0; r < nRanks; ++r) {
-            volatile uint16_t* dst = reinterpret_cast<volatile uint16_t*>(const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride + topk_off_bytes);
-            dst[i] = v;
+    const size_t rem = static_cast<size_t>(total - tail);
+    if (rem > 0) {
+        for (size_t idx = tid; idx < rem * nRanks; idx += nthreads) {
+            const int r = static_cast<int>(idx / rem);
+            const int i = tail + static_cast<int>(idx - static_cast<size_t>(r) * rem);
+            volatile uint16_t* dst = reinterpret_cast<volatile uint16_t*>(
+                const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride + topk_off_bytes);
+            dst[i] = own_topk[i];
         }
     }
-    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        nccl_ep::memory_fence_seq_cst_sys();
+    }
 }
 
 // Two MAP warps build maps and publish completed chunk ranges.
-// CTA 0 computes the layout once and releases it to the other blocks.
+// Every block derives the layout from the published counts; CTA 0 also writes the global
+// outputs and releases them to the pad warps.
 __device__ __forceinline__ void dispatch_pull_map_warp(
     int topk_off_bytes,
     int32_t* __restrict__ recv_slot_to_src,
@@ -6709,10 +7015,7 @@ __device__ __forceinline__ void dispatch_pull_map_warp(
     int32_t* __restrict__ expert_cursor,
     int32_t* __restrict__ layout_ready,
     int32_t* __restrict__ s_base,
-    int32_t* __restrict__ s_expert_total,
     int32_t* __restrict__ s_expert_base,
-    int32_t* __restrict__ g_slot_base,    // block 0 publishes s_base here; every other block reads it
-    int32_t* __restrict__ g_expert_base,  // block 0 publishes s_expert_base here; every other block reads it
     int top_k,
     int experts_per_rank,
     int lsa_team_size,
@@ -6748,105 +7051,143 @@ __device__ __forceinline__ void dispatch_pull_map_warp(
         return *src;
     };
 
-    // Build the shared recv-slot and per-expert layout once.
-    if (blockIdx.x == 0) {
-        // Load source counts in parallel, then reduce the local-expert columns.
-        for (int e = tid; e < epr; e += nMapThreads) s_expert_total[e] = 0;
-        for (int r = tid; r < nRanks; r += nMapThreads) {
-            s_base[r] = peer_count(r, my_rank);
-        }
-        arrive_and_wait(nMapThreads, kPullMapBarrierId);
-        for (int i = tid; i < nRanks * epr; i += nMapThreads) {
-            const int r = i / epr;
-            const int e = i % epr;
-            atomicAdd(&s_expert_total[e], peer_count(r, nRanks + expert_base_gid + e));
-        }
-        arrive_and_wait(nMapThreads, kPullMapBarrierId);
+    const bool is_layout_writer = (blockIdx.x == 0);
+    for (int r = tid; r < nRanks; r += nMapThreads) {
+        s_base[r] = peer_count(r, my_rank);
+    }
 
-        // Rank-major recv slots and aligned per-expert output zones.
-        if (tid == 0) {
-            int cum = 0;
-            for (int r = 0; r < nRanks; r++) {
-                const int count = s_base[r];
-                s_base[r] = cum;
-                cum += count;
+    __shared__ int s_warp_total[kPullDispatchMapWarps];
+    static_assert(sizeof(s_warp_total) == kPullDispatchMapScanBytes, "update kPullDispatchMapScanBytes");
+    const int align = (em_alignment > 1) ? em_alignment : 1;
+    int carry = 0;
+    for (int tile = 0; tile < epr; tile += nMapThreads) {
+        const int k = tile + tid;
+        int c = 0;
+        if (k < epr) {
+            for (int r = 0; r < nRanks; ++r) {
+                c += peer_count(r, nRanks + expert_base_gid + k);
             }
-            const int true_total = cum;
-            const bool overflow = true_total > max_recv_tokens_per_rank;
-            if (overflow && !allow_overflow_drop) {
+        }
+        const int padded = (align > 1 && c > 0) ? nccl_ep::align(c, align) : c;
+        // Block-wide inclusive scan of the padded zone sizes.
+        int v = padded;
+#pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const int n = __shfl_up_sync(0xffffffffu, v, off);
+            if (lane >= off) {
+                v += n;
+            }
+        }
+        if (lane == 31) {
+            s_warp_total[map_idx] = v;
+        }
+        arrive_and_wait(nMapThreads, kPullMapBarrierId);
+        int warp_prefix = carry;
+        int tile_total = 0;
+        for (int w = 0; w < kPullDispatchMapWarps; ++w) {
+            const int warp_total = s_warp_total[w];
+            if (w < map_idx) {
+                warp_prefix += warp_total;
+            }
+            tile_total += warp_total;
+        }
+        const int ecum = warp_prefix + v - padded;
+        if (k < epr) {
+            s_expert_base[k] = ecum;
+        }
+        if (is_layout_writer && k < epr) {
+            int room = padded;
+            if (allow_overflow_drop) {
+                room = (ecum < max_recv_tokens_per_rank) ? (max_recv_tokens_per_rank - ecum) : 0;
+            }
+            const int zone_base =
+                (allow_overflow_drop && ecum > max_recv_tokens_per_rank) ? max_recv_tokens_per_rank : ecum;
+            expert_token_offsets[k] = zone_base;
+            if (per_expert_counts_active) {
+                int out_actual = c;
+                if (allow_overflow_drop) {
+                    out_actual = (c < room) ? c : room;
+                }
+                per_expert_counts_active[k] = out_actual;
+            }
+            // Report padded layout sizes; active counts above exclude padding.
+            if (caller_offsets || caller_counts) {
+                int out_padded = padded;
+                if (allow_overflow_drop) {
+                    out_padded = (padded < room) ? padded : room;
+                }
+                if (caller_offsets) {
+                    if (caller_out_is_int64) {
+                        static_cast<int64_t*>(caller_offsets)[k] = zone_base;
+                    } else {
+                        static_cast<int32_t*>(caller_offsets)[k] = zone_base;
+                    }
+                }
+                if (caller_counts) {
+                    if (caller_out_is_int64) {
+                        static_cast<int64_t*>(caller_counts)[k] = out_padded;
+                    } else {
+                        static_cast<int32_t*>(caller_counts)[k] = out_padded;
+                    }
+                }
+            }
+        }
+        carry += tile_total;
+        // s_warp_total is rewritten by the next tile.
+        arrive_and_wait(nMapThreads, kPullMapBarrierId);
+    }
+
+    // Rank-major recv slots; tid 0 also publishes the totals.
+    if (tid == 0) {
+        int cum = 0;
+        for (int r = 0; r < nRanks; r++) {
+            const int count = s_base[r];
+            s_base[r] = cum;
+            cum += count;
+        }
+        const int true_total = cum;
+        const bool overflow = true_total > max_recv_tokens_per_rank;
+        if (overflow && !allow_overflow_drop) {
+            if (is_layout_writer) {
                 printf("ncclEpDispatch: HT fused pull-count FLAT recv tokens %d > max_recv_tokens_per_rank %d; "
                        "increase ncclEpGroupConfig_t::max_recv_tokens_per_rank "
                        "or set ncclEpGroupConfig_t::overflow_policy = NCCL_EP_OVERFLOW_DROP\n",
                        true_total, max_recv_tokens_per_rank);
-                __trap();
             }
-            // Also clamp to flat_recv_capacity: slots beyond it were never written by the MAP phase.
-            const int capped_total = overflow ? max_recv_tokens_per_rank : true_total;
-            *num_recv_tokens_dev = (capped_total < flat_recv_capacity) ? capped_total : flat_recv_capacity;
-
-            const int align = (em_alignment > 1) ? em_alignment : 1;
-            int ecum = 0;
-            for (int k = 0; k < epr; k++) {
-                const int c = s_expert_total[k];
-                s_expert_base[k] = ecum;
-                const int padded = (align > 1 && c > 0) ? ((c + align - 1) / align) * align : c;
-                const int room = (allow_overflow_drop)
-                    ? ((ecum < max_recv_tokens_per_rank) ? (max_recv_tokens_per_rank - ecum) : 0)
-                    : padded;
-                const int zone_base =
-                    (allow_overflow_drop && ecum > max_recv_tokens_per_rank) ? max_recv_tokens_per_rank : ecum;
-                expert_token_offsets[k] = zone_base;
-                if (per_expert_counts_active) {
-                    int out_actual = c;
-                    if (allow_overflow_drop) out_actual = (c < room) ? c : room;
-                    per_expert_counts_active[k] = out_actual;
-                }
-                // Caller's layout_info API reports the padded zone (not the raw count
-                // per_expert_counts_active carries), matching dispatch_push_map_warp's caller_counts.
-                if (caller_offsets || caller_counts) {
-                    const int out_padded = allow_overflow_drop ? ((padded < room) ? padded : room) : padded;
-                    if (caller_offsets) {
-                        if (caller_out_is_int64) static_cast<int64_t*>(caller_offsets)[k] = zone_base;
-                        else static_cast<int32_t*>(caller_offsets)[k] = zone_base;
-                    }
-                    if (caller_counts) {
-                        if (caller_out_is_int64) static_cast<int64_t*>(caller_counts)[k] = out_padded;
-                        else static_cast<int32_t*>(caller_counts)[k] = out_padded;
-                    }
-                }
-                ecum += padded;
-            }
-            // TRAP: padded EM total over budget under a non-DROP policy (may overflow via
-            // alignment padding even when the FLAT count fits) aborts with scan-mode parity.
-            if (!allow_overflow_drop && ecum > max_recv_tokens_per_rank) {
+            __trap();
+        }
+        const int ecum = carry;
+        // TRAP: padded EM total over budget under a non-DROP policy (may overflow via
+        // alignment padding even when the FLAT count fits) aborts with scan-mode parity.
+        if (!allow_overflow_drop && ecum > max_recv_tokens_per_rank) {
+            if (is_layout_writer) {
                 printf("ncclEpDispatch: HT fused pull-count padded EM total %d > max_recv_tokens_per_rank %d; "
                        "increase ncclEpGroupConfig_t::max_recv_tokens_per_rank "
                        "or set ncclEpGroupConfig_t::overflow_policy = NCCL_EP_OVERFLOW_DROP\n",
                        ecum, max_recv_tokens_per_rank);
-                __trap();
             }
+            __trap();
+        }
+        if (is_layout_writer) {
+            // Also clamp to flat_recv_capacity: slots beyond it were never written by the MAP phase.
+            const int capped_total = overflow ? max_recv_tokens_per_rank : true_total;
+            *num_recv_tokens_dev = (capped_total < flat_recv_capacity) ? capped_total : flat_recv_capacity;
             expert_token_offsets[epr] = (ecum > max_recv_tokens_per_rank) ? max_recv_tokens_per_rank : ecum;
             // recv_total_counter reports the pre-drop padded total (unclamped ecum); equals the
             // unpadded FLAT recv total when em_alignment == 1. Matches dispatch_push_map_warp.
             if (caller_recv_total) {
-                if (caller_out_is_int64) *static_cast<int64_t*>(caller_recv_total) = ecum;
-                else *static_cast<int32_t*>(caller_recv_total) = ecum;
+                if (caller_out_is_int64) {
+                    *static_cast<int64_t*>(caller_recv_total) = ecum;
+                } else {
+                    *static_cast<int32_t*>(caller_recv_total) = ecum;
+                }
             }
         }
-        arrive_and_wait(nMapThreads, kPullMapBarrierId);
-
-        for (int r = tid; r < nRanks; r += nMapThreads) g_slot_base[r] = s_base[r];
-        for (int k = tid; k < epr; k += nMapThreads) g_expert_base[k] = s_expert_base[k];
-        arrive_and_wait(nMapThreads, kPullMapBarrierId);
-        if (tid == 0) {
-            // Publish the completed layout before other blocks read it.
-            nccl_ep::st_release_sys_global(layout_ready, 1);
-        }
-    } else {
-        while (nccl_ep::ld_acquire_sys_global(layout_ready) == 0) {}
-        for (int r = tid; r < nRanks; r += nMapThreads) s_base[r] = g_slot_base[r];
-        for (int k = tid; k < epr; k += nMapThreads) s_expert_base[k] = g_expert_base[k];
-        arrive_and_wait(nMapThreads, kPullMapBarrierId);
+    }
+    arrive_and_wait(nMapThreads, kPullMapBarrierId);
+    if (is_layout_writer && tid == 0) {
+        // Publish the completed layout for the pad warps.
+        nccl_ep::st_release_sys_global(layout_ready, 1);
     }
 
     // Each warp reads 32 contiguous tokens from one source rank. Cycling ranks
@@ -7006,8 +7347,6 @@ __device__ __forceinline__ void dispatch_pull(
     const int32_t* __restrict__ own_row = dp.own_row;
     const uint16_t* __restrict__ own_topk_snapshot = dp.own_topk_snapshot;
     uint8_t* __restrict__ own_meta_staging = dp.own_meta_staging;
-    int32_t* __restrict__ layout_slot_base = dp.layout_slot_base;
-    int32_t* __restrict__ layout_expert_base = dp.layout_expert_base;
     const int32_t* __restrict__ cached_cnt_rows = dp.cached_cnt_rows;
     void* __restrict__ caller_offsets = dp.caller_offsets;
     void* __restrict__ caller_counts = dp.caller_counts;
@@ -7021,9 +7360,7 @@ __device__ __forceinline__ void dispatch_pull(
     constexpr int kMapWarps = FusedMap ? kPullDispatchMapWarps : 0;
     constexpr int kPayloadWarps = PullWarps - kMapWarps;
     static_assert(kPayloadWarps > 0, "dispatch requires a payload warp");
-    const size_t meta_stride = nccl_ep::align<size_t>(
-        static_cast<size_t>(topk_off_bytes) + static_cast<size_t>(tokens_per_rank) * MAX_NUM_TOPK * sizeof(uint16_t),
-        16);
+    const size_t meta_stride = pull_meta_stride(topk_off_bytes, tokens_per_rank);
     using ScalePolicy = PullTmaStage<kScaleTma ? ScaleTmaRowBytes : 16>;
 
     const int warp_id = threadIdx.x / kPullDispatchThreadsPerSlot;
@@ -7058,10 +7395,9 @@ __device__ __forceinline__ void dispatch_pull(
     }
     Policy::block_init_fence();
 
-    // Fused pull-count MAP smem: [s_base(lsa_team_size) | s_expert_total(epr) | s_expert_base(epr)],
+    // Fused pull-count MAP smem: [s_base(lsa_team_size) | s_expert_base(epr)],
     // laid out right after the pull warps' Policy/ScalePolicy staging region. Unused when kMapWarps == 0.
     int32_t* s_map_base = nullptr;
-    int32_t* s_map_expert_total = nullptr;
     int32_t* s_map_expert_base = nullptr;
     int2* s_chunk_ranges = nullptr;
     if constexpr (kFusedMap) {
@@ -7070,9 +7406,8 @@ __device__ __forceinline__ void dispatch_pull(
             (kScaleTma ? static_cast<size_t>(kPayloadWarps) * ScalePolicy::smem_bytes_per_warp : 0);
         int32_t* s_map = reinterpret_cast<int32_t*>(s_policy + kPolicyTotalBytes);
         s_map_base = s_map;
-        s_map_expert_total = s_map_base + lsa_team_size;
-        s_map_expert_base = s_map_expert_total + experts_per_rank;
-        const size_t map_bytes = static_cast<size_t>(lsa_team_size + 2 * experts_per_rank) * sizeof(int32_t);
+        s_map_expert_base = s_map_base + lsa_team_size;
+        const size_t map_bytes = static_cast<size_t>(lsa_team_size + experts_per_rank) * sizeof(int32_t);
         s_chunk_ranges = reinterpret_cast<int2*>(s_policy + kPolicyTotalBytes +
             ((map_bytes + alignof(int2) - 1) & ~size_t(alignof(int2) - 1)));
     }
@@ -7178,12 +7513,29 @@ __device__ __forceinline__ void dispatch_pull(
     };
 
     if constexpr (kFusedMap) {
-        // Reset the layout flag before publication and the fresh peer head gate.
-        if (blockIdx.x == 0 && threadIdx.x == 0) *layout_ready = 0;
-        dispatch_pull_map_publish(cached_cnt_rows ? nullptr : own_row, own_topk_snapshot, meta_ptrs, meta_stride,
-            topk_off_bytes, tokens_per_rank, top_k, my_rank, lsa_team_size);
-        __syncthreads();
-        lsa_grid_head_gate(dcomm, head_sync_flag, 2);
+        // When unfused, a standalone publish kernel and head-sync kernel already did this.
+        if (!unfused_sync) {
+            constexpr int kMapReady = 2;
+            dispatch_pull_map_publish_grid(cached_cnt_rows ? nullptr : own_row, own_topk_snapshot,
+                meta_ptrs, meta_stride, topk_off_bytes, tokens_per_rank, top_k, my_rank,
+                lsa_team_size);
+            const bool head_leader = elect_last_block(reinterpret_cast<const int*>(grid_barrier_counter),
+                                                      static_cast<int>(gridDim.x));
+            if (head_leader) {
+                if (threadIdx.x == 0) {
+                    *layout_ready = 0;
+                    atomicExch(grid_barrier_counter, 0u);
+                }
+                // Reset the slot cursors (and the trailing arrival counter) before any block claims.
+                for (int i = threadIdx.x; i < lsa_team_size; i += blockDim.x) {
+                    rank_cursor[i] = 0;
+                }
+                for (int i = threadIdx.x; i <= experts_per_rank; i += blockDim.x) {
+                    expert_cursor[i] = 0;
+                }
+            }
+            lsa_grid_head_gate_elected(dcomm, head_sync_flag, head_leader, kMapReady);
+        }
     } else if (!unfused_sync) {
         lsa_grid_head_gate(dcomm, head_sync_flag);
     }
@@ -7193,21 +7545,26 @@ __device__ __forceinline__ void dispatch_pull(
             dispatch_pull_map_warp(
                 topk_off_bytes, recv_slot_to_src, srcpos_map, flat2em_slot_map,
                 num_recv_tokens_dev, expert_token_offsets, per_expert_counts_active, rank_cursor,
-                expert_cursor, layout_ready, s_map_base, s_map_expert_total,
-                s_map_expert_base, layout_slot_base, layout_expert_base, top_k, experts_per_rank,
+                expert_cursor, layout_ready, s_map_base, s_map_expert_base, top_k, experts_per_rank,
                 lsa_team_size, tokens_per_rank, my_rank,
                 max_recv_tokens_per_rank, flat_recv_capacity, em_alignment, allow_overflow_drop,
                 caller_offsets, caller_counts, caller_recv_total, caller_out_is_int64,
                 map_idx, lane, own_meta_staging, meta_stride, s_chunk_ranges, s_chunks_ready,
                 cached_cnt_rows);
-        } else {
-            while (nccl_ep::ld_acquire_sys_global(layout_ready) == 0) {}
+        } else if (is_pad) {
+            if (lane == 0) {
+                while (nccl_ep::ld_acquire_sys_global(layout_ready) == 0) {
+                }
+            }
+            __syncwarp();
         }
     }
 
-    const int num_recv = *num_recv_tokens_dev;
-    const int64_t em_padded_total = expert_token_offsets[experts_per_rank];
-    EP_DEVICE_ASSERT(caller_num_recv_tokens >= em_padded_total);
+    // Fused map: each block holds the layout in smem; only the pad warps wait for the global outputs.
+    if (!kFusedMap || is_pad) {
+        const int64_t em_padded_total = expert_token_offsets[experts_per_rank];
+        EP_DEVICE_ASSERT(caller_num_recv_tokens >= em_padded_total);
+    }
 
     if (is_pad) {
         dispatch_pull_pad_fill<HiddenInt4, kFwd, kPullDispatchThreadsPerSlot, kPullDispatchPadWarps>(
@@ -7246,6 +7603,7 @@ __device__ __forceinline__ void dispatch_pull(
                 }
             }
         } else {
+            const int num_recv = *num_recv_tokens_dev;
             const int num_waves = (num_recv + kNWarps - 1) / kNWarps;
             for (int wave = 0; wave < num_waves; ++wave) {
                 const int token = gwarp * num_waves + wave;
@@ -7533,7 +7891,27 @@ __host__ __device__ constexpr int comb_stage_stride_bytes(int row_bytes, bool re
 // also scatters input weights into peer prob staging. NONE recipe, single LSA team only.
 // ============================================================================
 
+// Exact n / divisor for 0 <= n < 2^31 by multiply-high; g < 0 falls back to decode_src.
+struct tokens_fast_div_t {
+    uint32_t divisor;
+    uint32_t magic;
+    uint32_t shift;
+};
+__host__ __device__ inline tokens_fast_div_t make_tokens_fast_div(uint32_t divisor) {
+    uint32_t shift = 0;
+    while ((1ull << shift) < divisor) ++shift;
+    return {divisor, static_cast<uint32_t>(((1ull << 32) * ((1ull << shift) - divisor)) / divisor + 1), shift};
+}
+__device__ __forceinline__ decoded_src_t decode_src_fast(int32_t g, const tokens_fast_div_t& fd, int lsa_team_size) {
+    if (g < 0) return decode_src(g, static_cast<int>(fd.divisor), lsa_team_size);
+    const uint32_t n = static_cast<uint32_t>(g);
+    const uint32_t q = (__umulhi(n, fd.magic) + n) >> fd.shift;
+    const uint32_t team = static_cast<uint32_t>(lsa_team_size);
+    return {static_cast<int>(q < team ? q : q % team), static_cast<int>(n - q * fd.divisor)};
+}
+
 struct combine_push_param_t {
+    bool flat;
     // Output: per-attn-rank staging bases (peer-writable); reduced row lands at [t*team_size + R].
     void* peer_staging_ptrs[kPullMaxLsaRanks];   // [lsa_team_size]
     // Inputs
@@ -7561,8 +7939,14 @@ struct combine_push_param_t {
 
 // One recv slot per warp (kSlotsPerBlock in parallel), identical
 // gather-reduce to local_permute_reduce; the reduced row is assembled in a per-warp smem buffer
-// and pushed to the remote destination staging slot [t*team_size + R] with one whole-row TMA store.
-template <int MaxTopK, int HiddenInt4, ncclDataType_t kTokenDtype, bool BACKWARD_COMBINE = false>
+// and pushed to the remote destination staging slot [t*team_size + R], one TMA store per row
+// chunk (see combine_push_buf_int4).
+//   kChunkSize - chunk width in int4 (combine_push_chunk_size, resolved host-side in
+//                launch_combine_push); a chunk covering the whole row takes the single-chunk path,
+//                whose prefetch-pipelined reduce needs extra registers. The multi-chunk path stays
+//                register-frugal and relies on high occupancy to hide gather latency.
+template <int MaxTopK, int HiddenInt4, ncclDataType_t kTokenDtype, bool BACKWARD_COMBINE = false,
+          int kChunkSize = 0>
 __device__ __forceinline__ void combine_push(
     void* const* __restrict__ peer_staging_ptrs,
     const uint8_t* __restrict__ recv_x_em,
@@ -7601,9 +7985,10 @@ __device__ __forceinline__ void combine_push(
     __shared__ int32_t smem_flat2em_slot_map[kCombinePushMaxSlots][MaxTopK];
     __shared__ int s_nvalid[kCombinePushMaxSlots];
     __shared__ int4* s_dst[kCombinePushMaxSlots];
-    // Per-warp mbarrier for the opt-in TMA-load source relay (single-copy fast path).
+    // Per-warp mbarrier for the single-chunk path's opt-in TMA-load source relay (n==1 fast path,
+    // see below). Unused (but still reserved, see combine_push_slots_per_block) when !kSingleChunk.
     __shared__ uint64_t s_mbar[kCombinePushMaxSlots];
-    // Dynamic smem: one row buffer per warp for the TMA push (each HiddenInt4 int4).
+    // Dynamic smem: one per-warp chunk buffer for the TMA push (kBufInt4 int4 each).
     int4* const s_rows = reinterpret_cast<int4*>(smem_bytes);
     // Backward co-locates the prob in the token staging row's trailing pad (offset kRowBytes),
     // so no separate prob destination is needed.
@@ -7611,8 +7996,10 @@ __device__ __forceinline__ void combine_push(
     const int tid = threadIdx.x;
     const int slot_in_block = tid / kThreadsPerSlot;
     const int wlane = tid % kThreadsPerSlot;
-    // This warp's row staging buffer: [slot_in_block][HiddenInt4].
-    int4* const my_row = s_rows + static_cast<size_t>(slot_in_block) * HiddenInt4;
+    // This warp's push staging buffer (one chunk of the row).
+    constexpr int kBufInt4 = combine_push_buf_int4(HiddenInt4, kChunkSize);
+    constexpr bool kSingleChunk = combine_push_num_chunks(HiddenInt4, kChunkSize) == 1;
+    int4* const my_row = s_rows + static_cast<size_t>(slot_in_block) * kBufInt4;
 
     const int num_recv = *num_recv_tokens_dev;
     // Contiguous per-warp range with SM-spread global ordering: consecutive global warps land on
@@ -7629,9 +8016,22 @@ __device__ __forceinline__ void combine_push(
 
     // TMA-load relay: init this warp's mbarrier once (1 arrival: the load's complete_tx).
     uint32_t mbar_phase = 0;
-    if (wlane == 0) nccl_ep::mbarrier_init(&s_mbar[slot_in_block], 1);
-    nccl_ep::fence_barrier_init();
+    if constexpr (kSingleChunk) {
+        if (wlane == 0) nccl_ep::mbarrier_init(&s_mbar[slot_in_block], 1);
+        nccl_ep::fence_barrier_init();
+    }
     __syncthreads();
+
+    const tokens_fast_div_t tokens_div = make_tokens_fast_div(static_cast<uint32_t>(tokens_per_rank));
+    // Next slot's routing metadata is loaded one wave ahead to hide its latency.
+    int32_t next_s = -1;
+    int32_t next_g = 0;
+    auto load_meta = [&](int sl, bool want) {
+        const bool ok = want && sl < num_recv;
+        next_s = (ok && wlane < top_k) ? __ldg(flat2em_slot_map + static_cast<size_t>(sl) * top_k + wlane) : -1;
+        next_g = (ok && wlane == 0) ? __ldg(recv_slot_to_src + sl) : 0;
+    };
+    load_meta(slot_start, num_per_warp > 0);
 
     for (int wave = 0; wave < num_per_warp; ++wave) {
         const int slot = slot_start + wave;
@@ -7644,8 +8044,7 @@ __device__ __forceinline__ void combine_push(
         int32_t prob_p = -1;
         float prob_w = 0.0f;
         if (slot_valid && wlane < 32) {
-            const int32_t* slot_row_global = flat2em_slot_map + static_cast<size_t>(slot) * top_k;
-            const int32_t s = (wlane < top_k) ? __ldg(slot_row_global + wlane) : -1;
+            const int32_t s = next_s;
             EP_DEVICE_ASSERT(s < caller_num_recv_tokens);
             if constexpr (BACKWARD_COMBINE) {
                 if (wlane < top_k && s >= 0) {
@@ -7659,8 +8058,7 @@ __device__ __forceinline__ void combine_push(
             if (wlane == 0) {
                 s_nvalid[slot_in_block] = __popc(valid);
                 // Decode the destination attn (rank, token) this recv slot returns to.
-                const int32_t g = recv_slot_to_src[slot];
-                const decoded_src_t dst_id = decode_src(g, tokens_per_rank, lsa_team_size);
+                const decoded_src_t dst_id = decode_src_fast(next_g, tokens_div, lsa_team_size);
                 const int dst_rank = dst_id.rank;
                 const int t = dst_id.token;
                 const int64_t dst_row = static_cast<int64_t>(t) * lsa_team_size + my_lsa_rank;
@@ -7670,6 +8068,7 @@ __device__ __forceinline__ void combine_push(
             }
         }
         __syncwarp();
+        load_meta(slot + 1, wave + 1 < num_per_warp);
 
         if (slot_valid) {
             const int n = s_nvalid[slot_in_block];
@@ -7688,93 +8087,166 @@ __device__ __forceinline__ void combine_push(
                 return (tile * kHiddenVec + u) < kElemsPerThread && src_j(tile, u) < HiddenInt4;
             };
 
-            // Single-copy relay: TMA-load the one source row straight into the smem buffer.
-            bool filled = false;
-            if (n == 1) {
-                const int32_t em0 = smem_flat2em_slot_map[slot_in_block][0];
-                const int4* src0 =
-                    reinterpret_cast<const int4*>(recv_x_em + static_cast<size_t>(em0) * kRowBytes);
-                if (wlane == 0) {
-                    nccl_ep::mbarrier_arrive_and_expect_tx(&s_mbar[slot_in_block], kRowBytes);
-                    nccl_ep::tma_load_1d(my_row, src0, &s_mbar[slot_in_block], kRowBytes);
-                }
-                nccl_ep::mbarrier_wait(&s_mbar[slot_in_block], mbar_phase);
-                filled = true;
-            }
+            // First int4 index of tile t, clamped to the row width.
+            auto tile_j = [&](int t) { const int j = t * kHiddenVec * kThreadsPerSlot; return j < HiddenInt4 ? j : HiddenInt4; };
 
-            if (!filled) {
-            // Software-pipelined push: prefetch the next tile's first em copy so its read
-            // overlaps the posted writes. Registers stay bounded regardless of top_k.
-            int4 pf_a[kHiddenVec], pf_b[kHiddenVec];
-            int4* pf_cur = pf_a;
-            int4* pf_nxt = pf_b;
-            auto load_copy0 = [&](int tile, int4* pf) {
-                const int32_t em0 = smem_flat2em_slot_map[slot_in_block][0];
-                const int4* src =
-                    reinterpret_cast<const int4*>(recv_x_em + static_cast<size_t>(em0) * kRowBytes);
-#pragma unroll
-                for (int u = 0; u < kHiddenVec; u++)
-                    if (tile_valid(tile, u)) pf[u] = src[src_j(tile, u)];
-            };
-            if (n > 0) load_copy0(0, pf_cur);
-#pragma unroll
-            for (int tile = 0; tile < kNTiles; tile++) {
-                float2 acc[kHiddenVec][4];
-#pragma unroll
-                for (int u = 0; u < kHiddenVec; u++)
-#pragma unroll
-                    for (int p = 0; p < 4; p++) { acc[u][p].x = 0.0f; acc[u][p].y = 0.0f; }
-                if (n > 1) {  // accumulate copy 0 only when more copies follow
-#pragma unroll
-                    for (int u = 0; u < kHiddenVec; u++) {
-                        if (!tile_valid(tile, u)) continue;
-#pragma unroll
-                        for (int p = 0; p < kPairs; p++) {
-                            float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&pf_cur[u], p);
-                            acc[u][p].x += f.x;
-                            acc[u][p].y += f.y;
-                        }
+            // Chunked staging, kNumChunks iterations per token:
+            //   - reduce the chunk's tiles into the smem buffer (n copies summed per tile)
+            //   - push the chunk with one TMA store
+            //   - reuse the same buffer for the next chunk
+            // No copy-0 prefetch: at this occupancy the warps hide the gather latency, and dropping
+            // it frees registers for the tighter per-thread budget. The reuse-wait (tma_store_wait
+            // below) is hidden by other warps' concurrent gathers at this occupancy, not by this
+            // warp's own next chunk. n==1 folds through the same reduce (lossless for finite values;
+            // NaN payload/-0 sign are not preserved through the float round-trip).
+            // combine_push_tile_int4 must match the tile size the kernel computes here.
+            static_assert(kHiddenVec * kThreadsPerSlot == combine_push_tile_int4(HiddenInt4));
+            static_assert(kNTiles == combine_push_ntiles(HiddenInt4));
+            constexpr int kChunkTiles = kBufInt4 / (kHiddenVec * kThreadsPerSlot);
+            constexpr int kNumChunks = combine_push_num_chunks(HiddenInt4, kChunkSize);
+            if constexpr (kSingleChunk) {
+                // Single-copy relay: TMA-load the one source row straight into the smem buffer,
+                // bypassing the register round-trip below entirely. n==1 dominates at high EP
+                // (mean valid-copies per slot ~= top_k / lsa_team_size), so this matters more as
+                // EP grows even though it's a small win at low EP.
+                bool filled = false;
+                if (n == 1) {
+                    const int32_t em0 = smem_flat2em_slot_map[slot_in_block][0];
+                    const int4* src0 =
+                        reinterpret_cast<const int4*>(recv_x_em + static_cast<size_t>(em0) * kRowBytes);
+                    if (wlane == 0) {
+                        nccl_ep::mbarrier_arrive_and_expect_tx(&s_mbar[slot_in_block], kRowBytes);
+                        nccl_ep::tma_load_1d(my_row, src0, &s_mbar[slot_in_block], kRowBytes);
                     }
+                    nccl_ep::mbarrier_wait(&s_mbar[slot_in_block], mbar_phase);
+                    filled = true;
                 }
-                if (tile + 1 < kNTiles && n > 0) load_copy0(tile + 1, pf_nxt);  // prefetch
-                for (int k = 1; k < n; k++) {  // remaining copies loaded inline
-                    const int32_t em_slot = smem_flat2em_slot_map[slot_in_block][k];
+                if (!filled) {
+                // Whole row in one chunk: no multi-chunk occupancy to hide the gather latency,
+                // so pipeline copy 0's load with the previous tile's accumulate/store instead.
+                int4 pf_a[kHiddenVec], pf_b[kHiddenVec];
+                int4* pf_cur = pf_a;
+                int4* pf_nxt = pf_b;
+                auto load_copy0 = [&](int tile, int4* pf) {
+                    const int32_t em0 = smem_flat2em_slot_map[slot_in_block][0];
                     const int4* src =
-                        reinterpret_cast<const int4*>(recv_x_em + static_cast<size_t>(em_slot) * kRowBytes);
+                        reinterpret_cast<const int4*>(recv_x_em + static_cast<size_t>(em0) * kRowBytes);
+#pragma unroll
+                    for (int u = 0; u < kHiddenVec; u++)
+                        if (tile_valid(tile, u)) pf[u] = src[src_j(tile, u)];
+                };
+                if (n > 0) load_copy0(0, pf_cur);
+                for (int tile = 0; tile < kNTiles; tile++) {
+                    float2 acc[kHiddenVec][4];
+#pragma unroll
+                    for (int u = 0; u < kHiddenVec; u++)
+#pragma unroll
+                        for (int p = 0; p < 4; p++) { acc[u][p].x = 0.0f; acc[u][p].y = 0.0f; }
+                    if (n > 0) {
+#pragma unroll
+                        for (int u = 0; u < kHiddenVec; u++) {
+                            if (!tile_valid(tile, u)) continue;
+#pragma unroll
+                            for (int p = 0; p < kPairs; p++) {
+                                float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&pf_cur[u], p);
+                                acc[u][p].x += f.x;
+                                acc[u][p].y += f.y;
+                            }
+                        }
+                    }
+                    if (tile + 1 < kNTiles && n > 0) load_copy0(tile + 1, pf_nxt);  // prefetch
+                    for (int k = 1; k < n; k++) {
+                        const int32_t em_slot = smem_flat2em_slot_map[slot_in_block][k];
+                        const int4* src =
+                            reinterpret_cast<const int4*>(recv_x_em + static_cast<size_t>(em_slot) * kRowBytes);
+#pragma unroll
+                        for (int u = 0; u < kHiddenVec; u++) {
+                            if (!tile_valid(tile, u)) continue;
+                            int4 b = src[src_j(tile, u)];
+#pragma unroll
+                            for (int p = 0; p < kPairs; p++) {
+                                float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&b, p);
+                                acc[u][p].x += f.x;
+                                acc[u][p].y += f.y;
+                            }
+                        }
+                    }
 #pragma unroll
                     for (int u = 0; u < kHiddenVec; u++) {
                         if (!tile_valid(tile, u)) continue;
-                        int4 b = src[src_j(tile, u)];
-#pragma unroll
-                        for (int p = 0; p < kPairs; p++) {
-                            float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&b, p);
-                            acc[u][p].x += f.x;
-                            acc[u][p].y += f.y;
-                        }
-                    }
-                }
-#pragma unroll
-                for (int u = 0; u < kHiddenVec; u++) {
-                    if (!tile_valid(tile, u)) continue;
-                    int4 out;
-                    if (n == 1) {  // single copy: relay verbatim, no repack
-                        out = pf_cur[u];
-                    } else {
+                        // n == 1 is handled by the TMA relay above, so n >= 2 here: always repack.
+                        int4 out;
 #pragma unroll
                         for (int p = 0; p < kPairs; p++)
                             nccl_ep::st_token_pair<kTokenDtype>(&out, p, acc[u][p]);
+                        my_row[src_j(tile, u)] = out;
                     }
-                    my_row[src_j(tile, u)] = out;  // assemble reduced row in smem
+                    int4* tmp = pf_cur; pf_cur = pf_nxt; pf_nxt = tmp;
                 }
-                int4* tmp = pf_cur; pf_cur = pf_nxt; pf_nxt = tmp;
+                }  // end if (!filled): scalar reduce path
+                nccl_ep::tma_store_fence();
+                __syncwarp();
+                if (wlane == 0) nccl_ep::tma_store_1d(my_row, dst_int4, kRowBytes);
+            } else {
+            for (int chunk = 0; chunk < kNumChunks; chunk++) {
+                const int tile0 = chunk * kChunkTiles;
+                const int tile1 = tile0 + kChunkTiles < kNTiles ? tile0 + kChunkTiles : kNTiles;
+                const int base_j = tile_j(tile0);
+                const int end_j = tile_j(tile1);
+                if (chunk > 0 && wlane == 0) nccl_ep::tma_store_wait<0>();  // reuse buffer after prior chunk push
+                __syncwarp();
+                for (int tile = tile0; tile < tile1; tile++) {
+                    const int32_t* const f2e = smem_flat2em_slot_map[slot_in_block];
+                    float2 acc[kHiddenVec][4];
+#pragma unroll
+                    for (int u = 0; u < kHiddenVec; u++)
+#pragma unroll
+                        for (int p = 0; p < 4; p++) { acc[u][p].x = 0.0f; acc[u][p].y = 0.0f; }
+                    // Copies in ascending order; each batch's loads are all issued before any is summed.
+                    constexpr int kCopyBatch = 8 / kHiddenVec;
+#pragma unroll
+                    for (int kb = 0; kb < MaxTopK; kb += kCopyBatch) {
+                        if (kb > 0 && kb >= n) break;
+                        int4 b[kCopyBatch][kHiddenVec];
+#pragma unroll
+                        for (int kk = 0; kk < kCopyBatch; kk++) {
+                            if (kb + kk >= n) continue;
+                            const int4* src = reinterpret_cast<const int4*>(
+                                recv_x_em + static_cast<size_t>(f2e[kb + kk]) * kRowBytes);
+#pragma unroll
+                            for (int u = 0; u < kHiddenVec; u++)
+                                if (tile_valid(tile, u)) b[kk][u] = src[src_j(tile, u)];
+                        }
+#pragma unroll
+                        for (int kk = 0; kk < kCopyBatch; kk++) {
+                            if (kb + kk >= n) continue;
+#pragma unroll
+                            for (int u = 0; u < kHiddenVec; u++) {
+                                if (!tile_valid(tile, u)) continue;
+#pragma unroll
+                                for (int p = 0; p < kPairs; p++) {
+                                    float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&b[kk][u], p);
+                                    acc[u][p].x += f.x;
+                                    acc[u][p].y += f.y;
+                                }
+                            }
+                        }
+                    }
+#pragma unroll
+                    for (int u = 0; u < kHiddenVec; u++) {
+                        if (!tile_valid(tile, u)) continue;
+                        int4 out;
+#pragma unroll
+                        for (int p = 0; p < kPairs; p++)
+                            nccl_ep::st_token_pair<kTokenDtype>(&out, p, acc[u][p]);
+                        my_row[src_j(tile, u) - base_j] = out;
+                    }
+                }
+                nccl_ep::tma_store_fence();
+                __syncwarp();
+                if (wlane == 0) nccl_ep::tma_store_1d(my_row, dst_int4 + base_j, (end_j - base_j) * 16);
             }
-            }  // end if (!filled): scalar reduce path
-
-            // Push the row. The proxy fence makes the scalar smem writes visible to the async
-            // (TMA) proxy read.
-            nccl_ep::tma_store_fence();
-            __syncwarp();
-            if (wlane == 0) nccl_ep::tma_store_1d(my_row, dst_int4, kRowBytes);
+            }
 
             // Backward: store the prefetched weight to its srcpos in this (t,R) token row's trailing
             // pad (co-located, one remote write per slot), after the token push has hidden the load.
@@ -7799,6 +8271,9 @@ __device__ __forceinline__ void combine_push(
 }
 
 struct combine_reduce_param_t {
+    // Optional scan-built [source token, destination rank] map. Negative means
+    // the receiver dropped the contribution; never read its stale staging row.
+    const int32_t* retained_slots;
     // Outputs
     void* attn_output;                // [num_combined_tokens, hidden]
     float* combined_topk_weights;     // backward-only: [num_combined_tokens, top_k] gathered weights
@@ -7820,7 +8295,8 @@ struct combine_reduce_param_t {
 // [t*team_size + 0..team_size) into attn_output[t]. Which partials exist is derived from
 // this rank's own routing (topk_idx): token t has a partial from rank R iff one of its
 // top-k experts lives on R -- unwritten slots are skipped (no staging zero-init needed).
-template <int HiddenInt4, ncclDataType_t kTokenDtype, bool BACKWARD_COMBINE = false>
+template <int HiddenInt4, ncclDataType_t kTokenDtype, bool BACKWARD_COMBINE,
+          bool CheckRetained, bool Flat>
 __device__ __forceinline__ void combine_reduce(
     uint8_t* __restrict__ attn_output,
     const uint8_t* __restrict__ staging,
@@ -7832,16 +8308,25 @@ __device__ __forceinline__ void combine_reduce(
     int lsa_team_size,
     int /*row_bytes*/,
     // Backward-only: gather each srcpos weight from the token staging pad into combined_topk_weights.
-    float* __restrict__ combined_topk_weights = nullptr,
-    int top_k = 0) {
+    float* __restrict__ combined_topk_weights,
+    int top_k,
+    const int32_t* retained_slots) {
     constexpr int kRowBytes = HiddenInt4 * 16;
-    constexpr int kThreadsPerSlot = 128;
-    constexpr int kSlotsPerBlock = kLocalPermuteReduceSlotsPerBlock;
-    constexpr int kElemsPerThread = (HiddenInt4 + kThreadsPerSlot - 1) / kThreadsPerSlot;
+    // Flat spreads small batches across CTAs with four warps per token.
+    constexpr int kThreadsPerSlot = Flat
+        ? kLocalPermuteReduceThreads / kLocalPermuteReduceSlotsPerBlock : 32;
+    constexpr int kSlotsPerBlock = Flat ? kLocalPermuteReduceSlotsPerBlock : kCombineReduceSlotsPerBlock;
+    constexpr int kElemsPerThread = nccl_ep::ceil_div(HiddenInt4, kThreadsPerSlot);
+    constexpr int kFlatUnroll = kElemsPerThread < 4 ? kElemsPerThread : 4;
+    constexpr int kUnroll = Flat ? kFlatUnroll : kCombineReduceUnroll;
+    constexpr int kRankGroup = Flat ? 1 : kCombineReduceRankGroup;
+    constexpr int kChunkInt4 = kUnroll * kThreadsPerSlot;
+    constexpr int kNumChunks = nccl_ep::ceil_div(HiddenInt4, kChunkInt4);
+    constexpr bool kExactChunks = (HiddenInt4 % kChunkInt4) == 0;
+    constexpr int kPairs = nccl_ep::pairs_per_int4<kTokenDtype>();
 
     const int tid = threadIdx.x;
     const int slot_in_block = tid / kThreadsPerSlot;
-    const int slot_thread = tid % kThreadsPerSlot; // thread index within its slot (0..kThreadsPerSlot), not a warp lane
     const int slot_stride = kSlotsPerBlock * static_cast<int>(gridDim.x);
 
     // One expert per warp lane, so num_topk must fit the warp width.
@@ -7861,10 +8346,16 @@ __device__ __forceinline__ void combine_reduce(
         // one team; multi-team would need the global expert count and a team-aware decode. Out-of-range
         // / sentinel ids drop. Each warp lane holds one expert (num_topk <= MAX_NUM_TOPK).
         const int wlane = static_cast<int>(threadIdx.x) & 31;
+        const int slot_thread = Flat ? tid % kThreadsPerSlot : wlane;
         const int e_id = (wlane < num_topk)
                              ? static_cast<int>(topk_idx[static_cast<size_t>(t) * num_topk + wlane])
                              : -1;
-        const bool rank_valid = (e_id >= 0) && (e_id < experts_per_lsa_team);
+        const bool routed = (e_id >= 0) && (e_id < experts_per_lsa_team);
+        bool rank_valid = routed;
+        if constexpr (CheckRetained) {
+            rank_valid = routed &&
+                retained_slots[static_cast<size_t>(t) * lsa_team_size + e_id / experts_per_rank] >= 0;
+        }
         const int src_rank_of_lane = rank_valid ? (e_id / experts_per_rank) : -1;
         const unsigned same_rank = __match_any_sync(0xFFFFFFFFu, src_rank_of_lane);
         const bool rank_leader = rank_valid && ((__ffs(static_cast<int>(same_rank)) - 1) == wlane);
@@ -7888,56 +8379,66 @@ __device__ __forceinline__ void combine_reduce(
 
         int4* dst_int4 = reinterpret_cast<int4*>(attn_output + static_cast<size_t>(t) * kRowBytes);
         const size_t base_row = static_cast<size_t>(t) * lsa_team_size;
+        const size_t stage_stride = comb_stage_stride_bytes(kRowBytes, BACKWARD_COMBINE);
 
-        constexpr int kHiddenVec = (kElemsPerThread < 4) ? kElemsPerThread : 4;
-        for (int nn_base = 0; nn_base < kElemsPerThread; nn_base += kHiddenVec) {
-            int js[kHiddenVec];
-            bool valid_u[kHiddenVec];
+#pragma unroll 1
+        for (int c = 0; c < kNumChunks; c++) {
+            int js[kUnroll];
+            bool valid_u[kUnroll];
 #pragma unroll
-            for (int u = 0; u < kHiddenVec; u++) {
-                const int nn = nn_base + u;
-                js[u] = slot_thread + nn * kThreadsPerSlot;
-                valid_u[u] = (nn < kElemsPerThread) && (js[u] < HiddenInt4);
+            for (int u = 0; u < kUnroll; u++) {
+                js[u] = (c * kUnroll + u) * kThreadsPerSlot + slot_thread;
+                valid_u[u] = kExactChunks || (js[u] < HiddenInt4);
             }
 
-            float2 acc[kHiddenVec][4];
+            float2 acc[kUnroll][kPairs];
 #pragma unroll
-            for (int u = 0; u < kHiddenVec; u++) {
+            for (int u = 0; u < kUnroll; u++) {
 #pragma unroll
-                for (int p = 0; p < 4; p++) {
+                for (int p = 0; p < kPairs; p++) {
                     acc[u][p].x = 0.0f;
                     acc[u][p].y = 0.0f;
                 }
             }
 
-            for (unsigned bl = present_ranks; bl != 0u; bl &= (bl - 1u)) {
-                const int r = __shfl_sync(0xFFFFFFFFu, src_rank_of_lane, __ffs(static_cast<int>(bl)) - 1);
-                const int4* src =
-                    reinterpret_cast<const int4*>(staging + (base_row + r) *
-                        comb_stage_stride_bytes(kRowBytes, BACKWARD_COMBINE));
-                int4 buf[kHiddenVec];
+            unsigned bl = present_ranks;
+            while (bl != 0u) {
+                int4 buf[kRankGroup][kUnroll];
+                bool have[kRankGroup];
 #pragma unroll
-                for (int u = 0; u < kHiddenVec; u++) {
-                    if (valid_u[u]) buf[u] = src[js[u]];
+                for (int g = 0; g < kRankGroup; g++) {
+                    const int lead = __ffs(static_cast<int>(bl)) - 1;
+                    have[g] = lead >= 0;
+                    const int r = __shfl_sync(0xFFFFFFFFu, src_rank_of_lane, have[g] ? lead : 0);
+                    bl &= (bl - 1u);
+                    if (have[g]) {
+                        const int4* src = reinterpret_cast<const int4*>(staging + (base_row + r) * stage_stride);
+#pragma unroll
+                        for (int u = 0; u < kUnroll; u++) {
+                            if (valid_u[u]) buf[g][u] = src[js[u]];
+                        }
+                    }
                 }
 #pragma unroll
-                for (int u = 0; u < kHiddenVec; u++) {
-                    if (!valid_u[u]) continue;
-                    constexpr int kPairs = nccl_ep::pairs_per_int4<kTokenDtype>();
+                for (int g = 0; g < kRankGroup; g++) {
+                    if (!have[g]) continue;
 #pragma unroll
-                    for (int p = 0; p < kPairs; p++) {
-                        float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&buf[u], p);
-                        acc[u][p].x += f.x;
-                        acc[u][p].y += f.y;
+                    for (int u = 0; u < kUnroll; u++) {
+                        if (!valid_u[u]) continue;
+#pragma unroll
+                        for (int p = 0; p < kPairs; p++) {
+                            float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&buf[g][u], p);
+                            acc[u][p].x += f.x;
+                            acc[u][p].y += f.y;
+                        }
                     }
                 }
             }
 
 #pragma unroll
-            for (int u = 0; u < kHiddenVec; u++) {
+            for (int u = 0; u < kUnroll; u++) {
                 if (!valid_u[u]) continue;
                 int4 out;
-                constexpr int kPairs = nccl_ep::pairs_per_int4<kTokenDtype>();
 #pragma unroll
                 for (int p = 0; p < kPairs; p++) {
                     nccl_ep::st_token_pair<kTokenDtype>(&out, p, acc[u][p]);
@@ -7948,6 +8449,489 @@ __device__ __forceinline__ void combine_reduce(
     }
 }
 
+// Flat receive rows contain local experts in ascending order. One 32-bit entry
+// records both the expert and its original top-k position; -1 marks the tail.
+// Kept with the handle so backward combine never consults another handle's routing.
+__host__ __device__ constexpr int32_t flat_route_pack(int expert, int source_pos) {
+    return expert * MAX_NUM_TOPK + source_pos;
+}
+__host__ __device__ constexpr int flat_route_expert(int32_t route) {
+    return route / MAX_NUM_TOPK;
+}
+__host__ __device__ constexpr int flat_route_source_pos(int32_t route) {
+    return route % MAX_NUM_TOPK;
+}
+
+// Counts occupy the prefix of each published row, followed by packed top-k.
+// Flat appends [source chunk, destination rank] counts to the EM count prefix.
+__device__ __forceinline__ const int32_t* flat_count_row(const dispatch_pull_param_t& p, int source) {
+    if (p.cached_cnt_rows != nullptr) {
+        return p.cached_cnt_rows + static_cast<size_t>(source) * (p.topk_off_bytes / sizeof(int32_t));
+    }
+    return reinterpret_cast<const int32_t*>(p.own_meta_staging +
+        static_cast<size_t>(source) * pull_meta_stride(p.topk_off_bytes, p.tokens_per_rank));
+}
+
+template <bool FusedMap>
+__device__ __forceinline__ void flat_dispatch_head(const dispatch_pull_param_t& p) {
+    if (p.unfused_sync) {
+        return;
+    }
+    if constexpr (FusedMap) {
+        dispatch_pull_map_publish_grid(p.cached_cnt_rows ? nullptr : p.own_row, p.own_topk_snapshot,
+            p.meta_ptrs, pull_meta_stride(p.topk_off_bytes, p.tokens_per_rank), p.topk_off_bytes,
+            p.tokens_per_rank, p.top_k, p.my_rank, p.lsa_team_size);
+        const bool leader = elect_last_block(reinterpret_cast<const int*>(p.grid_barrier_counter),
+                                             static_cast<int>(gridDim.x));
+        if (leader && threadIdx.x == 0) {
+            atomicExch(p.grid_barrier_counter, 0u);
+        }
+        lsa_grid_head_gate_elected(p.dcomm, p.head_sync_flag, leader, 2);
+    } else {
+        lsa_grid_head_gate(p.dcomm, p.head_sync_flag);
+    }
+}
+
+__device__ __forceinline__ int flat_receive_count(const dispatch_pull_param_t& p, int* shared_total) {
+    if (threadIdx.x == 0) {
+        int total = 0;
+        for (int r = 0; r < p.lsa_team_size; ++r) {
+            total += flat_count_row(p, r)[p.my_rank];
+        }
+        if (total > p.flat_recv_capacity && !p.allow_overflow_drop) {
+            printf("ncclEpDispatch: flat pull recv tokens %d exceed capacity %d\n", total, p.flat_recv_capacity);
+            __trap();
+        }
+        *shared_total = min(total, p.flat_recv_capacity);
+        if (blockIdx.x == 0) {
+            *p.num_recv_tokens_dev = *shared_total;
+            if (p.caller_recv_total != nullptr) {
+                if (p.caller_out_is_int64) {
+                    *static_cast<int64_t*>(p.caller_recv_total) = total;
+                } else {
+                    *static_cast<int32_t*>(p.caller_recv_total) = total;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    return *shared_total;
+}
+
+// Warp-collective prefix for a source chunk at one destination. Chunk counts
+// preserve source-token order without per-token global atomics or a grid barrier.
+__device__ __forceinline__ int flat_chunk_base(
+    const dispatch_pull_param_t& p, int source, int chunk, int destination, int lane) {
+    int prefix = 0;
+    for (int r = lane; r < source; r += 32) {
+        prefix += flat_count_row(p, r)[destination];
+    }
+    const int32_t* chunks = flat_count_row(p, source) + p.lsa_team_size * (p.experts_per_rank + 1);
+    for (int c = lane; c < chunk; c += 32) {
+        prefix += chunks[static_cast<size_t>(c) * p.lsa_team_size + destination];
+    }
+    for (int d = 16; d > 0; d /= 2) {
+        prefix += __shfl_down_sync(0xffffffffu, prefix, d);
+    }
+    return __shfl_sync(0xffffffffu, prefix, 0);
+}
+
+template <int Warps>
+__device__ __forceinline__ void flat_map_barrier() {
+    // Only MAP threads participate. Order both shared prefix scratch and global
+    // routing writes before the leader publishes readiness to payload warps.
+    nccl_ep::named_barrier_sync(kPullMapBarrierId, Warps * 32);
+}
+
+// Preserve local-expert order and original top-k positions in one pass.
+template <int TopK, bool Receiver>
+__device__ __forceinline__ int flat_token_routes(
+    const uint16_t* routes, int token, int first_expert, int experts_per_rank, int* hits) {
+    int count = 0;
+#pragma unroll
+    for (int k = 0; k < TopK; ++k) {
+        const int expert = static_cast<int>(routes[static_cast<size_t>(token) * TopK + k]) - first_expert;
+        if (expert < 0 || expert >= experts_per_rank) {
+            continue;
+        }
+        if constexpr (Receiver) {
+            const int route = flat_route_pack(expert, k);
+            // K is small and JIT-specialized. Sorted insertion preserves
+            // flat's expert ordering without scanning every local expert.
+            int i = count;
+            while (i > 0 && hits[i - 1] > route) {
+                hits[i] = hits[i - 1];
+                --i;
+            }
+            hits[i] = route;
+        }
+        ++count;
+        // Source-side DROP validity needs only destination membership.
+        if constexpr (!Receiver) {
+            break;
+        }
+    }
+    return count;
+}
+
+// The MAP warp group builds one deterministic source chunk. Receiver=true writes
+// the receive maps; false builds this source's retained destination slots for
+// DROP combine. Both use exactly the same slot arithmetic.
+template <int TopK, int ChunkTokens, int Warps, bool Receiver, bool Publish>
+__device__ __forceinline__ int2 flat_build_chunk(
+    const dispatch_pull_param_t& p, int source, int chunk, int destination,
+    int* warp_counts, int* shared_base,
+    int2* tile_ranges, unsigned* tiles_ready, unsigned first_tile) {
+    static_assert(!Publish || ChunkTokens % (Warps * 32) == 0);
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    if (warp == 0) {
+        const int base = flat_chunk_base(p, source, chunk, destination, lane);
+        if (lane == 0) {
+            *shared_base = base;
+        }
+    }
+    flat_map_barrier<Warps>();
+    const int base = *shared_base;
+    int consumed = 0;
+    const int chunk_end = (chunk + 1) * ChunkTokens;
+    const int end = min(chunk_end, p.tokens_per_rank);
+    const int first_expert = destination * p.experts_per_rank;
+    const uint16_t* routes = reinterpret_cast<const uint16_t*>(p.own_meta_staging +
+        static_cast<size_t>(source) * pull_meta_stride(p.topk_off_bytes, p.tokens_per_rank) + p.topk_off_bytes);
+    const int loop_end = Publish ? chunk_end : end;
+    for (int tile = chunk * ChunkTokens; tile < loop_end; tile += Warps * 32) {
+        const int token = tile + threadIdx.x;
+        int hits[Receiver ? TopK : 1];
+        const int count = token < end
+            ? flat_token_routes<TopK, Receiver>(routes, token, first_expert, p.experts_per_rank, hits) : 0;
+        const unsigned mask = __ballot_sync(0xffffffffu, count > 0);
+        if (lane == 0) {
+            warp_counts[warp] = __popc(mask);
+        }
+        flat_map_barrier<Warps>();
+        int prefix = consumed;
+        for (int w = 0; w < warp; ++w) {
+            prefix += warp_counts[w];
+        }
+        const int slot = base + prefix + __popc(mask & ((1u << lane) - 1));
+        if constexpr (Receiver) {
+            if (count > 0 && slot < p.flat_recv_capacity) {
+                p.recv_slot_to_src[slot] = source * p.tokens_per_rank + token;
+#pragma unroll
+                for (int k = 0; k < TopK; ++k) {
+                    p.srcpos_map[static_cast<size_t>(slot) * TopK + k] = k < count ? hits[k] : -1;
+                    if (k < count && p.caller_counts != nullptr) {
+                        atomicAdd(static_cast<int32_t*>(p.caller_counts) + flat_route_expert(hits[k]), 1);
+                    }
+                }
+            }
+        } else {
+            if (token < end) {
+                p.retained_slots[static_cast<size_t>(token) * p.lsa_team_size + destination] =
+                count > 0 && slot < p.flat_recv_capacity ? slot : -1;
+            }
+        }
+        const int tile_base = base + consumed;
+        int tile_count = 0;
+        for (int w = 0; w < Warps; ++w) {
+            tile_count += warp_counts[w];
+        }
+        consumed += tile_count;
+        // Order routing writes before publication and finish all scratch reads
+        // before the next tile. Empty tail tiles also publish a zero-sized range.
+        flat_map_barrier<Warps>();
+        if constexpr (Publish) {
+            if (threadIdx.x == 0) {
+                const unsigned unit = first_tile + (tile - chunk * ChunkTokens) / (Warps * 32);
+                tile_ranges[unit] = make_int2(tile_base, max(0, min(tile_count, p.flat_recv_capacity - tile_base)));
+                nccl_ep::st_release_block_shared(tiles_ready, unit + 1);
+            }
+        }
+    }
+    return make_int2(base, max(0, min(consumed, p.flat_recv_capacity - base)));
+}
+
+template <int HiddenInt4, bool Scales, bool ScaleTma, int ScaleInt4PerLane,
+          typename TokenStage, typename ScaleStage>
+__device__ __forceinline__ void dispatch_pull_flat_row(
+    const dispatch_pull_param_t& p, int slot, int lane,
+    TokenStage& token_stage, ScaleStage& scale_stage) {
+    const int scale_int4 = p.scale_row_bytes / 16;
+    const decoded_src_t src = decode_src(p.recv_slot_to_src[slot], p.tokens_per_rank, p.lsa_team_size);
+    token_stage.issue(static_cast<const int4*>(p.peer_input_ptrs[src.rank]) +
+                      static_cast<size_t>(src.token) * HiddenInt4);
+    int4 scale_regs[ScaleTma ? 1 : ScaleInt4PerLane];
+    if constexpr (Scales) {
+        const uint8_t* scales = static_cast<const uint8_t*>(p.peer_scale_ptrs[src.rank]) +
+                                static_cast<size_t>(src.token) * p.scale_row_bytes;
+        if constexpr (ScaleTma) {
+            scale_stage.issue(scales);
+        } else {
+#pragma unroll
+            for (int i = 0; i < ScaleInt4PerLane; ++i) {
+                const int j = lane + i * 32;
+                if (j < scale_int4) {
+                    scale_regs[i] = reinterpret_cast<const int4*>(scales)[j];
+                }
+            }
+        }
+    }
+    if (p.recv_topk_weights_em != nullptr && lane < p.top_k) {
+        const size_t out = static_cast<size_t>(slot) * p.top_k + lane;
+        const int32_t route = p.srcpos_map[out];
+        const bool valid = route >= 0;
+        p.recv_topk_weights_em[out] = valid
+            ? p.peer_weight_ptrs[src.rank][static_cast<size_t>(src.token) * p.top_k +
+                                           flat_route_source_pos(route)] : 0.0f;
+        if (p.recv_topk_idx != nullptr) {
+            p.recv_topk_idx[out] = valid ? flat_route_expert(route) + p.output_expert_base : -1;
+        }
+    }
+    token_stage.wait();
+    token_stage.store(static_cast<int4*>(p.recv_x_em) + static_cast<size_t>(slot) * HiddenInt4);
+    if constexpr (Scales) {
+        uint8_t* scales = p.recv_x_scale_em + static_cast<size_t>(slot) * p.scale_row_bytes;
+        if constexpr (ScaleTma) {
+            scale_stage.wait();
+            scale_stage.store(scales);
+        } else {
+#pragma unroll
+            for (int i = 0; i < ScaleInt4PerLane; ++i) {
+                const int j = lane + i * 32;
+                if (j < scale_int4) {
+                    reinterpret_cast<int4*>(scales)[j] = scale_regs[i];
+                }
+            }
+        }
+    }
+    bulk_wait_reads(lane);
+}
+
+template <int TopK, int ChunkTokens, int kMapWarps>
+__device__ __forceinline__ void flat_produce_maps(
+    const dispatch_pull_param_t& p, int* warp_counts, int* shared_base,
+    int2* tile_ranges, unsigned* tiles_ready) {
+    constexpr unsigned kTilesPerChunk = ChunkTokens / (kMapWarps * 32);
+    const int total_chunks = nccl_ep::ceil_div(p.tokens_per_rank, ChunkTokens) * p.lsa_team_size;
+    unsigned built = 0;
+    for (int work = blockIdx.x; work < total_chunks; work += gridDim.x) {
+        const int source = work % p.lsa_team_size;
+        const int chunk = work / p.lsa_team_size;
+        flat_build_chunk<TopK, ChunkTokens, kMapWarps, true, true>(
+            p, source, chunk, p.my_rank, warp_counts, shared_base,
+            tile_ranges, tiles_ready, built * kTilesPerChunk);
+        ++built;
+        if (p.retained_slots != nullptr) {
+            flat_build_chunk<TopK, ChunkTokens, kMapWarps, false, false>(
+                p, p.my_rank, chunk, source, warp_counts, shared_base, nullptr, nullptr, 0);
+        }
+    }
+}
+
+template <int ChunkTokens, int kMapWarps, typename ProcessSlot>
+__device__ __forceinline__ void flat_consume_maps(
+    const dispatch_pull_param_t& p, int lane, int2* tile_ranges,
+    unsigned* tiles_ready, unsigned* next_ticket, ProcessSlot process_slot) {
+    constexpr unsigned kTileTokens = kMapWarps * 32;
+    constexpr unsigned kTilesPerChunk = ChunkTokens / kTileTokens;
+    const int total_chunks = nccl_ep::ceil_div(p.tokens_per_rank, ChunkTokens) * p.lsa_team_size;
+    // Match EM's small work claims; deterministic prefixes fix output order
+    // independently of which payload warp handles each ready row.
+    constexpr unsigned kSlotBatch = 4;
+    static_assert(kTileTokens % kSlotBatch == 0);
+    for (;;) {
+        unsigned ticket = 0;
+        if (lane == 0) {
+            ticket = atomicAdd(next_ticket, kSlotBatch);
+        }
+        ticket = __shfl_sync(0xffffffffu, ticket, 0);
+        const unsigned unit = ticket / kTileTokens;
+        if (blockIdx.x + (unit / kTilesPerChunk) * gridDim.x >= total_chunks) {
+            break;
+        }
+        int first_slot = 0, count = 0;
+        if (lane == 0) {
+            nccl_ep::wait_acquire_block_shared(tiles_ready, unit + 1);
+            const int2 range = tile_ranges[unit];
+            first_slot = range.x;
+            count = range.y;
+        }
+        first_slot = __shfl_sync(0xffffffffu, first_slot, 0);
+        count = __shfl_sync(0xffffffffu, count, 0);
+        __syncwarp();
+        const int offset = ticket % kTileTokens;
+        const int end = min(offset + static_cast<int>(kSlotBatch), count);
+        for (int i = offset; i < end; ++i) {
+            process_slot(first_slot + i);
+        }
+    }
+}
+
+template <int TopK, int ChunkTokens, int PullWarps, typename ProcessSlot>
+__device__ __forceinline__ void flat_map_and_transfer(
+    const dispatch_pull_param_t& p, int warp, int* warp_counts, int* shared_base, ProcessSlot process_slot) {
+    // With few chunks, use the whole CTA to build a map quickly rather than
+    // reserving producers that cannot overlap enough subsequent work.
+    const int total_chunks = nccl_ep::ceil_div(p.tokens_per_rank, ChunkTokens) * p.lsa_team_size;
+    for (int work = blockIdx.x; work < total_chunks; work += gridDim.x) {
+        const int source = work % p.lsa_team_size;
+        const int chunk = work / p.lsa_team_size;
+        const int2 range = flat_build_chunk<TopK, ChunkTokens, PullWarps, true, false>(
+            p, source, chunk, p.my_rank, warp_counts, shared_base, nullptr, nullptr, 0);
+        for (int i = warp; i < range.y; i += PullWarps) {
+            process_slot(range.x + i);
+        }
+        __syncthreads();
+        if (p.retained_slots != nullptr) {
+            flat_build_chunk<TopK, ChunkTokens, PullWarps, false, false>(
+                p, p.my_rank, chunk, source, warp_counts, shared_base, nullptr, nullptr, 0);
+        }
+    }
+}
+
+// One warp transfers a receive row. Unlike EM, no output fan-out or padding is
+// needed. Metadata and scale loads overlap the outstanding token-row load.
+template <int HiddenInt4, ncclEpDispQuant_t Recipe, int ScaleInt4PerLane,
+          int ScaleTmaRowBytes, int PullWarps, bool FusedMap, int TopK, int ChunkTokens, bool OverlapMap>
+__device__ __forceinline__ void dispatch_pull_flat(const dispatch_pull_param_t& p) {
+    static_assert(Recipe == NCCL_EP_DISP_QUANT_NONE || Recipe == NCCL_EP_DISP_QUANT_FWD);
+    constexpr int kMapWarps = FusedMap && OverlapMap ? kPullDispatchMapWarps : 0;
+    constexpr int kPayloadWarps = PullWarps - kMapWarps;
+    static_assert(kPayloadWarps > 0);
+    constexpr bool kScales = Recipe == NCCL_EP_DISP_QUANT_FWD;
+    constexpr bool kScaleTma = kScales && ScaleTmaRowBytes > 0;
+    using TokenStage = PullTmaStage<HiddenInt4 * 16>;
+    using ScaleStage = PullTmaStage<kScaleTma ? ScaleTmaRowBytes : 16>;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    extern __shared__ uint8_t smem[];
+    TokenStage token_stage;
+    ScaleStage scale_stage;
+    const bool is_map = warp < kMapWarps;
+    const int payload_warp = warp - kMapWarps;
+    if (!is_map) {
+        token_stage.init(lane, smem + payload_warp * TokenStage::smem_bytes_per_warp);
+        if constexpr (kScaleTma) {
+            scale_stage.init(lane, smem + kPayloadWarps * TokenStage::smem_bytes_per_warp +
+                                       payload_warp * ScaleStage::smem_bytes_per_warp);
+        }
+    }
+    TokenStage::block_init_fence();
+    flat_dispatch_head<FusedMap>(p);
+
+    constexpr size_t kPayloadBytes = kPayloadWarps * (TokenStage::smem_bytes_per_warp +
+        (kScaleTma ? ScaleStage::smem_bytes_per_warp : 0));
+    int2* tile_ranges = reinterpret_cast<int2*>(smem + kPayloadBytes);
+    __shared__ unsigned tiles_ready;
+    __shared__ unsigned next_ticket;
+    constexpr int kScratchWarps = OverlapMap ? kMapWarps : PullWarps;
+    __shared__ int warp_counts[FusedMap ? kScratchWarps : 1];
+    __shared__ int shared_base;
+    __shared__ int shared_total;
+    int num_recv;
+    if constexpr (FusedMap) {
+        if (threadIdx.x == 0) {
+            tiles_ready = 0;
+            next_ticket = 0;
+        }
+        num_recv = flat_receive_count(p, &shared_total);
+    } else {
+        num_recv = *p.num_recv_tokens_dev;
+    }
+    EP_DEVICE_ASSERT(num_recv <= p.caller_num_recv_tokens);
+    const int total_warps = gridDim.x * kPayloadWarps;
+    const int rows_per_warp = nccl_ep::ceil_div(num_recv, total_warps);
+    const int first = (blockIdx.x * kPayloadWarps + payload_warp) * rows_per_warp;
+    auto process_slot = [&](int slot) {
+        dispatch_pull_flat_row<HiddenInt4, kScales, kScaleTma, ScaleInt4PerLane>(
+            p, slot, lane, token_stage, scale_stage);
+    };
+    if constexpr (FusedMap && OverlapMap) {
+        if (is_map) {
+            flat_produce_maps<TopK, ChunkTokens, kMapWarps>(
+                p, warp_counts, &shared_base, tile_ranges, &tiles_ready);
+        } else {
+            flat_consume_maps<ChunkTokens, kMapWarps>(
+                p, lane, tile_ranges, &tiles_ready, &next_ticket, process_slot);
+        }
+    } else if constexpr (FusedMap) {
+        flat_map_and_transfer<TopK, ChunkTokens, PullWarps>(p, warp, warp_counts, &shared_base, process_slot);
+    } else {
+        for (int slot = first; slot < min(first + rows_per_warp, num_recv); ++slot) {
+            process_slot(slot);
+        }
+    }
+    if (!is_map) {
+        bulk_drain(lane);
+    }
+    __syncthreads();
+    if (!p.unfused_sync) {
+        lsa_grid_tail_barrier(p.dcomm, p.grid_barrier_counter, p.head_sync_flag);
+    }
+}
+
+// Flat expert outputs are already reduced locally by the caller. Relay each row
+// with TMA; neither floating-point accumulation nor EM gather metadata is needed.
+template <int HiddenInt4, int PushWarps, bool Backward>
+__device__ __forceinline__ void combine_push_flat(const combine_push_param_t& p) {
+    using Stage = PullTmaStage<HiddenInt4 * 16>;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    extern __shared__ uint8_t smem[];
+    Stage stage;
+    stage.init(lane, smem + warp * Stage::smem_bytes_per_warp);
+    Stage::block_init_fence();
+    if (!p.unfused_sync) {
+        lsa_grid_head_gate(p.dcomm, p.head_sync_flag);
+    }
+
+    const int num_recv = *p.num_recv_tokens_dev;
+    EP_DEVICE_ASSERT(num_recv <= p.caller_num_recv_tokens);
+    const int total_warps = gridDim.x * PushWarps;
+    // Match EM: spread consecutive row ranges across SMs before rotating peers.
+    const int global_warp = warp * gridDim.x + blockIdx.x;
+    const int rotated_warp = (global_warp +
+                             p.my_lsa_rank * (total_warps / p.lsa_team_size)) % total_warps;
+    const int rows_per_warp = nccl_ep::ceil_div(num_recv, total_warps);
+    const int first = rotated_warp * rows_per_warp;
+    const tokens_fast_div_t divisor = make_tokens_fast_div(p.tokens_per_rank);
+    constexpr int kRowBytes = HiddenInt4 * 16;
+    constexpr int kStride = comb_stage_stride_bytes(kRowBytes, Backward);
+    for (int slot = first; slot < min(first + rows_per_warp, num_recv); ++slot) {
+        stage.issue(static_cast<const int4*>(p.recv_x_em) + static_cast<size_t>(slot) * HiddenInt4);
+        const decoded_src_t dst = decode_src_fast(p.recv_slot_to_src[slot], divisor, p.lsa_team_size);
+        uint8_t* row = static_cast<uint8_t*>(p.peer_staging_ptrs[dst.rank]) +
+                       (static_cast<size_t>(dst.token) * p.lsa_team_size + p.my_lsa_rank) * kStride;
+        // Carry sparse backward weights while the token load is outstanding.
+        int source_pos = -1;
+        float weight = 0.0f;
+        if constexpr (Backward) {
+            if (lane < p.top_k) {
+                const size_t i = static_cast<size_t>(slot) * p.top_k + lane;
+                const int32_t route = p.srcpos_map[i];
+                if (route >= 0) {
+                    source_pos = flat_route_source_pos(route);
+                    weight = p.topk_weights_em[i];
+                }
+            }
+        }
+        stage.wait();
+        stage.store(row);
+        if constexpr (Backward) {
+            if (source_pos >= 0) {
+                reinterpret_cast<float*>(row + kRowBytes)[source_pos] = weight;
+            }
+        }
+        bulk_wait_reads(lane);
+    }
+    bulk_drain(lane);
+    __syncthreads();
+    if (!p.unfused_sync) {
+        lsa_grid_tail_barrier(p.dcomm, p.grid_barrier_counter, p.head_sync_flag);
+    }
+}
+
 } // namespace ht_ep
 
 #include "scan_kernel.cuh"
@@ -7955,9 +8939,9 @@ __device__ __forceinline__ void combine_reduce(
 
 namespace ht_ep {
 
-// Shared layout scratch: source-rank bases, expert totals, and expert bases.
+// Shared layout scratch: source-rank bases and expert bases.
 __host__ __device__ __forceinline__ size_t dispatch_pull_map_smem_ints(int nRanks, int epr) {
-    return static_cast<size_t>(nRanks) + 2u * static_cast<size_t>(epr);
+    return static_cast<size_t>(nRanks) + static_cast<size_t>(epr);
 }
 
 }  // namespace ht_ep

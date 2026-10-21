@@ -4,7 +4,7 @@
  *
  * Regression test for interleaved (1F1B / PP) HT combine on two live handles.
  *
- *   Under NCCL_EP_HT_EM_PULL_PUSH the push combine's reduce derives which (t,R)
+ *   Under NCCL_EP_HT_PULL_PUSH the push combine's reduce derives which (t,R)
  *   partials exist from this rank's own uint16 topk routing. That routing must be
  *   handle-private: with two handles alive, the later handle's ncclEpUpdateHandle
  *   would otherwise clobber a shared per-rank routing buffer before the earlier

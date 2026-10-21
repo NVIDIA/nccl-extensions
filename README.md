@@ -24,6 +24,10 @@ Python package (`nccl-extensions`) providing Pythonic wrappers for `nccl_ep`
 and `nccl_m2n` as `nccl.ep` and `nccl.m2n`. See
 [`python/README.md`](python/README.md) for details.
 
+## Blogs and Papers
+
+- [NCCL EP powers dropless MoE training in JAX](https://developer.nvidia.com/blog/accelerating-dropless-moe-training-in-jax-with-nvidia-transformer-engine/)
+
 ## Installation
 
 Prebuilt Python wheels are available from

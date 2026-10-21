@@ -53,7 +53,7 @@ inline std::string scan_flat_jit_source(
         << "      " << lsa_team_size << ",\n"
         << "      " << ::nccl_ep::jit::bool_literal(enable_per_expert_counts) << ",\n"
         << "      " << ::nccl_ep::jit::bool_literal(enable_em_permute) << ",\n"
-        << "      " << (enable_em_permute ? experts_per_rank : 0) << ",\n"
+        << "      " << ((enable_em_permute || use_topk_idx) ? experts_per_rank : 0) << ",\n"
         << "      " << em_out_type << ",\n"
         << "      " << ::nccl_ep::jit::bool_literal(use_topk_idx) << ">(\n"
         << "      p.input_routing_map, p.tmp, p.sparse_to_dense_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"
@@ -62,7 +62,7 @@ inline std::string scan_flat_jit_source(
         << "      p.lsa_team, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank,\n"
         << "      p.recv_total_counter, p.out_is_int64, p.max_recv_tokens_per_rank,\n"
         << "      p.allow_overflow_drop, p.token_to_recv_slot, smem_bytes";
-    if (enable_em_permute) {
+    if (enable_em_permute || use_topk_idx) {
         src << ",\n"
             << "      p.expert_scan_tmp, p.flat2em_slot_map, p.em_top_k, p.em_alignment, p.em_internal_offsets,\n"
             << "      reinterpret_cast<" << em_out_type << "*>(p.em_padded_out_counts),\n"
@@ -117,7 +117,9 @@ inline void launch_scan_flat(
              << "_LSATeams" << num_lsa_teams << "_lsa" << lsa_team_size << "_threads" << num_threads_per_block << "_blocks"
              << num_of_blocks << (enable_per_expert_counts ? "_pec" : "_nopec") << (enable_em_permute ? "_em" : "_noem");
         // EM out dtype is baked into the variant, so it's part of the cache key.
-        if (enable_em_permute) name << "_epr" << experts_per_rank << (out_is_int64 ? "_i64" : "_i32");
+        if (enable_em_permute || use_topk_idx) {
+            name << "_epr" << experts_per_rank << (out_is_int64 ? "_i64" : "_i32");
+        }
         if (use_topk_idx) name << "_tkidx";
         return name.str();
     }();

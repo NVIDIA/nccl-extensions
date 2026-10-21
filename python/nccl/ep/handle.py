@@ -5,9 +5,9 @@
 
 """Per-step EP handle (:class:`Handle`) and the Pythonic dataclasses
 that mirror the named-struct ABI used by NCCL EP's dispatch/combine
-entry points: :class:`HandleConfig`, :class:`DispatchConfig`,
-:class:`CombineConfig`, :class:`LayoutInfo`, :class:`DispatchInputs`,
-:class:`DispatchOutputs`, :class:`CombineInputs`,
+entry points: :class:`HandleConfig`, :class:`HandleState`,
+:class:`DispatchConfig`, :class:`CombineConfig`, :class:`LayoutInfo`,
+:class:`DispatchInputs`, :class:`DispatchOutputs`, :class:`CombineInputs`,
 :class:`CombineOutputs`.
 """
 
@@ -17,7 +17,7 @@ from dataclasses import field
 from typing import TYPE_CHECKING
 
 from nccl.core.cuda import get_stream_ptr
-from nccl.core.typing import NcclInvalid, NcclStreamSpec
+from nccl.core.typing import NcclDataType, NcclInvalid, NcclStreamSpec
 
 
 from nccl._extensions._binding_helpers import binding_dataclass
@@ -42,6 +42,7 @@ __all__ = [
     "DispatchOutputs",
     "Handle",
     "HandleConfig",
+    "HandleState",
     "LayoutInfo",
 ]
 
@@ -65,6 +66,24 @@ class HandleConfig:
     """
 
     dispatch_output_per_expert_alignment: int = 0
+
+
+@binding_dataclass(_ep_bindings.HandleState)
+class HandleState:
+    """Host metadata for importing a prepared HT handle buffer.
+
+    Mirrors :c:struct:`ncclEpHandleState_t`. The values must describe the
+    routing state used to prepare ``handle_mem`` with :meth:`Handle.update`.
+
+    Attributes:
+        num_tokens: Number of token rows in the prepared top-k tensor.
+        num_topk: Number of experts selected per token.
+        topk_idx_datatype: Top-k index dtype; ``ncclInt32`` or ``ncclInt64``.
+    """
+
+    num_tokens: int
+    num_topk: int
+    topk_idx_datatype: NcclDataType
 
 
 @binding_dataclass(_ep_bindings.DispatchConfig)
@@ -113,7 +132,8 @@ class CombineConfig:
         quantization_recipe: Selects the quantized combine pipeline; see
             :py:class:`CombineQuantizationRecipe`. Default ``NONE``.
             ``NVFP4`` is LL-only, experimental, and requires
-            :py:attr:`CombineInputs.scales`.
+            :py:attr:`CombineInputs.scales`; ``MXFP8`` is HT-only and
+            generates its scales internally.
     """
 
     send_only: int = 0
@@ -143,7 +163,9 @@ class LayoutInfo:
             * LL expert-major (dispatch time): per-expert received
               token counts written by NCCL EP.
         src_rank_counters: 1D ``[num_ranks]`` int32. LL rank-major only
-            (dispatch time): per-source-rank token counts.
+            (dispatch time): per-source-rank token counts. With AFD, only
+            ``[0, num_attn_ranks)`` is written; the remaining entries are
+            unspecified.
         expert_offsets: 1D ``[num_local_experts]`` int32 or int64. HT
             expert-major only: prefix sum of padded per-expert counts.
         recv_total_counter: 1D ``[1]`` int32 or int64. HT (handle time)
@@ -174,7 +196,8 @@ class DispatchInputs:
     Attributes:
         tokens: 2D ``[num_tokens, hidden]``. Token payload.
         topk_weights: 2D ``[num_tokens, top_k]`` float32. LL rank-major
-            per-token routing weights, or HT forward routing weights.
+            per-token routing weights, or HT forward routing weights. AFD
+            expert ranks omit this field.
         scales: 2D ``[num_tokens, scale_elems_per_token]`` per-token
             scaling factors. Required by
             :py:attr:`DispatchQuantizationRecipe.FWD`, which forwards the
@@ -192,8 +215,9 @@ class DispatchInputs:
 class DispatchOutputs:
     """Output tensor bundle for :py:meth:`Handle.dispatch`.
 
-    Mirrors :c:struct:`ncclEpDispatchOutputs_t`. ``tokens`` is required;
-    other fields are optional (``None`` → C-side ``NULL``).
+    Mirrors :c:struct:`ncclEpDispatchOutputs_t`. ``tokens`` is required
+    except on AFD attention ranks, which omit every receive field; other
+    fields are optional (``None`` → C-side ``NULL``).
 
     See ``nccl_ep/include/nccl_ep.h`` for the shape conventions
     of each field across LL/HT and the supported layouts.
@@ -220,8 +244,9 @@ class DispatchOutputs:
 class CombineInputs:
     """Input tensor bundle for :py:meth:`Handle.combine`.
 
-    Mirrors :c:struct:`ncclEpCombineInputs_t`. ``tokens`` is required;
-    other fields are optional.
+    Mirrors :c:struct:`ncclEpCombineInputs_t`. ``tokens`` is required except
+    on AFD attention ranks, which send no expert outputs; other fields are
+    optional.
 
     Attributes:
         tokens: Post-expert activation tensor (shape depends on
@@ -231,7 +256,7 @@ class CombineInputs:
         scales: Experimental NVFP4 combine only: FP32 per-expert-token
             global quantization scales. For each valid token row, pass
             ``2688 / amax(abs(tokens[row, :]))``, or 0 when ``amax`` is
-            0.
+            0. Must be ``None`` for ``NONE`` and ``MXFP8``.
     """
 
     tokens: Tensor | None = None
@@ -263,11 +288,15 @@ class CombineOutputs:
 class Handle:
     """Per-step routing handle for dispatch/combine.
 
-    Construct via :py:meth:`Group.create_handle`; release with :meth:`destroy`.
+    Construct via :py:meth:`Group.create_handle`, :py:meth:`Group.init_handle`,
+    or :py:meth:`Group.import_handle`; release with :meth:`destroy`.
     """
 
-    def __init__(self, ptr: int) -> None:
+    def __init__(self, ptr: int, *, handle_mem: Tensor | None = None) -> None:
         self._ptr = ptr
+        # Imported and caller-allocated handles borrow this descriptor and its
+        # backing buffer. Anchor both until ncclEpHandleDestroy completes.
+        self._handle_mem = handle_mem
 
     def _check_valid(self, operation: str) -> None:
         if not self._ptr:
@@ -328,10 +357,12 @@ class Handle:
 
         Args:
             inputs: Input tensor bundle (:class:`DispatchInputs`).
-                ``inputs.tokens`` is required.
+                ``inputs.tokens`` is required. With AFD, ``topk_weights`` is
+                required only on attention ranks.
             outputs: Pre-allocated output tensor bundle
                 (:class:`DispatchOutputs`). ``outputs.tokens`` is
-                required; per-layout shape rules in ``nccl_ep.h``.
+                required except on AFD attention ranks, which omit all dispatch
+                receive tensors; per-layout shape rules in ``nccl_ep.h``.
             stream: CUDA stream for the launch.
             layout_info: Optional :class:`LayoutInfo`. LL expert-major
                 writes ``expert_counters``; LL rank-major writes
@@ -344,6 +375,83 @@ class Handle:
         """
         self._check_valid("dispatch")
         _ep_bindings.dispatch(
+            self._ptr,
+            inputs._lowpp.ptr,  # type: ignore[attr-defined]
+            outputs._lowpp.ptr,  # type: ignore[attr-defined]
+            layout_info._lowpp.ptr if layout_info is not None else 0,  # type: ignore[attr-defined]
+            config._lowpp.ptr if config is not None else 0,  # type: ignore[attr-defined]
+            get_stream_ptr(stream),
+        )
+
+    def af_dispatch(
+        self,
+        inputs: DispatchInputs,
+        outputs: DispatchOutputs,
+        *,
+        layout_info: LayoutInfo | None = None,
+        config: DispatchConfig | None = None,
+        stream: NcclStreamSpec,
+    ) -> None:
+        """Dispatch from an AFD attention rank to the expert ranks.
+
+        This is the attention-rank role-checked form of :meth:`dispatch`.
+        Every rank in the AFD group must participate in the collective at the
+        same point: attention ranks call this method while expert ranks call
+        :meth:`af_recv`. The group must use low-latency rank-major mode with
+        ``num_attn_ranks > 0``.
+
+        Attention ranks provide token payloads and routing weights but omit
+        the expert-side receive tensors in ``outputs``.
+
+        Args:
+            inputs: Attention-side dispatch inputs.
+            outputs: Dispatch outputs with receive fields left ``None``.
+            stream: CUDA stream for the launch.
+            layout_info: Optional layout metadata; A-ranks do not receive
+                source-rank counters.
+            config: Optional dispatch configuration; ``None`` uses defaults.
+
+        See Also:
+            :meth:`af_recv`, :meth:`af_combine`.
+        """
+        self._check_valid("AFD dispatch")
+        _ep_bindings.af_dispatch(
+            self._ptr,
+            inputs._lowpp.ptr,  # type: ignore[attr-defined]
+            outputs._lowpp.ptr,  # type: ignore[attr-defined]
+            layout_info._lowpp.ptr if layout_info is not None else 0,  # type: ignore[attr-defined]
+            config._lowpp.ptr if config is not None else 0,  # type: ignore[attr-defined]
+            get_stream_ptr(stream),
+        )
+
+    def af_recv(
+        self,
+        inputs: DispatchInputs,
+        outputs: DispatchOutputs,
+        *,
+        layout_info: LayoutInfo | None = None,
+        config: DispatchConfig | None = None,
+        stream: NcclStreamSpec,
+    ) -> None:
+        """Receive dispatched tokens on an AFD expert rank.
+
+        This is the expert-rank role-checked form of :meth:`dispatch` and is
+        the collective counterpart to :meth:`af_dispatch`. Expert ranks pass
+        a zero-row token descriptor, omit ``inputs.topk_weights``, and provide
+        the full rank-major receive tensors in ``outputs``.
+
+        Args:
+            inputs: Expert-side dispatch inputs.
+            outputs: Preallocated rank-major receive tensors.
+            stream: CUDA stream for the launch.
+            layout_info: Optional metadata containing ``src_rank_counters``.
+            config: Optional dispatch configuration; ``None`` uses defaults.
+
+        See Also:
+            :meth:`af_dispatch`, :meth:`af_return`.
+        """
+        self._check_valid("AFD receive")
+        _ep_bindings.af_recv(
             self._ptr,
             inputs._lowpp.ptr,  # type: ignore[attr-defined]
             outputs._lowpp.ptr,  # type: ignore[attr-defined]
@@ -368,7 +476,8 @@ class Handle:
         Args:
             inputs: Input tensor bundle (:class:`CombineInputs`).
                 ``inputs.tokens`` is required; per-layout shape rules in
-                ``nccl_ep.h``.
+                ``nccl_ep.h``. AFD attention ranks omit it because they send no
+                expert outputs.
             outputs: Pre-allocated output tensor bundle
                 (:class:`CombineOutputs`). ``outputs.tokens`` is
                 required (shape ``[num_tokens, hidden]``).
@@ -381,6 +490,71 @@ class Handle:
         """
         self._check_valid("combine")
         _ep_bindings.combine(
+            self._ptr,
+            inputs._lowpp.ptr,  # type: ignore[attr-defined]
+            outputs._lowpp.ptr,  # type: ignore[attr-defined]
+            config._lowpp.ptr if config is not None else 0,  # type: ignore[attr-defined]
+            get_stream_ptr(stream),
+        )
+
+    def af_combine(
+        self,
+        inputs: CombineInputs,
+        outputs: CombineOutputs,
+        *,
+        config: CombineConfig | None = None,
+        stream: NcclStreamSpec,
+    ) -> None:
+        """Receive combined results on an AFD attention rank.
+
+        This is the attention-rank role-checked form of :meth:`combine` and
+        is the collective counterpart to :meth:`af_return`. Attention ranks
+        omit ``inputs.tokens`` and provide the token-order output tensor.
+
+        Args:
+            inputs: Combine inputs with ``tokens`` left ``None``.
+            outputs: Preallocated attention-side combined output.
+            stream: CUDA stream for the launch.
+            config: Optional combine configuration; ``None`` uses defaults.
+
+        See Also:
+            :meth:`af_return`, :meth:`af_dispatch`.
+        """
+        self._check_valid("AFD combine")
+        _ep_bindings.af_combine(
+            self._ptr,
+            inputs._lowpp.ptr,  # type: ignore[attr-defined]
+            outputs._lowpp.ptr,  # type: ignore[attr-defined]
+            config._lowpp.ptr if config is not None else 0,  # type: ignore[attr-defined]
+            get_stream_ptr(stream),
+        )
+
+    def af_return(
+        self,
+        inputs: CombineInputs,
+        outputs: CombineOutputs,
+        *,
+        config: CombineConfig | None = None,
+        stream: NcclStreamSpec,
+    ) -> None:
+        """Return expert outputs from an AFD expert rank.
+
+        This is the expert-rank role-checked form of :meth:`combine` and is
+        the collective counterpart to :meth:`af_combine`. Expert ranks supply
+        the post-expert rank-major tensor in ``inputs.tokens``; their output
+        descriptor has zero token rows.
+
+        Args:
+            inputs: Post-expert rank-major activations.
+            outputs: Zero-row expert-side combine output descriptor.
+            stream: CUDA stream for the launch.
+            config: Optional combine configuration; ``None`` uses defaults.
+
+        See Also:
+            :meth:`af_combine`, :meth:`af_recv`.
+        """
+        self._check_valid("AFD return")
+        _ep_bindings.af_return(
             self._ptr,
             inputs._lowpp.ptr,  # type: ignore[attr-defined]
             outputs._lowpp.ptr,  # type: ignore[attr-defined]
@@ -414,6 +588,7 @@ class Handle:
         if self._ptr:
             _ep_bindings.handle_destroy(self._ptr)
             self._ptr = 0
+            self._handle_mem = None
 
     def __repr__(self) -> str:
         if self._ptr:

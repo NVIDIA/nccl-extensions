@@ -165,6 +165,23 @@ typedef enum {
     NCCL_EP_ZERO_COPY_ON
 } ncclEpZeroCopyMode_t;
 
+// HT dispatch/combine data flow. The names describe dispatch followed by
+// combine. AUTO preserves the library default and allows the
+// NCCL_EP_HT_PULL_PUSH environment override.
+typedef enum {
+    NCCL_EP_HT_FLOW_AUTO = NCCL_EP_AUTO,
+    NCCL_EP_HT_FLOW_PUSH_PULL,
+    NCCL_EP_HT_FLOW_PULL_PUSH,
+} ncclEpHtFlow_t;
+
+// HT metadata-exchange policy. Fused exchange publishes routing metadata as
+// part of dispatch instead of exchanging it during ncclEpUpdateHandle.
+typedef enum {
+    NCCL_EP_META_EXCHANGE_AUTO = NCCL_EP_AUTO,
+    NCCL_EP_META_EXCHANGE_REQUIRE_FUSED,
+    NCCL_EP_META_EXCHANGE_FORCE_SCAN,
+} ncclEpMetaExchangePolicy_t;
+
 /**
  * Numbering convention for the recv_topk_idx output of dispatch.
  *

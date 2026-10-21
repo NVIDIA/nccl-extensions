@@ -94,9 +94,6 @@ static int gNumDevices = 0;
 static size_t gBufferBytes = 4096;
 static std::vector<ncclComm_t> gComms;
 static std::vector<ncclM2nHandle_t> gM2nHandles;
-#if !defined(GTEST_SKIP)
-static int gSkippedCases = 0;
-#endif
 
 #ifdef NCCL_M2N_TESTING
 /* The completion-fence failure paths decide whether an epoch is quarantined,
@@ -442,18 +439,10 @@ class BasicApiLocalTest : public ::testing::TestWithParam<LocalParam> {};
 #ifdef NCCL_M2N_TESTING
 TEST(LocalRankProgressTest, CollectiveSectionsAdmitPeerRanks) {
   if (gCli.filter == nullptr || strcmp(gCli.filter, "local_collective_progress") != 0) {
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << "run with --filter local_collective_progress";
-#else
-    return;
-#endif
   }
   if (gWorldSize != 2) {
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << "requires exactly two local ranks";
-#else
-    return;
-#endif
   }
 
   std::atomic<int> ready{0};
@@ -501,11 +490,7 @@ TEST(LocalRankProgressTest, CollectiveSectionsAdmitPeerRanks) {
  * failure without condemning the epoch. */
 TEST(DevCommFenceFailureTest, RecordFailureFencedByStreamSyncDoesNotQuarantine) {
   if (!fenceTestSelected()) {
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << "run with --filter devcomm_fence_failures";
-#else
-    return;
-#endif
   }
   DevCommFailureStateGuard stateGuard;
   reshardClearResourceQuarantine();
@@ -521,11 +506,7 @@ TEST(DevCommFenceFailureTest, RecordFailureFencedByStreamSyncDoesNotQuarantine) 
  * to prove the GPU is done and the epoch has to be quarantined. */
 TEST(DevCommFenceFailureTest, RecordAndStreamSyncFailureQuarantinesEpoch) {
   if (!fenceTestSelected()) {
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << "run with --filter devcomm_fence_failures";
-#else
-    return;
-#endif
   }
   DevCommFailureStateGuard stateGuard;
   reshardClearResourceQuarantine();
@@ -543,11 +524,7 @@ TEST(DevCommFenceFailureTest, RecordAndStreamSyncFailureQuarantinesEpoch) {
  * hold regardless of how the process was configured. */
 TEST(DevCommFenceFailureTest, PoisonedUseStateIsRefusedOnNextAcquisition) {
   if (!fenceTestSelected()) {
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << "run with --filter devcomm_fence_failures";
-#else
-    return;
-#endif
   }
   DevCommFailureStateGuard stateGuard;
   reshardClearResourceQuarantine();
@@ -575,18 +552,10 @@ TEST(DevCommFenceFailureTest, PoisonedUseStateIsRefusedOnNextAcquisition) {
  * case creates one collectively across both local ranks. */
 TEST(DevCommFenceFailureTest, RetirementRetainsDevCommWhenCompletionCannotBeProven) {
   if (!fenceTestSelected()) {
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << "run with --filter devcomm_fence_failures";
-#else
-    return;
-#endif
   }
   if (gWorldSize != 2) {
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << "requires exactly two local ranks";
-#else
-    return;
-#endif
   }
 
   DevCommFailureStateGuard stateGuard;
@@ -654,19 +623,14 @@ TEST_P(BasicApiLocalTest, Reshard) {
 
   LocalCaseResult res = runLocalCase(param.tc, param.api);
   if (res.status == CASE_SKIP) {
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << res.reason;
     return;
-#else
-    basicApiRecordFallbackSkip(&gSkippedCases, res.reason.c_str(), true);
-    return;
-#endif
   }
 
   EXPECT_EQ(CASE_PASS, res.status) << res.reason;
 }
 
-INSTANTIATE_TEST_CASE_P(Matrix, BasicApiLocalTest, ::testing::ValuesIn(selectedLocalParams()), gtestCaseName);
+INSTANTIATE_TEST_SUITE_P(Matrix, BasicApiLocalTest, ::testing::ValuesIn(selectedLocalParams()), gtestCaseName);
 
 static int initLocalRuntime() {
   TEST_CUDACHECK(cudaGetDeviceCount(&gNumDevices));
@@ -692,6 +656,7 @@ static int initLocalRuntime() {
   for (int i = 0; i < gWorldSize; ++i) devlist[i] = i;
 
   TEST_NCCLCHECK(ncclCommInitAll(gComms.data(), gWorldSize, devlist.data()));
+  testWaitComms(gComms);
   for (int i = 0; i < gWorldSize; ++i) {
     TEST_NCCLCHECK(ncclM2nInit(&gM2nHandles[i], NULL));
   }
@@ -712,10 +677,9 @@ static void shutdownLocalRuntime() {
     }
   }
   gM2nHandles.clear();
+  testWaitComms(gComms);
   for (ncclComm_t comm : gComms) {
-    if (comm != nullptr) {
-      TEST_NCCLCHECK(ncclCommDestroy(comm));
-    }
+    TEST_NCCLCHECK(ncclCommDestroy(comm));
   }
   gComms.clear();
 }
@@ -738,9 +702,6 @@ int main(int argc, char** argv) {
   if (initRc != 0) return initRc;
 
   int rc = RUN_ALL_TESTS();
-#if !defined(GTEST_SKIP)
-  basicApiPrintFallbackSkipSummary(gSkippedCases, true);
-#endif
   shutdownLocalRuntime();
   return rc;
 }

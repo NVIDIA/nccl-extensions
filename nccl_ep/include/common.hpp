@@ -23,15 +23,15 @@
 #define MAX_NUM_TOPK 32
 // Sentinel for empty/padding slots in the uint16 topk routing map (pull dispatch).
 static constexpr uint16_t kTopkIdxInvalid = 0xFFFFu;
+static constexpr int kPullMaxLsaRanks = 128;
 #define MAX_NCCL_GIN_CTX_PER_COMM 4
 #define NUM_WAIT_NANOSECONDS 500
 #define MAX_SUPPORTED_TOKENS_PER_RANK 8192  // Must match kernel template in ht_ep_adapter.cu
 #define FINISHED_SUM_TAG (MAX_SUPPORTED_TOKENS_PER_RANK * 2)
-// Default HT tokens-per-chunk for RDMA / multi-node configurations. LSA-only
-// (single-node) configs default to a grid-proportional size instead; either can
-// be overridden via NCCL_EP_TOKENS_PER_CHUNK (see ncclEpCreateGroup). The chunk
-// size is resolved per group into ncclEpGroup::ht_tokens_per_chunk.
-#define HT_TOKENS_PER_CHUNK_RDMA_DEFAULT 64
+// Two dedicated grid-wide election counters for combine_kernel_impl_1sided_rm_lsa (see ctaSync's
+// doc comment in ll/ll_combine_lsa.cuh) -- never shared, since they're not separated by a
+// grid-wide barrier.
+#define NCCL_EP_COMBINE_SYNC_COUNT 2
 
 // Timeout for GPU-side wait loops. When exceeded, the peer is masked (if active-mask
 // is enabled) or the kernel traps. Setting this too low risks false positives: a rank
@@ -78,6 +78,7 @@ static constexpr uint16_t kTopkIdxInvalid = 0xFFFFu;
 // ============================================================================
 // Standard includes
 // ============================================================================
+#include <cassert>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -289,12 +290,32 @@ struct LowLatencyBuffer {
     size_t combine_rdma_send_buffer_data_start_offset = 0;
     size_t num_bytes_per_combine_msg = 0;
 
+    // "Every peer confirms it's done reading my inData", for combine_kernel_impl_1sided_rm_lsa
+    // (ll/ll_combine_lsa.cuh). Allocated unconditionally (numRanks ints), packed immediately after
+    // the signal region within the same per-bank span -- see LowLatencyLayout::signal_slot_stride's
+    // doc comment for why, and lsa_signaling_clean_int_count below for its clear size.
+    size_t combine_rdma_read_done_buffer_offset = 0;
+
+    // Per-peer "total tokens dispatched this round" publish, for NCCL_EP_COMBINE_LSA's auto-mode
+    // want-1-sided decision (see ll::computeAndPublishWant1SidedLsa). Same rationale as above, packed right
+    // after combine_rdma_read_done_buffer_offset -- but excluded from
+    // lsa_signaling_clean_int_count, since it's plain-overwritten every round and never needs
+    // clearing.
+    size_t dispatch_rdma_total_token_buffer_offset = 0;
+
     // (count-buffer offset, count) for clean_low_latency_buffer. Dispatch
     // recv-count and combine recv-flag share the same signaling slot.
     std::pair<size_t, int> clean_meta_offset() const {
         EP_HOST_ASSERT(dispatch_rdma_recv_count_buffer_offset == combine_rdma_recv_flag_buffer_offset);
         return {dispatch_rdma_recv_count_buffer_offset, num_clean_int};
     }
+
+    // Ints to clear in one pass to wipe a bank's entire signal + read-done span (never
+    // total-token, see its offset field's doc comment above) -- dispatch and combine both pre-wipe
+    // their OWN next bank's signal region today; this lets either one wipe read-done in the same
+    // pass, which is required since dispatch never otherwise touches read-done at all (see
+    // LowLatencyLayout::signal_slot_stride's doc comment for why one shared bank is used by both).
+    int lsa_signaling_clean_int_count = 0;
 };
 
 struct LowLatencyEpochState {
@@ -307,6 +328,15 @@ struct LowLatencyLayout {
     size_t total_bytes = 0;
     LowLatencyBuffer buffer;
     size_t payload_slot_stride = 0;
+    // Shared bank-to-bank stride for every signaling buffer kind (recv-count/recv-flag,
+    // read-done, total-token -- see their offset fields' doc comments in LowLatencyBuffer): they're
+    // packed bank-major, one combined span per bank ([signal][read_done][total_token], then the
+    // same three again for bank 1), not kind-major with independent strides. That's what lets
+    // dispatch and combine each clear their next bank's signal+read-done region in a single pass
+    // (lsa_signaling_clean_int_count) regardless of which op actually reads each sub-buffer --
+    // dispatch never touches read-done itself, but its own next-bank wipe is what prepares it for
+    // combine, exactly as it already does for the shared signal region (every launch wipes the
+    // bank the *next* launch -- of either op -- will land on, not its own future occurrence).
     size_t signal_slot_stride = 0;
 
     template <typename out_ptr_t = void*, typename count_ptr_t = uint8_t*, typename in_ptr_t = void*>
@@ -320,7 +350,8 @@ struct LowLatencyLayout {
         int num_ranks,
         int num_experts,
         int num_topk,
-        ncclEpLayout_t layout) {
+        ncclEpLayout_t layout,
+        int num_attn_ranks = 0) {
         // Two physical payload and signaling banks are addressed from one base
         // layout by the device-selected epoch parity.
 
@@ -333,7 +364,8 @@ struct LowLatencyLayout {
 
         size_t disp_hdr_sz = ll::get_dispatch_hdr_sz(num_topk, layout);
         size_t num_bytes_per_dispatch_msg = disp_hdr_sz + max_token_bytes;
-        size_t num_bytes_per_combine_msg = scale_metadata_bytes + max_token_bytes;
+        size_t num_bytes_per_combine_msg =
+            align<size_t>(scale_metadata_bytes + max_token_bytes, sizeof(int4));
 
         // Per-op send and recv sizes.
         // Combine send buffer holds one slot per outbound message produced on
@@ -376,16 +408,36 @@ struct LowLatencyLayout {
         payload_slot_stride = slot_bytes;
         total_bytes += payload_slot_stride * 2;
 
-        // Symmetric signaling buffers
-        size_t dispatch_recv_count_buffer_bytes = num_experts * sizeof(int);
-        size_t combine_recv_flag_buffer_bytes = dispatch_recv_count_buffer_bytes;
+        // Dispatch addresses each epoch bank as [localExpert][worldSrcRank],
+        // which requires L * R counters. Combine needs one flag per expert (E).
+        // Both operations reuse the same bank, so size it for max(L * R, E).
+        // In classic EP every rank owns experts, hence L * R == E; AFD has only
+        // F expert ranks, so L = E / F and the dispatch bank grows to L * R.
+        const int num_expert_ranks = num_ranks - num_attn_ranks;
+        // Public group validation establishes this before any layout is built.
+        assert(num_expert_ranks > 0 && num_experts % num_expert_ranks == 0);
+        const size_t num_dispatch_signals =
+            static_cast<size_t>(num_experts / num_expert_ranks) * num_ranks;
+        size_t dispatch_recv_count_buffer_bytes = num_dispatch_signals * sizeof(int);
+        size_t combine_recv_flag_buffer_bytes = static_cast<size_t>(num_experts) * sizeof(int);
         size_t signaling_buffer_bytes = std::max(dispatch_recv_count_buffer_bytes, combine_recv_flag_buffer_bytes);
-        size_t signaling_buffer_bytes_aligned = align<size_t>(signaling_buffer_bytes, 128);
-        signal_slot_stride = signaling_buffer_bytes_aligned;
+
+        // Read-done (combine_kernel_impl_1sided_rm_lsa) and total-token (NCCL_EP_COMBINE_LSA auto
+        // mode) buffers -- see their offset fields' doc comments above. Packed immediately after
+        // the signal region within the same per-bank span (signal_slot_stride's doc comment
+        // explains why), both sized by num_ranks and fixed for the group's lifetime (ranks never
+        // change once a group is created), so sharing one stride introduces no later-growth
+        // coupling. total_token goes last, outside lsa_signaling_clean_int_count's range.
+        size_t read_done_buffer_bytes = static_cast<size_t>(num_ranks) * sizeof(int);
+        size_t total_token_buffer_bytes = static_cast<size_t>(num_ranks) * sizeof(int);
+        size_t signaling_bank_bytes = signaling_buffer_bytes + read_done_buffer_bytes + total_token_buffer_bytes;
+        signal_slot_stride = align<size_t>(signaling_bank_bytes, 128);
         total_bytes += signal_slot_stride * 2;
 
-        // Base-bank offsets into rdma_buffer. The device derives bank 1 with
-        // payload_slot_stride and signal_slot_stride.
+        // Bank-0 offsets within the shared signaling span; the device derives bank 1 by adding
+        // signal_slot_stride to each.
+        const size_t read_done_base = signaling_buffer_bytes;
+        const size_t total_token_base = read_done_base + read_done_buffer_bytes;
         const size_t slot_base = signal_slot_stride * 2;
         buffer = LowLatencyBuffer{
             .num_clean_int = static_cast<int>(signaling_buffer_bytes / sizeof(int)),
@@ -397,6 +449,10 @@ struct LowLatencyLayout {
             .combine_rdma_recv_flag_buffer_offset = 0,
             .combine_rdma_send_buffer_data_start_offset = slot_base,
             .num_bytes_per_combine_msg = num_bytes_per_combine_msg,
+            .combine_rdma_read_done_buffer_offset = read_done_base,
+            .dispatch_rdma_total_token_buffer_offset = total_token_base,
+            .lsa_signaling_clean_int_count =
+                static_cast<int>((signaling_buffer_bytes + read_done_buffer_bytes) / sizeof(int)),
         };
     }
 };
@@ -407,14 +463,16 @@ inline unsigned long int get_low_latency_rdma_size_hint_for_layout(
     size_t max_token_bytes,
     int num_ranks,
     int num_experts,
-    ncclEpLayout_t layout) {
+    ncclEpLayout_t layout,
+    int num_attn_ranks = 0) {
     auto num_bytes = LowLatencyLayout(
                          num_max_dispatch_tokens_per_rank,
                          max_token_bytes,
                          num_ranks,
                          num_experts,
                          MAX_NUM_TOPK,
-                         layout)
+                         layout,
+                         num_attn_ranks)
                          .total_bytes;
     return ((num_bytes + NUM_BUFFER_ALIGNMENT_BYTES) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES;
 }
@@ -426,14 +484,16 @@ inline unsigned long int get_low_latency_rdma_size_hint(
     int num_max_dispatch_tokens_per_rank,
     size_t max_token_bytes,
     int num_ranks,
-    int num_experts) {
+    int num_experts,
+    int num_attn_ranks = 0) {
     auto bytes_for = [&](ncclEpLayout_t layout) {
         return get_low_latency_rdma_size_hint_for_layout(
             num_max_dispatch_tokens_per_rank,
             max_token_bytes,
             num_ranks,
             num_experts,
-            layout);
+            layout,
+            num_attn_ranks);
     };
     return std::max(bytes_for(NCCL_EP_LAYOUT_EXPERT_MAJOR), bytes_for(NCCL_EP_LAYOUT_RANK_MAJOR));
 }

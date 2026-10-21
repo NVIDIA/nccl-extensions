@@ -6,6 +6,8 @@
 
 #include "nccl_ep_env.h"
 
+#include <cerrno>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <strings.h>  // strcasecmp
@@ -30,14 +32,54 @@ void parse_flag(ncclEpEnvVar& var) {
     }
 }
 
-// Parse an unsigned-long environment variable into var (is_set + value.ul).
-// Unset/empty leaves it not-set; otherwise the raw strtoul() value is stored
-// without interpretation — validity/range is the consumer's responsibility.
-void parse_ulong(ncclEpEnvVar& var) {
+// Parse an unsigned-long setting. Strict consumers receive zero for malformed
+// input and reject it during range validation; legacy consumers retain strtoul
+// semantics. Unset/empty leaves the setting unset in either mode.
+void parse_ulong(ncclEpEnvVar& var, bool strict = false) {
+    const char* v = std::getenv(var.name);
+    if (v == nullptr || v[0] == '\0') return;
+    var.is_set = true;
+    const char* number = v;
+    while (std::isspace(static_cast<unsigned char>(*number))) ++number;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long parsed = std::strtoul(number, &end, 10);
+    const bool valid = *number != '-' && end != number && *end == '\0' && errno != ERANGE;
+    var.value.ul = !strict || valid ? parsed : 0;
+}
+
+// Reject invalid timeout settings instead of turning negative or overflowing
+// values into huge unsigned timeout budgets.
+void parse_timeout_ms(ncclEpEnvVar& var) {
     const char* v = std::getenv(var.name);
     if (v == nullptr || v[0] == '\0') return;  // unset/empty -> not set
+    const char* number = v;
+    while (std::isspace(static_cast<unsigned char>(*number))) ++number;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long parsed = std::strtoul(number, &end, 10);
+    if (*number == '-' || end == number || *end != '\0' || errno == ERANGE) {
+        std::fprintf(stderr, "[nccl_ep] %s=%s ignored (expected an unsigned long integer)\n", var.name, v);
+        return;
+    }
     var.is_set = true;
-    var.value.ul = std::strtoul(v, nullptr, 10);
+    var.value.ul = parsed;
+}
+
+void parse_choice(ncclEpEnvVar& var) {
+    const char* v = std::getenv(var.name);
+    if (v == nullptr || v[0] == '\0') return;
+    for (unsigned long index = 0; var.choices[index] != nullptr; ++index) {
+        if (strcasecmp(v, var.choices[index]) == 0) {
+            var.is_set = true;
+            var.value.ul = index;
+            return;
+        }
+    }
+    std::fprintf(stderr, "[nccl_ep] %s=%s ignored (expected", var.name, v);
+    for (const char* const* name = var.choices; *name != nullptr; ++name)
+        std::fprintf(stderr, "%s%s", name == var.choices ? " " : ", ", *name);
+    std::fprintf(stderr, "); using default\n");
 }
 
 }  // namespace
@@ -51,26 +93,37 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_flag(cfg->debug);
     parse_flag(cfg->ht_em_local_dup);
     parse_flag(cfg->ht_em_nvlink_dup);
-    parse_flag(cfg->ht_em_pull_push);
+    parse_flag(cfg->ht_pull_push);
+    parse_flag(cfg->nucs);
     parse_flag(cfg->ht_unfused_sync);
-    parse_flag(cfg->ht_em_ag_scan_mode);
-    parse_flag(cfg->ht_em_count_unfused);
+    parse_flag(cfg->ht_ag_scan_mode);
+    parse_flag(cfg->ht_count_unfused);
     parse_flag(cfg->disable_guard);
+    parse_flag(cfg->ll_cft);
+
+    parse_timeout_ms(cfg->timeout_ms);
+    parse_choice(cfg->ht_recv_topk_order);
+    parse_choice(cfg->dispatch_copy_mode);
+    parse_choice(cfg->dispatch_lsa);
+    parse_ulong(cfg->ll_tma_quant_warps, true);
+    parse_choice(cfg->combine_lsa);
 
     // Numeric (ulong) vars: is_set means present, value.ul holds the raw integer
     // (no range checks here — consumers in nccl_ep.cc validate per their needs).
-    parse_ulong(cfg->timeout_ms);
     parse_ulong(cfg->comm_num_sms);
     parse_ulong(cfg->dispatch_num_sms);
     parse_ulong(cfg->combine_num_sms);
     parse_ulong(cfg->shuffle_sms);
     parse_ulong(cfg->preprocess_num_sms);
     parse_ulong(cfg->tokens_per_chunk);
+    parse_ulong(cfg->dispatch_tokens_per_chunk);
     parse_ulong(cfg->dispatch_num_stages);
     parse_ulong(cfg->dispatch_num_pipelines);
     parse_ulong(cfg->combine_num_stages_g2s);
     parse_ulong(cfg->combine_num_stages_s2g);
     parse_ulong(cfg->combine_num_pipelines);
+    parse_ulong(cfg->ll_cft_debug_min_driver);
+    parse_ulong(cfg->combine_lsa_threshold);
 }
 
 void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
@@ -81,11 +134,15 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.debug,
         &cfg.ht_em_local_dup,
         &cfg.ht_em_nvlink_dup,
-        &cfg.ht_em_pull_push,
+        &cfg.ht_pull_push,
+        &cfg.nucs,
         &cfg.ht_unfused_sync,
-        &cfg.ht_em_ag_scan_mode,
-        &cfg.ht_em_count_unfused,
+        &cfg.ht_ag_scan_mode,
+        &cfg.ht_count_unfused,
+        &cfg.ht_recv_topk_order,
+        &cfg.dispatch_copy_mode,
         &cfg.disable_guard,
+        &cfg.ll_cft,
         &cfg.timeout_ms,
         &cfg.comm_num_sms,
         &cfg.dispatch_num_sms,
@@ -93,11 +150,17 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.shuffle_sms,
         &cfg.preprocess_num_sms,
         &cfg.tokens_per_chunk,
+        &cfg.dispatch_tokens_per_chunk,
         &cfg.dispatch_num_stages,
         &cfg.dispatch_num_pipelines,
         &cfg.combine_num_stages_g2s,
         &cfg.combine_num_stages_s2g,
         &cfg.combine_num_pipelines,
+        &cfg.ll_cft_debug_min_driver,
+        &cfg.dispatch_lsa,
+        &cfg.ll_tma_quant_warps,
+        &cfg.combine_lsa,
+        &cfg.combine_lsa_threshold,
     };
 
     std::fprintf(stderr, "[nccl_ep][env] NCCL EP environment configuration:\n");
@@ -112,6 +175,9 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
             break;
         case ncclEpEnvType::ulong:
             std::fprintf(stderr, "[nccl_ep][env]   %-28s = %lu\n", v->name, v->value.ul);
+            break;
+        case ncclEpEnvType::choice:
+            std::fprintf(stderr, "[nccl_ep][env]   %-28s = %s\n", v->name, v->choices[v->value.ul]);
             break;
         }
     }

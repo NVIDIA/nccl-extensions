@@ -17,6 +17,9 @@ Options:
     --backward                          Exercise HT backward dispatch/combine
     --update                            Refresh a handle with changed routing
     --overflow-drop                     Exercise HT overflow DROP
+    --ht-flow {auto,push-pull,pull-push} HT dispatch/combine flow
+    --meta-exchange-policy {auto,require-fused,force-scan}
+                                        HT metadata exchange policy
     --expert-id-kind {auto,local,global}
     --alignment NUM                     HT expert-major slot alignment
     --mask                              Exercise LL active-mask APIs
@@ -538,6 +541,11 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
     parser.add_argument("--backward", action="store_true", help="Exercise HT backward dispatch/combine")
     parser.add_argument("--update", action="store_true", help="Update the handle with changed routing")
     parser.add_argument("--overflow-drop", action="store_true", help="Exercise HT overflow DROP policy")
+    parser.add_argument("--ht-flow", choices=["auto", "push-pull", "pull-push"], default="auto",
+                        help="HT dispatch/combine flow")
+    parser.add_argument("--meta-exchange-policy",
+                        choices=["auto", "require-fused", "force-scan"], default="auto",
+                        help="HT metadata exchange policy")
     parser.add_argument("--expert-id-kind", choices=["auto", "local", "global"], default="auto",
                         help="Numbering for received expert indices")
     parser.add_argument("--alignment", type=int, default=1,
@@ -599,6 +607,8 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
         parser.error("-c currently requires HT flat layout")
     if args.overflow_drop and (args.backward or args.c):
         parser.error("--overflow-drop cannot be combined with --backward or -c")
+    if args.a != "ht" and (args.ht_flow != "auto" or args.meta_exchange_policy != "auto"):
+        parser.error("--ht-flow and --meta-exchange-policy apply only to HT")
     if args.update and (args.overflow_drop or random_mode):
         parser.error("--update cannot be combined with --overflow-drop or -r")
 
@@ -660,6 +670,16 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
         "local": nccl_ep.ExpertIdKind.LOCAL,
         "global": nccl_ep.ExpertIdKind.GLOBAL,
     }
+    ht_flow_map = {
+        "auto": nccl_ep.HtFlow.AUTO,
+        "push-pull": nccl_ep.HtFlow.PUSH_PULL,
+        "pull-push": nccl_ep.HtFlow.PULL_PUSH,
+    }
+    meta_exchange_policy_map = {
+        "auto": nccl_ep.MetaExchangePolicy.AUTO,
+        "require-fused": nccl_ep.MetaExchangePolicy.REQUIRE_FUSED,
+        "force-scan": nccl_ep.MetaExchangePolicy.FORCE_SCAN,
+    }
     static_recv_slots = num_tokens * n_ranks * (top_k if is_em else 1)
     if not is_ll and is_em and args.alignment > 1:
         # Padding is per local-expert zone, so reserve the maximum aggregate
@@ -675,6 +695,8 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
         max_recv_tokens_per_rank=max_recv_slots if not is_ll else 0,
         max_token_bytes=hidden * 2,  # bfloat16
         enable_mask=args.mask,
+        ht_flow=ht_flow_map[args.ht_flow],
+        meta_exchange_policy=meta_exchange_policy_map[args.meta_exchange_policy],
         overflow_policy=(
             nccl_ep.OverflowPolicy.DROP
             if args.overflow_drop else nccl_ep.OverflowPolicy.AUTO

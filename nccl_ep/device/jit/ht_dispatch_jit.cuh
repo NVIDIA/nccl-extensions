@@ -235,6 +235,7 @@ inline ncclResult_t launch_dispatch(
     variant.num_blocks = config.num_of_blocks;
     variant.block_dim = L.block_dim;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
+    variant.nucs = env != nullptr && nccl_ep_env_flag_on(env->nucs);
 
     // Dump the effective kernel parameters once per distinct variant, just before
     // the launch, when the env config asks for verbose output on this rank.
@@ -453,7 +454,7 @@ inline int pick_pull_blocks_per_sm(int hidden_int4) {
 }
 
 inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec, int blocks_per_sm,
-                                                ncclEpDispQuant_t recipe) {
+                                                ncclEpDispQuant_t recipe, bool flat_expert_ids) {
     std::ostringstream src;
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
@@ -461,7 +462,8 @@ inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec,
         << "__global__ void " << kLocalPermuteDupJitEntryName << "(\n"
         << "    const __grid_constant__ ::ht_ep::local_permute_dup_param_t p) {\n"
         << "  ::ht_ep::local_permute_dup<" << hidden_int4 << ", " << hidden_vec
-        << ", " << ::nccl_ep::jit::dispatch_recipe_literal(recipe) << ">(\n"
+        << ", " << ::nccl_ep::jit::dispatch_recipe_literal(recipe)
+        << ", " << ::nccl_ep::jit::bool_literal(flat_expert_ids) << ">(\n"
         << "      reinterpret_cast<uint8_t*>(p.recv_x_em),\n"
         << "      p.recv_topk_weights_em,\n"
         << "      reinterpret_cast<const uint8_t*>(p.flat_staging),\n"
@@ -488,7 +490,7 @@ inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec,
 
 inline void
 launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& param,
-                         ncclEpDispQuant_t recipe, cudaStream_t stream) {
+                         ncclEpDispQuant_t recipe, bool flat_expert_ids, cudaStream_t stream) {
     static const int variant_identity = 0;
     assert((param.row_bytes % 16) == 0);
     const int hidden_int4 = param.row_bytes / 16;
@@ -497,10 +499,11 @@ launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& par
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "local_permute_dup_h" << hidden_int4 << "_v" << hidden_vec << "_b" << blocks_per_sm
-             << (recipe != NCCL_EP_DISP_QUANT_NONE ? "_sf" : "");
+             << (recipe != NCCL_EP_DISP_QUANT_NONE ? "_sf" : "")
+             << (flat_expert_ids ? "_topk" : "_map");
         return name.str();
     }();
-    const std::string source = local_permute_dup_jit_source(hidden_int4, hidden_vec, blocks_per_sm, recipe);
+    const std::string source = local_permute_dup_jit_source(hidden_int4, hidden_vec, blocks_per_sm, recipe, flat_expert_ids);
 
     // Dynamic smem: zero-fill buffer for the pad warp's cp.async.bulk S2G.
     // Must cover both token rows and scale rows (scale_row_bytes may exceed row_bytes).
@@ -516,7 +519,8 @@ launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& par
     variant.identity = &variant_identity;
     variant.runtime_key = (static_cast<std::uint64_t>(hidden_int4) << 16) |
                           (static_cast<std::uint64_t>(hidden_vec) << 8) | static_cast<std::uint64_t>(blocks_per_sm) |
-                          (static_cast<std::uint64_t>(static_cast<uint32_t>(recipe)) << 32);
+                          (static_cast<std::uint64_t>(static_cast<uint32_t>(recipe)) << 32) |
+                          (static_cast<std::uint64_t>(flat_expert_ids) << 40);
     variant.num_blocks = num_blocks * blocks_per_sm;
     variant.block_dim = ::ht_ep::kLocalPermuteThreads;
     variant.dynamic_smem_bytes = zero_smem_bytes;
@@ -565,14 +569,20 @@ inline int pull_static_smem_bytes_per_warp() {
 // map_only_warps/map_smem_bytes (fused pull-count only) are the fixed MAP-warp-group
 // warp count and its smem (layout scratch + chunk-ready counters), taken off the top.
 inline int pull_dispatch_warps(int hidden_int4, int scale_tma_row_bytes, size_t smem_optin,
-                               int blocks_per_sm, size_t map_smem_bytes = 0, int map_only_warps = 0) {
+                               int blocks_per_sm, size_t map_smem_bytes, int map_only_warps,
+                               bool flat) {
     const size_t total_budget = smem_optin / static_cast<size_t>(std::max(1, blocks_per_sm));
     const size_t counter_bytes = map_only_warps > 0
-        ? (::ht_ep::kPullDispatchMapWarps + 1) * sizeof(unsigned) : 0;
+        ? (::ht_ep::kPullDispatchMapWarps + 1) * sizeof(unsigned) +
+          ::ht_ep::kPullDispatchMapScanBytes : 0;
     for (int warps = ::ht_ep::kPullDispatchMaxPullWarps; warps > map_only_warps; --warps) {
         const int payload_warps = warps - map_only_warps;
-        const size_t static_bytes = nccl_ep::align<size_t>(
-            payload_warps * pull_static_smem_bytes_per_warp() + counter_bytes, 16);
+        size_t static_bytes = payload_warps * pull_static_smem_bytes_per_warp() + counter_bytes;
+        if (flat) {
+            const int scratch_warps = map_only_warps > 0 ? map_only_warps : payload_warps;
+            static_bytes = (scratch_warps + 4) * sizeof(int);
+        }
+        static_bytes = nccl_ep::align<size_t>(static_bytes, 16);
         const size_t dynamic_bytes = payload_warps * pull_smem_bytes_per_warp(hidden_int4, scale_tma_row_bytes) +
                                       map_smem_bytes;
         if (static_bytes + dynamic_bytes <= total_budget) return warps;
@@ -620,14 +630,24 @@ inline int pull_scale_tma_row_bytes(int hidden_int4, ncclEpDispQuant_t recipe, i
 inline std::string dispatch_pull_jit_source(int hidden_int4, int blocks_per_sm, ncclEpDispQuant_t recipe,
                                                int scale_int4_per_lane, int scale_tma_row_bytes,
                                                int pull_warps, bool fused_map,
-                                               int top_k, int nRanks, int experts_per_rank) {
+                                               int top_k, int nRanks, int experts_per_rank, bool flat,
+                                               bool overlap_map) {
     std::ostringstream src;
+    const int threads = flat ? pull_warps * 32 : ::ht_ep::pull_dispatch_threads(pull_warps);
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
-        << "extern \"C\" __launch_bounds__(" << ::ht_ep::pull_dispatch_threads(pull_warps) << ", " << blocks_per_sm << ")\n"
+        << "extern \"C\" __launch_bounds__(" << threads << ", " << blocks_per_sm << ")\n"
         << "__global__ void " << kDispatchPullJitEntryName << "(\n"
-        << "    const __grid_constant__ ::ht_ep::dispatch_pull_param_t p) {\n"
-        << "  ::ht_ep::dispatch_pull<" << hidden_int4 << ", " << pull_stage_literal(hidden_int4)
+        << "    const __grid_constant__ ::ht_ep::dispatch_pull_param_t p) {\n";
+    if (flat) {
+        src << "  ::ht_ep::dispatch_pull_flat<" << hidden_int4 << ", "
+            << ::nccl_ep::jit::dispatch_recipe_literal(recipe) << ", " << scale_int4_per_lane
+            << ", " << scale_tma_row_bytes << ", " << pull_warps << ", "
+            << ::nccl_ep::jit::bool_literal(fused_map) << ", " << top_k << ", "
+            << kFlatMetadataChunkTokens << ", " << ::nccl_ep::jit::bool_literal(overlap_map) << ">(p);\n}\n";
+        return src.str();
+    }
+    src << "  ::ht_ep::dispatch_pull<" << hidden_int4 << ", " << pull_stage_literal(hidden_int4)
         << ", " << ::nccl_ep::jit::dispatch_recipe_literal(recipe) << ", " << scale_int4_per_lane
         << ", " << scale_tma_row_bytes << ", " << pull_warps
         << ", " << (fused_map ? "true" : "false") << ">(\n"
@@ -640,12 +660,11 @@ inline std::string dispatch_pull_jit_source(int hidden_int4, int blocks_per_sm, 
 }
 
 inline ncclResult_t
-launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, ncclEpDispQuant_t recipe,
-                        cudaStream_t stream) {
+launch_dispatch_pull_variant(int num_blocks, int blocks_per_sm, ::ht_ep::dispatch_pull_param_t& param,
+                             ncclEpDispQuant_t recipe, cudaStream_t stream, bool nucs, bool* retry_residency) {
     static const int variant_identity = 0;
     assert((param.row_bytes % 16) == 0);
     const int hidden_int4 = param.row_bytes / 16;
-    const int blocks_per_sm = pick_pull_blocks_per_sm(hidden_int4);
     // Per-lane int4 capacity for the FWD scale row, sized from the actual scale row so
     // any scale dtype / quantization block size fits (1 for NONE, where scale_row_bytes==0).
     const int scale_int4_per_lane = std::max(1, ((param.scale_row_bytes / 16) + 31) / 32);
@@ -655,11 +674,20 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
     // layout_ready != nullptr is what selects the fused pull-count MAP-warp-group variant;
     // the adapter (launch_dispatch_pull) sets every fused-count field together with it.
     const bool fused_map = param.layout_ready != nullptr;
-    const int map_warps = fused_map ? ::ht_ep::kPullDispatchMapWarps : 0;
-    size_t map_smem_bytes = fused_map
+    const size_t blocks = static_cast<size_t>(num_blocks) * blocks_per_sm;
+    const size_t flat_chunks = static_cast<size_t>(param.lsa_team_size) *
+        nccl_ep::ceil_div(param.tokens_per_rank, ::nccl_ep::ht::kFlatMetadataChunkTokens);
+    // A single wave of flat chunks favors cooperative mapping. With more work,
+    // dedicated producers hide map construction behind the payload transfers.
+    bool overlap_map = fused_map && param.flat && flat_chunks > blocks;
+    int map_warps = fused_map && (!param.flat || overlap_map) ? ::ht_ep::kPullDispatchMapWarps : 0;
+    size_t map_smem_bytes = fused_map && !param.flat
         ? ::ht_ep::dispatch_pull_map_smem_ints(param.lsa_team_size, param.experts_per_rank) * sizeof(std::int32_t)
         : 0;
-    if (fused_map) {
+    if (overlap_map) {
+        const size_t tiles_per_chunk = ::nccl_ep::ht::kFlatMetadataChunkTokens / (map_warps * 32);
+        map_smem_bytes = nccl_ep::ceil_div(flat_chunks, blocks) * tiles_per_chunk * sizeof(int2);
+    } else if (fused_map && !param.flat) {
         // CTA0's per-chunk (int2 range) buffer sits after the layout scratch; sized for the
         // worst-case per-CTA chunk count so every MAP warp's chunk_ranges write stays in bounds.
         // Folded into map_smem_bytes before the warp-count search below, or that search would
@@ -671,8 +699,15 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
         map_smem_bytes = ((map_smem_bytes + alignof(int2) - 1) & ~size_t(alignof(int2) - 1)) +
             max_cta_chunks * sizeof(int2);
     }
-    const int pull_warps = pull_dispatch_warps(hidden_int4, scale_tma_row_bytes, smem_optin, blocks_per_sm,
-                                              map_smem_bytes, map_warps);
+    int pull_warps = pull_dispatch_warps(hidden_int4, scale_tma_row_bytes, smem_optin, blocks_per_sm,
+                                              map_smem_bytes, map_warps, param.flat);
+    if (pull_warps == 0 && overlap_map) {
+        overlap_map = false;
+        map_warps = 0;
+        map_smem_bytes = 0;
+        pull_warps = pull_dispatch_warps(hidden_int4, scale_tma_row_bytes, smem_optin, blocks_per_sm,
+                                         map_smem_bytes, map_warps, param.flat);
+    }
     if (pull_warps == 0) {
         std::fprintf(stderr, "[nccl_ep jit] dispatch-pull shared memory exceeds the device budget\n");
         return ncclInvalidArgument;
@@ -683,14 +718,24 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
         name << "dispatch_pull_h" << hidden_int4 << "_b" << blocks_per_sm
              << "_r" << static_cast<int>(recipe) << "_s" << scale_int4_per_lane
              << "_st" << scale_tma_row_bytes << "_w" << pull_warps
-             << "_fm" << (fused_map ? 1 : 0);
-        if (fused_map) name << "_k" << param.top_k << "_nr" << param.lsa_team_size << "_e" << param.experts_per_rank;
-        if (fused_map) name << "_cm" << map_smem_bytes;
+             << "_fm" << (fused_map ? 1 : 0) << (param.flat ? "_flat" : "");
+        if (fused_map || param.flat) {
+            name << "_k" << param.top_k;
+        }
+        if (fused_map && !param.flat) {
+            name << "_nr" << param.lsa_team_size << "_e" << param.experts_per_rank;
+        }
+        if (fused_map) {
+            name << "_cm" << map_smem_bytes;
+        }
+        if (param.flat) {
+            name << "_om" << overlap_map;
+        }
         return name.str();
     }();
     const std::string source = dispatch_pull_jit_source(hidden_int4, blocks_per_sm, recipe, scale_int4_per_lane,
                                                         scale_tma_row_bytes, pull_warps, fused_map, param.top_k,
-                                                        param.lsa_team_size, param.experts_per_rank);
+                                                        param.lsa_team_size, param.experts_per_rank, param.flat, overlap_map);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_dispatch_pull";
@@ -703,13 +748,20 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
     // bitfield would silently alias once a field (e.g. scale_tma_row_bytes) overflows.
     variant.runtime_key = static_cast<std::uint64_t>(std::hash<std::string>{}(variant_name));
     variant.num_blocks = num_blocks * blocks_per_sm;
-    variant.block_dim = ::ht_ep::pull_dispatch_threads(pull_warps);
+    variant.block_dim = param.flat ? pull_warps * 32 : ::ht_ep::pull_dispatch_threads(pull_warps);
     const int payload_warps = pull_warps - map_warps;
     variant.dynamic_smem_bytes = pull_dynamic_smem_bytes(hidden_int4, scale_tma_row_bytes, payload_warps) +
         static_cast<int>(map_smem_bytes);
+    variant.nucs = nucs;
+    variant.require_full_residency = fused_map && !param.unfused_sync;
+    variant.cooperative = variant.require_full_residency;
 
     std::string error;
     const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
+    if (status == ::nccl_ep::jit::JitKernelStatus::kInsufficientResidency && blocks_per_sm > 1) {
+        *retry_residency = true;
+        return ncclInvalidUsage;
+    }
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
         // The oversize-hidden smem case (kAttributeFailed) is pre-rejected in ncclEpDispatch
@@ -722,6 +774,20 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
         return ncclInternalError;
     }
     return ncclSuccess;
+}
+
+inline ncclResult_t launch_dispatch_pull(
+    int num_blocks, ::ht_ep::dispatch_pull_param_t& param, ncclEpDispQuant_t recipe,
+    cudaStream_t stream, bool nucs) {
+    const int blocks_per_sm = pick_pull_blocks_per_sm(param.row_bytes / 16);
+    bool retry_residency = false;
+    ncclResult_t result = launch_dispatch_pull_variant(
+        num_blocks, blocks_per_sm, param, recipe, stream, nucs, &retry_residency);
+    if (retry_residency) {
+        retry_residency = false;
+        result = launch_dispatch_pull_variant(num_blocks, 1, param, recipe, stream, nucs, &retry_residency);
+    }
+    return result;
 }
 
 } // namespace jit

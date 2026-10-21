@@ -145,7 +145,8 @@ ncclResult_t reshardComputeStagingGinCounts(int logRank, int numCtas, size_t max
 ncclResult_t reshardGetOrCreateDevCommWithRequirements(ncclComm_t comm, int barrierCount, int ginSignalCount,
                                                        int ginCounterCount, ReshardDevCommBarrierKind barrierKind,
                                                        int ginContextCount, int ginConnectionType, cudaStream_t stream,
-                                                       ncclDevComm* activeDevComm, ReshardDevCommUse* use) {
+                                                       ncclDevComm* activeDevComm, ReshardDevCommUse* use,
+                                                       bool retainPersistentState) {
   NCCL_M2N_CHECK_ARG(activeDevComm != nullptr && use != nullptr, -1,
                      "reshardGetOrCreateDevComm: output DevComm and use token must be non-null");
   cudaEvent_t completionEvent = nullptr;
@@ -156,9 +157,12 @@ ncclResult_t reshardGetOrCreateDevCommWithRequirements(ncclComm_t comm, int barr
   };
   ncclDevComm* devComm = findCachedDevComm(key, &completionEvent, &useState);
   if (devComm != nullptr) {
+    if (retainPersistentState && useState != nullptr) useState->bRetainPersistentState = true;
     *activeDevComm = *devComm;
     return reshardPrepareDevCommUse(completionEvent, useState, stream, use);
   }
+  ReshardDevCommCacheReservation reservation;
+  NCCL_M2N_CHECK(reserveDevCommCacheEntry(&reservation));
   ncclDevComm localDevComm = {};
   ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
   if (barrierKind == RESHARD_DEVCOMM_BARRIER_WORLD) {
@@ -176,7 +180,7 @@ ncclResult_t reshardGetOrCreateDevCommWithRequirements(ncclComm_t comm, int barr
     NCCL_M2N_CHECK(ncclDevCommCreate(comm, &reqs, &localDevComm));
     NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   }
-  ncclResult_t cacheResult = cacheDevComm(key, &localDevComm);
+  ncclResult_t cacheResult = cacheDevComm(key, &localDevComm, retainPersistentState, &reservation);
   if (cacheResult != ncclSuccess) {
     {
       M2nApiUnlock apiUnlock;

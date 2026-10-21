@@ -47,7 +47,7 @@ cdef _cyb_from_buffer(buffer, size, lowpp_type):
             raise ValueError("buffer itemsize must be 1 byte")
         if view.len != size:
             raise ValueError(f"buffer length must be {size} bytes")
-        return lowpp_type.from_ptr(<intptr_t><void *>view.buf, not view.readonly, buffer)
+        return lowpp_type.from_ptr(<intptr_t><void *>view.buf, view.readonly, buffer)
     finally:
         _cyb_cpython.PyBuffer_Release(&view)
 
@@ -755,6 +755,188 @@ cdef class HandleConfig:
             obj._owned = True
         else:
             obj._ptr = <ncclEpHandleConfig_t *>ptr
+            obj._owner = owner
+            obj._owned = False
+        obj._readonly = readonly
+        return obj
+
+
+cdef _get_handle_state_dtype_offsets():
+    cdef ncclEpHandleState_t pod
+    return _numpy.dtype({
+        'names': ['size_', 'magic', 'num_tokens', 'num_topk', 'topk_idx_datatype'],
+        'formats': [_numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.int32, _numpy.dtype(('V', sizeof(ncclDataType_t)))],
+        'offsets': [
+            (<intptr_t>&(pod.size)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.magic)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.num_tokens)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.num_topk)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.topk_idx_datatype)) - (<intptr_t>&pod),
+        ],
+        'itemsize': sizeof(ncclEpHandleState_t),
+    })
+
+handle_state_dtype = _get_handle_state_dtype_offsets()
+
+cdef class HandleState:
+    """Initialize an instance of `ncclEpHandleState_t` using configured defaults.
+
+
+    .. seealso:: `ncclEpHandleState_t`
+    """
+    cdef:
+        ncclEpHandleState_t *_ptr
+        object _owner
+        bint _owned
+        bint _readonly
+
+    def __init__(self):
+        self._ptr = <ncclEpHandleState_t *>_cyb_calloc(1, sizeof(ncclEpHandleState_t))
+        if self._ptr == NULL:
+            raise MemoryError("Error allocating HandleState")
+        self._owner = None
+        self._owned = True
+        self._readonly = False
+
+        self._ptr[0].size = sizeof(ncclEpHandleState_t)
+        self._ptr[0].magic = 0xC00FFFEE
+
+    def __dealloc__(self):
+        cdef ncclEpHandleState_t *ptr
+        if self._owned and self._ptr != NULL:
+            ptr = self._ptr
+            self._ptr = NULL
+            _cyb_free(ptr)
+
+    def __repr__(self):
+        return f"<{__name__}.HandleState object at {hex(id(self))}>"
+
+    @property
+    def ptr(self):
+        """Get the pointer address to the data as Python :class:`int`."""
+        return <intptr_t>(self._ptr)
+
+    cdef intptr_t _get_ptr(self):
+        return <intptr_t>(self._ptr)
+
+    def __int__(self):
+        return <intptr_t>(self._ptr)
+
+    def __eq__(self, other):
+        cdef HandleState other_
+        if not isinstance(other, HandleState):
+            return False
+        other_ = other
+        return (_cyb_memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpHandleState_t)) == 0)
+
+    def __getbuffer__(self, _cyb_cpython.Py_buffer *buffer, int flags):
+        _cyb___getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpHandleState_t), self._readonly)
+
+    def __releasebuffer__(self, Py_buffer *buffer):
+        pass
+
+    def __setitem__(self, key, val):
+        if key == 0 and isinstance(val, _numpy.ndarray):
+            self._ptr = <ncclEpHandleState_t *>_cyb_malloc(sizeof(ncclEpHandleState_t))
+            if self._ptr == NULL:
+                raise MemoryError("Error allocating HandleState")
+            _cyb_memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpHandleState_t))
+            self._owner = None
+            self._owned = True
+            self._readonly = not val.flags.writeable
+        else:
+            setattr(self, key, val)
+
+    @property
+    def size_(self):
+        """int: """
+        return self._ptr[0].size
+
+    @size_.setter
+    def size_(self, val):
+        if self._readonly:
+            raise ValueError("This HandleState instance is read-only")
+        self._ptr[0].size = val
+
+    @property
+    def magic(self):
+        """int: """
+        return self._ptr[0].magic
+
+    @magic.setter
+    def magic(self, val):
+        if self._readonly:
+            raise ValueError("This HandleState instance is read-only")
+        self._ptr[0].magic = val
+
+    @property
+    def num_tokens(self):
+        """int: """
+        return self._ptr[0].num_tokens
+
+    @num_tokens.setter
+    def num_tokens(self, val):
+        if self._readonly:
+            raise ValueError("This HandleState instance is read-only")
+        self._ptr[0].num_tokens = val
+
+    @property
+    def num_topk(self):
+        """int: """
+        return self._ptr[0].num_topk
+
+    @num_topk.setter
+    def num_topk(self, val):
+        if self._readonly:
+            raise ValueError("This HandleState instance is read-only")
+        self._ptr[0].num_topk = val
+
+    @property
+    def topk_idx_datatype(self):
+        """: """
+        return self._ptr[0].topk_idx_datatype
+
+    @topk_idx_datatype.setter
+    def topk_idx_datatype(self, val):
+        if self._readonly:
+            raise ValueError("This HandleState instance is read-only")
+        self._ptr[0].topk_idx_datatype = val
+
+    @staticmethod
+    def from_buffer(buffer):
+        """Create an HandleState instance with the memory from the given buffer."""
+        return _cyb_from_buffer(buffer, sizeof(ncclEpHandleState_t), HandleState)
+
+    @staticmethod
+    def from_data(data):
+        """Create an HandleState instance wrapping the given NumPy array.
+
+        Args:
+            data (_numpy.ndarray): a single-element array of dtype `handle_state_dtype` holding the data.
+        """
+        return _cyb_from_data(data, "handle_state_dtype", handle_state_dtype, HandleState)
+
+    @staticmethod
+    def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
+        """Create an HandleState instance wrapping the given pointer.
+
+        Args:
+            ptr (intptr_t): pointer address as Python :class:`int` to the data.
+            owner (object): The Python object that owns the pointer. If not provided, data will be copied.
+            readonly (bool): whether the data is read-only (to the user). default is `False`.
+        """
+        if ptr == 0:
+            raise ValueError("ptr must not be null (0)")
+        cdef HandleState obj = HandleState.__new__(HandleState)
+        if owner is None:
+            obj._ptr = <ncclEpHandleState_t *>_cyb_malloc(sizeof(ncclEpHandleState_t))
+            if obj._ptr == NULL:
+                raise MemoryError("Error allocating HandleState")
+            _cyb_memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpHandleState_t))
+            obj._owner = None
+            obj._owned = True
+        else:
+            obj._ptr = <ncclEpHandleState_t *>ptr
             obj._owner = owner
             obj._owned = False
         obj._readonly = readonly
@@ -2238,8 +2420,8 @@ cdef class CombineOutputs:
 cdef _get_group_config_dtype_offsets():
     cdef ncclEpGroupConfig_t pod
     return _numpy.dtype({
-        'names': ['size_', 'magic', 'version', 'algorithm', 'num_experts', 'max_dispatch_tokens_per_rank', 'max_recv_tokens_per_rank', 'max_token_bytes', 'rdma_buffer_size', 'num_qp_per_rank', 'num_channels', 'max_num_sms', 'alloc', 'enable_mask', 'timeout_ns', 'zero_copy', 'overflow_policy', 'num_topk', 'padding_v2', 'dispatch_num_sms', 'combine_num_sms'],
-        'formats': [_numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.dtype(('V', sizeof(unsigned long int))), _numpy.uint32, _numpy.uint32, _numpy.uint32, alloc_config_dtype, _numpy.uint32, _numpy.uint64, _numpy.int32, _numpy.int32, _numpy.uint32, (_numpy.uint8, 4), _numpy.uint32, _numpy.uint32],
+        'names': ['size_', 'magic', 'version', 'algorithm', 'num_experts', 'max_dispatch_tokens_per_rank', 'max_recv_tokens_per_rank', 'max_token_bytes', 'rdma_buffer_size', 'num_qp_per_rank', 'num_channels', 'max_num_sms', 'alloc', 'enable_mask', 'timeout_ns', 'zero_copy', 'overflow_policy', 'num_topk', 'padding_v2', 'dispatch_num_sms', 'combine_num_sms', 'ht_flow', 'meta_exchange_policy', 'num_attn_ranks', 'padding_v4'],
+        'formats': [_numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.dtype(('V', sizeof(unsigned long int))), _numpy.uint32, _numpy.uint32, _numpy.uint32, alloc_config_dtype, _numpy.uint32, _numpy.uint64, _numpy.int32, _numpy.int32, _numpy.uint32, (_numpy.uint8, 4), _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.int32, _numpy.uint32, (_numpy.uint8, 4)],
         'offsets': [
             (<intptr_t>&(pod.size)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.magic)) - (<intptr_t>&pod),
@@ -2262,6 +2444,10 @@ cdef _get_group_config_dtype_offsets():
             (<intptr_t>&(pod.padding_v2)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.dispatch_num_sms)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.combine_num_sms)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.ht_flow)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.meta_exchange_policy)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.num_attn_ranks)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.padding_v4)) - (<intptr_t>&pod),
         ],
         'itemsize': sizeof(ncclEpGroupConfig_t),
     })
@@ -2291,7 +2477,7 @@ cdef class GroupConfig:
         self._ptr[0].size = sizeof(ncclEpGroupConfig_t)
         self._ptr[0].magic = 0xC00FFFEE
         # = NCCL_EP_API_VERSION; bump with the header.
-        self._ptr[0].version = 3
+        self._ptr[0].version = 4
 
     def __dealloc__(self):
         cdef ncclEpGroupConfig_t *ptr
@@ -2581,6 +2767,56 @@ cdef class GroupConfig:
             raise ValueError("This GroupConfig instance is read-only")
         self._ptr[0].combine_num_sms = val
 
+    @property
+    def ht_flow(self):
+        """int: """
+        return <int>(self._ptr[0].ht_flow)
+
+    @ht_flow.setter
+    def ht_flow(self, val):
+        if self._readonly:
+            raise ValueError("This GroupConfig instance is read-only")
+        self._ptr[0].ht_flow = <ncclEpHtFlow_t><int>val
+
+    @property
+    def meta_exchange_policy(self):
+        """int: """
+        return <int>(self._ptr[0].meta_exchange_policy)
+
+    @meta_exchange_policy.setter
+    def meta_exchange_policy(self, val):
+        if self._readonly:
+            raise ValueError("This GroupConfig instance is read-only")
+        self._ptr[0].meta_exchange_policy = <ncclEpMetaExchangePolicy_t><int>val
+
+    @property
+    def num_attn_ranks(self):
+        """int: Number of leading attention ranks for AFD; zero disables AFD."""
+        return self._ptr[0].num_attn_ranks
+
+    @num_attn_ranks.setter
+    def num_attn_ranks(self, val):
+        if self._readonly:
+            raise ValueError("This GroupConfig instance is read-only")
+        self._ptr[0].num_attn_ranks = val
+
+    @property
+    def padding_v4(self):
+        """~_numpy.uint8: (array of length 4)."""
+        cdef _cyb_view.array arr = _cyb_view.array(shape=(4,), itemsize=sizeof(unsigned char), format="B", mode="c", allocate_buffer=False)
+        arr.data = <char *>(&(self._ptr[0].padding_v4))
+        return _numpy.asarray(arr)
+
+    @padding_v4.setter
+    def padding_v4(self, val):
+        if self._readonly:
+            raise ValueError("This GroupConfig instance is read-only")
+        if len(val) != 4:
+            raise ValueError(f"Expected length { 4 } for field padding_v4, got {len(val)}")
+        cdef _cyb_view.array arr = _cyb_view.array(shape=(4,), itemsize=sizeof(unsigned char), format="B", mode="c")
+        arr[:] = _numpy.asarray(val, dtype=_numpy.uint8)
+        _cyb_memcpy(<void *>(&(self._ptr[0].padding_v4)), <void *>(arr.data), sizeof(unsigned char) * len(val))
+
     @staticmethod
     def from_buffer(buffer):
         """Create an GroupConfig instance with the memory from the given buffer."""
@@ -2665,6 +2901,22 @@ class ZeroCopyMode(_cyb_IntEnum):
     ZERO_COPY_OFF = NCCL_EP_ZERO_COPY_OFF
     ZERO_COPY_ON = NCCL_EP_ZERO_COPY_ON
 
+class HtFlow(_cyb_IntEnum):
+    """
+    See `ncclEpHtFlow_t`.
+    """
+    AUTO = NCCL_EP_HT_FLOW_AUTO
+    PUSH_PULL = NCCL_EP_HT_FLOW_PUSH_PULL
+    PULL_PUSH = NCCL_EP_HT_FLOW_PULL_PUSH
+
+class MetaExchangePolicy(_cyb_IntEnum):
+    """
+    See `ncclEpMetaExchangePolicy_t`.
+    """
+    META_EXCHANGE_AUTO = NCCL_EP_META_EXCHANGE_AUTO
+    META_EXCHANGE_REQUIRE_FUSED = NCCL_EP_META_EXCHANGE_REQUIRE_FUSED
+    META_EXCHANGE_FORCE_SCAN = NCCL_EP_META_EXCHANGE_FORCE_SCAN
+
 class ExpertIdKind(_cyb_IntEnum):
     """
     See `ncclEpExpertIdKind_t`.
@@ -2687,6 +2939,7 @@ class CombQuant(_cyb_IntEnum):
     """
     NONE = NCCL_EP_COMB_QUANT_NONE
     NVFP4 = NCCL_EP_COMB_QUANT_NVFP4
+    MXFP8 = NCCL_EP_COMB_QUANT_MXFP8
 
 
 ###############################################################################
@@ -2764,6 +3017,14 @@ cpdef intptr_t init_handle(intptr_t ep_group, int layout, intptr_t config, int n
     return <intptr_t>handle
 
 
+cpdef intptr_t import_handle(intptr_t ep_group, int layout, intptr_t config, intptr_t state, intptr_t handle_mem) except? 0:
+    cdef Handle handle
+    with nogil:
+        __status__ = ncclEpImportHandle(&handle, <Group>ep_group, <_Layout>layout, <const ncclEpHandleConfig_t*>config, <const ncclEpHandleState_t*>state, <const ncclEpTensor_t*>handle_mem)
+    check_status(__status__)
+    return <intptr_t>handle
+
+
 cpdef update_handle(intptr_t handle, intptr_t topk_idx, intptr_t layout_info, intptr_t stream):
     with nogil:
         __status__ = ncclEpUpdateHandle(<Handle>handle, <const ncclEpTensor_t*>topk_idx, <const ncclEpLayoutInfo_t*>layout_info, <Stream>stream)
@@ -2831,6 +3092,30 @@ cpdef int get_async_error(intptr_t ep_group) except? -1:
 cpdef error_clear(intptr_t ep_group):
     with nogil:
         __status__ = ncclEpErrorClear(<Group>ep_group)
+    check_status(__status__)
+
+
+cpdef af_dispatch(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t layout_info, intptr_t config, intptr_t stream):
+    with nogil:
+        __status__ = ncclEpAfDispatch(<Handle>handle, <const ncclEpDispatchInputs_t*>inputs, <const ncclEpDispatchOutputs_t*>outputs, <const ncclEpLayoutInfo_t*>layout_info, <const ncclEpDispatchConfig_t*>config, <Stream>stream)
+    check_status(__status__)
+
+
+cpdef af_combine(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t config, intptr_t stream):
+    with nogil:
+        __status__ = ncclEpAfCombine(<Handle>handle, <const ncclEpCombineInputs_t*>inputs, <const ncclEpCombineOutputs_t*>outputs, <const ncclEpCombineConfig_t*>config, <Stream>stream)
+    check_status(__status__)
+
+
+cpdef af_recv(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t layout_info, intptr_t config, intptr_t stream):
+    with nogil:
+        __status__ = ncclEpAfRecv(<Handle>handle, <const ncclEpDispatchInputs_t*>inputs, <const ncclEpDispatchOutputs_t*>outputs, <const ncclEpLayoutInfo_t*>layout_info, <const ncclEpDispatchConfig_t*>config, <Stream>stream)
+    check_status(__status__)
+
+
+cpdef af_return(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t config, intptr_t stream):
+    with nogil:
+        __status__ = ncclEpAfReturn(<Handle>handle, <const ncclEpCombineInputs_t*>inputs, <const ncclEpCombineOutputs_t*>outputs, <const ncclEpCombineConfig_t*>config, <Stream>stream)
     check_status(__status__)
 
 

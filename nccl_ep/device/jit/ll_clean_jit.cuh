@@ -42,7 +42,8 @@ inline std::string ll_clean_jit_source() {
 
 inline ncclResult_t launch_ll_clean_low_latency_buffer(
     const clean_low_latency_buffer_kernel_args_t& args,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    bool nucs) {
     static const int variant_identity = 0;
     const std::string variant_name = "ll_clean";
     const std::string source = ll_clean_jit_source();
@@ -57,6 +58,7 @@ inline ncclResult_t launch_ll_clean_low_latency_buffer(
     variant.num_blocks = 1;
     variant.block_dim = kLlCleanNumThreads;
     variant.dynamic_smem_bytes = 0;
+    variant.nucs = nucs;
     variant.cooperative = true;
     variant.cluster_dim_x = 1;
 

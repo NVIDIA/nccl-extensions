@@ -64,6 +64,7 @@ add_custom_target(nccl-submodule
 # Source files
 set(NCCL_EP_HOST_SRC
     nccl_ep.cc
+    nccl_ep_cft.cc
     nccl_ep_env.cc
     device/jit/jit_utils.cc
     device/jit/jit_cache.cc
@@ -131,6 +132,8 @@ endif()
 set(NCCL_EP_JIT_CONFIG_HEADER "${NCCL_EP_JIT_SOURCE_DIR}/config.h")
 set(NCCL_EP_JIT_HEADERS
     device/ht_ep.cuh
+    device/ht_compact_prob.cuh
+    ht_compact_prob.h
     device/mxfp8_quant.cuh
     device/quant_recipe.cuh
     device/device_primitives.cuh
@@ -141,14 +144,18 @@ set(NCCL_EP_JIT_HEADERS
     device/macros.cuh
     device/ll_ep.cuh
     device/ll_ep_adapter.cuh
-    device/ll_ep_smem.cuh
     device/ll/ll_common.cuh
+    device/ll/ll_dispatch_recipe.cuh
+    device/ll/ll_ep_smem.cuh
     device/ll/ll_gin.cuh
     device/ll/ll_lsa_primitives.cuh
     device/ll/ll_mask.cuh
     device/ll/ll_logfmt.cuh
     device/ll/ll_dispatch_lsa.cuh
+    device/ll/ll_dispatch_cft_lsa.cuh
     device/ll/ll_combine_lsa.cuh
+    device/cft.cuh
+    device/ll_ep_cft.cuh
 )
 
 file(MAKE_DIRECTORY "${NCCL_EP_JIT_SOURCE_DIR}")

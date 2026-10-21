@@ -305,6 +305,10 @@ all NCCL EP outputs elsewhere.
 
 ### Environment Setup
 
+`NCCL_EP_DISPATCH_TOKENS_PER_CHUNK` overrides the HT dispatch chunk without changing combine. It applies only within one LSA team. Use a positive multiple of 32 that divides the shared `NCCL_EP_TOKENS_PER_CHUNK` value (or its resolved default). Invalid requests are warned about and retain the shared chunk.
+
+When unset, NCCL EP selects the dispatch chunk automatically. Set `NCCL_EP_ENV_VERBOSE=1` to report the resolved chunks.
+
 Make sure to set the generic environment according to the
 [Set the environment](#set-the-environment) section.
 
@@ -329,6 +333,26 @@ export NCCL_EP_JIT_LOG=1      # Runtime kernel-compilation diagnostics (see docs
 > where it was built needs no configuration; relocated installs, wheels,
 > containers, and read-only filesystems do. See
 > [JIT Kernel Compilation](docs/documentation/jit.md) for every knob, including `NCCL_EP_HOME`.
+
+#### NCCL EP compatibility with newer NCCL runtimes
+
+- Builds compiled against NCCL >= 2.31 work with newer NCCL runtimes without additional configuration.
+- Builds compiled against NCCL >= 2.30.5 and < 2.31 must enable
+  `NCCL_DEV_API_JIT` when running with a newer NCCL runtime.
+- Builds compiled against NCCL < 2.30.5 must use the same NCCL version at build time and runtime.
+
+```bash
+export NCCL_HOME=/path/to/nccl-2.31
+export LD_LIBRARY_PATH="${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
+export NCCL_DEV_API_JIT=1
+```
+
+> The runtime lib and headers must come from the same NCCL installation; mixing Device API layouts is unsupported.
+> Forward compatibility is unsupported: the runtime NCCL version must not be older than the build version.
+
+Set `NCCL_EP_ENABLE_NUCS=1` to request NVLink utilization-centric scheduling communication kernels.
+It is disabled by default and requires the library to be built with CUDA 13.3 or newer headers
+and run with a CUDA 13.3 or newer driver.
 
 ### High-Throughput tuning
 
@@ -476,6 +500,8 @@ typedef struct {
     unsigned char padding_v2[4];                // Consumes V2 tail padding; future fields append after
     unsigned int dispatch_num_sms;              // Dispatch budget (AUTO inherits max_num_sms/default)
     unsigned int combine_num_sms;               // Combine budget (AUTO inherits max_num_sms/default)
+    unsigned int num_attn_ranks;                // AFD A-side ranks; 0 = classic EP (universal LL only)
+    unsigned char padding_v4[4];                // Consumes V4 tail padding; future fields append after
 } ncclEpGroupConfig_t;
 
 // Use NCCL_EP_GROUP_CONFIG_INIT to pre-fill size/magic/version correctly.
@@ -531,7 +557,78 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
 
 ## HT-specific modifiers
 
+### Flat pull/push
+
+HT flat layout supports the same opt-in pull-dispatch / push-combine transport
+as expert-major layout. Set `NCCL_EP_HT_PULL_PUSH=1` before group creation
+on every rank. This replaces `NCCL_EP_HT_EM_PULL_PUSH` for both layouts; the
+old name is no longer recognized. Leaving the new flag unset preserves the
+existing transport selection.
+
+Pull dispatch writes one flat receive row per source token and destination
+rank, even when several selected experts belong to that rank. Within each
+row, expert IDs are ordered by ascending local expert index, with their
+corresponding weights. Push combine returns the caller's
+locally reduced row to the source rank, where contributions from destination
+ranks are summed. Forward and backward operations use handle-owned routing
+maps, including the original top-k positions needed for backward weights.
+
+Measure transport choices over the full update, dispatch, and combine sequence.
+Expert-major pull/push also eliminates separate expert-layout permutation and
+gather work; flat rows are already locally reduced by the caller. Flat push
+still writes peer staging before the final reduction, so wider rows can favor
+the existing transport even when fused metadata reduces dispatch overhead.
+
+Transport, metadata preparation, and synchronization are separate choices:
+
+| Control | Effect for HT flat layout |
+| --- | --- |
+| `NCCL_EP_HT_PULL_PUSH=1` | Select pull dispatch and push combine. |
+| `NCCL_EP_HT_AG_SCAN_MODE=1` | Force routing-map exchange and scan instead of fused metadata for pull/push. |
+| `NCCL_EP_HT_COUNT_UNFUSED=1` | Retain the scan path for flat metadata preparation. |
+| `NCCL_EP_HT_UNFUSED_SYNC=1` | With pull/push, run head/tail synchronization in standalone kernels instead of inside the payload kernels. Does not disable fused metadata. |
+
+The metadata controls now use the `NCCL_EP_HT_` prefix instead of
+`NCCL_EP_HT_EM_`. Update existing environment settings; the old names are
+no longer parsed.
+
+`NCCL_EP_HT_COUNT_UNFUSED=1` selects unfused count exchange for EM default
+transport and scan metadata for flat pull/push. EM pull/push does not use
+this override; use `NCCL_EP_HT_AG_SCAN_MODE=1` to force its scan path.
+
+When eligible, fused metadata stages local routing information during
+`ncclEpUpdateHandle` and builds receive maps during dispatch. It is supported with pull/push within one LSA team. Eager sizing, explicit update-time layout outputs, and unsupported
+metadata configurations retain the scan path. Enabling fused metadata alone
+does not select pull/push.
+
+To use fused metadata with a fixed receive budget, omit count/offset outputs
+from `ncclEpUpdateHandle`; request needed counters through the dispatch
+`layout_info` argument and consume them after that dispatch completes on the
+stream. All ranks must agree whether early layout outputs are requested.
+Flat expert counters use `ncclInt32`; the total receive counter accepts
+`ncclInt32` or `ncclInt64`. Flat layout does not provide expert offsets.
+
+Pull/push currently requires one LSA team, top-k at most 32, and at most 65535
+experts, with at most 128 ranks in the LSA team. It cannot be combined with the
+`NCCL_EP_HT_EM_LOCAL_DUP` or `NCCL_EP_HT_EM_NVLINK_DUP` overrides. Dispatch
+supports `NCCL_EP_DISP_QUANT_NONE` and `NCCL_EP_DISP_QUANT_FWD` (forwarded
+scales). Group-level transport and synchronization settings must match across
+ranks. For imported backward handles, snapshot handle memory after forward
+dispatch has completed so the snapshot includes dispatch-built routing maps.
+
+Combine supports `NCCL_EP_COMB_QUANT_NONE`; MXFP8 combine is not supported.
+Backward weight tensors use the handle's top-k width. Each token's nonnegative
+expert IDs must be unique; duplicate-ID handling is tracked separately in #138.
+
 ### Eager mode
+
+In fixed-capacity mode, staged HT dispatch can copy device-counted token and forwarded-scale rows without host count readback. Set `NCCL_EP_DISPATCH_COPY_MODE` before group creation to `CE`, `SIMT`, or `TMA` (default), case-insensitively. Unset or empty selects TMA. Invalid values warn and use TMA. TMA uses 96 CTAs on Blackwell SM100/SM103 and 128 on other architectures, including Rubin, bounded by the device SM count. It uses 32 threads per CTA with one issuer and 128 KiB of shared memory per CTA. If a staged copy's addresses or row size are not 16-byte aligned, that dispatch uses CE instead. The group's selected mode is unchanged. Explicit SIMT mode uses the shuffle grid.
+
+The TMA copy kernel requires a 128 KiB dynamic shared-memory allocation per CTA, in addition to its static barrier storage. If the device cannot satisfy that opt-in, dispatch falls back to host-issued CE copies, not SIMT, with a warning. This includes SM120/SM121, whose per-CTA shared-memory limit is 99 KiB. The same fallback applies if TMA is compiled out or the opt-in is unsupported. Other CUDA setup errors are returned to the caller.
+
+CE mode synchronously reads back the count outside graph capture and copies the bounded capacity during capture, so unused output rows may be overwritten. Both SM modes leave token and forwarded-scale rows beyond the device count untouched. Output tensors must cover the configured receive budget under every policy. Eager mode below, registered-window zero-copy, LL, and expert-major local permutation are unchanged.
+
+HT forward metadata conversion reads the device count under every copy policy. Routing weights and indices beyond that extent remain untouched. Direct expert-major conversion includes alignment padding, while local permutation retains its own padding handling.
 
 A group normally commits to a fixed per-rank recv budget, and every dispatch recv
 tensor is sized to it. Creating the group with
@@ -602,15 +699,15 @@ documentation for more details.
 ## API Reference
 
 The complete C API reference lives in **[docs/documentation/api_reference.md](docs/documentation/api_reference.md)**,
-covering all 18 public entry points:
+covering all 23 public entry points:
 
 | Group                    | Functions                                                                                                    |
 |--------------------------|--------------------------------------------------------------------------------------------------------------|
 | Library                  | `ncclEpGetVersion`                                                                                           |
 | Group Management         | `ncclEpCreateGroup`, `ncclEpGroupDestroy`                                                                    |
 | Tensor Descriptors       | `ncclEpTensorAlloc`, `ncclEpTensorDestroy`                                                                   |
-| Handle Management        | `ncclEpCreateHandle`, `ncclEpInitHandle`, `ncclEpUpdateHandle`, `ncclEpHandleMemSize`, `ncclEpHandleDestroy` |
-| Communication Operations | `ncclEpDispatch`, `ncclEpCombine`, `ncclEpComplete`                                                          |
+| Handle Management        | `ncclEpCreateHandle`, `ncclEpInitHandle`, `ncclEpUpdateHandle`, `ncclEpHandleMemSize`, `ncclEpImportHandle`, `ncclEpHandleDestroy` |
+| Communication Operations | `ncclEpDispatch`, `ncclEpCombine`, `ncclEpAfDispatch`, `ncclEpAfRecv`, `ncclEpAfCombine`, `ncclEpAfReturn`, `ncclEpComplete` |
 | Fault Tolerance (LL)     | `ncclEpMaskQuery`, `ncclEpMaskUpdate`, `ncclEpMaskClean`, `ncclEpGetAsyncError`, `ncclEpErrorClear`          |
 
 # Execution Modes

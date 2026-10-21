@@ -51,7 +51,7 @@
 #include "staging_profile.h"
 #include "staging_types.h"
 
-/* Advances the persistent flow-control generation for each reshard call. */
+/* Assigns each reshard call a unique trace epoch. */
 static std::atomic<uint64_t> gStagingEpoch{0};
 
 #ifdef NCCL_M2N_TESTING
@@ -165,8 +165,6 @@ static int stagingComputeCtaHeuristicPeerCount(const StagingTransferDescriptor* 
   computeMeshGroupInfo(src, src->mesh->startRank, &srcInfo);
   computeMeshGroupInfo(dst, dst->mesh->startRank, &dstInfo);
 
-  const int srcShardDim = srcInfo.shardTensorDim;
-  const int dstShardDim = dstInfo.shardTensorDim;
   const int srcShardCount = std::max(1, srcInfo.shardCount);
   const int dstShardCount = std::max(1, dstInfo.shardCount);
   int maxActivePeers = 1;
@@ -177,8 +175,8 @@ static int stagingComputeCtaHeuristicPeerCount(const StagingTransferDescriptor* 
     int active = 0;
     for (int ds = 0; ds < dstShardCount; ds++) {
       ncclReshardTransferPlan plan{};
-      computeTransferPlan(desc->srcDims, desc->srcStrides, srcShardDim, ss, desc->dstDims, desc->dstStrides,
-                          dstShardDim, ds, desc->ndims, elementsPerChunk, &plan);
+      computeTransferPlan(desc->srcDims, desc->srcStrides, srcInfo.shardLayout, ss, desc->dstDims, desc->dstStrides,
+                          dstInfo.shardLayout, ds, desc->ndims, elementsPerChunk, &plan);
       if (plan.totalInnerTransfers > 0) {
         active++;
       }
@@ -193,8 +191,8 @@ static int stagingComputeCtaHeuristicPeerCount(const StagingTransferDescriptor* 
     int active = 0;
     for (int ss = 0; ss < srcShardCount; ss++) {
       ncclReshardTransferPlan plan{};
-      computeTransferPlan(desc->srcDims, desc->srcStrides, srcShardDim, ss, desc->dstDims, desc->dstStrides,
-                          dstShardDim, ds, desc->ndims, elementsPerChunk, &plan);
+      computeTransferPlan(desc->srcDims, desc->srcStrides, srcInfo.shardLayout, ss, desc->dstDims, desc->dstStrides,
+                          dstInfo.shardLayout, ds, desc->ndims, elementsPerChunk, &plan);
       if (plan.totalInnerTransfers > 0) {
         active++;
       }
@@ -370,7 +368,7 @@ static ncclResult_t translateSplitPipeLsaPeer(StagingPeerInfo* peer, const Resha
 
 static ncclResult_t applySplitPipeParams(StagingKernelParams* params, const ReshardSplitComms* sc, ncclWindow_t windowA,
                                          ncclWindow_t windowB, int signalsPerControlSlot, int countersPerControlSlot,
-                                         int signalsPerSlotB, int countersPerSlotB, int persistentControlSlot) {
+                                         int signalsPerNamespaceB, int countersPerNamespaceB, int persistentControlSlot) {
   NCCL_M2N_CHECK_ARG(params != nullptr && sc != nullptr && sc->active, -1,
                      "applySplitPipeParams: active split state and params are required");
   params->rdmaWindow = windowA;
@@ -385,8 +383,11 @@ static ncclResult_t applySplitPipeParams(StagingKernelParams* params, const Resh
 
   const int signalOffsetA = persistentControlSlot * signalsPerControlSlot;
   const int counterOffsetA = persistentControlSlot * countersPerControlSlot;
-  const int signalOffsetB = sc->slotIdx * signalsPerSlotB + signalOffsetA;
-  const int counterOffsetB = sc->slotIdx * countersPerSlotB + counterOffsetA;
+  NCCL_M2N_CHECK_ARG(sc->pipeNamespaceId >= 0 && sc->pipeNamespaceId < sc->pipeNamespaceCapacity,
+                     params->myRank, "applySplitPipeParams: invalid persistent PIPE namespace %d/%d",
+                     sc->pipeNamespaceId, sc->pipeNamespaceCapacity);
+  const int signalOffsetB = sc->pipeNamespaceId * signalsPerNamespaceB + signalOffsetA;
+  const int counterOffsetB = sc->pipeNamespaceId * countersPerNamespaceB + counterOffsetA;
   const bool thisRankIsSource = splitParentRankIsSource(sc, params->myRank);
 
   applyPipeRdmaOffsets(params, sc, signalOffsetA, counterOffsetA, signalOffsetB, counterOffsetB);
@@ -836,6 +837,7 @@ static ncclResult_t pipeHostWaitSignals(ncclComm_t comm, PipeHostWaitList* waits
   const int nDesc = static_cast<int>(waits->size());
   RESHARD_DEBUG(rank, "PIPE host_rma %s wait enqueue begin ndesc=%d", tag, nDesc);
   NCCL_M2N_CHECK(ncclWaitSignal(nDesc, waits->data(), comm, stream));
+  NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   RESHARD_DEBUG(rank, "PIPE host_rma %s wait enqueue end ndesc=%d", tag, nDesc);
   NCCL_M2N_CHECK(pipeHostTraceSync(stream, rank, tag, "wait", -1));
   return ncclSuccess;
@@ -866,7 +868,8 @@ static ncclResult_t pipeHostRmaPhaseBegin(int rank, const char* phase) {
   return ncclSuccess;
 }
 
-static ncclResult_t pipeHostRmaPhaseEnd(cudaStream_t stream, int rank, const char* phase, ncclResult_t scheduleResult) {
+static ncclResult_t pipeHostRmaPhaseEnd(ncclComm_t comm, cudaStream_t stream, int rank, const char* phase,
+                                        ncclResult_t scheduleResult) {
   NCCL_M2N_CHECK_ARG(gPipeHostNcclGroupDepth > 0, rank, "PIPE host_rma: phase %s ended without a matching group start",
                      phase);
   gPipeHostNcclGroupDepth--;
@@ -878,6 +881,9 @@ static ncclResult_t pipeHostRmaPhaseEnd(cudaStream_t stream, int rank, const cha
     return scheduleResult;
   }
   NCCL_M2N_CHECK(groupEndResult);
+  /* Group completion can leave enqueue work pending even after a success return.
+   * Finish it before the pipeline records events or submits a dependent phase. */
+  NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   NCCL_M2N_CHECK(pipeHostTraceSync(stream, rank, phase, "phase_end", -1));
   return ncclSuccess;
 }
@@ -890,7 +896,7 @@ static ncclResult_t pipeHostRunPutSignalPhase(const PipeHostComm& hostComm, int 
   }
   NCCL_M2N_CHECK(pipeHostRmaPhaseBegin(logRank, phase));
   ncclResult_t scheduleResult = enqueueFn();
-  return pipeHostRmaPhaseEnd(stream, logRank, phase, scheduleResult);
+  return pipeHostRmaPhaseEnd(hostComm.comm, stream, logRank, phase, scheduleResult);
 }
 
 template <typename BuildWaitFn>
@@ -2686,13 +2692,12 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
                                      const size_t* dims) -> ncclResult_t {
     ncclReshardMeshGroupInfo info;
     computeMeshGroupInfo(tensor, tensor->mesh->startRank, &info);
-    if (info.shardTensorDim < 0) {
-      return ncclSuccess;
+    for (int d = 0; d < ndims; d++) {
+      size_t globalDim = 0;
+      NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(dims[d], (size_t)info.shardLayout.shardCounts[d], &globalDim), world_rank,
+                         "ncclReshard: %s shard dimension overflows global extent: dim=%d local=%zu shardCount=%d",
+                         side, d, dims[d], info.shardLayout.shardCounts[d]);
     }
-    size_t global_dim = 0;
-    NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(dims[info.shardTensorDim], (size_t)info.shardCount, &global_dim), world_rank,
-                       "ncclReshard: %s shard dimension overflows global extent: dim=%d local=%zu shardCount=%d", side,
-                       info.shardTensorDim, dims[info.shardTensorDim], info.shardCount);
     return ncclSuccess;
   };
   NCCL_M2N_CHECK(check_shard_global_size("source", &src_local, src_tensor_dims));
@@ -2931,7 +2936,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
         {
           M2nApiUnlock apiUnlock;
           NCCL_M2N_CHECK(ncclCommWindowRegister(comm, staging->buffer, staging->totalSize, &staging_window,
-                                                NCCL_WIN_COLL_SYMMETRIC));
+                                                NCCL_WIN_COLL_SYMMETRIC | NCCL_WIN_STRICT_ORDERING));
           NCCL_M2N_CHECK(m2nWaitCommReady(comm));
         }
         NCCL_M2N_CHECK(cacheInternalWindow(comm, staging->buffer, staging->totalSize, RESHARD_INTERNAL_WINDOW_STAGING,
@@ -3033,7 +3038,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   {
     StagingProfileScope profileScope(profile.get(), STAGING_PROFILE_GET_DEV_COMM);
     if (splitStagingActive) {
-      const int maxConcurrency = reshardGetSplitSlotCount();
+      const int maxConcurrency = splitComms.slotCount;
       const int persistentControlSlots = reshardGetPersistentControlSlotCount();
       const int allocatedPersistentControlSlots = persistentControlSlots;
       NCCL_M2N_CHECK_ARG(persistentControlSlotValid, world_rank,
@@ -3057,9 +3062,14 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
                          signalsPerControlSlot, countersPerControlSlot, allocatedPersistentControlSlots);
       const int ginSignalCountA = signalsPerControlSlot * allocatedPersistentControlSlots;
       const int ginCounterCountA = countersPerControlSlot * allocatedPersistentControlSlots;
-      const int signalsPerSlotB = signalsPerControlSlot * allocatedPersistentControlSlots;
-      const int countersPerSlotB = std::max(1, countersPerControlSlot * allocatedPersistentControlSlots);
+      const int signalsPerNamespaceB = signalsPerControlSlot * allocatedPersistentControlSlots;
+      const int countersPerNamespaceB = countersPerControlSlot * allocatedPersistentControlSlots;
       const int ctxPerSlotB = configuredGinContextCount;
+      ReshardCommBResourcePlan resourcesB{};
+      NCCL_M2N_CHECK_ARG(reshardBuildPipeCommBResourcePlan(splitComms.pipeNamespaceCapacity, maxConcurrency,
+                                                          allocatedPersistentControlSlots, signalsPerControlSlot,
+                                                          countersPerControlSlot, ctxPerSlotB, &resourcesB),
+                         world_rank, "ncclReshard: invalid or overflowing split PIPE commB resource plan");
       ncclWindow_t windowA = nullptr;
       ncclWindow_t windowB = nullptr;
       ncclDevComm* outSplitDevCommA = pipeHostRma ? nullptr : &splitDevCommA;
@@ -3068,16 +3078,24 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
       ReshardDevCommUse* outSplitDevCommBUse = pipeHostRma ? nullptr : &splitDevCommBUse;
       NCCL_M2N_CHECK(reshardSplitEnsureResources(
         &splitComms, staging->buffer, staging->totalSize, 0, RESHARD_DEVCOMM_BARRIER_NONE, ginSignalCountA,
-        ginCounterCountA, signalsPerSlotB, countersPerSlotB, ctxPerSlotB, maxConcurrency, workStream, &windowA,
+        ginCounterCountA, resourcesB, workStream, &windowA,
         &windowB, outSplitDevCommA, outSplitDevCommAUse, outSplitDevCommB, outSplitDevCommBUse));
       if (pipePlanCacheMiss) {
         NCCL_M2N_CHECK(applySplitPipeParams(pipePlanEntry->hostParams, &splitComms, windowA, windowB,
-                                            signalsPerControlSlot, countersPerControlSlot, signalsPerSlotB,
-                                            countersPerSlotB, persistentControlSlot));
+                                            signalsPerControlSlot, countersPerControlSlot, signalsPerNamespaceB,
+                                            countersPerNamespaceB, persistentControlSlot));
       }
       pipeCall.splitComm = true;
       pipeCall.splitCommBContextBase = splitComms.slotIdx * ctxPerSlotB;
       pipeCall.splitCommBContextCount = ctxPerSlotB;
+      RESHARD_INFO(world_rank,
+                   "PIPE commB-state: namespace=%d/%d controlSlot=%d lane=%d/%d "
+                   "signalBaseB=%d counterBaseB=%d contextBaseB=%d totalSignalsB=%d totalCountersB=%d totalContextsB=%d",
+                   splitComms.pipeNamespaceId, splitComms.pipeNamespaceCapacity, persistentControlSlot,
+                   splitComms.slotIdx, splitComms.slotCount,
+                   splitComms.pipeNamespaceId * signalsPerNamespaceB + persistentControlSlot * signalsPerControlSlot,
+                   splitComms.pipeNamespaceId * countersPerNamespaceB + persistentControlSlot * countersPerControlSlot,
+                   pipeCall.splitCommBContextBase, resourcesB.signals, resourcesB.counters, resourcesB.contexts);
       if (!pipeHostRma) {
         launchDevCommA = splitComms.inA ? splitDevCommA : splitDevCommB;
         launchDevCommB = splitComms.inB ? splitDevCommB : splitDevCommA;
@@ -3135,6 +3153,9 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
                                        cudaMemcpyHostToDevice, workStream));
   }
   NCCL_M2N_CHECK(reshardStartWorkStream(stream, &work));
+  if (splitStagingActive) {
+    NCCL_M2N_CHECK(reshardSplitPrepareCommBResourceLane(&splitComms, workStream));
+  }
 
   ncclResult_t launchResult = ncclSuccess;
   auto launchPipe = [&](bool splitLaunch) -> ncclResult_t {
@@ -3155,7 +3176,9 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
     /* Host-RMA keeps the cached host plan but replaces the device trainer /
      * generator kernels with host-orchestrated NCCL RMA and CUDA CE work.
      * There is no DevComm use to record for this path; split state is passed
-     * only so host RMA can choose the same split A/B communication graph. */
+     * only so host RMA can choose the same split A/B communication graph.
+     * Release the API gate for every submission and readiness wait in the
+     * pipeline so another local rank can enqueue its matching operations. */
     {
       M2nApiUnlock apiUnlock;
       return launchStagingReshardPipeHostRma(pipeLaunchParams, pipePlanEntry->hostPlan, staging, &pipeCall,
@@ -3181,6 +3204,9 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
     NCCL_M2N_CHECK(reshardRecordDevCommUse(&splitDevCommBUse, workStream));
   } else if (!pipeHostRma) {
     NCCL_M2N_CHECK(reshardRecordDevCommUse(&devCommUse, workStream));
+  }
+  if (splitStagingActive) {
+    NCCL_M2N_CHECK(reshardSplitRecordCommBResourceLane(&splitComms, workStream));
   }
 
   if (launchResult != ncclSuccess) {

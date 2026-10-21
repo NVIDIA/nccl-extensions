@@ -90,9 +90,13 @@ __forceinline__ __device__ int logfmtEncode(void* buffer, nv_bfloat162* sharedAm
             storeBuf[i * 5 + 4] = (encodedData[14] >> 2) | (encodedData[15] << 7) |
                                   ((i == 0) ? (localSigns << 16) : (localSigns & 0xffff0000u));
         }
-        tma_store_fence();
-        __syncwarp();
     }
+
+    // Min/max metadata is written even when the payload stays uncompressed.
+    // Publish every lane's generic shared-memory writes to the async proxy,
+    // then converge before the elected lane issues the TMA copies.
+    tma_store_fence();
+    __syncwarp();
 
     // Return TMA copy bytes
     return enableCast ? (32 * (kNumSendUnrolls * sizeof(int4) * 8 * 10 / 16 / 8)) :

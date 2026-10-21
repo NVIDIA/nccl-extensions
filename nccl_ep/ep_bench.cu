@@ -234,9 +234,9 @@ static cudaError_t cudaFreeCallback(void* ptr, void* /*context*/) {
     return cudaFree(ptr);
 }
 
-// True iff HT EM pull-push dispatch/combine was requested via NCCL_EP_HT_EM_PULL_PUSH.
-static bool htEmPullPushEnabled() {
-    const char* v = std::getenv("NCCL_EP_HT_EM_PULL_PUSH");
+// True iff HT pull-push dispatch/combine was requested via NCCL_EP_HT_PULL_PUSH.
+static bool htPullPushEnabled() {
+    const char* v = std::getenv("NCCL_EP_HT_PULL_PUSH");
     return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
@@ -803,11 +803,11 @@ void setupHighThroughputTensors(
 
     // Pull EM dispatch reads the source token + topk-weight rows over NVLink, so the
     // dispatch inputs must be window-backed even though the group stays zero_copy=OFF
-    // (local_permute mode). Window the inputs when NCCL_EP_HT_EM_PULL_PUSH is set.
+    // (local_permute mode). Window the inputs when NCCL_EP_HT_PULL_PUSH is set.
     EpTensorAllocOptions zc_in = zc_comm;
     zc_in.use_nccl_mem = true;
     zc_in.use_window = true;
-    const bool pull_inputs = em && htEmPullPushEnabled();
+    const bool pull_inputs = em && htPullPushEnabled();
     const EpTensorAllocOptions* input_window_opts =
         (zcopy ? &zc_comm : (pull_inputs ? &zc_in : nullptr));
 
@@ -1351,12 +1351,9 @@ static int64_t firstDuplicateExpertId(const int64_t* row, unsigned int top_k) {
     return -1;
 }
 
-// Check of one HT FLAT ([slot][top_k], no per-rank padding -- HT has no
-// rank-major layout) received weight row. The kernel emits the source token's weights for THIS rank's experts in
-// ascending local-expert order and zero-fills the remaining slots; the source
-// weights are regenerated with generateTopkWeights and compared with the
-// bench's usual 1e-5 relative tolerance (htWeightMismatch). Shared by the bf16
-// and the scales-forward HT validators so both check identically.
+// Check a packed HT FLAT ID/weight row without assuming expert order. Both
+// ascending and source top-k order must preserve the ID-to-weight association,
+// complete local membership, and -1/zero padding. Shared by BF16 and scales-forward.
 static void checkHTFlatRecvWeights(
     ErrorReporter& rep,
     const char* tag,
@@ -1367,6 +1364,8 @@ static void checkHTFlatRecvWeights(
     const int64_t* src_topk_row,
     const float* src_weight_row,
     const float* recv_weight_row,
+    const int64_t* recv_idx_row,
+    ncclEpExpertIdKind_t recv_idx_kind,
     unsigned int top_k,
     unsigned int num_local_experts) {
     const int64_t dup = firstDuplicateExpertId(src_topk_row, top_k);
@@ -1376,29 +1375,62 @@ static void checkHTFlatRecvWeights(
                   myRank, tag, slot, src_rank, token_id, static_cast<long long>(dup));
         return;
     }
-    std::map<int64_t, float> weight_by_expert;  // ascending expert id == emission order
+    if (recv_idx_row == nullptr) {
+        rep.error("[Rank %d] %s: slot %u cannot validate weights without returned expert IDs\n",
+                  myRank, tag, slot);
+        return;
+    }
+    std::map<int64_t, float> weight_by_expert;
     for (unsigned int k = 0; k < top_k; k++) {
         const int64_t eid = src_topk_row[k];
-        if (eid < 0) continue;
-        if (static_cast<int>(eid) / static_cast<int>(num_local_experts) != myRank) continue;
+        if (eid < 0 || eid / num_local_experts != myRank) {
+            continue;
+        }
         weight_by_expert.emplace(eid, src_weight_row[k]);
     }
-    unsigned int k_out = 0;
-    for (const auto& ew : weight_by_expert) {
-        const float got = recv_weight_row[k_out];
-        if (htWeightMismatch(got, ew.second)) {
+    bool padding = false;
+    for (unsigned int k = 0; k < top_k; k++) {
+        const int64_t id = recv_idx_row[k];
+        const float got = recv_weight_row[k];
+        if (id == -1) {
+            padding = true;
+            if (htWeightMismatch(got, 0.0f)) {
+                rep.error("[Rank %d] %s: slot %u (rank=%d token=%d) pad weight non-zero at k=%u (got=%.9g)\n",
+                          myRank, tag, slot, src_rank, token_id, k, got);
+            }
+            continue;
+        }
+        if (padding || id < 0) {
+            rep.error("[Rank %d] %s: slot %u (rank=%d token=%d) invalid packed expert ID at k=%u (id=%lld)\n",
+                      myRank, tag, slot, src_rank, token_id, k, static_cast<long long>(id));
+        }
+        if (id < 0) {
+            continue;
+        }
+        if (recv_idx_kind != NCCL_EP_EXPERT_ID_GLOBAL && id >= num_local_experts) {
+            rep.error("[Rank %d] %s: slot %u (rank=%d token=%d) local expert out of range at k=%u (id=%lld)\n",
+                      myRank, tag, slot, src_rank, token_id, k, static_cast<long long>(id));
+            continue;
+        }
+        const int64_t expert = recv_idx_kind == NCCL_EP_EXPERT_ID_GLOBAL
+            ? id : static_cast<int64_t>(myRank) * num_local_experts + id;
+        const auto expected = weight_by_expert.find(expert);
+        if (expected == weight_by_expert.end()) {
+            rep.error("[Rank %d] %s: slot %u (rank=%d token=%d) unexpected or duplicate expert at k=%u "
+                      "(expert=%lld)\n",
+                      myRank, tag, slot, src_rank, token_id, k, static_cast<long long>(expert));
+            continue;
+        }
+        if (htWeightMismatch(got, expected->second)) {
             rep.error("[Rank %d] %s: slot %u (rank=%d token=%d) weight mismatch at k=%u (expert=%lld expected=%.9g "
                       "got=%.9g)\n",
-                      myRank, tag, slot, src_rank, token_id, k_out, static_cast<long long>(ew.first), ew.second, got);
+                      myRank, tag, slot, src_rank, token_id, k, static_cast<long long>(expert), expected->second, got);
         }
-        k_out++;
+        weight_by_expert.erase(expected);
     }
-    for (; k_out < top_k; k_out++) {
-        const float got = recv_weight_row[k_out];
-        if (htWeightMismatch(got, 0.0f)) {
-            rep.error("[Rank %d] %s: slot %u (rank=%d token=%d) pad weight non-zero at k=%u (got=%.9g)\n",
-                      myRank, tag, slot, src_rank, token_id, k_out, got);
-        }
+    if (!weight_by_expert.empty()) {
+        rep.error("[Rank %d] %s: slot %u (rank=%d token=%d) missing local experts (remaining=%zu)\n",
+                  myRank, tag, slot, src_rank, token_id, weight_by_expert.size());
     }
 }
 
@@ -1927,6 +1959,169 @@ static ValidationResult validateDispatchOutputLLExpertMajDsFp8E3M4(
     return result;
 }
 
+// ==================== LL rank-major DS_FP8E3M4 validation ====================
+// Rank-major keeps one compacted row per (source rank, token). Decode the source
+// identity from the first four generated scales, validate every FP8 payload byte
+// and scale, then verify the rank-major routing metadata against the regenerated
+// source top-k table.
+static ValidationResult validateDispatchOutputLLRankMajDsFp8E3M4(
+    const BenchmarkAllocState& alloc,
+    const ncclEpDispatchOutputs_t& dispatch_outputs,
+    const ncclEpLayoutInfo_t& dispatch_layout_info,
+    unsigned int max_tokens_per_rank,
+    const unsigned int* num_tokens_per_rank,
+    unsigned int hidden,
+    unsigned int top_k,
+    unsigned int num_experts,
+    unsigned int num_local_experts,
+    int myRank,
+    int nRanks) {
+    ValidationResult result = {true, 0, 0.0, ""};
+    ErrorReporter rep;
+    const size_t max_tpr = dispatch_outputs.tokens->sizes[1];
+    const size_t total_slots = dispatch_outputs.tokens->sizes[0] * max_tpr;
+    const unsigned int num_scales = hidden / DS_FP8E3M4_ELEMENTS_PER_SCALE;
+    if (num_scales < DsFp8E3M4IdentityPattern::kIdentityScaleCount) {
+        return {false, 1, 0.0, "LL rank-major DS_FP8E3M4 has too few scales to decode identity"};
+    }
+
+    std::vector<uint8_t> recv_tokens(total_slots * hidden);
+    std::vector<float> recv_scales(total_slots * num_scales);
+    std::vector<float> recv_weights(total_slots * top_k);
+    std::vector<int32_t> recv_indices(total_slots * top_k);
+    std::vector<int32_t> recv_counts(nRanks);
+    void *tokens = nullptr, *scales = nullptr, *weights = nullptr, *indices = nullptr, *counters = nullptr;
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.tokens, &tokens));
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.scales, &scales));
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.topk_weights, &weights));
+    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.topk_idx, &indices));
+    NCCLCHECK(epGetTensorData(alloc, dispatch_layout_info.src_rank_counters, &counters));
+    CUDACHECK(cudaMemcpy(recv_tokens.data(), tokens, recv_tokens.size(), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_scales.data(), scales,
+                         recv_scales.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_weights.data(), weights,
+                         recv_weights.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_indices.data(), indices,
+                         recv_indices.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(recv_counts.data(), counters,
+                         recv_counts.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+
+    ncclEpExpertIdKind_t kind = dispatch_layout_info.recv_topk_idx_kind;
+    if (kind == NCCL_EP_EXPERT_ID_AUTO) kind = NCCL_EP_EXPERT_ID_LOCAL;
+    std::vector<int64_t> source_topk(static_cast<size_t>(max_tokens_per_rank) * top_k);
+    std::vector<float> source_weights(static_cast<size_t>(max_tokens_per_rank) * top_k);
+
+    for (int source_rank = 0; source_rank < nRanks; ++source_rank) {
+        generateRandomTopkIndicesLL(source_topk.data(), num_tokens_per_rank[source_rank],
+                                    num_experts, top_k, source_rank);
+        generateTopkWeights(source_weights.data(),
+                            static_cast<size_t>(num_tokens_per_rank[source_rank]) * top_k,
+                            source_rank);
+        std::set<int> expected;
+        for (unsigned int token = 0; token < num_tokens_per_rank[source_rank]; ++token) {
+            for (unsigned int k = 0; k < top_k; ++k) {
+                const int64_t expert = source_topk[token * top_k + k];
+                if (expert >= 0 && expert / static_cast<int>(num_local_experts) == myRank) {
+                    expected.insert(static_cast<int>(token));
+                    break;
+                }
+            }
+        }
+
+        const int count = recv_counts[source_rank];
+        if (count != static_cast<int>(expected.size())) {
+            rep.error("[Rank %d] LL RM DS_FP8E3M4: source rank %d count=%d expected=%zu\n",
+                      myRank, source_rank, count, expected.size());
+        }
+        if (count < 0 || static_cast<size_t>(count) > max_tpr) continue;
+
+        std::set<int> found;
+        for (int slot = 0; slot < count; ++slot) {
+            const size_t row = static_cast<size_t>(source_rank) * max_tpr + slot;
+            const uint8_t* token_row = recv_tokens.data() + row * hidden;
+            const float* scale_row = recv_scales.data() + row * num_scales;
+            const float* weight_row = recv_weights.data() + row * top_k;
+            const int32_t* index_row = recv_indices.data() + row * top_k;
+
+            int identity_bytes[DsFp8E3M4IdentityPattern::kIdentityScaleCount];
+            bool valid_identity_prefix = true;
+            for (unsigned int byte = 0; byte < DsFp8E3M4IdentityPattern::kIdentityScaleCount; ++byte) {
+                identity_bytes[byte] = dsFp8E3M4DecodeIdentityByteFromScale(scale_row[byte]);
+                valid_identity_prefix &= identity_bytes[byte] >= 0;
+            }
+            if (!valid_identity_prefix) {
+                rep.error("[Rank %d] LL RM DS_FP8E3M4: source rank %d slot %d has invalid identity scales\n",
+                          myRank, source_rank, slot);
+                continue;
+            }
+            const uint32_t encoded_identity =
+                static_cast<uint32_t>(identity_bytes[0]) |
+                (static_cast<uint32_t>(identity_bytes[1]) << 8) |
+                (static_cast<uint32_t>(identity_bytes[2]) << 16) |
+                (static_cast<uint32_t>(identity_bytes[3]) << 24);
+            const uint32_t source_identity = DsFp8E3M4IdentityPattern::decodeIdentity(encoded_identity);
+            const int decoded_rank = static_cast<int>(source_identity & 0xffffu);
+            const int decoded_token = static_cast<int>(source_identity >> 16);
+            if (decoded_rank != source_rank || decoded_token < 0 ||
+                decoded_token >= static_cast<int>(num_tokens_per_rank[source_rank]) ||
+                expected.find(decoded_token) == expected.end()) {
+                rep.error("[Rank %d] LL RM DS_FP8E3M4: source rank %d slot %d has unexpected source (%d, %d)\n",
+                          myRank, source_rank, slot, decoded_rank, decoded_token);
+                continue;
+            }
+            if (!found.insert(decoded_token).second) {
+                rep.error("[Rank %d] LL RM DS_FP8E3M4: source rank %d has duplicate token %d\n",
+                          myRank, source_rank, decoded_token);
+            }
+
+            for (unsigned int scale = 0; scale < num_scales; ++scale) {
+                const float expected_scale =
+                    dsFp8E3M4ScaleValue(source_rank, decoded_token, scale, num_scales);
+                if (std::abs(scale_row[scale] - expected_scale) >
+                    DsFp8E3M4IdentityPattern::kScaleTolerance) {
+                    rep.error("[Rank %d] LL RM DS_FP8E3M4: rank %d slot %d scale %u mismatch\n",
+                              myRank, source_rank, slot, scale);
+                }
+                if (!validateDsFp8E3M4PayloadIdentity(
+                        token_row + scale * DS_FP8E3M4_ELEMENTS_PER_SCALE,
+                        scale_row[scale], source_rank, decoded_token, scale)) {
+                    rep.error("[Rank %d] LL RM DS_FP8E3M4: rank %d slot %d block %u payload mismatch\n",
+                              myRank, source_rank, slot, scale);
+                }
+            }
+
+            for (unsigned int k = 0; k < top_k; ++k) {
+                const int64_t expert = source_topk[static_cast<size_t>(decoded_token) * top_k + k];
+                int32_t expected_idx = -1;
+                if (expert >= 0 && expert / static_cast<int>(num_local_experts) == myRank) {
+                    expected_idx = kind == NCCL_EP_EXPERT_ID_GLOBAL
+                        ? static_cast<int32_t>(expert)
+                        : static_cast<int32_t>(expert % num_local_experts);
+                }
+                if (index_row[k] != expected_idx) {
+                    rep.error("[Rank %d] LL RM DS_FP8E3M4: rank %d token %d topk[%u] idx=%d expected=%d\n",
+                              myRank, source_rank, decoded_token, k, index_row[k], expected_idx);
+                }
+                const float expected_weight =
+                    source_weights[static_cast<size_t>(decoded_token) * top_k + k];
+                if (std::abs(weight_row[k] - expected_weight) > 1e-5f * expected_weight) {
+                    rep.error("[Rank %d] LL RM DS_FP8E3M4: rank %d token %d weight[%u] mismatch\n",
+                              myRank, source_rank, decoded_token, k);
+                }
+            }
+        }
+        if (found != expected) {
+            rep.error("[Rank %d] LL RM DS_FP8E3M4: source rank %d received token set differs\n",
+                      myRank, source_rank);
+        }
+    }
+
+    result.errors = rep.errors;
+    result.passed = result.errors == 0;
+    if (!result.passed) result.message = "LL rank-major DS_FP8E3M4 dispatch validation failed";
+    return result;
+}
+
 // ==================== LL rank-major QUANT_FWD validation ====================
 // Rank-major stores received rows contiguously by source rank.  The recipe is
 // pure byte forwarding, so validate both the packed token row and opaque scale
@@ -2304,6 +2499,7 @@ static void preReduceRankMajor(
 static ValidationResult validateDispatchOutputHTScalesForward(
     const BenchmarkAllocState& alloc,
     const ncclEpDispatchOutputs_t& dispatch_outputs,
+    const ncclEpLayoutInfo_t& dispatch_layout_info,
     unsigned int max_tokens_per_rank,
     const unsigned int* num_tokens_per_rank,
     unsigned int hidden,
@@ -2343,6 +2539,7 @@ static ValidationResult validateDispatchOutputHTScalesForward(
     const bool expert_major = meta_expert_counts_padded != nullptr && meta_expert_offsets != nullptr;
     std::vector<int> slot_expert(buf_rows, -1);
     bool* valid_slot = new bool[buf_rows]();
+    std::vector<int64_t> recv_topk_idx;
     if (expert_major) {
         for (unsigned int e = 0; e < num_local_experts; ++e) {
             const int64_t begin = meta_expert_offsets[e];
@@ -2355,10 +2552,12 @@ static ValidationResult validateDispatchOutputHTScalesForward(
             }
         }
     } else if (dispatch_outputs.topk_idx != nullptr) {
-        int64_t* recv_topk_idx = new int64_t[static_cast<size_t>(buf_rows) * top_k];
+        recv_topk_idx.resize(static_cast<size_t>(buf_rows) * top_k);
+        void* output_indices = nullptr;
+        NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.topk_idx, &output_indices));
         CUDACHECK(cudaMemcpy(
-            recv_topk_idx,
-            dispatch_outputs.topk_idx->data,
+            recv_topk_idx.data(),
+            output_indices,
             static_cast<size_t>(buf_rows) * top_k * sizeof(int64_t),
             cudaMemcpyDeviceToHost));
         for (unsigned int j = 0; j < buf_rows; j++) {
@@ -2369,7 +2568,6 @@ static ValidationResult validateDispatchOutputHTScalesForward(
                 }
             }
         }
-        delete[] recv_topk_idx;
     } else {
         for (unsigned int j = 0; j < buf_rows; j++) valid_slot[j] = true;
     }
@@ -2477,7 +2675,8 @@ static ValidationResult validateDispatchOutputHTScalesForward(
                 topk_by_rank[src_rank].data() + static_cast<size_t>(token_id) * top_k,
                 weights_by_rank[src_rank].data() + static_cast<size_t>(token_id) * top_k,
                 recv_topk_w + static_cast<size_t>(j) * top_k,
-                top_k, num_local_experts);
+                recv_topk_idx.empty() ? nullptr : recv_topk_idx.data() + static_cast<size_t>(j) * top_k,
+                dispatch_layout_info.recv_topk_idx_kind, top_k, num_local_experts);
         }
         if (recv_w_em != nullptr && slot_expert[j] >= 0 && token_id < static_cast<int>(num_tokens_per_rank[src_rank])) {
             checkHTExpertMajorRecvWeight(
@@ -2718,9 +2917,8 @@ static ValidationResult validateDispatchOutputHTFlat(
 
         // Compare the set of expert ids written into recv_topk_idx[j, ...]
         // against the set expected from src_topk[token_id, ...] restricted to
-        // myRank's experts. Position k within the slot is not meaningful (the
-        // kernel writes in local-expert ascending order, not src_topk order),
-        // so use set equality instead of per-k equality.
+        // myRank's experts. The weight check below verifies the corresponding
+        // ID/weight pairs without assuming ascending or source top-k order.
         const std::vector<int64_t>& sr_topk = topk_by_rank[source_rank];
         std::set<int64_t> expected_ids;
         for (unsigned int k = 0; k < top_k; k++) {
@@ -2759,14 +2957,14 @@ static ValidationResult validateDispatchOutputHTFlat(
             errors++;
         }
 
-        // recv_topk_weights: check this slot's received weight row (ascending
-        // local-expert order, zero pads; duplicates are an error).
+        // Verify each returned ID's weight and the packed -1/zero tail.
         if (recv_topk_w != nullptr) {
             checkHTFlatRecvWeights(
                 weight_rep, "HT dispatch", myRank, j, source_rank, token_id,
                 sr_topk.data() + static_cast<size_t>(token_id) * top_k,
                 weights_by_rank[source_rank].data() + static_cast<size_t>(token_id) * top_k,
                 recv_topk_w + static_cast<size_t>(j) * top_k,
+                recv_topk_idx + static_cast<size_t>(j) * top_k, kind,
                 top_k, num_local_experts);
         }
     }
@@ -3005,7 +3203,7 @@ ValidationResult validateDispatchOutput(
         case NCCL_EP_DISP_QUANT_FWD:
             if (is_ht_mode) {
                 return validateDispatchOutputHTScalesForward(
-                alloc, dispatch_outputs,
+                alloc, dispatch_outputs, dispatch_layout_info,
                 max_tokens_per_rank,
                 num_tokens_per_rank,
                 hidden,
@@ -3028,12 +3226,18 @@ ValidationResult validateDispatchOutput(
                 max_tokens_per_rank, num_tokens_per_rank,
                 hidden, top_k, num_experts, num_local_experts, myRank, nRanks);
         case NCCL_EP_DISP_QUANT_DS_FP8E3M4:
-            if (is_ht_mode || !is_expert_major) {
+            if (is_ht_mode) {
                 fprintf(stderr,
-                        "NCCL EP benchmark warning: DS_FP8E3M4 validation is implemented only for LL expert-major output.\n");
-                return {true, 0, 0.0, "skipped (DS_FP8E3M4 validation unavailable for this layout)"};
+                        "NCCL EP benchmark warning: DS_FP8E3M4 validation is unavailable for HT output.\n");
+                return {true, 0, 0.0, "skipped (DS_FP8E3M4 validation unavailable for HT)"};
             }
-            return validateDispatchOutputLLExpertMajDsFp8E3M4(
+            if (is_expert_major) {
+                return validateDispatchOutputLLExpertMajDsFp8E3M4(
+                    alloc, dispatch_outputs, dispatch_layout_info,
+                    max_tokens_per_rank, num_tokens_per_rank,
+                    hidden, top_k, num_experts, num_local_experts, myRank, nRanks);
+            }
+            return validateDispatchOutputLLRankMajDsFp8E3M4(
                 alloc, dispatch_outputs, dispatch_layout_info,
                 max_tokens_per_rank, num_tokens_per_rank,
                 hidden, top_k, num_experts, num_local_experts, myRank, nRanks);
@@ -3898,6 +4102,8 @@ struct BenchResult {
     double avg_ms;
     double min_ms;
     double max_ms;
+    double p50_ms = 0;   // nearest-rank percentiles over the timed iterations (first one trimmed)
+    double p99_ms = 0;
     double throughput_gbps;
 };
 
@@ -3920,7 +4126,8 @@ PairedBenchResult runPairedBenchmark(
     size_t dispatch_bytes,
     size_t combine_bytes,
     KernelTimer& ktimer,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    bool use_cuda_graph) {
     // Warmup with paired dispatch+combine
     // Note: cudaStreamSynchronize between dispatch and combine is required for HT mode
     // MPI_Barrier at end of each iteration ensures all ranks stay in sync (critical for HT mode)
@@ -3933,18 +4140,86 @@ PairedBenchResult runPairedBenchmark(
         MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     }
 
+    // Capture dispatch and combine as child graphs, then compose one executable
+    // parent graph with embedded events so per-phase GPU timings remain available.
+    // The warmup above primes JIT kernels and lazy/cached state; update_fn stays
+    // outside the measured path.
+    cudaGraph_t dispatch_phase_graph = nullptr;
+    cudaGraph_t combine_phase_graph = nullptr;
+    cudaGraph_t replay_graph = nullptr;
+    cudaGraphExec_t replay_graph_exec = nullptr;
+    cudaEvent_t captured_dispatch_start = nullptr;
+    cudaEvent_t captured_dispatch_end = nullptr;
+    cudaEvent_t captured_combine_start = nullptr;
+    cudaEvent_t captured_combine_end = nullptr;
+    const bool has_combine = combine_bytes != 0;
+    if (use_cuda_graph) {
+        CUDACHECK(cudaEventCreate(&captured_dispatch_start));
+        CUDACHECK(cudaEventCreate(&captured_dispatch_end));
+        CUDACHECK(cudaEventCreate(&captured_combine_start));
+        CUDACHECK(cudaEventCreate(&captured_combine_end));
+
+        CUDACHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+        dispatch_fn();
+        CUDACHECK(cudaStreamEndCapture(stream, &dispatch_phase_graph));
+        if (has_combine) {
+            CUDACHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+            combine_fn();
+            CUDACHECK(cudaStreamEndCapture(stream, &combine_phase_graph));
+        }
+
+        // Compose one executable parent graph from the captured phase graphs.
+        // Explicit event-record nodes retain phase timing without adding a
+        // host synchronization boundary between dispatch and combine.
+        cudaGraphNode_t dispatch_start_node;
+        cudaGraphNode_t dispatch_node;
+        cudaGraphNode_t dispatch_end_node;
+        cudaGraphNode_t combine_start_node;
+        cudaGraphNode_t combine_node;
+        cudaGraphNode_t combine_end_node;
+        CUDACHECK(cudaGraphCreate(&replay_graph, 0));
+        CUDACHECK(cudaGraphAddEventRecordNode(
+            &dispatch_start_node, replay_graph, nullptr, 0, captured_dispatch_start));
+        CUDACHECK(cudaGraphAddChildGraphNode(
+            &dispatch_node, replay_graph, &dispatch_start_node, 1, dispatch_phase_graph));
+        CUDACHECK(cudaGraphAddEventRecordNode(
+            &dispatch_end_node, replay_graph, &dispatch_node, 1, captured_dispatch_end));
+        CUDACHECK(cudaGraphAddEventRecordNode(
+            &combine_start_node, replay_graph, &dispatch_end_node, 1, captured_combine_start));
+        if (has_combine) {
+            CUDACHECK(cudaGraphAddChildGraphNode(
+                &combine_node, replay_graph, &combine_start_node, 1, combine_phase_graph));
+        } else {
+            combine_node = combine_start_node;
+        }
+        CUDACHECK(cudaGraphAddEventRecordNode(
+            &combine_end_node, replay_graph, &combine_node, 1, captured_combine_end));
+        CUDACHECK(cudaGraphInstantiate(&replay_graph_exec, replay_graph, nullptr, nullptr, 0));
+
+        // Graph construction can finish at different times on different ranks.
+        // Do not let an early rank enter a communication graph while peers are
+        // still capturing or instantiating theirs.
+        MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+    }
+
     // Create events for dispatch, combine, and total timing
     std::vector<cudaEvent_t> dispatch_start(num_iters);
     std::vector<cudaEvent_t> dispatch_end(num_iters);
     std::vector<cudaEvent_t> combine_start(num_iters);
     std::vector<cudaEvent_t> combine_end(num_iters);
 
-    for (int i = 0; i < num_iters; i++) {
-        CUDACHECK(cudaEventCreate(&dispatch_start[i]));
-        CUDACHECK(cudaEventCreate(&dispatch_end[i]));
-        CUDACHECK(cudaEventCreate(&combine_start[i]));
-        CUDACHECK(cudaEventCreate(&combine_end[i]));
+    if (!use_cuda_graph) {
+        for (int i = 0; i < num_iters; i++) {
+            CUDACHECK(cudaEventCreate(&dispatch_start[i]));
+            CUDACHECK(cudaEventCreate(&dispatch_end[i]));
+            CUDACHECK(cudaEventCreate(&combine_start[i]));
+            CUDACHECK(cudaEventCreate(&combine_end[i]));
+        }
     }
+
+    std::vector<float> dispatch_times(num_iters);
+    std::vector<float> combine_times(num_iters);
+    std::vector<float> total_times(num_iters);
 
     // Start CUPTI kernel timer
     ktimer.start();
@@ -3955,6 +4230,19 @@ PairedBenchResult runPairedBenchmark(
     // MPI_Barrier at end of each iteration ensures all ranks stay in sync (critical for HT mode)
     // update_fn() is excluded from timed iters; its cost is reported by the UpdateHandle micro-bench.
     for (int i = 0; i < num_iters; i++) {
+        if (use_cuda_graph) {
+            CUDACHECK(cudaGraphLaunch(replay_graph_exec, stream));
+            CUDACHECK(cudaStreamSynchronize(stream));
+            CUDACHECK(cudaEventElapsedTime(
+                &dispatch_times[i], captured_dispatch_start, captured_dispatch_end));
+            CUDACHECK(cudaEventElapsedTime(
+                &combine_times[i], captured_combine_start, captured_combine_end));
+            CUDACHECK(cudaEventElapsedTime(
+                &total_times[i], captured_dispatch_start, captured_combine_end));
+            MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+            continue;
+        }
+
         CUDACHECK(cudaEventRecord(dispatch_start[i], stream));
         dispatch_fn();
         CUDACHECK(cudaEventRecord(dispatch_end[i], stream));    // Record before sync
@@ -3969,24 +4257,31 @@ PairedBenchResult runPairedBenchmark(
     // Stop CUPTI kernel timer
     ktimer.stop();
 
-    // Collect times
-    std::vector<float> dispatch_times(num_iters);
-    std::vector<float> combine_times(num_iters);
-    std::vector<float> total_times(num_iters);
+    // Collect times recorded outside the graph. CUDA graph timings were
+    // collected per replay above before the reusable event nodes were overwritten.
+    if (!use_cuda_graph) {
+        for (int i = 0; i < num_iters; i++) {
+            CUDACHECK(cudaEventElapsedTime(&dispatch_times[i], dispatch_start[i], dispatch_end[i]));
+            CUDACHECK(cudaEventElapsedTime(&combine_times[i], combine_start[i], combine_end[i]));
+            CUDACHECK(cudaEventElapsedTime(&total_times[i], dispatch_start[i], combine_end[i]));
+        }
 
-    for (int i = 0; i < num_iters; i++) {
-        CUDACHECK(cudaEventElapsedTime(&dispatch_times[i], dispatch_start[i], dispatch_end[i]));
-        CUDACHECK(cudaEventElapsedTime(&combine_times[i], combine_start[i], combine_end[i]));
-        CUDACHECK(cudaEventElapsedTime(&total_times[i], dispatch_start[i], combine_end[i]));
+        for (int i = 0; i < num_iters; i++) {
+            CUDACHECK(cudaEventDestroy(dispatch_start[i]));
+            CUDACHECK(cudaEventDestroy(dispatch_end[i]));
+            CUDACHECK(cudaEventDestroy(combine_start[i]));
+            CUDACHECK(cudaEventDestroy(combine_end[i]));
+        }
     }
 
-    // Cleanup events
-    for (int i = 0; i < num_iters; i++) {
-        CUDACHECK(cudaEventDestroy(dispatch_start[i]));
-        CUDACHECK(cudaEventDestroy(dispatch_end[i]));
-        CUDACHECK(cudaEventDestroy(combine_start[i]));
-        CUDACHECK(cudaEventDestroy(combine_end[i]));
-    }
+    if (replay_graph_exec != nullptr) CUDACHECK(cudaGraphExecDestroy(replay_graph_exec));
+    if (replay_graph != nullptr) CUDACHECK(cudaGraphDestroy(replay_graph));
+    if (combine_phase_graph != nullptr) CUDACHECK(cudaGraphDestroy(combine_phase_graph));
+    if (dispatch_phase_graph != nullptr) CUDACHECK(cudaGraphDestroy(dispatch_phase_graph));
+    if (captured_dispatch_start != nullptr) CUDACHECK(cudaEventDestroy(captured_dispatch_start));
+    if (captured_dispatch_end != nullptr) CUDACHECK(cudaEventDestroy(captured_dispatch_end));
+    if (captured_combine_start != nullptr) CUDACHECK(cudaEventDestroy(captured_combine_start));
+    if (captured_combine_end != nullptr) CUDACHECK(cudaEventDestroy(captured_combine_end));
 
     // Helper to calculate stats from times vector (skip first iteration if we have more than 1)
     auto calc_stats = [](const std::vector<float>& times, size_t data_bytes) -> BenchResult {
@@ -4009,6 +4304,20 @@ PairedBenchResult runPairedBenchmark(
             result.avg_ms = std::accumulate(times_trimmed.begin(), times_trimmed.end(), 0.0) / times_trimmed.size();
             result.min_ms = *std::min_element(times_trimmed.begin(), times_trimmed.end());
             result.max_ms = *std::max_element(times_trimmed.begin(), times_trimmed.end());
+            std::vector<float> sorted(times_trimmed);
+            std::sort(sorted.begin(), sorted.end());
+            auto pct = [&](double q) {
+                size_t k = static_cast<size_t>(std::ceil(q * sorted.size()));
+                if (k == 0) {
+                    k = 1;
+                }
+                if (k > sorted.size()) {
+                    k = sorted.size();
+                }
+                return static_cast<double>(sorted[k - 1]);
+            };
+            result.p50_ms = pct(0.50);
+            result.p99_ms = pct(0.99);
             result.throughput_gbps = data_bytes == 0 || result.avg_ms <= 0
                 ? 0
                 : (data_bytes / 1e9) / (result.avg_ms / 1000.0);
@@ -4325,6 +4634,14 @@ void printLowLatencyResults(
     double global_dispatch_avg, global_dispatch_min, global_dispatch_max;
     double global_combine_avg, global_combine_min, global_combine_max;
     double global_total_avg, global_total_min, global_total_max;
+    // Percentiles: mean over ranks of each rank's per-iteration percentile.
+    double local_pct[6] = {dispatch_result.p50_ms, dispatch_result.p99_ms, combine_result.p50_ms,
+                           combine_result.p99_ms, combined_result.p50_ms, combined_result.p99_ms};
+    double global_pct[6] = {0, 0, 0, 0, 0, 0};
+    MPI_Reduce(local_pct, global_pct, 6, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    for (double& v : global_pct) {
+        v /= nRanks;
+    }
 
     MPI_Reduce(&local_dispatch_avg, &global_dispatch_avg, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_dispatch_min, &global_dispatch_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
@@ -4434,8 +4751,8 @@ void printLowLatencyResults(
 
         printf("\n--- Host-observed performance ---\n");
 
-        printf("Dispatch:  avg=%.2f us, min=%.2f us, max=%.2f us\n", global_dispatch_avg * 1000,
-               global_dispatch_min * 1000, global_dispatch_max * 1000);
+        printf("Dispatch:  avg=%.2f us, min=%.2f us, max=%.2f us, p50=%.2f us, p99=%.2f us\n", global_dispatch_avg * 1000,
+               global_dispatch_min * 1000, global_dispatch_max * 1000, global_pct[0] * 1000, global_pct[1] * 1000);
         printf("          bus bandwidth (excl. protocol headers): avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
                avg_dispatch_tp, global_dispatch_tp_min.value, global_dispatch_tp_min.rank, global_dispatch_tp_max.value,
                global_dispatch_tp_max.rank);
@@ -4443,16 +4760,16 @@ void printLowLatencyResults(
                avg_dispatch_tp * dispatch_algorithm_factor, global_dispatch_tp_min.value * dispatch_algorithm_factor,
                global_dispatch_tp_max.value * dispatch_algorithm_factor);
         if (!dispatch_only) {
-            printf("Combine:   avg=%.2f us, min=%.2f us, max=%.2f us\n", global_combine_avg * 1000,
-                   global_combine_min * 1000, global_combine_max * 1000);
+            printf("Combine:   avg=%.2f us, min=%.2f us, max=%.2f us, p50=%.2f us, p99=%.2f us\n", global_combine_avg * 1000,
+                   global_combine_min * 1000, global_combine_max * 1000, global_pct[2] * 1000, global_pct[3] * 1000);
             printf("          bus bandwidth (excl. protocol headers): avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
                    avg_combine_tp, global_combine_tp_min.value, global_combine_tp_min.rank,
                    global_combine_tp_max.value, global_combine_tp_max.rank);
             printf("          algorithm bandwidth: avg=%.2f GB/s, min=%.2f GB/s, max=%.2f GB/s\n",
                    avg_combine_tp * combine_algorithm_factor, global_combine_tp_min.value * combine_algorithm_factor,
                    global_combine_tp_max.value * combine_algorithm_factor);
-            printf("Total (D+C):      avg=%.2f us, min=%.2f us, max=%.2f us\n", global_total_avg * 1000,
-                   global_total_min * 1000, global_total_max * 1000);
+            printf("Total (D+C):      avg=%.2f us, min=%.2f us, max=%.2f us, p50=%.2f us, p99=%.2f us\n", global_total_avg * 1000,
+                   global_total_min * 1000, global_total_max * 1000, global_pct[4] * 1000, global_pct[5] * 1000);
             printf("          bus bandwidth (excl. protocol headers): avg=%.2f GB/s, min=%.2f GB/s (rank %d), max=%.2f GB/s (rank %d)\n",
                    avg_total_tp, global_total_tp_min.value, global_total_tp_min.rank,
                    global_total_tp_max.value, global_total_tp_max.rank);
@@ -4866,6 +5183,7 @@ void printUsage(const char* programName, int myRank) {
         printf("  --experts <num>         Total number of experts (default: 256)\n");
         printf("  --warmup <num>          Warmup iterations (default: 10)\n");
         printf("  --iters <num>           Benchmark iterations (default: 50)\n");
+        printf("  --cuda-graph            Replay one graph containing dispatch+combine during measurement\n");
         printf("  --user-handle-mem       Use caller-owned buffer via ncclEpInitHandle+ncclEpUpdateHandle\n");
         printf("  --profile               Enable NVTX profiling mode (use with nsys)\n");
         printf("  --disable-nvlink        Disable NVLink, force RDMA for intranode communication (LL only)\n");
@@ -4881,6 +5199,8 @@ void printUsage(const char* programName, int myRank) {
             "                             Ignored in LL mode.\n");
         printf("  --zcopy                 Use ncclMemAlloc buffers + windows for supported direct token/scale paths\n");
         printf("  --overflow-drop          HT: NCCL_EP_OVERFLOW_DROP instead of trapping on overflow\n");
+        printf("  --ht-flow <f>            HT flow: auto (default) | push-pull | pull-push\n");
+        printf("  --meta-exchange-policy <p>  HT: metadata exchange policy: auto (default) | require-fused | force-scan\n");
         printf("  --max-num-sms <N>       Shared dispatch/combine SM fallback (0 = auto, default: 0)\n");
         printf("  --dispatch-num-sms <N>  Dispatch SM budget (0 = inherit shared budget)\n");
         printf("  --combine-num-sms <N>   Combine SM budget (0 = inherit shared budget)\n");
@@ -4944,6 +5264,7 @@ int main(int argc, char* argv[]) {
     unsigned int num_experts = 256;
     int num_warmup = 10;
     int num_iters = 50;
+    bool use_cuda_graph = false;  // Replay one captured dispatch+combine graph during measurement
     bool profile_mode = false;  // Enable NVTX profiling with nsys
     bool disable_nvlink = false;  // Force RDMA instead of NVLink
     bool user_handle_mem = false;  // Use caller-owned buffer via ncclEpInitHandle+ncclEpUpdateHandle
@@ -4956,6 +5277,8 @@ int main(int argc, char* argv[]) {
     size_t expert_major_alignment = 0;  // 0 = no padding; >1 aligns each expert zone
     unsigned int max_recv_tokens_per_rank = UINT_MAX;  // HT only; UINT_MAX = unset -> bench auto; 0 = lib auto (worst case)
     bool overflow_drop = false;  // HT only; NCCL_EP_OVERFLOW_DROP instead of the library default (trap)
+    ncclEpHtFlow_t ht_flow = NCCL_EP_HT_FLOW_AUTO;  // HT only; --ht-flow
+    ncclEpMetaExchangePolicy_t meta_exchange_policy = NCCL_EP_META_EXCHANGE_AUTO;  // HT only; --meta-exchange-policy
     bool zcopy = false;  // Use ncclMemAlloc + windows for supported direct token/scale paths
     unsigned int max_num_sms = NCCL_EP_AUTO;  // Automatic SM assignment for different EP stages
     unsigned int dispatch_num_sms = NCCL_EP_AUTO;
@@ -4995,6 +5318,7 @@ int main(int argc, char* argv[]) {
         {"warmup", required_argument, 0, 'w'},
         {"iters", required_argument, 0, 'i'},
         {"profile", no_argument, 0, 'p'},
+        {"cuda-graph", no_argument, 0, 1009},
         {"disable-nvlink", no_argument, 0, 'n'},
         {"user-handle-mem", no_argument, 0, 'U'},
         {"validate", no_argument, 0, 'V'},
@@ -5024,6 +5348,8 @@ int main(int argc, char* argv[]) {
         {"fused-meta-dispatch", no_argument, 0, 1005},
         {"backward", no_argument, 0, 'B'},
         {"overflow-drop", no_argument, 0, 1008},
+        {"meta-exchange-policy", required_argument, 0, 1010},
+        {"ht-flow", required_argument, 0, 1011},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
@@ -5255,11 +5581,44 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             break;
+        case 1009:  // --cuda-graph
+            use_cuda_graph = true;
+            break;
         case 1001:  // --disable-token-dropping
             g_disable_token_dropping = true;
             break;
         case 1008:  // --overflow-drop
             overflow_drop = true;
+            break;
+        case 1010:  // --meta-exchange-policy
+            if (strcmp(optarg, "auto") == 0) {
+                meta_exchange_policy = NCCL_EP_META_EXCHANGE_AUTO;
+            } else if (strcmp(optarg, "require-fused") == 0) {
+                meta_exchange_policy = NCCL_EP_META_EXCHANGE_REQUIRE_FUSED;
+            } else if (strcmp(optarg, "force-scan") == 0) {
+                meta_exchange_policy = NCCL_EP_META_EXCHANGE_FORCE_SCAN;
+            } else {
+                if (myRank == 0) {
+                    printf("Error: Invalid --meta-exchange-policy '%s'. Use 'auto', 'require-fused', or 'force-scan'\n", optarg);
+                }
+                MPI_Finalize();
+                return 1;
+            }
+            break;
+        case 1011:  // --ht-flow
+            if (strcmp(optarg, "auto") == 0) {
+                ht_flow = NCCL_EP_HT_FLOW_AUTO;
+            } else if (strcmp(optarg, "push-pull") == 0) {
+                ht_flow = NCCL_EP_HT_FLOW_PUSH_PULL;
+            } else if (strcmp(optarg, "pull-push") == 0) {
+                ht_flow = NCCL_EP_HT_FLOW_PULL_PUSH;
+            } else {
+                if (myRank == 0) {
+                    printf("Error: Invalid --ht-flow '%s'. Use 'auto', 'push-pull', or 'pull-push'\n", optarg);
+                }
+                MPI_Finalize();
+                return 1;
+            }
             break;
         case 1005:  // --fused-meta-dispatch
             fused_meta_dispatch = true;
@@ -5337,6 +5696,16 @@ int main(int argc, char* argv[]) {
     if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4 && !kNvfp4BenchmarkSupported) {
         if (myRank == 0) {
             printf("Error: NVFP4 combine requires CUDA 12.9+ with cuda_fp4.h.\n");
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    if (use_cuda_graph && algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
+        max_recv_tokens_per_rank == NCCL_EP_AUTO) {
+        if (myRank == 0) {
+            printf("Error: --cuda-graph cannot be combined with HT eager receive sizing "
+                   "(--max-recv-token-slots-per-rank 0); use a fixed receive-slot budget.\n");
         }
         MPI_Finalize();
         return 1;
@@ -5543,6 +5912,8 @@ int main(int argc, char* argv[]) {
         printf("  Experts:         %u (local: %u)\n", num_experts, num_local_experts);
         printf("  Warmup iters:    %d\n", num_warmup);
         printf("  Benchmark iters: %d\n", num_iters);
+        printf("  CUDA Graph:      %s\n",
+               use_cuda_graph ? "enabled (paired dispatch/combine replay)" : "disabled");
         printf("  Dispatch recipe: %s\n", dispatchRecipeName(dispatch_quantization));
         const ncclDataType_t printed_token_dtype =
             dispatchTokenDtype(dispatch_quantization, token_dtype, scales_forward_token_dtype);
@@ -5564,6 +5935,12 @@ int main(int argc, char* argv[]) {
         printf("  Profile mode:    %s\n", profile_mode ? "enabled" : "disabled");
         printf("  NVLink:          %s\n", disable_nvlink ? "disabled (force RDMA intranode, LL only)" : "enabled");
         printf("  Validate mode:   %s\n", validate_data ? "enabled" : "disabled");
+        printf("  HT flow:         %s\n",
+               ht_flow == NCCL_EP_HT_FLOW_PUSH_PULL ? "push-pull" :
+               ht_flow == NCCL_EP_HT_FLOW_PULL_PUSH ? "pull-push" : "auto");
+        printf("  Meta exchange:   %s\n",
+               meta_exchange_policy == NCCL_EP_META_EXCHANGE_REQUIRE_FUSED ? "require-fused" :
+               meta_exchange_policy == NCCL_EP_META_EXCHANGE_FORCE_SCAN    ? "force-scan" : "auto");
         printf("  Dynamic tokens:  %s\n", dynamic_tokens ? "enabled (NCCL_EP_AUTO)" : "disabled");
 #ifdef HAVE_CUPTI
         printf("  CUPTI:           enabled (kernel-level GPU timing available)\n");
@@ -5681,6 +6058,8 @@ int main(int argc, char* argv[]) {
     }
     config.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
     if (overflow_drop) config.overflow_policy = NCCL_EP_OVERFLOW_DROP;
+    config.ht_flow = ht_flow;
+    config.meta_exchange_policy = meta_exchange_policy;
     config.max_num_sms = max_num_sms;
     config.zero_copy = zcopy ? NCCL_EP_ZERO_COPY_ON : NCCL_EP_ZERO_COPY_AUTO;
     if (ht_em_local_dup) {
@@ -5967,7 +6346,8 @@ int main(int argc, char* argv[]) {
         ll_dispatch_out_opts =
             (zcopy && layout == NCCL_EP_LAYOUT_RANK_MAJOR &&
              (dispatch_quantization == NCCL_EP_DISP_QUANT_NONE ||
-              dispatch_quantization == NCCL_EP_DISP_QUANT_FWD)) ? &ll_zc_opts : nullptr;
+              dispatch_quantization == NCCL_EP_DISP_QUANT_FWD ||
+              dispatch_quantization == NCCL_EP_DISP_QUANT_DS_FP8E3M4)) ? &ll_zc_opts : nullptr;
         setupLowLatencyTensors(
             dispatch_inputs,
             dispatch_outputs,
@@ -5983,7 +6363,7 @@ int main(int argc, char* argv[]) {
             config.max_dispatch_tokens_per_rank,
             nRanks,
             layout,
-            ll_dispatch_out_opts,
+            dispatch_input_dtype == dispatch_output_dtype ? ll_dispatch_out_opts : nullptr,
             dispatch_input_dtype);
         if (dispatch_input_dtype != dispatch_output_dtype) {
             const size_t output_sizes[3] = {
@@ -5993,7 +6373,8 @@ int main(int argc, char* argv[]) {
             };
             epFreeTensor(&dispatch_outputs.tokens, &alloc.external_data_ptrs, &alloc.tensor_data_ptrs);
             NCCLCHECK(epMakeTensor(&dispatch_outputs.tokens, 3, dispatch_output_dtype,
-                                   output_sizes[0], output_sizes[1], output_sizes[2]));
+                                   output_sizes[0], output_sizes[1], output_sizes[2], 1, 1,
+                                   ll_dispatch_out_opts));
         }
     } else {
         setupHighThroughputTensors(
@@ -6023,7 +6404,7 @@ int main(int argc, char* argv[]) {
     // Pull EM dispatch reads each token's scale row over NVLink, so the FWD input
     // scales must be window-backed (like the token input) even when zero_copy is OFF.
     const bool sf_pull_inputs = !is_ll_mode && (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) &&
-        dispatch_quantization == NCCL_EP_DISP_QUANT_FWD && htEmPullPushEnabled();
+        dispatch_quantization == NCCL_EP_DISP_QUANT_FWD && htPullPushEnabled();
     EpTensorAllocOptions ht_sf_zc_opts;
     const EpTensorAllocOptions* ht_sf_window_opts = nullptr;      // output scales (zero_copy only)
     const EpTensorAllocOptions* ht_sf_in_window_opts = nullptr;   // input scales (zero_copy or pull)
@@ -6387,7 +6768,8 @@ int main(int argc, char* argv[]) {
             dispatch_data_bytes,
             combine_data_bytes,
             kt,
-            stream);
+            stream,
+            use_cuda_graph);
     };
 
     PairedBenchResult paired_result = run_paired_pass(ktimer, update_fn);
@@ -6943,61 +7325,68 @@ int main(int argc, char* argv[]) {
             CUDACHECK(cudaFree(mask_status_d));
         }
 
-        // --- Phase 2: Combine with rank 3 failing ---
-        // Copy dispatch output to combine input (passthrough)
-        if (myRank != dispatch_fail_rank && myRank != combine_fail_rank) {
-            void* eo_data;
-            void* output0_data;
-            NCCLCHECK(epGetTensorData(alloc, combine_inputs.tokens, &eo_data));
-            NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.tokens, &output0_data));
-            const size_t* out0_sizes = dispatch_outputs.tokens->sizes;
-            size_t data_size = out0_sizes[0] * out0_sizes[1] * out0_sizes[2] * tokenElemBytes(token_dtype);
-            CUDACHECK(cudaMemcpy(eo_data, output0_data, data_size, cudaMemcpyDeviceToDevice));
-        }
+        // Dispatch-only recipes have no combine contract (and their FP8 output
+        // cannot be copied as a BF16 combine input).
+        if (!dispatch_only) {
+            // --- Phase 2: Combine with rank 3 failing ---
+            // Copy dispatch output to combine input (passthrough)
+            if (myRank != dispatch_fail_rank && myRank != combine_fail_rank) {
+                void* eo_data;
+                void* output0_data;
+                NCCLCHECK(epGetTensorData(alloc, combine_inputs.tokens, &eo_data));
+                NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.tokens, &output0_data));
+                const size_t* out0_sizes = dispatch_outputs.tokens->sizes;
+                size_t data_size = out0_sizes[0] * out0_sizes[1] * out0_sizes[2] * tokenElemBytes(token_dtype);
+                CUDACHECK(cudaMemcpy(eo_data, output0_data, data_size, cudaMemcpyDeviceToDevice));
+            }
 
-        if (myRank == dispatch_fail_rank || myRank == combine_fail_rank) {
-            printf("Rank %d: simulating failure (skipping combine)\n", myRank);
-            fflush(stdout);
-        } else {
-            combine_fn();
-            CUDACHECK(cudaStreamSynchronize(stream));
-        }
+            if (myRank == dispatch_fail_rank || myRank == combine_fail_rank) {
+                printf("Rank %d: simulating failure (skipping combine)\n", myRank);
+                fflush(stdout);
+            } else {
+                combine_fn();
+                CUDACHECK(cudaStreamSynchronize(stream));
+            }
 
-        MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+            MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
 
-        // Poll async error first, then query mask for details
-        if (myRank != dispatch_fail_rank && myRank != combine_fail_rank) {
-            int async_err = 0;
-            NCCLCHECK(ncclEpGetAsyncError(ep_group, &async_err));
-            printf("Rank %d: async error after combine: %d (%s)\n", myRank, async_err, async_err ? "PASSED" : "FAILED");
-            fflush(stdout);
+            // Poll async error first, then query mask for details
+            if (myRank != dispatch_fail_rank && myRank != combine_fail_rank) {
+                int async_err = 0;
+                NCCLCHECK(ncclEpGetAsyncError(ep_group, &async_err));
+                printf("Rank %d: async error after combine: %d (%s)\n", myRank, async_err, async_err ? "PASSED" : "FAILED");
+                fflush(stdout);
 
-            // Error detected -- query mask to find which ranks failed
-            int* mask_status_d;
-            CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&mask_status_d), nRanks * sizeof(int)));
-            NCCLCHECK(ncclEpMaskQuery(ep_group, mask_status_d, stream));
-            CUDACHECK(cudaStreamSynchronize(stream));
+                // Error detected -- query mask to find which ranks failed
+                int* mask_status_d;
+                CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&mask_status_d), nRanks * sizeof(int)));
+                NCCLCHECK(ncclEpMaskQuery(ep_group, mask_status_d, stream));
+                CUDACHECK(cudaStreamSynchronize(stream));
 
-            int* mask_status_h = new int[nRanks];
-            CUDACHECK(cudaMemcpy(mask_status_h, mask_status_d, nRanks * sizeof(int), cudaMemcpyDeviceToHost));
+                int* mask_status_h = new int[nRanks];
+                CUDACHECK(cudaMemcpy(mask_status_h, mask_status_d, nRanks * sizeof(int), cudaMemcpyDeviceToHost));
 
-            printf("Rank %d: mask after combine = [", myRank);
-            for (int r = 0; r < nRanks; r++) printf("%d%s", mask_status_h[r], r < nRanks - 1 ? "," : "");
-            printf("]\n");
+                printf("Rank %d: mask after combine = [", myRank);
+                for (int r = 0; r < nRanks; r++) {
+                    printf("%d%s", mask_status_h[r], r < nRanks - 1 ? "," : "");
+                }
+                printf("]\n");
 
-            // 0 = masked/failed, 1 = active
-            bool combine_mask_ok = (mask_status_h[dispatch_fail_rank] == 0) && (mask_status_h[combine_fail_rank] == 0);
-            printf("Rank %d: combine mask check: %s (rank %d=%d, rank %d=%d)\n", myRank,
-                   combine_mask_ok ? "PASSED" : "FAILED", dispatch_fail_rank, mask_status_h[dispatch_fail_rank],
-                   combine_fail_rank, mask_status_h[combine_fail_rank]);
-            fflush(stdout);
+                // 0 = masked/failed, 1 = active
+                bool combine_mask_ok = (mask_status_h[dispatch_fail_rank] == 0) && (mask_status_h[combine_fail_rank] == 0);
+                printf("Rank %d: combine mask check: %s (rank %d=%d, rank %d=%d)\n", myRank,
+                       combine_mask_ok ? "PASSED" : "FAILED", dispatch_fail_rank, mask_status_h[dispatch_fail_rank],
+                       combine_fail_rank, mask_status_h[combine_fail_rank]);
+                fflush(stdout);
 
-            delete[] mask_status_h;
-            CUDACHECK(cudaFree(mask_status_d));
-        }
+                delete[] mask_status_h;
+                CUDACHECK(cudaFree(mask_status_d));
+            }
+
+        } // !dispatch_only
 
         // --- Phase 3: Clean mask buffer and verify ---
-        if (myRank != dispatch_fail_rank && myRank != combine_fail_rank) {
+        if (myRank != dispatch_fail_rank && (dispatch_only || myRank != combine_fail_rank)) {
             NCCLCHECK(ncclEpMaskClean(ep_group, stream));
             NCCLCHECK(ncclEpErrorClear(ep_group));
             CUDACHECK(cudaStreamSynchronize(stream));
@@ -7045,19 +7434,6 @@ int main(int argc, char* argv[]) {
         epFreeTensor(&dispatch_outputs.scales);
     }
 
-    // Cleanup (order matters: tensors -> handle -> group -> comm)
-    cleanupBenchmarkTensors(
-        alloc,
-        dispatch_inputs,
-        dispatch_outputs,
-        dispatch_layout_info,
-        combine_inputs,
-        combine_outputs,
-        topk_weights,
-        topk_idx,
-        is_ll_mode);
-    delete[] topk_idx_host; // Now safe to delete after validation
-
     NCCLCHECK(ncclEpHandleDestroy(ep_handle));
 
     if (handle_mem_tensor != nullptr) epFreeTensor(&handle_mem_tensor);
@@ -7072,6 +7448,20 @@ int main(int argc, char* argv[]) {
     }
 
     NCCLCHECK(ncclEpGroupDestroy(ep_group));
+
+    // Keep registered outputs alive until group destruction unbinds CFT memory.
+    cleanupBenchmarkTensors(
+        alloc,
+        dispatch_inputs,
+        dispatch_outputs,
+        dispatch_layout_info,
+        combine_inputs,
+        combine_outputs,
+        topk_weights,
+        topk_idx,
+        is_ll_mode);
+    delete[] topk_idx_host;
+
     ncclCommDestroy(comm);
 
     CUDACHECK(cudaStreamDestroy(stream));

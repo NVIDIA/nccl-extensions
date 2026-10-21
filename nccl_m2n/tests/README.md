@@ -14,6 +14,22 @@ Both use only the public API in `src/nccl_m2n.h`.
 
 ## Building
 
+`pipe_commb_resources_test` is a host-only test of stable PIPE parent namespace
+IDs, exhaustion without wrapping, control-slot ranges, resource sizing and
+overflow. It does not require CUDA, NCCL or GTest at runtime. Build directly:
+
+```sh
+c++ -std=c++17 -Wall -Wextra -Isrc tests/pipe_commb_resources_test.cc -o /tmp/pipe_commb_resources_test
+/tmp/pipe_commb_resources_test
+```
+
+From a configured CUDA/NCCL build, `make -C tests pipe_commb_resources_test`
+builds and runs it. CMake includes it when tests are enabled, even without GTest.
+`NCCL_RESHARD_GEN_COMM_PARENT_CAPACITY` reserves PIPE's persistent namespaces
+before first use; it is independent of `NCCL_RESHARD_GEN_COMM_CONCURRENCY`.
+The latter selects PIPE lanes and optionally caps PACK's effective physical
+slots per bucket. An unset value leaves PACK's configured slot counts unchanged.
+
 ```sh
 make tests
 ```
@@ -226,3 +242,45 @@ the run.
 Cluster-specific launch wrappers and perf-regression workflows are not
 shipped with this contrib; copy `run_basic_api_tests.sh` and adapt its
 environment for your system.
+
+## Multi-dimensional placement coverage
+
+With `NCCL_M2N_BUILD_TESTS=ON`, build `multi_dim_geometry_test` and
+`multi_dim_test_mpi` (neither requires GTest). Make provides the same target
+names under `nccl_m2n/tests`. `make -C nccl_m2n tests`, or the default
+`make` inside `nccl_m2n/tests`, builds both placement tests even without
+GTest; GTest-dependent binaries are included when GTest is available.
+
+The local CI runner requires `MULTI_DIM_GEOMETRY_PASS pairs=109872`.
+The MPI runner requires each sweep to report `MULTI_DIM_GPU_PASS cases=356`
+with the expected API, grouping, nonblocking mode, and mesh shapes. Its
+four-rank profile runs two sweeps on `2 x 1` meshes. The eight-rank profile
+runs ten sweeps on `2 x 2` meshes: DIRECT/PACK with RING/DIRECT, default and
+grouped-window APIs, plus PACK nonblocking default/window calls. Blocking
+default sweeps use UNIFORM balancing; window and nonblocking sweeps use
+NODE_AWARE.
+
+`multi_dim_geometry_test` checks every placement pair for tensor ranks 1–3
+on non-square and unit-axis meshes. Its independent global-box oracle checks
+rank mapping, overlap volume, local bounds, element correspondence, complete
+coverage, and rejection of invalid dimensions, global shapes, and overflow.
+It requires no GPU operations.
+
+`multi_dim_test_mpi` checks all 353 source/destination placement pairs across
+1D, 2D, and 3D tensors, plus three larger transfers. Each destination and
+source is checked against a global-coordinate data oracle and guard bytes.
+Use 8 ranks (4 GPUs per side) by default:
+
+```bash
+NCCL_RESHARD_COPY_ALGORITHM=PACK mpirun -np 8 build/bin/multi_dim_test_mpi
+NCCL_RESHARD_COPY_ALGORITHM=PACK mpirun -np 8 build/bin/multi_dim_test_mpi --window --grouped
+```
+
+Repeat with `DIRECT`, and `NCCL_RESHARD_ALGORITHM=RING` or `DIRECT`.
+`--nonblocking` tests a nonblocking caller communicator. Optional
+`--src-ranks`, `--src-rows`, and `--dst-rows` select asymmetric or non-square
+meshes; their shard products must divide the test shapes (24 and 48/96/192).
+Incompatible products fail the whole launch before CUDA/NCCL setup; cases
+are not silently skipped.
+For example, 12 ranks with `--src-ranks 6 --src-rows 2 --dst-rows 3` exercises
+`2 x 3` to `3 x 2` meshes.

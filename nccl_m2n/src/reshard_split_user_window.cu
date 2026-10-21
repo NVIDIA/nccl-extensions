@@ -371,7 +371,7 @@ ncclResult_t reshardLaunchPackSplit(const ReshardSplitComms* sc, void* stagingBu
   //          srcMeshSize * numCtas is a safe per-slot upper bound (matches
   //          the commA sizing) and is independent of the per-tensor shard
   //          count — letting one DevComm serve every reshard.
-  const int maxConcurrency = reshardGetSplitSlotCount();
+  const int maxConcurrency = sc->slotCount;
   const int ginSignalCountA = sc->srcMeshSize * numCtas;
   const int signalsPerSlotB = sc->srcMeshSize * numCtas;
   const int ctxPerSlotB = reshardGetGinContextCount();
@@ -387,9 +387,14 @@ ncclResult_t reshardLaunchPackSplit(const ReshardSplitComms* sc, void* stagingBu
   ncclWindow_t windowA = nullptr, windowB = nullptr;
   ncclDevComm devCommA, devCommB;
   ReshardDevCommUse devCommAUse, devCommBUse;
+  ReshardCommBResourcePlan resourcesB{};
+  NCCL_M2N_CHECK_ARG(reshardCheckedResourceProduct(signalsPerSlotB, maxConcurrency, &resourcesB.signals) &&
+                       reshardCheckedResourceProduct(ctxPerSlotB, maxConcurrency, &resourcesB.contexts) &&
+                       reshardCheckedResourceProduct(numCtas, maxConcurrency, &resourcesB.barriers),
+                     sc->parentRank, "reshardLaunchPackSplit: commB resource count overflow");
   NCCL_M2N_CHECK(reshardSplitEnsureResources(
     sc, stagingBuffer, stagingCapacity, numCtas, RESHARD_DEVCOMM_BARRIER_HYBRID, ginSignalCountA,
-    /*ginCounterCountA=*/0, signalsPerSlotB, /*countersPerSlotB=*/0, ctxPerSlotB, maxConcurrency, stream, &windowA,
+    /*ginCounterCountA=*/0, resourcesB, stream, &windowA,
     &windowB, &devCommA, &devCommAUse, &devCommB, &devCommBUse));
 
   ncclReshardParamsSplit sp;

@@ -35,6 +35,9 @@ Notes:
 
 - Registration is **collective** — every rank in the communicator must register
   its corresponding buffer.
+- Registered sizes may differ across ranks. NCCL reserves the largest local size
+  in the shared virtual-address layout while preserving each rank's actual
+  allocation size.
 - `win_offset` lets several tensors share one registration; give each its byte
   offset within the window.
 - Only *user-registered* windows count. The library's own internal window does not
@@ -77,10 +80,28 @@ LL dispatch takes the direct path only when all of these hold:
 
 - **NVLink-only topology** — `lsa_team_size == nRanks`, i.e. no RDMA leg;
 - **`NCCL_EP_LAYOUT_RANK_MAJOR`**;
-- recipe is `NCCL_EP_DISP_QUANT_NONE` or `NCCL_EP_DISP_QUANT_FWD`.
+- recipe is `NCCL_EP_DISP_QUANT_NONE`, `NCCL_EP_DISP_QUANT_FWD`, or
+  `NCCL_EP_DISP_QUANT_DS_FP8E3M4`.
 
-Then `outputs->tokens` is written directly when windowed, and under `QUANT_FWD`
-`outputs->scales` independently as well — either, both, or neither.
+Then `outputs->tokens` is written directly when windowed. Under `QUANT_FWD`
+and fused `DS_FP8E3M4`, `outputs->scales` is independently written directly
+when windowed — either, both, or neither. DSFP8 accepts BF16 input and generates
+FP8 tokens and FP32 inverse scales inside dispatch. Universal, LSA SIMT, and
+LSA TMA dispatch all support this fused zero-copy path.
+
+Set `NCCL_EP_LL_TMA_QUANT_WARPS` to `2` through `6` to tune LL TMA fused
+DSFP8 performance (default `2`). The setting is captured when the group is
+created. TMA dispatch requires these quantization workers plus a control warp
+and a cleanup warp. Invalid worker counts or insufficient CTA warps return
+`ncclInvalidArgument`. The setting does not affect BF16, SIMT, or universal dispatch.
+
+For AFD, the same window must be represented on every rank in the collective.
+F-ranks register their full rank-major receive buffer. A-ranks, which receive no
+dispatch payload, register a minimal placeholder allocation and attach that
+window handle to `outputs->tokens`; asymmetric NCCL registration avoids a full
+receive allocation on those ranks. Under `AUTO`, either all ranks attach their
+corresponding handles or none do. Mixed attachment is unsupported, matching the
+existing classic LL contract.
 
 ## The group-wide `zero_copy` flag
 
@@ -137,8 +158,10 @@ be made separately.
 ### Memory
 
 `ON` elides both token staging regions in the intra-LSA buffer — the dispatch and
-combine token regions are simply not allocated. The scale region and the
-per-expert probability regions are not elided.
+combine token regions are simply not allocated. There is no dedicated scale
+region: `QUANT_FWD` scales are carved from each token slot's tail slack, so when
+the token regions are elided the caller must window `outputs->scales` too. The
+per-expert probability regions are still allocated.
 
 ## Debugging
 

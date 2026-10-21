@@ -20,6 +20,7 @@
 #include "cuda_runtime.h"
 
 #include "m2n_checks.h"
+#include "reshard_internal.h"
 #include "staging_types.h"
 #include "staging_primitives.cuh"
 
@@ -67,6 +68,10 @@ bool pipeLaunchCompletionEventSupported() {
       cudaDriverGetVersion(&driverVersion) == cudaSuccess && driverVersion >= kPipeLaunchCompletionMinDriverVersion;
   });
   return supported;
+}
+
+bool pipeLaunchOrderingEnabled() {
+  return reshardUsePipeLaunchOrder() && pipeLaunchCompletionEventSupported();
 }
 
 PipeLaunchOrderState* getPipeLaunchOrderState(int cudaDev) {
@@ -713,6 +718,31 @@ __device__ __forceinline__ PipeGeneratorLaunchMap pipe_generator_launch_map(cons
   return map;
 }
 
+__device__ __forceinline__ size_t pipe_ready_offset(const StagingKernelParams* params, int channel) {
+  return (size_t)channel * params->pipeReadyChannelStride + params->pipeReadySlotOffset;
+}
+
+__device__ __forceinline__ void pipe_wait_ready(ncclGin& gin, ncclWindow_t window, size_t offset) {
+  char* staging_base = (char*)ncclGetLocalPointer(window, 0);
+  uint64_t* shadow = (uint64_t*)(staging_base + offset + CTRL_FIELD_PIPE_READY_SHADOW);
+  const uint64_t generation = ld_acquire_sys(shadow) + 1;
+  gin.waitSignal(ncclCoopThread(), window, offset + CTRL_FIELD_PIPE_READY, generation);
+  st_release_sys(shadow, generation);
+}
+
+__device__ __forceinline__ void pipe_wait_target_ready(const StagingKernelParams* params,
+                                                       const StagingPipeTrainerEdge* targets, int first, int end,
+                                                       int channel, ncclGin& ginA, ncclGin& ginB) {
+  for (int t = first; t < end; t++) {
+    const StagingPipePeerEdge& target = targets[t].peer;
+    if (!pipe_edge_active(target)) {
+      continue;
+    }
+    ncclGin& gin = pipe_edge_uses_split_b(target) ? ginB : ginA;
+    pipe_wait_ready(gin, pipe_edge_rdma_window(params, target), pipe_ready_offset(params, channel));
+  }
+}
+
 __device__ __forceinline__ size_t pipe_layout_offset(const StagingPipeCopyLayout& layout, size_t iter) {
   size_t offset = layout.baseOffset;
   size_t tmp = iter;
@@ -912,9 +942,8 @@ __global__ __launch_bounds__(PIPE_TRAINER_THREADS, 1) void StagingReshardKernel_
 
   /* Trainer stage A: control warp.
    *
-   * Lane 0 waits for each locally packed staging slot, posts an RDMA put to
-   * the generator FIFO and increments the remote tail. The reusable staging
-   * pool orders the next call after these DMA puts have completed. */
+   * Lane 0 waits for generator readiness, posts locally packed staging slots
+   * to the generator FIFO, and increments the remote tail. */
   if (warp_id == 0) {
     if (lane_id == 0) {
       for (int t = 0; t < params->numRdmaTargets; t++) {
@@ -928,14 +957,17 @@ __global__ __launch_bounds__(PIPE_TRAINER_THREADS, 1) void StagingReshardKernel_
         ncclGin& target_gin = pipe_edge_uses_split_b(target) ? ginB : ginA;
         ncclTeam target_world = pipe_edge_uses_split_b(target) ? worldB : worldA;
         ncclWindow_t target_window = pipe_edge_rdma_window(params, target);
-        const uint64_t local_tail = staging_cursor_load(rdma_region, local_fc.localTailOffset);
-        local_fc.shadowTail = local_tail;
-        local_fc.lastTailVal = local_tail;
         uint64_t local_put_counter_base = target_gin.readCounter(local_fc.localPutCounter);
 
         StagingFlowCtrl rdma_fc = target.fc;
         rdma_fc.shadowTail = staging_cursor_load(rdma_region, rdma_fc.cursorTailOffset);
         rdma_fc.headSignalBase = 0;
+        /* Pack warps may publish this call's first local tail before the
+         * readiness wait completes. Start from the last posted RDMA tail. */
+        local_fc.shadowTail = rdma_fc.shadowTail;
+        local_fc.lastTailVal = rdma_fc.shadowTail;
+
+        pipe_wait_target_ready(params, pipe_plan->rdmaTargets[channel_id], t, t + 1, channel_id, ginA, ginB);
 
         const size_t chunkSize = target.logicalChunkSize;
         const PipeChunkRange chunks = pipe_chunk_range(target);
@@ -1133,6 +1165,35 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
       ncclGin ginB{devCommB, pipe_gin_context(devCommB, channel_id, call.splitCommBContextBase, ctxPerSlotB)};
       ncclTeam worldA = ncclTeamWorld(devCommA);
       ncclTeam worldB = ncclTeamWorld(devCommB);
+
+      /* Reaching this kernel means this channel's prior consumption is done. */
+      int ready_source = -1;
+      for (int s = 0; s < params->numRdmaSources; s++) {
+        if (pipe_edge_active(pipe_plan->rdmaSources[channel_id][s])) {
+          ready_source = s;
+          break;
+        }
+      }
+      if (ready_source >= 0) {
+        const StagingPipePeerEdge& source = pipe_plan->rdmaSources[channel_id][ready_source];
+        ncclGin& source_gin = pipe_edge_uses_split_b(source) ? ginB : ginA;
+        if (threadIdx.x == 0) {
+          ncclTeam source_world = pipe_edge_uses_split_b(source) ? worldB : worldA;
+          source_gin.signal(source_world, source.peerWorldRank,
+                            ncclGin_WeakVASignalInc{pipe_edge_rdma_window(params, source),
+                                                    pipe_ready_offset(params, channel_id) + CTRL_FIELD_PIPE_READY});
+        }
+        __syncthreads();
+      }
+
+      if (threadIdx.x == 0) {
+        if constexpr (DoRingForward) {
+          const int ring_start = params->numRdmaTargets - params->numRingTargets;
+          pipe_wait_target_ready(params, pipe_plan->rdmaTargets[channel_id], ring_start, params->numRdmaTargets,
+                                 channel_id, ginA, ginB);
+        }
+      }
+      __syncthreads();
 
       for (int s = 0; s < params->numRdmaSources; s++) {
         const StagingPipePeerEdge& source = pipe_plan->rdmaSources[channel_id][s];
@@ -1515,9 +1576,9 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
               pipe_plan->lsaSourceLayouts[channel_id][source.copyLayoutIndex];
             pipe_unpack_chunk(user_dst, tile_src, source_layout, cur_desc.byte_start, cur_desc.bytes,
                               PIPE_GENERATOR_UNPACK_THREADS, unpack_thread);
+            const int last_tile = cur_desc.last_tile;
             /* Keep the tile queued until the full unpack group has consumed it. */
             barrier_sync_subset(PIPE_GENERATOR_UNPACK_BARRIER_ID, PIPE_GENERATOR_UNPACK_THREADS);
-            const int last_tile = cur_desc.last_tile;
             tiles_done++;
             if (last_tile) {
               chunks_done++;
@@ -1624,7 +1685,7 @@ static ncclResult_t launchPipeGeneratorSpecialized(const StagingKernelParams* ho
                            cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_smem_bytes));
   }
 #if NCCLM2N_PIPE_HAS_LAUNCH_COMPLETION_EVENT
-  if (pipeLaunchCompletionEventSupported()) {
+  if (pipeLaunchOrderingEnabled()) {
     NCCL_M2N_CHECK(
       (launchPipeKernelOrdered(dim3(grid), dim3(PIPE_GENERATOR_THREADS), dynamic_smem_bytes, stream,
                                StagingReshardKernel_PipeGenerator<TmaTileSize, DoRdmaSources, DoRingForward,
@@ -1710,7 +1771,7 @@ ncclResult_t launchStagingReshardPipeSplit(const StagingKernelParams* hostParams
 
   if (launch_trainer && trainer_grid > 0) {
 #if NCCLM2N_PIPE_HAS_LAUNCH_COMPLETION_EVENT
-    if (pipeLaunchCompletionEventSupported()) {
+    if (pipeLaunchOrderingEnabled()) {
       NCCL_M2N_CHECK((launchPipeKernelOrdered(dim3(trainer_grid), dim3(PIPE_TRAINER_THREADS), 0, stream,
                                             StagingReshardKernel_PipeTrainer, devParams, devPipePlan, *call, *devCommA,
                                             *devCommB)));

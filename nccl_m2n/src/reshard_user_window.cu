@@ -385,8 +385,8 @@ static ncclResult_t packPackedRxOffset(const Params& p, int dstShard, int srcSha
   size_t off = rxBase;
   for (int s = 0; s < srcShardLimit; s++) {
     ncclReshardTransferPlan probe;
-    NCCL_M2N_CHECK(computeTransferPlanChecked(p.srcDims, p.srcStrides, p.srcShardTensorDim, s, p.dstDims,
-                                              p.dstStrides, p.dstShardTensorDim, dstShard, p.ndims,
+    NCCL_M2N_CHECK(computeTransferPlanChecked(p.srcDims, p.srcStrides, p.srcShardLayout, s, p.dstDims,
+                                              p.dstStrides, p.dstShardLayout, dstShard, p.ndims,
                                               p.elementsPerChunk, &probe));
     size_t pairBytes = 0;
     NCCL_M2N_CHECK_ARG(packPlanPairBytes(probe, &pairBytes) && m2nCheckedAddSize(off, pairBytes, &off), -1,
@@ -521,9 +521,9 @@ static ncclResult_t reshardCopyPackLsaHput(ncclComm_t comm, const ncclDistTensor
   if (params.isDest) {
     for (int srcShard = 0; srcShard < params.srcShardCount; srcShard++) {
       ncclReshardTransferPlan& plan = unpackPlans[srcShard];
-      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardTensorDim,
+      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardLayout,
                                                 srcShard, params.dstDims, params.dstStrides,
-                                                params.dstShardTensorDim, params.myDstShardIdx, params.ndims,
+                                                params.dstShardLayout, params.myDstShardIdx, params.ndims,
                                                 params.elementsPerChunk, &plan));
       NCCL_M2N_CHECK_ARG(packPlanPairBytes(plan, &unpackBytes[srcShard]), worldRank,
                          "PACK LSA unpack shard %d byte count overflow", srcShard);
@@ -670,39 +670,21 @@ ncclResult_t reshardCopyPackNormalized(ncclComm_t comm, const ncclDistTensor_t* 
 
   const int srcMeshSize = srcMesh->dims[0] * srcMesh->dims[1];
   const bool isSource = worldRank >= srcMesh->startRank && worldRank < srcMesh->startRank + srcMeshSize;
-  int srcShardTensorDim = -1;
-  int dstShardTensorDim = -1;
-  int srcShardCount = 1;
-  int dstShardCount = 1;
-  for (int i = 0; i < NCCL_RESHARD_MESH_NDIMS; i++) {
-    if (isShardPlacement(src->placements[i])) {
-      srcShardTensorDim = getShardTensorDim(src->placements[i]);
-      srcShardCount = srcMesh->dims[i];
-    }
-    if (isShardPlacement(dst->placements[i])) {
-      dstShardTensorDim = getShardTensorDim(dst->placements[i]);
-      dstShardCount = dstMesh->dims[i];
-    }
-  }
-
-  size_t globalDims[NCCL_RESHARD_MAX_TENSOR_DIMS];
-  for (int d = 0; d < ndims; d++) {
-    globalDims[d] = srcDimsBytes[d];
-    if (d == srcShardTensorDim) {
-      NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(globalDims[d], (size_t)srcShardCount, &globalDims[d]), worldRank,
-                         "reshardCopyPack: source global size overflow at dim %d", d);
-    }
-  }
-
+  ncclReshardMeshGroupInfo srcInfo{}, dstInfo{};
+  computeMeshGroupInfo(srcTensor, srcMesh->startRank, &srcInfo);
+  computeMeshGroupInfo(dstTensor, dstMesh->startRank, &dstInfo);
+  const int srcShardCount = srcInfo.shardCount;
+  const int dstShardCount = dstInfo.shardCount;
+  size_t resolvedSrc[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
+  size_t resolvedDst[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
+  NCCL_M2N_CHECK(resolveReshardDims(worldRank, srcDimsBytes, srcInfo.shardLayout, dstDimsBytes,
+                                    dstInfo.shardLayout, ndims, resolvedSrc, resolvedDst));
   size_t srcLocal = 1;
   size_t dstLocal = 1;
   for (int d = 0; d < ndims; d++) {
-    size_t srcDim = (d == srcShardTensorDim && srcShardCount > 1) ? globalDims[d] / srcShardCount : globalDims[d];
-    size_t dstDim = (d == dstShardTensorDim && dstShardCount > 1) ? globalDims[d] / dstShardCount : globalDims[d];
-    NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(srcLocal, srcDim, &srcLocal), worldRank,
-                       "reshardCopyPack: source staging size overflow at dim %d", d);
-    NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(dstLocal, dstDim, &dstLocal), worldRank,
-                       "reshardCopyPack: destination staging size overflow at dim %d", d);
+    NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(srcLocal, resolvedSrc[d], &srcLocal) &&
+                         m2nCheckedMulSize(dstLocal, resolvedDst[d], &dstLocal), worldRank,
+                       "reshardCopyPack: staging size overflow at dim %d", d);
   }
 
   const size_t areaBytes = std::max(std::max(srcLocal, dstLocal), kMinPackStagingBytes);
@@ -949,8 +931,8 @@ ncclResult_t reshardCopyPackNormalized(ncclComm_t comm, const ncclDistTensor_t* 
   if (params.isDest && dstBuffer != nullptr) {
     for (int srcShard = 0; srcShard < params.srcShardCount; srcShard++) {
       ncclReshardTransferPlan plan;
-      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardTensorDim, srcShard,
-                                                params.dstDims, params.dstStrides, params.dstShardTensorDim,
+      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardLayout, srcShard,
+                                                params.dstDims, params.dstStrides, params.dstShardLayout,
                                                 params.myDstShardIdx, params.ndims, params.elementsPerChunk, &plan));
       size_t pairBytes = 0;
       NCCL_M2N_CHECK_ARG(packPlanPairBytes(plan, &pairBytes), worldRank,
@@ -997,50 +979,21 @@ static bool packGroupSameTopology(const ReshardTensorSetup& first, const Reshard
 
 static ncclResult_t packGroupTensorBytes(int worldRank, const ReshardTensorSetup& setup, size_t* srcBytes,
                                        size_t* dstBytes) {
-  // Match the single-entry PACK path: reconstruct the global shape,
-  // then derive both canonical local regions from mesh shard counts.
-  size_t srcDimsBytes[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
-  size_t dstDimsBytes[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
+  size_t srcDims[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
+  size_t dstDims[NCCL_RESHARD_MAX_TENSOR_DIMS] = {};
   NCCL_M2N_CHECK(reshardDimsToBytes(worldRank, "ncclM2nGroupEnd:", setup.ndims, setup.elementSize,
-                                    setup.srcTensor.localShape, setup.dstTensor.localShape, srcDimsBytes,
-                                    dstDimsBytes));
-
-  int srcShardDim = -1;
-  int dstShardDim = -1;
-  int srcShardCount = 1;
-  int dstShardCount = 1;
-  for (int i = 0; i < NCCL_RESHARD_MESH_NDIMS; i++) {
-    if (isShardPlacement(setup.srcTensor.placements[i])) {
-      srcShardDim = getShardTensorDim(setup.srcTensor.placements[i]);
-      srcShardCount = setup.srcMesh.dims[i];
-    }
-    if (isShardPlacement(setup.dstTensor.placements[i])) {
-      dstShardDim = getShardTensorDim(setup.dstTensor.placements[i]);
-      dstShardCount = setup.dstMesh.dims[i];
-    }
-  }
-
+                                    setup.srcTensor.localShape, setup.dstTensor.localShape, srcDims, dstDims));
+  ncclReshardMeshGroupInfo srcInfo{}, dstInfo{};
+  computeMeshGroupInfo(&setup.srcTensor, setup.srcMesh.startRank, &srcInfo);
+  computeMeshGroupInfo(&setup.dstTensor, setup.dstMesh.startRank, &dstInfo);
+  NCCL_M2N_CHECK(resolveReshardDims(worldRank, srcDims, srcInfo.shardLayout, dstDims, dstInfo.shardLayout,
+                                    setup.ndims, srcDims, dstDims));
   *srcBytes = 1;
   *dstBytes = 1;
   for (int d = 0; d < setup.ndims; d++) {
-    size_t globalDim = srcDimsBytes[d];
-    if (d == srcShardDim) {
-      NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(globalDim, (size_t)srcShardCount, &globalDim), worldRank,
-                         "ncclM2nGroupEnd: source global size overflow at dim %d", d);
-    }
-    size_t dstGlobalDim = dstDimsBytes[d];
-    if (d == dstShardDim) {
-      NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(dstGlobalDim, (size_t)dstShardCount, &dstGlobalDim), worldRank,
-                         "ncclM2nGroupEnd: destination global size overflow at dim %d", d);
-    }
-    NCCL_M2N_CHECK_ARG(globalDim == dstGlobalDim, worldRank,
-                       "ncclM2nGroupEnd: source and destination global shapes differ at dim %d", d);
-    const size_t srcDim = (d == srcShardDim && srcShardCount > 1) ? globalDim / srcShardCount : globalDim;
-    const size_t dstDim = (d == dstShardDim && dstShardCount > 1) ? globalDim / dstShardCount : globalDim;
-    NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(*srcBytes, srcDim, srcBytes), worldRank,
-                       "ncclM2nGroupEnd: source local byte size overflow at dim %d", d);
-    NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(*dstBytes, dstDim, dstBytes), worldRank,
-                       "ncclM2nGroupEnd: destination local byte size overflow at dim %d", d);
+    NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(*srcBytes, srcDims[d], srcBytes) &&
+                         m2nCheckedMulSize(*dstBytes, dstDims[d], dstBytes), worldRank,
+                       "ncclM2nGroupEnd: local byte size overflow at dim %d", d);
   }
   return ncclSuccess;
 }
@@ -1209,16 +1162,16 @@ static ncclResult_t reshardCopyPackGroupNormalized(ncclComm_t comm, const Reshar
       memset(&plan, 0, sizeof(plan));
       if (entryParams->isDest) {
         NCCL_M2N_CHECK(computeTransferPlanChecked(entryParams->srcDims, entryParams->srcStrides,
-                                                  entryParams->srcShardTensorDim, s, entryParams->dstDims,
-                                                  entryParams->dstStrides, entryParams->dstShardTensorDim,
+                                                  entryParams->srcShardLayout, s, entryParams->dstDims,
+                                                  entryParams->dstStrides, entryParams->dstShardLayout,
                                                   entryParams->myDstShardIdx, entryParams->ndims,
                                                   entryParams->elementsPerChunk, &plan));
       }
       for (int d = 0; d < dstShardCount; d++) {
         ncclReshardTransferPlan pairPlan;
         NCCL_M2N_CHECK(computeTransferPlanChecked(entryParams->srcDims, entryParams->srcStrides,
-                                                  entryParams->srcShardTensorDim, s, entryParams->dstDims,
-                                                  entryParams->dstStrides, entryParams->dstShardTensorDim, d,
+                                                  entryParams->srcShardLayout, s, entryParams->dstDims,
+                                                  entryParams->dstStrides, entryParams->dstShardLayout, d,
                                                   entryParams->ndims, entryParams->elementsPerChunk, &pairPlan));
         const size_t index = (e * (size_t)srcShardCount + (size_t)s) * (size_t)dstShardCount + (size_t)d;
         NCCL_M2N_CHECK_ARG(packPlanPairBytes(pairPlan, &pairBytes[index]), worldRank,

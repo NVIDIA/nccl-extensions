@@ -135,6 +135,53 @@ protected:
         early = (g_rank < g_nranks / 2);
         base_rank_slot = early ? 0 : 2;
     }
+
+    // One forward FLAT dispatch with the fixture routing (output contents are not checked).
+    void run_flat_dispatch(ncclEpHandle_t h) {
+        std::vector<nv_bfloat16> h_tok(kNumTokens * kHidden, __float2bfloat16(1.0f));
+        std::vector<float> h_w(kNumTokens * kTopK, 1.0f);
+        nv_bfloat16 *d_tok = nullptr, *d_recv = nullptr;
+        float *d_w = nullptr, *d_recv_w = nullptr;
+        int64_t* d_recv_idx = nullptr;
+        CUDA_ASSERT(cudaMalloc(&d_tok, kNumTokens * kHidden * sizeof(nv_bfloat16)));
+        CUDA_ASSERT(cudaMalloc(&d_recv, kMaxRecvSlots * kHidden * sizeof(nv_bfloat16)));
+        CUDA_ASSERT(cudaMalloc(&d_w, kNumTokens * kTopK * sizeof(float)));
+        CUDA_ASSERT(cudaMalloc(&d_recv_w, kMaxRecvSlots * kTopK * sizeof(float)));
+        CUDA_ASSERT(cudaMalloc(&d_recv_idx, kMaxRecvSlots * kTopK * sizeof(int64_t)));
+        CUDA_ASSERT(cudaMemcpy(d_tok, h_tok.data(), h_tok.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+        CUDA_ASSERT(cudaMemcpy(d_w, h_w.data(), h_w.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+        ncclEpTensor_t *t_tok = nullptr, *t_recv = nullptr, *t_w = nullptr, *t_recv_w = nullptr,
+                       *t_recv_idx = nullptr;
+        NCCL_ASSERT(epTensorCreate(&t_tok, 2, ncclBfloat16, d_tok, kNumTokens, kHidden));
+        NCCL_ASSERT(epTensorCreate(&t_recv, 2, ncclBfloat16, d_recv, kMaxRecvSlots, kHidden));
+        NCCL_ASSERT(epTensorCreate(&t_w, 2, ncclFloat32, d_w, kNumTokens, kTopK));
+        NCCL_ASSERT(epTensorCreate(&t_recv_w, 2, ncclFloat32, d_recv_w, kMaxRecvSlots, kTopK));
+        NCCL_ASSERT(epTensorCreate(&t_recv_idx, 2, ncclInt64, d_recv_idx, kMaxRecvSlots, kTopK));
+
+        ncclEpDispatchInputs_t in = NCCL_EP_DISPATCH_INPUTS_INIT;
+        ncclEpDispatchOutputs_t out = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+        in.tokens = t_tok;
+        in.topk_weights = t_w;
+        out.tokens = t_recv;
+        out.topk_weights = t_recv_w;
+        out.topk_idx = t_recv_idx;
+        ncclEpDispatchConfig_t cfg = NCCL_EP_DISPATCH_CONFIG_INIT;
+        NCCL_ASSERT(ncclEpDispatch(h, &in, &out, nullptr, &cfg, g_stream));
+        NCCL_ASSERT(ncclEpComplete(h, nullptr, g_stream));
+        CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+
+        ncclEpTensorDestroy(t_recv_idx);
+        ncclEpTensorDestroy(t_recv_w);
+        ncclEpTensorDestroy(t_w);
+        ncclEpTensorDestroy(t_recv);
+        ncclEpTensorDestroy(t_tok);
+        cudaFree(d_recv_idx);
+        cudaFree(d_recv_w);
+        cudaFree(d_w);
+        cudaFree(d_recv);
+        cudaFree(d_tok);
+    }
 };
 
 // ── Test: S2D layout for rank-major ────────────────────────────────────────────
@@ -142,6 +189,13 @@ protected:
 TEST_F(HandleMapsTest, S2DRankMajor) {
     ncclEpHandle_t h = make_handle(nullptr);  // default = rank-major
     ASSERT_NE(h, nullptr);
+
+    // Count mode builds the FLAT s2d inside the forward dispatch, not at UpdateHandle; run one
+    // dispatch first so the same assertions inspect the in-kernel build. Scan (and the EM-dup
+    // scan fallback) fills it at UpdateHandle.
+    if (ht_count_mode_active(h)) {
+        ASSERT_NO_FATAL_FAILURE(run_flat_dispatch(h));
+    }
 
     NcclEpHandleInspector insp(h);
     ASSERT_EQ(insp.rows(), kNumTokens);
@@ -357,7 +411,7 @@ TEST_F(HandleMapsTest, S2DExpertMajorPermute) {
     }
     // Count mode builds the FLAT s2d during dispatch, not UpdateHandle, so there is nothing to
     // inspect here; only scan mode fills it at UpdateHandle.
-    if (!ht_em_ag_scan_mode_active()) {
+    if (!ht_ag_scan_mode_active()) {
         GTEST_SKIP() << "count mode defers FLAT s2d to post-dispatch";
     }
 
@@ -395,6 +449,8 @@ TEST_F(HandleMapsTest, S2DExpertMajorPermute) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
+    // These tests inspect scan-produced maps before any dispatch runs.
+    setenv("NCCL_EP_HT_AG_SCAN_MODE", "1", 1);
     if (!ep_bootstrap(argc, argv, "te_ep_hmaps_uid")) return 0;
     int ret = RUN_ALL_TESTS();
     ep_teardown();

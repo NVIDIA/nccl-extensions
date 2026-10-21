@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -41,6 +42,36 @@
 
 namespace nccl_ep {
 namespace jit {
+
+bool ensure_nucs_available() {
+#if CUDA_VERSION < 13030
+    if (announce_once("nucs_unavailable_cuda_headers")) {
+        std::fprintf(
+            stderr,
+            "[nccl_ep] NUCS was requested but this library was built with CUDA headers older than 13.3; "
+            "the launch is not supported.\n");
+    }
+    return false;
+#else
+    static const CUresult driver_support = [] {
+        int driver_version = 0;
+        const CUresult rc = cuDriverGetVersion(&driver_version);
+        if (rc != CUDA_SUCCESS) return rc;
+        return driver_version >= 13030 ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
+    }();
+    if (driver_support != CUDA_SUCCESS && announce_once("nucs_unavailable_cuda_driver")) {
+        std::fprintf(
+            stderr,
+            driver_support == CUDA_ERROR_NOT_SUPPORTED
+                ? "[nccl_ep] NUCS was requested but the CUDA driver is older than 13.3; "
+                  "the launch is not supported.\n"
+                : "[nccl_ep] NUCS was requested but the CUDA driver version could not be queried; "
+                  "the launch is not supported.\n");
+    }
+    return driver_support == CUDA_SUCCESS;
+#endif
+}
+
 namespace {
 
 struct LoadedKernelModule {
@@ -82,6 +113,9 @@ std::unordered_map<std::string, LoadedKernelModule> g_modules;
 struct FastCacheEntry {
     CUfunction function = nullptr;
     int configured_smem_bytes = 0;
+    int residency_block_dim = 0;
+    int residency_smem_bytes = -1;
+    int resident_blocks = 0;
 };
 
 // Small per-thread cache keeps repeated launches off the shared map.
@@ -401,17 +435,19 @@ JitKernelStatus configure_smem(CUfunction function, int dynamic_smem_bytes, std:
     return JitKernelStatus::kLaunched;
 }
 
-void update_thread_fast_cache(const FastCacheKey& fast_key, CUfunction function, int configured_smem_bytes) {
-    if (fast_key.identity == nullptr) return;
+void update_thread_fast_cache(const FastCacheKey& fast_key, FastCacheEntry entry) {
+    if (fast_key.identity == nullptr) {
+        return;
+    }
 
     // Update an existing slot if the key is already present (preserves max smem).
     for (int i = 0; i < kTlCacheSlots; ++i) {
         ThreadCache::Slot& slot = g_thread_cache.slots[i];
         if (slot.valid && FastCacheKeyEqual{}(slot.key, fast_key)) {
-            if (slot.entry.configured_smem_bytes > configured_smem_bytes) {
-                configured_smem_bytes = slot.entry.configured_smem_bytes;
+            if (slot.entry.configured_smem_bytes > entry.configured_smem_bytes) {
+                entry.configured_smem_bytes = slot.entry.configured_smem_bytes;
             }
-            slot.entry = FastCacheEntry{function, configured_smem_bytes};
+            slot.entry = entry;
             return;
         }
     }
@@ -420,7 +456,7 @@ void update_thread_fast_cache(const FastCacheKey& fast_key, CUfunction function,
     ThreadCache::Slot& slot = g_thread_cache.slots[g_thread_cache.next_evict];
     slot.valid = true;
     slot.key = fast_key;
-    slot.entry = FastCacheEntry{function, configured_smem_bytes};
+    slot.entry = entry;
     g_thread_cache.next_evict = (g_thread_cache.next_evict + 1) % kTlCacheSlots;
 }
 
@@ -433,19 +469,17 @@ void erase_thread_fast_cache(const FastCacheKey& fast_key) {
     }
 }
 
-void update_fast_cache(const FastCacheKey& fast_key, CUfunction function, int configured_smem_bytes) {
-    if (fast_key.identity == nullptr) return;
-
+void update_fast_cache(const FastCacheKey& fast_key, FastCacheEntry entry) {
+    if (fast_key.identity == nullptr) {
+        return;
+    }
     {
         std::unique_lock<std::shared_mutex> lock(g_fast_mutex);
-        FastCacheEntry& entry = g_fast_cache[fast_key];
-        entry.function = function;
-        if (configured_smem_bytes > entry.configured_smem_bytes) {
-            entry.configured_smem_bytes = configured_smem_bytes;
-        }
-        configured_smem_bytes = entry.configured_smem_bytes;
+        FastCacheEntry& cached = g_fast_cache[fast_key];
+        entry.configured_smem_bytes = std::max(entry.configured_smem_bytes, cached.configured_smem_bytes);
+        cached = entry;
     }
-    update_thread_fast_cache(fast_key, function, configured_smem_bytes);
+    update_thread_fast_cache(fast_key, entry);
 }
 
 void erase_fast_cache(const FastCacheKey& fast_key) {
@@ -474,29 +508,20 @@ CUresult launch_function(
         CU_LAUNCH_PARAM_END
     };
 
-    // Default path: plain cuLaunchKernel (no cooperative / cluster attributes).
     const bool needs_cluster = (variant.cluster_dim_x > 1 || variant.cluster_dim_y > 1 || variant.cluster_dim_z > 1);
-    if (!variant.cooperative && !needs_cluster) {
-        return cuLaunchKernel(
-            function,
-            variant.num_blocks,
-            1,
-            1,
-            variant.block_dim,
-            1,
-            1,
-            static_cast<unsigned int>(variant.dynamic_smem_bytes),
-            reinterpret_cast<CUstream>(stream),
-            single_arg ? single_arg_array : nullptr,
-            single_arg ? nullptr : extra);
-    }
-
-    // Attributes path: use cuLaunchKernelEx with cooperative and/or cluster dim.
     // LL kernels need cooperative for cg::this_grid().sync() and use a cluster
     // dim of 2 when num_blocks is even.
     // Value-initialize attrs[] so the union/pad bytes are well-defined.
-    CUlaunchAttribute attrs[2]{};
+    CUlaunchAttribute attrs[3]{};
     unsigned int num_attrs = 0;
+    if (variant.nucs) {
+        if (!ensure_nucs_available()) return CUDA_ERROR_NOT_SUPPORTED;
+#if CUDA_VERSION >= 13030
+        attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_NVLINK_UTIL_CENTRIC_SCHEDULING;
+        attrs[num_attrs].value.nvlinkUtilCentricScheduling = 1;
+#endif
+        ++num_attrs;
+    }
     if (variant.cooperative) {
         attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
         attrs[num_attrs].value.cooperative = 1;
@@ -519,10 +544,49 @@ CUresult launch_function(
     config.blockDimZ = 1;
     config.sharedMemBytes = static_cast<unsigned int>(variant.dynamic_smem_bytes);
     config.hStream = reinterpret_cast<CUstream>(stream);
-    config.attrs = attrs;
+    config.attrs = num_attrs == 0 ? nullptr : attrs;
     config.numAttrs = num_attrs;
 
     return cuLaunchKernelEx(&config, function, single_arg ? single_arg_array : nullptr, single_arg ? nullptr : extra);
+}
+
+JitKernelStatus check_grid_residency(
+    const JitKernelVariant& variant, const FastCacheKey& fast_key,
+    FastCacheEntry* entry, std::string* error) {
+    if (!variant.require_full_residency) {
+        return JitKernelStatus::kLaunched;
+    }
+    if (entry->residency_block_dim != variant.block_dim ||
+        entry->residency_smem_bytes != variant.dynamic_smem_bytes) {
+        int blocks_per_sm = 0;
+        CUresult rc = cuOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_per_sm, entry->function, variant.block_dim, variant.dynamic_smem_bytes);
+        CUdevice device;
+        int sm_count = 0;
+        if (rc == CUDA_SUCCESS) {
+            rc = cuDeviceGet(&device, fast_key.device);
+        }
+        if (rc == CUDA_SUCCESS) {
+            rc = cuDeviceGetAttribute(&sm_count, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+        }
+        if (rc != CUDA_SUCCESS) {
+            if (error != nullptr) {
+                *error = cu_error_string(rc);
+            }
+            return JitKernelStatus::kAttributeFailed;
+        }
+        entry->residency_block_dim = variant.block_dim;
+        entry->residency_smem_bytes = variant.dynamic_smem_bytes;
+        entry->resident_blocks = blocks_per_sm * sm_count;
+        update_fast_cache(fast_key, *entry);
+    }
+    if (variant.num_blocks > entry->resident_blocks) {
+        if (error != nullptr) {
+            *error = "grid exceeds compiled kernel residency";
+        }
+        return JitKernelStatus::kInsufficientResidency;
+    }
+    return JitKernelStatus::kLaunched;
 }
 
 JitKernelStatus try_fast_launch(
@@ -557,7 +621,7 @@ JitKernelStatus try_fast_launch(
             }
             entry = it->second;
         }
-        update_thread_fast_cache(fast_key, entry.function, entry.configured_smem_bytes);
+        update_thread_fast_cache(fast_key, entry);
         log_memory_cache_event(fast_key, variant, "hit", "process");
     } else {
         log_memory_cache_event(fast_key, variant, "hit", "thread");
@@ -569,7 +633,13 @@ JitKernelStatus try_fast_launch(
             erase_fast_cache(fast_key);
             return JitKernelStatus::kDisabled;
         }
-        update_fast_cache(fast_key, entry.function, variant.dynamic_smem_bytes);
+        entry.configured_smem_bytes = variant.dynamic_smem_bytes;
+        update_fast_cache(fast_key, entry);
+    }
+
+    const JitKernelStatus residency = check_grid_residency(variant, fast_key, &entry, error);
+    if (residency != JitKernelStatus::kLaunched) {
+        return residency;
     }
 
     CUresult rc = launch_function(entry.function, variant, kernel_param, kernel_param_size, stream);
@@ -794,7 +864,14 @@ JitKernelStatus load_and_launch_kernel(
         return status;
     }
 
-    update_fast_cache(fast_key, function, variant.dynamic_smem_bytes);
+    FastCacheEntry entry;
+    entry.function = function;
+    entry.configured_smem_bytes = variant.dynamic_smem_bytes;
+    const JitKernelStatus residency = check_grid_residency(variant, fast_key, &entry, error);
+    if (residency != JitKernelStatus::kLaunched) {
+        return residency;
+    }
+    update_fast_cache(fast_key, entry);
 
     CUresult rc = launch_function(function, variant, kernel_param, kernel_param_size, stream);
     if (rc != CUDA_SUCCESS) {
@@ -832,6 +909,8 @@ const char* jit_kernel_status_name(JitKernelStatus status) {
         return "attribute failed";
     case JitKernelStatus::kLaunchFailed:
         return "launch failed";
+    case JitKernelStatus::kInsufficientResidency:
+        return "insufficient residency";
     }
     return "unknown";
 }
@@ -887,7 +966,8 @@ JitKernelStatus launch_jit_kernel(
     const FastCacheKey fast_key{variant.identity, variant.runtime_key, context, device};
     const JitKernelStatus fast_status =
         try_fast_launch(fast_key, variant, kernel_param, kernel_param_size, stream, error);
-    if (fast_status == JitKernelStatus::kLaunched || fast_status == JitKernelStatus::kLaunchFailed) {
+    if (fast_status == JitKernelStatus::kLaunched || fast_status == JitKernelStatus::kLaunchFailed ||
+        fast_status == JitKernelStatus::kInsufficientResidency) {
         return fast_status;
     }
 

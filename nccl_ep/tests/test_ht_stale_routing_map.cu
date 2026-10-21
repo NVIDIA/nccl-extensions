@@ -60,6 +60,10 @@ protected:
 static constexpr int64_t kIter2Expert = 0;
 
 TEST_F(HtStaleRoutingMapTest, StaleTailTriggersIllegalAddress) {
+    // The stale tail rides the routing-map AllGather (scan), the count-row AllGather (unfused
+    // count) or the in-dispatch count-row fan-out (fused count). Fused count publishes the recv
+    // count inside dispatch, so that mode checks it after the iter-2 dispatch instead of after
+    // UpdateHandle.
     // ── iter-1 topk_idx [kNumTokens, kTopK] ──────────────────────────────────
     // Use the same per-rank/per-token expert assignment as test_common.h's
     // expert_for_token() so iter-1 routing exercises every expert at least once
@@ -162,6 +166,13 @@ TEST_F(HtStaleRoutingMapTest, StaleTailTriggersIllegalAddress) {
     // AllGather ships those stale rows to peers.
     NCCL_ASSERT(ncclEpUpdateHandle(h, t_topk_iter2, nullptr, g_stream));
     CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+    // Fused count: UpdateHandle zeroes the recv count (dispatch republishes it), so iter-1's
+    // count must not leak into a pre-dispatch read.
+    if (ht_count_fused_active(h)) {
+        unsigned int cleared = 0xFFFFFFFFu;
+        NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &cleared));
+        EXPECT_EQ(cleared, 0u) << "Rank " << g_rank << ": fused count must zero the recv count at UpdateHandle";
+    }
 
     // Read post-allgather routing-derived recv count. With the fix in place,
     // iter-2's lone token (routed to expert 0) means only rank 0 receives
@@ -170,14 +181,20 @@ TEST_F(HtStaleRoutingMapTest, StaleTailTriggersIllegalAddress) {
     // every rank — see project_ncclep_ht_alloc_callback_segv.md.
     static constexpr unsigned int kExpectedRecvWithFix[4] = {4, 0, 0, 0};
     ASSERT_LT(g_rank, 4);
-    unsigned int num_recv = 0;
-    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
-    EXPECT_EQ(num_recv, kExpectedRecvWithFix[g_rank])
-        << "Rank " << g_rank << ": iter-2 num_recv_tokens=" << num_recv << ", expected " << kExpectedRecvWithFix[g_rank]
-        << ". A mismatch on rank g indicates stale routing-map tail bits "
-           "from iter-1 were shipped to peers via AllGather — the fix at "
-           "nccl_ep.cc:2082 (cudaMemsetAsync of the local routing send slot) "
-           "is missing.";
+    auto check_iter2_recv_count = [&]() {
+        unsigned int num_recv = 0;
+        NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+        EXPECT_EQ(num_recv, kExpectedRecvWithFix[g_rank])
+            << "Rank " << g_rank << ": iter-2 num_recv_tokens=" << num_recv << ", expected "
+            << kExpectedRecvWithFix[g_rank]
+            << ". A mismatch on rank g indicates stale routing-map tail bits "
+               "from iter-1 were shipped to peers via AllGather — the fix at "
+               "nccl_ep.cc:2082 (cudaMemsetAsync of the local routing send slot) "
+               "is missing.";
+    };
+    if (!ht_count_fused_active(h)) {
+        ASSERT_NO_FATAL_FAILURE(check_iter2_recv_count());
+    }
 
     // Iter-2 dispatch buffers. The token buffer is sized to the iter-2
     // num_tokens (1), so any stale-tail-driven sender-side read past row 0 is
@@ -241,6 +258,11 @@ TEST_F(HtStaleRoutingMapTest, StaleTailTriggersIllegalAddress) {
                                      << ". Expected cudaSuccess — without the fix this is typically "
                                         "cudaErrorIllegalAddress, produced by the HT dispatch kernel "
                                         "following stale-tail routing bits to an OOB token slot.";
+    // Fused count: the iter-2 dispatch just published the recv count; a stale iter-1 tail in the
+    // fanned-out count rows would inflate it the same way.
+    if (ht_count_fused_active(h) && disp_ret == ncclSuccess && sync_err == cudaSuccess) {
+        ASSERT_NO_FATAL_FAILURE(check_iter2_recv_count());
+    }
 
     // ── Cleanup ──────────────────────────────────────────────────────────────
     ncclEpTensorDestroy(t_recv_idx2);
@@ -268,6 +290,8 @@ TEST_F(HtStaleRoutingMapTest, StaleTailTriggersIllegalAddress) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
+    // This regression specifically checks the bitmap AllGather tail clear.
+    setenv("NCCL_EP_HT_AG_SCAN_MODE", "1", 1);
     if (!ep_bootstrap(argc, argv, "te_ep_ht_stale_routing_map_uid")) return 0;
     int ret = RUN_ALL_TESTS();
     ep_teardown();

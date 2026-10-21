@@ -108,6 +108,8 @@ inline constexpr size_t CTRL_FIELD_LSA_TAIL = 16;
 inline constexpr size_t CTRL_FIELD_LSA_HEAD = 24;
 inline constexpr size_t CTRL_FIELD_CURSOR_TAIL = 32;
 inline constexpr size_t CTRL_FIELD_CURSOR_HEAD = 40;
+inline constexpr size_t CTRL_FIELD_PIPE_READY = 48;
+inline constexpr size_t CTRL_FIELD_PIPE_READY_SHADOW = 56;
 
 inline constexpr int MAX_STAGING_BUFFER_ENTRIES = 16;
 

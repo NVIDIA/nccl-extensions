@@ -13,6 +13,27 @@ namespace nccl_ep {
 
 namespace ll {
 
+// Flatten a source rank's token slot into the rank-major receive output.
+__forceinline__ __device__ size_t getLsaRecvSlot(int srcRank, int maxTokensPerRank, int slotIdx) {
+    return static_cast<size_t>(srcRank) * maxTokensPerRank + slotIdx;
+}
+
+// Resolve a token's peer output address, retaining staging when no window is registered.
+// The caller must ensure the destination is LSA-reachable and zero-copy is eligible.
+template <typename T>
+__forceinline__ __device__ T* resolveLsaRecvPointer(
+    T* stagingPtr,
+    ncclWindow_t window,
+    size_t windowOffset,
+    size_t recvSlot,
+    size_t bytesPerToken,
+    int dstRank) {
+    if (window != ncclWindow_t{}) {
+        return static_cast<T*>(ncclGetPeerPointer(window, windowOffset + recvSlot * bytesPerToken, dstRank));
+    }
+    return stagingPtr;
+}
+
 // Resolves `dstRank`'s peer pointer for the given local window offset, but
 // only when `dstRank` is reachable over NVLink (same LSA team as `rank`).
 // Returns 0 for same-LSA peers whose window mapping failed and for any

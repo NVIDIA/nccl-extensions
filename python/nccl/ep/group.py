@@ -17,8 +17,15 @@ from nccl.core.typing import NcclInvalid, NcclStreamSpec
 
 from nccl._extensions.bindings import nccl_ep as _ep_bindings
 from nccl.ep.allocator import AllocConfig
-from nccl.ep.enums import Algorithm, Layout, OverflowPolicy, ZeroCopyMode
-from nccl.ep.handle import Handle, HandleConfig, LayoutInfo
+from nccl.ep.enums import (
+    Algorithm,
+    HtFlow,
+    Layout,
+    MetaExchangePolicy,
+    OverflowPolicy,
+    ZeroCopyMode,
+)
+from nccl.ep.handle import Handle, HandleConfig, HandleState, LayoutInfo
 
 if TYPE_CHECKING:
     from nccl.core import Communicator
@@ -67,6 +74,9 @@ class GroupConfig:
             shared budget. NCCL_EP_DISPATCH_SMS overrides it.
         combine_num_sms: Combine SM budget. 0 inherits the resolved
             shared budget. NCCL_EP_COMBINE_SMS overrides it.
+        num_attn_ranks: Number of leading attention ranks for AFD. Non-zero
+            values require universal LL kernels, rank-major layout, and a
+            square attention-to-expert-rank partition. Default: 0.
         alloc: Device allocator hooks. Default
             :class:`AllocConfig` selects ``cudaMalloc``/``cudaFree``.
         enable_mask: Enable active-mask support for fault tolerance
@@ -87,6 +97,14 @@ class GroupConfig:
             than ``max_recv_tokens_per_rank``. HT only; ignored by LL.
             ``DROP`` is unavailable in eager mode. Default ``AUTO``
             resolves to ``TRAP``.
+        ht_flow: HT dispatch/combine flow. An explicit value takes precedence
+            over legacy environment controls; under ``AUTO``, the environment
+            may override the built-in push-pull default. All ranks must resolve
+            to the same flow. Default ``AUTO``.
+        meta_exchange_policy: Whether HT metadata exchange is automatic, required
+            to be fused with dispatch, or forced to scan. An explicit policy
+            takes precedence over legacy environment controls; all ranks must
+            resolve to the same policy. Default ``AUTO``.
         num_topk: Upper bound on per-token top-k across all handles of
             this group. Required for HT eager mode with Expert-Major
             layout; 0 means unset.
@@ -107,6 +125,9 @@ class GroupConfig:
     max_num_sms: int = 0
     dispatch_num_sms: int = 0
     combine_num_sms: int = 0
+    ht_flow: HtFlow = HtFlow.AUTO
+    meta_exchange_policy: MetaExchangePolicy = MetaExchangePolicy.AUTO
+    num_attn_ranks: int = 0
     alloc: AllocConfig = field(default_factory=AllocConfig)
     enable_mask: bool = False
     timeout_ns: int = 0
@@ -197,6 +218,80 @@ class Group:
             get_stream_ptr(stream),
         )
         return Handle(ptr)
+
+    def handle_mem_size(
+        self,
+        layout: Layout,
+        *,
+        config: HandleConfig | None = None,
+        num_topk: int = -1,
+    ) -> int:
+        """Return device bytes required for caller-owned handle memory.
+
+        ``num_topk`` must be positive for LL and may remain ``-1`` for HT.
+        Allocate a one-dimensional ``ncclUint8`` :class:`Tensor` with at
+        least this many elements before calling :meth:`init_handle`.
+        """
+        self._check_valid("query handle memory size")
+        return int(
+            _ep_bindings.handle_mem_size(
+                self._ptr,
+                int(layout),
+                config._lowpp.ptr if config is not None else 0,  # type: ignore[attr-defined]
+                int(num_topk),
+            )
+        )
+
+    def init_handle(
+        self,
+        layout: Layout,
+        *,
+        config: HandleConfig | None = None,
+        num_topk: int = -1,
+        handle_mem: Tensor | None = None,
+    ) -> Handle:
+        """Allocate routing state without binding this step's top-k tensor.
+
+        Call :meth:`Handle.update` before dispatch/combine. Passing
+        ``handle_mem=None`` lets NCCL EP allocate the routing buffer; otherwise
+        the supplied 1D ``ncclUint8`` tensor is borrowed and retained by the
+        returned handle. With an auto-sized group RDMA buffer this call may be
+        collective and must be made in rank-consistent order.
+        """
+        self._check_valid("initialize handle")
+        ptr = _ep_bindings.init_handle(
+            self._ptr,
+            int(layout),
+            config._lowpp.ptr if config is not None else 0,  # type: ignore[attr-defined]
+            int(num_topk),
+            handle_mem.ptr if handle_mem is not None else 0,
+        )
+        return Handle(ptr, handle_mem=handle_mem)
+
+    def import_handle(
+        self,
+        layout: Layout,
+        state: HandleState,
+        handle_mem: Tensor,
+        *,
+        config: HandleConfig | None = None,
+    ) -> Handle:
+        """Import an HT handle from an already-prepared routing buffer.
+
+        The buffer must have been prepared with matching group, layout,
+        configuration, and :class:`HandleState`. Import is local: it performs
+        no CUDA launch, metadata scan, or device copy. The returned handle
+        retains ``handle_mem`` for its lifetime.
+        """
+        self._check_valid("import handle")
+        ptr = _ep_bindings.import_handle(
+            self._ptr,
+            int(layout),
+            config._lowpp.ptr if config is not None else 0,  # type: ignore[attr-defined]
+            state._lowpp.ptr,  # type: ignore[attr-defined]
+            handle_mem.ptr,
+        )
+        return Handle(ptr, handle_mem=handle_mem)
 
     def destroy(self) -> None:
         """Release the group. Subsequent operations on this object are invalid."""

@@ -15,6 +15,11 @@
 // HT-specific configuration constants
 // ============================================================================
 #define NCCL_EP_HT_DFLT_NUM_SMS 16
+// Default HT tokens-per-chunk for RDMA / multi-LSA-team configurations. Single-LSA
+// configs use a grid-proportional default instead; either can be overridden via
+// NCCL_EP_TOKENS_PER_CHUNK. Resolved per group into ht_combine_tokens_per_chunk;
+// dispatch may use an independent override or a smaller per-handle selection.
+#define HT_TOKENS_PER_CHUNK_RDMA_DEFAULT 64
 // ============================================================================
 // Dispatch configuration constants
 // ============================================================================

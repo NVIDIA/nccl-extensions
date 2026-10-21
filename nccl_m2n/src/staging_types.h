@@ -248,6 +248,9 @@ struct StagingKernelParams {
   size_t chunkSize;
   int ginSignalCount;
   int ginCounterCount;
+  /* Start-of-call readiness in this graph's control slot. */
+  size_t pipeReadySlotOffset;
+  size_t pipeReadyChannelStride;
   uint64_t epoch;
 
   /* Tensor metadata for pack/unpack strides. */

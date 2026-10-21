@@ -12,6 +12,7 @@
 #pragma once
 
 #include "common.hpp"
+#include <cuda/atomic>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
@@ -47,6 +48,28 @@
     }
 
 namespace nccl_ep {
+
+constexpr int kWarpSize = 32; // CUDA hardware warp width.
+constexpr int kBf16PerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
+
+// Compiler ordering only; does not emit a hardware fence.
+__device__ __forceinline__ void compiler_fence() {
+    asm volatile("" ::: "memory");
+}
+
+template <typename T>
+__device__ __forceinline__ T ld_read_only_global(const T* ptr) {
+    return __ldg(ptr);
+}
+
+__device__ __forceinline__ int atomic_add_relaxed_global(int* ptr, int value) {
+    return atomicAdd(ptr, value);
+}
+
+__device__ __forceinline__ unsigned long long atomic_or_relaxed_shared(
+    unsigned long long* ptr, unsigned long long value) {
+    return atomicOr(ptr, value);
+}
 
 //==============================================================================
 // Type Traits and Helper Types
@@ -92,6 +115,23 @@ __host__ __device__ constexpr int size_u8<ncclFloat8e5m2>() {
 template <>
 __host__ __device__ constexpr int size_u8<ncclFloat4x2>() {
     return sizeof(uint8_t);
+}
+
+// Bytes needed to store `num_elements` logical elements of wire dtype `dt`, for host code that
+// only has the dtype as a runtime value (e.g. before it's baked into a JIT variant's compile-time
+// kTokenDtype). NOT simply num_elements * a per-dtype byte size: ncclFloat4x2 packs two logical
+// elements per byte, so its row is HALF as many bytes as elements -- size_u8<kDt>() alone (1 byte)
+// would silently double-count it if naively multiplied by num_elements. Every other dtype here
+// packs >= 1 byte/element, so it reduces to num_elements * size_u8<kDt>() for them.
+__host__ __forceinline__ size_t token_row_bytes(ncclDataType_t dt, size_t num_elements) {
+    switch (dt) {
+        case ncclFloat32: return num_elements * size_u8<ncclFloat32>();
+        case ncclFloat16: return num_elements * size_u8<ncclFloat16>();
+        case ncclFloat8e4m3: return num_elements * size_u8<ncclFloat8e4m3>();
+        case ncclFloat8e5m2: return num_elements * size_u8<ncclFloat8e5m2>();
+        case ncclFloat4x2: return (num_elements + 1) / 2;
+        default: return num_elements * size_u8<ncclBfloat16>();
+    }
 }
 
 // Wire element width in uint16_t units (token buffers use a uint16_t* base; one-byte values have no
@@ -298,6 +338,25 @@ __forceinline__ __device__ out_dtype_t extract_required_scale_format(float value
 // Memory Fences
 //==============================================================================
 
+__device__ __forceinline__ void named_barrier_sync(int barrier, int threads) {
+    asm volatile("bar.sync %0, %1;" :: "r"(barrier), "r"(threads) : "memory");
+}
+
+__device__ __forceinline__ void st_release_block_shared(unsigned* ptr, unsigned value) {
+    cuda::atomic_ref<unsigned, cuda::thread_scope_block> ready(*ptr);
+    ready.store(value, cuda::memory_order_release);
+}
+
+__device__ __forceinline__ void wait_acquire_block_shared(unsigned* ptr, unsigned value) {
+    cuda::atomic_ref<unsigned, cuda::thread_scope_block> ready(*ptr);
+    while (ready.load(cuda::memory_order_acquire) < value) {
+    }
+}
+
+__device__ __forceinline__ void memory_fence_seq_cst_sys() {
+    __threadfence_system();
+}
+
 __device__ __forceinline__ void memory_fence() {
     asm volatile("fence.acq_rel.sys;" ::: "memory");
 }
@@ -310,8 +369,25 @@ __device__ __forceinline__ void memory_fence_release_sys() {
     asm volatile("fence.release.sys;" ::: "memory");
 }
 
+// Acquire-only system-scope fence: a strong read (e.g. ld_relaxed_sys_global)
+// followed by this fence forms an acquire pattern on the read location, so the
+// thread's later accesses observe every write ordered before the matching
+// release pattern of the writer. It does not order the thread's earlier writes
+// (no release half), so it does not wait for outstanding stores to drain.
+__device__ __forceinline__ void memory_fence_acquire_sys() {
+    asm volatile("fence.acquire.sys;" ::: "memory");
+}
+
 __device__ __forceinline__ void memory_fence_gpu() {
     asm volatile("fence.acq_rel.gpu;" ::: "memory");
+}
+
+// Acquire-only GPU-scope fence: a strong read (e.g. the read half of an
+// atomic RMW) followed by this fence forms an acquire pattern on the read
+// location. It does not order the thread's earlier writes (no release half),
+// so it does not wait for outstanding stores to drain.
+__device__ __forceinline__ void memory_fence_acquire_gpu() {
+    asm volatile("fence.acquire.gpu;" ::: "memory");
 }
 
 __device__ __forceinline__ void memory_fence_cta() {
@@ -848,8 +924,6 @@ get_channel_task_range(int num_tokens, int num_sms, int sm_id, int& token_start_
 // SM90-Specific Features (TMA, Mbarriers)
 //==============================================================================
 
-#ifndef DISABLE_SM90_FEATURES
-
 __device__ __forceinline__ uint32_t elect_one_sync() {
     uint32_t pred = 0;
     asm volatile("{\n"
@@ -883,10 +957,11 @@ __device__ __forceinline__ void mbarrier_inval(uint64_t* mbar_ptr) {
     asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::"r"(mbar_int_ptr));
 }
 
-template <bool kWithMultiStages = false>
+template <bool kWithMultiStages = false, bool kMemoryClobber = true>
 __device__ __forceinline__ void mbarrier_wait(uint64_t* mbar_ptr, uint32_t& phase, int stage_idx = 0) {
     auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
     const auto& wait = kWithMultiStages ? (phase >> stage_idx) & 1 : phase;
+    if constexpr (kMemoryClobber) asm volatile("" ::: "memory");
     asm volatile(
         "{\n\t"
         ".reg .pred       P1; \n\t"
@@ -898,6 +973,7 @@ __device__ __forceinline__ void mbarrier_wait(uint64_t* mbar_ptr, uint32_t& phas
         "}" ::"r"(mbar_int_ptr),
         "r"(wait),
         "r"(0x989680));
+    if constexpr (kMemoryClobber) asm volatile("" ::: "memory");
     phase ^= kWithMultiStages ? (1 << stage_idx) : 1;
 }
 
@@ -933,8 +1009,14 @@ __device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar_ptr) {
 constexpr uint64_t kEvictFirst = 0x12f0000000000000;
 constexpr uint64_t kEvictNormal = 0x1000000000000000;
 
+// Enable compiler memory ordering by default; callers can explicitly opt out.
+template <bool kMemoryClobber = true>
 __device__ __forceinline__ void tma_store_fence() {
-    asm volatile("fence.proxy.async.shared::cta;");
+    if constexpr (kMemoryClobber) {
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    } else {
+        asm volatile("fence.proxy.async.shared::cta;");
+    }
 }
 
 __device__ __forceinline__ void
@@ -984,7 +1066,5 @@ template <int N = 0>
 __device__ __forceinline__ void tma_store_wait_complete() {
     asm volatile("cp.async.bulk.wait_group %0;" ::"n"(N) : "memory");
 }
-
-#endif // DISABLE_SM90_FEATURES
 
 } // namespace nccl_ep

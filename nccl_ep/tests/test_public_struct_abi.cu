@@ -66,7 +66,11 @@ void ncclEpGroupConfig_backwards_compat_test() {
     static_assert(offsetof(ncclEpGroupConfig_t, padding_v2) == 108);
     static_assert(offsetof(ncclEpGroupConfig_t, dispatch_num_sms) == 112);
     static_assert(offsetof(ncclEpGroupConfig_t, combine_num_sms) == 116);
-    static_assert(sizeof(ncclEpGroupConfig_t) == 120);
+    static_assert(offsetof(ncclEpGroupConfig_t, ht_flow) == 120);
+    static_assert(offsetof(ncclEpGroupConfig_t, meta_exchange_policy) == 124);
+    static_assert(offsetof(ncclEpGroupConfig_t, num_attn_ranks) == 128);
+    static_assert(offsetof(ncclEpGroupConfig_t, padding_v4) == 132);
+    static_assert(sizeof(ncclEpGroupConfig_t) == 136);
 }
 
 void ncclEpLayoutInfo_backwards_compat_test() {
@@ -127,6 +131,15 @@ void ncclEpHandleConfig_backwards_compat_test() {
     static_assert(sizeof(ncclEpHandleConfig_t) == 16);
 }
 
+void ncclEpHandleState_backwards_compat_test() {
+    static_assert(offsetof(ncclEpHandleState_t, size) == 0);
+    static_assert(offsetof(ncclEpHandleState_t, magic) == 4);
+    static_assert(offsetof(ncclEpHandleState_t, num_tokens) == 8);
+    static_assert(offsetof(ncclEpHandleState_t, num_topk) == 12);
+    static_assert(offsetof(ncclEpHandleState_t, topk_idx_datatype) == 16);
+    static_assert(sizeof(ncclEpHandleState_t) == 20);
+}
+
 void ncclEpDispatchConfig_backwards_compat_test() {
     static_assert(offsetof(ncclEpDispatchConfig_t, size) == 0);
     static_assert(offsetof(ncclEpDispatchConfig_t, magic) == 4);
@@ -156,6 +169,38 @@ void ncclEpCompleteConfig_backwards_compat_test() {
 
 class PublicStructAbiRuntimeTest : public EpTestBase {};
 
+class ScopedHtFlowEnv {
+public:
+    ScopedHtFlowEnv(const char* name, const char* value) : name_(name) {
+        const char* previous = getenv(name_);
+        if (previous != nullptr) {
+            had_previous_ = true;
+            previous_ = previous;
+        }
+        setenv(name_, value, 1);
+    }
+
+    ~ScopedHtFlowEnv() {
+        if (had_previous_) setenv(name_, previous_.c_str(), 1);
+        else unsetenv(name_);
+    }
+
+private:
+    const char* name_;
+    bool had_previous_ = false;
+    std::string previous_;
+};
+
+static ncclEpGroupConfig_t htFlowTestConfig() {
+    ncclEpGroupConfig_t config = NCCL_EP_GROUP_CONFIG_INIT;
+    config.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+    config.num_experts = kNumExperts;
+    config.max_dispatch_tokens_per_rank = kNumTokens;
+    config.max_recv_tokens_per_rank = kMaxRecvSlots;
+    config.max_token_bytes = kHidden * sizeof(nv_bfloat16);
+    return config;
+}
+
 template <typename T>
 static void expectPublicStructPrefix(
     const T& value,
@@ -177,6 +222,7 @@ TEST(PublicStructAbiTest, InitializersPopulatePrefix) {
     ncclEpCombineInputs_t combine_inputs = NCCL_EP_COMBINE_INPUTS_INIT;
     ncclEpCombineOutputs_t combine_outputs = NCCL_EP_COMBINE_OUTPUTS_INIT;
     ncclEpHandleConfig_t handle = NCCL_EP_HANDLE_CONFIG_INIT;
+    ncclEpHandleState_t handle_state = NCCL_EP_HANDLE_STATE_INIT;
     ncclEpDispatchConfig_t dispatch = NCCL_EP_DISPATCH_CONFIG_INIT;
     ncclEpCombineConfig_t combine = NCCL_EP_COMBINE_CONFIG_INIT;
     ncclEpCompleteConfig_t complete = NCCL_EP_COMPLETE_CONFIG_INIT;
@@ -188,6 +234,9 @@ TEST(PublicStructAbiTest, InitializersPopulatePrefix) {
     expectPublicStructPrefix(layout, NCCL_EP_LAYOUT_INFO_SIZE, NCCL_EP_MAGIC);
     EXPECT_EQ(group.dispatch_num_sms, NCCL_EP_AUTO);
     EXPECT_EQ(group.combine_num_sms, NCCL_EP_AUTO);
+    EXPECT_EQ(group.ht_flow, NCCL_EP_HT_FLOW_AUTO);
+    EXPECT_EQ(group.meta_exchange_policy, NCCL_EP_META_EXCHANGE_AUTO);
+    EXPECT_EQ(group.num_attn_ranks, 0u);
     expectPublicStructPrefix(
         dispatch_inputs, NCCL_EP_DISPATCH_INPUTS_SIZE, NCCL_EP_MAGIC);
     expectPublicStructPrefix(
@@ -197,6 +246,8 @@ TEST(PublicStructAbiTest, InitializersPopulatePrefix) {
     expectPublicStructPrefix(
         combine_outputs, NCCL_EP_COMBINE_OUTPUTS_SIZE, NCCL_EP_MAGIC);
     expectPublicStructPrefix(handle, NCCL_EP_HANDLE_CONFIG_SIZE, NCCL_EP_MAGIC);
+    expectPublicStructPrefix(
+        handle_state, NCCL_EP_HANDLE_STATE_SIZE, NCCL_EP_MAGIC);
     expectPublicStructPrefix(
         dispatch, NCCL_EP_DISPATCH_CONFIG_SIZE, NCCL_EP_MAGIC);
     expectPublicStructPrefix(
@@ -236,6 +287,89 @@ TEST(PublicStructAbiTest, TensorAllocConfigSizeCompatibility) {
         ncclEpTensorAlloc(&allocated, 1, ncclUint8, dims, &wrong_magic),
         ncclInvalidArgument);
     EXPECT_EQ(allocated, nullptr);
+}
+
+TEST_F(PublicStructAbiRuntimeTest, HtFlowRejectsInvalidAndLlSelections) {
+    ncclEpGroup_t group = nullptr;
+    ncclEpGroupConfig_t config = htFlowTestConfig();
+    config.ht_flow = static_cast<ncclEpHtFlow_t>(NCCL_EP_HT_FLOW_PULL_PUSH + 1);
+    EXPECT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclInvalidArgument);
+    EXPECT_EQ(group, nullptr);
+
+    config.ht_flow = NCCL_EP_HT_FLOW_AUTO;
+    config.meta_exchange_policy = static_cast<ncclEpMetaExchangePolicy_t>(
+        NCCL_EP_META_EXCHANGE_FORCE_SCAN + 1);
+    EXPECT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclInvalidArgument);
+    EXPECT_EQ(group, nullptr);
+
+    config.algorithm = NCCL_EP_ALGO_LOW_LATENCY;
+    config.meta_exchange_policy = NCCL_EP_META_EXCHANGE_AUTO;
+    config.ht_flow = NCCL_EP_HT_FLOW_PUSH_PULL;
+    EXPECT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclInvalidUsage);
+    EXPECT_EQ(group, nullptr);
+
+    config.ht_flow = NCCL_EP_HT_FLOW_AUTO;
+    config.meta_exchange_policy = NCCL_EP_META_EXCHANGE_FORCE_SCAN;
+    EXPECT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclInvalidUsage);
+    EXPECT_EQ(group, nullptr);
+}
+
+TEST_F(PublicStructAbiRuntimeTest, ExplicitPushPullOverridesEnvironment) {
+    ScopedHtFlowEnv pull_push_env("NCCL_EP_HT_PULL_PUSH", "1");
+    ncclEpGroupConfig_t config = htFlowTestConfig();
+    config.ht_flow = NCCL_EP_HT_FLOW_PUSH_PULL;
+
+    ncclEpGroup_t group = nullptr;
+    ASSERT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclSuccess);
+
+    ncclEpHandle_t handle = nullptr;
+    EXPECT_EQ(
+        ncclEpCreateHandle(
+            &handle, group, NCCL_EP_LAYOUT_FLAT, topk_idx_, nullptr, nullptr, g_stream),
+        ncclSuccess);
+    EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+    if (handle != nullptr) EXPECT_EQ(ncclEpHandleDestroy(handle), ncclSuccess);
+    EXPECT_EQ(ncclEpGroupDestroy(group), ncclSuccess);
+}
+
+TEST_F(PublicStructAbiRuntimeTest, ExplicitMetaPolicyOverridesLegacyEnvironment) {
+    ScopedHtFlowEnv scan_env("NCCL_EP_HT_AG_SCAN_MODE", "1");
+    ScopedHtFlowEnv unfused_env("NCCL_EP_HT_COUNT_UNFUSED", "1");
+    ncclEpGroupConfig_t config = htFlowTestConfig();
+    config.ht_flow = NCCL_EP_HT_FLOW_PUSH_PULL;
+    config.meta_exchange_policy = NCCL_EP_META_EXCHANGE_REQUIRE_FUSED;
+
+    ncclEpGroup_t group = nullptr;
+    ASSERT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclSuccess);
+
+    ncclEpHandle_t handle = nullptr;
+    EXPECT_EQ(
+        ncclEpCreateHandle(
+            &handle, group, NCCL_EP_LAYOUT_EXPERT_MAJOR, topk_idx_em_, nullptr, nullptr, g_stream),
+        ncclSuccess);
+    EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+    if (handle != nullptr) EXPECT_EQ(ncclEpHandleDestroy(handle), ncclSuccess);
+    EXPECT_EQ(ncclEpGroupDestroy(group), ncclSuccess);
+}
+
+TEST_F(PublicStructAbiRuntimeTest, ExplicitPullPushSupportsFlatLayout) {
+    ScopedHtFlowEnv pull_push_env("NCCL_EP_HT_PULL_PUSH", "0");
+    ncclEpGroupConfig_t config = htFlowTestConfig();
+    config.ht_flow = NCCL_EP_HT_FLOW_PULL_PUSH;
+
+    ncclEpGroup_t group = nullptr;
+    ASSERT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclSuccess);
+
+    ncclEpHandle_t handle = nullptr;
+    EXPECT_EQ(
+        ncclEpCreateHandle(
+            &handle, group, NCCL_EP_LAYOUT_FLAT, topk_idx_, nullptr, nullptr, g_stream),
+        ncclSuccess);
+    EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+    if (handle != nullptr) {
+        EXPECT_EQ(ncclEpHandleDestroy(handle), ncclSuccess);
+    }
+    EXPECT_EQ(ncclEpGroupDestroy(group), ncclSuccess);
 }
 
 TEST_F(

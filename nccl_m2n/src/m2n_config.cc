@@ -161,7 +161,11 @@ void resetReshardRuntimeConfig() {
   gReshardGinContextCount = DEFAULT_GIN_CONTEXT_COUNT;
   gReshardPipeGinPeersPerSlot = STAGING_PIPE_GIN_PEERS_PER_SLOT;
   gReshardPipeGinChannelsPerPeer = STAGING_PIPE_GIN_CHANNELS_PER_PEER;
+  gReshardPipeLaunchOrder = true;
+  gReshardCommBConcurrency = kDefaultStagingBucketSlots;
+  gReshardPipeCommBParentCapacity = RESHARD_PIPE_DEFAULT_PARENT_CAPACITY;
   gReshardUseInternalStreams = true;
+  gReshardDevCommCacheCapacity = MAX_DEVCOMM_CACHE_ENTRIES;
   gReshardChunkSizeBytes = 0;
   for (int i = 0; i < kMaxStagingBuckets; i++) {
     gReshardStagingBuckets[i] = {};
@@ -259,6 +263,12 @@ void applyReshardEnv() {
   ReshardLogLevel lvl;
   if (reshardLogLevelFromStr(getenv("NCCL_RESHARD_LOG_LEVEL"), &lvl)) reshardSetLogLevel(lvl);
 
+  const char* cacheCapacity = getenv("NCCL_RESHARD_DEVCOMM_CACHE_CAPACITY");
+  if (cacheCapacity != nullptr && !parseM2nPositiveEnvInt(cacheCapacity, &gReshardDevCommCacheCapacity)) {
+    RESHARD_WARN(-1, "Ignoring invalid NCCL_RESHARD_DEVCOMM_CACHE_CAPACITY=\"%s\"; expected a positive int",
+                   cacheCapacity);
+  }
+
   ReshardAlgorithm algo;
   if (parseAlgorithmEnv(getenv("NCCL_RESHARD_ALGORITHM"), &algo)) gReshardAlgorithm = algo;
 
@@ -299,6 +309,26 @@ void applyReshardEnv() {
   if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_PIPE_GIN_CHANNELS_PER_PEER"), &n)) {
     gReshardPipeGinChannelsPerPeer = n;
   }
+  // Zero means no explicit PACK cap; PIPE keeps its default of four lanes.
+  int genCommConcurrency = 0;
+  if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_GEN_COMM_CONCURRENCY"), &n)) {
+    if (n <= MAX_SPLIT_CONCURRENCY) {
+      gReshardCommBConcurrency = n;
+      genCommConcurrency = n;
+    } else {
+      RESHARD_WARN(-1, "ignoring NCCL_RESHARD_GEN_COMM_CONCURRENCY=%d; maximum supported value is %d", n,
+                   MAX_SPLIT_CONCURRENCY);
+    }
+  }
+
+  if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_GEN_COMM_PARENT_CAPACITY"), &n)) {
+    if (n <= RESHARD_PIPE_MAX_PARENT_NAMESPACES) {
+      gReshardPipeCommBParentCapacity = n;
+    } else {
+      RESHARD_WARN(-1, "ignoring NCCL_RESHARD_GEN_COMM_PARENT_CAPACITY=%d; maximum supported value is %d", n,
+                   RESHARD_PIPE_MAX_PARENT_NAMESPACES);
+    }
+  }
 
   if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_SRC_DOMAIN_SIZE"), &n)) gReshardSrcDomainSize = n;
   if (parseM2nPositiveEnvInt(getenv("NCCL_RESHARD_DST_DOMAIN_SIZE"), &n)) gReshardDstDomainSize = n;
@@ -317,6 +347,11 @@ void applyReshardEnv() {
   bool useInternalStreams;
   if (parseBoolEnv(getenv("NCCL_RESHARD_USE_INTERNAL_STREAMS"), &useInternalStreams)) {
     gReshardUseInternalStreams = useInternalStreams;
+  }
+
+  bool pipeLaunchOrder;
+  if (parseBoolEnv(getenv("NCCL_RESHARD_PIPE_LAUNCH_ORDER"), &pipeLaunchOrder)) {
+    gReshardPipeLaunchOrder = pipeLaunchOrder;
   }
 
   bool splitComm;
@@ -445,6 +480,20 @@ void applyReshardEnv() {
       RESHARD_WARN(-1, "ignoring invalid NCCL_RESHARD_PACK_BUFFSIZES=\"%s\"; using built-in default %zu:%d",
                    buckets, kDefaultStagingBucketBytes, kDefaultStagingBucketSlots);
     }
+  }
+  // Both physical-slot assignment and commB sizing read this resolved profile.
+  // Cap it before first pool use instead of aliasing distinct physical slots
+  // onto fewer resource lanes, which would bypass their existing event order.
+  if (gReshardCopyAlgorithm == RESHARD_COPY_ALGO_PACK && genCommConcurrency > 0) {
+    for (int i = 0; i < gReshardStagingBucketCount; i++) {
+      auto& bucket = gReshardStagingBuckets[i];
+      if (bucket.numSlots > genCommConcurrency) bucket.numSlots = genCommConcurrency;
+    }
+    RESHARD_INFO(-1, "PACK generator concurrency cap=%d: %d active staging slots", genCommConcurrency,
+                   reshardStagingTotalSlots());
+  }
+  if (gReshardCopyAlgorithm == RESHARD_COPY_ALGO_PACK && gReshardStagingBucketCount > 1) {
+    RESHARD_WARN(-1, "PACK split comm is disabled for multiple size buckets; using the parent DevComm path");
   }
   resolveReshardStagingRuntimeConfig();
 }

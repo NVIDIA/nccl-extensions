@@ -5550,8 +5550,9 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
 #endif
             // The first admitted block publishes this rank's input readiness; all blocks wait.
             const uint32_t expected_val = *param.expected_lsa_flag_val;
-            if (head_leader)
+            if (head_leader) {
                 nccl_ep::publish_lsa_completion(param.lsa_S2G_flags + param.local_rank, expected_val);
+            }
             nccl_ep::wait_lsa_completion(param.lsa_S2G_flags, expected_val, param.ranks_per_lsa_team);
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
             _wt_head_end = clock64();

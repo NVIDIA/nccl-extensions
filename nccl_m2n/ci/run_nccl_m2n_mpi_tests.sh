@@ -349,6 +349,8 @@ runEightRankDefaultMatrix() {
 runBenchmark() {
   local label="$1"
   shift
+  local srcLayout="${BENCH_SRC_LAYOUT:-1 reps x 4 shards}"
+  local dstLayout="${BENCH_DST_LAYOUT:-1 reps x 4 shards}"
   local log
   log="$(mktemp)"
 
@@ -361,8 +363,8 @@ runBenchmark() {
     rm -f "${log}"
     return "${rc}"
   fi
-  if ! grep -Fq 'Source: 4 ranks = 1 reps x 4 shards' "${log}" ||
-     ! grep -Fq 'Dest: 4 ranks = 1 reps x 4 shards' "${log}" ||
+  if ! grep -Fq "Source: 4 ranks = ${srcLayout}" "${log}" ||
+     ! grep -Fq "Dest: 4 ranks = ${dstLayout}" "${log}" ||
      ! grep -Fxq '*** VALIDATION PASSED ***' "${log}"; then
     echo "reshard_bench [${label}] did not complete the expected 8-rank validation." >&2
     rm -f "${log}"
@@ -402,6 +404,13 @@ case "${NCCL_M2N_MPI_TEST_PROFILE}" in
           --algorithm "${algorithm}" --iterations 10 --warmup 2
       done
     done
+    # LSA followers pull 12-byte forwarded pieces, which are not a multiple
+    # of the 16-byte bulk-copy granule.
+    BENCH_DST_LAYOUT="2 reps x 2 shards" \
+      runBenchmark "PIPE LSA fan-out, unaligned pieces" \
+      --src-mesh-dims 1,4 --dst-mesh-dims 2,2 --tensor-dims 2,24 \
+      --src-shard-dim 1 --dst-shard-dim 1 --validate \
+      --copy-algorithm pipe --iterations 3 --warmup 1
     ;;
 esac
 

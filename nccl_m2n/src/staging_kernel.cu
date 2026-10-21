@@ -1513,8 +1513,12 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
                 unsigned int q_idx = q_tail % (unsigned int)PIPE_GENERATOR_QUEUE_DEPTH;
                 size_t tile_bytes = pipe_min_size((size_t)TmaTileSize, this_bytes - tile_offset);
                 char* tma_tile_buf = tma_tile_base + (size_t)q_idx * (size_t)TmaTileSize;
-                staging_tma_mbarrier_expect(&tma_mbar[q_idx], (int)tile_bytes);
-                staging_tma_load(tma_tile_buf, remote_src + tile_offset, &tma_mbar[q_idx], (int)tile_bytes);
+                /* cp.async.bulk needs a multiple of 16 bytes; with a shorter tail the
+                 * mbarrier never completes.  Load the padded size: the staging slot is
+                 * chunk-sized, and the unpack reads only tile_bytes. */
+                const int tma_bytes = (int)((tile_bytes + 15) & ~(size_t)15);
+                staging_tma_mbarrier_expect(&tma_mbar[q_idx], tma_bytes);
+                staging_tma_load(tma_tile_buf, remote_src + tile_offset, &tma_mbar[q_idx], tma_bytes);
 
                 q_desc[q_idx].staging_offset = 0;
                 q_desc[q_idx].byte_start = byte_start + tile_offset;

@@ -544,8 +544,9 @@ static StagingReceiverSourceLayout stagingResolveReceiverSourceLayout(size_t reg
                     0;
     sourceRank = (sourceIndexOnReceiver - firstSource) / peerGroupCount;
   }
-  const size_t dataSize = sourceCount > 0 ? regionSize / (size_t)sourceCount : 0;
-  const int numSlots = chunkSize > 0 ? (int)(dataSize / chunkSize) : 0;
+  /* Whole slots only, so each source's slots start chunk-aligned. */
+  const int numSlots = (sourceCount > 0 && chunkSize > 0) ? (int)(regionSize / (size_t)sourceCount / chunkSize) : 0;
+  const size_t dataSize = (size_t)numSlots * chunkSize;
   return {regionStart + (size_t)sourceRank * dataSize, dataSize, numSlots, sourceCount, sourceRank};
 }
 
@@ -716,6 +717,13 @@ ncclResult_t stagingPrepareTransfer(const StagingBufferState* state, const Stagi
   /* PIPE chunk boundaries drive peer-visible signals and must not depend on
    * rank-local fanout. Receiver FIFO validation below rejects insufficient capacity. */
   const size_t chunkSize = pipe ? state->chunkSize : std::min(state->chunkSize, maxChunkSize);
+  /* LSA followers bulk-copy whole 16-byte granules from 16-byte-aligned slots.
+   * Check on every PIPE rank, not only on followers: a rejection on some ranks
+   * would leave their peers waiting in the kernel. */
+  NCCL_M2N_CHECK_ARG(!pipe || (chunkSize % 16 == 0 && state->channelSize % 16 == 0 &&
+                               state->channelDataSize % 16 == 0 && state->controlRegionSize % 16 == 0),
+                     R, "[STAGING] PIPE staging sizes must be multiples of 16 bytes (chunk=%zu channel=%zu)", chunkSize,
+                     state->channelSize);
   if (!pipe && chunkSize != state->chunkSize) {
     STAGING_LOG(R,
                 "  chunkSize adjusted: requested=%zu effective=%zu max_peer_group=%zu "

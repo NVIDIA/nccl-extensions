@@ -9,7 +9,14 @@
  * See LICENSE.txt for more license information.
  */
 
-#pragma once
+// Source and installed copies can enter the same translation unit.
+#ifndef NCCL_EP_HT_EP_CONFIGS_CUH_
+#define NCCL_EP_HT_EP_CONFIGS_CUH_
+
+namespace nccl_ep {
+enum class HtDispatchSchedule { Coarse, Redistributed };
+inline constexpr int kHtDispatchTailChunkTokens = 16;
+}
 
 // ============================================================================
 // HT-specific configuration constants
@@ -82,3 +89,5 @@
 static_assert(
     NCCL_EP_HT_LOCAL_REDUCE_PIPE_DEPTH <= 32,
     "NCCL_EP_HT_LOCAL_REDUCE_PIPE_DEPTH must be <= 32 (warp shuffle width)");
+
+#endif // NCCL_EP_HT_EP_CONFIGS_CUH_

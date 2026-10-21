@@ -122,7 +122,7 @@ struct State {
         ncclEpHandleConfig_t cfg = NCCL_EP_HANDLE_CONFIG_INIT;
         cfg.dispatch_output_per_expert_alignment = 1;
         ncclEpHandle_t imported = nullptr;
-        const ncclEpLayout_t layout = mode == LayoutMode::Flat ? NCCL_EP_LAYOUT_FLAT : NCCL_EP_LAYOUT_EXPERT_MAJOR;
+        const ncclEpLayout_t layout = (mode == LayoutMode::Flat) ? NCCL_EP_LAYOUT_FLAT : NCCL_EP_LAYOUT_EXPERT_MAJOR;
         NCCL_ASSERT(ncclEpImportHandle(&imported, group, layout, &cfg, &state, snapshot_mem));
         NCCL_ASSERT(ncclEpHandleDestroy(handle));
         NCCL_ASSERT(ncclEpTensorDestroy(mem));

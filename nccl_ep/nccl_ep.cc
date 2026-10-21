@@ -6820,6 +6820,7 @@ ncclResult_t ncclEpDispatch(
         params.local_rank = group->lsa_rank;
         params.lsa_team = group->rdma_rank;
         params.tokens_per_lsa = group->config.max_dispatch_tokens_per_rank;
+        params.work_tokens_per_rank = (is_lsa_only) ? handle->num_tokens : params.tokens_per_lsa;
         // EM local-fanout: dispatch dedups S2G; receiver local_dup fills secondaries.
         const bool em_unfused_active = em_local_dup_active(group, handle->layout);
         params.local_dup_num_sms = em_unfused_active ? static_cast<int>(group->shuffle_sms) : 0;

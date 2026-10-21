@@ -12,6 +12,7 @@
 #include "device/jit/jit_utils.hpp"
 #include "device/jit/jit_source_literals.hpp"
 #include "nccl_ep_env.h"
+#include "ht_chunk_config.hpp"
 
 #include <algorithm>
 #include <climits>
@@ -106,6 +107,7 @@ inline std::string dispatch_jit_source(
     int hidden_dim,
     int sf_bytes_per_token,
     int experts_per_rank,
+    HtDispatchSchedule schedule,
     const DispatchKernelSpec& kernel_spec) {
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
     std::ostringstream src;
@@ -132,6 +134,8 @@ inline std::string dispatch_jit_source(
         << "> param) {\n"
         << "  extern __shared__ uint8_t smem_bytes[];\n"
         << "  ht_ep::dispatch_kernel_impl<\n"
+        << "      nccl_ep::HtDispatchSchedule::"
+        << ((schedule == HtDispatchSchedule::Redistributed) ? "Redistributed" : "Coarse") << ",\n"
         << "      TOKEN_DATA_TYPE,\n"
         << "      SCALE_DATA_TYPE,\n"
         << "      " << kernel_spec.recipe_source_literal << ",\n"
@@ -161,6 +165,7 @@ inline std::string dispatch_jit_source(
 inline ncclResult_t launch_dispatch(
     const ::ht_ep::dispatch_config_t& config,
     int max_tokens_per_rank,
+    int work_tokens_per_rank,
     int num_lsa_teams,
     int lsa_team_size,
     ncclEpLayout_t layout,
@@ -176,6 +181,8 @@ inline ncclResult_t launch_dispatch(
     bool count_map_warp) {
     const dispatch_warp_layout_t L =
         compute_dispatch_warp_layout(num_lsa_teams, layout, config.num_pipelines, count_map_warp);
+    const HtDispatchSchedule schedule = ht_dispatch_schedule(
+        work_tokens_per_rank, config.num_of_tokens_per_chunk, config.num_of_blocks, num_lsa_teams);
 
     static const int fwd_variant_identity = 0;
     static const int bwd_variant_identity = 0;
@@ -194,7 +201,8 @@ inline ncclResult_t launch_dispatch(
              << "_scale" << kernel_spec.scale_cache_tag
              << "_sf" << sf_bytes_per_token
              << "_epr" << experts_per_rank
-             << (count_map_warp ? "_countmap" : "");
+             << ((count_map_warp) ? "_countmap" : "")
+             << ((schedule == HtDispatchSchedule::Redistributed) ? "_tail" : "_coarse");
         return name.str();
     }();
     const std::string source = dispatch_jit_source(
@@ -223,6 +231,7 @@ inline ncclResult_t launch_dispatch(
         hidden_dim,
         sf_bytes_per_token,
         experts_per_rank,
+        schedule,
         kernel_spec);
 
     ::nccl_ep::jit::JitKernelVariant variant;

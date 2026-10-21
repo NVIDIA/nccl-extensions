@@ -9,6 +9,7 @@
 #include "device/ht_ep_configs.cuh"
 
 #include <cstdio>
+#include <cstdint>
 #include <limits>
 #include <optional>
 
@@ -56,6 +57,19 @@ inline int nccl_ep_resolve_dispatch_chunk(const ncclEpEnvConfig& cfg, int combin
 }
 
 namespace nccl_ep {
+
+inline HtDispatchSchedule ht_dispatch_schedule(int work_tokens, int chunk, int blocks, int lsa_teams) {
+    // Cover all chunk sizes produced by the adaptive dispatch policy.
+    const bool supported_chunk = chunk >= 32 && chunk <= 256 && (chunk & (chunk - 1)) == 0;
+    if (lsa_teams != 1 || work_tokens <= 0 || blocks < 16 || blocks > 64 || !supported_chunk) {
+        return HtDispatchSchedule::Coarse;
+    }
+    const int64_t wave = int64_t{chunk} * blocks;
+    if (work_tokens > wave && work_tokens % wave != 0) {
+        return HtDispatchSchedule::Redistributed;
+    }
+    return HtDispatchSchedule::Coarse;
+}
 
 class HtDispatchChunkPolicy {
 public:

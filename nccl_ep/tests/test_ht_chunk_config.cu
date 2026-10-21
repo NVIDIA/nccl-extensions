@@ -8,6 +8,55 @@
 #include "ht_sm_policy.hpp"
 
 using nccl_ep::HtDispatchChunkPolicy;
+using nccl_ep::HtDispatchSchedule;
+
+TEST(HtChunkConfig, AdaptiveSelectionWithTailScheduling) {
+    for (int blocks : {16, 24, 32, 64}) {
+        for (int fallback : {128, 256}) {
+            const HtDispatchChunkPolicy policy(std::nullopt, fallback, 1, blocks, true);
+            EXPECT_EQ(policy.select(64 * blocks), 64);
+            for (int tokens : {64 * blocks + 1, 112 * blocks - 1, 112 * blocks, 112 * blocks + 1}) {
+                EXPECT_EQ(policy.select(tokens), 128);
+            }
+            EXPECT_EQ(policy.select(128 * blocks), 128);
+            EXPECT_EQ(policy.select(128 * blocks + 1), fallback);
+            EXPECT_EQ(HtDispatchChunkPolicy(fallback, fallback, 1, blocks, true).select(96 * blocks), fallback);
+            EXPECT_EQ(HtDispatchChunkPolicy(std::nullopt, fallback, 2, blocks, true).select(96 * blocks), fallback);
+        }
+    }
+}
+
+TEST(HtChunkConfig, TailScheduleUsesWorkNotCapacity) {
+    for (int blocks : {16, 24, 32, 64}) {
+        for (int chunk : {32, 64, 128, 256}) {
+            const int wave = blocks * chunk;
+            for (int tokens : {0, 1, wave - 1, wave, 2 * wave, 3 * wave}) {
+                EXPECT_EQ(nccl_ep::ht_dispatch_schedule(tokens, chunk, blocks, 1), HtDispatchSchedule::Coarse);
+            }
+            for (int tokens : {wave + 1, wave + 16, 2 * wave - 1, 2 * wave + 1}) {
+                EXPECT_EQ(nccl_ep::ht_dispatch_schedule(tokens, chunk, blocks, 1), HtDispatchSchedule::Redistributed);
+                EXPECT_EQ(nccl_ep::ht_dispatch_schedule(tokens, chunk, blocks, 2), HtDispatchSchedule::Coarse);
+            }
+        }
+    }
+}
+
+TEST(HtChunkConfig, TailScheduleSafeArithmetic) {
+    const int limit = std::numeric_limits<int>::max();
+    for (int invalid : {-1, 0}) {
+        EXPECT_EQ(nccl_ep::ht_dispatch_schedule(invalid, 128, 32, 1), HtDispatchSchedule::Coarse);
+        EXPECT_EQ(nccl_ep::ht_dispatch_schedule(8192, invalid, 32, 1), HtDispatchSchedule::Coarse);
+        EXPECT_EQ(nccl_ep::ht_dispatch_schedule(8192, 128, invalid, 1), HtDispatchSchedule::Coarse);
+    }
+    EXPECT_EQ(nccl_ep::ht_dispatch_schedule(limit, limit, limit, 1), HtDispatchSchedule::Coarse);
+    EXPECT_EQ(nccl_ep::ht_dispatch_schedule(limit, 128, 32, 1), HtDispatchSchedule::Redistributed);
+    for (int blocks : {8, 128, limit}) {
+        EXPECT_EQ(nccl_ep::ht_dispatch_schedule(32769, 128, blocks, 1), HtDispatchSchedule::Coarse);
+    }
+    for (int chunk : {16, 96, 192, 512, limit}) {
+        EXPECT_EQ(nccl_ep::ht_dispatch_schedule(32769, chunk, 32, 1), HtDispatchSchedule::Coarse);
+    }
+}
 
 TEST(HtChunkConfig, CombinePreservesDefault) {
     ncclEpEnvConfig cfg;

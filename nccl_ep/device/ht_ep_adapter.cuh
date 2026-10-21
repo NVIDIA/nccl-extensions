@@ -736,6 +736,7 @@ struct DispatchParams {
     int local_rank;
     int lsa_team;
     int tokens_per_lsa;
+    int work_tokens_per_rank; // Local source work; capacity for multi-LSA dispatch.
 
     // EM local-fanout: > 0 enables sender S2G dedup + a receiver local_dup kernel.
     int local_dup_num_sms = 0;

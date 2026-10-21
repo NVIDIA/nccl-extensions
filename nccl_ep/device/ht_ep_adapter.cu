@@ -1532,6 +1532,7 @@ template <typename TOKEN_DATA_TYPE>
     kp.local_rank = params.local_rank;
     kp.lsa_team = params.lsa_team;
     kp.num_of_tokens_per_rank = params.tokens_per_lsa;
+    kp.work_tokens_per_rank = params.work_tokens_per_rank;
     kp.local_dup_enabled = (params.local_dup_num_sms > 0);
     kp.guard_enabled = params.guard_enabled;
     kp.max_recv_tokens_per_rank = params.max_recv_tokens_per_rank;
@@ -1809,6 +1810,7 @@ ncclResult_t dispatch_impl(
         if (ncclResult_t r = jit::launch_dispatch(
             d_config,
             max_dispatch_tokens_per_rank,
+            params.work_tokens_per_rank,
             num_lsa_teams,
             params.lsa_team_size,
             params.layout,

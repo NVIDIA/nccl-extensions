@@ -339,6 +339,12 @@ __host__ __device__ constexpr dtype_t align(dtype_t a, dtype_t b) {
     return ceil_div<dtype_t>(a, b) * b;
 }
 
+// Round a nonnegative value down to a multiple of a positive alignment.
+template <typename dtype_t>
+__host__ __device__ constexpr dtype_t align_down(dtype_t a, dtype_t b) {
+    return (a / b) * b;
+}
+
 // Packed bitmap stored as little-endian 64-bit words: word count, word index, single-bit test/set.
 __host__ __device__ constexpr int bit_words(int n) { return ceil_div(n, 64); }
 __host__ __device__ constexpr int bit_word(int i) { return i >> 6; }

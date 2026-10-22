@@ -1081,8 +1081,8 @@ LOW_LATENCY_COMBINE_LSA_RECV_1SIDED:
 // ll/ll_dispatch_lsa.cuh), then calls straight into the same impls above -- no JIT-generated
 // string logic, this is a real compiled function. p.want1SidedBuf is a plain read: dispatch
 // overwrites it fresh each round, so no reset is needed here.
-template <int kHidden, int kNumTopk, int kNumMaxUnrolls, typename TopkIdxT, ncclDataType_t kTokenDtype>
-__device__ __forceinline__ void combine_kernel_impl_auto_rm_lsa(const combine_kernel_args_t& p) {
+template <int kHidden, int kNumTopk, int kNumMaxUnrolls, typename TopkIdxT, ncclDataType_t kTokenDtype, typename WeightT>
+__device__ __forceinline__ void combine_kernel_impl_auto_rm_lsa(const combine_kernel_args_t<WeightT>& p) {
     const bool want1Sided = *p.want1SidedBuf != 0;
     if (want1Sided) {
         combine_kernel_impl_1sided_rm_lsa<kHidden, kNumTopk, kNumMaxUnrolls, kTokenDtype>(

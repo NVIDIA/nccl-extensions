@@ -17,6 +17,7 @@
 #include <functional>
 #include <sstream>
 #include <string>
+#include <type_traits>
 
 namespace nccl_ep {
 namespace ll {
@@ -126,12 +127,14 @@ inline std::string ll_combine_jit_source(
     ncclEpLayout_t layout,
     bool topkIdxIsInt64,
     ncclDataType_t tokenDtype,
-    LlCombineKernel kernel) {
+    LlCombineKernel kernel,
+    ncclDataType_t weightDtype) {
     // Callers must pass a resolved, concrete kernel -- never the sentinels ll_combine_select_kernel
     // returns for "not yet resolved" (kNone) or "enforcement unreachable" (kInvalid); see its doc
     // comment.
     EP_HOST_ASSERT(kernel != LlCombineKernel::kInvalid && kernel != LlCombineKernel::kNone);
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
+    const char* weight_type = ::nccl_ep::jit::routing_weight_type_literal(weightDtype);
     const char* topk_type = topkIdxIsInt64 ? "int64_t" : "int32_t";
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(tokenDtype);
     std::ostringstream src;
@@ -140,7 +143,7 @@ inline std::string ll_combine_jit_source(
         << "\n"
         << "extern \"C\" __launch_bounds__(1024, 1)\n"
         << "__global__ void " << kLlCombineJitEntryName << "(\n"
-        << "    const __grid_constant__ nccl_ep::ll::combine_kernel_args_t p) {\n";
+        << "    const __grid_constant__ nccl_ep::ll::combine_kernel_args_t<" << weight_type << "> p) {\n";
     switch (kernel) {
         case LlCombineKernel::kAutoRmLsa:
             // A real compiled function (ll/ll_combine_lsa.cuh), not string-generated logic -- see
@@ -194,6 +197,7 @@ inline std::string ll_combine_jit_source(
             break;
         case LlCombineKernel::kDefault:
             src << "  nccl_ep::ll::combine_kernel_impl<\n"
+                << "      " << weight_type << ",\n"
                 << "      " << ::nccl_ep::jit::bool_literal(useLogFmt) << ",\n"
                 << "      " << hidden << ",\n"
                 << "      " << num_topk << ",\n"
@@ -202,7 +206,8 @@ inline std::string ll_combine_jit_source(
                 << "      " << topk_type << ",\n"
                 << "      " << token_dtype_literal << ", " << recipe_literal << ">(\n"
                 << "      p.inData, p.inGlobalScales, p.srcInfo, p.layoutRange,\n"
-                << "      static_cast<const " << topk_type << "*>(p.inTopkIdx), p.topkWeights,\n"
+                << "      static_cast<const " << topk_type << "*>(p.inTopkIdx),\n"
+                << "      p.topkWeights,\n"
                 << "      p.rankMask, p.asyncErrorFlag,\n"
                 << "      p.outData,\n"
                 << "      p.rdmaBuf,\n"
@@ -226,6 +231,7 @@ inline std::string ll_combine_jit_source(
     return src.str();
 }
 
+template <typename WeightT>
 inline ncclResult_t launch_ll_combine(
     bool useLogFmt,
     ncclEpCombQuant_t qrecipe,
@@ -239,9 +245,11 @@ inline ncclResult_t launch_ll_combine(
     int numWarps,
     int dynamic_smem_bytes,
     LlCombineKernel kernel,
-    const combine_kernel_args_t& args,
+    const combine_kernel_args_t<WeightT>& args,
     cudaStream_t stream,
     bool nucs) {
+    static_assert(std::is_same_v<WeightT, float> || std::is_same_v<WeightT, __nv_bfloat16>);
+    constexpr ncclDataType_t weightDtype = std::is_same_v<WeightT, float> ? ncclFloat32 : ncclBfloat16;
     // kernel is resolved once by the caller (ll_combine_select_kernel, via call_combine) --
     // never re-derived here, so there's exactly one place eligibility is evaluated.
     const bool twoSidedRmLsa = kernel == LlCombineKernel::k2SidedRmLsa;
@@ -279,6 +287,7 @@ inline ncclResult_t launch_ll_combine(
         key, (useLogFmt ? 1u : 0u) | (topkIdxIsInt64 ? 2u : 0u) | (oneSidedRmLsa ? 4u : 0u) |
             (autoRmLsa ? 8u : 0u));
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(tokenDtype));
+    key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(weightDtype));
     variant.runtime_key = key;
     variant.num_blocks = numSms;
     variant.block_dim = numWarps * 32;
@@ -298,7 +307,7 @@ inline ncclResult_t launch_ll_combine(
     std::string error;
     // Warm-cache fast path: launches without materializing variant_name/source.
     ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel_cached(
-        variant, const_cast<combine_kernel_args_t*>(&args), 0, stream, &error);
+        variant, const_cast<combine_kernel_args_t<WeightT>*>(&args), 0, stream, &error);
 
     std::string variant_name;
     if (status == ::nccl_ep::jit::JitKernelStatus::kDisabled) {
@@ -306,6 +315,7 @@ inline ncclResult_t launch_ll_combine(
         std::ostringstream name;
         name << "ll_combine"
              << "_hdim" << hidden << ::nccl_ep::jit::layout_name_tag(layout)
+             << "_weights" << static_cast<int>(weightDtype)
              << "_topk" << num_topk
              << (useLogFmt ? "_logfmt" : "")
              << (twoSidedRmLsa ? "_2sidedrmlsa" : "")
@@ -316,11 +326,11 @@ inline ncclResult_t launch_ll_combine(
              << (anyLsa ? "" : ::nccl_ep::jit::combine_recipe_name_tag(qrecipe));
         variant_name = name.str();
         const std::string source = ll_combine_jit_source(
-            useLogFmt, recipe_literal, hidden, num_topk, layout, topkIdxIsInt64, tokenDtype, kernel);
+            useLogFmt, recipe_literal, hidden, num_topk, layout, topkIdxIsInt64, tokenDtype, kernel, weightDtype);
         variant.variant_name = variant_name;
         variant.source = source;
         status = ::nccl_ep::jit::launch_jit_kernel(
-            variant, const_cast<combine_kernel_args_t*>(&args), stream, &error);
+            variant, const_cast<combine_kernel_args_t<WeightT>*>(&args), stream, &error);
     }
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {

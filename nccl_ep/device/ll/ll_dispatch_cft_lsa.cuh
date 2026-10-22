@@ -217,12 +217,12 @@ __forceinline__ __device__ void lsaCftPutTokenScalar(
 
 // Participants: complete warp 0. Owns this token's descriptor scratch and tile header.
 // The previous source reads are complete; warp joins publish headers before issue.
-template <int kNumTopk, class Geometry, typename TopkIdxT, int kMaskWords>
+template <int kNumTopk, class Geometry, typename TopkIdxT, int kMaskWords, typename WeightT>
 __forceinline__ __device__ void prepareTokenHeadersCftLsa(
     const CftSelfDestination& self, const CftMessageLayout& msg,
     const LsaCftSmem<kMaskWords>& cs, const int* list, int* dscratch,
     uint8_t* tile, uint8_t* hdrBatch, int j, int nDest, int tok,
-    const TopkIdxT* inTopkIdx, const float* inTopkWeights, int currRank, int laneId) {
+    const TopkIdxT* inTopkIdx, const WeightT* inTopkWeights, int currRank, int laneId) {
     // Destination list -> (rank, slot) pairs for lane 0; find the self slot.
     int selfSlot = -1;
     if (laneId < nDest) {
@@ -274,11 +274,11 @@ __forceinline__ __device__ void prepareTokenHeadersCftLsa(
     __syncwarp();
 }
 
-template <int kNumTopk, bool kCountedPayload, class Geometry, typename TopkIdxT, int kMaskWords>
+template <int kNumTopk, bool kCountedPayload, class Geometry, typename TopkIdxT, int kMaskWords, typename WeightT>
 __forceinline__ __device__ void lsaCftSendToken(
     CftSendContext<Geometry>& ctx, const cft_dispatch_args_t& cft, const CftSelfDestination& self,
     const CftMessageLayout& msg, const LsaCftSmem<kMaskWords>& cs, const int* list, const int* nd, uint8_t* hdrBatch, int j,
-    int nTok, int smId, int numSms, const TopkIdxT* inTopkIdx, const float* inTopkWeights, const int4* inDataInt4,
+    int nTok, int smId, int numSms, const TopkIdxT* inTopkIdx, const WeightT* inTopkWeights, const int4* inDataInt4,
     size_t hiddenInt4, int currRank, int laneId, uint64_t timeoutCycles, int* asyncErrorFlag) {
     const int tok = smId + j * numSms;
     const int rslot = j % Geometry::kRingDepth;
@@ -320,11 +320,11 @@ __forceinline__ __device__ void lsaCftSendToken(
 // The reservation barrier publishes base/count/offset and token masks to
 // helpers. Each helper warp owns complete token headers, so no two warps
 // write one header. No payload tile or sender descriptor scratch is touched.
-template <int kNumTopk, typename TopkIdxT, int kMaskWords>
+template <int kNumTopk, typename TopkIdxT, int kMaskWords, typename WeightT>
 __forceinline__ __device__ void lsaCftPrepareHeaders(
     const CftSelfDestination& self, const CftMessageLayout& msg, const LsaCftSmem<kMaskWords>& cs,
     const int* list, const int* nd, uint8_t* hdrBatch, int nTok, int smId, int numSms,
-    const TopkIdxT* inTopkIdx, const float* inTopkWeights, int currRank,
+    const TopkIdxT* inTopkIdx, const WeightT* inTopkWeights, int currRank,
     int helperIdx, int numHelpers, int laneId) {
     for (int j = helperIdx; j < nTok; j += numHelpers) {
         const int tok = smId + j * numSms;
@@ -452,9 +452,9 @@ __forceinline__ __device__ int lsaCftDecodeCount(const int* recvCntBuf, int srcR
 // Buffer carving uses the unchanged host allocation. Only the existing
 // CftSendContext carries transport state; list/count/header pointers describe
 // the additional routing workspace, whose lifetime spans the SEND phase.
-template <int kNumTopk, class Geometry, int kMaskWords>
+template <int kNumTopk, class Geometry, int kMaskWords, typename WeightT>
 __forceinline__ __device__ void initDispatchCftLsa(
-    const dispatch_kernel_args_t& args, const cft_dispatch_args_t& cft,
+    const dispatch_kernel_args_t<WeightT>& args, const cft_dispatch_args_t& cft,
     const CftMessageLayout& msg, void* recvBuf, CftSendContext<Geometry>& sender,
     CftSelfDestination& self, LsaCftSmem<kMaskWords>& cs,
     int*& list, int*& nd, uint8_t*& hdrBatch,
@@ -493,9 +493,9 @@ __forceinline__ __device__ void initDispatchCftLsa(
 // owns strided token lists; masks are atomic ORs. Sentinel rows are disjoint
 // across all helper threads/CTAs. CTA 0 also clears the next count bank.
 // The caller's barrier A joins these writes with warp 0 before reservation.
-template <int kNumTopk, typename TopkIdxT, int kMaskWords>
+template <int kNumTopk, typename TopkIdxT, int kMaskWords, typename WeightT>
 __forceinline__ __device__ void preprocessRoutingCftLsa(
-    const dispatch_kernel_args_t& args, int smId, int warpId, int laneId,
+    const dispatch_kernel_args_t<WeightT>& args, int smId, int warpId, int laneId,
     int numSms, int numWarps, int numLocalExperts, int nTok, int* list, int* nd,
     int* nextRecvCntBuf, LsaCftSmem<kMaskWords>& cs) {
     lsaCftPreprocess<kNumTopk>(
@@ -519,9 +519,9 @@ __forceinline__ __device__ void preprocessRoutingCftLsa(
 // never touch payload tiles or descriptor scratch. Per-token source-read waits
 // protect the two-slot TMA ring; capacity drains remain inside lsaCftSendToken.
 // The final warp barrier joins lane 0's stream before the header-batch handoff.
-template <int kNumTopk, bool kCountedPayload, typename TopkIdxT, class Geometry, int kMaskWords>
+template <int kNumTopk, bool kCountedPayload, typename TopkIdxT, class Geometry, int kMaskWords, typename WeightT>
 __forceinline__ __device__ void streamPayloadsCftLsa(
-    const dispatch_kernel_args_t& args, const cft_dispatch_args_t& cft,
+    const dispatch_kernel_args_t<WeightT>& args, const cft_dispatch_args_t& cft,
     CftSendContext<Geometry>& sender, const CftSelfDestination& self, const CftMessageLayout& msg,
     const LsaCftSmem<kMaskWords>& cs, const int* list, const int* nd, uint8_t* hdrBatch,
     int nTok, int smId, int numSms, int laneId) {
@@ -541,9 +541,9 @@ __forceinline__ __device__ void streamPayloadsCftLsa(
 // barriers publish reservations to header helpers and join their stores before
 // header puts, preserving their overlap with payload streaming.
 // Returns the source-wide last-SEND-CTA election after final publication/reset.
-template <int kNumTopk, bool kCountedPayload, typename TopkIdxT, class Geometry, int kMaskWords>
+template <int kNumTopk, bool kCountedPayload, typename TopkIdxT, class Geometry, int kMaskWords, typename WeightT>
 __forceinline__ __device__ bool dispatchSendPhaseCftLsa(
-    const dispatch_kernel_args_t& args, const cft_dispatch_args_t& cft,
+    const dispatch_kernel_args_t<WeightT>& args, const cft_dispatch_args_t& cft,
     CftSendContext<Geometry>& sender, const CftSelfDestination& self, const CftMessageLayout& msg,
     LsaCftSmem<kMaskWords>& cs, int* list, int* nd, uint8_t* hdrBatch,
     int* recvCntBuf, int* nextRecvCntBuf, size_t recvCntOff,
@@ -621,8 +621,9 @@ __forceinline__ __device__ bool dispatchSendPhaseCftLsa(
 
 // Participants: the first lane of an active receive group. Owns its byte target.
 // Acquires source readiness and local sentinel clears; uncounted targets stay unchanged.
+template <typename WeightT>
 __forceinline__ __device__ void awaitSourceReadyCftLsa(
-    const dispatch_kernel_args_t& args, const cft_dispatch_args_t& cft,
+    const dispatch_kernel_args_t<WeightT>& args, const cft_dispatch_args_t& cft,
     int* recvCntBuf, size_t numBytesPerMsg, int numSms, int numLocalExperts,
     int srcRank, int rankLaneIdx) {
     const bool selfSrc = srcRank == args.currRank;
@@ -672,8 +673,9 @@ __forceinline__ __device__ void awaitSourceReadyCftLsa(
 // Named barriers release only that group's warps; with >14 groups the final
 // CTA-wide barrier MUST include inactive groups. Compiler fences keep generic
 // payload/header loads after the acquire and the group/CTA handoff.
+template <typename WeightT>
 __forceinline__ __device__ void syncAndRecvCountsCftLsa(
-    const dispatch_kernel_args_t& args, const cft_dispatch_args_t& cft,
+    const dispatch_kernel_args_t<WeightT>& args, const cft_dispatch_args_t& cft,
     int* recvCntBuf, size_t numBytesPerMsg, int laneId, int numSms, int numLocalExperts,
     int warpGroupId, int subWarpId, int responsibleExpertIdx) {
     const bool perGroupRelease = args.numWarpGroups + kLsaCftGroupBarrierBase <= 16;
@@ -700,9 +702,9 @@ __forceinline__ __device__ void syncAndRecvCountsCftLsa(
 // addressing stay here; the shared metadata helper sees only an interpreted
 // header and output slot. Zero-copy skips payload copying; self always reads
 // its split-layout headers, while staged remote headers precede their payloads.
-template <int kNumTopk, bool kZeroCopy>
+template <int kNumTopk, bool kZeroCopy, typename WeightT>
 __forceinline__ __device__ void recordRecvTokensCftLsa(
-    const dispatch_kernel_args_t& args, const cft_dispatch_args_t& cft,
+    const dispatch_kernel_args_t<WeightT>& args, const cft_dispatch_args_t& cft,
     const int* recvCntBuf, const void* recvBuf, size_t numBytesPerMsg,
     size_t dispatch_hdr_sz, size_t hiddenInt4, int laneId, int numLocalExperts,
     int subWarpId, int responsibleExpertIdx) {
@@ -753,9 +755,9 @@ __forceinline__ __device__ void recordRecvTokensCftLsa(
 // Rank-major CFT entry point. Initialization and all phase helpers are CTA
 // cooperative; SEND returns the elected last sender for the shared epoch rule.
 // Split RECV chooses/advances its pending epoch in selectLowLatencyEpoch.
-template <int kHidden, int kNumTopk, typename TopkIdxT, ncclDataType_t kTokenDtype,
+template <typename WeightT, int kHidden, int kNumTopk, typename TopkIdxT, ncclDataType_t kTokenDtype,
           bool kCftZeroCopy, bool kCftCountedPayload, int kCftMaskWords>
-__device__ __forceinline__ void dispatch_kernel_impl_cft_rm_lsa(const dispatch_kernel_args_t& args) {
+__device__ __forceinline__ void dispatch_kernel_impl_cft_rm_lsa(const dispatch_kernel_args_t<WeightT>& args) {
     EP_STATIC_ASSERT(kNumTopk > 0 && kNumTopk <= combine_smem::kWarpSize - kLlDispatchControlWarps,
                      "LL dispatch top-k must leave one control warp");
     EP_STATIC_ASSERT(size_u8<kTokenDtype>() == kCftElementBytes, "LSA-CFT dispatch requires two-byte tokens");

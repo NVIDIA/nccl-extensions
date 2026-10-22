@@ -209,12 +209,13 @@ struct cft_dispatch_args_t {
     int             countedPayload;      // LSA-CFT: 1 = this rank's payload puts are counted in this dispatch
 };
 
+template <typename WeightT>
 struct dispatch_kernel_args_t {
     // INPUT
     const void* inData;
     const void* inScalesBuf;      // non-null for QUANT_FWD; runtime-typed storage
     const void* inTopkIdx;        // cast to const TopkIdxT* by dispatch_kernel_impl
-    const float* inTopkWeights;
+    const WeightT* inTopkWeights;
     int* rankMask;
     int* asyncErrorFlag;
     // OUTPUT
@@ -232,7 +233,7 @@ struct dispatch_kernel_args_t {
     int* outRecvRankCounter;
     int64_t* outLayout;
     int* outCnt;
-    float* outRecvTopkWeights;
+    WeightT* outRecvTopkWeights;
     int32_t* outRecvTopkIdx;
     // INTERMEDIATE
     void* rdmaBuf;
@@ -293,6 +294,7 @@ struct dispatch_kernel_args_t {
     cft_dispatch_args_t cft;
 };
 
+template <typename WeightT>
 struct combine_kernel_args_t {
     // INPUT
     const void* inData;
@@ -308,7 +310,7 @@ struct combine_kernel_args_t {
     size_t inDataWindowOffset;
     const int64_t* layoutRange;
     const void* inTopkIdx;        // cast to const TopkIdxT* by the JIT entry
-    const float* topkWeights;
+    const WeightT* topkWeights;
     int* rankMask;
     int* asyncErrorFlag;
     // OUTPUT
@@ -382,6 +384,7 @@ struct clean_low_latency_buffer_kernel_args_t {
 // arguments into a struct keeps the call sites readable and lets fields default.
 // ============================================================================
 
+template <typename WeightT>
 struct DispatchParams {
     int maxDynamicSmem = 0; // Cached device capacity; also honors the test override.
     // User inputs
@@ -393,7 +396,7 @@ struct DispatchParams {
     int scalesPerToken = 0;
     int scaleBytesPerToken = 0;            // scalesPerToken * sizeof(scale element); QUANT_FWD only
     ncclDataType_t scaleDtype;              // QUANT_FWD tensor dtype; selects ScaleT in JIT
-    const float* inTopkWeights;
+    const WeightT* inTopkWeights;
 
     // User / pre-allocated output buffers
     void* outDataBuf;
@@ -404,7 +407,7 @@ struct DispatchParams {
     int* outRecvRankCounter;       // rank-major only; nullptr otherwise
     int64_t* outLayout;
     int* outCnt;
-    float* outRecvTopkWeights;     // rank-major only; nullptr otherwise
+    WeightT* outRecvTopkWeights;     // rank-major only; nullptr otherwise
     int32_t* outRecvTopkIdx;       // rank-major only; nullptr otherwise
 
     // Intermediate RDMA buffers + window-relative offsets
@@ -502,6 +505,7 @@ struct DispatchParams {
     uint64_t        cftOutputOffset = 0;
 };
 
+template <typename WeightT>
 struct CombineParams {
     // User inputs
     const void* inData;
@@ -513,7 +517,7 @@ struct CombineParams {
     const int64_t* layoutRange;
     const void* inTopkIdx;        // int32_t* or int64_t*; see topkIdxIsInt64
     bool topkIdxIsInt64 = true;   // selects the TopkIdxT kernel specialization
-    const float* topkWeights;
+    const WeightT* topkWeights;
 
     // User output
     void* outData;
@@ -613,13 +617,15 @@ struct CleanLowLatencyBufferParams {
 // JIT-compiled kernel.
 // ============================================================================
 
+template <typename WeightT>
 ncclResult_t call_dispatch(
-    const DispatchParams& params,
+    const DispatchParams<WeightT>& params,
     ncclEpDispQuant_t recipe,
-    cudaStream_t stream = 0,
-    bool nucs = false);
+    cudaStream_t stream,
+    bool nucs);
 
-ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream = 0, bool nucs = false);
+template <typename WeightT>
+ncclResult_t call_combine(const CombineParams<WeightT>& params, cudaStream_t stream, bool nucs);
 
 ncclResult_t call_clean_low_latency_buffer(
     const CleanLowLatencyBufferParams& params,

@@ -96,6 +96,7 @@ __device__ __forceinline__ void cleanNextRecvCntBufStrided(
 // decoded its output slot and source-info address. All 32 lanes of one warp
 // call together with the same header, slot and geometry. This helper owns no
 // transport synchronization, count decoding or payload copies.
+template <typename WeightT>
 __device__ __forceinline__ void recordRankMajorRecvTokenMetadata(
     const DispatchHdr<NCCL_EP_LAYOUT_RANK_MAJOR>* recvHdr,
     int slot,
@@ -105,7 +106,7 @@ __device__ __forceinline__ void recordRankMajorRecvTokenMetadata(
     int laneId,
     int* recvSrcInfo,
     int32_t* outRecvTopkIdx,
-    float* outRecvTopkWeights,
+    WeightT* outRecvTopkWeights,
     ncclEpExpertIdKind_t recvTopkIdxKind) {
     const auto rtr = recvHdr->rtr;
     const auto recvSrcTopkInfo = recvSrcInfo + 1;
@@ -132,7 +133,7 @@ __device__ __forceinline__ void recordRankMajorRecvTokenMetadata(
         bool valid = (localExpertIdx >= 0 && localExpertIdx < numLocalExperts);
         int writeIdx = (recvTopkIdxKind == NCCL_EP_EXPERT_ID_GLOBAL) ? globalExpertIdx : localExpertIdx;
         outRecvTopkIdx[slot * numTopk + laneId] = valid ? (int32_t)writeIdx : (int32_t)-1;
-        outRecvTopkWeights[slot * numTopk + laneId] = rtr[laneId].topk_weight;
+        outRecvTopkWeights[slot * numTopk + laneId] = static_cast<WeightT>(rtr[laneId].topk_weight);
     }
 }
 

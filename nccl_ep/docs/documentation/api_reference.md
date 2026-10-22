@@ -350,6 +350,15 @@ ncclResult_t ncclEpTensorDestroy(ncclEpTensor_t* tensor);
 
 Perform EP dispatch: send tokens to experts according to routing decisions.
 
+LL rank-major dispatch accepts FP32 or BF16 routing weights in
+`inputs->topk_weights` with shape `[num_tokens, top_k]`. The corresponding
+`outputs->topk_weights` tensor must use the same dtype and shape
+`[num_ranks, max_dispatch_tokens_per_rank, top_k]`. The JIT specializes weight
+loads and stores by dtype; the internal routing wire header remains FP32.
+LL expert-major combine also accepts FP32 or BF16 routing weights in
+`outputs->topk_weights`; BF16 weights are widened in registers before the
+FP32 weighted reduction. HT routing weights remain FP32.
+
 ```c
 // Perform EP dispatch
 //   * Sends tokens and metadata to the experts according to routing decisions.

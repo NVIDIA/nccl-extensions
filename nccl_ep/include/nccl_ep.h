@@ -473,10 +473,10 @@ typedef struct {
     unsigned int size; // = sizeof(this struct); first field, never moves
     unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
     ncclEpTensor_t* tokens; // required; 2D [num_tokens, hidden]
-    ncclEpTensor_t* topk_weights; // optional; 2D [num_tokens, top_k], ncclFloat32
-  //   LL rank-major: per-token routing weights
+    ncclEpTensor_t* topk_weights; // optional; 2D [num_tokens, top_k]
+  //   LL rank-major: FP32 or BF16 routing weights; receive dtype must match.
   //   AFD: required on attention ranks and omitted on expert ranks
-  //   HT forward: routing weights (topk_idx taken from handle)
+  //   HT forward: FP32 routing weights (topk_idx taken from handle)
     ncclEpTensor_t* scales;       // required by QUANT_FWD; caller-provided scales are forwarded
                                   // without conversion (see the recipe contract below)
 } ncclEpDispatchInputs_t;
@@ -501,8 +501,8 @@ typedef struct {
     unsigned int size; // = sizeof(this struct); first field, never moves
     unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
     ncclEpTensor_t* tokens; // required received tokens; omitted on AFD attention ranks
-    ncclEpTensor_t* topk_weights; // optional; LL rank-major or HT: received top-k weights
-  //   LL rank-major: ncclFloat32 [num_ranks, max_dispatch_tokens_per_rank, top_k]
+    ncclEpTensor_t* topk_weights; // optional; LL rank-major: input dtype; HT: FP32 received top-k weights
+  //   LL rank-major: [num_ranks, max_dispatch_tokens_per_rank, top_k]
     ncclEpTensor_t* scales;       // required by recipes that forward or generate scales; received per-token scales
     ncclEpTensor_t* topk_idx; // optional; LL rank-major or HT FLAT: received top-k expert indices
   // Per-slot values are either the local or global expert id, selected via
@@ -568,9 +568,9 @@ typedef struct {
     unsigned int size; // = sizeof(this struct); first field, never moves
     unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
     ncclEpTensor_t* tokens; // required; combined output in original token order
-    ncclEpTensor_t* topk_weights; // optional; 2D [num_tokens, top_k], ncclFloat32
-  //   LL expert-major: per-token routing weights applied on receive side
-  //   HT backward: combined routing weights output
+    ncclEpTensor_t* topk_weights; // optional; 2D [num_tokens, top_k]
+  //   LL expert-major: FP32 or BF16 routing weights; reduction uses FP32.
+  //   HT backward: FP32 combined routing weights output
 } ncclEpCombineOutputs_t;
 
 #define NCCL_EP_COMBINE_OUTPUTS_INIT \

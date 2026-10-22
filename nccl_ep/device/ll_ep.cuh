@@ -494,10 +494,10 @@ __device__ __forceinline__ void cftPublishCountEarly(
 // Templated on the wire dtype (kTokenDtype) like combine/HT. All element widths come
 // from size_u8<kTokenDtype>(); the read stride is the input element width whether or
 // not the output is FP8 (so FP32-input quantization reads the correct stride too).
-template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumTopk, ncclEpLayout_t kLayout, bool kNvlinkOnly,
+template <typename WeightT, ncclEpDispQuant_t kRecipe, int kHidden, int kNumTopk, ncclEpLayout_t kLayout, bool kNvlinkOnly,
           typename TopkIdxT, ncclDataType_t kTokenDtype, typename ScaleT, bool kCft, bool kUseSharedQuant,
           bool kRankOwnsExperts, bool kRankOwnsTokens>
-__device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_t& args) {
+__device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_t<WeightT>& args) {
     constexpr bool kSharedQuant = kUseSharedQuant && kNvlinkOnly && !kCft &&
         kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4 && kLayout == NCCL_EP_LAYOUT_RANK_MAJOR;
     __shared__ __align__(16) int2 quantized[kSharedQuant ? kHidden / 8 : 1];
@@ -518,7 +518,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     const void* inData = args.inData;
     const uint8_t* inScalesBuf = static_cast<const uint8_t*>(args.inScalesBuf); // non-null for QUANT_FWD
     const TopkIdxT* inTopkIdx = static_cast<const TopkIdxT*>(args.inTopkIdx);
-    const float* inTopkWeights = args.inTopkWeights;
+    const WeightT* inTopkWeights = args.inTopkWeights;
     int* rankMask = args.rankMask;
     int* asyncErrorFlag = args.asyncErrorFlag;
     // OUTPUT
@@ -528,7 +528,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     int* outRecvRankCounter = args.outRecvRankCounter;
     int64_t* outLayout = args.outLayout;
     int* outCnt = args.outCnt;
-    float* outRecvTopkWeights = args.outRecvTopkWeights;
+    WeightT* outRecvTopkWeights = args.outRecvTopkWeights;
     int32_t* outRecvTopkIdx = args.outRecvTopkIdx;
     // INTERMEDIATE
     void* rdmaBuf = args.rdmaBuf;
@@ -1198,7 +1198,7 @@ LOW_LATENCY_DISPATCH_RECV:
                     bool valid = (localExpertIdx >= 0 && localExpertIdx < numLocalExperts);
                     int writeIdx = (recvTopkIdxKind == NCCL_EP_EXPERT_ID_GLOBAL) ? globalExpertIdx : localExpertIdx;
                     outRecvTopkIdx[slot * numTopk + laneId] = valid ? (int32_t)writeIdx : (int32_t)-1;
-                    outRecvTopkWeights[slot * numTopk + laneId] = recvBufHdr->rtr[laneId].topk_weight;
+                    outRecvTopkWeights[slot * numTopk + laneId] = static_cast<WeightT>(recvBufHdr->rtr[laneId].topk_weight);
                 }
 
                 // Compute j_eff via __ballot_sync: first topk position mapping to currRank.
@@ -1777,11 +1777,11 @@ __device__ __forceinline__ void decodeAndAccumulateNvfp4(
     }
 }
 
-template <bool kUseLogFMT, int kHidden, int kNumTopk, int kNumMaxUnrolls, ncclEpLayout_t kLayout, typename TopkIdxT, ncclDataType_t kTokenDtype,
+template <typename WeightT, bool kUseLogFMT, int kHidden, int kNumTopk, int kNumMaxUnrolls, ncclEpLayout_t kLayout, typename TopkIdxT, ncclDataType_t kTokenDtype,
           ncclEpCombQuant_t kRecipe>
 __device__ __forceinline__ void combine_kernel_impl( // INPUT
   const void* inData, const float* inGlobalScales, const int* srcInfo, const int64_t* layoutRange, const TopkIdxT* inTopkIdx,
-  const float* topkWeights, int* rankMask, int* asyncErrorFlag,
+  const WeightT* topkWeights, int* rankMask, int* asyncErrorFlag,
   // OUTPUT
   void* outData,
   // INTERMEDIATE
@@ -2283,8 +2283,9 @@ LOW_LATENCY_COMBINE_RECV:
                 if (laneId < numTopk) {
                     topkIdxByLane = static_cast<int>(__ldg(inTopkIdx + tokenIdx * numTopk + laneId));
                     // Rank-major: weights applied by caller before combine; kernel uses weight=1
-                    if constexpr (kLayout != NCCL_EP_LAYOUT_RANK_MAJOR)
-                        topkWeightsByLane = __ldg(topkWeights + tokenIdx * numTopk + laneId);
+                    if constexpr (kLayout != NCCL_EP_LAYOUT_RANK_MAJOR) {
+                        topkWeightsByLane = static_cast<float>(__ldg(topkWeights + tokenIdx * numTopk + laneId));
+                    }
                 }
                 __syncwarp();
 

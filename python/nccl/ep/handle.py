@@ -195,9 +195,9 @@ class DispatchInputs:
 
     Attributes:
         tokens: 2D ``[num_tokens, hidden]``. Token payload.
-        topk_weights: 2D ``[num_tokens, top_k]`` float32. LL rank-major
-            per-token routing weights, or HT forward routing weights. AFD
-            expert ranks omit this field.
+        topk_weights: 2D ``[num_tokens, top_k]``. LL rank-major accepts
+            float32 or bfloat16 routing weights, with matching receive dtype.
+            HT forward requires float32. AFD expert ranks omit this field.
         scales: 2D ``[num_tokens, scale_elems_per_token]`` per-token
             scaling factors. Required by
             :py:attr:`DispatchQuantizationRecipe.FWD`, which forwards the
@@ -224,7 +224,8 @@ class DispatchOutputs:
 
     Attributes:
         tokens: Received tokens.
-        topk_weights: LL rank-major or HT: received top-k weights.
+        topk_weights: Received top-k weights. LL rank-major uses the input
+            dtype (float32 or bfloat16); HT uses float32.
         scales: Received per-token scaling factors. Required by
             :py:attr:`DispatchQuantizationRecipe.FWD` (forwarded
             unchanged from the input) and by
@@ -274,11 +275,11 @@ class CombineOutputs:
     Attributes:
         tokens: 2D ``[num_tokens, hidden]`` combined output, restored to
             original token order.
-        topk_weights: 2D ``[num_tokens, top_k]`` float32.
+        topk_weights: 2D ``[num_tokens, top_k]``.
 
-            * LL expert-major: per-token routing weights applied on the
-              receive side.
-            * HT backward: combined routing weights output.
+            * LL expert-major: float32 or bfloat16 routing weights, applied
+              on the receive side with float32 accumulation.
+            * HT backward: float32 combined routing weights output.
     """
 
     tokens: Tensor | None = None

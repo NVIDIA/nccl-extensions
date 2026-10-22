@@ -20,6 +20,7 @@
 #include <functional>
 #include <sstream>
 #include <string>
+#include <type_traits>
 
 namespace nccl_ep {
 namespace ll {
@@ -123,8 +124,10 @@ inline std::string ll_dispatch_jit_source(
     bool cftZeroCopy,
     bool cftCountedPayload,
     int cftNumWarps,
-    bool cftOneWordMask) {
+    bool cftOneWordMask,
+    ncclDataType_t weightDtype) {
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
+    const char* weight_type = ::nccl_ep::jit::routing_weight_type_literal(weightDtype);
     const char* topk_type = topkIdxIsInt64 ? "int64_t" : "int32_t";
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(tokenDtype);
 
@@ -146,10 +149,11 @@ inline std::string ll_dispatch_jit_source(
         << blockThreads
         << ", 1)\n"
         << "__global__ void " << kLlDispatchJitEntryName << "(\n"
-        << "    const __grid_constant__ nccl_ep::ll::dispatch_kernel_args_t p) {\n";
+        << "    const __grid_constant__ nccl_ep::ll::dispatch_kernel_args_t<" << weight_type << "> p) {\n";
     switch (algo) {
     case LlDispatchAlgo::k2SidedRmLsaTma:
         src << "  nccl_ep::ll::dispatch_kernel_impl_2sided_rm_lsa_tma<\n"
+            << "      " << weight_type << ",\n"
             << "      " << kernel_spec.recipe_source_literal << ",\n"
             << "      " << hidden << ",\n"
             << "      " << num_topk << ",\n"
@@ -161,6 +165,7 @@ inline std::string ll_dispatch_jit_source(
         break;
     case LlDispatchAlgo::k2SidedRmLsa:
         src << "  nccl_ep::ll::dispatch_kernel_impl_2sided_rm_lsa<\n"
+            << "      " << weight_type << ",\n"
             << "      " << kernel_spec.recipe_source_literal << ",\n"
             << "      " << hidden << ",\n"
             << "      " << num_topk << ",\n"
@@ -170,6 +175,7 @@ inline std::string ll_dispatch_jit_source(
         break;
     case LlDispatchAlgo::kCftRmLsa:
         src << "  nccl_ep::ll::dispatch_kernel_impl_cft_rm_lsa<\n"
+            << "      " << weight_type << ",\n"
             << "      " << hidden << ",\n"
             << "      " << num_topk << ",\n"
             << "      " << topk_type << ",\n"
@@ -180,6 +186,7 @@ inline std::string ll_dispatch_jit_source(
         break;
     case LlDispatchAlgo::kDefault:
         src << "  nccl_ep::ll::dispatch_kernel_impl<\n"
+            << "      " << weight_type << ",\n"
             << "      " << kernel_spec.recipe_source_literal << ",\n"
             << "      " << hidden << ",\n"
             << "      " << num_topk << ",\n"
@@ -198,6 +205,7 @@ inline std::string ll_dispatch_jit_source(
     return src.str();
 }
 
+template <typename WeightT>
 inline ncclResult_t launch_ll_dispatch(
     int hidden,
     unsigned int device_sm,
@@ -217,11 +225,13 @@ inline ncclResult_t launch_ll_dispatch(
     int maxDynamicSmem,
     bool recordDstInfo,
     bool cftZeroCopy,
-    const dispatch_kernel_args_t& args,
+    const dispatch_kernel_args_t<WeightT>& args,
     cudaStream_t stream,
     bool nucs,
     bool* dstInfoDisqualifiedOut,
     bool cftOneWordMask) {
+    static_assert(std::is_same_v<WeightT, float> || std::is_same_v<WeightT, __nv_bfloat16>);
+    constexpr ncclDataType_t weightDtype = std::is_same_v<WeightT, float> ? ncclFloat32 : ncclBfloat16;
     const bool cftEnabled = cft_smem_bytes != 0;
     const LlDispatchAlgo algo = ll_dispatch_select_algo(
         nvlinkOnly, recipe, layout, cftEnabled, lsaMode, hidden, tokenDtype, args.numAttnRanks);
@@ -346,6 +356,7 @@ inline ncclResult_t launch_ll_dispatch(
     key = ::nccl_ep::jit::runtime_key_mix(
         key, (nvlinkOnly ? 1u : 0u) | (topkIdxIsInt64 ? 2u : 0u) | (cftEnabled ? 4u : 0u));
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(tokenDtype));
+    key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(weightDtype));
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(compactQuant));
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(stageQuant));
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(rankOwnsExperts));
@@ -386,7 +397,7 @@ inline ncclResult_t launch_ll_dispatch(
     // Warm-cache fast path: launches without materializing variant_name/source.
     // sizeof = 0 means "kernel_param points to a single fixed-size arg struct".
     ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel_cached(
-        variant, const_cast<dispatch_kernel_args_t*>(&args), 0, stream, &error);
+        variant, const_cast<dispatch_kernel_args_t<WeightT>*>(&args), 0, stream, &error);
 
     std::string variant_name;
     if (status == ::nccl_ep::jit::JitKernelStatus::kDisabled) {
@@ -395,6 +406,7 @@ inline ncclResult_t launch_ll_dispatch(
         name << "ll_dispatch"
              << "_hdim" << hidden << ::nccl_ep::jit::layout_name_tag(layout)
              << "_topk" << num_topk
+             << "_weights" << static_cast<int>(weightDtype)
              << "_recipe" << kernel_spec.recipe_cache_tag
              << "_payload" << kernel_spec.payload_cache_tag
              << "_scale" << kernel_spec.scale_cache_tag
@@ -427,11 +439,11 @@ inline ncclResult_t launch_ll_dispatch(
             kernel_spec, hidden, num_topk, layout, nvlinkOnly, topkIdxIsInt64, tokenDtype, algo,
             compactQuant, stageQuant, cftEnabled, rankOwnsExperts, rankOwnsTokens,
             numTmaStages, numTmaQuantWarps, recordDstInfo,
-            cftZeroCopy, cftCountedPayload, numWarps, cftOneWordMask);
+            cftZeroCopy, cftCountedPayload, numWarps, cftOneWordMask, weightDtype);
         variant.variant_name = variant_name;
         variant.source = source;
         status = ::nccl_ep::jit::launch_jit_kernel(
-            variant, const_cast<dispatch_kernel_args_t*>(&args), stream, &error);
+            variant, const_cast<dispatch_kernel_args_t<WeightT>*>(&args), stream, &error);
     }
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {

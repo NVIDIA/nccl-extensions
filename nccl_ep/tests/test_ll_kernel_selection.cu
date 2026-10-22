@@ -91,7 +91,7 @@ TEST(LlKernelSelection, DispatchJitBurnsInRankRoles) {
         return ll_dispatch_jit_source(
             spec, 2048, 2, NCCL_EP_LAYOUT_RANK_MAJOR, true, false,
             ncclBfloat16, LlDispatchAlgo::kDefault, false, false, false,
-            rank_owns_experts, rank_owns_tokens, 0, 0, false, false, false, 4, false);
+            rank_owns_experts, rank_owns_tokens, 0, 0, false, false, false, 4, false, ncclFloat32);
     };
 
     EXPECT_NE(source_for(true, true).find("false, false, true, true>(p);"), std::string::npos);
@@ -245,15 +245,15 @@ TEST(LlKernelSelection, CftJitSeparatesSenderModes) {
     const std::string counted = ll_dispatch_jit_source(
         spec, 7168, 8, NCCL_EP_LAYOUT_RANK_MAJOR, true, true, ncclBfloat16,
         LlDispatchAlgo::kCftRmLsa, false, false, true, true, true,
-        0, 0, false, false, true, 4, false);
+        0, 0, false, false, true, 4, false, ncclFloat32);
     const std::string uncounted = ll_dispatch_jit_source(
         spec, 7168, 8, NCCL_EP_LAYOUT_RANK_MAJOR, true, true, ncclBfloat16,
         LlDispatchAlgo::kCftRmLsa, false, false, true, true, true,
-        0, 0, false, false, false, 4, false);
+        0, 0, false, false, false, 4, false, ncclFloat32);
     const std::string zeroCopy = ll_dispatch_jit_source(
         spec, 7168, 8, NCCL_EP_LAYOUT_RANK_MAJOR, true, true, ncclBfloat16,
         LlDispatchAlgo::kCftRmLsa, false, false, true, true, true,
-        0, 0, false, true, false, 4, false);
+        0, 0, false, true, false, 4, false, ncclFloat32);
     EXPECT_NE(counted, uncounted);
     EXPECT_NE(uncounted, zeroCopy);
     EXPECT_NE(counted.find("device/ll/ll_dispatch_cft_lsa.cuh"), std::string::npos);

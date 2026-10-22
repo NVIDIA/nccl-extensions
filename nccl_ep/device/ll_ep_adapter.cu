@@ -31,7 +31,8 @@ bool ll_cft_zero_copy_supported(
 
 namespace {
 
-int cft_counted_payload(const DispatchParams& params) {
+template <typename WeightT>
+int cft_counted_payload(const DispatchParams<WeightT>& params) {
     const int maxTok = ll_lsa_cft_counted_max_tokens();
     const int countedPayload = (maxTok > 0 && params.numTokens <= maxTok) ? 1 : 0;
     static bool announced = false;
@@ -43,8 +44,9 @@ int cft_counted_payload(const DispatchParams& params) {
     return countedPayload;
 }
 
+template <typename WeightT>
 ncclResult_t cft_dispatch_smem_bytes(
-    const DispatchParams& params, bool lsaCft, int numSms, int* smemBytes) {
+    const DispatchParams<WeightT>& params, bool lsaCft, int numSms, int* smemBytes) {
     // Match the device's two-slot stage, peer IDs and destination scratch.
     const int tileHdrBytes =
         static_cast<int>(align<size_t>(get_dispatch_hdr_sz(params.numTopk, params.layout), 128));
@@ -89,8 +91,9 @@ ncclResult_t cft_dispatch_smem_bytes(
 //   - hands off to launch_ll_dispatch(), which JIT-compiles the kernel
 //     specialised for (recipe, hidden, layout, nvlinkOnly)
 // ============================================================================
+template <typename WeightT>
 ncclResult_t call_dispatch(
-    const DispatchParams& params,
+    const DispatchParams<WeightT>& params,
     ncclEpDispQuant_t recipe,
     cudaStream_t stream,
     bool nucs) {
@@ -134,7 +137,7 @@ ncclResult_t call_dispatch(
         return ncclInvalidUsage;
     }
 
-    dispatch_kernel_args_t args{};
+    dispatch_kernel_args_t<WeightT> args{};
     args.inData = params.inData;
     args.inScalesBuf = params.inScalesBuf;
     args.inTopkIdx = params.inTopkIdx;
@@ -272,7 +275,8 @@ ncclResult_t call_dispatch(
 // Resolves (numSms, numWarps), computes the dynamic SMEM budget, packs args,
 // and hands off to launch_ll_combine() for JIT compile + launch.
 // ============================================================================
-ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream, bool nucs) {
+template <typename WeightT>
+ncclResult_t call_combine(const CombineParams<WeightT>& params, cudaStream_t stream, bool nucs) {
     if (params.numDeviceSms <= 0 || params.numExperts <= 0 || params.numCombinedTokens < 0) {
         std::fprintf(
             stderr,
@@ -379,7 +383,7 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream, bool
 
     const int hidden = params.hidden;
 
-    combine_kernel_args_t args{};
+    combine_kernel_args_t<WeightT> args{};
     args.inData = params.inData;
     args.inGlobalScales = params.inGlobalScales;
     args.srcInfo = params.srcInfo;
@@ -457,6 +461,13 @@ call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStr
 
     return jit::launch_ll_clean_low_latency_buffer(args, params.deviceSm, stream, nucs);
 }
+
+template ncclResult_t call_dispatch<float>(
+    const DispatchParams<float>&, ncclEpDispQuant_t, cudaStream_t, bool);
+template ncclResult_t call_combine<float>(const CombineParams<float>&, cudaStream_t, bool);
+template ncclResult_t call_dispatch<__nv_bfloat16>(
+    const DispatchParams<__nv_bfloat16>&, ncclEpDispQuant_t, cudaStream_t, bool);
+template ncclResult_t call_combine<__nv_bfloat16>(const CombineParams<__nv_bfloat16>&, cudaStream_t, bool);
 
 } // namespace ll
 } // namespace nccl_ep

@@ -22,6 +22,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <type_traits>
 #include <nccl.h>
 #include <nccl_device.h>
 #include "nccl_ep.h"
@@ -619,13 +620,31 @@ static ncclResult_t requireTensorDtype(const ncclEpTensor_t* t, ncclDataType_t e
     return ncclInvalidArgument;
 }
 
+static ncclResult_t validate_ll_weight_dtypes(const ncclEpTensor_t* input, const ncclEpTensor_t* output) {
+    for (const auto* weights : {input, output}) {
+        if (weights != nullptr && weights->datatype != ncclFloat32 && weights->datatype != ncclBfloat16) {
+            fprintf(stderr, "NCCL EP: LL routing weights must use FP32 or BF16\n");
+            return ncclInvalidArgument;
+        }
+    }
+    if (input != nullptr && output != nullptr && input->datatype != output->datatype) {
+        fprintf(stderr, "NCCL EP: LL dispatch input and output routing weights must use the same dtype\n");
+        return ncclInvalidArgument;
+    }
+    return ncclSuccess;
+}
+
 static ncclResult_t validateDispatchAuxDtypes(
     const ncclEpDispatchInputs_t* inputs,
     const ncclEpDispatchOutputs_t* outputs,
     const ncclEpLayoutInfo_t* layout_info,
     ncclEpAlgorithm_t algorithm) {
-    NCCLCHECK(requireTensorDtype(tensor_ptr(inputs->topk_weights), ncclFloat32, "inputs->topk_weights"));
-    NCCLCHECK(requireTensorDtype(tensor_ptr(outputs->topk_weights), ncclFloat32, "outputs->topk_weights"));
+    if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
+        NCCLCHECK(validate_ll_weight_dtypes(tensor_ptr(inputs->topk_weights), tensor_ptr(outputs->topk_weights)));
+    } else {
+        NCCLCHECK(requireTensorDtype(tensor_ptr(inputs->topk_weights), ncclFloat32, "inputs->topk_weights"));
+        NCCLCHECK(requireTensorDtype(tensor_ptr(outputs->topk_weights), ncclFloat32, "outputs->topk_weights"));
+    }
     if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         NCCLCHECK(requireTensorDtype(tensor_ptr(outputs->topk_idx), ncclInt32, "outputs->topk_idx"));
         if (layout_info != nullptr) {
@@ -5495,6 +5514,24 @@ static ncclResult_t validate_ht_backward_weights(
     return ncclSuccess;
 }
 
+
+template <typename Launch>
+static ncclResult_t launch_ll_with_weight_type(
+    ncclDataType_t dtype, const ncclEpTensor_t* input, const ncclEpTensor_t* output, Launch&& launch) {
+    switch (dtype) {
+    case ncclFloat32:
+        return launch(
+            static_cast<const float*>(input ? input->data : nullptr),
+            static_cast<float*>(output ? output->data : nullptr));
+    case ncclBfloat16:
+        return launch(
+            static_cast<const __nv_bfloat16*>(input ? input->data : nullptr),
+            static_cast<__nv_bfloat16*>(output ? output->data : nullptr));
+    default:
+        return ncclInvalidArgument;
+    }
+}
+
 ncclResult_t ncclEpDispatch(
     ncclEpHandle_t handle,
     const ncclEpDispatchInputs_t* inputs,
@@ -5605,13 +5642,28 @@ ncclResult_t ncclEpDispatch(
         // their presence (rank-major) or absence (expert-major) in the switch below.
         const ncclEpTensor_t* topk_weights_in = tensor_ptr(inputs->topk_weights);
         const ncclEpTensor_t* recv_topk_weights = tensor_ptr(outputs->topk_weights);
+        ncclEpTensor_t topk_weights_in_local = NCCL_EP_TENSOR_INIT;
+        ncclEpTensor_t recv_topk_weights_local = NCCL_EP_TENSOR_INIT;
+        if (topk_weights_in != nullptr && topk_weights_in->data == nullptr) {
+            NCCLCHECK(resolveTensorWindowBinding(group, topk_weights_in, &topk_weights_in_local, 0, &topk_weights_in));
+        }
+        if (recv_topk_weights != nullptr && recv_topk_weights->data == nullptr) {
+            NCCLCHECK(resolveTensorWindowBinding(group, recv_topk_weights, &recv_topk_weights_local, 0, &recv_topk_weights));
+        }
         const ncclEpTensor_t* recv_topk_idx = tensor_ptr(outputs->topk_idx);
         const ncclEpTensor_t* src_rank_counter = layout_info ? tensor_ptr(layout_info->src_rank_counters) : nullptr;
+
+        const auto* dispatch_weights = topk_weights_in ? topk_weights_in : recv_topk_weights;
+        const ncclDataType_t weight_dtype = dispatch_weights ? dispatch_weights->datatype : ncclFloat32;
 
         const unsigned num_recv_tokens =
             static_cast<unsigned>(group->nRanks) * group->config.max_dispatch_tokens_per_rank;
         switch (handle->layout) {
         case NCCL_EP_LAYOUT_RANK_MAJOR:
+            if ((owns_tokens && topk_weights_in == nullptr) || (owns_experts && recv_topk_weights == nullptr)) {
+                fprintf(stderr, "NCCL EP: LL rank-major dispatch requires routing weight tensors\n");
+                return ncclInvalidArgument;
+            }
             // Rank-major output is 3D so the per-rank, per-slot structure is
             // explicit in the descriptor — the caller must acknowledge it.
             if (owns_experts) {
@@ -5805,18 +5857,17 @@ ncclResult_t ncclEpDispatch(
             auto* expert_dispatch_layout_data = static_cast<int64_t*>(handle->ll.expert_dispatch_layout.data);
             auto* recv_count_data = recv_count ? static_cast<int*>(recv_count->data) : nullptr;
             auto* x_data = x->data;
-            auto* topk_weights_in_data = topk_weights_in ? static_cast<const float*>(topk_weights_in->data) : nullptr;
-            auto* recv_topk_weights_data = recv_topk_weights ? static_cast<float*>(recv_topk_weights->data) : nullptr;
             auto* recv_topk_idx_data = recv_topk_idx ? static_cast<int32_t*>(recv_topk_idx->data) : nullptr;
 
             // LL accepts int32 or int64 topk_idx; the cached dtype picks the JIT
             // kernel specialization (TopkIdxT). The lambda packs the shared
             // DispatchParams and threads recipe-specific state through.
-            auto launch_dispatch = [&](auto* topk_idx_data, bool topk_is_int64) -> ncclResult_t {
+            auto launch_dispatch = [&](auto* topk_idx_data, bool topk_is_int64, auto* in_weights, auto* recv_weights) -> ncclResult_t {
+                using WeightT = std::remove_cv_t<std::remove_pointer_t<decltype(in_weights)>>;
                 auto* in_scales_data =
                     (recipe == NCCL_EP_DISP_QUANT_FWD)
                     ? static_cast<const uint8_t*>(in_scales_outer->data) : nullptr;
-                nccl_ep::ll::DispatchParams params{};
+                nccl_ep::ll::DispatchParams<WeightT> params{};
                 params.maxDynamicSmem = handle->group->max_dynamic_smem;
                 params.inData = x_data;
                 params.inScalesBuf = in_scales_data;
@@ -5833,7 +5884,7 @@ ncclResult_t ncclEpDispatch(
                 params.scaleBytesPerToken = recipe == NCCL_EP_DISP_QUANT_FWD
                     ? params.scalesPerToken * static_cast<int>(ncclTypeSize(in_scales_outer->datatype))
                     : 0;
-                params.inTopkWeights = topk_weights_in_data;
+                params.inTopkWeights = in_weights;
                 params.outDataBuf = recv_x_data;
                 params.outScalesBuf = scales_data;
                 params.outSrcInfo = expert_recv_source_indices_data;
@@ -5845,7 +5896,7 @@ ncclResult_t ncclEpDispatch(
                 params.outRecvRankCounter = src_rank_counter_data;
                 params.outLayout = expert_dispatch_layout_data;
                 params.outCnt = recv_count_data;
-                params.outRecvTopkWeights = recv_topk_weights_data;
+                params.outRecvTopkWeights = recv_weights;
                 params.outRecvTopkIdx = recv_topk_idx_data;
                 params.rdmaBuf = rdma_buf;
                 params.sendOff = buffer.dispatch_rdma_send_buffer_offset;
@@ -5942,18 +5993,22 @@ ncclResult_t ncclEpDispatch(
                         return ncclInvalidArgument;
                 }
             };
-            switch (handle->topk_idx.datatype) {
-            case ncclInt32:
-                    return launch_dispatch(
-                        static_cast<const int32_t*>(handle->topk_idx.data), /*topk_is_int64=*/false);
-            case ncclInt64:
-                    return launch_dispatch(
-                        static_cast<const int64_t*>(handle->topk_idx.data), /*topk_is_int64=*/true);
-            default:
-                    std::fprintf(stderr, "NCCL EP warning: LL topk_idx has unsupported dtype %d\n",
-                                 static_cast<int>(handle->topk_idx.datatype));
-                    return ncclInvalidArgument;
-            }
+            return launch_ll_with_weight_type(
+                weight_dtype, topk_weights_in, recv_topk_weights,
+                [&](auto* in_weights, auto* recv_weights) -> ncclResult_t {
+                    switch (handle->topk_idx.datatype) {
+                    case ncclInt32:
+                        return launch_dispatch(
+                            static_cast<const int32_t*>(handle->topk_idx.data), false, in_weights, recv_weights);
+                    case ncclInt64:
+                        return launch_dispatch(
+                            static_cast<const int64_t*>(handle->topk_idx.data), true, in_weights, recv_weights);
+                    default:
+                        std::fprintf(stderr, "NCCL EP warning: LL topk_idx has unsupported dtype %d\n",
+                                     static_cast<int>(handle->topk_idx.datatype));
+                        return ncclInvalidArgument;
+                    }
+                });
         };
 
         // dispatch_want_1sided is handle-owned and touched only by this rank's own kernels:
@@ -7275,7 +7330,7 @@ ncclResult_t ncclEpCombine(
             return ncclInvalidArgument;
         }
         if (group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY && handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-            NCCLCHECK(requireTensorDtype(tensor_ptr(outputs->topk_weights), ncclFloat32, "outputs->topk_weights"));
+            NCCLCHECK(validate_ll_weight_dtypes(tensor_ptr(outputs->topk_weights), nullptr));
         }
     }
 
@@ -7310,11 +7365,15 @@ ncclResult_t ncclEpCombine(
         // topk_weights: expert-major requires it in outputs; rank-major does not
         // (weights are applied by the caller in preReduceRankMajor before ncclEpCombine).
         const ncclEpTensor_t* topk_weights;
+        ncclEpTensor_t topk_weights_local = NCCL_EP_TENSOR_INIT;
         if (handle->layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
             topk_weights = nullptr;
         } else {
             topk_weights = tensor_ptr(outputs->topk_weights);
             EP_HOST_ASSERT(topk_weights != nullptr && "expert-major combine requires topk_weights in outputs");
+            if (topk_weights->data == nullptr) {
+                NCCLCHECK(resolveTensorWindowBinding(handle->group, topk_weights, &topk_weights_local, 0, &topk_weights));
+            }
         }
 
         // Extract configuration values
@@ -7393,6 +7452,8 @@ ncclResult_t ncclEpCombine(
         assert(src_info->ndim == 1);
         assert(src_info->datatype == ncclInt32);
 
+        const ncclDataType_t weight_dtype = topk_weights ? topk_weights->datatype : ncclFloat32;
+
         // Validate topk_weights tensor (expert-major only; rank-major applies weights before combine)
         if (topk_weights != nullptr) {
             assert(topk_weights->ndim == 2);
@@ -7433,7 +7494,6 @@ ncclResult_t ncclEpCombine(
             // Prepare data pointers
             auto* out_data = out->data;
             auto* x_data = x ? x->data : nullptr;
-            auto* topk_weights_data = topk_weights ? static_cast<float*>(topk_weights->data) : nullptr;
             auto* src_info_data = static_cast<int*>(src_info->data);
             // Passed through unconditionally -- call_combine decides whether 1-sided is actually
             // reachable (forced, or auto mode's on-device wrapper picking it at runtime) and only
@@ -7446,8 +7506,9 @@ ncclResult_t ncclEpCombine(
             // false: combine reads inData directly and uses windows only to
             // translate peer recv-buffer ptrs; the kernel's zeroCopy mode is
             // dispatch-shaped, so config.zero_copy is a dispatch-only switch.
-            auto launch_combine = [&](auto* topk_idx_data, bool topk_is_int64) -> ncclResult_t {
-                nccl_ep::ll::CombineParams params{};
+            auto launch_combine = [&](auto* topk_idx_data, bool topk_is_int64, auto* weights) -> ncclResult_t {
+                using WeightT = std::remove_cv_t<std::remove_pointer_t<decltype(weights)>>;
+                nccl_ep::ll::CombineParams<WeightT> params{};
                 params.inData = x_data;
                 params.inGlobalScales = global_scales ? static_cast<const float*>(global_scales->data) : nullptr;
                 params.srcInfo = src_info_data;
@@ -7457,7 +7518,7 @@ ncclResult_t ncclEpCombine(
                 params.layoutRange = layout_range_data;
                 params.inTopkIdx = topk_idx_data;
                 params.topkIdxIsInt64 = topk_is_int64;
-                params.topkWeights = topk_weights_data;
+                params.topkWeights = weights;
                 params.outData = out_data;
                 params.rdmaBuf = rdma_buf;
                 params.sendOff = buffer.combine_rdma_send_buffer_offset;
@@ -7506,16 +7567,20 @@ ncclResult_t ncclEpCombine(
                 return nccl_ep::ll::call_combine(
                     params, stream, nccl_ep_env_flag_on(handle->group->env.nucs));
             };
-            switch (topk_idx->datatype) {
-            case ncclInt32:
-                return launch_combine(static_cast<const int32_t*>(topk_idx->data), /*topk_is_int64=*/false);
-            case ncclInt64:
-                return launch_combine(static_cast<const int64_t*>(topk_idx->data), /*topk_is_int64=*/true);
-            default:
-                    std::fprintf(stderr, "NCCL EP warning: LL topk_idx has unsupported dtype %d\n",
-                                 static_cast<int>(topk_idx->datatype));
-                    return ncclInvalidArgument;
-            }
+            return launch_ll_with_weight_type(
+                weight_dtype, topk_weights, nullptr,
+                [&](auto* weights, auto*) -> ncclResult_t {
+                    switch (topk_idx->datatype) {
+                    case ncclInt32:
+                        return launch_combine(static_cast<const int32_t*>(topk_idx->data), false, weights);
+                    case ncclInt64:
+                        return launch_combine(static_cast<const int64_t*>(topk_idx->data), true, weights);
+                    default:
+                        std::fprintf(stderr, "NCCL EP warning: LL topk_idx has unsupported dtype %d\n",
+                                     static_cast<int>(topk_idx->datatype));
+                        return ncclInvalidArgument;
+                    }
+                });
         };
 
         // Execute combine with appropriate phase flags

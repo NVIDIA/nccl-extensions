@@ -27,6 +27,18 @@ inline const char* bool_literal(bool value) {
     return value ? "true" : "false";
 }
 
+inline const char* routing_weight_type_literal(ncclDataType_t dtype) {
+    switch (dtype) {
+    case ncclFloat32:
+        return "float";
+    case ncclBfloat16:
+        return "__nv_bfloat16";
+    default:
+        std::fprintf(stderr, "[nccl_ep jit] unsupported routing weight dtype %d\n", static_cast<int>(dtype));
+        std::abort();
+    }
+}
+
 // ncclDataType_t -> enumerator name for the kTokenDtype template argument.
 // LL dispatch may carry an FP8 wire dtype (MXFP8); HT combine only ever passes
 // BF16/FP16/FP32, so the FP8 cases are simply unused there. Anything unlisted

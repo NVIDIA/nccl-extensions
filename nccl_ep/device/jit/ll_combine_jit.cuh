@@ -256,6 +256,7 @@ inline ncclResult_t launch_ll_combine(
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.device_sm = static_cast<int>(device_sm);
+    variant.propagate_cache_errors = true;
     variant.kernel_family = oneSidedRmLsa ? "ll_combine_1sided_rm_lsa" :
         (twoSidedRmLsa ? "ll_combine_2sided_rm_lsa" : (autoRmLsa ? "ll_combine_auto_rm_lsa" : "ll_combine"));
     variant.entry_name = kLlCombineJitEntryName;

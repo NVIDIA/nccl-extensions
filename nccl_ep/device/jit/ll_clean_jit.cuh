@@ -53,6 +53,7 @@ inline ncclResult_t launch_ll_clean_low_latency_buffer(
     variant.identity = &variant_identity;
     variant.runtime_key = ::nccl_ep::jit::kRuntimeKeySeed;
     variant.device_sm = static_cast<int>(device_sm);
+    variant.propagate_cache_errors = true;
     variant.num_blocks = 1;
     variant.block_dim = kLlCleanNumThreads;
     variant.dynamic_smem_bytes = 0;

@@ -630,7 +630,7 @@ JitKernelStatus try_fast_launch(
     if (variant.dynamic_smem_bytes > entry.configured_smem_bytes) {
         const JitKernelStatus status = configure_smem(entry.function, variant.dynamic_smem_bytes, error);
         if (status != JitKernelStatus::kLaunched) {
-            if (variant.device_sm > 0) {
+            if (variant.propagate_cache_errors) {
                 return status;
             }
             erase_fast_cache(fast_key);
@@ -971,7 +971,7 @@ JitKernelStatus launch_jit_kernel(
         try_fast_launch(fast_key, variant, kernel_param, kernel_param_size, stream, error);
     if (fast_status == JitKernelStatus::kLaunched || fast_status == JitKernelStatus::kLaunchFailed ||
         fast_status == JitKernelStatus::kInsufficientResidency ||
-        (variant.device_sm > 0 && fast_status != JitKernelStatus::kDisabled)) {
+        (variant.propagate_cache_errors && fast_status != JitKernelStatus::kDisabled)) {
         return fast_status;
     }
 

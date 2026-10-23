@@ -38,7 +38,9 @@ struct JitKernelVariant {
     int block_dim = 0;
     int dynamic_smem_bytes = 0;
     int min_sm = 90;
-    int device_sm = 0;  // LL uses architecture cached at group creation.
+    int device_sm = 0;  // Optional architecture cached at group creation.
+    // LL propagates cache errors; false preserves HT cache eviction and fallback.
+    bool propagate_cache_errors = false;
     std::string_view target_arch;
     // Optional launch attributes (default = off).
     // Cooperative launch enables cg::this_grid().sync() inside the kernel.

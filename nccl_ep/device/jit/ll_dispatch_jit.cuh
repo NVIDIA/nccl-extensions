@@ -304,6 +304,7 @@ inline ncclResult_t launch_ll_dispatch(
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.device_sm = static_cast<int>(device_sm);
+    variant.propagate_cache_errors = true;
     switch (algo) {
     case LlDispatchAlgo::k2SidedRmLsaTma:
         variant.kernel_family = "ll_dispatch_2sided_rm_lsa_tma";

@@ -185,6 +185,10 @@ $(OBJDIR)/%.o: %.cc $(JIT_CONFIG_HEADER) $(HEADER_TARGETS) $(NCCL_EP_JIT_HEADER_
 	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # Compile device code (with automatic header dependency generation)
+# LL launch planning runs on the CPU; preserve its host optimization flags.
+$(OBJDIR)/device/ll_ep_adapter.o: NVCUFLAGS += $(addprefix -Xcompiler=,$(filter -O%,$(CXXFLAGS)))
+$(OBJDIR)/device/ll_ep_adapter.o: Makefile
+
 $(OBJDIR)/%.o: %.cu $(JIT_CONFIG_HEADER) $(HEADER_TARGETS) $(NCCL_EP_JIT_HEADER_TARGETS)
 	@echo "Compiling $<"
 	@mkdir -p $(dir $@)

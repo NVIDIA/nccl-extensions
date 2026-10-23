@@ -42,19 +42,17 @@ inline std::string ll_clean_jit_source() {
 
 inline ncclResult_t launch_ll_clean_low_latency_buffer(
     const clean_low_latency_buffer_kernel_args_t& args,
+    unsigned int device_sm,
     cudaStream_t stream,
     bool nucs) {
     static const int variant_identity = 0;
-    const std::string variant_name = "ll_clean";
-    const std::string source = ll_clean_jit_source();
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ll_clean";
-    variant.variant_name = variant_name;
-    variant.source = source;
     variant.entry_name = kLlCleanJitEntryName;
     variant.identity = &variant_identity;
-    variant.runtime_key = static_cast<std::uint64_t>(std::hash<std::string>{}(variant_name));
+    variant.runtime_key = ::nccl_ep::jit::kRuntimeKeySeed;
+    variant.device_sm = static_cast<int>(device_sm);
     variant.num_blocks = 1;
     variant.block_dim = kLlCleanNumThreads;
     variant.dynamic_smem_bytes = 0;
@@ -63,11 +61,15 @@ inline ncclResult_t launch_ll_clean_low_latency_buffer(
     variant.cluster_dim_x = 1;
 
     std::string error;
-    const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(
-        variant,
-        const_cast<clean_low_latency_buffer_kernel_args_t*>(&args),
-        stream,
-        &error);
+    auto status = ::nccl_ep::jit::launch_jit_kernel_cached(variant,
+        const_cast<clean_low_latency_buffer_kernel_args_t*>(&args), 0, stream, &error);
+    if (status == ::nccl_ep::jit::JitKernelStatus::kDisabled) {
+        const std::string source = ll_clean_jit_source();
+        variant.variant_name = "ll_clean";
+        variant.source = source;
+        status = ::nccl_ep::jit::launch_jit_kernel(variant,
+            const_cast<clean_low_latency_buffer_kernel_args_t*>(&args), stream, &error);
+    }
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
         std::fprintf(stderr, "[nccl_ep jit] LL clean JIT launch failure: %s%s%s\n",

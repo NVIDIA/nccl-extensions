@@ -589,6 +589,7 @@ struct CombineParams {
 };
 
 struct CleanLowLatencyBufferParams {
+    unsigned int deviceSm;
     int* clean_0;
     int num_clean_int_0;
     int* clean_1;

@@ -630,6 +630,9 @@ JitKernelStatus try_fast_launch(
     if (variant.dynamic_smem_bytes > entry.configured_smem_bytes) {
         const JitKernelStatus status = configure_smem(entry.function, variant.dynamic_smem_bytes, error);
         if (status != JitKernelStatus::kLaunched) {
+            if (variant.device_sm > 0) {
+                return status;
+            }
             erase_fast_cache(fast_key);
             return JitKernelStatus::kDisabled;
         }
@@ -967,20 +970,25 @@ JitKernelStatus launch_jit_kernel(
     const JitKernelStatus fast_status =
         try_fast_launch(fast_key, variant, kernel_param, kernel_param_size, stream, error);
     if (fast_status == JitKernelStatus::kLaunched || fast_status == JitKernelStatus::kLaunchFailed ||
-        fast_status == JitKernelStatus::kInsufficientResidency) {
+        fast_status == JitKernelStatus::kInsufficientResidency ||
+        (variant.device_sm > 0 && fast_status != JitKernelStatus::kDisabled)) {
         return fast_status;
     }
 
     const auto jit_begin = std::chrono::steady_clock::now();
     const std::string log_prefix = kernel_log_prefix(variant);
 
-    cudaDeviceProp prop{};
-    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
-        if (error != nullptr) *error = "cudaGetDeviceProperties failed";
-        return JitKernelStatus::kUnsupportedDevice;
+    int sm = variant.device_sm;
+    if (sm == 0) {
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+            if (error != nullptr) {
+                *error = "cudaGetDeviceProperties failed";
+            }
+            return JitKernelStatus::kUnsupportedDevice;
+        }
+        sm = prop.major * 10 + prop.minor;
     }
-
-    const int sm = prop.major * 10 + prop.minor;
     if (sm < variant.min_sm) {
         if (error != nullptr) {
             *error = log_prefix + " requires sm_" + std::to_string(variant.min_sm) + " or newer";

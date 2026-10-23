@@ -240,6 +240,7 @@ ncclResult_t call_dispatch(
 
     return jit::launch_ll_dispatch(
         params.hidden,
+        params.deviceSm,
         params.layout,
         params.nvlinkOnly,
         params.topkIdxIsInt64,
@@ -448,7 +449,7 @@ call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStr
     args.barrierSignalBase = params.barrierSignalBase;
     args.timeoutCycles = params.timeoutCycles;
 
-    return jit::launch_ll_clean_low_latency_buffer(args, stream, nucs);
+    return jit::launch_ll_clean_low_latency_buffer(args, params.deviceSm, stream, nucs);
 }
 
 } // namespace ll

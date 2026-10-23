@@ -34,6 +34,7 @@
 #include "device/ht_ep_adapter.cuh"
 #include "device/ht_ep_configs.cuh"
 #include "device/ll_ep_adapter.cuh"
+#include "device/jit/jit_runtime.hpp"
 
 namespace ll = nccl_ep::ll;
 
@@ -2405,6 +2406,9 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     CUDA_CHECK(cudaDeviceGetAttribute(
         &ep_group->max_dynamic_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, ep_group->cuda_device_id));
     ep_group->device_smem_optin = device_prop.sharedMemPerBlockOptin;
+    if (low_latency_mode && nccl_ep_env_flag_on(ep_group->env.nucs)) {
+        (void)nccl_ep::jit::ensure_nucs_available();
+    }
 
     // Gather local platform facts now; reject only after the collective vote
     // below so peers cannot be stranded in setup. This query does not throw.
@@ -8066,6 +8070,7 @@ ncclResult_t ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) {
     clean_params.devComm = ep_group->nccl_dev_comm;
     clean_params.barrierSignalBase = ep_group->clean_barrier_signal_base;
     clean_params.timeoutCycles = ep_group->timeout_cycles;
+    clean_params.deviceSm = ep_group->device_sm;
 
     NCCLCHECK(nccl_ep::ll::call_clean_low_latency_buffer(
         clean_params, stream, nccl_ep_env_flag_on(ep_group->env.nucs)));

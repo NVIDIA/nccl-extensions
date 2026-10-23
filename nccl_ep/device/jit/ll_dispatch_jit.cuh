@@ -194,6 +194,7 @@ inline std::string ll_dispatch_jit_source(
 
 inline ncclResult_t launch_ll_dispatch(
     int hidden,
+    unsigned int device_sm,
     ncclEpLayout_t layout,
     bool nvlinkOnly,
     bool topkIdxIsInt64,
@@ -302,6 +303,7 @@ inline ncclResult_t launch_ll_dispatch(
     static const int variant_identity_cft_rm_lsa = 0;
 
     ::nccl_ep::jit::JitKernelVariant variant;
+    variant.device_sm = static_cast<int>(device_sm);
     switch (algo) {
     case LlDispatchAlgo::k2SidedRmLsaTma:
         variant.kernel_family = "ll_dispatch_2sided_rm_lsa_tma";
@@ -374,8 +376,7 @@ inline ncclResult_t launch_ll_dispatch(
         variant, const_cast<dispatch_kernel_args_t*>(&args), 0, stream, &error);
 
     std::string variant_name;
-    if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched &&
-        status != ::nccl_ep::jit::JitKernelStatus::kLaunchFailed) {
+    if (status == ::nccl_ep::jit::JitKernelStatus::kDisabled) {
         // Cache miss: build the name + source and take the compile/load path.
         std::ostringstream name;
         name << "ll_dispatch"

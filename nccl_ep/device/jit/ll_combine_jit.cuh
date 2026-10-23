@@ -255,6 +255,7 @@ inline ncclResult_t launch_ll_combine(
     static const int variant_identity_auto_rm_lsa = 0;
 
     ::nccl_ep::jit::JitKernelVariant variant;
+    variant.device_sm = static_cast<int>(device_sm);
     variant.kernel_family = oneSidedRmLsa ? "ll_combine_1sided_rm_lsa" :
         (twoSidedRmLsa ? "ll_combine_2sided_rm_lsa" : (autoRmLsa ? "ll_combine_auto_rm_lsa" : "ll_combine"));
     variant.entry_name = kLlCombineJitEntryName;
@@ -294,8 +295,7 @@ inline ncclResult_t launch_ll_combine(
         variant, const_cast<combine_kernel_args_t*>(&args), 0, stream, &error);
 
     std::string variant_name;
-    if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched &&
-        status != ::nccl_ep::jit::JitKernelStatus::kLaunchFailed) {
+    if (status == ::nccl_ep::jit::JitKernelStatus::kDisabled) {
         // Cache miss: build the name + source and take the compile/load path.
         std::ostringstream name;
         name << "ll_combine"

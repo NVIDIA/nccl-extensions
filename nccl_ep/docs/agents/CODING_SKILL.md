@@ -55,6 +55,8 @@ arguments that nest them.
   Point at the canonical explanation in one line instead ("see CombineLsaMode").
 - Explain why, not what. Skip multi-line essays on struct fields and branches.
 - Longer design rationale belongs in `docs/`, not inline.
+- No issue or tracker ids, MR numbers or links in comments: they are not visible in the
+  public mirror. Mark a temporary workaround in words with its removal condition.
 
 ## 4. Braced single-statement bodies, on their own line
 
@@ -103,6 +105,10 @@ mbarriers, async copies, and cache-hint or volatile accesses.
   and call it from the kernel. Do not write `asm` at the use site.
 - The same applies to a new variant of an existing primitive (another scope, order or width).
   Extend the existing family rather than writing a one-off copy.
+- Inline asm in new code is not acceptable. Look for an existing wrapper, then a standard or
+  libcu++ facility (`cuda::atomic_ref`, `cuda::ptx`), then add a named wrapper to
+  `device_primitives.cuh`. Moving an existing use site there is welcome when the new code
+  needs the same operation.
 
 ```cpp
 // WRONG (in a kernel header)
@@ -122,6 +128,8 @@ and are usable from host and device.
 - Do not hand-roll the arithmetic inline either: `(n + 31) / 32` is `nccl_ep::ceil_div(n, 32)`
   and `((n + a - 1) / a) * a` is `nccl_ep::align(n, a)`.
 - If an existing helper is almost right, extend it in place instead of adding a near-copy.
+- Scan `device_primitives.cuh`, `include/common.hpp` and the LL and HT primitive headers before
+  writing any helper, and use what exists.
 
 ## 8. No code duplication, modularize
 
@@ -133,6 +141,8 @@ and are usable from host and device.
   `__device__ __forceinline__` helper that both call.
 - Before adding code, check whether the same logic already exists elsewhere in the repo.
   Reuse it or move it somewhere shared.
+- When a pattern appears in one kernel, grep the sibling kernels for it in the same change.
+  Moving existing code to a shared place goes in a separate commit before the feature commit.
 
 ## 9. Keep functions readable
 
@@ -166,5 +176,6 @@ When reviewing a diff, grep the added lines for:
 - `asm`, `__asm__` or `asm volatile` anywhere outside `device/device_primitives.cuh`
 - a local definition or inline expansion of `ceil_div`, `align`, `div_up`, `round_up` or
   `(x + n - 1) / n`
+- an issue or MR id or link in a comment
 - a newly added block that closely mirrors an existing one, or a function that grew past
   about 60 lines

@@ -496,12 +496,12 @@ __device__ __forceinline__ void combine_kernel_impl_2sided_rm_lsa( // INPUT
 
     // Use different unroll factors for send and recv phases
     constexpr int kNumSendUnrolls = combine_smem::send_unrolls(kHidden, kElemBytes);
-    constexpr int kNumRecvUnrolls = combine_smem::kNumRecvUnrolls;
+    constexpr int kNumRecvUnrolls = combine_smem::recv_unrolls(kHidden, kElemBytes);
+    EP_STATIC_ASSERT(kNumRecvUnrolls > 0, "hidden too wide: no LL combine receive group fits a CTA");
     EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumRecvUnrolls * kNumElemsPerInt4) == 0,
                      "Partial tiles require universal combine");
     EP_STATIC_ASSERT(kNumSendUnrolls <= kNumMaxUnrolls and kNumRecvUnrolls <= kNumMaxUnrolls, "Invalid unrolls");
     EP_STATIC_ASSERT(hiddenBf16Int4 % kNumSendUnrolls == 0, "Invalid hidden");
-    EP_STATIC_ASSERT(kNumSendUnrolls >= kNumRecvUnrolls, "Invalid unroll factors");
 
     // Message package: the NONE-recipe wire slot size, including its
     // reserved (here, always-unused) LogFMT metadata tail -- see the
@@ -676,7 +676,7 @@ LOW_LATENCY_COMBINE_LSA_RECV:
 
     // Reassign warp groups; FP32 doubles SMEM per group, drop to 1 group to stay within limits
     constexpr int kMaxNumGroups = combine_smem::max_recv_groups(kElemBytes);
-    const int numDecodeWarps = hiddenBf16Int4 / (kNumRecvUnrolls * kWarpSize);
+    constexpr int numDecodeWarps = combine_smem::recv_decode_warps(kHidden, kElemBytes);
     const int warpsPerRecvGroup = numDecodeWarps + combine_smem::kNumRecvTmaWarps;
     const int numGroups = min(kMaxNumGroups, (numThreads / kWarpSize) / warpsPerRecvGroup);
     const int decodeWarpIdx = __shfl_sync(0xffffffff, warpId % warpsPerRecvGroup, 0);
@@ -902,7 +902,8 @@ __device__ __forceinline__ void combine_kernel_impl_1sided_rm_lsa( // INPUT
     constexpr int kWarpSize = combine_smem::kWarpSize;
     constexpr int64_t hiddenBf16Int4 = kHidden / kNumElemsPerInt4;
 
-    constexpr int kNumRecvUnrolls = combine_smem::kNumRecvUnrolls;
+    constexpr int kNumRecvUnrolls = combine_smem::recv_unrolls(kHidden, kElemBytes);
+    EP_STATIC_ASSERT(kNumRecvUnrolls > 0, "hidden too wide: no LL combine receive group fits a CTA");
     EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumRecvUnrolls * kNumElemsPerInt4) == 0,
                      "Partial tiles require universal combine");
     EP_STATIC_ASSERT(kNumRecvUnrolls <= kNumMaxUnrolls, "Invalid unrolls");
@@ -958,7 +959,7 @@ LOW_LATENCY_COMBINE_LSA_RECV_1SIDED:
     completeFullLowLatencyEpoch(epochState, phases, isLastCta, threadId);
 
     constexpr int kMaxNumGroups = combine_smem::max_recv_groups(kElemBytes);
-    const int numDecodeWarps = hiddenBf16Int4 / (kNumRecvUnrolls * kWarpSize);
+    constexpr int numDecodeWarps = combine_smem::recv_decode_warps(kHidden, kElemBytes);
     const int warpsPerRecvGroup = numDecodeWarps + combine_smem::kNumRecvTmaWarps;
     const int numGroups = min(kMaxNumGroups, (numThreads / kWarpSize) / warpsPerRecvGroup);
     const int decodeWarpIdx = __shfl_sync(0xffffffff, warpId % warpsPerRecvGroup, 0);

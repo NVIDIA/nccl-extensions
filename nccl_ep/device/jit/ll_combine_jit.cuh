@@ -27,6 +27,8 @@ constexpr const char* kLlCombineJitEntryName = "nccl_ep_jit_ll_combine_kernel";
 // The inner-loop unroll factor is compile-time fixed; top-k is passed to the
 // source generator so each handle receives an exact specialization.
 constexpr int kLlCombineMaxUnrolls = 4;
+static_assert(combine_smem::kMaxRecvUnrolls <= kLlCombineMaxUnrolls,
+              "combine receive unrolls must stay within the kernels' kNumMaxUnrolls");
 
 // Which device combine kernel implementation gets JIT-compiled -- see LlCombineKernel's doc
 // comment in device/ll_ep_adapter.cuh for what each value means and which role(s) it's valid in.
@@ -61,9 +63,12 @@ inline bool ll_combine_lsa_eligible(
     const bool dispatchWipesNextBank = !cftEnabled ||
         (ll_cft_lsa_enabled() && lsaMode != NcclEpDispatchLsaMode::kUniversal);
     const int elemBytes = tokenDtype == ncclFloat32 ? 4 : 2;
-    const int elemsPerTile = combine_smem::kWarpSize * combine_smem::kNumRecvUnrolls *
-        combine_smem::elements_per_int4(elemBytes);
-    return numAttnRanks == 0 && hidden > 0 && hidden % elemsPerTile == 0 && dispatchWipesNextBank && nvlinkOnly &&
+    // Same hidden-dependent receive unroll the kernels instantiate (combine_smem::recv_unrolls);
+    // 0 means no receive group fits a CTA, which the general path then reports as "cannot fit".
+    const int recvUnrolls = hidden > 0 ? combine_smem::recv_unrolls(hidden, elemBytes) : 0;
+    if (recvUnrolls == 0) return false;
+    const int elemsPerTile = combine_smem::kWarpSize * recvUnrolls * combine_smem::elements_per_int4(elemBytes);
+    return numAttnRanks == 0 && hidden % elemsPerTile == 0 && dispatchWipesNextBank && nvlinkOnly &&
         qrecipe == NCCL_EP_COMB_QUANT_NONE && !useLogFmt && layout == NCCL_EP_LAYOUT_RANK_MAJOR;
 }
 

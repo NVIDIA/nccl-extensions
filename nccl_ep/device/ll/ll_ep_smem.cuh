@@ -18,7 +18,18 @@ namespace nccl_ep::ll::combine_smem {
 constexpr int kWarpSize = 32;
 constexpr int kMaxSendUnrolls = 4;
 constexpr int kMinSendUnrolls = 2;
-constexpr int kNumRecvUnrolls = 2;
+// Receive-side unroll factor: each decode warp owns kWarpSize * unrolls int4 of
+// the token and keeps elements_per_int4 * unrolls fp32 accumulators per lane.
+// A receive group = recv_decode_warps(hidden) decode warps + kNumRecvTmaWarps,
+// and the whole group must fit in one CTA (kMaxCtaWarps). recv_unrolls() picks
+// the smallest factor in [kMinRecvUnrolls, kMaxRecvUnrolls] that satisfies that,
+// so every hidden size that fit before keeps the historical factor of 2 and only
+// larger tokens (bf16 hidden > 15872, i.e. H=16384) move to 4 (16 decode warps,
+// 32 accumulators per lane). kMaxRecvUnrolls must not exceed the kernels'
+// kNumMaxUnrolls (jit::kLlCombineMaxUnrolls).
+constexpr int kMinRecvUnrolls = 2;
+constexpr int kMaxRecvUnrolls = 4;
+constexpr int kMaxCtaWarps = 32;
 constexpr int kNumStages = 3;
 constexpr int kNumTmaPrefetch = 1;
 constexpr int kNumRecvTmaWarps = 1;
@@ -53,13 +64,47 @@ constexpr int send_unrolls(int hidden, int elem_bytes) {
 
 constexpr int padded_hidden_int4(int hidden, int elem_bytes) {
     const int unrolls = send_unrolls(hidden, elem_bytes);
-    const int hidden_int4 = hidden / elements_per_int4(elem_bytes);
+    const int num_int4 = hidden / elements_per_int4(elem_bytes);
     const int alignment = kWarpSize * unrolls;
-    return ((hidden_int4 + alignment - 1) / alignment) * alignment;
+    return ((num_int4 + alignment - 1) / alignment) * alignment;
 }
 
+constexpr int hidden_int4(int hidden, int elem_bytes) {
+    const int per_int4 = elements_per_int4(elem_bytes);
+    return (hidden + per_int4 - 1) / per_int4;
+}
+
+constexpr int recv_tile_int4(int unrolls) {
+    return kWarpSize * unrolls;
+}
+
+constexpr int recv_decode_warps_at(int hidden, int elem_bytes, int unrolls) {
+    const int tile = recv_tile_int4(unrolls);
+    return (hidden_int4(hidden, elem_bytes) + tile - 1) / tile;
+}
+
+// Smallest receive unroll factor whose receive group (decode warps + TMA warp)
+// fits in one CTA; 0 when none does (the token is too wide for LL combine).
+constexpr int recv_unrolls(int hidden, int elem_bytes) {
+    for (int unrolls = kMinRecvUnrolls; unrolls <= kMaxRecvUnrolls; unrolls *= 2) {
+        if (recv_decode_warps_at(hidden, elem_bytes, unrolls) + kNumRecvTmaWarps <= kMaxCtaWarps) return unrolls;
+    }
+    return 0;
+}
+
+// Token length in int4 rounded up to a whole receive tile (one decode warp's slice).
+constexpr int recv_padded_hidden_int4(int hidden, int elem_bytes) {
+    const int unrolls = recv_unrolls(hidden, elem_bytes);
+    if (unrolls == 0) return hidden_int4(hidden, elem_bytes);
+    const int tile = recv_tile_int4(unrolls);
+    return ((hidden_int4(hidden, elem_bytes) + tile - 1) / tile) * tile;
+}
+
+// Decode warps per receive group. When no unroll factor fits, returns kMaxCtaWarps
+// so that num_warps / (decode_warps + 1) == 0 and the host reports "cannot fit".
 constexpr int recv_decode_warps(int hidden, int elem_bytes) {
-    return padded_hidden_int4(hidden, elem_bytes) / (kNumRecvUnrolls * kWarpSize);
+    const int unrolls = recv_unrolls(hidden, elem_bytes);
+    return unrolls == 0 ? kMaxCtaWarps : recv_padded_hidden_int4(hidden, elem_bytes) / recv_tile_int4(unrolls);
 }
 
 constexpr int max_recv_groups(int elem_bytes) {
@@ -93,13 +138,13 @@ constexpr int send_smem_bytes(int hidden, int elem_bytes, int num_warps) {
 }
 
 constexpr int recv_tma_buffer_bytes(int hidden, int elem_bytes, bool nvfp4) {
-    const int padded_token_bytes = padded_hidden_int4(hidden, elem_bytes) * static_cast<int>(sizeof(int4));
+    const int padded_token_bytes = recv_padded_hidden_int4(hidden, elem_bytes) * static_cast<int>(sizeof(int4));
     return kRecvTmaBarrierBytes + (nvfp4 ? nvfp4_slot_bytes(hidden) : kRecvTmaPaddingBytes + padded_token_bytes);
 }
 
 constexpr int recv_group_smem_bytes(int hidden, int elem_bytes, bool nvfp4) {
     const int tma_bytes = recv_tma_buffer_bytes(hidden, elem_bytes, nvfp4);
-    const int padded_token_bytes = padded_hidden_int4(hidden, elem_bytes) * static_cast<int>(sizeof(int4));
+    const int padded_token_bytes = recv_padded_hidden_int4(hidden, elem_bytes) * static_cast<int>(sizeof(int4));
     // Every receive group contains TMA barriers and bulk-copy buffers. Keep the
     // group stride int4-aligned so group 1+ has the same alignment as group 0.
     // The metadata tail is only 4-byte granular and can otherwise leave the

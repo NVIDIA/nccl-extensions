@@ -341,12 +341,16 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream, bool
         requestedWarpsPerGroup,
         max_dynamic_smem_for_combine);
     if (!smem_config.feasible) {
+        const int elem_bytes = params.tokenDtype == ncclFloat32 ? 4 : 2;
         std::fprintf(
             stderr,
             "[nccl_ep] LL combine shared memory cannot fit: hidden=%d, dtype=%d, warp_groups=%d, "
-            "requested_warps_per_group=%d, limit=%d bytes.\n",
+            "requested_warps_per_group=%d, limit=%d bytes (receive group needs %d decode warps + %d TMA warp "
+            "at recv_unrolls=%d; the CTA has at most %d warps).\n",
             params.hidden, static_cast<int>(params.tokenDtype), numWarpGroups, requestedWarpsPerGroup,
-            max_dynamic_smem_for_combine);
+            max_dynamic_smem_for_combine, combine_smem::recv_decode_warps(params.hidden, elem_bytes),
+            combine_smem::kNumRecvTmaWarps, combine_smem::recv_unrolls(params.hidden, elem_bytes),
+            numWarpGroups * requestedWarpsPerGroup);
         return ncclInvalidArgument;
     }
     const int numWarpsPerGroup = smem_config.num_warps_per_group;

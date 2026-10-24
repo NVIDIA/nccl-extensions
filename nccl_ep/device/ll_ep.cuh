@@ -1833,11 +1833,18 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
 
     // Use different unroll factors for send and recv phases
     constexpr int kNumSendUnrolls = combine_smem::send_unrolls(kHidden, kElemBytes);
-    constexpr int kNumRecvUnrolls = combine_smem::kNumRecvUnrolls;
+    // Receive unrolls grow with the token so one receive group (decode warps + TMA
+    // warp) always fits a 32-warp CTA -- see combine_smem::recv_unrolls.
+    constexpr int kNumRecvUnrolls = combine_smem::recv_unrolls(kHidden, kElemBytes);
+    EP_STATIC_ASSERT(kNumRecvUnrolls > 0, "hidden too wide: no LL combine receive group fits a CTA");
     constexpr int hiddenBf16Int4Pad = align(static_cast<int>(hiddenBf16Int4), kWarpSize * kNumSendUnrolls);
+    constexpr int kNumDecodeWarps = combine_smem::recv_decode_warps(kHidden, kElemBytes);
+    constexpr int kRecvPaddedTokenBytes = combine_smem::recv_padded_hidden_int4(kHidden, kElemBytes) * sizeof(int4);
     EP_STATIC_ASSERT(kNumSendUnrolls <= kNumMaxUnrolls and kNumRecvUnrolls <= kNumMaxUnrolls, "Invalid unrolls");
     EP_STATIC_ASSERT(hiddenBf16Int4 % kNumSendUnrolls == 0, "Invalid hidden");
-    EP_STATIC_ASSERT(kNumSendUnrolls >= kNumRecvUnrolls, "Invalid unroll factors");
+    // LogFMT's cast bookkeeping groups lanes by the receive unroll inside a send
+    // tile, so it needs send tiles to be at least as wide as receive tiles.
+    EP_STATIC_ASSERT(!kUseLogFMT || kNumSendUnrolls >= kNumRecvUnrolls, "Invalid unroll factors");
 
     // Message package
     using Recipe = CombineRecipeTraits<kRecipe>;
@@ -2131,7 +2138,7 @@ LOW_LATENCY_COMBINE_RECV:
 
     // Reassign warp groups; FP32 doubles SMEM per group, drop to 1 group to stay within limits
     constexpr int kMaxNumGroups = combine_smem::max_recv_groups(kElemBytes);
-    const int numDecodeWarps = hiddenBf16Int4Pad / (kNumRecvUnrolls * kWarpSize);
+    const int numDecodeWarps = kNumDecodeWarps;
     const int warpsPerRecvGroup = numDecodeWarps + combine_smem::kNumRecvTmaWarps;
     const int numGroups = min(kMaxNumGroups, (numThreads / kWarpSize) / warpsPerRecvGroup);
     const int decodeWarpIdx = __shfl_sync(0xffffffff, warpId % warpsPerRecvGroup, 0);
@@ -2148,7 +2155,7 @@ LOW_LATENCY_COMBINE_RECV:
             return combine_smem::recv_tma_buffer_bytes(kHidden, kElemBytes, /*nvfp4=*/false);
         }();
         constexpr int kNumBF16PerWarpBytes = kWarpSize * kNumRecvUnrolls * kNumElemsPerInt4 * kElemBytes;
-        constexpr int kPaddedTokenBytes = hiddenBf16Int4Pad * sizeof(int4);
+        constexpr int kPaddedTokenBytes = kRecvPaddedTokenBytes;
         constexpr int kNumLogFMTPerWarpBytes =
             kNumBF16PerWarpBytes / combine_smem::kLogFmtInputBytesPerChunk * combine_smem::kLogFmtOutputBytesPerChunk;
         constexpr int kNumDivisionBytes = kNumDivisions * sizeof(uint32_t);

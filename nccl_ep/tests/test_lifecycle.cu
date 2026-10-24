@@ -126,6 +126,56 @@ TEST(LlCombineSmem, PadsGptOssHiddenForPartialDecodeWarp) {
     EXPECT_EQ(layout.buffer.num_bytes_per_combine_msg % sizeof(int4), 0);
 }
 
+TEST(LlCombineSmem, RecvUnrollsGrowOnlyWhenAGroupCannotFitTheCta) {
+    using namespace nccl_ep::ll::combine_smem;
+    constexpr int kBf16 = kTwoByteElementBytes;
+    // Historical factor of 2 for every hidden size that fit before.
+    EXPECT_EQ(recv_unrolls(2880, kBf16), 2);
+    EXPECT_EQ(recv_unrolls(7168, kBf16), 2);
+    EXPECT_EQ(recv_unrolls(8192, kBf16), 2);
+    EXPECT_EQ(recv_decode_warps(8192, kBf16), 16);
+    EXPECT_EQ(recv_unrolls(15360, kBf16), 2);
+    EXPECT_EQ(recv_decode_warps(15360, kBf16), 30);
+    // 16384 bf16 needs 32 decode warps at 2 unrolls (+1 TMA warp > 32): move to 4.
+    EXPECT_EQ(recv_unrolls(16384, kBf16), 4);
+    EXPECT_EQ(recv_decode_warps(16384, kBf16), 16);
+    EXPECT_EQ(recv_padded_hidden_int4(16384, kBf16), 2048);
+    // fp32 doubles the int4 count: 16384 fp32 needs 32 decode warps even at 4 unrolls.
+    EXPECT_EQ(recv_unrolls(15360, 4), 4);
+    EXPECT_EQ(recv_unrolls(16384, 4), 0);
+    EXPECT_EQ(recv_decode_warps(16384, 4), kMaxCtaWarps);
+}
+
+TEST(LlCombineSmem, Hidden16384Bf16FitsWith1024ExpertsOn148Sms) {
+    // 1024 experts / 148 SMs -> 7 warp groups x 4 warps = 28 warps; before the
+    // hidden-dependent unroll this needed 33 warps and was infeasible.
+    constexpr int kOptinSmem = 232448;
+    const auto config = nccl_ep::ll::choose_combine_smem_config(
+        /*hidden=*/16384,
+        ncclBfloat16,
+        NCCL_EP_COMB_QUANT_NONE,
+        /*num_warp_groups=*/7,
+        /*requested_warps_per_group=*/4,
+        kOptinSmem - nccl_ep::ll::combine_smem::kLsaStaticSmemBytes);
+    ASSERT_TRUE(config.feasible);
+    EXPECT_EQ(config.num_warps_per_group, 4);
+    EXPECT_EQ(config.num_warps, 28);
+    EXPECT_EQ(config.num_recv_groups, 1);
+    EXPECT_LE(config.dynamic_smem_bytes, kOptinSmem);
+
+    const auto wide = nccl_ep::ll::choose_combine_smem_config(
+        /*hidden=*/16384, ncclBfloat16, NCCL_EP_COMB_QUANT_NONE,
+        /*num_warp_groups=*/1, /*requested_warps_per_group=*/32, kOptinSmem);
+    ASSERT_TRUE(wide.feasible);
+    EXPECT_EQ(wide.num_warps, 32);
+
+    // fp32 at 16384 still has no receive group that fits a CTA.
+    const auto fp32 = nccl_ep::ll::choose_combine_smem_config(
+        /*hidden=*/16384, ncclFloat32, NCCL_EP_COMB_QUANT_NONE,
+        /*num_warp_groups=*/1, /*requested_warps_per_group=*/32, 1024 * 1024);
+    EXPECT_FALSE(fp32.feasible);
+}
+
 TEST(LlCombineSmem, RejectsConfigurationsBelowMinimumFootprint) {
     const auto config = nccl_ep::ll::choose_combine_smem_config(
         /*hidden=*/7168,

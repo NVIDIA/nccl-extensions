@@ -3625,12 +3625,6 @@ static bool em_staging_indexed_by_em_slot(ncclEpGroup_t group) {
 // IDs. Pull-push already uses original-order sparse weights and srcpos_map.
 enum class HtProbWire { kDense, kCompact };
 
-// Wire prob row width in floats. Rounded up to a multiple of 4 so rows stay
-// 16 B-aligned for TMA / float4 stores (same constraint the dense row has).
-static inline int combine_compact_prob_row_floats(int num_topk) {
-    return (num_topk + 3) & ~3;
-}
-
 // Resolve the wire format for this group + handle top-k (num_topk > 0 is
 // guaranteed by ncclEpInitHandle validation). Select compact automatically
 // when the complete weights-plus-IDs row fits the representation and is smaller
@@ -6106,7 +6100,7 @@ ncclResult_t ncclEpDispatch(
             (!recv_topk_order.is_set || recv_topk_order.value.ul == 0);
         const int wire_prob_floats =
             compact_dispatch_prob ? nccl_ep::ht::dispatch_compact_prob_row_floats(handle->num_topk) :
-            (prob_wire == HtProbWire::kCompact) ? combine_compact_prob_row_floats(handle->num_topk) : 0;
+            (prob_wire == HtProbWire::kCompact) ? nccl_ep::ht::combine_compact_prob_row_floats(handle->num_topk) : 0;
         // FWD only: rebuild the wire prob rows from cached topk_idx + caller topk_weights.
         float* prob_buffer = handle->ht.prob_buffer;
         if (forward_dispatch && !pull_active) {
@@ -7598,7 +7592,7 @@ ncclResult_t ncclEpCombine(
         // for pull-push, whose actual weight payload remains sparse-direct.
         const HtProbWire prob_wire = ht_prob_wire_mode(group, handle->num_topk);
         const int wire_prob_floats =
-            (prob_wire == HtProbWire::kCompact) ? combine_compact_prob_row_floats(handle->num_topk) : 0;
+            (prob_wire == HtProbWire::kCompact) ? nccl_ep::ht::combine_compact_prob_row_floats(handle->num_topk) : 0;
         if (backward_combine && prob_wire == HtProbWire::kCompact) {
             assert(num_topk == handle->num_topk &&
                    "HT compact BWD combine: output width must match handle top-k");

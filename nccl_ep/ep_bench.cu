@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <algorithm>
 #include <cmath>
@@ -36,6 +37,7 @@
 #include <nccl.h>
 #include <nccl_device.h>
 #include "nccl_ep.h"
+#include "ht_compact_prob.h"
 
 #if defined(__has_include)
 #if __has_include(<cuda_fp4.h>)
@@ -239,6 +241,54 @@ static cudaError_t cudaFreeCallback(void* ptr, void* /*context*/) {
 static bool htPullPushEnabled() {
     const char* v = std::getenv("NCCL_EP_HT_PULL_PUSH");
     return v != nullptr && v[0] != '\0' && v[0] != '0';
+
+// Widened to size_t: the product can exceed a 32-bit int for absurd --experts values, and a
+// wrapped or negative width would be reported as a plausible byte count rather than rejected.
+static size_t htDenseProbRowFloats(unsigned int num_experts_per_rank, int lsa_team_size) {
+    return static_cast<size_t>(num_experts_per_rank) * static_cast<size_t>(lsa_team_size);
+}
+
+// Compact-vs-dense exactly as the library resolves it. One mode serves both legs
+// (nccl_ep.cc ht_prob_wire_mode), so the predicate is the dispatch-width one on both.
+static size_t htProbRowBytes(size_t dense_floats, int compact_floats, unsigned int top_k,
+                             unsigned int num_experts) {
+    // Both width helpers return -1 on bad input; fall back to dense rather than reporting SIZE_MAX.
+    const bool compact =
+        compact_floats > 0 &&
+        dense_floats <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
+        nccl_ep::ht::compact_prob_fits(static_cast<int>(top_k), static_cast<int>(num_experts),
+                                       static_cast<int>(dense_floats));
+    const size_t floats = compact ? static_cast<size_t>(compact_floats) : dense_floats;
+    return floats * sizeof(float);
+}
+
+// Routing-probability bytes per token copy for dispatch. Only plain forward dispatch sends a row:
+// backward sends none, and pull-push stages none at all (the receiver pulls scalar weights
+// instead, which these counters do not model).
+static size_t htDispatchProbBytesPerToken(ncclEpPassDir_t pass, ncclEpLayout_t layout,
+                                          unsigned int top_k, unsigned int num_experts,
+                                          unsigned int num_experts_per_rank, int lsa_team_size) {
+    if (pass != NCCL_EP_FWD_PASS) return 0;
+    if (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR && htPullPushEnabled()) return 0;
+
+    return htProbRowBytes(htDenseProbRowFloats(num_experts_per_rank, lsa_team_size),
+                          nccl_ep::ht::dispatch_compact_prob_row_floats(static_cast<int>(top_k)),
+                          top_k, num_experts);
+}
+
+// Routing-probability bytes per token copy for combine. Only plain backward combine sends a row;
+// forward sends none. Zero under pull-push, but that is a gap, not an exact figure: push combine
+// scatters one weight per expert copy into the peer's row pad (device/ht_ep.cuh combine_push), which
+// these counters do not model -- as on the dispatch side.
+static size_t htCombineProbBytesPerToken(ncclEpPassDir_t pass, ncclEpLayout_t layout,
+                                         unsigned int top_k, unsigned int num_experts,
+                                         unsigned int num_experts_per_rank, int lsa_team_size) {
+    if (pass != NCCL_EP_BWD_PASS) return 0;
+    if (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR && htPullPushEnabled()) return 0;
+
+    return htProbRowBytes(htDenseProbRowFloats(num_experts_per_rank, lsa_team_size),
+                          nccl_ep::ht::combine_compact_prob_row_floats(static_cast<int>(top_k)),
+                          top_k, num_experts);
 }
 
 // Element size for the dtypes used in this benchmark. ncclTypeSize is internal to the EP library.
@@ -4469,6 +4519,32 @@ static void printHtBandwidthLine(const char* direction, size_t total, size_t nvl
            static_cast<double>(scale_out) * per_rank_gb);
 }
 
+// Sum one pass's two legs across ranks.
+static void htReduceLegs(const HighThroughputBytes& local, HtByteTotals* dispatch_out,
+                         HtByteTotals* combine_out) {
+    // One reduce per leg, over the struct as a flat array of the MPI element type. Two asserts
+    // are needed: every member must BE that type, or the element count below is wrong; and the
+    // struct must hold nothing else, or a member is silently dropped from the reduction.
+    using ReduceWord = unsigned long;  // must match MPI_UNSIGNED_LONG
+    static_assert(std::is_same_v<decltype(HtByteTotals::total_send), ReduceWord> &&
+                      std::is_same_v<decltype(HtByteTotals::nvl_send), ReduceWord> &&
+                      std::is_same_v<decltype(HtByteTotals::scale_out_send), ReduceWord> &&
+                      std::is_same_v<decltype(HtByteTotals::total_recv), ReduceWord> &&
+                      std::is_same_v<decltype(HtByteTotals::nvl_recv), ReduceWord> &&
+                      std::is_same_v<decltype(HtByteTotals::scale_out_recv), ReduceWord>,
+                  "every HtByteTotals member must match MPI_UNSIGNED_LONG");
+    static_assert(sizeof(HtByteTotals) ==
+                      sizeof(HtByteTotals::total_send) + sizeof(HtByteTotals::nvl_send) +
+                          sizeof(HtByteTotals::scale_out_send) + sizeof(HtByteTotals::total_recv) +
+                          sizeof(HtByteTotals::nvl_recv) + sizeof(HtByteTotals::scale_out_recv),
+                  "HtByteTotals must hold exactly these members, padding-free");
+    constexpr int kLegFields = static_cast<int>(sizeof(HtByteTotals) / sizeof(ReduceWord));
+    MPI_Reduce(&local.dispatch, dispatch_out, kLegFields, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+               MPI_COMM_WORLD);
+    MPI_Reduce(&local.combine, combine_out, kLegFields, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+               MPI_COMM_WORLD);
+}
+
 static HtByteTotals htTokensToBytes(const HighThroughputBytes& b, size_t bytes_per_token) {
     HtByteTotals t = {};
     t.total_send = b.total_send_tokens * bytes_per_token;
@@ -4483,7 +4559,8 @@ static HtByteTotals htTokensToBytes(const HighThroughputBytes& b, size_t bytes_p
 // Calculate all six byte metrics from topk_idx for High Throughput mode. The send loop walks this
 // rank's own routing; the recv loop replays every source rank's randperm routing (deterministic
 // from seed = src_rank + 42) and also credits nvl_send with the fan-out myRank issues as a landing
-// rank.
+// rank. Token counts are direction-independent, so pass/layout only pick which leg carries the
+// probability row.
 HighThroughputBytes calculateHighThroughputBytes(
     const int64_t* topk_idx_host,
     unsigned int num_tokens,
@@ -4497,6 +4574,8 @@ HighThroughputBytes calculateHighThroughputBytes(
     int lsa_team_size,
     ncclDataType_t token_dtype,
     ncclDataType_t scales_forward_token_dtype,
+    ncclEpPassDir_t pass,
+    ncclEpLayout_t layout,
     bool ignore_local_traffic) {
     HighThroughputBytes bytes = {};
 
@@ -4619,8 +4698,15 @@ HighThroughputBytes calculateHighThroughputBytes(
     // is a different number and is computed above.
     const size_t combine_bytes_per_token = none_bytes_per_token;
 
-    bytes.dispatch = htTokensToBytes(bytes, dispatch_bytes_per_token);
-    bytes.combine = htTokensToBytes(bytes, combine_bytes_per_token);
+    // The probability row rides the same token counts as the token: one copy per destination rank.
+    bytes.dispatch = htTokensToBytes(
+        bytes,
+        dispatch_bytes_per_token + htDispatchProbBytesPerToken(pass, layout, top_k, num_experts,
+                                                               num_experts_per_rank, lsa_team_size));
+    bytes.combine = htTokensToBytes(
+        bytes,
+        combine_bytes_per_token + htCombineProbBytesPerToken(pass, layout, top_k, num_experts,
+                                                             num_experts_per_rank, lsa_team_size));
 
     return bytes;
 }
@@ -4910,8 +4996,7 @@ void printHighThroughputResults(
     const HtByteTotals& dispatch_totals,
     const HtByteTotals& combine_totals,
     ncclEpDispQuant_t dispatch_quantization,
-    bool dispatch_only,
-    bool report_bandwidth = true) {
+    bool dispatch_only) {
     double local_dispatch_avg = dispatch_result.avg_ms;
     double local_dispatch_min = dispatch_result.min_ms;
     double local_dispatch_max = dispatch_result.max_ms;
@@ -5004,7 +5089,7 @@ void printHighThroughputResults(
         printf("--- BW based on total time ---\n");
         printf("Dispatch:    total=%.2f us (min=%.2f, max=%.2f)\n", global_dispatch_avg * 1000,
                global_dispatch_min * 1000, global_dispatch_max * 1000);
-        if (report_bandwidth && dk_total_s > 0) {
+        if (dk_total_s > 0) {
             printHtBandwidthLine("recv", dispatch_totals.total_recv, dispatch_totals.nvl_recv,
                                  dispatch_totals.scale_out_recv, nRanks, dk_total_s);
             printHtBandwidthLine("send", dispatch_totals.total_send, dispatch_totals.nvl_send,
@@ -5013,7 +5098,7 @@ void printHighThroughputResults(
         if (!dispatch_only) {
             printf("Combine:     total=%.2f us (min=%.2f, max=%.2f)\n", global_combine_avg * 1000,
                    global_combine_min * 1000, global_combine_max * 1000);
-            if (report_bandwidth && ck_total_s > 0) {
+            if (ck_total_s > 0) {
                 printHtBandwidthLine("send", combine_totals.total_recv, combine_totals.nvl_recv,
                                      combine_totals.scale_out_recv, nRanks, ck_total_s);
                 printHtBandwidthLine("recv", combine_totals.total_send, combine_totals.nvl_send,
@@ -5034,7 +5119,7 @@ void printHighThroughputResults(
             double dk_s = avg_kernel_dk_us / 1e6;
             double ck_s = avg_kernel_ck_us / 1e6;
             printf("Dispatch:    kernel=%.2f us\n", avg_kernel_dk_us);
-            if (report_bandwidth && dk_s > 0) {
+            if (dk_s > 0) {
                 printHtBandwidthLine("recv", dispatch_totals.total_recv, dispatch_totals.nvl_recv,
                                      dispatch_totals.scale_out_recv, nRanks, dk_s);
                 printHtBandwidthLine("send", dispatch_totals.total_send, dispatch_totals.nvl_send,
@@ -5046,7 +5131,7 @@ void printHighThroughputResults(
 
             if (!dispatch_only) {
                 printf("Combine:     kernel=%.2f us\n", avg_kernel_ck_us);
-                if (report_bandwidth && ck_s > 0) {
+                if (ck_s > 0) {
                     printHtBandwidthLine("send", combine_totals.total_recv, combine_totals.nvl_recv,
                                          combine_totals.scale_out_recv, nRanks, ck_s);
                     printHtBandwidthLine("recv", combine_totals.total_send, combine_totals.nvl_send,
@@ -5072,25 +5157,24 @@ void printHighThroughputResults(
             printf("  NOTE: CUPTI support was not compiled.\n");
         }
 
-        if (report_bandwidth) {
-            printf(
-                "\nLogical payload bytes (tokens + forwarded scales, per-rank avg): "
-                "total_send=%.2f MB (%u tokens), nvl_send=%.2f MB (%u tokens), "
-                "scale_out_send=%.2f MB (%u tokens), total_recv=%.2f MB (%u tokens), "
-                "nvl_recv=%.2f MB (%u tokens), scale_out_recv=%.2f MB (%u tokens)\n",
-                htMbPerRank(dispatch_totals.total_send, nRanks),
-                ht_bytes.total_send_tokens,
-                htMbPerRank(dispatch_totals.nvl_send, nRanks),
-                ht_bytes.nvl_send_tokens,
-                htMbPerRank(dispatch_totals.scale_out_send, nRanks),
-                ht_bytes.scale_out_send_tokens,
-                htMbPerRank(dispatch_totals.total_recv, nRanks),
-                ht_bytes.total_recv_tokens,
-                htMbPerRank(dispatch_totals.nvl_recv, nRanks),
-                ht_bytes.nvl_recv_tokens,
-                htMbPerRank(dispatch_totals.scale_out_recv, nRanks),
-                ht_bytes.scale_out_recv_tokens);
-        }
+        printf(
+            "\nLogical payload bytes, dispatch leg (tokens + forwarded scales + routing "
+            "probabilities where transmitted, per-rank avg): "
+            "total_send=%.2f MB (%u tokens), nvl_send=%.2f MB (%u tokens), "
+            "scale_out_send=%.2f MB (%u tokens), total_recv=%.2f MB (%u tokens), "
+            "nvl_recv=%.2f MB (%u tokens), scale_out_recv=%.2f MB (%u tokens)\n",
+            htMbPerRank(dispatch_totals.total_send, nRanks),
+            ht_bytes.total_send_tokens,
+            htMbPerRank(dispatch_totals.nvl_send, nRanks),
+            ht_bytes.nvl_send_tokens,
+            htMbPerRank(dispatch_totals.scale_out_send, nRanks),
+            ht_bytes.scale_out_send_tokens,
+            htMbPerRank(dispatch_totals.total_recv, nRanks),
+            ht_bytes.total_recv_tokens,
+            htMbPerRank(dispatch_totals.nvl_recv, nRanks),
+            ht_bytes.nvl_recv_tokens,
+            htMbPerRank(dispatch_totals.scale_out_recv, nRanks),
+            ht_bytes.scale_out_recv_tokens);
     }
 }
 
@@ -6215,6 +6299,12 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Declared here so the byte accounting below reads the pass direction the kernels will run
+    // with, rather than assuming one. apply_pass_wiring is the only writer.
+    ncclEpDispatchConfig_t dispatch_config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    dispatch_config.round_scales = 0;
+    dispatch_config.quant_recipe = dispatch_quantization;
+
     // Calculate logical payload metrics for the selected recipe.
     LowLatencyBytes ll_bytes = {};
     HighThroughputBytes ht_bytes = {};
@@ -6245,6 +6335,8 @@ int main(int argc, char* argv[]) {
             ncclTeamLsa(comm).nRanks,
             token_dtype,
             scales_forward_token_dtype,
+            dispatch_config.pass_direction,
+            layout,
             ignore_local_traffic);
     }
 
@@ -6641,10 +6733,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    ncclEpDispatchConfig_t dispatch_config = NCCL_EP_DISPATCH_CONFIG_INIT;
-    dispatch_config.round_scales = 0;
-    dispatch_config.quant_recipe = dispatch_quantization;
-
     // Synchronize before benchmarking
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     CUDACHECK(cudaStreamSynchronize(stream));
@@ -6669,8 +6757,9 @@ int main(int argc, char* argv[]) {
         // runPairedBenchmark's throughput_gbps, which HT does not print -- only printLowLatencyResults
         // reports those fields -- so nothing HT prints depends on it today.
         dispatch_data_bytes = ht_bytes.dispatch.scale_out_send + ht_bytes.dispatch.total_recv;
-        // Combine's own totals, which now carry the caller-dtype row rather than the dispatch
-        // recipe's. Identical to dispatch_data_bytes whenever dispatch is unquantized.
+        // Combine's own totals, which carry the caller-dtype row rather than the dispatch recipe's.
+        // These can differ even unquantized when dispatch transmits a routing-probability row;
+        // forward combine carries no such row. They match again where that row is absent.
         if (!dispatch_only) {
             combine_data_bytes =
                 ht_bytes.combine.scale_out_send + ht_bytes.combine.total_recv;
@@ -6903,27 +6992,7 @@ int main(int argc, char* argv[]) {
     HtByteTotals dispatch_totals = {};
     HtByteTotals combine_totals = {};
     if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
-        // One reduce per leg, over the struct as a flat array of the MPI element type. Two asserts
-        // are needed: every member must BE that type, or the element count below is wrong; and the
-        // struct must hold nothing else, or a member is silently dropped from the reduction.
-        using ReduceWord = unsigned long;  // must match MPI_UNSIGNED_LONG
-        static_assert(std::is_same_v<decltype(HtByteTotals::total_send), ReduceWord> &&
-                          std::is_same_v<decltype(HtByteTotals::nvl_send), ReduceWord> &&
-                          std::is_same_v<decltype(HtByteTotals::scale_out_send), ReduceWord> &&
-                          std::is_same_v<decltype(HtByteTotals::total_recv), ReduceWord> &&
-                          std::is_same_v<decltype(HtByteTotals::nvl_recv), ReduceWord> &&
-                          std::is_same_v<decltype(HtByteTotals::scale_out_recv), ReduceWord>,
-                      "every HtByteTotals member must match MPI_UNSIGNED_LONG");
-        static_assert(sizeof(HtByteTotals) ==
-                          sizeof(HtByteTotals::total_send) + sizeof(HtByteTotals::nvl_send) +
-                              sizeof(HtByteTotals::scale_out_send) + sizeof(HtByteTotals::total_recv) +
-                              sizeof(HtByteTotals::nvl_recv) + sizeof(HtByteTotals::scale_out_recv),
-                      "HtByteTotals must hold exactly these members, padding-free");
-        constexpr int kLegFields = static_cast<int>(sizeof(HtByteTotals) / sizeof(ReduceWord));
-        MPI_Reduce(&ht_bytes.dispatch, &dispatch_totals, kLegFields, MPI_UNSIGNED_LONG, MPI_SUM, 0,
-                   MPI_COMM_WORLD);
-        MPI_Reduce(&ht_bytes.combine, &combine_totals, kLegFields, MPI_UNSIGNED_LONG, MPI_SUM, 0,
-                   MPI_COMM_WORLD);
+        htReduceLegs(ht_bytes, &dispatch_totals, &combine_totals);
     }
 
     if (myRank == 0 && algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
@@ -7235,9 +7304,28 @@ int main(int argc, char* argv[]) {
             // No update_fn here: backward reuses the forward pass's routing state as-is.
             PairedBenchResult bwd_result = run_paired_pass(ktimer_bwd, [] {});
 
-            // Backward transports a different byte volume than forward (dispatch drops
-            // weights/idx, combine moves grad tokens), so suppress the forward-derived
-            // bandwidth lines and report timing only.
+            // Backward moves the same token rows as forward but swaps which leg carries the
+            // probability row, so its byte totals are recomputed for this direction rather than
+            // reusing the forward ones.
+            const HighThroughputBytes bwd_bytes = calculateHighThroughputBytes(
+                topk_idx_host,
+                num_tokens,
+                num_tokens_per_rank.data(),
+                top_k,
+                num_experts,
+                hidden,
+                myRank,
+                nRanks,
+                dispatch_quantization,
+                ncclTeamLsa(comm).nRanks,
+                token_dtype,
+                scales_forward_token_dtype,
+                dispatch_config.pass_direction,
+                layout,
+                ignore_local_traffic);
+            HtByteTotals bwd_dispatch_totals = {};
+            HtByteTotals bwd_combine_totals = {};
+            htReduceLegs(bwd_bytes, &bwd_dispatch_totals, &bwd_combine_totals);
             printHighThroughputResults(
                 myRank,
                 nRanks,
@@ -7245,12 +7333,11 @@ int main(int argc, char* argv[]) {
                 bwd_result.combine,
                 bwd_result.total,
                 ktimer_bwd,
-                ht_bytes,
-                dispatch_totals,
-                combine_totals,
+                bwd_bytes,
+                bwd_dispatch_totals,
+                bwd_combine_totals,
                 dispatch_quantization,
-                dispatch_only,
-                /*report_bandwidth=*/false);
+                dispatch_only);
 
             // ===== Backward correctness validation (EM round-trip) =====
             // grad_tokens must equal the unweighted per-token sum of its expert copies, and

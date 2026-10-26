@@ -248,6 +248,9 @@ $(JIT_DIR)/%: %
 
 # Include generated dependency files (the - prefix silences errors if files don't exist yet)
 -include $(ALL_OBJ:.o=.d)
+# ep_test/ep_bench are built outside ALL_OBJ, so pick up their dependency files too: both pull in
+# private headers (ht_compact_prob.h) that no explicit prerequisite lists.
+-include $(DST_DIR)/ep_test.d $(DST_DIR)/ep_bench.d
 
 # Detect CUPTI headers at compile time (optional; enables kernel-level GPU timing)
 CUPTI_AVAILABLE := $(shell echo '\#include <cupti.h>' | $(NVCC_CXX_COMPILER) -x c++ -E - >/dev/null 2>&1 && echo 1)
@@ -286,7 +289,7 @@ af_test: lib $(DST_DIR)/af_test
 $(DST_DIR)/ep_test.o: ep_test.cu $(HEADER_TARGETS)
 	@printf "Compiling  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
-	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) -c $<
+	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) $(DEPFLAGS) -c $<
 
 $(DST_DIR)/ep_test: $(DST_DIR)/ep_test.o $(SOLIBTARGET)
 	@printf "Linking    %-35s > %s\n" $< $@
@@ -306,7 +309,7 @@ $(DST_DIR)/af_test: $(DST_DIR)/af_test.o $(SOLIBTARGET)
 $(DST_DIR)/ep_bench.o: ep_bench.cu $(HEADER_TARGETS)
 	@printf "Compiling  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
-	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) -c $<
+	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) $(DEPFLAGS) -c $<
 
 $(DST_DIR)/ep_bench: $(DST_DIR)/ep_bench.o $(SOLIBTARGET)
 	@printf "Linking    %-35s > %s\n" $< $@
@@ -328,7 +331,7 @@ af_test: lib $(DST_DIR)/af_test
 $(DST_DIR)/ep_test.o: ep_test.cu $(HEADER_TARGETS)
 	@printf "Compiling  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
-	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) -c $<
+	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) $(DEPFLAGS) -c $<
 
 $(DST_DIR)/ep_test: $(DST_DIR)/ep_test.o $(SOLIBTARGET)
 	@printf "Linking    %-35s > %s\n" $< $@
@@ -348,7 +351,7 @@ $(DST_DIR)/af_test: $(DST_DIR)/af_test.o $(SOLIBTARGET)
 $(DST_DIR)/ep_bench.o: ep_bench.cu $(HEADER_TARGETS)
 	@printf "Compiling  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
-	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) -c $<
+	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) $(DEPFLAGS) -c $<
 
 $(DST_DIR)/ep_bench: $(DST_DIR)/ep_bench.o $(SOLIBTARGET)
 	@printf "Linking    %-35s > %s\n" $< $@

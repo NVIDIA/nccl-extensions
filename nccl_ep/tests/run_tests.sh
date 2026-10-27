@@ -29,6 +29,14 @@ HT_EM_RERUN=0
 # AUTO tests independently clear this override and declare their top-k.
 export NCCL_EP_HT_PULL_PUSH=0
 
+# Chunk and SM selection are header-only host policies.
+if [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ht_chunk_config" ]]; then
+    "${NCCL_EP_BUILDDIR}/test/nccl_ep/test_ht_chunk_config" ${GTEST_ARGS[@]+"${GTEST_ARGS[@]}"} || OVERALL_FAIL=1
+fi
+if [[ "${TEST_SUITE}" == "test_ht_chunk_config" ]]; then
+    exit "${OVERALL_FAIL}"
+fi
+
 # Driver compatibility checks use mocked CUDA queries and need no GPU ranks.
 if [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_cft_driver_api" ]]; then
     if ! CFT_UNDEFINED_SYMBOLS=$(nm -D --undefined-only "${NCCL_EP_BUILDDIR}/lib/libnccl_ep.so"); then
@@ -131,7 +139,6 @@ run_suite() {
 # em_affected suites are re-run under every HT-EM mode.
 SUITES=(
     "test_ht_dispatch_async|EP HT Async Dispatch Tests|0"
-    "test_ht_chunk_config|EP HT Chunk Config Tests|0"
     "test_ht_chunk_handle|EP HT Chunk Handle Tests|0"
     "test_output_layout|EP Output Layout Tests|1"
     "test_handle_maps|EP Handle Maps Tests|1"

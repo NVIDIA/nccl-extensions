@@ -16,6 +16,7 @@
 #include <functional>
 #include <mutex>
 #include <new>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <cstring>
@@ -28,6 +29,7 @@
 #include "nccl_ep_env.h"
 #include "ht_compact_prob.h"
 #include "ht_chunk_config.hpp"
+#include "ht_sm_policy.hpp"
 #include "common.hpp"
 
 // HT (High Throughput) includes
@@ -806,6 +808,8 @@ struct ncclEpGroup {
     int ht_combine_tokens_per_chunk = 0;
     // Dispatch override/fallback; automatic selection is stored per handle.
     int ht_dispatch_tokens_per_chunk = 0;
+    int ht_flat_combine_tokens_per_chunk = 0;
+    int ht_flat_dispatch_tokens_per_chunk = 0;
 
     struct {
         // Device communicator (single comm, multiple contexts)
@@ -848,7 +852,7 @@ struct ncclEpGroup {
     int num_attn_ranks;       // AFD A-side rank count; zero means classic EP.
     int max_recv_tokens;      // Resolved per-rank IPC slot budget (= config.max_recv_tokens_per_rank).
 
-    // SM-count configuration, all resolved once at ncclEpCreateGroup.
+    // SM budgets resolved at group creation; shared resources reserve the larger layout budget.
     unsigned int device_sm;
     unsigned int device_sm_count;   // Number of SMs on the device
     int max_dynamic_smem;           // Opt-in dynamic shared-memory limit per block
@@ -860,6 +864,8 @@ struct ncclEpGroup {
     size_t device_smem_optin;
     unsigned int dispatch_num_sms; // Resolved dispatch SM budget.
     unsigned int combine_num_sms;  // Resolved combine SM budget.
+    unsigned int flat_dispatch_num_sms = 0;
+    unsigned int flat_combine_num_sms = 0;
     nccl_ep::ht::DispatchCopyMode dispatch_copy_mode;
     unsigned int shuffle_sms; // Resolved SM count for the shuffle kernels (local_dup, local_reduce, push-combine reduce).
     unsigned int
@@ -2261,6 +2267,46 @@ __attribute__((constructor)) static void nccl_ep_lib_init() {
     showVersion();
 }
 
+static bool ht_valid_sms_override(const ncclEpEnvVar& var, unsigned int device_sms) {
+    return var.is_set && var.value.ul >= 1 && var.value.ul <= device_sms;
+}
+
+static unsigned int ht_flat_sm_budget(
+    ncclEpGroup_t group, const ncclEpGroupConfig_t* config, unsigned int requested,
+    const ncclEpEnvVar& op_env, unsigned int resolved, unsigned int default_sms) {
+    const bool automatic = config->max_num_sms == NCCL_EP_AUTO && requested == NCCL_EP_AUTO &&
+                           !ht_valid_sms_override(group->env.comm_num_sms, group->device_sm_count) &&
+                           !ht_valid_sms_override(op_env, group->device_sm_count);
+    if (config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && automatic) {
+        return default_sms;
+    }
+    return resolved;
+}
+
+static void init_ht_chunks(ncclEpGroup_t ep_group) {
+    const int chunk = nccl_ep_resolve_combine_chunk(
+        ep_group->env, static_cast<int>(ep_group->dispatch_num_sms), ep_group->rdma_team_size);
+    ep_group->ht_combine_tokens_per_chunk = chunk;
+    ep_group->ht_dispatch_tokens_per_chunk =
+        nccl_ep_resolve_dispatch_chunk(ep_group->env, chunk, ep_group->rdma_team_size);
+    const int flat_chunk = ep_group->flat_dispatch_num_sms == ep_group->dispatch_num_sms
+                               ? chunk
+                               : nccl_ep_resolve_combine_chunk(
+                                     ep_group->env, ep_group->flat_dispatch_num_sms, ep_group->rdma_team_size);
+    ep_group->ht_flat_combine_tokens_per_chunk = flat_chunk;
+    ep_group->ht_flat_dispatch_tokens_per_chunk = flat_chunk == chunk
+        ? ep_group->ht_dispatch_tokens_per_chunk
+        : nccl_ep_resolve_dispatch_chunk(ep_group->env, flat_chunk, ep_group->rdma_team_size);
+    if (nccl_ep_env_verbose(ep_group->env)) {
+        fprintf(stderr, "[nccl_ep] HT chunks: expert-major dispatch=%d combine=%d; flat dispatch=%d combine=%d\n",
+                ep_group->ht_dispatch_tokens_per_chunk, chunk,
+                ep_group->ht_flat_dispatch_tokens_per_chunk, flat_chunk);
+    }
+    // The shared stride must be divisible by both layouts' chunk sizes.
+    ep_group->ht_aligned_max_tokens = nccl_ep::align<unsigned int>(
+        ep_group->config.max_dispatch_tokens_per_rank, std::lcm(chunk, flat_chunk));
+}
+
 ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, const ncclEpGroupConfig_t* in_config) {
     NCCLCHECK(validateNcclRuntimeVersion());
 
@@ -2451,11 +2497,10 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         }
     }
 
-    // Resolve the shared budget first. New operation-specific config fields
-    // inherit it when AUTO, preserving the V1/V2 behavior exactly.
+    // Reserve shared dispatch resources for the larger layout default.
     const unsigned int default_comm_sms =
         in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT ?
-            NCCL_EP_HT_DFLT_NUM_SMS :
+            nccl_ep::ht_default_comm_sms(ep_group->device_sm, /*expert_major=*/true) :
             ep_group->device_sm_count;
     unsigned int shared_num_sms = default_comm_sms;
     if (in_config->max_num_sms != NCCL_EP_AUTO) {
@@ -2498,7 +2543,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     // value when the override is invalid.
     auto apply_sms_override = [dev_sms, &env = ep_group->env](const ncclEpEnvVar& var, unsigned int& target) {
         if (!var.is_set) return;
-        if (var.value.ul >= 1 && var.value.ul <= dev_sms) {
+        if (ht_valid_sms_override(var, dev_sms)) {
             target = static_cast<unsigned int>(var.value.ul);
         } else {
             fprintf(stderr, "[nccl_ep] %s=%lu out of range (must be in [1, %u]); using %u\n", var.name, var.value.ul,
@@ -2510,6 +2555,13 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     apply_sms_override(ep_group->env.comm_num_sms, ep_group->combine_num_sms);
     apply_sms_override(ep_group->env.dispatch_num_sms, ep_group->dispatch_num_sms);
     apply_sms_override(ep_group->env.combine_num_sms, ep_group->combine_num_sms);
+    // Only the algorithm fallback varies by layout; explicit overrides stay shared.
+    ep_group->flat_dispatch_num_sms = ht_flat_sm_budget(
+        ep_group, in_config, in_config->dispatch_num_sms, ep_group->env.dispatch_num_sms,
+        ep_group->dispatch_num_sms, nccl_ep::kHtFlatDefaultSms);
+    ep_group->flat_combine_num_sms = ht_flat_sm_budget(
+        ep_group, in_config, in_config->combine_num_sms, ep_group->env.combine_num_sms,
+        ep_group->combine_num_sms, nccl_ep::ht_flat_combine_default_sms(in_config->max_dispatch_tokens_per_rank));
     apply_sms_override(ep_group->env.shuffle_sms, ep_group->shuffle_sms);
     apply_sms_override(ep_group->env.preprocess_num_sms, ep_group->preprocess_num_sms);
     const auto& copy_mode = ep_group->env.dispatch_copy_mode;
@@ -2854,20 +2906,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
 
     // Initialize HT intra-LSA buffers (windows, completion flags, etc.)
     if (ht_mode) {
-        // Resolve group-level defaults and overrides. Actual-token-based
-        // dispatch selection is deferred to ncclEpUpdateHandle.
-        const int chunk = nccl_ep_resolve_combine_chunk(
-            ep_group->env, static_cast<int>(ep_group->dispatch_num_sms), ep_group->rdma_team_size);
-        ep_group->ht_combine_tokens_per_chunk = chunk;
-        ep_group->ht_dispatch_tokens_per_chunk =
-            nccl_ep_resolve_dispatch_chunk(ep_group->env, chunk, ep_group->rdma_team_size);
-        if (nccl_ep_env_verbose(ep_group->env)) {
-            fprintf(stderr, "[nccl_ep] HT chunks: dispatch=%d combine=%d\n",
-                    ep_group->ht_dispatch_tokens_per_chunk, chunk);
-        }
-        // Chunk-aligned cross-LSA-team RDMA stride; also the max-tokens template arg for
-        // the dispatch/combine kernels (guarantees MAX_NUM_OF_TOKENS_PER_RANK % chunk == 0).
-        ep_group->ht_aligned_max_tokens = nccl_ep::align<unsigned int>(ep_group->config.max_dispatch_tokens_per_rank, chunk);
+        init_ht_chunks(ep_group);
 
         NCCL_CHECK_RESULT(init_ht_intranode(ep_group, in_config, stream));
         NCCL_CHECK_RESULT(init_ht_internode(ep_group, in_config, stream));
@@ -3685,14 +3724,31 @@ static HtProbWire ht_prob_wire_mode(ncclEpGroup_t group, int num_topk) {
     return HtProbWire::kCompact;
 }
 
+static unsigned int ht_dispatch_num_sms(ncclEpGroup_t group, ncclEpLayout_t layout) {
+    return layout == NCCL_EP_LAYOUT_FLAT ? group->flat_dispatch_num_sms : group->dispatch_num_sms;
+}
+
+static unsigned int ht_combine_num_sms(ncclEpGroup_t group, ncclEpLayout_t layout) {
+    return layout == NCCL_EP_LAYOUT_FLAT ? group->flat_combine_num_sms : group->combine_num_sms;
+}
+
+static int ht_combine_chunk(ncclEpGroup_t group, ncclEpLayout_t layout) {
+    return layout == NCCL_EP_LAYOUT_FLAT ? group->ht_flat_combine_tokens_per_chunk
+                                       : group->ht_combine_tokens_per_chunk;
+}
+
 static nccl_ep::HtDispatchChunkPolicy ht_dispatch_chunk_policy(ncclEpGroup_t group, ncclEpLayout_t layout) {
     // Automatic selection covers FLAT and expert-major local-permute only.
     const bool supported_layout = layout != NCCL_EP_LAYOUT_EXPERT_MAJOR ||
                                   group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalPermute;
     std::optional<int> explicit_chunk;
-    if (group->env.dispatch_tokens_per_chunk.is_set) explicit_chunk = group->ht_dispatch_tokens_per_chunk;
-    return {explicit_chunk, group->ht_dispatch_tokens_per_chunk,
-            group->rdma_team_size, static_cast<int>(group->dispatch_num_sms), supported_layout};
+    const int fallback = layout == NCCL_EP_LAYOUT_FLAT ? group->ht_flat_dispatch_tokens_per_chunk
+                                                      : group->ht_dispatch_tokens_per_chunk;
+    if (group->env.dispatch_tokens_per_chunk.is_set) {
+        explicit_chunk = fallback;
+    }
+    return {explicit_chunk, fallback,
+            group->rdma_team_size, static_cast<int>(ht_dispatch_num_sms(group, layout)), supported_layout};
 }
 
 // Returns the total buffer size (in bytes) for a LL handle_mem block.
@@ -4403,7 +4459,7 @@ ncclResult_t ncclEpInitHandle(
     if (ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         res = ll_init_handle(handle, ep_group, handle_mem, num_topk);
     } else {
-        handle->ht.dispatch_tokens_per_chunk = ep_group->ht_dispatch_tokens_per_chunk;
+        handle->ht.dispatch_tokens_per_chunk = ht_dispatch_chunk_policy(ep_group, layout).select(0);
         res = ht_init_handle(handle, ep_group, handle_mem, num_topk);
         if (res == ncclSuccess && is_ht_em) {
             handle->ht.dispatch_output_per_expert_alignment = em_align;
@@ -4832,7 +4888,7 @@ ncclResult_t ncclEpUpdateHandle(
     if (nccl_ep_env_verbose(ep_group->env)) {
         fprintf(stderr, "[nccl_ep] HT handle chunk: rank=%d tokens=%d dispatch=%d combine=%d\n",
                 ep_group->env.rank, handle->num_tokens, handle->ht.dispatch_tokens_per_chunk,
-                ep_group->ht_combine_tokens_per_chunk);
+                ht_combine_chunk(ep_group, handle->layout));
     }
 
     const ncclEpTensor_t* recv_expert_counter = layout_info ? tensor_ptr(layout_info->expert_counters) : nullptr;
@@ -6571,7 +6627,7 @@ ncclResult_t ncclEpDispatch(
                     group->rdma_team_size,
                     recipe,
                     pass_direction,
-                    static_cast<int>(group->dispatch_num_sms),
+                    static_cast<int>(ht_dispatch_num_sms(group, handle->layout)),
                     group->max_dynamic_smem,
                     sf_bytes_per_token,
                     &group->env,
@@ -7042,7 +7098,7 @@ ncclResult_t ncclEpDispatch(
                     lsa_ranks,
                     // Pull is the dispatch, so it uses the dispatch SM budget
                     // (dispatch_num_sms), not the shuffle or combine budget.
-                    static_cast<int>(group->dispatch_num_sms),
+                    static_cast<int>(ht_dispatch_num_sms(group, handle->layout)),
                     0u,
                     recipe,
                     group->gin_config.d_dcomm,
@@ -7698,7 +7754,7 @@ ncclResult_t ncclEpCombine(
                 team_size,
                 group->nRanks,
                 // Push combine is a comm kernel (NVLink push), so it uses the combine SM budget.
-                static_cast<int>(group->combine_num_sms),
+                static_cast<int>(ht_combine_num_sms(group, handle->layout)),
                 0u,
                 stream,
                 x->datatype,
@@ -7971,10 +8027,10 @@ ncclResult_t ncclEpCombine(
                 nccl_ep::ht::call_combine(
                     params,
                     group->ht_aligned_max_tokens, // chunk-aligned stride
-                    group->ht_combine_tokens_per_chunk, // tokens per combine chunk
+                    ht_combine_chunk(group, handle->layout), // tokens per combine chunk
                     group->rdma_team_size, // num_lsa_teams (RDMA domain size)
                     backward_combine, // backward mode flag
-                    static_cast<int>(group->combine_num_sms),
+                    static_cast<int>(ht_combine_num_sms(group, handle->layout)),
                     group->max_dynamic_smem,
                     &group->env,
                     stream));
@@ -8274,6 +8330,20 @@ void ncclEpGroup_test_getSmBudgets(
     if (group == nullptr) return;
     if (dispatch_num_sms != nullptr) *dispatch_num_sms = group->dispatch_num_sms;
     if (combine_num_sms != nullptr) *combine_num_sms = group->combine_num_sms;
+}
+
+void ncclEpHandle_test_getSmBudgets(
+    ncclEpHandle_t handle, unsigned int* dispatch_num_sms, unsigned int* combine_num_sms) {
+    if (dispatch_num_sms) {
+        *dispatch_num_sms = ht_dispatch_num_sms(handle->group, handle->layout);
+    }
+    if (combine_num_sms) {
+        *combine_num_sms = ht_combine_num_sms(handle->group, handle->layout);
+    }
+}
+
+int ncclEpHandle_test_getCombineTokensPerChunk(ncclEpHandle_t handle) {
+    return ht_combine_chunk(handle->group, handle->layout);
 }
 
 ncclEpHtFlow_t ncclEpGroup_test_getHtFlow(ncclEpGroup_t group) {

@@ -358,7 +358,7 @@ and run with a CUDA 13.3 or newer driver.
 
 ```bash
 # Override the HT dispatch/combine tokens-per-chunk. HT mode only; resolved once
-# per group at ncclEpCreateGroup. Must be a multiple of 32 (non-conforming values
+# per layout at ncclEpCreateGroup. Must be a multiple of 32 (non-conforming values
 # are rounded up with a warning). When unset, the chunk size defaults to:
 #   - RDMA / multi-node configs:  64
 #   - LSA-only / single-node:     NUM_OF_TOKENS_PER_GROUP (4) * resolved SM count,
@@ -397,7 +397,7 @@ configuration is first used.
 Dispatch/combine SM-budget controls (LL and HT):
 
     # Legacy fallback: used by both operations unless overridden below
-    export NCCL_EP_COMM_SMS=16
+    export NCCL_EP_COMM_SMS=32
 
     # Independent operation overrides
     export NCCL_EP_DISPATCH_SMS=12
@@ -410,10 +410,25 @@ Dispatch/combine SM-budget controls (LL and HT):
 Each operation resolves its budget independently. Precedence, highest first,
 is its operation-specific environment variable, NCCL_EP_COMM_SMS, its
 operation-specific ncclEpGroupConfig_t field, max_num_sms, then the
-algorithm default (all device SMs for LL and 16 for HT). Leaving both new
-fields and variables unset therefore preserves legacy behavior; setting one
+algorithm default (all device SMs for LL; HT expert-major uses 32 on Rubin SM107
+and 24 elsewhere). HT flat defaults to 16 for dispatch and combine, except combine
+uses 32 when the group's `max_dispatch_tokens_per_rank` is at least 8192. This
+uses the configured maximum, even when a handle dispatches fewer tokens. Leaving both
+fields and variables unset uses that default; setting one
 operation does not alter the other. Values must be in [1, device_sm_count]
 after resolution and must satisfy the LL warp-group geometry when LL is used.
+
+For multi-LSA HT groups, `num_qp_per_rank` must cover one reserved context plus
+two contexts per group dispatch SM. With automatic SM settings this is 49
+contexts on non-Rubin devices and 65 on Rubin, including for flat-only groups
+because group resources support both layouts. AUTO provisions that minimum;
+an explicit smaller value fails group creation.
+
+The non-Rubin expert-major default gives a 96-token chunk. Adaptive dispatch
+chunk selection is limited to validated defaults of 64, 128, and 256, so
+expert-major local-permute retains 96. A dispatch chunk override must divide
+the layout's shared chunk: 64 is ignored for a 96-token chunk. Set
+`NCCL_EP_TOKENS_PER_CHUNK=128` as well if you need a dispatch chunk of 64.
 
 The budgets do not need to be multiples of 4 or 8; any positive integer within
 the device and LL geometry limits is supported. Combine commonly benefits from

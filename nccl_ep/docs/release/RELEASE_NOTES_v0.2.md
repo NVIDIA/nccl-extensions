@@ -36,6 +36,16 @@ users. AUTO provisions them; smaller explicit budgets are rejected. The 24-SM
 expert-major default produces a 96-token chunk, outside the adaptive dispatch
 chunk policy's validated defaults; dispatch overrides must divide that chunk.
 
+## HT benchmark defaults
+
+`ep_bench` requests fused metadata by default where supported; use
+`--unfused-meta-dispatch` for comparison. Random-routing receive capacity now
+uses `ceil(1.15 * top_k * max_tokens_per_rank)`, plus expert-major padding.
+This is a benchmark policy, not a worst-case guarantee. Explicit budgets and
+legacy duplication staging requirements remain authoritative. Existing default
+benchmark time series change with these defaults; explicit push/pull rows
+retain coverage of the legacy implementation.
+
 ## New Features
 
 ### Quantization support

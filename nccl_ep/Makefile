@@ -307,7 +307,7 @@ $(DST_DIR)/af_test: $(DST_DIR)/af_test.o $(SOLIBTARGET)
 	@mkdir -p $(DST_DIR)
 	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) $< $(EP_TEST_NVLDFLAGS)
 
-$(DST_DIR)/ep_bench.o: ep_bench.cu $(HEADER_TARGETS)
+$(DST_DIR)/ep_bench.o: ep_bench.cu ep_bench_recv_budget.hpp $(HEADER_TARGETS)
 	@printf "Compiling  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
 	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) -c $<
@@ -349,7 +349,7 @@ $(DST_DIR)/af_test: $(DST_DIR)/af_test.o $(SOLIBTARGET)
 	@mkdir -p $(DST_DIR)
 	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) $< $(EP_TEST_NVLDFLAGS)
 
-$(DST_DIR)/ep_bench.o: ep_bench.cu $(HEADER_TARGETS)
+$(DST_DIR)/ep_bench.o: ep_bench.cu ep_bench_recv_budget.hpp $(HEADER_TARGETS)
 	@printf "Compiling  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
 	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) -c $<

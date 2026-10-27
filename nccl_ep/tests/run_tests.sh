@@ -24,6 +24,11 @@ TEST_SUITE="${TEST_SUITE:-}"
 OVERALL_FAIL=0
 HT_EM_RERUN=0
 
+# Keep the baseline and duplication reruns on push-pull. Explicit pull reruns
+# also cover legacy fixtures that leave the group top-k unspecified; targeted
+# AUTO tests independently clear this override and declare their top-k.
+export NCCL_EP_HT_PULL_PUSH=0
+
 # Driver compatibility checks use mocked CUDA queries and need no GPU ranks.
 if [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_cft_driver_api" ]]; then
     if ! CFT_UNDEFINED_SYMBOLS=$(nm -D --undefined-only "${NCCL_EP_BUILDDIR}/lib/libnccl_ep.so"); then
@@ -259,7 +264,7 @@ OVERFLOW_DROP_PULL_COUNT_FILTER="HtOverflowDropTest.DispatchCombineContinueOnOve
         "LifecycleTest.ImportsRelocatedPreparedHandleMem:LifecycleTest.ImportedHandleSelectsDispatchChunkFromNumTokens"
 [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ht_overflow_drop" ]] && \
     run_suite "test_ht_overflow_drop" "EP HT Overflow Drop Tests (Pull-Count)" 4 "${OVERFLOW_DROP_PULL_COUNT_FILTER}"
-unset NCCL_EP_HT_PULL_PUSH
+export NCCL_EP_HT_PULL_PUSH=0
 unset NCCL_LSA_TEAM_SIZE
 
 # Pull-push scan rerun: same NCCL_EP_HT_AG_SCAN_MODE fallback that forces EM local-permute
@@ -276,7 +281,7 @@ done
 [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ht_overflow_drop" ]] && \
     run_suite "test_ht_overflow_drop" "EP HT Flat Overflow Drop (Pull-Push, Scan)" 4 \
         "HtOverflowDropTest.DispatchCombineContinueOnOverflow"
-unset NCCL_EP_HT_PULL_PUSH
+export NCCL_EP_HT_PULL_PUSH=0
 unset NCCL_EP_HT_AG_SCAN_MODE
 unset NCCL_LSA_TEAM_SIZE
 
@@ -291,7 +296,7 @@ for entry in "${SUITES[@]}"; do
     [[ " ${PULL_PUSH_SUITES} " == *" ${bin} "* ]] || continue
     run_suite "${bin}" "${desc} (Pull-Push, Unfused Sync)"
 done
-unset NCCL_EP_HT_PULL_PUSH
+export NCCL_EP_HT_PULL_PUSH=0
 unset NCCL_EP_HT_UNFUSED_SYNC
 unset NCCL_LSA_TEAM_SIZE
 

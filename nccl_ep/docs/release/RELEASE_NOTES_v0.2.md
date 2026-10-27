@@ -7,6 +7,21 @@ delivers performance optimizations and bug fixes, and lifts several hard-coded l
 A versioned ABI keeps v0.1-compiled applications working against v0.2, and new
 environment knobs expose SM allocation, HT pipelining, and build configuration.
 
+## HT default flow compatibility
+
+AUTO now selects pull dispatch / push combine for both flat and expert-major
+when the group specifies top-k in [1, 32], at most 65535 experts, and one LSA
+team of at most 128 ranks, without explicit EM duplication modes. Unspecified
+top-k retains push/pull. Explicit flow and environment overrides remain supported.
+Invalid flow environment values warn and use the AUTO policy.
+
+MXFP8 combine is unsupported with pull/push and fails with an actionable error.
+Use explicit `NCCL_EP_HT_FLOW_PUSH_PULL` with expert-major local-permute
+(`zero_copy` AUTO/OFF, no duplication overrides) for this recipe. Pull/push
+retains staging even with `zero_copy=ON`, which can increase group memory.
+Input tokens, weights, and scales can independently use windows or staging;
+the backing choice for each operand must match across ranks.
+
 ## New Features
 
 ### Quantization support

@@ -70,3 +70,6 @@ int ncclEpGroup_test_getLastLlCombineWarpsPerGroup(ncclEpGroup_t group);
 // Return the independently resolved dispatch and combine SM budgets.
 void ncclEpGroup_test_getSmBudgets(
     ncclEpGroup_t group, unsigned int* dispatch_num_sms, unsigned int* combine_num_sms);
+
+// Return the resolved HT flow for testing AUTO selection and explicit overrides.
+ncclEpHtFlow_t ncclEpGroup_test_getHtFlow(ncclEpGroup_t group);

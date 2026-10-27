@@ -9,12 +9,21 @@
  */
 
 #include "test_common.h"
+#include <nccl_device.h>
 
 static float bf16_val(nv_bfloat16 v) {
     return __bfloat162float(v);
 }
 
 namespace {
+
+struct AutoPullEnvironment {
+    ScopedEnvVar flow{"NCCL_EP_HT_PULL_PUSH", nullptr};
+    ScopedEnvVar local_dup{"NCCL_EP_HT_EM_LOCAL_DUP", nullptr};
+    ScopedEnvVar nvlink_dup{"NCCL_EP_HT_EM_NVLINK_DUP", nullptr};
+    ScopedEnvVar scan{"NCCL_EP_HT_AG_SCAN_MODE", nullptr};
+    ScopedEnvVar unfused{"NCCL_EP_HT_COUNT_UNFUSED", nullptr};
+};
 
 // Optional overrides on top of NCCL_EP_GROUP_CONFIG_INIT.
 struct GroupOpts {
@@ -119,8 +128,11 @@ protected:
         ncclEpGroup_t group,
         bool windowed_dispatch_out,
         bool windowed_combine_in,
-        ncclResult_t expected_dispatch_err = ncclSuccess,
-        ncclResult_t expected_combine_err = ncclSuccess) {
+        ncclResult_t expected_dispatch_err,
+        ncclResult_t expected_combine_err,
+        bool windowed_input_tokens,
+        bool windowed_input_weights,
+        ncclEpLayout_t layout) {
         // -- Allocate host-side input -----------------------------------------
         std::vector<nv_bfloat16> h_tok(kNumTokens * kHidden);
         for (int i = 0; i < kNumTokens; ++i) {
@@ -137,9 +149,19 @@ protected:
         int64_t* d_recv_idx = nullptr;
         const size_t recv_bytes = static_cast<size_t>(kMaxRecvSlots) * kHidden * sizeof(nv_bfloat16);
 
-        EXPECT_EQ(cudaMalloc(&d_tok, kNumTokens * kHidden * sizeof(nv_bfloat16)), cudaSuccess);
+        const size_t input_token_bytes = kNumTokens * kHidden * sizeof(nv_bfloat16);
+        const size_t input_weight_bytes = kNumTokens * kTopK * sizeof(float);
+        if (windowed_input_tokens) {
+            EXPECT_EQ(ncclMemAlloc(reinterpret_cast<void**>(&d_tok), input_token_bytes), ncclSuccess);
+        } else {
+            EXPECT_EQ(cudaMalloc(&d_tok, input_token_bytes), cudaSuccess);
+        }
         EXPECT_EQ(cudaMalloc(&d_out, kNumTokens * kHidden * sizeof(nv_bfloat16)), cudaSuccess);
-        EXPECT_EQ(cudaMalloc(&d_weights, kNumTokens * kTopK * sizeof(float)), cudaSuccess);
+        if (windowed_input_weights) {
+            EXPECT_EQ(ncclMemAlloc(reinterpret_cast<void**>(&d_weights), input_weight_bytes), ncclSuccess);
+        } else {
+            EXPECT_EQ(cudaMalloc(&d_weights, input_weight_bytes), cudaSuccess);
+        }
         EXPECT_EQ(cudaMalloc(&d_recv_w, kMaxRecvSlots * kTopK * sizeof(float)), cudaSuccess);
         EXPECT_EQ(cudaMalloc(&d_recv_idx, kMaxRecvSlots * kTopK * sizeof(int64_t)), cudaSuccess);
 
@@ -153,6 +175,11 @@ protected:
         }
 
         std::vector<float> h_w(kNumTokens * kTopK, 1.0f);
+        if (windowed_input_tokens || windowed_input_weights) {
+            for (int i = 0; i < kNumTokens; ++i) {
+                h_w[i] = 0.25f * static_cast<float>(g_rank * kNumTokens + i + 1);
+            }
+        }
         EXPECT_EQ(
             cudaMemcpy(d_tok, h_tok.data(), kNumTokens * kHidden * sizeof(nv_bfloat16), cudaMemcpyHostToDevice),
             cudaSuccess);
@@ -174,8 +201,20 @@ protected:
             ncclSuccess);
         EXPECT_EQ(epTensorCreate(&t_out, 2, ncclBfloat16, d_out, kNumTokens, kHidden), ncclSuccess);
         EXPECT_EQ(epTensorCreate(&t_w, 2, ncclFloat32, d_weights, kNumTokens, kTopK), ncclSuccess);
-        EXPECT_EQ(epTensorCreate(&t_recv_w, 2, ncclFloat32, d_recv_w, kMaxRecvSlots, kTopK), ncclSuccess);
+        if (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+            EXPECT_EQ(epTensorCreate(&t_recv_w, 1, ncclFloat32, d_recv_w, kMaxRecvSlots), ncclSuccess);
+        } else {
+            EXPECT_EQ(epTensorCreate(&t_recv_w, 2, ncclFloat32, d_recv_w, kMaxRecvSlots, kTopK), ncclSuccess);
+        }
         EXPECT_EQ(epTensorCreate(&t_recv_idx, 2, ncclInt64, d_recv_idx, kMaxRecvSlots, kTopK), ncclSuccess);
+
+        ncclWindow_t input_tokens_win{}, input_weights_win{};
+        if (windowed_input_tokens) {
+            EXPECT_EQ(attach_symmetric_window(t_tok, d_tok, input_token_bytes, &input_tokens_win), ncclSuccess);
+        }
+        if (windowed_input_weights) {
+            EXPECT_EQ(attach_symmetric_window(t_w, d_weights, input_weight_bytes, &input_weights_win), ncclSuccess);
+        }
 
         // Window-register the recv buffer; the same window covers dispatch
         // output and combine input (caller picks which path uses it).
@@ -186,7 +225,7 @@ protected:
 
         // -- Create handle (collective; ep_group lifetime is per-test) -------
         ncclEpHandle_t h = nullptr;
-        EXPECT_EQ(ncclEpCreateHandle(&h, group, NCCL_EP_LAYOUT_FLAT, topk_, nullptr, nullptr, g_stream), ncclSuccess);
+        EXPECT_EQ(ncclEpCreateHandle(&h, group, layout, topk_, nullptr, nullptr, g_stream), ncclSuccess);
         EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
 
         // -- Dispatch --------------------------------------------------------
@@ -196,7 +235,7 @@ protected:
         d_in.topk_weights = t_w;
         d_out_s.tokens = t_recv;
         d_out_s.topk_weights = t_recv_w;
-        d_out_s.topk_idx = t_recv_idx;
+        d_out_s.topk_idx = layout == NCCL_EP_LAYOUT_FLAT ? t_recv_idx : nullptr;
 
         ncclEpDispatchConfig_t dcfg = NCCL_EP_DISPATCH_CONFIG_INIT;
         ncclResult_t disp_r = ncclEpDispatch(h, &d_in, &d_out_s, nullptr, &dcfg, g_stream);
@@ -205,6 +244,29 @@ protected:
         std::vector<float> vals;
         if (disp_r == ncclSuccess && expected_combine_err != ncclInvalidArgument) {
             EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+        }
+
+        if (disp_r == ncclSuccess && (windowed_input_tokens || windowed_input_weights)) {
+            unsigned int received_rows = 0;
+            EXPECT_EQ(ncclEpHandle_test_getNumRecvTokens(h, &received_rows), ncclSuccess);
+            EXPECT_LE(received_rows, static_cast<unsigned int>(kMaxRecvSlots));
+            if (received_rows <= static_cast<unsigned int>(kMaxRecvSlots)) {
+                std::vector<nv_bfloat16> received_tokens(static_cast<size_t>(received_rows) * kHidden);
+                std::vector<float> received_weights(received_rows);
+                EXPECT_EQ(
+                    cudaMemcpy(received_tokens.data(), d_recv, received_tokens.size() * sizeof(nv_bfloat16),
+                               cudaMemcpyDeviceToHost),
+                    cudaSuccess);
+                EXPECT_EQ(cudaMemcpy(received_weights.data(), d_recv_w,
+                                     received_weights.size() * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
+                for (unsigned int row = 0; row < received_rows; ++row) {
+                    const float value = bf16_val(received_tokens[static_cast<size_t>(row) * kHidden]);
+                    EXPECT_FLOAT_EQ(received_weights[row], 0.25f * value);
+                    for (int hidden = 0; hidden < kHidden; ++hidden) {
+                        EXPECT_FLOAT_EQ(bf16_val(received_tokens[static_cast<size_t>(row) * kHidden + hidden]), value);
+                    }
+                }
+            }
         }
 
         // -- Combine (only if dispatch succeeded; we keep combine input fresh
@@ -250,15 +312,29 @@ protected:
         if (need_window) {
             EXPECT_EQ(ncclCommWindowDeregister(g_comm, recv_win), ncclSuccess);
         }
+        if (windowed_input_weights) {
+            EXPECT_EQ(ncclCommWindowDeregister(g_comm, input_weights_win), ncclSuccess);
+        }
+        if (windowed_input_tokens) {
+            EXPECT_EQ(ncclCommWindowDeregister(g_comm, input_tokens_win), ncclSuccess);
+        }
         ncclEpTensorDestroy(t_tok);
         ncclEpTensorDestroy(t_recv);
         ncclEpTensorDestroy(t_out);
         ncclEpTensorDestroy(t_w);
         ncclEpTensorDestroy(t_recv_w);
         ncclEpTensorDestroy(t_recv_idx);
-        cudaFree(d_tok);
+        if (windowed_input_tokens) {
+            ncclMemFree(d_tok);
+        } else {
+            cudaFree(d_tok);
+        }
         cudaFree(d_out);
-        cudaFree(d_weights);
+        if (windowed_input_weights) {
+            ncclMemFree(d_weights);
+        } else {
+            cudaFree(d_weights);
+        }
         cudaFree(d_recv_w);
         cudaFree(d_recv_idx);
         if (need_window) ncclMemFree(d_recv);
@@ -273,7 +349,10 @@ protected:
         size_t token_window_offset,
         size_t scale_window_offset,
         ncclEpZeroCopyMode_t zero_copy_mode,
-        ncclResult_t expected_dispatch_result) {
+        ncclResult_t expected_dispatch_result,
+        bool windowed_input_tokens,
+        bool windowed_input_weights,
+        bool windowed_input_scales) {
         const int num_local_experts = kNumExperts / g_nranks;
         const size_t token_bytes_per_row =
             static_cast<size_t>(wire.token_elements) * wire_dtype_bytes(wire.token_dtype);
@@ -296,14 +375,25 @@ protected:
         group_config.num_qp_per_rank = NCCL_EP_AUTO;
         group_config.num_channels = NCCL_EP_AUTO;
         group_config.zero_copy = zero_copy_mode;
+        const bool mixed_input_windows =
+            windowed_input_tokens || windowed_input_weights || windowed_input_scales;
+        if (mixed_input_windows) {
+            group_config.num_topk = kTopK;
+        }
 
         ncclEpGroup_t group = nullptr;
         NCCL_ASSERT(ncclEpCreateGroup(&group, g_comm, &group_config));
+        if (mixed_input_windows) {
+            EXPECT_EQ(ncclEpGroup_test_getHtFlow(group), NCCL_EP_HT_FLOW_PULL_PUSH);
+        }
 
         std::vector<uint8_t> host_tokens(kNumTokens * token_bytes_per_row);
         std::vector<uint8_t> host_scales(kNumTokens * scale_bytes_per_row);
         std::vector<float> host_weights(kNumTokens * kTopK, 1.0f);
         for (int token = 0; token < kNumTokens; ++token) {
+            if (mixed_input_windows) {
+                host_weights[token] = 1.0f + 0.25f * static_cast<float>(g_rank * kNumTokens + token);
+            }
             for (size_t byte = 0; byte < token_bytes_per_row; ++byte) {
                 host_tokens[token * token_bytes_per_row + byte] =
                     ht_scales_forward_token_byte(g_rank, token, byte);
@@ -318,9 +408,21 @@ protected:
         uint8_t *device_recv_tokens = nullptr, *device_recv_scales = nullptr;
         float *device_weights = nullptr, *device_recv_weights = nullptr;
         int64_t* device_recv_topk_idx = nullptr;
-        CUDA_ASSERT(cudaMalloc(&device_tokens, host_tokens.size()));
-        CUDA_ASSERT(cudaMalloc(&device_scales, host_scales.size()));
-        CUDA_ASSERT(cudaMalloc(&device_weights, host_weights.size() * sizeof(float)));
+        if (windowed_input_tokens) {
+            NCCL_ASSERT(ncclMemAlloc(reinterpret_cast<void**>(&device_tokens), host_tokens.size()));
+        } else {
+            CUDA_ASSERT(cudaMalloc(&device_tokens, host_tokens.size()));
+        }
+        if (windowed_input_scales) {
+            NCCL_ASSERT(ncclMemAlloc(reinterpret_cast<void**>(&device_scales), host_scales.size()));
+        } else {
+            CUDA_ASSERT(cudaMalloc(&device_scales, host_scales.size()));
+        }
+        if (windowed_input_weights) {
+            NCCL_ASSERT(ncclMemAlloc(reinterpret_cast<void**>(&device_weights), host_weights.size() * sizeof(float)));
+        } else {
+            CUDA_ASSERT(cudaMalloc(&device_weights, host_weights.size() * sizeof(float)));
+        }
         CUDA_ASSERT(cudaMalloc(&device_recv_weights, kMaxRecvSlots * kTopK * sizeof(float)));
         CUDA_ASSERT(cudaMalloc(&device_recv_topk_idx, kMaxRecvSlots * kTopK * sizeof(int64_t)));
         if (windowed_tokens) {
@@ -388,6 +490,18 @@ protected:
             &recv_weights, 2, ncclFloat32, device_recv_weights, kMaxRecvSlots, kTopK));
         NCCL_ASSERT(epTensorCreate(
             &recv_topk_idx, 2, ncclInt64, device_recv_topk_idx, kMaxRecvSlots, kTopK));
+
+        ncclWindow_t input_tokens_window{}, input_weights_window{}, input_scales_window{};
+        if (windowed_input_tokens) {
+            NCCL_ASSERT(attach_symmetric_window(tokens, device_tokens, host_tokens.size(), &input_tokens_window));
+        }
+        if (windowed_input_weights) {
+            NCCL_ASSERT(attach_symmetric_window(
+                weights, device_weights, host_weights.size() * sizeof(float), &input_weights_window));
+        }
+        if (windowed_input_scales) {
+            NCCL_ASSERT(attach_symmetric_window(scales, device_scales, host_scales.size(), &input_scales_window));
+        }
 
         ncclWindow_t recv_tokens_window{};
         ncclWindow_t recv_scales_window{};
@@ -478,7 +592,9 @@ protected:
                 const int expert = (src_rank * kNumTokens + token) % kNumExperts;
                 EXPECT_EQ(expert / num_local_experts, g_rank);
                 EXPECT_EQ(received_topk_idx[row], expert % num_local_experts);
-                EXPECT_FLOAT_EQ(received_weights[row], 1.0f);
+                const float expected_weight = mixed_input_windows
+                    ? 1.0f + 0.25f * static_cast<float>(src_rank * kNumTokens + token) : 1.0f;
+                EXPECT_FLOAT_EQ(received_weights[row], expected_weight);
                 for (size_t byte = 0; byte < token_bytes_per_row; ++byte) {
                     EXPECT_EQ(
                         received_tokens[token_offset + byte],
@@ -506,6 +622,15 @@ protected:
         NCCL_ASSERT(ncclEpHandleDestroy(handle));
         if (windowed_scales) NCCL_ASSERT(ncclCommWindowDeregister(g_comm, recv_scales_window));
         if (windowed_tokens) NCCL_ASSERT(ncclCommWindowDeregister(g_comm, recv_tokens_window));
+        if (windowed_input_scales) {
+            NCCL_ASSERT(ncclCommWindowDeregister(g_comm, input_scales_window));
+        }
+        if (windowed_input_weights) {
+            NCCL_ASSERT(ncclCommWindowDeregister(g_comm, input_weights_window));
+        }
+        if (windowed_input_tokens) {
+            NCCL_ASSERT(ncclCommWindowDeregister(g_comm, input_tokens_window));
+        }
         ncclEpTensorDestroy(tokens);
         ncclEpTensorDestroy(scales);
         ncclEpTensorDestroy(weights);
@@ -513,9 +638,21 @@ protected:
         ncclEpTensorDestroy(recv_scales);
         ncclEpTensorDestroy(recv_weights);
         ncclEpTensorDestroy(recv_topk_idx);
-        cudaFree(device_tokens);
-        cudaFree(device_scales);
-        cudaFree(device_weights);
+        if (windowed_input_tokens) {
+            NCCL_ASSERT(ncclMemFree(device_tokens));
+        } else {
+            cudaFree(device_tokens);
+        }
+        if (windowed_input_scales) {
+            NCCL_ASSERT(ncclMemFree(device_scales));
+        } else {
+            cudaFree(device_scales);
+        }
+        if (windowed_input_weights) {
+            NCCL_ASSERT(ncclMemFree(device_weights));
+        } else {
+            cudaFree(device_weights);
+        }
         cudaFree(device_recv_weights);
         cudaFree(device_recv_topk_idx);
         if (windowed_tokens) NCCL_ASSERT(ncclMemFree(device_recv_tokens));
@@ -811,10 +948,58 @@ TEST_F(ZeroCopyTest, DefaultStaging) {
     ncclEpGroup_t g = nullptr;
     NCCL_ASSERT(ncclEpCreateGroup(&g, g_comm, &cfg));
 
-    auto vals = run_roundtrip(g, /*windowed_dispatch_out=*/false, /*windowed_combine_in=*/false);
+    auto vals = run_roundtrip(
+        g, false, false, ncclSuccess, ncclSuccess, false, false, NCCL_EP_LAYOUT_FLAT);
     expect_identity_roundtrip(vals);
 
     NCCL_ASSERT(ncclEpGroupDestroy(g));
+}
+
+TEST_F(ZeroCopyTest, AutoPullPreservesMixedTokenAndWeightWindows) {
+    if (ncclTeamLsa(g_comm).nRanks != g_nranks) {
+        GTEST_SKIP() << "AUTO pull-push requires one LSA team";
+    }
+    AutoPullEnvironment env;
+    for (auto layout : {NCCL_EP_LAYOUT_FLAT, NCCL_EP_LAYOUT_EXPERT_MAJOR}) {
+        for (bool windowed_input_tokens : {true, false}) {
+            SCOPED_TRACE(::testing::Message() << "layout=" << layout
+                                              << " windowed_input_tokens=" << windowed_input_tokens);
+            GroupOpts opts;
+            ncclEpGroupConfig_t cfg = base_group_cfg(opts);
+            cfg.num_topk = kTopK;
+            ncclEpGroup_t group = nullptr;
+            NCCL_ASSERT(ncclEpCreateGroup(&group, g_comm, &cfg));
+            EXPECT_EQ(ncclEpGroup_test_getHtFlow(group), NCCL_EP_HT_FLOW_PULL_PUSH);
+            const auto vals = run_roundtrip(
+                group, false, false, ncclSuccess, ncclSuccess,
+                windowed_input_tokens, !windowed_input_tokens, layout);
+            ASSERT_EQ(vals.size(), static_cast<size_t>(kNumTokens));
+            for (int token = 0; token < kNumTokens; ++token) {
+                const float value = static_cast<float>(g_rank * kNumTokens + token + 1);
+                EXPECT_FLOAT_EQ(vals[token], value);
+            }
+            NCCL_ASSERT(ncclEpGroupDestroy(group));
+        }
+    }
+}
+
+TEST_F(ZeroCopyTest, AutoPullPreservesIndependentForwardedScaleInputWindows) {
+    if (ncclTeamLsa(g_comm).nRanks != g_nranks) {
+        GTEST_SKIP() << "AUTO pull-push requires one LSA team";
+    }
+    AutoPullEnvironment env;
+    // These flags describe source inputs, independently of the plain outputs.
+    constexpr bool input_windows[][3] = {
+        {true, false, false}, {true, true, false},
+        {false, true, true}, {false, false, true}, {true, true, true},
+    };
+    for (const auto& windows : input_windows) {
+        SCOPED_TRACE(::testing::Message() << "token=" << windows[0]
+                                          << " weight=" << windows[1] << " scale=" << windows[2]);
+        run_ht_scales_forward_flat_dispatch(
+            kBf16Fp16Wire, false, false, 0, 0, NCCL_EP_ZERO_COPY_AUTO,
+            ncclSuccess, windows[0], windows[1], windows[2]);
+    }
 }
 
 // zero_copy = ON -- dispatch output and combine input are user-registered windows.
@@ -825,7 +1010,8 @@ TEST_F(ZeroCopyTest, ZeroCopyWindowedRoundtrip) {
     ncclEpGroup_t g = nullptr;
     NCCL_ASSERT(ncclEpCreateGroup(&g, g_comm, &cfg));
 
-    auto vals = run_roundtrip(g, /*windowed_dispatch_out=*/true, /*windowed_combine_in=*/true);
+    auto vals = run_roundtrip(
+        g, true, true, ncclSuccess, ncclSuccess, false, false, NCCL_EP_LAYOUT_FLAT);
     expect_identity_roundtrip(vals);
 
     NCCL_ASSERT(ncclEpGroupDestroy(g));
@@ -839,7 +1025,7 @@ TEST_F(ZeroCopyTest, HtScalesForwardFlatZeroCopyPreservesPackedBytesAndScales) {
         /*token_window_offset=*/0,
         /*scale_window_offset=*/0,
         NCCL_EP_ZERO_COPY_ON,
-        /*expected_dispatch_result=*/ncclSuccess);
+        /*expected_dispatch_result=*/ncclSuccess, false, false, false);
 }
 
 TEST_F(ZeroCopyTest, HtScalesForwardFlatStagedPreservesAllScaleDtypes) {
@@ -860,7 +1046,7 @@ TEST_F(ZeroCopyTest, HtScalesForwardFlatStagedPreservesAllScaleDtypes) {
             /*token_window_offset=*/0,
             /*scale_window_offset=*/0,
             NCCL_EP_ZERO_COPY_AUTO,
-            /*expected_dispatch_result=*/ncclSuccess);
+            /*expected_dispatch_result=*/ncclSuccess, false, false, false);
     }
 }
 
@@ -886,7 +1072,7 @@ TEST_F(ZeroCopyTest, HtScalesForwardFlatRejectsHalfOutputWindows) {
             /*token_window_offset=*/0,
             /*scale_window_offset=*/0,
             test_case.zero_copy_mode,
-            /*expected_dispatch_result=*/ncclInvalidArgument);
+            /*expected_dispatch_result=*/ncclInvalidArgument, false, false, false);
     }
 }
 
@@ -902,7 +1088,7 @@ TEST_F(ZeroCopyTest, HtScalesForwardFlatRejectsMisalignedWindowOffsets) {
             offset[0],
             offset[1],
             NCCL_EP_ZERO_COPY_ON,
-            /*expected_dispatch_result=*/ncclInvalidArgument);
+            /*expected_dispatch_result=*/ncclInvalidArgument, false, false, false);
     }
 }
 

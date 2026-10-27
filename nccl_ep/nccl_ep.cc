@@ -2717,7 +2717,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             "ncclEpCreateGroup: HT requires rdma_team_size * lsa_team_size == nRanks");
     }
 
-    // HT flow mode: explicit public flow, then env under AUTO, then built-in default.
+    // HT flow mode: explicit public flow, then env under AUTO, then pull-push
+    // within one supported LSA team (push-pull elsewhere).
     //   pull_push (any zero_copy)   -> kPullPush     (NVLink pull dispatch + push combine)
     //   non zero_copy               -> kLocalPermute (FLAT dispatch + permute kernels)
     //   zero_copy, multiple teams   -> kNvlinkDup    (sender duplicates per-expert over NVLink)
@@ -2727,8 +2728,15 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         const bool explicit_pull_push = in_config->ht_flow == NCCL_EP_HT_FLOW_PULL_PUSH;
         const bool explicit_push_pull = in_config->ht_flow == NCCL_EP_HT_FLOW_PUSH_PULL;
         const bool env_pull_push = nccl_ep_env_flag_on(ep_group->env.ht_pull_push);
+        const bool default_pull_push = ep_group->rdma_team_size == 1 &&
+            ep_group->lsa_team_size <= kPullMaxLsaRanks &&
+            in_config->num_topk > 0 && in_config->num_topk <= MAX_NUM_TOPK &&
+            in_config->num_experts <= kTopkIdxInvalid &&
+            !nccl_ep_env_flag_on(ep_group->env.ht_em_local_dup) &&
+            !nccl_ep_env_flag_on(ep_group->env.ht_em_nvlink_dup);
         const bool want_pull_push = explicit_pull_push ||
-            (in_config->ht_flow == NCCL_EP_HT_FLOW_AUTO && env_pull_push);
+            (in_config->ht_flow == NCCL_EP_HT_FLOW_AUTO &&
+             (ep_group->env.ht_pull_push.is_set ? env_pull_push : default_pull_push));
         const bool want_local_dup = !explicit_pull_push &&
             nccl_ep_env_flag_on(ep_group->env.ht_em_local_dup);
         const bool want_nvlink_dup = !explicit_pull_push &&
@@ -6854,73 +6862,63 @@ ncclResult_t ncclEpDispatch(
                 const void* const* peer_in = nullptr;
                 const float* const* peer_w = nullptr;
                 const void* const* peer_scale = nullptr;
+                // Each source operand can independently use its registered window
+                // or the group staging region. Copies are ordered before the LSA
+                // head gate, which makes them visible before any peer pulls them.
                 if (x->win_hdl != ncclWindow_t{}) {
-                    // Pull reads the token, weight and scale rows from the same peer-visible
-                    // source, so every delivered operand must share x's window backing. Input
-                    // windowing is per-tensor opt-in (even under zero_copy=ON, which only
-                    // requires the output window), so reject a windowed x paired with a plain
-                    // topk_weights/scales instead of reading a non-shared peer address.
-                    if (deliver_weights && (topk_weights == nullptr || topk_weights->win_hdl == ncclWindow_t{})) {
-                        fprintf(stderr,
-                                "ncclEpDispatch: NCCL_EP_HT_PULL_PUSH needs topk_weights window-registered "
-                                "when tokens are (mixed windowed/non-windowed pull inputs are unsupported)\n");
-                        return ncclInvalidArgument;
-                    }
-                    if (deliver_scales && (scales == nullptr || scales->win_hdl == ncclWindow_t{})) {
-                        fprintf(stderr,
-                                "ncclEpDispatch: NCCL_EP_HT_PULL_PUSH needs scales window-registered "
-                                "when tokens are (mixed windowed/non-windowed pull inputs are unsupported)\n");
-                        return ncclInvalidArgument;
-                    }
-                    // Window-backed input: peers read it in place (zero-copy, no staging).
                     NCCLCHECK(buildIntranodePtrArray<void>(group, x, win_tokens));
                     peer_in = win_tokens.data();
-                    if (deliver_weights) {
-                        NCCLCHECK(buildIntranodePtrArray<float>(group, topk_weights, win_weights));
-                        peer_w = win_weights.data();
-                    }
-                    if (deliver_scales) {
-                        // QUANT_FWD: peers read each token's scale row over NVLink too.
-                        NCCLCHECK(buildIntranodePtrArray<void>(group, scales, win_scales));
-                        peer_scale = win_scales.data();
-                    }
                 } else {
-                    // Non-symmetric input: stage into the peer-accessible FLAT dispatch
-                    // buffers and point pull at them. The memcpy is stream-ordered before the
-                    // kernel and lsa_grid_head_gate rendezvous with every peer before any peer
-                    // read, so no peer observes this rank's staging early.
                     assert(group->ht_buffers.expert_output_token != nullptr);
-                    CUDA_CHECK(cudaMemcpyAsync(group->ht_buffers.expert_output_token, x->data,
-                                               static_cast<size_t>(handle->num_tokens) * row_bytes,
-                                               cudaMemcpyDeviceToDevice, stream));
+                    if (handle->num_tokens > 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(group->ht_buffers.expert_output_token, x->data,
+                                                   static_cast<size_t>(handle->num_tokens) * row_bytes,
+                                                   cudaMemcpyDeviceToDevice, stream));
+                    }
                     peer_in = group->ht_buffers.dispatch_expert_output_token_buffer_ptrs;
-                    // A source must stage its input weights/scales for peers to pull even
-                    // when it receives zero tokens (deliver_weights/deliver_scales gate only
-                    // this rank's own recv output). Stage whenever there is input to forward.
-                    if (forward_dispatch && topk_weights != nullptr) {
-                        CUDA_CHECK(cudaMemcpyAsync(
-                            group->ht_buffers.expert_output_prob, topk_weights->data,
-                            static_cast<size_t>(handle->num_tokens) * handle->num_topk * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream));
+                }
+                // Publish source weights even when this rank receives no rows:
+                // its tokens can still be routed to other ranks.
+                if (forward_dispatch && topk_weights != nullptr) {
+                    if (topk_weights->win_hdl != ncclWindow_t{}) {
+                        if (deliver_weights) {
+                            NCCLCHECK(buildIntranodePtrArray<float>(group, topk_weights, win_weights));
+                            peer_w = win_weights.data();
+                        }
+                    } else {
+                        if (handle->num_tokens > 0) {
+                            CUDA_CHECK(cudaMemcpyAsync(
+                                group->ht_buffers.expert_output_prob, topk_weights->data,
+                                static_cast<size_t>(handle->num_tokens) * handle->num_topk * sizeof(float),
+                                cudaMemcpyDeviceToDevice, stream));
+                        }
+                        if (deliver_weights) {
+                            peer_w = group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs;
+                        }
                     }
-                    if (deliver_weights) {
-                        peer_w = group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs;
-                    }
-                    if (recipe == NCCL_EP_DISP_QUANT_FWD && scales != nullptr) {
-                        // Stage input scales into this rank's carved scale slack for peers to pull.
+                }
+                // Scale backing is independent of token and weight backing too.
+                if (recipe == NCCL_EP_DISP_QUANT_FWD && scales != nullptr) {
+                    if (scales->win_hdl != ncclWindow_t{}) {
+                        if (deliver_scales) {
+                            NCCLCHECK(buildIntranodePtrArray<void>(group, scales, win_scales));
+                            peer_scale = win_scales.data();
+                        }
+                    } else {
                         void* scale_staging =
                             group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[group->lsa_rank];
                         assert(scale_staging != nullptr);
-                        const int send_scale_row_bytes =
-                            static_cast<int>(scales->sizes[1]) * ncclTypeSize(scales->datatype);
-                        CUDA_CHECK(cudaMemcpyAsync(
-                            scale_staging, scales->data,
-                            static_cast<size_t>(handle->num_tokens) * send_scale_row_bytes,
-                            cudaMemcpyDeviceToDevice, stream));
-                    }
-                    if (deliver_scales) {
-                        peer_scale = const_cast<const void* const*>(
-                            group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs);
+                        if (handle->num_tokens > 0) {
+                            const size_t send_scale_row_bytes = scales->sizes[1] * ncclTypeSize(scales->datatype);
+                            CUDA_CHECK(cudaMemcpyAsync(
+                                scale_staging, scales->data,
+                                static_cast<size_t>(handle->num_tokens) * send_scale_row_bytes,
+                                cudaMemcpyDeviceToDevice, stream));
+                        }
+                        if (deliver_scales) {
+                            peer_scale = const_cast<const void* const*>(
+                                group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs);
+                        }
                     }
                 }
                 // Pull-count: the recv-map rebuild (Phase 0 + Phase 1) runs inside this dispatch
@@ -7641,7 +7639,9 @@ ncclResult_t ncclEpCombine(
         if (mxfp8_combine && (!em_permute_combine || comb_push)) {
             fprintf(
                 stderr,
-                "NCCL EP error: MXFP8 combine requires the expert-major local-permute path "
+                "NCCL EP error: MXFP8 combine requires the expert-major local-permute path. "
+                "Set group ht_flow=NCCL_EP_HT_FLOW_PUSH_PULL and zero_copy=AUTO or OFF "
+                "without EM duplication overrides "
                 "(layout=%d, em_permute=%d, push_combine=%d)\n",
                 static_cast<int>(handle->layout),
                 static_cast<int>(em_permute_combine),
@@ -8274,4 +8274,9 @@ void ncclEpGroup_test_getSmBudgets(
     if (group == nullptr) return;
     if (dispatch_num_sms != nullptr) *dispatch_num_sms = group->dispatch_num_sms;
     if (combine_num_sms != nullptr) *combine_num_sms = group->combine_num_sms;
+}
+
+ncclEpHtFlow_t ncclEpGroup_test_getHtFlow(ncclEpGroup_t group) {
+    return group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush
+               ? NCCL_EP_HT_FLOW_PULL_PUSH : NCCL_EP_HT_FLOW_PUSH_PULL;
 }

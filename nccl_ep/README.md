@@ -559,11 +559,13 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
 
 ### Flat pull/push
 
-HT flat layout supports the same opt-in pull-dispatch / push-combine transport
-as expert-major layout. Set `NCCL_EP_HT_PULL_PUSH=1` before group creation
-on every rank. This replaces `NCCL_EP_HT_EM_PULL_PUSH` for both layouts; the
-old name is no longer recognized. Leaving the new flag unset preserves the
-existing transport selection.
+HT defaults to pull dispatch and push combine for flat and expert-major
+layouts within one supported LSA team when the group specifies a supported
+positive `num_topk`. AUTO retains push/pull for unspecified top-k, multiple
+LSA teams, unsupported pull/push dimensions, or explicit EM duplication modes.
+Set `config.ht_flow` to `NCCL_EP_HT_FLOW_PUSH_PULL` to select push/pull explicitly.
+Under AUTO, `NCCL_EP_HT_PULL_PUSH=0` selects push/pull and `=1` requires pull/push
+on every rank. The old `NCCL_EP_HT_EM_PULL_PUSH` name is no longer recognized.
 
 Pull dispatch writes one flat receive row per source token and destination
 rank, even when several selected experts belong to that rank. Within each
@@ -613,10 +615,26 @@ experts, with at most 128 ranks in the LSA team. It cannot be combined with the
 `NCCL_EP_HT_EM_LOCAL_DUP` or `NCCL_EP_HT_EM_NVLINK_DUP` overrides. Dispatch
 supports `NCCL_EP_DISP_QUANT_NONE` and `NCCL_EP_DISP_QUANT_FWD` (forwarded
 scales). Group-level transport and synchronization settings must match across
-ranks. For imported backward handles, snapshot handle memory after forward
+ranks. Each input operand (tokens, weights, or scales) may independently use
+its registered window or library staging, but all ranks must use the same
+backing choice for that operand. Plain token inputs require a staging copy;
+`ep_bench` currently windows expert-major pull inputs by default, while flat
+inputs use staging unless `--zcopy` is specified.
+
+Pull/push keeps dispatch-input staging and full-fan-out combine staging even
+with `zero_copy=ON`; this can increase group memory relative to push/pull,
+especially with a tight receive budget. `zero_copy=ON` requires output windows
+but does not guarantee that the group allocates no staging.
+
+For imported backward handles, snapshot handle memory after forward
 dispatch has completed so the snapshot includes dispatch-built routing maps.
 
-Combine supports `NCCL_EP_COMB_QUANT_NONE`; MXFP8 combine is not supported.
+Combine supports `NCCL_EP_COMB_QUANT_NONE`. MXFP8 combine is unsupported with
+pull/push, including when AUTO selects it, and returns `ncclInvalidArgument`.
+For MXFP8 combine, set `config.ht_flow = NCCL_EP_HT_FLOW_PUSH_PULL`, use
+expert-major layout with `zero_copy` AUTO or OFF, and leave EM duplication
+overrides disabled. The combine recipe is supplied per call and cannot be
+inferred at group creation; there is no automatic combine-time fallback.
 Backward weight tensors use the handle's top-k width. Each token's nonnegative
 expert IDs must be unique; duplicate-ID handling is tracked separately in #138.
 

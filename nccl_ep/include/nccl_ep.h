@@ -318,7 +318,8 @@ typedef struct {
     // Upper bound on per-token top-k across all handles of this group. Optional
     // (0 = unset); required only for HT eager mode with the Expert-Major layout,
     // where it sizes internal buffers. When set, ncclEpInitHandle validates the
-    // handle's num_topk against it.
+    // handle's num_topk against it. A supported positive value also enables
+    // AUTO pull-push selection; zero retains push-pull.
     unsigned int num_topk;
     unsigned char padding_v2[4]; // consumes V2 tail padding; future fields append after it
     // Dispatch SM budget. NCCL_EP_AUTO inherits the resolved shared budget.
@@ -327,9 +328,12 @@ typedef struct {
     unsigned int combine_num_sms;
     // HT dispatch/combine flow. All ranks must resolve to the same flow;
     // inconsistent API or environment configuration is unsupported. An
-    // explicit value is authoritative. AUTO preserves the built-in push/pull
-    // default and permits the NCCL_EP_HT_PULL_PUSH environment
-    // override.
+    // explicit value is authoritative. AUTO selects pull/push within a supported
+    // single LSA team: at most 128 ranks, num_topk in [1, 32], and at most
+    // 65535 experts, without EM duplication overrides. Other cases retain push/pull.
+    // MXFP8 combine requires explicit PUSH_PULL with expert-major local-permute;
+    // PULL_PUSH returns ncclInvalidArgument for that recipe. NCCL_EP_HT_PULL_PUSH
+    // overrides AUTO (0 = push/pull, 1 = pull/push).
     // PUSH_PULL and PULL_PUSH support flat and expert-major layouts;
     // PULL_PUSH requires a single LSA domain.
     ncclEpHtFlow_t ht_flow;

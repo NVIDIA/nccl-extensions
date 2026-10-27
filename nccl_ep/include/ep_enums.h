@@ -177,8 +177,12 @@ typedef enum {
 } ncclEpZeroCopyMode_t;
 
 // HT dispatch/combine data flow. The names describe dispatch followed by
-// combine. AUTO preserves the library default and allows the
-// NCCL_EP_HT_PULL_PUSH environment override.
+// combine. AUTO selects pull-push within one supported LSA team with a known
+// supported group top-k, and push-pull elsewhere, respecting explicit EM
+// duplication modes. NCCL_EP_HT_PULL_PUSH
+// overrides AUTO (0 selects push-pull, 1 selects pull-push).
+// AUTO pull-push requires one LSA team of at most 128 ranks, top-k in [1, 32],
+// and at most 65535 experts. MXFP8 combine requires PUSH_PULL local-permute.
 typedef enum {
     NCCL_EP_HT_FLOW_AUTO = NCCL_EP_AUTO,
     NCCL_EP_HT_FLOW_PUSH_PULL,

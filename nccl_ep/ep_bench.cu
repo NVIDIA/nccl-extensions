@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <algorithm>
 #include <cmath>
@@ -234,10 +235,30 @@ static cudaError_t cudaFreeCallback(void* ptr, void* /*context*/) {
     return cudaFree(ptr);
 }
 
-// True iff HT pull-push dispatch/combine was requested via NCCL_EP_HT_PULL_PUSH.
+// Resolved after communicator creation using the same AUTO policy as the library.
+static bool g_ht_pull_push_enabled = false;
 static bool htPullPushEnabled() {
-    const char* v = std::getenv("NCCL_EP_HT_PULL_PUSH");
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
+    return g_ht_pull_push_enabled;
+}
+
+static bool htEnvFlagEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value && (strcasecmp(value, "1") == 0 || strcasecmp(value, "on") == 0 ||
+                     strcasecmp(value, "true") == 0);
+}
+
+static bool resolveHtPullPushEnabled(
+    ncclComm_t comm, int num_ranks, ncclEpHtFlow_t flow, unsigned int topk, unsigned int num_experts) {
+    const char* flow_env = std::getenv("NCCL_EP_HT_PULL_PUSH");
+    const bool flow_env_valid = flow_env &&
+        (htEnvFlagEnabled("NCCL_EP_HT_PULL_PUSH") || strcasecmp(flow_env, "0") == 0 ||
+         strcasecmp(flow_env, "off") == 0 || strcasecmp(flow_env, "false") == 0);
+    const bool default_pull_push = ncclTeamLsa(comm).nRanks == num_ranks && num_ranks <= 128 &&
+        topk <= 32 && num_experts <= 65535 &&
+        !htEnvFlagEnabled("NCCL_EP_HT_EM_LOCAL_DUP") && !htEnvFlagEnabled("NCCL_EP_HT_EM_NVLINK_DUP");
+    return flow == NCCL_EP_HT_FLOW_PULL_PUSH ||
+        (flow == NCCL_EP_HT_FLOW_AUTO &&
+         (flow_env_valid ? htEnvFlagEnabled("NCCL_EP_HT_PULL_PUSH") : default_pull_push));
 }
 
 // Element size for the dtypes used in this benchmark. ncclTypeSize is internal to the EP library.
@@ -801,9 +822,7 @@ void setupHighThroughputTensors(
     const EpTensorAllocOptions* comm_window_opts = zcopy ? &zc_comm : nullptr;
     const EpTensorAllocOptions* no_window_opts = zcopy ? &zc_no_window : nullptr;
 
-    // Pull EM dispatch reads the source token + topk-weight rows over NVLink, so the
-    // dispatch inputs must be window-backed even though the group stays zero_copy=OFF
-    // (local_permute mode). Window the inputs when NCCL_EP_HT_PULL_PUSH is set.
+    // Pull inputs use peer windows even when output staging is enabled.
     EpTensorAllocOptions zc_in = zc_comm;
     zc_in.use_nccl_mem = true;
     zc_in.use_window = true;
@@ -909,12 +928,14 @@ void cleanupBenchmarkTensors(
     alloc.registered_windows.clear();
 
     epFreeTensor(&dispatch_inputs.tokens, &alloc.external_data_ptrs, &alloc.tensor_data_ptrs);
+    epFreeTensor(&dispatch_inputs.scales, &alloc.external_data_ptrs, &alloc.tensor_data_ptrs);
 
     if (!is_ll_mode) {
         epFreeTensor(&dispatch_inputs.topk_weights, &alloc.external_data_ptrs, &alloc.tensor_data_ptrs);
     }
 
     epFreeTensor(&dispatch_outputs.tokens, &alloc.external_data_ptrs, &alloc.tensor_data_ptrs);
+    epFreeTensor(&dispatch_outputs.scales, &alloc.external_data_ptrs, &alloc.tensor_data_ptrs);
     epFreeTensor(&dispatch_outputs.topk_weights, &alloc.external_data_ptrs, &alloc.tensor_data_ptrs);
     epFreeTensor(&dispatch_outputs.topk_idx, &alloc.external_data_ptrs, &alloc.tensor_data_ptrs);
 
@@ -6058,12 +6079,17 @@ int main(int argc, char* argv[]) {
     }
     config.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
     if (overflow_drop) config.overflow_policy = NCCL_EP_OVERFLOW_DROP;
-    config.ht_flow = ht_flow;
+    // An explicit local-permute benchmark request must override the new AUTO flow.
+    config.ht_flow = ht_em_local_permute_explicit && ht_flow == NCCL_EP_HT_FLOW_AUTO
+                         ? NCCL_EP_HT_FLOW_PUSH_PULL : ht_flow;
     config.meta_exchange_policy = meta_exchange_policy;
     config.max_num_sms = max_num_sms;
     config.zero_copy = zcopy ? NCCL_EP_ZERO_COPY_ON : NCCL_EP_ZERO_COPY_AUTO;
     if (ht_em_local_dup) {
         setenv("NCCL_EP_HT_EM_LOCAL_DUP", "1", 1);
+    }
+    if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+        g_ht_pull_push_enabled = resolveHtPullPushEnabled(comm, nRanks, config.ht_flow, top_k, num_experts);
     }
     config.dispatch_num_sms = dispatch_num_sms;
     config.combine_num_sms = combine_num_sms;
@@ -7425,13 +7451,6 @@ int main(int argc, char* argv[]) {
             printf("=== Active-Mask Test Complete ===\n");
             fflush(stdout);
         }
-    }
-
-    // Free recipe scale tensors (cleanupBenchmarkTensors does not handle them).
-    if (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD ||
-        dispatch_quantization == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
-        epFreeTensor(&dispatch_inputs.scales);
-        epFreeTensor(&dispatch_outputs.scales);
     }
 
     NCCLCHECK(ncclEpHandleDestroy(ep_handle));

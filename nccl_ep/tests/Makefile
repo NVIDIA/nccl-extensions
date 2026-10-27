@@ -36,6 +36,7 @@ NVCUFLAGS := $(NVCC_GENCODE) \
 NVLDFLAGS := -L$(NCCL_EP_LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -lnccl -lpthread -lrt -ldl -lcuda
 
 TEST_BINARIES := \
+        $(DST_DIR)/test_ep_bench_recv_budget \
         $(DST_DIR)/test_cft_driver_api \
         $(DST_DIR)/test_elastic_buffer \
         $(DST_DIR)/test_handle_maps \
@@ -64,6 +65,10 @@ TEST_BINARIES := \
 
 .PHONY: all clean
 all: $(TEST_BINARIES)
+
+# Benchmark capacity arithmetic is host-only and can run without CUDA or GPUs.
+$(DST_DIR)/test_ep_bench_recv_budget: test_ep_bench_recv_budget.cpp $(NCCL_EP_SRCDIR)/ep_bench_recv_budget.hpp | $(DST_DIR)
+	$(CXX) $(CXXSTD) -I$(NCCL_EP_SRCDIR) $< -o $@
 
 # The compact-order fixture directly probes the private decoder and saved positions.
 $(DST_DIR)/test_ht_compact_prob: NVLDFLAGS := $(NCCL_EP_LIBDIR)/libnccl_ep.a $(filter-out -lnccl_ep,$(NVLDFLAGS))

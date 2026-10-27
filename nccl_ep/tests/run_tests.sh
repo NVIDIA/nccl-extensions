@@ -29,6 +29,14 @@ HT_EM_RERUN=0
 # AUTO tests independently clear this override and declare their top-k.
 export NCCL_EP_HT_PULL_PUSH=0
 
+# Benchmark capacity arithmetic is host-only and needs no GPU ranks.
+if [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ep_bench_recv_budget" ]]; then
+    "${NCCL_EP_BUILDDIR}/test/nccl_ep/test_ep_bench_recv_budget" || OVERALL_FAIL=1
+fi
+if [[ "${TEST_SUITE}" == "test_ep_bench_recv_budget" ]]; then
+    exit "${OVERALL_FAIL}"
+fi
+
 # Chunk and SM selection are header-only host policies.
 if [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ht_chunk_config" ]]; then
     "${NCCL_EP_BUILDDIR}/test/nccl_ep/test_ht_chunk_config" ${GTEST_ARGS[@]+"${GTEST_ARGS[@]}"} || OVERALL_FAIL=1

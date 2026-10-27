@@ -36,6 +36,7 @@
 #include <nccl.h>
 #include <nccl_device.h>
 #include "nccl_ep.h"
+#include "ep_bench_recv_budget.hpp"
 
 #if defined(__has_include)
 #if __has_include(<cuda_fp4.h>)
@@ -280,6 +281,19 @@ static bool htDispatchMetadataCapable(
         !scan_metadata && !unfused_metadata &&
         (htPullPushEnabled() ? (!expert_major || num_local_experts <= max_pull_count_local_experts)
                              : (config.zero_copy != NCCL_EP_ZERO_COPY_ON && !duplicate_mode));
+}
+
+static std::optional<unsigned int> benchmarkRecvBudget(
+    const ncclEpGroupConfig_t& config, ncclEpLayout_t layout, size_t alignment,
+    unsigned int num_ranks, unsigned int requested) {
+    const bool expert_major = layout == NCCL_EP_LAYOUT_EXPERT_MAJOR;
+    const bool staged_dup = expert_major && config.zero_copy != NCCL_EP_ZERO_COPY_ON &&
+        config.ht_flow != NCCL_EP_HT_FLOW_PULL_PUSH &&
+        (htEnvFlagEnabled("NCCL_EP_HT_EM_LOCAL_DUP") || htEnvFlagEnabled("NCCL_EP_HT_EM_NVLINK_DUP"));
+    return ep_bench_recv_budget(
+        requested, config.max_dispatch_tokens_per_rank, config.num_topk,
+        expert_major ? config.num_experts / num_ranks : 0u,
+        expert_major ? alignment : 0u, staged_dup ? num_ranks : 0u);
 }
 
 // Element size for the dtypes used in this benchmark. ncclTypeSize is internal to the EP library.
@@ -5237,8 +5251,10 @@ void printUsage(const char* programName, int myRank) {
             "2)\n");
         printf(
             "  --max-recv-token-slots-per-rank <N>  Per-rank recv-slot budget\n"
-            "                             HT only (0 = auto; HT default: FLAT=nRanks*tokens, Expert-major=nRanks*tokens*top_k).\n"
-            "                             Ignored in LL mode.\n");
+            "                             HT default: ceil(1.15*top_k*tokens), plus expert-major alignment slack.\n"
+            "                             Staged duplication retains its worst-case staging bound.\n"
+            "                             0 = library eager sizing; explicit budgets override the default. "
+            "Ignored in LL.\n");
         printf("  --zcopy                 Use ncclMemAlloc buffers + windows for supported direct token/scale paths\n");
         printf("  --overflow-drop          HT: NCCL_EP_OVERFLOW_DROP instead of trapping on overflow\n");
         printf("  --ht-flow <f>            HT flow: auto (default) | push-pull | pull-push\n");
@@ -5318,7 +5334,7 @@ int main(int argc, char* argv[]) {
     bool dynamic_tokens = false;  // Enable dynamic token allocation (HT only, for random topk)
     bool run_backward = false;  // Also benchmark the HT backward dispatch/combine ops
     size_t expert_major_alignment = 0;  // 0 = no padding; >1 aligns each expert zone
-    unsigned int max_recv_tokens_per_rank = UINT_MAX;  // HT only; UINT_MAX = unset -> bench auto; 0 = lib auto (worst case)
+    unsigned int max_recv_tokens_per_rank = UINT_MAX; // HT: UINT_MAX = benchmark default, 0 = eager sizing.
     bool overflow_drop = false;  // HT only; NCCL_EP_OVERFLOW_DROP instead of the library default (trap)
     ncclEpHtFlow_t ht_flow = NCCL_EP_HT_FLOW_AUTO;  // HT only; --ht-flow
     ncclEpMetaExchangePolicy_t meta_exchange_policy = NCCL_EP_META_EXCHANGE_AUTO;  // HT only; --meta-exchange-policy
@@ -6100,20 +6116,6 @@ int main(int argc, char* argv[]) {
     // num_qp_per_rank: LL mode requires >= num_local_experts, HT mode uses auto
     config.num_qp_per_rank = (algorithm == NCCL_EP_ALGO_LOW_LATENCY) ? num_local_experts : NCCL_EP_AUTO;
     config.num_channels = NCCL_EP_AUTO;
-    // HT worst case: FLAT = nRanks*max_tokens_per_rank;
-    //                EM (any mode) = nRanks*max_tokens_per_rank*top_k.
-    // LL ignores this field entirely and sizes to the worst case.
-    if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
-        if (max_recv_tokens_per_rank == UINT_MAX) {
-            const bool em = (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
-            max_recv_tokens_per_rank = static_cast<unsigned int>(nRanks) * max_tokens_per_rank * (em ? top_k : 1u);
-        }
-    } else if (max_recv_tokens_per_rank == UINT_MAX) {
-        // Pass NCCL_EP_AUTO, not the unset sentinel: UINT_MAX would survive
-        // ncclEpCreateGroup's AUTO check and land in max_recv_tokens as -1.
-        max_recv_tokens_per_rank = NCCL_EP_AUTO;
-    }
-    config.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
     if (overflow_drop) config.overflow_policy = NCCL_EP_OVERFLOW_DROP;
     // An explicit local-permute benchmark request must override the new AUTO flow.
     config.ht_flow = ht_em_local_permute_explicit && ht_flow == NCCL_EP_HT_FLOW_AUTO
@@ -6126,6 +6128,29 @@ int main(int argc, char* argv[]) {
     }
     if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
         g_ht_pull_push_enabled = resolveHtPullPushEnabled(comm, nRanks, config.ht_flow, top_k, num_experts);
+    }
+    // Apply benchmark headroom only when the user leaves the receive budget unset.
+    const bool default_recv_budget = max_recv_tokens_per_rank == UINT_MAX;
+    if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+        const auto budget = benchmarkRecvBudget(
+            config, layout, expert_major_alignment, nRanks, max_recv_tokens_per_rank);
+        if (!budget) {
+            if (myRank == 0) {
+                printf("Error: HT default receive budget must be positive and fit INT_MAX, "
+                       "including padding/staging.\n");
+            }
+            MPI_Finalize();
+            return 1;
+        }
+        max_recv_tokens_per_rank = *budget;
+    } else if (default_recv_budget) {
+        // LL ignores the receive budget; never pass the unset sentinel through.
+        max_recv_tokens_per_rank = NCCL_EP_AUTO;
+    }
+    config.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
+    if (myRank == 0 && algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+        printf("HT receive-slot budget: %u (%s)\n", max_recv_tokens_per_rank,
+               default_recv_budget ? "15% routing headroom plus padding/staging requirements" : "explicit");
     }
     config.dispatch_num_sms = dispatch_num_sms;
     config.combine_num_sms = combine_num_sms;

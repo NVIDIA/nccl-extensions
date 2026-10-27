@@ -625,6 +625,18 @@ update-time metadata exchange instead. `--fused-meta-dispatch` remains an
 explicit alias for the default. Unsupported configurations retain their
 metadata fallback; `--meta-exchange-policy require-fused` requires fusion.
 
+For random HT routing, `ep_bench` defaults to a receive-slot budget of
+`ceil(1.15 * top_k * max_tokens_per_rank)` for both flat and expert-major.
+Expert-major additionally reserves `local_experts * (alignment - 1)` slots
+when per-expert alignment exceeds one. The 15% headroom is a benchmark
+capacity policy, not a guarantee for arbitrary routing or very small batches;
+overflow still traps by default. Use `--max-recv-token-slots-per-rank N` to
+provide a different budget, or `0` for library eager sizing. Explicit budgets
+are used as supplied, including any required padding. Legacy expert-major
+staged duplication modes retain their required worst-case staging bound.
+These benchmark defaults do not change library receive-sizing or overflow
+semantics.
+
 To use fused metadata with a fixed receive budget, omit count/offset outputs
 from `ncclEpUpdateHandle`; request needed counters through the dispatch
 `layout_info` argument and consume them after that dispatch completes on the

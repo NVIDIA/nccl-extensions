@@ -75,7 +75,11 @@ $(DST_DIR)/test_ht_dispatch_async: NVLDFLAGS := $(NCCL_EP_LIBDIR)/libnccl_ep.a $
 $(DST_DIR)/test_ht_dispatch_async: $(NCCL_EP_LIBDIR)/libnccl_ep.a
 $(DST_DIR)/test_ht_dispatch_async.o: $(NCCL_EP_SRCDIR)/device/ht_ep_adapter.cuh
 
-$(DST_DIR)/test_ht_chunk_config.o: $(NCCL_EP_SRCDIR)/ht_chunk_config.hpp $(NCCL_EP_SRCDIR)/nccl_ep_env.h $(NCCL_EP_SRCDIR)/device/ht_ep_configs.cuh
+$(DST_DIR)/test_ht_chunk_config: $(DST_DIR)/test_ht_chunk_config.o $(GTEST_LIBS)
+	$(CXX) $(CXXSTD) $< $(GTEST_LIBS) -pthread -o $@
+
+$(DST_DIR)/test_ht_chunk_config.o: test_ht_chunk_config.cu $(NCCL_EP_SRCDIR)/ht_chunk_config.hpp $(NCCL_EP_SRCDIR)/ht_sm_policy.hpp $(NCCL_EP_SRCDIR)/nccl_ep_env.h $(NCCL_EP_SRCDIR)/device/ht_ep_configs.cuh | $(DST_DIR)
+	$(CXX) $(CXXSTD) -x c++ -pthread -I$(NCCL_EP_SRCDIR) -I$(GTEST_DIR)/include -c $< -o $@
 
 # Exercise optional driver API lookup without a GPU or production test hooks.
 CFT_DRIVER_WRAPS := cudaGetDriverEntryPointByVersion cudaGetLastError cudaRuntimeGetVersion \

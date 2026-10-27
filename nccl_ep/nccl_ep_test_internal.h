@@ -67,9 +67,14 @@ ncclResult_t ncclEpGroup_test_setMaxDynamicSmem(ncclEpGroup_t group, int max_dyn
 // Returns the last LL combine launch's resolved warps-per-group, or zero when
 // that group has not launched LL combine.
 int ncclEpGroup_test_getLastLlCombineWarpsPerGroup(ncclEpGroup_t group);
-// Return the independently resolved dispatch and combine SM budgets.
+// Return the group budgets (expert-major for HT); use the handle accessor for flat.
 void ncclEpGroup_test_getSmBudgets(
     ncclEpGroup_t group, unsigned int* dispatch_num_sms, unsigned int* combine_num_sms);
 
 // Return the resolved HT flow for testing AUTO selection and explicit overrides.
 ncclEpHtFlow_t ncclEpGroup_test_getHtFlow(ncclEpGroup_t group);
+
+// Effective HT handle budgets, including the layout-specific default.
+void ncclEpHandle_test_getSmBudgets(
+    ncclEpHandle_t handle, unsigned int* dispatch_num_sms, unsigned int* combine_num_sms);
+int ncclEpHandle_test_getCombineTokensPerChunk(ncclEpHandle_t handle);

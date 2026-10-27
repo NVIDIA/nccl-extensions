@@ -9,7 +9,9 @@
  */
 
 #include "test_common.h"
+#include <algorithm>
 #include <nccl_device.h>
+#include "nccl_ep/common.hpp"
 
 // These checks freeze every public-struct field offset in the 64-bit NCCL EP
 // ABI. They do not need to run: compilation catches incompatible layout
@@ -292,6 +294,79 @@ TEST_F(PublicStructAbiRuntimeTest, HtFlowRejectsInvalidAndLlSelections) {
     config.meta_exchange_policy = NCCL_EP_META_EXCHANGE_FORCE_SCAN;
     EXPECT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclInvalidUsage);
     EXPECT_EQ(group, nullptr);
+}
+
+TEST_F(PublicStructAbiRuntimeTest, HtDefaultsAndOverridesApplyPerHandleLayout) {
+    ScopedEnvVar comm_env("NCCL_EP_COMM_SMS", nullptr);
+    ScopedEnvVar dispatch_env("NCCL_EP_DISPATCH_SMS", nullptr);
+    ScopedEnvVar combine_env("NCCL_EP_COMBINE_SMS", nullptr);
+    ScopedEnvVar chunk_env("NCCL_EP_TOKENS_PER_CHUNK", nullptr);
+    ScopedEnvVar dispatch_chunk_env("NCCL_EP_DISPATCH_TOKENS_PER_CHUNK", nullptr);
+    int device = 0;
+    cudaDeviceProp prop{};
+    ASSERT_EQ(cudaGetDevice(&device), cudaSuccess);
+    ASSERT_EQ(cudaGetDeviceProperties(&prop, device), cudaSuccess);
+    const bool rubin = prop.major * 10 + prop.minor == 107;
+    const unsigned int flat_default = 16u;
+    const unsigned int em_default = rubin ? 32u : 24u;
+    struct SmCase {
+        unsigned int shared_config, dispatch_config, combine_config;
+        const char* shared_env;
+        const char* dispatch_env;
+        const char* combine_env;
+        unsigned int expected_dispatch, expected_combine;
+        unsigned int max_dispatch_tokens, flat_combine_default;
+    };
+    // Zero expected values select the architecture/layout default.
+    const SmCase cases[] = {
+        {0, 0, 0, nullptr, nullptr, nullptr, 0, 0, kNumTokens, 16},
+        {20, 0, 0, nullptr, nullptr, nullptr, 20, 20, kNumTokens, 16},
+        {0, 18, 0, nullptr, nullptr, nullptr, 18, 0, kNumTokens, 16},
+        {0, 0, 0, "22", nullptr, nullptr, 22, 22, kNumTokens, 16},
+        {0, 0, 0, nullptr, nullptr, "12", 0, 12, kNumTokens, 16},
+        {0, 0, 0, "0", "0", nullptr, 0, 0, kNumTokens, 16},
+        {20, 18, 19, "22", "12", nullptr, 12, 22, kNumTokens, 16},
+        {0, 0, 0, nullptr, nullptr, nullptr, 0, 0, 8191, 16},
+        {0, 0, 0, nullptr, nullptr, nullptr, 0, 0, 8192, 32},
+        {20, 0, 0, nullptr, nullptr, nullptr, 20, 20, 8192, 32},
+        {0, 18, 0, nullptr, nullptr, nullptr, 18, 0, 8192, 32},
+        {0, 0, 0, nullptr, nullptr, "12", 0, 12, 8192, 32},
+    };
+    for (const auto& test_case : cases) {
+        ScopedEnvVar shared_override("NCCL_EP_COMM_SMS", test_case.shared_env);
+        ScopedEnvVar dispatch_override("NCCL_EP_DISPATCH_SMS", test_case.dispatch_env);
+        ScopedEnvVar combine_override("NCCL_EP_COMBINE_SMS", test_case.combine_env);
+        ncclEpGroupConfig_t config = htFlowTestConfig();
+        config.max_num_sms = test_case.shared_config;
+        config.max_dispatch_tokens_per_rank = test_case.max_dispatch_tokens;
+        config.max_recv_tokens_per_rank =
+            std::max(config.max_recv_tokens_per_rank, test_case.max_dispatch_tokens);
+        config.dispatch_num_sms = test_case.dispatch_config;
+        config.combine_num_sms = test_case.combine_config;
+        ncclEpGroup_t group = nullptr;
+        ASSERT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclSuccess);
+        for (auto layout : {NCCL_EP_LAYOUT_FLAT, NCCL_EP_LAYOUT_EXPERT_MAJOR}) {
+            SCOPED_TRACE(::testing::Message() << "layout=" << layout
+                         << " shared=" << test_case.shared_config << " dispatch=" << test_case.dispatch_config);
+            const unsigned int fallback = layout == NCCL_EP_LAYOUT_FLAT ? flat_default : em_default;
+            const unsigned int expected_d = test_case.expected_dispatch ? test_case.expected_dispatch : fallback;
+            const unsigned int combine_fallback = layout == NCCL_EP_LAYOUT_FLAT
+                ? test_case.flat_combine_default : em_default;
+            const unsigned int expected_c = test_case.expected_combine ? test_case.expected_combine : combine_fallback;
+            ncclEpHandle_t handle = nullptr;
+            ASSERT_EQ(ncclEpCreateHandle(&handle, group, layout, topk_idx_, nullptr, nullptr, g_stream), ncclSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+            unsigned int dispatch_sms = 0, combine_sms = 0;
+            ncclEpHandle_test_getSmBudgets(handle, &dispatch_sms, &combine_sms);
+            EXPECT_EQ(dispatch_sms, expected_d);
+            EXPECT_EQ(combine_sms, expected_c);
+            const int expected_chunk = ncclTeamLsa(g_comm).nRanks == g_nranks
+                ? static_cast<int>(nccl_ep::align(4 * expected_d, 32u)) : 64;
+            EXPECT_EQ(ncclEpHandle_test_getCombineTokensPerChunk(handle), expected_chunk);
+            EXPECT_EQ(ncclEpHandleDestroy(handle), ncclSuccess);
+        }
+        EXPECT_EQ(ncclEpGroupDestroy(group), ncclSuccess);
+    }
 }
 
 TEST_F(PublicStructAbiRuntimeTest, AutoFlowDefaultsToPullPushForBothLayouts) {

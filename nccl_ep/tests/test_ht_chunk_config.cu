@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <limits>
 #include "ht_chunk_config.hpp"
+#include "ht_sm_policy.hpp"
 
 using nccl_ep::HtDispatchChunkPolicy;
 
@@ -190,4 +191,15 @@ TEST(HtChunkConfig, ExplicitDefaultDisablesSelection) {
             EXPECT_EQ(explicit_default.select(128), fallback);
         }
     }
+}
+
+TEST(HtSmPolicy, ArchitectureAndLayoutDefaults) {
+    for (unsigned int sm : {90u, 100u, 103u, 110u, 120u, 121u}) {
+        EXPECT_EQ(nccl_ep::ht_default_comm_sms(sm, false), 16u);
+        EXPECT_EQ(nccl_ep::ht_default_comm_sms(sm, true), 24u);
+    }
+    EXPECT_EQ(nccl_ep::ht_default_comm_sms(107, false), 16u);
+    EXPECT_EQ(nccl_ep::ht_default_comm_sms(107, true), 32u);
+    EXPECT_EQ(nccl_ep::ht_flat_combine_default_sms(8191), 16u);
+    EXPECT_EQ(nccl_ep::ht_flat_combine_default_sms(8192), 32u);
 }

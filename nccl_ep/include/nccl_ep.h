@@ -296,6 +296,8 @@ typedef struct {
     //     reallocation is ever performed.
     //     (NOTE: for optimal sizing, a way to query the required size is planned for future release)
     unsigned long int rdma_buffer_size;
+    // Multi-LSA HT minimum: 1 + 2 * group dispatch SMs (AUTO: 49 non-Rubin,
+    // 65 Rubin). Group resources reserve expert-major capacity even for flat.
     unsigned int num_qp_per_rank;        // Number of QPs per rank (NCCL_EP_AUTO for auto)
     // Number of channels per rank (NCCL_EP_AUTO for auto).
     // In high throughput collectives, each channel occupies 2 SMs
@@ -332,9 +334,11 @@ typedef struct {
     // AUTO pull-push selection; zero retains push-pull.
     unsigned int num_topk;
     unsigned char padding_v2[4]; // consumes V2 tail padding; future fields append after it
-    // Dispatch SM budget. NCCL_EP_AUTO inherits the resolved shared budget.
+    // Dispatch SM budget. AUTO inherits max_num_sms when set; otherwise HT
+    // defaults to 16 flat, or 32 on Rubin (SM107) / 24 elsewhere for expert-major.
     unsigned int dispatch_num_sms;
-    // Combine SM budget. NCCL_EP_AUTO inherits the resolved shared budget.
+    // Combine SM budget. AUTO follows dispatch defaults, except HT flat uses 32
+    // when max_dispatch_tokens_per_rank >= 8192. Environment overrides still apply.
     unsigned int combine_num_sms;
     // HT dispatch/combine flow. All ranks must resolve to the same flow;
     // inconsistent API or environment configuration is unsupported. An

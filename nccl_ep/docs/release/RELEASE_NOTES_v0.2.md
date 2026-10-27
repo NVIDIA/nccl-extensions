@@ -22,6 +22,20 @@ retains staging even with `zero_copy=ON`, which can increase group memory.
 Input tokens, weights, and scales can independently use windows or staging;
 the backing choice for each operand must match across ranks.
 
+## HT communication SM defaults
+
+Expert-major dispatch and combine default to 24 SMs on non-Rubin devices and
+32 on Rubin SM107. Flat dispatch defaults to 16; flat combine defaults to 32
+when group `max_dispatch_tokens_per_rank >= 8192`, otherwise 16. The threshold
+uses configured capacity, not the current handle batch. Explicit SM overrides
+retain their precedence.
+
+Multi-LSA HT group resources require `num_qp_per_rank >= 1 + 2 * group dispatch
+SMs`: automatic defaults require 49 contexts, or 65 on Rubin, even for flat-only
+users. AUTO provisions them; smaller explicit budgets are rejected. The 24-SM
+expert-major default produces a 96-token chunk, outside the adaptive dispatch
+chunk policy's validated defaults; dispatch overrides must divide that chunk.
+
 ## New Features
 
 ### Quantization support

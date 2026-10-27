@@ -63,7 +63,7 @@ inline LlDispatchAlgo ll_dispatch_select_algo(
         recipe == NCCL_EP_DISP_QUANT_NONE || recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
     // All LSA paths require complete warp-sized input vector tiles.
     // Partial tiles use the universal kernel, including explicit SIMT/TMA modes.
-    const int elemsPerWarp = 32 * static_cast<int>(sizeof(int4)) / (tokenDtype == ncclFloat32 ? 4 : 2);
+    const int elemsPerWarp = 32 * static_cast<int>(sizeof(int4)) / ::nccl_ep::wire_elem_bytes(tokenDtype);
     // CFT: the LSA-CFT specialization (NONE recipe) unless NCCL_EP_LL_CFT_LSA=0; partial tiles
     // and other recipes keep the general CFT kernel.
     const bool cftUsesLsaKernel = !cftEnabled || (ll_cft_lsa_enabled() && recipe == NCCL_EP_DISP_QUANT_NONE);

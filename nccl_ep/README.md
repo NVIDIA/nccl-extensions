@@ -600,8 +600,15 @@ this override; use `NCCL_EP_HT_AG_SCAN_MODE=1` to force its scan path.
 
 When eligible, fused metadata stages local routing information during
 `ncclEpUpdateHandle` and builds receive maps during dispatch. It is supported with pull/push within one LSA team. Eager sizing, explicit update-time layout outputs, and unsupported
-metadata configurations retain the scan path. Enabling fused metadata alone
-does not select pull/push.
+metadata configurations retain the scan path. Fused expert-major pull metadata
+supports at most 2048 local experts; larger configurations retain scan metadata.
+Enabling fused metadata alone does not select pull/push.
+
+`ep_bench` defers metadata to dispatch by default for both HT layouts where
+supported, including validation runs. Pass `--unfused-meta-dispatch` to measure
+update-time metadata exchange instead. `--fused-meta-dispatch` remains an
+explicit alias for the default. Unsupported configurations retain their
+metadata fallback; `--meta-exchange-policy require-fused` requires fusion.
 
 To use fused metadata with a fixed receive budget, omit count/offset outputs
 from `ncclEpUpdateHandle`; request needed counters through the dispatch

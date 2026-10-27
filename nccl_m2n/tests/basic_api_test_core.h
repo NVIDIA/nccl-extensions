@@ -1378,17 +1378,30 @@ static void basicApiPrintRuntimeSummary(const char* title, int worldSize, int de
  * Returns CaseResult; rank-aggregation happens in the bootstrap loop.
  * ====================================================================*/
 
-static inline CaseResult checkPipeHostRmaSupport(TestEnv* env) {
+static inline bool isPipeHostRmaAlgo() {
   const char* copyAlgorithm = getenv("NCCL_RESHARD_COPY_ALGORITHM");
   const char* pipeNetMode = getenv("NCCL_RESHARD_PIPE_NET_MODE");
-  if (copyAlgorithm != nullptr && strcasecmp(copyAlgorithm, "PIPE") == 0 && pipeNetMode != nullptr &&
-      (strcasecmp(pipeNetMode, "HOST_RMA") == 0 || strcasecmp(pipeNetMode, "HOST-RMA") == 0 ||
-       strcasecmp(pipeNetMode, "HOSTRMA") == 0)) {
+  return copyAlgorithm != nullptr && strcasecmp(copyAlgorithm, "PIPE") == 0 && pipeNetMode != nullptr &&
+         (strcasecmp(pipeNetMode, "HOST_RMA") == 0 || strcasecmp(pipeNetMode, "HOST-RMA") == 0 ||
+          strcasecmp(pipeNetMode, "HOSTRMA") == 0);
+}
+
+/* ncclReshard rejects PIPE host-RMA before NCCL 2.31.2; see #139. */
+static inline bool skipPipeHostRmaTest() {
+  int ncclVersion = 0;
+  return ncclGetVersion(&ncclVersion) != ncclSuccess || ncclVersion < NCCL_VERSION(2, 31, 2);
+}
+
+static inline CaseResult checkPipeHostRmaSupport(TestEnv* env) {
+  if (isPipeHostRmaAlgo()) {
     int driverVersion = 0;
     if (cudaDriverGetVersion(&driverVersion) != cudaSuccess) driverVersion = -1;
     const int minDriverVersion = env->allreduceMinInt(env, driverVersion);
     if (minDriverVersion < 0) return makeFail("failed to query the CUDA driver version");
     if (minDriverVersion < 12050) return makeSkip("PIPE host-RMA requires CUDA driver API 12.5 or newer");
+    if (skipPipeHostRmaTest()) {
+      return makeSkip("PIPE host-RMA requires NCCL 2.31.2 or newer; older NCCL can hang on idle ranks");
+    }
   }
   return makePass();
 }

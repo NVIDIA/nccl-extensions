@@ -2733,10 +2733,21 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   const bool pipeHostRma =
     (copyAlgo == RESHARD_COPY_ALGO_PIPE) && (reshardGetPipeNetMode() == RESHARD_PIPE_NET_HOST_RMA);
 
-  if (pipeHostRma && !commProps.hostRmaSupport) {
-    NCCL_M2N_FAIL(ncclInvalidUsage, world_rank,
-                  "ncclReshard: PIPE host_rma requested but the parent communicator does not report host RMA "
-                  "support");
+  if (pipeHostRma) {
+    if (!commProps.hostRmaSupport) {
+      NCCL_M2N_FAIL(ncclInvalidUsage, world_rank,
+                    "ncclReshard: PIPE host_rma requested but the parent communicator does not report host RMA "
+                    "support");
+    }
+    /* Before 2.31.2, NCCL starts its collective host-RMA init on the first
+     * put/signal; a rank with no PIPE edges never makes one, so peers hang. */
+    int ncclVersion = 0;
+    NCCL_M2N_CHECK(ncclGetVersion(&ncclVersion));
+    if (ncclVersion < NCCL_VERSION(2, 31, 2)) {
+      NCCL_M2N_FAIL(ncclInvalidUsage, world_rank,
+                    "ncclReshard: PIPE host_rma requires NCCL 2.31.2 or newer; found %d.%d.%d",
+                    ncclVersion / 10000, (ncclVersion % 10000) / 100, ncclVersion % 100);
+    }
   }
 
   /* PACK: full per-dest-contiguous CE pack + hierarchical

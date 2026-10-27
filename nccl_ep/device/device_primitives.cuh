@@ -117,21 +117,15 @@ __host__ __device__ constexpr int size_u8<ncclFloat4x2>() {
     return sizeof(uint8_t);
 }
 
-// Bytes needed to store `num_elements` logical elements of wire dtype `dt`, for host code that
-// only has the dtype as a runtime value (e.g. before it's baked into a JIT variant's compile-time
-// kTokenDtype). NOT simply num_elements * a per-dtype byte size: ncclFloat4x2 packs two logical
-// elements per byte, so its row is HALF as many bytes as elements -- size_u8<kDt>() alone (1 byte)
-// would silently double-count it if naively multiplied by num_elements. Every other dtype here
-// packs >= 1 byte/element, so it reduces to num_elements * size_u8<kDt>() for them.
-__host__ __forceinline__ size_t token_row_bytes(ncclDataType_t dt, size_t num_elements) {
-    switch (dt) {
-        case ncclFloat32: return num_elements * size_u8<ncclFloat32>();
-        case ncclFloat16: return num_elements * size_u8<ncclFloat16>();
-        case ncclFloat8e4m3: return num_elements * size_u8<ncclFloat8e4m3>();
-        case ncclFloat8e5m2: return num_elements * size_u8<ncclFloat8e5m2>();
-        case ncclFloat4x2: return (num_elements + 1) / 2;
-        default: return num_elements * size_u8<ncclBfloat16>();
+// Runtime form of size_u8: bytes of one physical wire element (a warp tile is 32 * 16 / wire_elem_bytes).
+__host__ __device__ constexpr int wire_elem_bytes(ncclDataType_t dt) {
+    if (dt == ncclFloat32) {
+        return 4;
     }
+    if (dt == ncclFloat16 || dt == ncclBfloat16) {
+        return 2;
+    }
+    return 1;
 }
 
 // Wire element width in uint16_t units (token buffers use a uint16_t* base; one-byte values have no

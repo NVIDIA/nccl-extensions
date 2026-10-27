@@ -276,7 +276,8 @@ inline ncclResult_t launch_ll_dispatch(
     int tmaDynamicSmemBytes = 0;
     if (twoSidedRmLsaTma) {
         // DSFP8 compacts in place; preserve the BF16 stage size and depth.
-        const int hiddenBytes = static_cast<int>(::nccl_ep::token_row_bytes(tokenDtype, hidden));
+        // `hidden` is the physical width (fp4x2 rows are H/2 bytes).
+        const int hiddenBytes = static_cast<int>(static_cast<size_t>(hidden) * ::nccl_ep::wire_elem_bytes(tokenDtype));
         const size_t dispatchHdrSz = get_dispatch_hdr_sz(num_topk, layout);
         // Reserve syncAndSendCounts's static __shared__ state out of the budget before sizing the
         // dynamic stage ring -- see dispatch_tma_smem::kStaticSmemBytes's doc comment; same split

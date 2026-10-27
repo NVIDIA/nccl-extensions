@@ -235,7 +235,7 @@ static cudaError_t cudaFreeCallback(void* ptr, void* /*context*/) {
     return cudaFree(ptr);
 }
 
-// Resolved after communicator creation using the same AUTO policy as the library.
+// Resource setup follows the documented HT defaults and explicit benchmark options.
 static bool g_ht_pull_push_enabled = false;
 static bool htPullPushEnabled() {
     return g_ht_pull_push_enabled;
@@ -253,12 +253,33 @@ static bool resolveHtPullPushEnabled(
     const bool flow_env_valid = flow_env &&
         (htEnvFlagEnabled("NCCL_EP_HT_PULL_PUSH") || strcasecmp(flow_env, "0") == 0 ||
          strcasecmp(flow_env, "off") == 0 || strcasecmp(flow_env, "false") == 0);
-    const bool default_pull_push = ncclTeamLsa(comm).nRanks == num_ranks && num_ranks <= 128 &&
-        topk <= 32 && num_experts <= 65535 &&
+    constexpr unsigned int max_pull_ranks = 128;
+    constexpr unsigned int max_pull_topk = 32;
+    constexpr unsigned int max_pull_experts = 65535;
+    const bool default_pull_push = ncclTeamLsa(comm).nRanks == num_ranks &&
+        num_ranks <= max_pull_ranks && topk > 0 && topk <= max_pull_topk && num_experts <= max_pull_experts &&
         !htEnvFlagEnabled("NCCL_EP_HT_EM_LOCAL_DUP") && !htEnvFlagEnabled("NCCL_EP_HT_EM_NVLINK_DUP");
     return flow == NCCL_EP_HT_FLOW_PULL_PUSH ||
         (flow == NCCL_EP_HT_FLOW_AUTO &&
          (flow_env_valid ? htEnvFlagEnabled("NCCL_EP_HT_PULL_PUSH") : default_pull_push));
+}
+
+static bool htDispatchMetadataCapable(
+    ncclComm_t comm, int num_ranks, const ncclEpGroupConfig_t& config,
+    ncclEpLayout_t layout, unsigned int num_local_experts) {
+    constexpr unsigned int max_pull_count_local_experts = 2048;
+    const bool expert_major = layout == NCCL_EP_LAYOUT_EXPERT_MAJOR;
+    const bool scan_metadata = config.meta_exchange_policy == NCCL_EP_META_EXCHANGE_FORCE_SCAN ||
+        (config.meta_exchange_policy == NCCL_EP_META_EXCHANGE_AUTO && htEnvFlagEnabled("NCCL_EP_HT_AG_SCAN_MODE"));
+    const bool unfused_metadata = config.meta_exchange_policy == NCCL_EP_META_EXCHANGE_AUTO &&
+        (!expert_major || !htPullPushEnabled()) && htEnvFlagEnabled("NCCL_EP_HT_COUNT_UNFUSED");
+    const bool duplicate_mode = htEnvFlagEnabled("NCCL_EP_HT_EM_LOCAL_DUP") ||
+        htEnvFlagEnabled("NCCL_EP_HT_EM_NVLINK_DUP");
+    return config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
+        config.max_recv_tokens_per_rank != NCCL_EP_AUTO && ncclTeamLsa(comm).nRanks == num_ranks &&
+        !scan_metadata && !unfused_metadata &&
+        (htPullPushEnabled() ? (!expert_major || num_local_experts <= max_pull_count_local_experts)
+                             : (config.zero_copy != NCCL_EP_ZERO_COPY_ON && !duplicate_mode));
 }
 
 // Element size for the dtypes used in this benchmark. ncclTypeSize is internal to the EP library.
@@ -5264,7 +5285,8 @@ void printUsage(const char* programName, int myRank) {
         printf("  --datatype <dtype>      Wire dtype for token tensors: bf16 (default), fp16, fp32\n");
         printf("  --disable-token-dropping LL only: do not insert random -1 sentinels in the topk table\n");
         printf("                          (drop-free, deterministic routing; useful for debugging/validation)\n");
-        printf("  --fused-meta-dispatch   HT-EM count: keep AG-of-count fused in dispatch (skip UpdateHandle unfused path)\n");
+        printf("  --fused-meta-dispatch   HT: build metadata inside dispatch (default where supported)\n");
+        printf("  --unfused-meta-dispatch HT: request metadata before dispatch for comparison runs\n");
         printf("  -B, --backward          HT only: also benchmark the backward dispatch/combine ops\n");
         printf("                          (reuses the forward routing state; combine consumes topk_weights)\n");
         printf("  --help                  Show this help message\n");
@@ -5292,7 +5314,7 @@ int main(int argc, char* argv[]) {
     bool validate_data = false;  // Validate dispatch/combine correctness
     bool validation_passed = true;  // Aggregated across ranks when validation is enabled
     bool dispatch_only = false;  // Skip combine run and validation (use with --validate)
-    bool fused_meta_dispatch = false;  // HT-EM count: keep AG-of-count fused in dispatch (skip UpdateHandle unfused path)
+    bool fused_meta_dispatch = true;  // HT: defer metadata to dispatch by default
     bool dynamic_tokens = false;  // Enable dynamic token allocation (HT only, for random topk)
     bool run_backward = false;  // Also benchmark the HT backward dispatch/combine ops
     size_t expert_major_alignment = 0;  // 0 = no padding; >1 aligns each expert zone
@@ -5367,6 +5389,7 @@ int main(int argc, char* argv[]) {
         {"datatype", required_argument, 0, 0},
         {"disable-token-dropping", no_argument, 0, 1001},
         {"fused-meta-dispatch", no_argument, 0, 1005},
+        {"unfused-meta-dispatch", no_argument, 0, 1012},
         {"backward", no_argument, 0, 'B'},
         {"overflow-drop", no_argument, 0, 1008},
         {"meta-exchange-policy", required_argument, 0, 1010},
@@ -5644,6 +5667,9 @@ int main(int argc, char* argv[]) {
         case 1005:  // --fused-meta-dispatch
             fused_meta_dispatch = true;
             break;
+        case 1012:  // --unfused-meta-dispatch
+            fused_meta_dispatch = false;
+            break;
         case 'h':
             printUsage(argv[0], myRank);
             MPI_Finalize();
@@ -5717,6 +5743,16 @@ int main(int argc, char* argv[]) {
     if (combine_quantization == NCCL_EP_COMB_QUANT_NVFP4 && !kNvfp4BenchmarkSupported) {
         if (myRank == 0) {
             printf("Error: NVFP4 combine requires CUDA 12.9+ with cuda_fp4.h.\n");
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && !fused_meta_dispatch &&
+        meta_exchange_policy == NCCL_EP_META_EXCHANGE_REQUIRE_FUSED) {
+        if (myRank == 0) {
+            printf("Error: --unfused-meta-dispatch conflicts with "
+                   "--meta-exchange-policy require-fused.\n");
         }
         MPI_Finalize();
         return 1;
@@ -6225,21 +6261,22 @@ int main(int argc, char* argv[]) {
     const bool ht_em = (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
     const bool need_layout_info = ht_em && validate_data;
 
-    // HT-EM count: default unfused (write layout_info in UpdateHandle); --fused-meta-dispatch keeps it
-    // fused in dispatch. Allocate the count tensors so the unfused path is exercised/timed even
-    // without --validate.
-    const bool need_layout_info_before_dispatch = ht_em && !fused_meta_dispatch;
+    // Scan and native-dup dispatch cannot publish caller layout outputs.
+    const bool dispatch_metadata_capable = htDispatchMetadataCapable(comm, nRanks, config, layout, num_local_experts);
+    const bool defer_metadata = fused_meta_dispatch && dispatch_metadata_capable;
+    const bool need_layout_info_before_dispatch =
+        algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && !defer_metadata;
     ncclEpTensor_t* recv_expert_counter_tensor = nullptr;
     ncclEpTensor_t* recv_total_counter_tensor = nullptr;
     if (ht_em && (dynamic_tokens || need_layout_info || need_layout_info_before_dispatch)) {
         NCCLCHECK(epMakeTensor(&recv_expert_counter_tensor, 1, ncclInt64, num_local_experts));
         if (need_layout_info_before_dispatch) NCCLCHECK(epMakeTensor(&recv_total_counter_tensor, 1, ncclInt64, 1));
-    } else if (dynamic_tokens) {
+    } else if (dynamic_tokens || need_layout_info_before_dispatch) {
         NCCLCHECK(epMakeTensor(&recv_expert_counter_tensor, 1, ncclInt32, num_local_experts));
         NCCLCHECK(epMakeTensor(&recv_total_counter_tensor, 1, ncclInt32, 1));
     }
     ncclEpTensor_t* meta_offsets_tensor = nullptr;
-    if (need_layout_info || need_layout_info_before_dispatch) {
+    if (ht_em && (need_layout_info || need_layout_info_before_dispatch)) {
         NCCLCHECK(epMakeTensor(&meta_offsets_tensor, 1, ncclInt64, num_local_experts));
     }
 
@@ -6251,9 +6288,8 @@ int main(int argc, char* argv[]) {
     const bool has_handle_layout_info = handle_layout_info.expert_counters != nullptr ||
                                         handle_layout_info.recv_total_counter != nullptr ||
                                         handle_layout_info.expert_offsets != nullptr;
-    // --fused-meta-dispatch suppresses UpdateHandle count provisioning so the AG-of-count stays fused
-    // in the dispatch head.
-    const bool provide_update_layout = has_handle_layout_info && !fused_meta_dispatch;
+    // Provision update-time outputs when dispatch cannot publish them.
+    const bool provide_update_layout = has_handle_layout_info && !defer_metadata;
     const ncclEpLayoutInfo_t* handle_layout = provide_update_layout ? &handle_layout_info : nullptr;
 
     const bool ht_expert_major = (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);

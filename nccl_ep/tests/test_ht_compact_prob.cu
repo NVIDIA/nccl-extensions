@@ -182,7 +182,8 @@ struct State {
                                    &cfg, topk, nullptr));
         const int compact_floats = ((6 * topk + 15) & ~15) / 4;
         const int dense_floats = (experts / g_nranks) * ncclEpHandle_test_getNRanksPerNode(handle);
-        const bool inline_wire = compact_floats < dense_floats && !enabled("NCCL_EP_HT_PULL_PUSH");
+        const bool pull_push = ncclEpGroup_test_getHtFlow(group) == NCCL_EP_HT_FLOW_PULL_PUSH;
+        const bool inline_wire = compact_floats < dense_floats && !pull_push;
         ASSERT_EQ(ncclEpHandle_test_getCompactProbWireFloats(handle), inline_wire ? compact_floats : 0)
             << "Compact is automatic when smaller; pull-push keeps its existing sparse-ID path";
         const char* order = std::getenv("NCCL_EP_HT_RECV_TOPK_ORDER");

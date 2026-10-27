@@ -40,7 +40,37 @@ static inline bool env_flag_active(const char* name) {
     return strcasecmp(v, "1") == 0 || strcasecmp(v, "on") == 0 || strcasecmp(v, "true") == 0;
 }
 
-// True when HT pull-dispatch/push-combine mode is active (NCCL_EP_HT_PULL_PUSH).
+class ScopedEnvVar {
+public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        const char* previous = getenv(name_);
+        if (previous != nullptr) {
+            had_previous_ = true;
+            previous_ = previous;
+        }
+        if (value != nullptr) {
+            setenv(name_, value, 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (had_previous_) {
+            setenv(name_, previous_.c_str(), 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+private:
+    const char* name_;
+    bool had_previous_ = false;
+    std::string previous_;
+};
+
+// Reports only an explicit pull environment override, not the group's resolved flow.
+// AUTO-aware tests must inspect the group or handle instead.
 static inline bool ht_pull_push_active() {
     return env_flag_active("NCCL_EP_HT_PULL_PUSH");
 }

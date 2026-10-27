@@ -33,10 +33,12 @@ static_assert(nccl_ep::combine_recipe_traits<NCCL_EP_COMB_QUANT_NONE>::kScaleBlo
 static constexpr int kMxHidden = 512;           // must be a multiple of 32 (MXFP8 block)
 static constexpr int kMxElemsTested = 10;       // first N elements per token to validate
 
-static ncclEpGroup_t make_mxfp8_ht_group() {
+static ncclEpGroup_t make_mxfp8_ht_group(ncclEpHtFlow_t flow) {
     ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
     gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
     gcfg.num_experts = kNumExperts;
+    gcfg.num_topk = kTopK;
+    gcfg.ht_flow = flow;
     gcfg.max_dispatch_tokens_per_rank = kNumTokens;
     gcfg.max_token_bytes = kMxHidden * static_cast<unsigned int>(sizeof(nv_bfloat16));
     gcfg.rdma_buffer_size = NCCL_EP_AUTO;
@@ -149,7 +151,7 @@ protected:
     // MXFP8 combine is expert-major only: the quantizing prologue lives in
     // local_permute_reduce, which no other layout runs.
     void run_mxfp8_combine_case() {
-        ncclEpGroup_t group = make_mxfp8_ht_group();
+        ncclEpGroup_t group = make_mxfp8_ht_group(NCCL_EP_HT_FLOW_PUSH_PULL);
         ASSERT_NE(group, nullptr);
 
         ncclEpHandle_t handle = nullptr;
@@ -212,7 +214,7 @@ TEST_F(Mxfp8CombineTest, ExpertMajorCombineMatchesReference) {
 // JIT variant, and it pins the split of concerns: the token path is quantized, while the
 // FP32 weight gradients must round-trip bit-exactly through it.
 TEST_F(Mxfp8CombineTest, ExpertMajorBackwardCombineMatchesReference) {
-    ncclEpGroup_t group = make_mxfp8_ht_group();
+    ncclEpGroup_t group = make_mxfp8_ht_group(NCCL_EP_HT_FLOW_PUSH_PULL);
     ASSERT_NE(group, nullptr);
 
     ncclEpHandle_t handle = nullptr;
@@ -292,7 +294,7 @@ TEST_F(Mxfp8CombineTest, ExpertMajorBackwardCombineMatchesReference) {
 // MXFP8 has no quantizing prologue outside the expert-major local-permute path, so a FLAT
 // handle must be rejected rather than silently transporting unquantized BF16.
 TEST_F(Mxfp8CombineTest, RejectsFlatLayout) {
-    ncclEpGroup_t group = make_mxfp8_ht_group();
+    ncclEpGroup_t group = make_mxfp8_ht_group(NCCL_EP_HT_FLOW_PUSH_PULL);
     ASSERT_NE(group, nullptr);
     ncclEpHandle_t handle = nullptr;
     EXPECT_EQ(ncclEpCreateHandle(&handle, group, NCCL_EP_LAYOUT_FLAT, topk_idx_, nullptr, nullptr, g_stream),
@@ -323,10 +325,46 @@ TEST_F(Mxfp8CombineTest, RejectsFlatLayout) {
     NCCL_ASSERT(ncclEpGroupDestroy(group));
 }
 
+TEST_F(Mxfp8CombineTest, AutoPullPushRejectsMxfp8) {
+    if (ncclTeamLsa(g_comm).nRanks != g_nranks) {
+        GTEST_SKIP() << "AUTO pull-push requires one LSA team";
+    }
+    ScopedEnvVar flow_env("NCCL_EP_HT_PULL_PUSH", nullptr);
+    ScopedEnvVar local_dup_env("NCCL_EP_HT_EM_LOCAL_DUP", nullptr);
+    ScopedEnvVar nvlink_dup_env("NCCL_EP_HT_EM_NVLINK_DUP", nullptr);
+    ncclEpGroup_t group = make_mxfp8_ht_group(NCCL_EP_HT_FLOW_AUTO);
+    ASSERT_NE(group, nullptr);
+    EXPECT_EQ(ncclEpGroup_test_getHtFlow(group), NCCL_EP_HT_FLOW_PULL_PUSH);
+    ncclEpHandle_t handle = nullptr;
+    ASSERT_EQ(ncclEpCreateHandle(
+        &handle, group, NCCL_EP_LAYOUT_EXPERT_MAJOR, topk_idx_em_, nullptr, nullptr, g_stream), ncclSuccess);
+    nv_bfloat16* recv_data = nullptr;
+    ncclEpTensor_t* recv = nullptr;
+    run_forward_dispatch_bf16(handle, true, &recv_data, &recv, nullptr, nullptr);
+    nv_bfloat16* output_data = nullptr;
+    CUDA_ASSERT(cudaMalloc(&output_data, kNumTokens * kMxHidden * sizeof(nv_bfloat16)));
+    ncclEpTensor_t* output = nullptr;
+    NCCL_ASSERT(epTensorCreate(&output, 2, ncclBfloat16, output_data, kNumTokens, kMxHidden));
+    ncclEpCombineInputs_t inputs = NCCL_EP_COMBINE_INPUTS_INIT;
+    ncclEpCombineOutputs_t outputs = NCCL_EP_COMBINE_OUTPUTS_INIT;
+    ncclEpCombineConfig_t config = NCCL_EP_COMBINE_CONFIG_INIT;
+    inputs.tokens = recv;
+    outputs.tokens = output;
+    config.quant_recipe = NCCL_EP_COMB_QUANT_MXFP8;
+    EXPECT_EQ(ncclEpCombine(handle, &inputs, &outputs, &config, g_stream), ncclInvalidArgument);
+    EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+    NCCL_ASSERT(ncclEpTensorDestroy(recv));
+    NCCL_ASSERT(ncclEpTensorDestroy(output));
+    CUDA_ASSERT(cudaFree(recv_data));
+    CUDA_ASSERT(cudaFree(output_data));
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
+}
+
 // Scales are generated internally, so any caller-supplied scale tensor is a contract error.
 // Uses the expert-major handle so the rejection can only come from the scales rule.
 TEST_F(Mxfp8CombineTest, RejectsWithScales) {
-    ncclEpGroup_t group = make_mxfp8_ht_group();
+    ncclEpGroup_t group = make_mxfp8_ht_group(NCCL_EP_HT_FLOW_PUSH_PULL);
     ASSERT_NE(group, nullptr);
     ncclEpHandle_t handle = nullptr;
     EXPECT_EQ(ncclEpCreateHandle(

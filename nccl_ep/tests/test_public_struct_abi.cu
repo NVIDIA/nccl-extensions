@@ -9,6 +9,7 @@
  */
 
 #include "test_common.h"
+#include <nccl_device.h>
 
 // These checks freeze every public-struct field offset in the 64-bit NCCL EP
 // ABI. They do not need to run: compilation catches incompatible layout
@@ -169,32 +170,11 @@ void ncclEpCompleteConfig_backwards_compat_test() {
 
 class PublicStructAbiRuntimeTest : public EpTestBase {};
 
-class ScopedHtFlowEnv {
-public:
-    ScopedHtFlowEnv(const char* name, const char* value) : name_(name) {
-        const char* previous = getenv(name_);
-        if (previous != nullptr) {
-            had_previous_ = true;
-            previous_ = previous;
-        }
-        setenv(name_, value, 1);
-    }
-
-    ~ScopedHtFlowEnv() {
-        if (had_previous_) setenv(name_, previous_.c_str(), 1);
-        else unsetenv(name_);
-    }
-
-private:
-    const char* name_;
-    bool had_previous_ = false;
-    std::string previous_;
-};
-
 static ncclEpGroupConfig_t htFlowTestConfig() {
     ncclEpGroupConfig_t config = NCCL_EP_GROUP_CONFIG_INIT;
     config.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
     config.num_experts = kNumExperts;
+    config.num_topk = kTopK;
     config.max_dispatch_tokens_per_rank = kNumTokens;
     config.max_recv_tokens_per_rank = kMaxRecvSlots;
     config.max_token_bytes = kHidden * sizeof(nv_bfloat16);
@@ -314,13 +294,84 @@ TEST_F(PublicStructAbiRuntimeTest, HtFlowRejectsInvalidAndLlSelections) {
     EXPECT_EQ(group, nullptr);
 }
 
+TEST_F(PublicStructAbiRuntimeTest, AutoFlowDefaultsToPullPushForBothLayouts) {
+    ScopedEnvVar flow_env("NCCL_EP_HT_PULL_PUSH", nullptr);
+    ScopedEnvVar local_dup_env("NCCL_EP_HT_EM_LOCAL_DUP", nullptr);
+    ScopedEnvVar nvlink_dup_env("NCCL_EP_HT_EM_NVLINK_DUP", nullptr);
+    ncclEpGroupConfig_t config = htFlowTestConfig();
+    ncclEpGroup_t group = nullptr;
+    ASSERT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclSuccess);
+    const bool single_lsa = ncclTeamLsa(g_comm).nRanks == g_nranks;
+    EXPECT_EQ(ncclEpGroup_test_getHtFlow(group),
+              single_lsa ? NCCL_EP_HT_FLOW_PULL_PUSH : NCCL_EP_HT_FLOW_PUSH_PULL);
+    for (auto layout : {NCCL_EP_LAYOUT_FLAT, NCCL_EP_LAYOUT_EXPERT_MAJOR}) {
+        ncclEpHandle_t handle = nullptr;
+        EXPECT_EQ(ncclEpCreateHandle(&handle, group, layout, topk_idx_, nullptr, nullptr, g_stream), ncclSuccess);
+        EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+        if (handle != nullptr) {
+            EXPECT_EQ(ncclEpHandleDestroy(handle), ncclSuccess);
+        }
+    }
+    EXPECT_EQ(ncclEpGroupDestroy(group), ncclSuccess);
+}
+
+TEST_F(PublicStructAbiRuntimeTest, AutoFlowRespectsKnownTopkLimit) {
+    ScopedEnvVar flow_env("NCCL_EP_HT_PULL_PUSH", nullptr);
+    ScopedEnvVar local_dup_env("NCCL_EP_HT_EM_LOCAL_DUP", nullptr);
+    ScopedEnvVar nvlink_dup_env("NCCL_EP_HT_EM_NVLINK_DUP", nullptr);
+    constexpr int topk = 64;
+    std::vector<int64_t> ids(kNumTokens * topk);
+    for (int token = 0; token < kNumTokens; ++token) {
+        for (int k = 0; k < topk; ++k) {
+            ids[token * topk + k] = k;
+        }
+    }
+    int64_t* device_ids = nullptr;
+    ASSERT_EQ(cudaMalloc(&device_ids, ids.size() * sizeof(int64_t)), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(device_ids, ids.data(), ids.size() * sizeof(int64_t), cudaMemcpyHostToDevice), cudaSuccess);
+    for (unsigned int bound : {0u, 32u, static_cast<unsigned int>(topk)}) {
+        ncclEpGroupConfig_t config = htFlowTestConfig();
+        config.num_experts = topk * g_nranks;
+        config.num_topk = bound;
+        config.max_recv_tokens_per_rank = g_nranks * kNumTokens * topk;
+        ncclEpGroup_t group = nullptr;
+        ASSERT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclSuccess);
+        const bool pull = bound == 32 && ncclTeamLsa(g_comm).nRanks == g_nranks;
+        EXPECT_EQ(ncclEpGroup_test_getHtFlow(group),
+                  pull ? NCCL_EP_HT_FLOW_PULL_PUSH : NCCL_EP_HT_FLOW_PUSH_PULL);
+        ncclEpTensor_t* bounded_indices = nullptr;
+        ASSERT_EQ(epTensorCreate(&bounded_indices, 2, ncclInt64, device_ids,
+                                 kNumTokens, bound == 32 ? 32 : topk), ncclSuccess);
+        ncclEpHandle_t handle = nullptr;
+        EXPECT_EQ(ncclEpCreateHandle(&handle, group, NCCL_EP_LAYOUT_EXPERT_MAJOR,
+                                    bounded_indices, nullptr, nullptr, g_stream), ncclSuccess);
+        EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+        if (handle != nullptr) {
+            EXPECT_EQ(ncclEpHandleDestroy(handle), ncclSuccess);
+        }
+        EXPECT_EQ(ncclEpGroupDestroy(group), ncclSuccess);
+        EXPECT_EQ(ncclEpTensorDestroy(bounded_indices), ncclSuccess);
+    }
+    EXPECT_EQ(cudaFree(device_ids), cudaSuccess);
+}
+
+TEST_F(PublicStructAbiRuntimeTest, AutoFlowHonorsPushPullEnvironmentOverride) {
+    ScopedEnvVar flow_env("NCCL_EP_HT_PULL_PUSH", "0");
+    ncclEpGroupConfig_t config = htFlowTestConfig();
+    ncclEpGroup_t group = nullptr;
+    ASSERT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclSuccess);
+    EXPECT_EQ(ncclEpGroup_test_getHtFlow(group), NCCL_EP_HT_FLOW_PUSH_PULL);
+    EXPECT_EQ(ncclEpGroupDestroy(group), ncclSuccess);
+}
+
 TEST_F(PublicStructAbiRuntimeTest, ExplicitPushPullOverridesEnvironment) {
-    ScopedHtFlowEnv pull_push_env("NCCL_EP_HT_PULL_PUSH", "1");
+    ScopedEnvVar pull_push_env("NCCL_EP_HT_PULL_PUSH", "1");
     ncclEpGroupConfig_t config = htFlowTestConfig();
     config.ht_flow = NCCL_EP_HT_FLOW_PUSH_PULL;
 
     ncclEpGroup_t group = nullptr;
     ASSERT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclSuccess);
+    EXPECT_EQ(ncclEpGroup_test_getHtFlow(group), NCCL_EP_HT_FLOW_PUSH_PULL);
 
     ncclEpHandle_t handle = nullptr;
     EXPECT_EQ(
@@ -333,8 +384,8 @@ TEST_F(PublicStructAbiRuntimeTest, ExplicitPushPullOverridesEnvironment) {
 }
 
 TEST_F(PublicStructAbiRuntimeTest, ExplicitMetaPolicyOverridesLegacyEnvironment) {
-    ScopedHtFlowEnv scan_env("NCCL_EP_HT_AG_SCAN_MODE", "1");
-    ScopedHtFlowEnv unfused_env("NCCL_EP_HT_COUNT_UNFUSED", "1");
+    ScopedEnvVar scan_env("NCCL_EP_HT_AG_SCAN_MODE", "1");
+    ScopedEnvVar unfused_env("NCCL_EP_HT_COUNT_UNFUSED", "1");
     ncclEpGroupConfig_t config = htFlowTestConfig();
     config.ht_flow = NCCL_EP_HT_FLOW_PUSH_PULL;
     config.meta_exchange_policy = NCCL_EP_META_EXCHANGE_REQUIRE_FUSED;
@@ -353,12 +404,13 @@ TEST_F(PublicStructAbiRuntimeTest, ExplicitMetaPolicyOverridesLegacyEnvironment)
 }
 
 TEST_F(PublicStructAbiRuntimeTest, ExplicitPullPushSupportsFlatLayout) {
-    ScopedHtFlowEnv pull_push_env("NCCL_EP_HT_PULL_PUSH", "0");
+    ScopedEnvVar pull_push_env("NCCL_EP_HT_PULL_PUSH", "0");
     ncclEpGroupConfig_t config = htFlowTestConfig();
     config.ht_flow = NCCL_EP_HT_FLOW_PULL_PUSH;
 
     ncclEpGroup_t group = nullptr;
     ASSERT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclSuccess);
+    EXPECT_EQ(ncclEpGroup_test_getHtFlow(group), NCCL_EP_HT_FLOW_PULL_PUSH);
 
     ncclEpHandle_t handle = nullptr;
     EXPECT_EQ(

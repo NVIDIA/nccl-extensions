@@ -44,7 +44,8 @@ means anything at all:
   rank's stores to itself, and `scale_out_bw` includes the rail-self entry unless
   `--ignore-local-traffic` — and it holds only where the caller's representation is what the
   library puts on the wire. Where the library repacks internally the counted row can *exceed*
-  the real one.
+  the real one, so that figure is withheld rather than reported; MXFP8 combine is the one such
+  mode today.
 - **Overhead appears as time, not as payload.** An implementation that sends a wider row or
   copies more often takes longer, so its reported bandwidth goes *down*. A byte count that
   tracked the implementation would instead make a wasteful encoding look faster.

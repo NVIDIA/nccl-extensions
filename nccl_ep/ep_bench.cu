@@ -4991,7 +4991,12 @@ void printHighThroughputResults(
     const HtByteTotals& dispatch_totals,
     const HtByteTotals& combine_totals,
     ncclEpDispQuant_t dispatch_quantization,
+    ncclEpCombQuant_t combine_quantization,
     bool dispatch_only) {
+    const bool combine_bw_unavailable = (combine_quantization == NCCL_EP_COMB_QUANT_MXFP8);
+    const char* kCombineBwNote =
+        "             (combine BW withheld: MXFP8 repacks rows internally, so counted bytes are "
+        "not what crosses the link)\n";
     double local_dispatch_avg = dispatch_result.avg_ms;
     double local_dispatch_min = dispatch_result.min_ms;
     double local_dispatch_max = dispatch_result.max_ms;
@@ -5093,7 +5098,9 @@ void printHighThroughputResults(
         if (!dispatch_only) {
             printf("Combine:     total=%.2f us (min=%.2f, max=%.2f)\n", global_combine_avg * 1000,
                    global_combine_min * 1000, global_combine_max * 1000);
-            if (ck_total_s > 0) {
+            if (combine_bw_unavailable) {
+                printf("%s", kCombineBwNote);
+            } else if (ck_total_s > 0) {
                 printHtBandwidthLine("send", combine_totals.total_recv, combine_totals.nvl_recv,
                                      combine_totals.scale_out_recv, nRanks, ck_total_s);
                 printHtBandwidthLine("recv", combine_totals.total_send, combine_totals.nvl_send,
@@ -5126,7 +5133,9 @@ void printHighThroughputResults(
 
             if (!dispatch_only) {
                 printf("Combine:     kernel=%.2f us\n", avg_kernel_ck_us);
-                if (ck_s > 0) {
+                if (combine_bw_unavailable) {
+                    printf("%s", kCombineBwNote);
+                } else if (ck_s > 0) {
                     printHtBandwidthLine("send", combine_totals.total_recv, combine_totals.nvl_recv,
                                          combine_totals.scale_out_recv, nRanks, ck_s);
                     printHtBandwidthLine("recv", combine_totals.total_send, combine_totals.nvl_send,
@@ -7023,6 +7032,7 @@ int main(int argc, char* argv[]) {
             dispatch_totals,
             combine_totals,
             dispatch_quantization,
+            combine_quantization,
             dispatch_only);
     }
 
@@ -7331,6 +7341,7 @@ int main(int argc, char* argv[]) {
                 bwd_dispatch_totals,
                 bwd_combine_totals,
                 dispatch_quantization,
+                combine_quantization,
                 dispatch_only);
 
             // ===== Backward correctness validation (EM round-trip) =====

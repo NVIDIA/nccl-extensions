@@ -47,6 +47,7 @@ implemented on top of NCCL Device API: Load-Store Accessible (LSA) and GPU-Initi
 - [Usage Examples](docs/documentation/usage_examples.md) — end-to-end HT and LL walkthroughs
 - [Custom Allocators](docs/documentation/custom_allocators.md) — routing internal allocations through a caller pool
 - [Elastic Receive Buffers](docs/documentation/elastic_buffers.md) — GPU + CPU backed recv tensors
+- [AWS EFA](docs/documentation/aws_efa.md) — NCCL GIN CPU proxy over the aws-ofi-nccl plugin
 
 # Overview
 
@@ -316,6 +317,9 @@ Make sure to set the generic environment according to the
 # NCCL GIN configuration recommended for multi-node RDMA:
 export NCCL_GIN_TYPE=3  # GDAKI - GPU Direct Async Kernel-Initiated
 ```
+
+On AWS Elastic Fabric Adapter (EFA), the validated configuration is NCCL's GIN CPU proxy
+(`NCCL_GIN_TYPE=2`) over the aws-ofi-nccl plugin; see [AWS EFA](docs/documentation/aws_efa.md).
 
 For debugging, the following variables can be set
 

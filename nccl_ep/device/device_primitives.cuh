@@ -89,44 +89,6 @@ __host__ __device__ constexpr bool is_fp16() {
     return kDt == ncclFloat16;
 }
 
-// Bytes per wire element.
-template <ncclDataType_t kDt>
-__host__ __device__ constexpr int size_u8();
-template <>
-__host__ __device__ constexpr int size_u8<ncclFloat32>() {
-    return sizeof(uint32_t);
-}
-template <>
-__host__ __device__ constexpr int size_u8<ncclFloat16>() {
-    return sizeof(uint16_t);
-}
-template <>
-__host__ __device__ constexpr int size_u8<ncclBfloat16>() {
-    return sizeof(uint16_t);
-}
-template <>
-__host__ __device__ constexpr int size_u8<ncclFloat8e4m3>() {
-    return sizeof(uint8_t);
-}
-template <>
-__host__ __device__ constexpr int size_u8<ncclFloat8e5m2>() {
-    return sizeof(uint8_t);
-}
-template <>
-__host__ __device__ constexpr int size_u8<ncclFloat4x2>() {
-    return sizeof(uint8_t);
-}
-
-// Runtime form of size_u8: bytes of one physical wire element (a warp tile is 32 * 16 / wire_elem_bytes).
-__host__ __device__ constexpr int wire_elem_bytes(ncclDataType_t dt) {
-    if (dt == ncclFloat32) {
-        return 4;
-    }
-    if (dt == ncclFloat16 || dt == ncclBfloat16) {
-        return 2;
-    }
-    return 1;
-}
 
 // Wire element width in uint16_t units (token buffers use a uint16_t* base; one-byte values have no
 // uint16_t-unit stride, so it is intentionally not specialized here).

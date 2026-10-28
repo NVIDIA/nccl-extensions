@@ -23,7 +23,7 @@ TEST(LlKernelSelection, PartialDispatchTilesUseUniversalInBothModes) {
         {NCCL_EP_DISP_QUANT_FWD, ncclFloat8e4m3}, {NCCL_EP_DISP_QUANT_FWD, ncclFloat8e5m2},
         {NCCL_EP_DISP_QUANT_FWD, ncclFloat4x2}};
     for (const auto& c : cases) {
-        const int tile = 32 * static_cast<int>(sizeof(int4)) / ::nccl_ep::wire_elem_bytes(c.dtype);
+        const int tile = 32 * static_cast<int>(sizeof(int4)) / static_cast<int>(::nccl_ep::ncclTypeSize(c.dtype));
         for (auto mode : {NcclEpDispatchLsaMode::kSimt, NcclEpDispatchLsaMode::kTma}) {
             for (int hidden : {2880, tile - 16, tile + 16}) {
                 EXPECT_EQ(ll_dispatch_select_algo(true, c.recipe,
@@ -51,6 +51,12 @@ TEST(LlKernelSelection, DsFp8DispatchSupportsTmaAndSimt) {
 TEST(LlKernelSelection, DispatchPreservesOtherFallbacks) {
     EXPECT_EQ(ll_dispatch_select_algo(true, NCCL_EP_DISP_QUANT_DS_FP8E3M4,
         NCCL_EP_LAYOUT_RANK_MAJOR, false, NcclEpDispatchLsaMode::kTma, 128, ncclBfloat16),
+        LlDispatchAlgo::kDefault);
+    // An unassigned dtype value has no wire size (ncclTypeSize == 0) and must not reach the tile division.
+    const auto unassignedDtype = static_cast<ncclDataType_t>(15);
+    EXPECT_EQ(::nccl_ep::ncclTypeSize(unassignedDtype), 0u);
+    EXPECT_EQ(ll_dispatch_select_algo(true, NCCL_EP_DISP_QUANT_NONE,
+        NCCL_EP_LAYOUT_RANK_MAJOR, false, NcclEpDispatchLsaMode::kTma, 7168, unassignedDtype),
         LlDispatchAlgo::kDefault);
     for (auto recipe : {NCCL_EP_DISP_QUANT_NONE, NCCL_EP_DISP_QUANT_FWD}) {
         EXPECT_EQ(ll_dispatch_select_algo(true, recipe,

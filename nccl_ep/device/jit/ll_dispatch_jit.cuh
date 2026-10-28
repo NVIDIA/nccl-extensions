@@ -64,7 +64,12 @@ inline LlDispatchAlgo ll_dispatch_select_algo(
                            recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
     // All LSA paths require complete warp-sized input vector tiles.
     // Partial tiles use the universal kernel, including explicit SIMT/TMA modes.
-    const int elemsPerWarp = 32 * static_cast<int>(sizeof(int4)) / ::nccl_ep::wire_elem_bytes(tokenDtype);
+    const size_t tokenBytes = ::nccl_ep::ncclTypeSize(tokenDtype);
+    // A dtype without a wire size has no tile geometry; the host rejects such dtypes before dispatch.
+    if (tokenBytes == 0) {
+        return LlDispatchAlgo::kDefault;
+    }
+    const int elemsPerWarp = 32 * static_cast<int>(sizeof(int4)) / static_cast<int>(tokenBytes);
     // CFT: the LSA-CFT specialization (NONE recipe) unless NCCL_EP_LL_CFT_LSA=0; partial tiles
     // and other recipes (including QUANT_FWD) keep the general CFT kernel.
     const bool cftUsesLsaKernel = !cftEnabled || (ll_cft_lsa_enabled() && recipe == NCCL_EP_DISP_QUANT_NONE);
@@ -278,7 +283,7 @@ inline ncclResult_t launch_ll_dispatch(
     if (twoSidedRmLsaTma) {
         // DSFP8 compacts in place; preserve the BF16 stage size and depth.
         // `hidden` is the physical width (fp4x2 rows are H/2 bytes); QUANT_FWD stages add the scale row.
-        const int hiddenBytes = static_cast<int>(static_cast<size_t>(hidden) * ::nccl_ep::wire_elem_bytes(tokenDtype)) +
+        const int hiddenBytes = static_cast<int>(static_cast<size_t>(hidden) * ::nccl_ep::ncclTypeSize(tokenDtype)) +
             (recipe == NCCL_EP_DISP_QUANT_FWD ? args.scaleBytesPerToken : 0);
         const size_t dispatchHdrSz = get_dispatch_hdr_sz(num_topk, layout);
         // Reserve syncAndSendCounts's static __shared__ state out of the budget before sizing the

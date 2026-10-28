@@ -149,6 +149,89 @@ inline constexpr bool host_build_supports_mxfp8() {
 
 constexpr int kDsFp8E3M4ElementsPerScale = 128;
 
+// Bytes per element of an ncclDataType_t, keyed on the compile-time dtype the
+// kernels are instantiated for. A dtype without a specialization fails to
+// compile. ncclUint8 is the raw byte form of QUANT_FWD scales; the integer and
+// fp64 entries exist for the generic size query (ncclTypeSize) only.
+template <ncclDataType_t kDt>
+__host__ __device__ constexpr int size_u8();
+template <>
+__host__ __device__ constexpr int size_u8<ncclFloat32>() {
+    return sizeof(uint32_t);
+}
+template <>
+__host__ __device__ constexpr int size_u8<ncclFloat16>() {
+    return sizeof(uint16_t);
+}
+template <>
+__host__ __device__ constexpr int size_u8<ncclBfloat16>() {
+    return sizeof(uint16_t);
+}
+template <>
+__host__ __device__ constexpr int size_u8<ncclFloat8e4m3>() {
+    return sizeof(uint8_t);
+}
+template <>
+__host__ __device__ constexpr int size_u8<ncclFloat8e5m2>() {
+    return sizeof(uint8_t);
+}
+template <>
+__host__ __device__ constexpr int size_u8<ncclFloat4x2>() {
+    return sizeof(uint8_t);
+}
+template <>
+__host__ __device__ constexpr int size_u8<ncclUint8>() {
+    return sizeof(uint8_t);
+}
+template <>
+__host__ __device__ constexpr int size_u8<ncclInt8>() {
+    return sizeof(int8_t);
+}
+template <>
+__host__ __device__ constexpr int size_u8<ncclInt32>() {
+    return sizeof(int32_t);
+}
+template <>
+__host__ __device__ constexpr int size_u8<ncclUint32>() {
+    return sizeof(uint32_t);
+}
+template <>
+__host__ __device__ constexpr int size_u8<ncclInt64>() {
+    return sizeof(int64_t);
+}
+template <>
+__host__ __device__ constexpr int size_u8<ncclUint64>() {
+    return sizeof(uint64_t);
+}
+template <>
+__host__ __device__ constexpr int size_u8<ncclFloat64>() {
+    return sizeof(double);
+}
+
+// Runtime form of size_u8 for host code that only has the dtype as a value
+// (ncclEpTensor_t::datatype, LL kernel selection and sizing before the JIT
+// variant is fixed). Every case forwards to the size_u8 table so the two
+// cannot disagree. Returns 0 for a dtype without a wire size; callers that
+// divide by it or size a buffer from it must handle 0.
+__host__ __device__ constexpr size_t ncclTypeSize(ncclDataType_t dt) {
+    switch (dt) {
+    case ncclFloat32:    return size_u8<ncclFloat32>();
+    case ncclFloat16:    return size_u8<ncclFloat16>();
+    case ncclBfloat16:   return size_u8<ncclBfloat16>();
+    case ncclFloat8e4m3: return size_u8<ncclFloat8e4m3>();
+    case ncclFloat8e5m2: return size_u8<ncclFloat8e5m2>();
+    case ncclFloat4x2:   return size_u8<ncclFloat4x2>();
+    case ncclUint8:      return size_u8<ncclUint8>();
+    case ncclInt8:       return size_u8<ncclInt8>();
+    case ncclInt32:      return size_u8<ncclInt32>();
+    case ncclUint32:     return size_u8<ncclUint32>();
+    case ncclInt64:      return size_u8<ncclInt64>();
+    case ncclUint64:     return size_u8<ncclUint64>();
+    case ncclFloat64:    return size_u8<ncclFloat64>();
+    default:             return 0;
+    }
+}
+
 // low-latency kernels
 namespace ll {
 

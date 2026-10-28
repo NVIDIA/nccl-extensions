@@ -180,30 +180,8 @@ static cudaDataType_t ncclDataTypeToCudaDataType(ncclDataType_t nccl_type) {
     }
 }
 
-static size_t ncclTypeSize(ncclDataType_t nccl_type) {
-    switch (nccl_type) {
-    case ncclInt8:
-    case ncclUint8:
-    case ncclFloat8e4m3:
-    case ncclFloat8e5m2:
-    case ncclFloat4x2:
-        return 1;
-    case ncclFloat16:
-    case ncclBfloat16:
-        return 2;
-    case ncclInt32:
-    case ncclUint32:
-    case ncclFloat32:
-        return 4;
-    case ncclInt64:
-    case ncclUint64:
-    case ncclFloat64:
-        return 8;
-    default:
-        assert(false && "Unsupported ncclDataType_t for size query");
-        return 0;
-    }
-}
+// Shared with the device headers (include/common.hpp): one dtype-to-bytes table.
+using nccl_ep::ncclTypeSize;
 
 // QUANT_FWD accepts byte-preserving raw wire dtypes.
 static bool validate_dtype(ncclDataType_t dt) {

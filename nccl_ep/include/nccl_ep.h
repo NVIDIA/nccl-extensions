@@ -12,16 +12,6 @@
 #include <nccl.h>
 #include "nccl_ep/ep_enums.h"
 
-// NCCL reserves value 12 for ncclFloat4x2: one byte containing two packed
-// 4-bit floating-point values. The NCCL version used to build this library
-// may not expose the enumerator yet, and NCCL collectives do not support it.
-// Define the matching value here so EP can use it solely for its byte-copy
-// QUANT_FWD recipe. This also works with a newer NCCL header, where it
-// expands to that same reserved enum value.
-#ifndef ncclFloat4x2
-#define ncclFloat4x2 ((ncclDataType_t)12)
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif

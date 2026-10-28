@@ -6922,6 +6922,7 @@ struct dispatch_pull_param_t {
     int32_t* flat2em_slot_map;                  // [num_recv, top_k]
     int32_t* srcpos_map;                        // [num_recv, top_k] source top-k pos of each hit (weights)
     int32_t* recv_slot_to_src;                  // [num_recv] recv slot -> global src token id
+    int32_t* token_to_recv_slot;                // [num_total_tokens] inverse routing-export snapshot
     const void* peer_input_ptrs[kPullMaxLsaRanks];   // [lsa_team_size] source token bases (NVLink)
     const float* peer_weight_ptrs[kPullMaxLsaRanks]; // [lsa_team_size] source topk_weights bases (null if not delivered)
     const void* peer_scale_ptrs[kPullMaxLsaRanks];   // [lsa_team_size] source scale bases (QUANT_FWD; null for NONE)
@@ -7062,6 +7063,7 @@ __device__ __forceinline__ void dispatch_pull_map_publish_grid(
 __device__ __forceinline__ void dispatch_pull_map_warp(
     int topk_off_bytes,
     int32_t* __restrict__ recv_slot_to_src,
+    int32_t* __restrict__ token_to_recv_slot,
     int32_t* __restrict__ srcpos_map,
     int32_t* __restrict__ flat2em_slot_map,
     int32_t* __restrict__ num_recv_tokens_dev,
@@ -7312,6 +7314,7 @@ __device__ __forceinline__ void dispatch_pull_map_warp(
             if (!slot_overflows(recv_slot, flat_recv_capacity)) {
                 produce = true;
                 recv_slot_to_src[recv_slot] = r * tokens_per_rank + t;
+                if (token_to_recv_slot) token_to_recv_slot[r * tokens_per_rank + t] = recv_slot;
                 for (int j = 0; j < n; j++) {
                     const int hit = hits[j];
                     const int e = hit / MAX_NUM_TOPK;
@@ -7376,6 +7379,7 @@ __device__ __forceinline__ void dispatch_pull(
     int32_t* __restrict__ flat2em_slot_map = dp.flat2em_slot_map;
     int32_t* __restrict__ srcpos_map = dp.srcpos_map;
     int32_t* __restrict__ recv_slot_to_src = dp.recv_slot_to_src;
+    int32_t* __restrict__ token_to_recv_slot = dp.token_to_recv_slot;
     const void* const* __restrict__ peer_input_ptrs = dp.peer_input_ptrs;
     const float* const* __restrict__ peer_weight_ptrs = dp.peer_weight_ptrs;
     const void* const* __restrict__ peer_scale_ptrs = dp.peer_scale_ptrs;
@@ -7599,7 +7603,7 @@ __device__ __forceinline__ void dispatch_pull(
     if constexpr (kFusedMap) {
         if (is_map) {
             dispatch_pull_map_warp(
-                topk_off_bytes, recv_slot_to_src, srcpos_map, flat2em_slot_map,
+                topk_off_bytes, recv_slot_to_src, token_to_recv_slot, srcpos_map, flat2em_slot_map,
                 num_recv_tokens_dev, expert_token_offsets, per_expert_counts_active, rank_cursor,
                 expert_cursor, layout_ready, s_map_base, s_map_expert_base, top_k, experts_per_rank,
                 lsa_team_size, tokens_per_rank, my_rank,

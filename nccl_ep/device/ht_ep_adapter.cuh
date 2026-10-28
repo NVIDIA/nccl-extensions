@@ -471,6 +471,7 @@ ncclResult_t launch_dispatch_pull(
     int32_t* flat2em_slot_map,
     int32_t* srcpos_map,
     int32_t* recv_slot_to_src,
+    int32_t* token_to_recv_slot,
     const void* const* peer_input_ptrs,
     const float* const* peer_weight_ptrs,
     const void* const* peer_scale_ptrs,

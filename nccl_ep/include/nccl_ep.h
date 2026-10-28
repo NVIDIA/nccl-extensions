@@ -746,6 +746,21 @@ ncclResult_t ncclEpUpdateHandle(
     const ncclEpLayoutInfo_t* layout_info, // NULL = none
     cudaStream_t stream);
 
+// Experimental snapshot of prepared HT local-permute routing, single LSA team only.
+// Must follow UpdateHandle on the same stream (or after an explicit dependency).
+// No collective, allocation, or host synchronization is performed.
+// token_to_slot: int32 [nRanks * max_dispatch_tokens_per_rank], -1 for no local hit.
+// flat_to_expert: int32 [max_recv_tokens_per_rank, num_topk]. Valid rows are those
+// referenced by token_to_slot; other rows are unspecified. Nonnegative entries
+// are final expert-major token positions, with local hits in ascending expert order.
+// Source token i encodes (source_rank, source_token) as rank * max_dispatch + token.
+// Copying snapshots does not transfer ownership of the handle's internal storage.
+ncclResult_t ncclEpExportExpertMajorRouting(
+    ncclEpHandle_t handle,
+    const ncclEpTensor_t* token_to_slot,
+    const ncclEpTensor_t* flat_to_expert,
+    cudaStream_t stream);
+
 // Create, initialize and bind an EP handle to a given layout and routing decisions.
 // Must be called before the first ncclEpDispatch/ncclEpCombine.
 // Combines the functionality of ncclEpInitHandle and ncclEpUpdateHandle (see above)

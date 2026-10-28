@@ -5758,6 +5758,9 @@ ncclResult_t ncclEpDispatch(
                     : 0;
                 params.scaleDtype = (recipe == NCCL_EP_DISP_QUANT_FWD)
                     ? in_scales_outer->datatype : ncclUint8;
+                params.scaleBytesPerToken = recipe == NCCL_EP_DISP_QUANT_FWD
+                    ? params.scalesPerToken * static_cast<int>(ncclTypeSize(in_scales_outer->datatype))
+                    : 0;
                 params.inTopkWeights = topk_weights_in_data;
                 params.outDataBuf = recv_x_data;
                 params.outScalesBuf = scales_data;

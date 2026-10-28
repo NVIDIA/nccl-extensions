@@ -14,7 +14,7 @@
 #include "ll_lsa_primitives.cuh"
 #include "ll_mask.cuh"
 
-// LSA-only LL dispatch for unquantized and fused DS-FP8E3M4 payloads. Every
+// LSA-only LL dispatch for unquantized, forwarded-scales (QUANT_FWD) and fused DS-FP8E3M4 payloads. Every
 // destination is assumed NVLink-reachable (same LSA team) -- there is no RDMA/GIN
 // fallback anywhere in this file, unlike the general dispatch_kernel_impl in
 // ll_ep.cuh. Keeping the supported recipe set deliberately narrow lets this path
@@ -52,7 +52,7 @@ __forceinline__ __device__ uint8_t* sendTokenHeaderLsa(
     return dstPayloadSlot;
 }
 
-// Intra-LSA dispatch send (NVLink direct path, split layout, unquantized): header
+// Intra-LSA dispatch send (NVLink direct path, split layout, unquantized or QUANT_FWD): header
 // copied from the local staging slot, payload cast directly from `srcData` into
 // the peer's per-srcRank region (or straight into the peer's output window when
 // zero-copy is enabled). Takes the already-resolved peer pointer; the caller is
@@ -72,10 +72,17 @@ __forceinline__ __device__ void sendTokenLsa(
     // Zero-copy output: direct NVLink writes may target the peer's output window.
     ncclWindow_t recvDataWindow,
     size_t recvDataOffset,
-    int laneId) {
+    int laneId,
+    // QUANT_FWD: caller-provided scales for this token, forwarded as opaque 16-byte-aligned
+    // bytes behind the token data (or straight into the peer's scales window when zero-copy).
+    const int4* srcScales,
+    int scaleBytes,
+    ncclWindow_t rcvScalesWin,
+    size_t rcvScalesOffs) {
     void* payloadDst = sendTokenHeaderLsa(
         dstSrcRankP2pPtr, sendDataInt4, slotIdx, numBytesPerMsg,
         dispatch_hdr_sz, maxTokensPerRank, laneId);
+    void* scalesDst = static_cast<uint8_t*>(payloadDst) + hiddenBytes;
     payloadDst = resolveLsaRecvPointer(
         payloadDst, recvDataWindow, recvDataOffset, recvSlot, hiddenBytes, dstRank);
     auto* dstDataVec = reinterpret_cast<int4*>(payloadDst);
@@ -83,6 +90,14 @@ __forceinline__ __device__ void sendTokenLsa(
     // Unquantized copy: plain per-lane vector store, no recipe branching.
     for (int i = laneId; i < static_cast<int>(hiddenInt4); i += 32) {
         dstDataVec[i] = __ldg(srcData + i);
+    }
+    if (srcScales != nullptr) {
+        scalesDst = resolveLsaRecvPointer(
+            scalesDst, rcvScalesWin, rcvScalesOffs, recvSlot, scaleBytes, dstRank);
+        auto* dstScalesVec = reinterpret_cast<int4*>(scalesDst);
+        for (int i = laneId; i < scaleBytes / static_cast<int>(sizeof(int4)); i += 32) {
+            dstScalesVec[i] = __ldg(srcScales + i);
+        }
     }
 }
 
@@ -552,6 +567,11 @@ __forceinline__ __device__ void recordRecvTokensLsa(
                     copyRecvTokenScalesLsa(
                         recvPayloadPtr, slot, outScalesBuf, static_cast<int>(hiddenBytes), scaleBytes, laneId);
                 }
+            } else if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
+                if (copyScales) {
+                    copyRecvTokenFwdScalesLsa(
+                        recvPayloadPtr, slot, outScalesBuf, static_cast<int>(hiddenBytes), scaleBytes, laneId);
+                }
             }
         }
     }
@@ -578,7 +598,7 @@ __forceinline__ __device__ void recordDstInfoLsa(
 // Send-phase per-token body used by dispatch_kernel_impl_2sided_rm_lsa:
 // stages the routing header, dedups by destination rank (one send per
 // (token, destRank) pair, elected via the lowest topk slot targeting that
-// rank), and selects the unquantized or DS-FP8 send helper.
+// rank), and selects the unquantized/QUANT_FWD or DS-FP8 send helper.
 template <ncclEpDispQuant_t kRecipe, int kHidden, typename TopkIdxT, ncclDataType_t kTokenDtype, bool kUseSharedQuant,
     bool kRecordDstInfo = false>
 __forceinline__ __device__ void dispatchSendTokenLsa(
@@ -676,7 +696,18 @@ __forceinline__ __device__ void dispatchSendTokenLsa(
                         dstSrcRankP2pPtr, sendBufInt4, srcDataInt4, slotIdx,
                         numBytesPerMsg, dispatch_hdr_sz, hiddenBytes, inputHiddenInt4,
                         args.maxTokensPerRank, dstRank, recvSlot,
-                        args.recvDataWindow, args.recvDataOffset, laneId);
+                        args.recvDataWindow, args.recvDataOffset, laneId,
+                        nullptr, 0, ncclWindow_t{}, 0);
+                } else if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
+                    const auto srcScalesInt4 = reinterpret_cast<const int4*>(
+                        static_cast<const uint8_t*>(args.inScalesBuf) +
+                        static_cast<size_t>(tokenIdx) * scaleBytes);
+                    sendTokenLsa(
+                        dstSrcRankP2pPtr, sendBufInt4, srcDataInt4, slotIdx,
+                        numBytesPerMsg, dispatch_hdr_sz, hiddenBytes, inputHiddenInt4,
+                        args.maxTokensPerRank, dstRank, recvSlot,
+                        args.recvDataWindow, args.recvDataOffset, laneId,
+                        srcScalesInt4, scaleBytes, args.rcvScalesWin, args.rcvScalesOffs);
                 } else {
                     sendTokenDsFp8Lsa(
                         dstSrcRankP2pPtr, sendBufInt4, srcDataInt4, slotIdx,
@@ -790,7 +821,8 @@ template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumTopk, typename TopkIdx
 __device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa(const dispatch_kernel_args_t& args) {
     static constexpr ncclEpLayout_t kLayout = NCCL_EP_LAYOUT_RANK_MAJOR;
     EP_STATIC_ASSERT(
-        kRecipe == NCCL_EP_DISP_QUANT_NONE || kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4,
+        kRecipe == NCCL_EP_DISP_QUANT_NONE || kRecipe == NCCL_EP_DISP_QUANT_FWD ||
+            kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4,
         "Unsupported LSA dispatch recipe");
     EP_STATIC_ASSERT(
         kRecipe != NCCL_EP_DISP_QUANT_DS_FP8E3M4 || kTokenDtype == ncclBfloat16,
@@ -832,10 +864,8 @@ __device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa(const dispatc
         ? static_cast<size_t>(kHidden) * sizeof(uint8_t)
         : inputHiddenBytes;
     const size_t hiddenInt4 = hiddenBytes / sizeof(int4);
-    const int numScales = kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4
-        ? kHidden / kDsFp8E3M4ElementsPerScale
-        : 0;
-    const int scaleBytes = numScales * sizeof(float);
+    const int scaleBytes = static_cast<int>(
+        DispatchRecipeDeviceTypes<kRecipe, float>::scale_payload_bytes(kHidden, args.scaleBytesPerToken));
 
     // Message package: header + recipe-specific token data and scales.
     const size_t dispatch_hdr_sz = get_dispatch_hdr_sz<kLayout>(numTopk);
@@ -951,10 +981,14 @@ __forceinline__ __device__ void dispatchSendTmaControlWarp(
     uint8_t* smemBase,
     size_t stageBytes) {
     constexpr bool kQuant = kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
+    constexpr bool kFwd = kRecipe == NCCL_EP_DISP_QUANT_FWD;
     constexpr size_t inputBytes = static_cast<size_t>(kHidden) * size_u8<kTokenDtype>();
-    constexpr size_t scaleBytes = kQuant ? kHidden / kDsFp8E3M4ElementsPerScale * sizeof(float) : 0;
+    // QUANT_FWD scales are caller-provided rows, TMA-loaded next to the token and stored out untouched.
+    const size_t scaleBytes =
+        DispatchRecipeDeviceTypes<kRecipe, float>::scale_payload_bytes(kHidden, args.scaleBytesPerToken);
     const size_t payloadBytes = hiddenBytes + scaleBytes;
-    const size_t stageDataBytes = inputBytes;
+    // Stage: [token data][FWD scales][header][mbarrier]. DS-FP8 scales reuse the BF16 data region.
+    const size_t stageDataBytes = inputBytes + (kFwd ? scaleBytes : 0);
     const size_t hdrSectionBytes = static_cast<size_t>(args.maxTokensPerRank) * dispatch_hdr_sz;
     const size_t srcRankRegionBytes = static_cast<size_t>(args.maxTokensPerRank) * (dispatch_hdr_sz + payloadBytes);
     // Rank-pointer cache lives right after the kNumStages-deep stage ring, in the same dynamic
@@ -1020,7 +1054,14 @@ __forceinline__ __device__ void dispatchSendTmaControlWarp(
             // Single-lane read issue
             if (laneId == 0) {
                 tma_load_1d(stagePayload(stage), srcPtr, stageBarrier(stage), static_cast<int>(inputBytes));
-                mbarrier_arrive_and_expect_tx(stageBarrier(stage), static_cast<int>(inputBytes));
+                int expectTx = static_cast<int>(inputBytes);
+                if constexpr (kFwd) {
+                    const auto* srcScales = static_cast<const uint8_t*>(args.inScalesBuf) +
+                        static_cast<size_t>(tokenIdx) * scaleBytes;
+                    tma_load_1d(stageScales(stage), srcScales, stageBarrier(stage), static_cast<int>(scaleBytes));
+                    expectTx += static_cast<int>(scaleBytes);
+                }
+                mbarrier_arrive_and_expect_tx(stageBarrier(stage), expectTx);
             }
             __syncwarp();
         };
@@ -1100,7 +1141,7 @@ __forceinline__ __device__ void dispatchSendTmaControlWarp(
                     const size_t recvSlot = getLsaRecvSlot(args.currRank, args.maxTokensPerRank, slotIdx);
                     payloadDst = resolveLsaRecvPointer(
                         payloadDst, args.recvDataWindow, args.recvDataOffset, recvSlot, hiddenBytes, dstRank);
-                    if constexpr (kQuant) {
+                    if constexpr (kQuant || kFwd) {
                         scalesDst = resolveLsaRecvPointer(
                             scalesDst, args.rcvScalesWin, args.rcvScalesOffs, recvSlot, scaleBytes, dstRank);
                     }
@@ -1129,7 +1170,7 @@ __forceinline__ __device__ void dispatchSendTmaControlWarp(
                             __shfl_sync(0xffffffffu, reinterpret_cast<uint64_t>(dstHdrSlot), srcLane);
                         const uint64_t payloadW =
                             __shfl_sync(0xffffffffu, reinterpret_cast<uint64_t>(payloadDst), srcLane);
-                        const uint64_t scalesW = kQuant
+                        const uint64_t scalesW = (kQuant || kFwd)
                             ? __shfl_sync(0xffffffffu, reinterpret_cast<uint64_t>(scalesDst), srcLane) : 0;
                         if (laneId == 0) {
                             tma_store_1d_no_commit(
@@ -1137,7 +1178,7 @@ __forceinline__ __device__ void dispatchSendTmaControlWarp(
                             tma_store_1d_no_commit(
                                 stageOutput(stage), reinterpret_cast<void*>(payloadW),
                                 static_cast<int>(hiddenBytes));
-                            if constexpr (kQuant) {
+                            if constexpr (kQuant || kFwd) {
                                 tma_store_1d_no_commit(stageScales(stage),
                                     reinterpret_cast<void*>(scalesW), static_cast<int>(scaleBytes));
                             }
@@ -1272,9 +1313,12 @@ __forceinline__ __device__ void dispatchSendPhaseLsaTma(
     EP_STATIC_ASSERT(kNumStages > 0 && kNumStages < 32, "Invalid stage count (tmaPhase is a 32-bit mask)");
 
     constexpr bool kQuant = kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
+    constexpr bool kFwd = kRecipe == NCCL_EP_DISP_QUANT_FWD;
     constexpr size_t inputBytes = static_cast<size_t>(kHidden) * size_u8<kTokenDtype>();
     constexpr size_t scaleBytes = kQuant ? kHidden / kDsFp8E3M4ElementsPerScale * sizeof(float) : 0;
-    const size_t stageBytes = dispatch_tma_smem::per_stage_bytes(inputBytes, dispatch_hdr_sz);
+    // FWD stages carry the caller's scale row next to the token (host sizing in ll_dispatch_jit.cuh matches).
+    const size_t stageBytes = dispatch_tma_smem::per_stage_bytes(
+        inputBytes + (kFwd ? static_cast<size_t>(args.scaleBytesPerToken) : 0), dispatch_hdr_sz);
     static_assert(!kQuant || (kQuantWarps >= dispatch_tma_smem::kMinQuantWarps &&
                              kQuantWarps <= dispatch_tma_smem::kMaxQuantWarps),
                   "TMA quantization worker count is out of range");
@@ -1345,7 +1389,8 @@ __forceinline__ __device__ void dispatchSendPhaseLsaTma(
 template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumTopk, int kNumStages, typename TopkIdxT, ncclDataType_t kTokenDtype,
     int kQuantWarps, bool kRecordDstInfo = false>
 __device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa_tma(const dispatch_kernel_args_t& args) {
-    EP_STATIC_ASSERT(kRecipe == NCCL_EP_DISP_QUANT_NONE || kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4,
+    EP_STATIC_ASSERT(kRecipe == NCCL_EP_DISP_QUANT_NONE || kRecipe == NCCL_EP_DISP_QUANT_FWD ||
+                         kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4,
                      "Unsupported TMA dispatch recipe");
     EP_STATIC_ASSERT(kRecipe != NCCL_EP_DISP_QUANT_DS_FP8E3M4 || kTokenDtype == ncclBfloat16,
                      "DS_FP8E3M4 requires BF16 input");
@@ -1382,11 +1427,11 @@ __device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa_tma(const dis
     auto rankSentCnt = args.rankSentCnt;
 
     const size_t hiddenBytes = DispatchRecipeDeviceTypes<kRecipe, float>::template token_payload_bytes<kTokenDtype>(kHidden);
-    constexpr int scaleBytes = kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4
-        ? kHidden / kDsFp8E3M4ElementsPerScale * sizeof(float) : 0;
+    const int scaleBytes = static_cast<int>(
+        DispatchRecipeDeviceTypes<kRecipe, float>::scale_payload_bytes(kHidden, args.scaleBytesPerToken));
     const size_t hiddenInt4 = hiddenBytes / sizeof(int4);
 
-    // Message package: header + token data + optional generated scales.
+    // Message package: header + token data + optional generated or forwarded scales.
     const size_t dispatch_hdr_sz = get_dispatch_hdr_sz<kLayout>(numTopk);
     const size_t numBytesPerMsg = dispatch_hdr_sz + hiddenBytes + scaleBytes;
 

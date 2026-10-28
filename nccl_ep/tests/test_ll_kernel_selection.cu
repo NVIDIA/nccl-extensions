@@ -12,16 +12,26 @@ using namespace nccl_ep::ll;
 using namespace nccl_ep::ll::jit;
 
 TEST(LlKernelSelection, PartialDispatchTilesUseUniversalInBothModes) {
-    for (auto dtype : {ncclBfloat16, ncclFloat16, ncclFloat32}) {
-        const int tile = dtype == ncclFloat32 ? 128 : 256;
+    struct Case {
+        ncclEpDispQuant_t recipe;
+        ncclDataType_t dtype;
+    };
+    // QUANT_FWD also forwards raw 8-bit and packed fp4 rows; a warp tile is 32 lanes * 16 bytes.
+    const Case cases[] = {
+        {NCCL_EP_DISP_QUANT_NONE, ncclBfloat16}, {NCCL_EP_DISP_QUANT_NONE, ncclFloat16},
+        {NCCL_EP_DISP_QUANT_NONE, ncclFloat32}, {NCCL_EP_DISP_QUANT_FWD, ncclBfloat16},
+        {NCCL_EP_DISP_QUANT_FWD, ncclFloat8e4m3}, {NCCL_EP_DISP_QUANT_FWD, ncclFloat8e5m2},
+        {NCCL_EP_DISP_QUANT_FWD, ncclFloat4x2}};
+    for (const auto& c : cases) {
+        const int tile = 32 * static_cast<int>(sizeof(int4)) / ::nccl_ep::wire_elem_bytes(c.dtype);
         for (auto mode : {NcclEpDispatchLsaMode::kSimt, NcclEpDispatchLsaMode::kTma}) {
             for (int hidden : {2880, tile - 16, tile + 16}) {
-                EXPECT_EQ(ll_dispatch_select_algo(true, NCCL_EP_DISP_QUANT_NONE,
-                    NCCL_EP_LAYOUT_RANK_MAJOR, false, mode, hidden, dtype), LlDispatchAlgo::kDefault);
+                EXPECT_EQ(ll_dispatch_select_algo(true, c.recipe,
+                    NCCL_EP_LAYOUT_RANK_MAJOR, false, mode, hidden, c.dtype), LlDispatchAlgo::kDefault);
             }
             for (int hidden : {tile, 3072, 7168}) {
-                EXPECT_EQ(ll_dispatch_select_algo(true, NCCL_EP_DISP_QUANT_NONE,
-                    NCCL_EP_LAYOUT_RANK_MAJOR, false, mode, hidden, dtype),
+                EXPECT_EQ(ll_dispatch_select_algo(true, c.recipe,
+                    NCCL_EP_LAYOUT_RANK_MAJOR, false, mode, hidden, c.dtype),
                     mode == NcclEpDispatchLsaMode::kTma ? LlDispatchAlgo::k2SidedRmLsaTma :
                                                         LlDispatchAlgo::k2SidedRmLsa);
             }
@@ -42,15 +52,20 @@ TEST(LlKernelSelection, DispatchPreservesOtherFallbacks) {
     EXPECT_EQ(ll_dispatch_select_algo(true, NCCL_EP_DISP_QUANT_DS_FP8E3M4,
         NCCL_EP_LAYOUT_RANK_MAJOR, false, NcclEpDispatchLsaMode::kTma, 128, ncclBfloat16),
         LlDispatchAlgo::kDefault);
-    for (bool nvlink : {false, true}) {
-        for (bool cft : {false, true}) {
-            EXPECT_EQ(ll_dispatch_select_algo(nvlink, NCCL_EP_DISP_QUANT_NONE,
-                NCCL_EP_LAYOUT_RANK_MAJOR, cft, NcclEpDispatchLsaMode::kUniversal, 7168, ncclBfloat16),
-                LlDispatchAlgo::kDefault);
-            if (!nvlink) {
-                EXPECT_EQ(ll_dispatch_select_algo(nvlink, NCCL_EP_DISP_QUANT_NONE,
-                    NCCL_EP_LAYOUT_RANK_MAJOR, cft, NcclEpDispatchLsaMode::kTma, 7168, ncclBfloat16),
+    for (auto recipe : {NCCL_EP_DISP_QUANT_NONE, NCCL_EP_DISP_QUANT_FWD}) {
+        EXPECT_EQ(ll_dispatch_select_algo(true, recipe,
+            NCCL_EP_LAYOUT_EXPERT_MAJOR, false, NcclEpDispatchLsaMode::kTma, 7168, ncclBfloat16),
+            LlDispatchAlgo::kDefault);
+        for (bool nvlink : {false, true}) {
+            for (bool cft : {false, true}) {
+                EXPECT_EQ(ll_dispatch_select_algo(nvlink, recipe,
+                    NCCL_EP_LAYOUT_RANK_MAJOR, cft, NcclEpDispatchLsaMode::kUniversal, 7168, ncclBfloat16),
                     LlDispatchAlgo::kDefault);
+                if (!nvlink) {
+                    EXPECT_EQ(ll_dispatch_select_algo(nvlink, recipe,
+                        NCCL_EP_LAYOUT_RANK_MAJOR, cft, NcclEpDispatchLsaMode::kTma, 7168, ncclBfloat16),
+                        LlDispatchAlgo::kDefault);
+                }
             }
         }
     }
@@ -193,6 +208,22 @@ TEST(LlKernelSelection, CftZeroCopyRequiresLsaAndHalfPrecision) {
         NCCL_EP_LAYOUT_RANK_MAJOR, NcclEpDispatchLsaMode::kUniversal, 7168, ncclBfloat16));
     EXPECT_FALSE(ll_dispatch_cft_zero_copy_supported(true, NCCL_EP_DISP_QUANT_NONE,
         NCCL_EP_LAYOUT_RANK_MAJOR, NcclEpDispatchLsaMode::kTma, 2880, ncclBfloat16));
+}
+
+TEST(LlKernelSelection, ForwardedScalesStayOffTheCftKernels) {
+    // QUANT_FWD is forwarded by the non-CFT STORE/TMA LSA kernels only; with CFT enabled it keeps the
+    // general kernel (the CFT LSA kernel is NONE-recipe only), and CFT zero-copy is never offered for it.
+    for (auto mode : {NcclEpDispatchLsaMode::kSimt, NcclEpDispatchLsaMode::kTma}) {
+        EXPECT_EQ(ll_dispatch_select_algo(true, NCCL_EP_DISP_QUANT_FWD, NCCL_EP_LAYOUT_RANK_MAJOR, true, mode,
+            4096, ncclBfloat16), LlDispatchAlgo::kDefault);
+        EXPECT_EQ(ll_dispatch_select_algo(true, NCCL_EP_DISP_QUANT_FWD, NCCL_EP_LAYOUT_RANK_MAJOR, false, mode,
+            4096, ncclBfloat16),
+            mode == NcclEpDispatchLsaMode::kTma ? LlDispatchAlgo::k2SidedRmLsaTma : LlDispatchAlgo::k2SidedRmLsa);
+    }
+    for (auto dtype : {ncclBfloat16, ncclFloat16}) {
+        EXPECT_FALSE(ll_dispatch_cft_zero_copy_supported(true, NCCL_EP_DISP_QUANT_FWD, NCCL_EP_LAYOUT_RANK_MAJOR,
+            NcclEpDispatchLsaMode::kTma, 4096, dtype));
+    }
 }
 
 TEST(LlKernelSelection, CftReceiveWarpsFollowCapacity) {

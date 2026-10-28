@@ -33,7 +33,7 @@ constexpr const char* kLlDispatchJitEntryName = "nccl_ep_jit_ll_dispatch_kernel"
 //   kDefault:     the general kernel (every recipe/layout, RDMA/GIN capable).
 //                 Also the CFT fallback: quantized recipes, partial tiles, expert-major,
 //                 non-NVLink groups, and NCCL_EP_LL_CFT_LSA=0.
-//   k2SidedRmLsa: STORE LSA-only rank-major SIMT kernel, quantization: NONE or
+//   k2SidedRmLsa: STORE LSA-only rank-major SIMT kernel, quantization: NONE, FWD or
 //                 fused DS_FP8E3M4. Token and scale windows independently bypass
 //                 receive staging, selected at runtime.
 //   kCftRmLsa:    CFT LSA-only rank-major kernel, NONE recipe only. Warp 0 issues
@@ -41,7 +41,7 @@ constexpr const char* kLlDispatchJitEntryName = "nccl_ep_jit_ll_dispatch_kernel"
 //                 sources publish after completion. Sender completion mode and
 //                 zero-copy output are JIT specializations. NCCL_EP_LL_CFT_LSA=0
 //                 selects the general CFT kernel instead.
-//   k2SidedRmLsaTma: TMA-pipelined SEND, NONE or fused DS_FP8E3M4, with the same
+//   k2SidedRmLsaTma: TMA-pipelined SEND, NONE, FWD or fused DS_FP8E3M4, with the same
 //                 direct-output contract, when CFT is disabled. DSFP8 quantizes
 //                 once per token into the existing BF16 stage in place before
 //                 issuing peer TMA stores.
@@ -59,13 +59,14 @@ inline LlDispatchAlgo ll_dispatch_select_algo(
         return LlDispatchAlgo::kDefault;
     }
 
-    const bool lsaRecipe =
-        recipe == NCCL_EP_DISP_QUANT_NONE || recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
+    // The STORE/TMA LSA kernels forward QUANT_FWD scales as an opaque trailing payload.
+    const bool lsaRecipe = recipe == NCCL_EP_DISP_QUANT_NONE || recipe == NCCL_EP_DISP_QUANT_FWD ||
+                           recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
     // All LSA paths require complete warp-sized input vector tiles.
     // Partial tiles use the universal kernel, including explicit SIMT/TMA modes.
     const int elemsPerWarp = 32 * static_cast<int>(sizeof(int4)) / ::nccl_ep::wire_elem_bytes(tokenDtype);
     // CFT: the LSA-CFT specialization (NONE recipe) unless NCCL_EP_LL_CFT_LSA=0; partial tiles
-    // and other recipes keep the general CFT kernel.
+    // and other recipes (including QUANT_FWD) keep the general CFT kernel.
     const bool cftUsesLsaKernel = !cftEnabled || (ll_cft_lsa_enabled() && recipe == NCCL_EP_DISP_QUANT_NONE);
     const bool lsaEligible = numAttnRanks == 0 && hidden > 0 && hidden % elemsPerWarp == 0 &&
         cftUsesLsaKernel && nvlinkOnly && lsaRecipe && layout == NCCL_EP_LAYOUT_RANK_MAJOR;
@@ -276,8 +277,9 @@ inline ncclResult_t launch_ll_dispatch(
     int tmaDynamicSmemBytes = 0;
     if (twoSidedRmLsaTma) {
         // DSFP8 compacts in place; preserve the BF16 stage size and depth.
-        // `hidden` is the physical width (fp4x2 rows are H/2 bytes).
-        const int hiddenBytes = static_cast<int>(static_cast<size_t>(hidden) * ::nccl_ep::wire_elem_bytes(tokenDtype));
+        // `hidden` is the physical width (fp4x2 rows are H/2 bytes); QUANT_FWD stages add the scale row.
+        const int hiddenBytes = static_cast<int>(static_cast<size_t>(hidden) * ::nccl_ep::wire_elem_bytes(tokenDtype)) +
+            (recipe == NCCL_EP_DISP_QUANT_FWD ? args.scaleBytesPerToken : 0);
         const size_t dispatchHdrSz = get_dispatch_hdr_sz(num_topk, layout);
         // Reserve syncAndSendCounts's static __shared__ state out of the budget before sizing the
         // dynamic stage ring -- see dispatch_tma_smem::kStaticSmemBytes's doc comment; same split
@@ -347,6 +349,10 @@ inline ncclResult_t launch_ll_dispatch(
         key, twoSidedRmLsaTma ? (1u | (static_cast<std::uint64_t>(numTmaStages) << 2)) : 0u);
     if (tmaQuant) {
         key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(numTmaQuantWarps));
+    }
+    if (twoSidedRmLsaTma && recipe == NCCL_EP_DISP_QUANT_FWD) {
+        // Stage bytes (hence the dynamic smem carve) depend on the forwarded scale row size.
+        key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(args.scaleBytesPerToken));
     }
     key = ::nccl_ep::jit::runtime_key_mix(key, recordDstInfo ? 1u : 0u);
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(cftZeroCopy));

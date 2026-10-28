@@ -167,6 +167,7 @@ ncclResult_t call_dispatch(
     args.signalSlotStride = params.signalSlotStride;
     args.numTokens = params.numTokens;
     args.scalesPerToken = params.scalesPerToken;
+    args.scaleBytesPerToken = params.scaleBytesPerToken;
     args.maxTokensPerRank = params.maxTokensPerRank;
     args.numExperts = params.numExperts;
     args.currRank = params.currRank;
@@ -204,6 +205,7 @@ ncclResult_t call_dispatch(
     }
 
     // Select the CFT JIT variant only for supported dispatch configurations.
+    // QUANT_FWD is not a CFT recipe: forwarded-scales dispatches take the non-CFT LSA (TMA/SIMT) kernels.
     const bool cft_active = (params.cftPeerLeIds != nullptr) &&
                             (recipe == NCCL_EP_DISP_QUANT_NONE) &&
                             (params.cftZeroCopy || params.recvDataWindow == ncclWindow_t{}) &&

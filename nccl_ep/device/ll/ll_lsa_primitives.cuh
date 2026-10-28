@@ -8,6 +8,7 @@
 
 #include "nccl_ep.h"
 #include "nccl_device.h"
+#include "../device_primitives.cuh"
 
 namespace nccl_ep {
 
@@ -16,6 +17,21 @@ namespace ll {
 // Flatten a source rank's token slot into the rank-major receive output.
 __forceinline__ __device__ size_t getLsaRecvSlot(int srcRank, int maxTokensPerRank, int slotIdx) {
     return static_cast<size_t>(srcRank) * maxTokensPerRank + slotIdx;
+}
+
+// Copy a QUANT_FWD token's staged scales (opaque 16-byte-aligned bytes) into its output slot.
+__forceinline__ __device__ void copyRecvTokenFwdScalesLsa(
+    const uint8_t* recvPayloadPtr,
+    int tokenIdx,
+    void* outScales,
+    int hiddenBytes,
+    int scaleBytes,
+    int laneId) {
+    const int scaleInt4 = scaleBytes / static_cast<int>(sizeof(int4));
+    const auto* recvScalesInt4 = reinterpret_cast<const int4*>(recvPayloadPtr + hiddenBytes);
+    auto* outScalesInt4 = reinterpret_cast<int4*>(static_cast<uint8_t*>(outScales) +
+                                                  static_cast<size_t>(tokenIdx) * scaleBytes);
+    UNROLLED_WARP_COPY(1, laneId, scaleInt4, outScalesInt4, recvScalesInt4, ld_nc_global, st_na_global);
 }
 
 // Resolve a token's peer output address, retaining staging when no window is registered.

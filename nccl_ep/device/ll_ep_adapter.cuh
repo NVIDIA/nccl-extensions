@@ -263,6 +263,8 @@ struct dispatch_kernel_args_t {
     int numTokens;
     // Derived from validated inputs->scales->sizes[1].
     int scalesPerToken;
+    // QUANT_FWD forwarded scale bytes per token (scalesPerToken * scale element size); 0 otherwise.
+    int scaleBytesPerToken;
     int maxTokensPerRank;
     int numExperts;
     int currRank;
@@ -389,6 +391,7 @@ struct DispatchParams {
     bool topkIdxIsInt64 = true;             // selects the TopkIdxT kernel specialization
     // Derived from inputs->scales->sizes[1] by ncclEpDispatch.
     int scalesPerToken = 0;
+    int scaleBytesPerToken = 0;            // scalesPerToken * sizeof(scale element); QUANT_FWD only
     ncclDataType_t scaleDtype;              // QUANT_FWD tensor dtype; selects ScaleT in JIT
     const float* inTopkWeights;
 

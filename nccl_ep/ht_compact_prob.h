@@ -30,18 +30,6 @@ constexpr int64_t compact_prob_id_byte_offset(int topk) {
     return static_cast<int64_t>(topk) * sizeof(float);
 }
 
-// Backward combine row width in floats. Narrower than the dispatch row above:
-// the row returns to the rank that sent the token, so position is identity and
-// the ID tail is redundant -- gradients in original top-k order, no IDs.
-// Rounded up to a multiple of 4 so rows stay 16 B-aligned for TMA / float4
-// stores (the same constraint the dense row has).
-// Guarded like the dispatch sibling: callers may evaluate this before knowing
-// compact was selected, so a bad topk must return -1 rather than overflow.
-constexpr int combine_compact_prob_row_floats(int topk) {
-    const int64_t words = (static_cast<int64_t>(topk) + 3) & ~int64_t{3};
-    return topk < 0 || words > std::numeric_limits<int>::max() ? -1 : static_cast<int>(words);
-}
-
 // Original top-k position saved per returned weight for backward combine.
 // Reserve the largest value for padding: K=255 uses positions 0..254 plus
 // sentinel255; K=256 needs uint16. Compact's expert-ID limit also bounds K.
@@ -61,8 +49,6 @@ constexpr bool compact_prob_fits(int topk, int num_experts, int dense_row_floats
 static_assert(sizeof(float) == 4, "compact wire requires 32-bit floats");
 static_assert(dispatch_compact_prob_row_floats(8) == 12, "K8 occupies 48 bytes");
 static_assert(dispatch_compact_prob_row_floats(10) == 16, "K10 occupies 64 bytes");
-static_assert(combine_compact_prob_row_floats(8) == 8, "K8 combine occupies 32 bytes");
-static_assert(combine_compact_prob_row_floats(10) == 12, "K10 combine occupies 48 bytes");
 static_assert(compact_prob_pos_bytes(255) == 1, "K255 map uses uint8");
 static_assert(compact_prob_pos_bytes(256) == 2, "K256 map uses uint16");
 

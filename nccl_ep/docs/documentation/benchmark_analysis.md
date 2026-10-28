@@ -9,6 +9,91 @@ which invariants must hold in a healthy run.
 Scope: **HT only.** Low Latency uses its own byte accounting (`calculateLowLatencyBytes`)
 with different definitions, so an LL `nvl_bw` is not comparable to an HT one.
 
+## What the bytes are, and what they are not
+
+Every HT column is **effective bus bandwidth**: the data the *selected routing* requires to
+cross a link on this topology, divided by elapsed time. It is not a measurement of what the
+kernel actually sent.
+
+Each link crossing is counted as three terms:
+
+| term | formula | varies with |
+|---|---|---|
+| token | `hidden × elem_bytes(recipe)` | hidden and that leg's own representation |
+| routing weight | `4 B × picks that destination hosts` | the routing |
+| quantization scales | `scales_per_token(recipe) × scale_elem_bytes` | the recipe the caller configured |
+
+Each leg is sized by the representation it carries: dispatch by the dispatch recipe, combine by
+the caller's dtype. The two differ whenever dispatch quantizes and combine does not.
+
+The routing weight term applies only on the legs that carry one — forward dispatch sends
+weights out, backward combine returns their gradients. Forward combine and backward dispatch
+carry bare tokens.
+
+**Nothing here inspects the implementation.** No routing metadata, no expert identifiers, no
+internal dense-versus-compact row decision. Those are the library's business, and mixing them
+into a bandwidth figure ties the number to one implementation's internals.
+
+Four consequences. The first three are deliberate; the fourth is a limit on when the figure
+means anything at all:
+
+- **These are lower bounds on remote traffic.** Expert identifiers, row alignment padding and
+  any duplicate copies beyond the minimum are excluded, so real link traffic is higher than
+  reported and the true physical bandwidth is somewhat above these figures. Two bounds on the
+  bound: it holds only for the terms that actually cross a wire — `nvl_bw` includes a landing
+  rank's stores to itself, and `scale_out_bw` includes the rail-self entry unless
+  `--ignore-local-traffic` — and it holds only where the caller's representation is what the
+  library puts on the wire. Where the library repacks internally the counted row can *exceed*
+  the real one.
+- **Overhead appears as time, not as payload.** An implementation that sends a wider row or
+  copies more often takes longer, so its reported bandwidth goes *down*. A byte count that
+  tracked the implementation would instead make a wasteful encoding look faster.
+- **A line-rate comparison stays valid, but reads low.** Within the bounds above, a column
+  held against NVLink or NIC peak understates utilisation by the excluded terms — see the
+  worked figure below. Treat a line-rate comparison as conservative rather than exact, and
+  against a wire peak prefer `scale_out_bw` with `--ignore-local-traffic`, which drops the
+  local entry that never leaves the node.
+- **A run that dropped deliveries is not bounded at all.** These counters describe the routing the
+  benchmark *requested*. Under the drop overflow policy a delivery whose recv slot is over budget
+  never leaves the sender, so the counted bytes include traffic that crossed nothing and the figure
+  can exceed what moved by a large factor rather than understating it. Read bandwidth only from
+  runs that dropped nothing; a run that actually dropped is reporting requested routing, not
+  delivered traffic.
+
+The practical value of a lower bound is that it is the floor an implementation can approach: as
+encodings improve, reported bandwidth rises toward the link's goodput ceiling, so the gap tells
+you how much headroom is left. These are not achievable targets — the excluded alignment
+padding, for one, is required by the stores that carry the row.
+
+One caveat on comparing runs. In `nccl-tests` the factor relating payload to bus traffic is a
+constant of the collective and its rank count, so two runs are directly comparable. Here it is a
+property of the *workload*: it moves with the routing sample, so a change in reported bandwidth
+can reflect routing skew rather than implementation efficiency. The benchmark's seeded routing
+makes this reproducible at a fixed seed, `top_k` and topology, which is the basis on which runs
+should be compared.
+
+### How large is the undercount?
+
+Worst case, at `top_k` 8: a token's picks land on 8 different nodes, so every node gets its
+own crossing. Take a shape where the library selects the compact row — it does so only when
+compact is strictly smaller than the dense alternative, which at `top_k` 8 needs a destination
+LSA team hosting more than 12 experts' worth of dense floats.
+
+- **We count** `top_k × 4 B = 32 B` — each node hosts one pick, so one fp32 each.
+- **The current implementation sends** the full compact row to every node:
+  `top_k × 48 B = 384 B`.
+
+That is **48 / 4 = 12×** per crossing. The gap is almost entirely row duplication: each node
+receives all eight weights and all eight expert identifiers when it needs one weight. Only
+2 B of the 48 B per-pick difference is the identifier this accounting excludes as addressing.
+
+In perspective against the token, which is 14,336 B at `hidden` 7168 BF16: 384 B versus 32 B
+is a **0.3 %** difference in the reported total. Minor, but worth flagging rather than
+discovering. That figure is this configuration's, not a general bound: it assumes the compact
+row, and the share grows with `top_k` and with how widely a token scatters, and shrinks as
+`hidden` grows, since the token term dominates. Where the library picks the dense row instead,
+the per-crossing gap is the dense width rather than 48 B.
+
 ## The topology model
 
 Ranks are grouped into nodes of `lsa_team_size` ranks. A rank reaches another node with a

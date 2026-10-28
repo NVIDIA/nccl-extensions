@@ -11,7 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <unistd.h>
 #include <algorithm>
 #include <cmath>
@@ -37,7 +36,6 @@
 #include <nccl.h>
 #include <nccl_device.h>
 #include "nccl_ep.h"
-#include "ht_compact_prob.h"
 
 #if defined(__has_include)
 #if __has_include(<cuda_fp4.h>)
@@ -241,54 +239,6 @@ static cudaError_t cudaFreeCallback(void* ptr, void* /*context*/) {
 static bool htPullPushEnabled() {
     const char* v = std::getenv("NCCL_EP_HT_PULL_PUSH");
     return v != nullptr && v[0] != '\0' && v[0] != '0';
-
-// Widened to size_t: the product can exceed a 32-bit int for absurd --experts values, and a
-// wrapped or negative width would be reported as a plausible byte count rather than rejected.
-static size_t htDenseProbRowFloats(unsigned int num_experts_per_rank, int lsa_team_size) {
-    return static_cast<size_t>(num_experts_per_rank) * static_cast<size_t>(lsa_team_size);
-}
-
-// Compact-vs-dense exactly as the library resolves it. One mode serves both legs
-// (nccl_ep.cc ht_prob_wire_mode), so the predicate is the dispatch-width one on both.
-static size_t htProbRowBytes(size_t dense_floats, int compact_floats, unsigned int top_k,
-                             unsigned int num_experts) {
-    // Both width helpers return -1 on bad input; fall back to dense rather than reporting SIZE_MAX.
-    const bool compact =
-        compact_floats > 0 &&
-        dense_floats <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
-        nccl_ep::ht::compact_prob_fits(static_cast<int>(top_k), static_cast<int>(num_experts),
-                                       static_cast<int>(dense_floats));
-    const size_t floats = compact ? static_cast<size_t>(compact_floats) : dense_floats;
-    return floats * sizeof(float);
-}
-
-// Routing-probability bytes per token copy for dispatch. Only plain forward dispatch sends a row:
-// backward sends none, and pull-push stages none at all (the receiver pulls scalar weights
-// instead, which these counters do not model).
-static size_t htDispatchProbBytesPerToken(ncclEpPassDir_t pass, ncclEpLayout_t layout,
-                                          unsigned int top_k, unsigned int num_experts,
-                                          unsigned int num_experts_per_rank, int lsa_team_size) {
-    if (pass != NCCL_EP_FWD_PASS) return 0;
-    if (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR && htPullPushEnabled()) return 0;
-
-    return htProbRowBytes(htDenseProbRowFloats(num_experts_per_rank, lsa_team_size),
-                          nccl_ep::ht::dispatch_compact_prob_row_floats(static_cast<int>(top_k)),
-                          top_k, num_experts);
-}
-
-// Routing-probability bytes per token copy for combine. Only plain backward combine sends a row;
-// forward sends none. Zero under pull-push, but that is a gap, not an exact figure: push combine
-// scatters one weight per expert copy into the peer's row pad (device/ht_ep.cuh combine_push), which
-// these counters do not model -- as on the dispatch side.
-static size_t htCombineProbBytesPerToken(ncclEpPassDir_t pass, ncclEpLayout_t layout,
-                                         unsigned int top_k, unsigned int num_experts,
-                                         unsigned int num_experts_per_rank, int lsa_team_size) {
-    if (pass != NCCL_EP_BWD_PASS) return 0;
-    if (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR && htPullPushEnabled()) return 0;
-
-    return htProbRowBytes(htDenseProbRowFloats(num_experts_per_rank, lsa_team_size),
-                          nccl_ep::ht::combine_compact_prob_row_floats(static_cast<int>(top_k)),
-                          top_k, num_experts);
 }
 
 // Element size for the dtypes used in this benchmark. ncclTypeSize is internal to the EP library.
@@ -4503,6 +4453,15 @@ struct HighThroughputBytes {
     unsigned int total_recv_tokens;
     unsigned int nvl_recv_tokens;
     unsigned int scale_out_recv_tokens;
+    // Routing weights, counted per top-k pick rather than per token copy: a destination needs one
+    // fp32 per pick it hosts, not a row sized to the caller's full top-k. Six counters mirroring
+    // the token ones, since a copy's weight share depends on which destination it is.
+    unsigned int total_send_picks;
+    unsigned int nvl_send_picks;
+    unsigned int scale_out_send_picks;
+    unsigned int total_recv_picks;
+    unsigned int nvl_recv_picks;
+    unsigned int scale_out_recv_picks;
 };
 
 // Takes a total summed over all ranks and returns MB per rank.
@@ -4545,6 +4504,17 @@ static void htReduceLegs(const HighThroughputBytes& local, HtByteTotals* dispatc
                MPI_COMM_WORLD);
 }
 
+// Adds the routing-weight term: one fp32 per top-k pick the destination hosts. Separate from
+// htTokensToBytes because it scales with picks, not with token copies.
+static void htAddPickBytes(const HighThroughputBytes& b, HtByteTotals* t, size_t bytes_per_pick) {
+    t->total_send += b.total_send_picks * bytes_per_pick;
+    t->nvl_send += b.nvl_send_picks * bytes_per_pick;
+    t->scale_out_send += b.scale_out_send_picks * bytes_per_pick;
+    t->total_recv += b.total_recv_picks * bytes_per_pick;
+    t->nvl_recv += b.nvl_recv_picks * bytes_per_pick;
+    t->scale_out_recv += b.scale_out_recv_picks * bytes_per_pick;
+}
+
 static HtByteTotals htTokensToBytes(const HighThroughputBytes& b, size_t bytes_per_token) {
     HtByteTotals t = {};
     t.total_send = b.total_send_tokens * bytes_per_token;
@@ -4559,8 +4529,8 @@ static HtByteTotals htTokensToBytes(const HighThroughputBytes& b, size_t bytes_p
 // Calculate all six byte metrics from topk_idx for High Throughput mode. The send loop walks this
 // rank's own routing; the recv loop replays every source rank's randperm routing (deterministic
 // from seed = src_rank + 42) and also credits nvl_send with the fan-out myRank issues as a landing
-// rank. Token counts are direction-independent, so pass/layout only pick which leg carries the
-// probability row.
+// rank. Token and pick counts are direction-independent, so the pass only picks which leg carries
+// the routing weights.
 HighThroughputBytes calculateHighThroughputBytes(
     const int64_t* topk_idx_host,
     unsigned int num_tokens,
@@ -4575,7 +4545,6 @@ HighThroughputBytes calculateHighThroughputBytes(
     ncclDataType_t token_dtype,
     ncclDataType_t scales_forward_token_dtype,
     ncclEpPassDir_t pass,
-    ncclEpLayout_t layout,
     bool ignore_local_traffic) {
     HighThroughputBytes bytes = {};
 
@@ -4584,33 +4553,38 @@ HighThroughputBytes calculateHighThroughputBytes(
 
     // Send side: walk this rank's own routing.
     for (unsigned int t = 0; t < num_tokens; t++) {
-        std::set<int> ranks_for_token;
-        std::set<int> nodes_for_token;
+        // Tally this token's picks per destination before emitting, because a destination's weight
+        // share is how many picks it hosts -- which the old dedup-and-continue shape discarded.
+        std::map<int, unsigned int> picks_per_rank;
+        std::map<int, unsigned int> picks_per_node;
         for (unsigned int k = 0; k < top_k; k++) {
             int64_t expert_id = topk_idx_host[t * top_k + k];
             if (expert_id < 0) continue;
             int target_rank = static_cast<int>(expert_id / num_experts_per_rank);
-            // Two experts on one rank are a single token on the wire, so dedup per rank first.
-            if (!ranks_for_token.insert(target_rank).second) continue;
-            bytes.total_send_tokens++;
+            picks_per_rank[target_rank]++;
+            picks_per_node[target_rank / lsa_team_size]++;
+        }
 
-            int target_node = target_rank / lsa_team_size;
-            if (target_node == local_node) {
+        // Per destination rank: two experts on one rank are a single token copy on the wire, but
+        // that copy still carries both their weights.
+        for (const auto& [target_rank, picks] : picks_per_rank) {
+            bytes.total_send_tokens++;
+            bytes.total_send_picks += picks;
+            if (target_rank / lsa_team_size == local_node) {
                 // Every peer on this node gets its own NVLink copy from this rank.
                 bytes.nvl_send_tokens++;
-                // One entry per destination node, this one included, deduped exactly as the remote
-                // term below. Crediting only target_rank == myRank would count this rank's experts
-                // against the remote term's whole node, mixing per-rank and per-node units.
-                //
-                // These local entries are NVLink writes, not NIC traffic, and are also counted in
-                // nvl_send. --ignore-local-traffic drops them; use that form whenever the column is
-                // compared against RDMA line rate.
-                if (!ignore_local_traffic && nodes_for_token.insert(target_node).second)
-                    bytes.scale_out_send_tokens++;
-                continue;
+                bytes.nvl_send_picks += picks;
             }
-            // One put per remote destination node: the landing rank there fans the token out.
-            if (nodes_for_token.insert(target_node).second) bytes.scale_out_send_tokens++;
+        }
+
+        // Per destination node: one put per node, the landing rank fans it out from there. The
+        // local node is included -- those entries are NVLink writes, not NIC traffic, and are also
+        // counted in nvl_send. --ignore-local-traffic drops them; use that form whenever the column
+        // is compared against RDMA line rate.
+        for (const auto& [target_node, picks] : picks_per_node) {
+            if (target_node == local_node && ignore_local_traffic) continue;
+            bytes.scale_out_send_tokens++;
+            bytes.scale_out_send_picks += picks;
         }
     }
 
@@ -4649,10 +4623,18 @@ HighThroughputBytes calculateHighThroughputBytes(
             stamp++;
             bool targets_me = false;
             unsigned int local_dst_ranks = 0;
+            // Picks are tallied alongside the dedup: my experts' own share, and the share for every
+            // expert on this node, which is what a landing rank must receive and fan out.
+            unsigned int picks_for_me = 0;
+            unsigned int picks_for_my_node = 0;
             for (unsigned int k = 0; k < top_k; k++) {
                 int target_rank = static_cast<int>(src_perm[k] / num_experts_per_rank);
-                if (target_rank == myRank) targets_me = true;
+                if (target_rank == myRank) {
+                    targets_me = true;
+                    picks_for_me++;
+                }
                 if (target_rank / lsa_team_size != local_node) continue;
+                picks_for_my_node++;
                 unsigned int slot = static_cast<unsigned int>(target_rank % lsa_team_size);
                 if (local_dst_stamp[slot] == stamp) continue;
                 local_dst_stamp[slot] = stamp;
@@ -4660,18 +4642,27 @@ HighThroughputBytes calculateHighThroughputBytes(
             }
             if (targets_me) {
                 bytes.total_recv_tokens++;
-                if (consumed_tokens_came_over_nvlink) bytes.nvl_recv_tokens++;
+                bytes.total_recv_picks += picks_for_me;
+                if (consumed_tokens_came_over_nvlink) {
+                    bytes.nvl_recv_tokens++;
+                    bytes.nvl_recv_picks += picks_for_me;
+                }
             }
             // The same predicate on both arms -- "this node wanted the token" -- because myRank
             // lands for its own node exactly as a rail peer lands for theirs. Using targets_me on
             // the local arm would pair a per-node send entry with a per-rank recv one.
             if (i_land_from_another_node ? local_dst_ranks > 0
-                                         : (count_my_own_tokens && local_dst_ranks > 0))
+                                         : (count_my_own_tokens && local_dst_ranks > 0)) {
                 bytes.scale_out_recv_tokens++;
-            // One NVLink copy to every local destination except myRank, whose own delivery is a
-            // local store already counted as nvl_recv.
-            if (i_fan_out_for_this_source)
+                // A landing rank receives the whole node's share, not just its own experts'.
+                bytes.scale_out_recv_picks += picks_for_my_node;
+            }
+            // One NVLink copy to every local destination except myRank: a landing rank takes its own
+            // share straight off the landing buffer, which is a local store and not an NVLink hop.
+            if (i_fan_out_for_this_source) {
                 bytes.nvl_send_tokens += local_dst_ranks - (targets_me ? 1u : 0u);
+                bytes.nvl_send_picks += picks_for_my_node - picks_for_me;
+            }
         }
     }
 
@@ -4698,15 +4689,19 @@ HighThroughputBytes calculateHighThroughputBytes(
     // is a different number and is computed above.
     const size_t combine_bytes_per_token = none_bytes_per_token;
 
-    // The probability row rides the same token counts as the token: one copy per destination rank.
-    bytes.dispatch = htTokensToBytes(
-        bytes,
-        dispatch_bytes_per_token + htDispatchProbBytesPerToken(pass, layout, top_k, num_experts,
-                                                               num_experts_per_rank, lsa_team_size));
-    bytes.combine = htTokensToBytes(
-        bytes,
-        combine_bytes_per_token + htCombineProbBytesPerToken(pass, layout, top_k, num_experts,
-                                                             num_experts_per_rank, lsa_team_size));
+    // Count only the data expected to be routed over the hardware bus (NVLink / RDMA): the token,
+    // its routing weight on the legs that carry one -- forward dispatch and backward combine -- and
+    // the quantization the user configured. Nothing here peeks into the application side: no routing
+    // metadata, no internal dense/compact decode, because we do not want to mix the layers.
+    // More details in docs/documentation/benchmark_analysis.md, linked from the README.
+    const size_t weight_bytes = sizeof(float);
+    const bool dispatch_carries_weights = (pass == NCCL_EP_FWD_PASS);
+    const bool combine_carries_weights = (pass == NCCL_EP_BWD_PASS);
+
+    bytes.dispatch = htTokensToBytes(bytes, dispatch_bytes_per_token);
+    bytes.combine = htTokensToBytes(bytes, combine_bytes_per_token);
+    if (dispatch_carries_weights) htAddPickBytes(bytes, &bytes.dispatch, weight_bytes);
+    if (combine_carries_weights) htAddPickBytes(bytes, &bytes.combine, weight_bytes);
 
     return bytes;
 }
@@ -5158,8 +5153,8 @@ void printHighThroughputResults(
         }
 
         printf(
-            "\nLogical payload bytes, dispatch leg (tokens + forwarded scales + routing "
-            "probabilities where transmitted, per-rank avg): "
+            "\nEffective bus payload bytes, dispatch leg (tokens + configured quantization + one "
+            "fp32 routing weight per top-k pick where this leg carries them, per-rank avg): "
             "total_send=%.2f MB (%u tokens), nvl_send=%.2f MB (%u tokens), "
             "scale_out_send=%.2f MB (%u tokens), total_recv=%.2f MB (%u tokens), "
             "nvl_recv=%.2f MB (%u tokens), scale_out_recv=%.2f MB (%u tokens)\n",
@@ -5503,7 +5498,7 @@ int main(int argc, char* argv[]) {
         {"datatype", required_argument, 0, 0},
         {"disable-token-dropping", no_argument, 0, 1001},
         {"fused-meta-dispatch", no_argument, 0, 1005},
-        {"ignore-local-traffic", no_argument, 0, 1010},
+        {"ignore-local-traffic", no_argument, 0, 1012},
         {"backward", no_argument, 0, 'B'},
         {"overflow-drop", no_argument, 0, 1008},
         {"meta-exchange-policy", required_argument, 0, 1010},
@@ -5781,7 +5776,7 @@ int main(int argc, char* argv[]) {
         case 1005:  // --fused-meta-dispatch
             fused_meta_dispatch = true;
             break;
-        case 1010:  // --ignore-local-traffic
+        case 1012:  // --ignore-local-traffic
             ignore_local_traffic = true;
             break;
         case 'h':
@@ -6336,7 +6331,6 @@ int main(int argc, char* argv[]) {
             token_dtype,
             scales_forward_token_dtype,
             dispatch_config.pass_direction,
-            layout,
             ignore_local_traffic);
     }
 
@@ -6758,8 +6752,9 @@ int main(int argc, char* argv[]) {
         // reports those fields -- so nothing HT prints depends on it today.
         dispatch_data_bytes = ht_bytes.dispatch.scale_out_send + ht_bytes.dispatch.total_recv;
         // Combine's own totals, which carry the caller-dtype row rather than the dispatch recipe's.
-        // These can differ even unquantized when dispatch transmits a routing-probability row;
-        // forward combine carries no such row. They match again where that row is absent.
+        // These can differ even unquantized because only one leg carries the routing weights:
+        // forward dispatch, backward combine. Their token terms match where dispatch is unquantized;
+        // the weight term is what separates them.
         if (!dispatch_only) {
             combine_data_bytes =
                 ht_bytes.combine.scale_out_send + ht_bytes.combine.total_recv;
@@ -7305,7 +7300,7 @@ int main(int argc, char* argv[]) {
             PairedBenchResult bwd_result = run_paired_pass(ktimer_bwd, [] {});
 
             // Backward moves the same token rows as forward but swaps which leg carries the
-            // probability row, so its byte totals are recomputed for this direction rather than
+            // routing weights, so its byte totals are recomputed for this direction rather than
             // reusing the forward ones.
             const HighThroughputBytes bwd_bytes = calculateHighThroughputBytes(
                 topk_idx_host,
@@ -7321,7 +7316,6 @@ int main(int argc, char* argv[]) {
                 token_dtype,
                 scales_forward_token_dtype,
                 dispatch_config.pass_direction,
-                layout,
                 ignore_local_traffic);
             HtByteTotals bwd_dispatch_totals = {};
             HtByteTotals bwd_combine_totals = {};

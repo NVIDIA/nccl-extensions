@@ -1649,6 +1649,33 @@ TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsMismatchedOutputTokenDtype)
     NCCL_ASSERT(ncclEpHandleDestroy(handle));
 }
 
+TEST_F(QuantizationRecipeTest, CombineNoneRejectsMismatchedOutputDtype) {
+    RecipeTensor tokens(ncclBfloat16);
+    RecipeTensor output_tokens(ncclFloat16);
+    ncclEpCombineInputs_t inputs = NCCL_EP_COMBINE_INPUTS_INIT;
+    ncclEpCombineOutputs_t outputs = NCCL_EP_COMBINE_OUTPUTS_INIT;
+    inputs.tokens = &tokens.tensor;
+    outputs.tokens = &output_tokens.tensor;
+    ncclEpHandle_t handle = make_handle(nullptr);
+    EXPECT_EQ(ncclEpCombine(handle, &inputs, &outputs, nullptr, g_stream), ncclInvalidArgument);
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+}
+
+TEST_F(QuantizationRecipeTest, DispatchRejectsNonFloat32TopkWeights) {
+    RecipeTensor tokens(ncclBfloat16);
+    RecipeTensor output_tokens(ncclBfloat16);
+    RecipeTensor topk_weights(ncclFloat16, kNumTokens, 2);
+    ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    inputs.tokens = &tokens.tensor;
+    inputs.topk_weights = &topk_weights.tensor;
+    outputs.tokens = &output_tokens.tensor;
+    ncclEpHandle_t handle = make_handle(nullptr);
+    EXPECT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclInvalidArgument);
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+}
+
 TEST_F(QuantizationRecipeTest, CombineNoneRejectsDispatchWireDtype) {
     RecipeTensor tokens(ncclFloat8e4m3);
     ncclEpCombineInputs_t inputs = NCCL_EP_COMBINE_INPUTS_INIT;

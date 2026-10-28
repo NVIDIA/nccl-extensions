@@ -530,8 +530,14 @@ static ncclResult_t validateCombineRecipe(
             if (scales != nullptr) {
                 return fail("inputs->scales must be null for NONE");
             }
-            return !requires_input || validate_dtype(tokens->datatype)
-                ? ncclSuccess : fail("tokens has unsupported dtype");
+            if (requires_input && !validate_dtype(tokens->datatype)) {
+                return fail("tokens has unsupported dtype");
+            }
+            // The kernels write outputs->tokens as the dtype they read from inputs->tokens.
+            if (requires_input && output_tokens != nullptr && output_tokens->datatype != tokens->datatype) {
+                return fail("outputs->tokens dtype must match inputs->tokens");
+            }
+            return ncclSuccess;
         case NCCL_EP_COMB_QUANT_NVFP4:
             // LL-only, as the enum documents: the HT combine kernels have no NVFP4
             // combine_recipe_traits specialization, so an HT call would fail JIT
@@ -598,6 +604,36 @@ static ncclResult_t validateCombineRecipe(
         default:
             return fail("recipe is not implemented");
     }
+}
+
+// Dtype contract of a non-payload tensor (routing weights, LL counters). The kernels reinterpret the memory as
+// this type, so a mismatch is rejected at the API boundary before any work; absent tensors are skipped.
+static ncclResult_t requireTensorDtype(const ncclEpTensor_t* t, ncclDataType_t expected, const char* name) {
+    if (t == nullptr || t->datatype == expected) {
+        return ncclSuccess;
+    }
+    fprintf(stderr, "NCCL EP warning: %s has dtype %d, expected %d\n", name, static_cast<int>(t->datatype),
+            static_cast<int>(expected));
+    return ncclInvalidArgument;
+}
+
+static ncclResult_t validateDispatchAuxDtypes(
+    const ncclEpDispatchInputs_t* inputs,
+    const ncclEpDispatchOutputs_t* outputs,
+    const ncclEpLayoutInfo_t* layout_info,
+    ncclEpAlgorithm_t algorithm) {
+    NCCLCHECK(requireTensorDtype(tensor_ptr(inputs->topk_weights), ncclFloat32, "inputs->topk_weights"));
+    NCCLCHECK(requireTensorDtype(tensor_ptr(outputs->topk_weights), ncclFloat32, "outputs->topk_weights"));
+    if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
+        NCCLCHECK(requireTensorDtype(tensor_ptr(outputs->topk_idx), ncclInt32, "outputs->topk_idx"));
+        if (layout_info != nullptr) {
+            NCCLCHECK(requireTensorDtype(
+                tensor_ptr(layout_info->src_rank_counters), ncclInt32, "layout_info->src_rank_counters"));
+            NCCLCHECK(requireTensorDtype(
+                tensor_ptr(layout_info->expert_counters), ncclInt32, "layout_info->expert_counters"));
+        }
+    }
+    return ncclSuccess;
 }
 
 // Make a temporary stack copy of `src` for short-lived library-internal use
@@ -5458,6 +5494,7 @@ ncclResult_t ncclEpDispatch(
         .max_token_bytes = group->config.max_token_bytes,
     };
     NCCLCHECK(validateDispatchRecipe(inputs, outputs, config, recipe_launch));
+    NCCLCHECK(validateDispatchAuxDtypes(inputs, outputs, layout_info, group->config.algorithm));
     if (pass_direction != NCCL_EP_FWD_PASS && handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         fprintf(stderr, "ncclEpDispatch: backward pass (pass_direction=%d) is not supported in LL mode\n",
                 (int)pass_direction);
@@ -5523,12 +5560,10 @@ ncclResult_t ncclEpDispatch(
                 assert(recv_topk_weights != nullptr);
                 assert(recv_topk_idx != nullptr);
                 assert(recv_topk_weights->ndim == 3);
-                assert(recv_topk_weights->datatype == ncclFloat32);
                 assert(recv_topk_weights->sizes[0] == static_cast<unsigned>(group->nRanks));
                 assert(recv_topk_weights->sizes[1] == group->config.max_dispatch_tokens_per_rank);
                 assert(recv_topk_weights->sizes[2] == static_cast<unsigned>(handle->num_topk));
                 assert(recv_topk_idx->ndim == 3);
-                assert(recv_topk_idx->datatype == ncclInt32);
                 assert(recv_topk_idx->sizes[0] == static_cast<unsigned>(group->nRanks));
                 assert(recv_topk_idx->sizes[1] == group->config.max_dispatch_tokens_per_rank);
                 assert(recv_topk_idx->sizes[2] == static_cast<unsigned>(handle->num_topk));
@@ -5536,13 +5571,11 @@ ncclResult_t ncclEpDispatch(
             if (owns_tokens) {
                 assert(topk_weights_in != nullptr);
                 assert(topk_weights_in->ndim == 2);
-                assert(topk_weights_in->datatype == ncclFloat32);
                 assert(topk_weights_in->sizes[0] == static_cast<unsigned>(handle->num_tokens));
                 assert(topk_weights_in->sizes[1] == static_cast<unsigned>(handle->num_topk));
             }
             if (owns_experts && src_rank_counter != nullptr) {
                 assert(src_rank_counter->ndim == 1);
-                assert(src_rank_counter->datatype == ncclInt32);
                 assert(src_rank_counter->sizes[0] == static_cast<unsigned>(group->nRanks));
             }
             break;
@@ -5568,7 +5601,6 @@ ncclResult_t ncclEpDispatch(
         } else {
             assert(recv_count != nullptr);
             assert(recv_count->ndim == 1);
-            assert(recv_count->datatype == ncclInt32);
             assert(recv_count->sizes[0] == group->num_local_experts);
         }
 
@@ -6060,7 +6092,7 @@ ncclResult_t ncclEpDispatch(
             if (topk_weights == nullptr) {
                 return ncclInvalidArgument;
             }
-            assert(topk_weights->ndim == 2 && topk_weights->datatype == ncclFloat32);
+            assert(topk_weights->ndim == 2);
             assert(topk_weights->sizes[0] == handle->num_tokens);
             assert(topk_weights->sizes[1] == handle->num_topk);
             NCCLCHECK(resolveTensorWindowBinding(
@@ -6651,7 +6683,6 @@ ncclResult_t ncclEpDispatch(
                 }
                 NCCLCHECK(resolveTensorWindowBinding(group, recv_topk_idx, &recv_topk_idx_local, 0, &recv_topk_idx));
             }
-            assert(recv_topk_weights->datatype == ncclFloat32);
             if (em) {
                 assert(recv_topk_weights->ndim == 1 && "HT EM recv_topk_weights must be 1D [num_recv_tokens]");
             }
@@ -7186,6 +7217,9 @@ ncclResult_t ncclEpCombine(
             fprintf(stderr, "NCCL EP: combine unsupported token dtype %d\n", static_cast<int>(xt->datatype));
             return ncclInvalidArgument;
         }
+        if (group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY && handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+            NCCLCHECK(requireTensorDtype(tensor_ptr(outputs->topk_weights), ncclFloat32, "outputs->topk_weights"));
+        }
     }
 
     if (handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
@@ -7307,7 +7341,6 @@ ncclResult_t ncclEpCombine(
             assert(topk_weights->ndim == 2);
             assert(topk_weights->sizes[0] == topk_idx->sizes[0]);
             assert(topk_weights->sizes[1] == topk_idx->sizes[1]);
-            assert(topk_weights->datatype == ncclFloat32);
             assert(topk_weights->sizes[0] <= num_max_dispatch_tokens_per_rank);
         }
 
@@ -7326,7 +7359,6 @@ ncclResult_t ncclEpCombine(
         assert(out->sizes[0] == num_combined_tokens);
         assert(out->sizes[1] == hidden);
         const ncclEpTensor_t* wire_tokens = owns_experts ? x : out;
-        assert(out->datatype == wire_tokens->datatype);
 
         if (nccl_ep_env_flag_on(handle->group->env.debug)) {
             fprintf(

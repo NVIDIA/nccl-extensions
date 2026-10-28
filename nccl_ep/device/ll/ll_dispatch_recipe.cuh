@@ -34,10 +34,6 @@ struct DispatchRecipeDeviceTypes<NCCL_EP_DISP_QUANT_NONE, ScaleT> {
     __host__ __device__ static constexpr size_t token_payload_bytes(size_t tensor_hidden) {
         return tensor_hidden * size_u8<kTokenDtype>();
     }
-
-    __host__ __device__ static constexpr size_t scale_payload_bytes(size_t, size_t) {
-        return 0;
-    }
 };
 
 template <typename ScaleT>
@@ -50,11 +46,6 @@ struct DispatchRecipeDeviceTypes<NCCL_EP_DISP_QUANT_FWD, ScaleT> {
     template <ncclDataType_t kTokenDtype>
     __host__ __device__ static constexpr size_t token_payload_bytes(size_t tensor_hidden) {
         return tensor_hidden * size_u8<kTokenDtype>();
-    }
-
-    // The caller-provided scale row travels as opaque bytes.
-    __host__ __device__ static constexpr size_t scale_payload_bytes(size_t, size_t forwarded_scale_bytes) {
-        return forwarded_scale_bytes;
     }
 };
 
@@ -70,10 +61,6 @@ struct DispatchRecipeDeviceTypes<NCCL_EP_DISP_QUANT_DS_FP8E3M4, ScaleT> {
     __host__ __device__ static constexpr size_t token_payload_bytes(size_t tensor_hidden) {
         // This recipe generates one FP8 byte for each BF16 input element.
         return tensor_hidden * sizeof(uint8_t);
-    }
-
-    __host__ __device__ static constexpr size_t scale_payload_bytes(size_t tensor_hidden, size_t) {
-        return tensor_hidden / kDsFp8E3M4ElementsPerScale * sizeof(float);
     }
 };
 

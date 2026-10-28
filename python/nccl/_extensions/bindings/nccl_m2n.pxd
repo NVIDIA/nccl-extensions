@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# This code was automatically generated with version 0.2.0. Do not modify it directly.
+# This code was automatically generated with version 0.3.1. Do not modify it directly.
 
 from libc.stdint cimport intptr_t
 

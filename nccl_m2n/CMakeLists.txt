@@ -12,7 +12,7 @@ set(NCCL_M2N_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 set(NCCL_M2N_INCLUDE_DIR "${NCCL_M2N_BINARY_DIR}/include")
 set(NCCL_M2N_LIBRARY_DIR "${NCCL_M2N_BINARY_DIR}/lib")
 set(NCCL_M2N_RUNTIME_DIR "${NCCL_M2N_BINARY_DIR}/bin")
-set(NCCL_M2N_VERSION "0.2.0")
+set(NCCL_M2N_VERSION "0.3.1")
 set(NCCL_M2N_STANDALONE OFF)
 
 # CMake initializes its CUDA compiler and architecture flags in project(). Set

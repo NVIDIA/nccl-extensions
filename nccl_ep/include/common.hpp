@@ -177,6 +177,19 @@ __host__ __device__ __forceinline__ int relativeRankSlot(int senderRank, int rec
                                          : (senderRank - receiverRank + numRanks);
 }
 
+// Return the dispatch receive-buffer row assigned to a sender on a receiver.
+// Classic EP rotates over the entire world-rank space. AFD rotates over its
+// contiguous attention-source rows using the FFN-local receiver rank, wrapping
+// receivers when the A:F partition is not square.
+template <bool kAfd>
+__host__ __device__ __forceinline__ int
+dispatchSourceRankSlot(int senderRank, int receiverRank, int numRanks, int numAttnRanks) {
+    if constexpr (!kAfd) return relativeRankSlot(senderRank, receiverRank, numRanks);
+
+    const int receiverSourceSlot = (receiverRank - numAttnRanks) % numAttnRanks;
+    return relativeRankSlot(senderRank, receiverSourceSlot, numAttnRanks);
+}
+
 __host__ __device__ __forceinline__ int getExpertRankIdx(int expertIdx, int numLocalExperts) {
     return (expertIdx >= 0) ? expertIdx / numLocalExperts : -1;
 }
@@ -367,20 +380,31 @@ struct LowLatencyLayout {
         size_t num_bytes_per_combine_msg =
             align<size_t>(scale_metadata_bytes + max_token_bytes, sizeof(int4));
 
-        // Per-op send and recv sizes.
+        // Per-op send and recv sizes. AFD rank-major groups split the world
+        // into token-owning attention ranks and expert-owning FFN ranks. Only
+        // attention ranks can populate a source-rank row, so the wire's active
+        // rank prefix is num_attn_ranks rather than num_ranks.
+        const bool afd_role_split =
+            num_attn_ranks > 0 && layout == NCCL_EP_LAYOUT_RANK_MAJOR;
+        const size_t num_active_token_ranks = afd_role_split
+            ? static_cast<size_t>(num_attn_ranks)
+            : static_cast<size_t>(num_ranks);
+
         // Combine send buffer holds one slot per outbound message produced on
         // the sender side: expert-major fans tokens out per expert (num_experts
         // slots), while rank-major fans them out per destination rank
         // (num_ranks slots). Sizing per layout avoids over-allocating in the
         // rank-major case (typically num_ranks < num_experts).
         size_t combine_send_slots =
-            (layout == NCCL_EP_LAYOUT_RANK_MAJOR) ? static_cast<size_t>(num_ranks) : static_cast<size_t>(num_experts);
+            (layout == NCCL_EP_LAYOUT_RANK_MAJOR) ? num_active_token_ranks : static_cast<size_t>(num_experts);
         size_t dispatch_send_buffer_bytes = num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
         size_t combine_send_buffer_bytes =
             combine_send_slots * num_max_dispatch_tokens_per_rank * num_bytes_per_combine_msg;
 
-        // Symmetric receive buffers: the RDMA wire is always rank-major regardless of user-facing layout.
-        size_t dispatch_recv_data_buffer_bytes = static_cast<size_t>(num_ranks) *
+        // The RDMA wire is rank-major regardless of user-facing layout. In AFD,
+        // only the attention-rank prefix owns tokens and therefore needs source
+        // rows in an FFN rank's dispatch receive buffer.
+        size_t dispatch_recv_data_buffer_bytes = num_active_token_ranks *
                                                  static_cast<size_t>(num_max_dispatch_tokens_per_rank) *
                                                  num_bytes_per_dispatch_msg;
         size_t combine_recv_buffer_bytes = static_cast<size_t>(num_max_dispatch_tokens_per_rank) *
@@ -397,14 +421,31 @@ struct LowLatencyLayout {
         // their recv buffers across the boundary (each kernel copies received
         // payloads out to user tensors before exit). So one shared slot can
         // hold either op's (send + recv) pair, sized to the worst case.
-        // Inside a slot:
-        //   - send_buffer always starts at slot_base.
-        //   - dispatch_recv starts at slot_base + dispatch_send_buffer_bytes.
-        //   - combine_recv  starts at slot_base + combine_send_buffer_bytes.
+        //
+        // AFD has the stronger invariant that, within either operation, a rank
+        // is exclusively a sender or receiver. All ranks still need an
+        // identical registered-window layout, but the mutually exclusive
+        // logical regions can alias at slot_base:
+        //
+        //   Classic: dispatch [dispatch-send][dispatch-recv]
+        //            combine  [combine-send ][combine-recv ]
+        //
+        //   A rank:  dispatch [dispatch-send]
+        //            combine  [combine-recv ]
+        //   F rank:  dispatch [dispatch-recv]
+        //            combine  [combine-send ]
+        //                     ^ slot_base; AFD slot size = max(all four)
         // Two slots for double-buffering.
-        size_t dispatch_combo_bytes = dispatch_send_buffer_bytes + dispatch_recv_data_buffer_bytes;
-        size_t combine_combo_bytes = combine_send_buffer_bytes + combine_recv_buffer_bytes;
-        size_t slot_bytes = std::max(dispatch_combo_bytes, combine_combo_bytes);
+        size_t slot_bytes;
+        if (afd_role_split) {
+            slot_bytes = std::max(
+                std::max(dispatch_send_buffer_bytes, dispatch_recv_data_buffer_bytes),
+                std::max(combine_send_buffer_bytes, combine_recv_buffer_bytes));
+        } else {
+            size_t dispatch_combo_bytes = dispatch_send_buffer_bytes + dispatch_recv_data_buffer_bytes;
+            size_t combine_combo_bytes = combine_send_buffer_bytes + combine_recv_buffer_bytes;
+            slot_bytes = std::max(dispatch_combo_bytes, combine_combo_bytes);
+        }
         payload_slot_stride = slot_bytes;
         total_bytes += payload_slot_stride * 2;
 
@@ -442,10 +483,12 @@ struct LowLatencyLayout {
         buffer = LowLatencyBuffer{
             .num_clean_int = static_cast<int>(signaling_buffer_bytes / sizeof(int)),
             .dispatch_rdma_send_buffer_offset = slot_base,
-            .dispatch_rdma_recv_data_buffer_offset = slot_base + dispatch_send_buffer_bytes,
+            .dispatch_rdma_recv_data_buffer_offset =
+                slot_base + (afd_role_split ? 0 : dispatch_send_buffer_bytes),
             .dispatch_rdma_recv_count_buffer_offset = 0,
             .combine_rdma_send_buffer_offset = slot_base,
-            .combine_rdma_recv_data_buffer_offset = slot_base + combine_send_buffer_bytes,
+            .combine_rdma_recv_data_buffer_offset =
+                slot_base + (afd_role_split ? 0 : combine_send_buffer_bytes),
             .combine_rdma_recv_flag_buffer_offset = 0,
             .combine_rdma_send_buffer_data_start_offset = slot_base,
             .num_bytes_per_combine_msg = num_bytes_per_combine_msg,

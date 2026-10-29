@@ -576,6 +576,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     const auto numSms = static_cast<int>(gridDim.x);
     const auto numWarps = numWarpGroups * numWarpsPerGroup;
     const auto numLocalExperts = numExperts / (numRanks - numAttnRanks);
+    constexpr bool kAfd = !(kRankOwnsExperts && kRankOwnsTokens);
     const auto warpGroupId = warpId / numWarpsPerGroup;
     const auto subWarpId = warpId % numWarpsPerGroup;
     const auto responsibleExpertIdx = smId * numWarpGroups + warpGroupId;
@@ -785,8 +786,9 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
                         // Per-srcRank region base on the peer; sendToken picks the
                         // NVLink (split layout, direct from `inData`) or RDMA
                         // (interleaved, gin.put from staging) path internally.
-                        const size_t srcRankOffset =
-                            static_cast<size_t>(relativeRankSlot(currRank, dstRank, numRanks)) * srcRankRegionBytes;
+                        const size_t srcRankOffset = static_cast<size_t>(
+                            dispatchSourceRankSlot<kAfd>(currRank, dstRank, numRanks, numAttnRanks)) *
+                            srcRankRegionBytes;
                         const auto srcRankLocalPtr = reinterpret_cast<uint64_t>(recvBuf) + srcRankOffset;
                         const auto sendBufInt4 = reinterpret_cast<const int4*>(sendBufBase);
                         sendToken<kRecipe, kNvlinkOnly, ScaleT, kSharedQuant>(
@@ -1076,11 +1078,14 @@ LOW_LATENCY_DISPATCH_RECV:
         // CFT and RDMA use interleaved messages; NVLink stores use split layout.
         const bool isNvlinkSrc = !cft_for_recv && isIntraLsa_srcRank;
 
-        // CFT indexes source regions by absolute rank; stores use relative rank.
+        // CFT indexes source regions by absolute rank. Store dispatch uses the
+        // rotated ring layout for classic EP and the compact attention prefix
+        // for AFD.
         const uint8_t* const srcRankRecvBase = cft_for_recv
             ? cftRecvRegion(cft, srcRank)
             : reinterpret_cast<const uint8_t*>(recvBuf) +
-                  static_cast<size_t>(relativeRankSlot(srcRank, currRank, numRanks)) * maxTokensPerRank * numBytesPerMsg;
+                  static_cast<size_t>(dispatchSourceRankSlot<kAfd>(srcRank, currRank, numRanks, numAttnRanks)) *
+                      maxTokensPerRank * numBytesPerMsg;
 
         if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
             for (int i = rankLaneIdx * numWarpsPerGroup + subWarpId; i < numRecvTokens * numTopk;

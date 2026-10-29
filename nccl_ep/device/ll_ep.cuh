@@ -576,8 +576,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     const auto numSms = static_cast<int>(gridDim.x);
     const auto numWarps = numWarpGroups * numWarpsPerGroup;
     const auto numLocalExperts = numExperts / (numRanks - numAttnRanks);
-    // JIT-time burn-in flag derived from role-specialized template arguments;
-    // it adds no runtime branch or state.
+    // JIT-time burn-in flag: classic ranks own both tokens and experts, while
+    // each AFD rank owns exactly one role. It adds no runtime branch or state.
     constexpr bool kAfd = !(kRankOwnsExperts && kRankOwnsTokens);
     const auto warpGroupId = warpId / numWarpsPerGroup;
     const auto subWarpId = warpId % numWarpsPerGroup;

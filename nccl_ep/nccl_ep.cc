@@ -1244,10 +1244,9 @@ buildIntranodePtrArray(const ncclEpGroup_t group, const ncclEpTensor_t* tensor, 
     return ncclSuccess;
 }
 
-// True when dispatch writes EM staging by em_slot (max_recv_tokens-sized).
-// Only kLocalDup/kNvlinkDup with non-zero-copy; reachable via env override since
-// auto selection pairs these modes with zero_copy=ON (no staging allocated).
-static bool em_staging_indexed_by_em_slot(ncclEpGroup_t group);
+// Expert-Major duplication uses em_slot indexing when dispatch staging is needed.
+// Auto selection enables zero-copy; env overrides can require staging.
+static bool em_staging_indexed_by_em_slot(ncclEpGroup_t group, ncclEpLayout_t layout);
 static ncclResult_t ht_query_num_recv_tokens(ncclEpHandle_t handle, cudaStream_t stream, unsigned int* num_recv_tokens);
 
 // Physical flat recv-token capacity (before the per-token num_topk fan-out). Caps the
@@ -1341,7 +1340,8 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // indexed at a padded per-expert stride that can exceed the flat recv cap, so it keeps the
     // full nRanks * max_dispatch fan-out. Dup modes stay at the EM-slot budget.
     size_t token_staging_slots;
-    if (em_staging_indexed_by_em_slot(ep_group)) {
+    // Group storage must cover future Expert-Major handles; no handle layout exists yet.
+    if (em_staging_indexed_by_em_slot(ep_group, NCCL_EP_LAYOUT_EXPERT_MAJOR)) {
         // kNvlinkDup / kLocalDup: EM-slot indexed, full EM recv budget.
         token_staging_slots = max_output_slots;
     } else if (ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush) {
@@ -3367,7 +3367,7 @@ struct ncclEpHandle {
             // Original source top-k position for each delivered weight. FWD inline
             // decoding fills this handle-owned map; BWD combine scatters each
             // gradient back to that same source position. FWD must precede BWD.
-            // FLAT and EM-permute scratch: [max_recv_tokens, num_topk].
+            // FLAT and EM-permute scratch: [flat recv capacity, num_topk].
             // Native EM: [max_recv_tokens], one source position per expert slot.
             // uint8 for K <= 255, uint16 otherwise; all-ones means no expert.
             void* wire_prob_pos;
@@ -3616,9 +3616,10 @@ static bool em_local_dup_active(ncclEpGroup_t group, ncclEpLayout_t layout) {
     return layout == NCCL_EP_LAYOUT_EXPERT_MAJOR && group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalDup;
 }
 
-static bool em_staging_indexed_by_em_slot(ncclEpGroup_t group) {
-    return group->ht_em_mode == ncclEpGroup::HtEmMode::kNvlinkDup ||
-           group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalDup;
+static bool em_staging_indexed_by_em_slot(ncclEpGroup_t group, ncclEpLayout_t layout) {
+    return layout == NCCL_EP_LAYOUT_EXPERT_MAJOR &&
+           (group->ht_em_mode == ncclEpGroup::HtEmMode::kNvlinkDup ||
+            group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalDup);
 }
 
 // Push transport only: compact FWD rows contain original-order FP32 weights
@@ -3734,7 +3735,7 @@ struct HtBlockLayout {
         // bitmap (ceil(epr/64) u64 words/slot), scan mode as one bool/expert. Per-handle private
         // copy for combine. Row count: EM-slot indexed modes (kNvlinkDup/kLocalDup) need
         // max_recv_tokens; flat-indexed modes need only the flat recv capacity.
-        const size_t ler_rows = em_staging_indexed_by_em_slot(ep_group)
+        const size_t ler_rows = em_staging_indexed_by_em_slot(ep_group, layout)
                                     ? static_cast<size_t>(ep_group->max_recv_tokens)
                                     : ht_max_flat_recv_tokens(ep_group);
         L.sz_ler = count_mode_capable ?
@@ -3747,9 +3748,8 @@ struct HtBlockLayout {
         L.sz_ntfe = align256(sizeof(int32_t));
         // Match the existing receiver conversion's row capacity. Native EM has
         // one weight per slot; FLAT and EM-permute's internal FLAT scratch need
-        // one original source position per local weight. FWD initializes every
-        // active map entry. The existing S2D 0xFF initialization also clears
-        // this map's tail, which BWD may read at full caller-buffer capacity.
+        // one original source position per local weight. FWD fills active entries;
+        // S2D's 0xFF initialization clears the unused tail within this capacity.
         const int wire_pos_stride = (has_expert_major && !em_permute) ? 1 : num_topk;
         L.sz_wire_pos = (ht_prob_wire_mode(ep_group, num_topk) == HtProbWire::kCompact) ?
                            align256(ler_rows * wire_pos_stride *
@@ -4192,11 +4192,9 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     // Count mode's single-LSA-team precondition is already enforced by dispatch_push_count_capable()
     // (which includes !is_internode_available); internode EM falls back to scan through the same
     // gate, so no redundant handle-init assert is needed here.
-    // kNvlinkDup/kLocalDup write the staging buffer in the same per-expert
-    // expanded shape as the dispatch output (each token can occupy up to
-    // num_topk slots), so max_recv_tokens must cover the worst case
-    // nRanks * max_dispatch_tokens_per_rank * num_topk.
-    if (em_staging_indexed_by_em_slot(ep_group) && ep_group->config.zero_copy != NCCL_EP_ZERO_COPY_ON) {
+    // Only Expert-Major dup handles expand each token into up to num_topk staging slots.
+    if (em_staging_indexed_by_em_slot(ep_group, handle->layout) &&
+        ep_group->config.zero_copy != NCCL_EP_ZERO_COPY_ON) {
         const size_t needed =
             static_cast<size_t>(ep_group->nRanks) * ep_group->config.max_dispatch_tokens_per_rank * num_topk;
         EP_HOST_ASSERT(
@@ -6678,7 +6676,7 @@ ncclResult_t ncclEpDispatch(
             int num_recv_tokens =
                 em_permute_active
                     ? static_cast<int>(flat_recv_cap)
-                    : static_cast<int>(em_staging_indexed_by_em_slot(group)
+                    : static_cast<int>(em_staging_indexed_by_em_slot(group, handle->layout)
                                            ? static_cast<size_t>(recv_copy_rows)
                                            : std::min<size_t>(recv_copy_rows, flat_recv_cap));
             int experts_per_lsa_team = group->num_local_experts * group->lsa_team_size;
@@ -7756,13 +7754,14 @@ ncclResult_t ncclEpCombine(
             /* ===== Convert sparse topk_weights to wire prob rows for backward combine ===== */
             if (backward_combine) {
                 int experts_per_lsa_team = group->num_local_experts * group->lsa_team_size;
-                // Probability staging has token_staging_slots rows and the combine kernel reads only
-                // valid recv slots, so clamp the scatter there: flat recv capacity for FLAT and
-                // em-permute, full recv budget for the EM-slot dup modes.
+                // Group staging can exceed FLAT's handle-owned maps; clamp both scatter paths
+                // to the layout's capacity, matching FWD decoding and scratch allocation.
+                const size_t prob_staging_rows = em_staging_indexed_by_em_slot(group, handle->layout)
+                    ? group->ht_buffers.token_staging_slots : ht_max_flat_recv_tokens(group);
                 const int conv_rows = em_permute_combine
-                    ? static_cast<int>(ht_max_flat_recv_tokens(group))
+                    ? static_cast<int>(prob_staging_rows)
                     : static_cast<int>(std::min<size_t>(
-                          static_cast<size_t>(num_tokens), group->ht_buffers.token_staging_slots));
+                          static_cast<size_t>(num_tokens), prob_staging_rows));
                 const int in_prob_row_floats =
                     (prob_wire == HtProbWire::kCompact) ? wire_prob_floats : experts_per_lsa_team;
                 size_t wire_prob_size = static_cast<size_t>(conv_rows) * in_prob_row_floats * sizeof(float);

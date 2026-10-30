@@ -307,6 +307,7 @@ ncclResult_t call_metadata_preprocessing(
     int32_t*
         sparse_to_dense_map, // Output: unified S2D — flat stores token->rank->slot; expert-major stores packed (rank, slot) entries
     bool* rdma_to_attn_map, // Output: which tokens come from RDMA
+    bool* rdma_to_attn_map_wo_drop, // Output: pristine pre-drop copy; null unless policy is DROP
     bool* attn_to_rdma_map, // Output: which tokens go to RDMA
     void* token_rank_mask, // Scratch rank masks, sized by get_rank_mask_elem_size().
     int32_t* num_tokens_for_experts, // Output: total tokens for local experts
@@ -815,6 +816,7 @@ struct CombineParams {
     int s2d_inner_dim; // Inner dim of unified S2D (num_topk in expert-major, ranks per LSA team in flat).
     ncclEpLayout_t layout; // Output layout (selects kernel template specialization).
     const bool* rdma_to_attn_map;
+    const bool* rdma_to_attn_map_wo_drop;
     const bool* attn_to_rdma_map; // For multi-LSA-team RDMA routing
     const bool* local_expert_routing_map; // For backward gradient routing
 

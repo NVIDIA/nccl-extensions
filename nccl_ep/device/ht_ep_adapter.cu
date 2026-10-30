@@ -987,6 +987,7 @@ ncclResult_t call_metadata_preprocessing(
     const uint8_t* global_routing_map,
     int32_t* sparse_to_dense_map,
     bool* rdma_to_attn_map,
+    bool* rdma_to_attn_map_wo_drop,
     bool* attn_to_rdma_map,
     void* token_rank_mask,
     int32_t* num_tokens_for_experts,
@@ -1077,6 +1078,7 @@ ncclResult_t call_metadata_preprocessing(
             sp.tmp = reinterpret_cast<::ht_ep::tmp_state_t*>(ranks_scan_tmp);
             sp.sparse_to_dense_map = sparse_to_dense_map;
             sp.rdma_to_attn_map = rdma_to_attn_map;
+            sp.rdma_to_attn_map_wo_drop = rdma_to_attn_map_wo_drop;
             sp.attn_to_rdma_map = attn_to_rdma_map;
             sp.token_rank_mask = token_rank_mask;
             // Initialize Flat parameters
@@ -1115,6 +1117,7 @@ ncclResult_t call_metadata_preprocessing(
                 /*enable_em_permute=*/true,
                 out_is_int64,
                 use_topk_idx,
+                sp.rdma_to_attn_map_wo_drop != nullptr,
                 sp,
                 dynamic_smem_bytes,
                 stream);
@@ -1132,6 +1135,7 @@ ncclResult_t call_metadata_preprocessing(
             ::ht_ep::scan_em_kernel_param_t sp;
             sp.input_routing_map = global_routing_map;
             sp.rdma_to_attn_map = rdma_to_attn_map;
+            sp.rdma_to_attn_map_wo_drop = rdma_to_attn_map_wo_drop;
             sp.attn_to_rdma_map = attn_to_rdma_map;
             sp.token_rank_mask = token_rank_mask;
             sp.lsa_team = lsa_team;
@@ -1139,7 +1143,10 @@ ncclResult_t call_metadata_preprocessing(
             sp.num_of_tokens_per_rank = num_tokens_per_rank;
             sp.experts_per_rank = experts_per_rank;
 
-            jit::launch_scan_em(NUM_THREADS_PER_BLOCK, NUM_OF_BLOCKS, num_lsa_teams, lsa_team_size, sp, stream);
+            jit::launch_scan_em(
+                NUM_THREADS_PER_BLOCK, NUM_OF_BLOCKS, num_lsa_teams, lsa_team_size,
+                sp.rdma_to_attn_map_wo_drop != nullptr, sp,
+                stream);
         }
 
         const int num_mask_words = nccl_ep::bit_words(lsa_team_size);
@@ -1208,6 +1215,7 @@ ncclResult_t call_metadata_preprocessing(
     sp.tmp = reinterpret_cast<::ht_ep::tmp_state_t*>(ranks_scan_tmp);
     sp.sparse_to_dense_map = sparse_to_dense_map;
     sp.rdma_to_attn_map = rdma_to_attn_map;
+    sp.rdma_to_attn_map_wo_drop = rdma_to_attn_map_wo_drop;
     sp.attn_to_rdma_map = attn_to_rdma_map;
     sp.token_rank_mask = token_rank_mask;
     sp.num_of_tokens_for_experts = num_tokens_for_experts;
@@ -1236,6 +1244,7 @@ ncclResult_t call_metadata_preprocessing(
         /*enable_em_permute=*/false,
         out_is_int64,
         use_topk_idx,
+        sp.rdma_to_attn_map_wo_drop != nullptr,
         sp,
         dynamic_smem_bytes,
         stream);
@@ -1922,7 +1931,8 @@ ncclResult_t call_dispatch(
 
 std::vector<uint8_t> build_combine_arg_buffer(
     const ::ht_ep::combine_kernel_param_base_t& kp,
-    const CombineParams& params) {
+    const CombineParams& params,
+    bool unordered) {
     using ParamBase = ::ht_ep::combine_kernel_param_base_t;
     static_assert(sizeof(ParamBase) % alignof(void*) == 0);
 
@@ -1934,6 +1944,9 @@ std::vector<uint8_t> build_combine_arg_buffer(
     const size_t prob_offset = token_offset + params.lsa_team_size * sizeof(uint16_t*);
     size_t total_size = prob_offset + params.lsa_team_size * sizeof(float*);
     total_size = (total_size + alignof(void*) - 1) & ~(alignof(void*) - 1);
+    // The unordered kernel takes rdma_to_attn_map_wo_drop as its second argument.
+    const size_t wo_drop_offset = total_size;
+    if (unordered) total_size += sizeof(const bool*);
 
     std::vector<uint8_t> arg(total_size);
     std::memcpy(arg.data(), &kp, sizeof(kp));
@@ -1944,6 +1957,7 @@ std::vector<uint8_t> build_combine_arg_buffer(
         token_ptrs[i] = params.expert_input_token_ptrs[i];
         prob_ptrs[i] = params.expert_input_prob_ptrs ? params.expert_input_prob_ptrs[i] : nullptr;
     }
+    if (unordered) std::memcpy(arg.data() + wo_drop_offset, &params.rdma_to_attn_map_wo_drop, sizeof(const bool*));
 
     return arg;
 }
@@ -2144,7 +2158,8 @@ ncclResult_t combine_impl(
     kp.block_timing = d_bt;
 #endif
 
-    std::vector<uint8_t> kernel_arg = build_combine_arg_buffer(kp, params);
+    const bool unordered = ht_select_kernel_impl(env) == HtKernelImpl::kUnordered;
+    std::vector<uint8_t> kernel_arg = build_combine_arg_buffer(kp, params, unordered);
     // Captured rather than NCCLCHECK'd inline so the warp-timing buffers below are still
     // freed on the failure path.
     const ncclResult_t combine_res = jit::launch_combine(
@@ -2155,6 +2170,7 @@ ncclResult_t combine_impl(
         params.layout,
         kp.hidden_dim,
         env,
+        params.rdma_to_attn_map_wo_drop != nullptr,
         kernel_arg.data(),
         kernel_arg.size(),
         static_cast<int>(smem_size),

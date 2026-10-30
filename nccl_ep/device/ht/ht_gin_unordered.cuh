@@ -32,6 +32,7 @@
 #include "ht_ep_configs.cuh"
 #include "mxfp8_quant.cuh"
 #include "quant_recipe.cuh"
+#include "ht/ht_combine_packed.cuh"
 #include <assert.h>
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -2723,6 +2724,29 @@ __device__ __forceinline__ void st_token_pairs_shared(void* base, int first_pair
     }
 }
 
+// Zero the FP32 accumulators for one destination token. Used by the reducer before it adds
+// source contributions, and on its own for a reserved slot under OVERFLOW_DROP.
+template <
+    typename RED_GROUP,
+    bool BACKWARD_COMBINE,
+    int HIDDEN_DIM,
+    int NUM_ACC>
+__forceinline__ __device__ void combine_zero_acc(
+    float2 (&acc_token_fp32)[NUM_ACC],
+    float* acc_prob_ptr,
+    int prob_vec_per_thread) {
+#pragma unroll
+    for (int n = 0; n < NUM_ACC; n++) {
+        acc_token_fp32[n].x = 0.0f;
+        acc_token_fp32[n].y = 0.0f;
+    }
+    if constexpr (BACKWARD_COMBINE) {
+        for (int n = 0; n < prob_vec_per_thread; n++) {
+            acc_prob_ptr[n] = 0.0f;
+        }
+    }
+}
+
 // Reduce all G2S source-token contributions for one destination token into FP32 registers
 // (+prob into SMEM for backward). Advances the G2S stage cursor/parity to the next dst token.
 template <
@@ -2744,17 +2768,8 @@ __forceinline__ __device__ void combine_reduce_dst_token(
     int prob_dim) {
     constexpr int NUM_OF_BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
 
-#pragma unroll
-    for (int n = 0; n < NUM_ACC; n++) {
-        acc_token_fp32[n].x = 0.0f;
-        acc_token_fp32[n].y = 0.0f;
-    }
-    if constexpr (BACKWARD_COMBINE) {
-#pragma unroll
-        for (int n = 0; n < prob_vec_per_thread; n++) {
-            acc_prob_ptr[n] = 0.0f;
-        }
-    }
+    combine_zero_acc<RED_GROUP, BACKWARD_COMBINE, HIDDEN_DIM, NUM_ACC>(
+        acc_token_fp32, acc_prob_ptr, prob_vec_per_thread);
 
     // Consume source tokens for this dst token until the producer marks the last one.
     bool last_src_token = false;
@@ -2881,7 +2896,6 @@ __forceinline__ __device__ void combine_store_reduced_token(
     int prob_vec_per_thread,
     int prob_dim,
     uint16_t* red_token_base,
-    float* red_prob_base,
     int cur_tokid) {
     constexpr int BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
 
@@ -2931,8 +2945,9 @@ __forceinline__ __device__ void combine_store_reduced_token(
         if (cuda::ptx::elect_sync(~0)) {
             // Wire token width scaled into uint16_t units (4 B FP32, 2 B BF16/FP16).
             const size_t red_token_bytes = HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>());
-            uint16_t* current_token_addr =
-                red_token_base + cur_tokid * red_token_bytes / sizeof(uint16_t);
+            uint8_t* red_slot = reinterpret_cast<uint8_t*>(red_token_base) +
+                                cur_tokid * ::nccl_ep::ht_packed::slot_bytes(red_token_bytes, BACKWARD_COMBINE, prob_dim);
+            uint16_t* current_token_addr = reinterpret_cast<uint16_t*>(red_slot);
             cuda::ptx::cp_async_bulk(
                 cuda::ptx::space_global,
                 cuda::ptx::space_shared,
@@ -2941,7 +2956,7 @@ __forceinline__ __device__ void combine_store_reduced_token(
                 (uint32_t)(red_token_bytes));
 
             if constexpr (BACKWARD_COMBINE) {
-                float* current_prob_addr = red_prob_base + cur_tokid * prob_dim;
+                float* current_prob_addr = reinterpret_cast<float*>(red_slot + red_token_bytes);
                 cuda::ptx::cp_async_bulk(
                     cuda::ptx::space_global,
                     cuda::ptx::space_shared,
@@ -3001,13 +3016,14 @@ template <
     int HIDDEN_DIM,
     int LSA_TEAM_SZ,
     ncclDataType_t kTokenDtype,
-    ncclEpCombQuant_t kCombineRecipe>
+    ncclEpCombQuant_t kCombineRecipe,
+    bool OVERFLOW_DROP>
 __forceinline__ __device__ void combine_RED_intra_warp(
     // INPUT
     const bool* rdma_to_attn_map,
+    const bool* rdma_to_attn_map_wo_drop,
     // OUTPUT
     uint16_t* combine_gin_RED_tokens,
-    float* combine_gin_RED_prob,
     // CONFIG
     const int my_lteam,
     const int num_of_tokens_per_rank,
@@ -3065,8 +3081,16 @@ __forceinline__ __device__ void combine_RED_intra_warp(
                                                  ? nccl_ep::ceil_div(rem_chunk_sz, (int)sizeof(routing_loads_t))
                                                  : ROUTING_LOADS_PER_CHUNK;
 
-        const routing_loads_t* rdma_map_base = reinterpret_cast<const routing_loads_t*>(
-            rdma_to_attn_map + (meta.lteam_id * rdma_per_lsa_sz + meta.chunk_id * TOKENS_PER_CHUNK));
+        const int rdma_map_offset = meta.lteam_id * rdma_per_lsa_sz + meta.chunk_id * TOKENS_PER_CHUNK;
+        const routing_loads_t* rdma_map_base =
+            reinterpret_cast<const routing_loads_t*>(rdma_to_attn_map + rdma_map_offset);
+        // Slot numbering follows the pristine map, ring traffic the cleared one: the receiver's
+        // attn_to_rdma_map keeps a dropped token's bit, so its slot must still be counted.
+        const routing_loads_t* rdma_map_base_wo_drop = nullptr;
+        if constexpr (OVERFLOW_DROP) {
+            rdma_map_base_wo_drop =
+                reinterpret_cast<const routing_loads_t*>(rdma_to_attn_map_wo_drop + rdma_map_offset);
+        }
 
         // Per-token stride in gin_RED: Recipe::rdma_bytes, the inter-node row width
         // (dtype-width for NONE), matching the previous
@@ -3075,15 +3099,18 @@ __forceinline__ __device__ void combine_RED_intra_warp(
             nccl_ep::combine_recipe_traits<kCombineRecipe>::template rdma_bytes<kTokenDtype>(HIDDEN_DIM);
         uint16_t* red_token_base = reinterpret_cast<uint16_t*>(
             reinterpret_cast<uint8_t*>(combine_gin_RED_tokens) +
-            static_cast<size_t>(gin_RED_slot) * red_stride);
-        float* red_prob_base = nullptr;
-        if constexpr (BACKWARD_COMBINE) {
-            red_prob_base = combine_gin_RED_prob + gin_RED_slot * prob_dim;
-        }
+            static_cast<size_t>(gin_RED_slot) * ::nccl_ep::ht_packed::slot_bytes(red_stride, BACKWARD_COMBINE, prob_dim));
         streaming_pending = 0;
         int additional_in_flight_s2g = 0;
+        // Packed contiguous layout: the n-th routed token of this chunk goes to slot n. This walk is
+        // sequential, so one cursor is the whole sender-side change.
+        int packed_slot = 0;
         for (int load_idx = 0; load_idx < routing_loads_for_chunk; load_idx++) {
             routing_loads_t routing_data = rdma_map_base[load_idx];
+            routing_loads_t routing_data_wo_drop = routing_data;
+            if constexpr (OVERFLOW_DROP) {
+                routing_data_wo_drop = rdma_map_base_wo_drop[load_idx];
+            }
 #pragma unroll
             for (int token_in_load = 0; token_in_load < TOKENS_PER_ROUTING_LOAD; token_in_load++) {
                 int cur_tokid = load_idx * TOKENS_PER_ROUTING_LOAD + token_in_load;
@@ -3091,10 +3118,12 @@ __forceinline__ __device__ void combine_RED_intra_warp(
                 if (cur_tokid >= meta.csize) {
                     break;
                 }
-                // Skip dst tokens this LSA team doesn't need.
-                if (!*(reinterpret_cast<bool*>(&routing_data) + token_in_load)) {
+                // Skip dst tokens this LSA team doesn't need. A dropped one keeps its slot.
+                const bool routed = *(reinterpret_cast<bool*>(&routing_data_wo_drop) + token_in_load);
+                if (!routed) {
                     continue;
                 }
+                const bool owed = *(reinterpret_cast<bool*>(&routing_data) + token_in_load);
 
                 float2 acc_token_fp32[ACC_ELEM_PER_THRD];
                 // acc_prob storage instantiated only in backward specializations.
@@ -3106,20 +3135,31 @@ __forceinline__ __device__ void combine_RED_intra_warp(
                     acc_prob_ptr = acc_prob_storage.data;
                 }
 
-                combine_reduce_dst_token<
-                    RED_GROUP,
-                    STAGES_G2S,
-                    BACKWARD_COMBINE,
-                    HIDDEN_DIM,
-                    kTokenDtype,
-                    kCombineRecipe>(
-                    smem_buffer_ptr,
-                    token_stage,
-                    token_producer_parity,
-                    acc_token_fp32,
-                    acc_prob_ptr,
-                    prob_vec_per_thread,
-                    prob_dim);
+                // owed alone decides this; the OVERFLOW_DROP conjunct is only there so the
+                // non-drop build folds the branch away, since owed is always true here then.
+                // A routed-but-dropped token still gets a zero row stored and sent: the NVLink
+                // fanout never combined it, because that rank's recv buffer overflowed. The G2S
+                // producer gates on the cleared map too, so it has no ring stage and the
+                // zero-fill must not consume one.
+                if (!OVERFLOW_DROP || owed) {
+                    combine_reduce_dst_token<
+                        RED_GROUP,
+                        STAGES_G2S,
+                        BACKWARD_COMBINE,
+                        HIDDEN_DIM,
+                        kTokenDtype,
+                        kCombineRecipe>(
+                        smem_buffer_ptr,
+                        token_stage,
+                        token_producer_parity,
+                        acc_token_fp32,
+                        acc_prob_ptr,
+                        prob_vec_per_thread,
+                        prob_dim);
+                } else {
+                    combine_zero_acc<RED_GROUP, BACKWARD_COMBINE, HIDDEN_DIM, ACC_ELEM_PER_THRD>(
+                        acc_token_fp32, acc_prob_ptr, prob_vec_per_thread);
+                }
 
                 combine_store_reduced_token<
                     RED_GROUP,
@@ -3137,8 +3177,8 @@ __forceinline__ __device__ void combine_RED_intra_warp(
                     prob_vec_per_thread,
                     prob_dim,
                     red_token_base,
-                    red_prob_base,
-                    cur_tokid);
+                    packed_slot);
+                packed_slot++;
 
                 additional_in_flight_s2g += 1;
                 streaming_pending++;
@@ -3189,8 +3229,6 @@ __forceinline__ __device__ void combine_n2n_put_active_tokens(
     ncclGin& net,
     ncclTeam rail,
     int lteam_id,
-    ncclWindow_t nccl_token_window,
-    ncclWindow_t nccl_prob_window,
     ncclWindow_t nccl_internal_window,
     const struct combine_memory_region_info_t* smem_mr_info_ptr,
     const bool* rdma_to_attn_map,
@@ -3204,57 +3242,36 @@ __forceinline__ __device__ void combine_n2n_put_active_tokens(
     uint32_t& cumulative_sent) {
     int batch_start_in_chunk = -1;
     int batch_count = 0;
+    int token_idx_in_packed_chunk = 0;
     for (int token_idx_in_chunk = 0; token_idx_in_chunk < token_range; ++token_idx_in_chunk) {
         bool need_write = rdma_to_attn_map[token_idx_in_chunk + chunk_base_token_idx];
         bool is_last = (token_idx_in_chunk == token_range - 1);
         if (need_write) {
-            if (batch_count == 0) batch_start_in_chunk = token_idx_in_chunk;
+            if (batch_count == 0) batch_start_in_chunk = token_idx_in_packed_chunk;
             batch_count++;
+            token_idx_in_packed_chunk++;
         }
-        bool should_flush = batch_count > 0 && (!need_write || is_last || batch_count >= MAX_BATCH);
+        bool should_flush = batch_count > 0 && (is_last || batch_count >= MAX_BATCH);
         if (should_flush) {
             if constexpr (STREAMING) {
                 while (*streaming_counter < (cumulative_sent + batch_count)) {
                 }
             }
             int batch_start_token = batch_start_in_chunk + chunk_first_token;
-            size_t token_src_offset =
-                smem_mr_info_ptr->combine_red_token_offset +
-                (rdma_tile_id * MAX_TOKENS_PER_RANK + batch_start_token) * TOKEN_BYTES;
-            size_t token_dst_offset =
-                smem_mr_info_ptr->combine_g2s_token_offset +
-                (rank_in_remote * MAX_TOKENS_PER_RANK + batch_start_token) * TOKEN_BYTES;
+            const size_t slot = ::nccl_ep::ht_packed::slot_bytes(TOKEN_BYTES, BACKWARD_COMBINE, prob_dim);
             net.put(
                 rail,
                 lteam_id,
                 nccl_internal_window,
-                token_dst_offset,
-                nccl_token_window,
-                token_src_offset,
-                batch_count * TOKEN_BYTES,
+                smem_mr_info_ptr->combine_g2s_token_offset +
+                    (rank_in_remote * MAX_TOKENS_PER_RANK + batch_start_token) * slot,
+                nccl_internal_window,
+                smem_mr_info_ptr->combine_red_token_offset +
+                    (rdma_tile_id * MAX_TOKENS_PER_RANK + batch_start_token) * slot,
+                batch_count * slot,
                 ncclGin_None{},
                 ncclGin_None{},
                 ncclCoopThread());
-
-            if constexpr (BACKWARD_COMBINE) {
-                size_t prob_src_offset =
-                    smem_mr_info_ptr->combine_red_prob_offset +
-                    (rdma_tile_id * MAX_TOKENS_PER_RANK + batch_start_token) * prob_dim * sizeof(float);
-                size_t prob_dst_offset =
-                    smem_mr_info_ptr->combine_g2s_prob_offset +
-                    (rank_in_remote * MAX_TOKENS_PER_RANK + batch_start_token) * prob_dim * sizeof(float);
-                net.put(
-                    rail,
-                    lteam_id,
-                    nccl_internal_window,
-                    prob_dst_offset,
-                    nccl_prob_window,
-                    prob_src_offset,
-                    batch_count * prob_dim * sizeof(float),
-                    ncclGin_None{},
-                    ncclGin_None{},
-                    ncclCoopThread());
-            }
 
             if constexpr (STREAMING) {
                 cumulative_sent += batch_count;
@@ -3304,10 +3321,12 @@ template <
     bool BACKWARD_COMBINE,
     int HIDDEN_DIM,
     ncclDataType_t kTokenDtype,
-    ncclEpCombQuant_t kCombineRecipe>
+    ncclEpCombQuant_t kCombineRecipe,
+    bool OVERFLOW_DROP>
 __forceinline__ __device__ void combine_N2N_inter_warp(
     // INPUT
     const bool* rdma_to_attn_map,
+    const bool* rdma_to_attn_map_wo_drop,
     const struct combine_memory_region_info_t* mr_info,
     // SCRATCH
     SMEM_TYPE* smem_buffer_ptr,
@@ -3376,6 +3395,9 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
         ncclTeam rail = ncclTeamRail(*dcomm);
         int rdma_tile_id = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
         int chunk_base_token_idx = lteam_id * rdma_per_lsa_sz + chunk_id * TOKENS_PER_CHUNK;
+        // Put every token the receiver counts: a reserved slot holds real zeros, and skipping
+        // it would leave the receiver reading stale memory.
+        const bool* put_gate_map = OVERFLOW_DROP ? rdma_to_attn_map_wo_drop : rdma_to_attn_map;
         // Residue chunks carry no tokens; real chunks use the scheduled size (tail = remainder).
         const int token_range = is_residue ? 0 : meta.csize;
         constexpr int STREAMING_BATCH = NCCL_EP_HT_COMBINE_RDMA_STREAMING_BATCH;
@@ -3393,8 +3415,8 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
             if (GIN_GROUP::thread_rank() == 0) {
                 combine_n2n_put_active_tokens</*STREAMING=*/true, BACKWARD_COMBINE, STREAMING_BATCH,
                                               MAX_TOKENS_PER_RANK, token_bytes>(
-                    net, rail, lteam_id, nccl_token_window, nccl_prob_window, nccl_internal_window, smem_mr_info_ptr,
-                    rdma_to_attn_map, chunk_base_token_idx, chunk_id * TOKENS_PER_CHUNK, token_range,
+                    net, rail, lteam_id, nccl_internal_window, smem_mr_info_ptr,
+                    put_gate_map, chunk_base_token_idx, chunk_id * TOKENS_PER_CHUNK, token_range,
                     rdma_tile_id, rank_in_remote, wire_prob_dim,
                     (volatile uint32_t*)smem_buffer_ptr->rdma_streaming_counter, cumulative_sent);
             }
@@ -3432,8 +3454,8 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
                 constexpr int max_batch = NCCL_EP_HT_DISPATCH_RDMA_BATCH_SIZE;
                 combine_n2n_put_active_tokens</*STREAMING=*/false, BACKWARD_COMBINE, max_batch,
                                               MAX_TOKENS_PER_RANK, token_bytes>(
-                    net, rail, lteam_id, nccl_token_window, nccl_prob_window, nccl_internal_window, smem_mr_info_ptr,
-                    rdma_to_attn_map, chunk_base_token_idx, chunk_id * TOKENS_PER_CHUNK, token_range,
+                    net, rail, lteam_id, nccl_internal_window, smem_mr_info_ptr,
+                    put_gate_map, chunk_base_token_idx, chunk_id * TOKENS_PER_CHUNK, token_range,
                     rdma_tile_id, rank_in_remote, wire_prob_dim,
                     nullptr, cumulative_sent);
             }
@@ -3457,6 +3479,13 @@ struct rdma_lane_t {
     int tile_id;
 };
 
+template <int LSA_TEAMS>
+__forceinline__ __device__ int combine_g2s_rdma_tile(int lane_id, int my_lteam) {
+    const int n = lane_id + 1;
+    const int lteam_id = (my_lteam + LSA_TEAMS - n) % LSA_TEAMS;
+    return lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
+}
+
 // Map lane_id -> remote LSA team (lane 0 -> my_lteam-1, wrapping past self) and read its routing bit.
 template <int LSA_TEAMS>
 __forceinline__ __device__ rdma_lane_t
@@ -3465,8 +3494,7 @@ combine_g2s_resolve_rdma_lane(int lane_id, int my_lteam, const bool* attn_to_rdm
     if (n >= LSA_TEAMS) {
         return rdma_lane_t{false, 0};
     }
-    const int lteam_id = (my_lteam + LSA_TEAMS - n) % LSA_TEAMS;
-    const int tile_id = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
+    const int tile_id = combine_g2s_rdma_tile<LSA_TEAMS>(lane_id, my_lteam);
     return rdma_lane_t{attn_to_rdma_addr[tile_id], tile_id};
 }
 
@@ -3482,7 +3510,6 @@ template <bool BACKWARD_COMBINE, int HIDDEN_DIM, ncclDataType_t kTokenDtype,
           ncclEpCombQuant_t kCombineRecipe>
 __forceinline__ __device__ g2s_src_t combine_g2s_resolve_rdma_source(
     const uint16_t* combine_gin_G2S_tokens,
-    const float* combine_gin_G2S_prob,
     int tile_id,
     int flat_token_id,
     int wire_prob_dim) {
@@ -3491,13 +3518,13 @@ __forceinline__ __device__ g2s_src_t combine_g2s_resolve_rdma_source(
     // HIDDEN_DIM * size_u16<kTokenDtype>() form for every unquantized case.
     const int rdma_wire_stride =
         nccl_ep::combine_recipe_traits<kCombineRecipe>::template rdma_bytes<kTokenDtype>(HIDDEN_DIM);
-    const uint16_t* token_src = reinterpret_cast<const uint16_t*>(
-        reinterpret_cast<const uint8_t*>(combine_gin_G2S_tokens) +
-        static_cast<size_t>(rdma_row) * rdma_wire_stride);
+    const uint8_t* slot = reinterpret_cast<const uint8_t*>(combine_gin_G2S_tokens) +
+                          static_cast<size_t>(rdma_row) *
+                              ::nccl_ep::ht_packed::slot_bytes(rdma_wire_stride, BACKWARD_COMBINE, wire_prob_dim);
+    const uint16_t* token_src = reinterpret_cast<const uint16_t*>(slot);
     const float* prob_src = nullptr;
     if constexpr (BACKWARD_COMBINE) {
-        // Row stride must match the sender's put stride (wire width: dense or compact K4).
-        prob_src = combine_gin_G2S_prob + static_cast<size_t>(rdma_row) * wire_prob_dim;
+        prob_src = reinterpret_cast<const float*>(slot + rdma_wire_stride);
     }
     return g2s_src_t{token_src, prob_src};
 }
@@ -3519,7 +3546,6 @@ __forceinline__ __device__ void issue_rdma_g2s_row(
     SMEM_TYPE* smem_buffer_ptr,
     const bool* attn_to_rdma_addr,
     const uint16_t* combine_gin_G2S_tokens,
-    const float* combine_gin_G2S_prob,
     int flat_token_id,
     int& global_offset,
     int starting_G2S_index,
@@ -3556,7 +3582,6 @@ __forceinline__ __device__ void issue_rdma_g2s_row(
                 combine_g2s_resolve_rdma_source<BACKWARD_COMBINE, HIDDEN_DIM, kTokenDtype,
                                                 MAX_TOKENS_PER_RANK, kCombineRecipe>(
                     combine_gin_G2S_tokens,
-                    combine_gin_G2S_prob,
                     lane.tile_id,
                     flat_token_id,
                     wire_prob_dim);
@@ -3606,7 +3631,6 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     const void* const* remote_expert_input_token,
     float* const* remote_expert_input_prob,
     const uint16_t* combine_gin_G2S_tokens,
-    const float* combine_gin_G2S_prob,
     // OUTPUT
     uint64_t* gin_G2S_flags,
     SMEM_TYPE* smem_buffer_ptr,
@@ -3712,6 +3736,21 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
             }
         }
 
+        // Layout rule and a worked example: build_chunk_mask in ht/ht_combine_packed.cuh.
+        nccl_ep::ht_packed::chunk_mask_t<TOKENS_PER_CHUNK> packed_mask{};
+        if constexpr (LSA_TEAMS > 1) {
+            if (blockIdx.x < (unsigned)token_groups_for_chunk) {
+                const int packed_col =
+                    (lane_id + 1 < LSA_TEAMS) ? combine_g2s_rdma_tile<LSA_TEAMS>(lane_id, my_lteam) : -1;
+                // packed_mask: one bitmap per lane, LSA_TEAMS - 1 live across the warp, one per
+                // remote team. Bit t set = token t of this chunk is valid here and needs a slot.
+                // 0xB5 = 1011 0101, and bit 0 is token 0 so it reads right to left: tokens
+                // 0, 2, 4, 5, 7, which take slots 0, 1, 2, 3, 4.
+                packed_mask = nccl_ep::ht_packed::build_chunk_mask<TOKENS_PER_CHUNK>(
+                    attn_to_rdma_map_base, LSA_TEAMS - 1, LSA_TEAMS - 1, packed_col, csize);
+            }
+        }
+
         for (int group_idx = blockIdx.x; group_idx < token_groups_for_chunk; group_idx += NBLOCKS) {
             for (int token_in_group = G2S_GROUP::warp_rank(); token_in_group < TOKENS_PER_GROUP;
                  token_in_group += G2S_GROUP::warp_size()) {
@@ -3753,8 +3792,11 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
                     // with no RDMA leg (MXFP8) defines no rdma_bytes to call.
                     const uint32_t rdma_token_bytes =
                         (uint32_t)Recipe::template rdma_bytes<kTokenDtype>(HIDDEN_DIM);
+                    // The sender's compacted slot for this lane's sender, which differs per lane.
+                    // issue_rdma_g2s_row uses it only inside its own lane's address math, so a
+                    // divergent value is safe.
                     const int flat_token_id =
-                        cidx * TOKENS_PER_CHUNK + group_idx * TOKENS_PER_GROUP + token_in_group;
+                        cidx * TOKENS_PER_CHUNK + nccl_ep::ht_packed::prefix<TOKENS_PER_CHUNK>(packed_mask, cur_tokid);
                     const bool* attn_to_rdma_addr =
                         attn_to_rdma_map_base + (group_idx * TOKENS_PER_GROUP + token_in_group) * (LSA_TEAMS - 1);
                     issue_rdma_g2s_row<
@@ -3767,7 +3809,6 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
                         smem_buffer_ptr,
                         attn_to_rdma_addr,
                         combine_gin_G2S_tokens,
-                        combine_gin_G2S_prob,
                         flat_token_id,
                         global_offset,
                         starting_G2S_index,
@@ -5496,12 +5537,15 @@ template < // This type represent intra-LSA reduction warp group.
   // Output dtype, resolved at compile time (JIT literal) so the per-element
   // reduction branches fold away.
   ncclDataType_t kTokenDtype,
-  ncclEpCombQuant_t kCombineRecipe>
+  ncclEpCombQuant_t kCombineRecipe,
+  // NCCL_EP_OVERFLOW_DROP: reserve and zero-fill a fully dropped token's slot.
+  bool OVERFLOW_DROP>
 // Each CUDA block of combine kernel has named warp groups:
 // intra/inter reduction, intra/inter G2S, and cross-LSA-team N2N RDMA. Group sizes are
 // set by the HT combine warp-count constants and the selected pipeline count.
 __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t<LSA_TEAM_SZ>& param,
-                                                    uint8_t* smem_bytes) {
+                                                    uint8_t* smem_bytes,
+                                                    const bool* rdma_to_attn_map_wo_drop) {
     const int my_lteam = param.lsa_team;
     // Compile-time check (only enforce for multi-LSA-team layout).
     if constexpr (LSA_TEAMS != 1) {
@@ -5643,13 +5687,13 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             combine_RED_intra_warp<LSA_RED_GROUP, cur_smem_t, STAGES_G2S, STAGES_S2G, \
                                    TOKENS_PER_CHUNK, MAX_TOKENS_PER_RANK, LSA_TEAMS, NBLOCKS, \
                                    BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SZ, \
-                                   kTokenDtype, kCombineRecipe>
+                                   kTokenDtype, kCombineRecipe, OVERFLOW_DROP>
             COMBINE_RED_INTRA_TEMPLATE(
                 // INPUT
                 param.rdma_to_attn_map,
+                rdma_to_attn_map_wo_drop,
                 // OUTPUT
                 param.combine_gin_RED_tokens,
-                param.combine_gin_RED_prob,
                 // CONFIG
                 my_lteam,
                 param.num_of_tokens_per_rank,
@@ -5718,7 +5762,6 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             reinterpret_cast<const void* const*>(param.expert_input_token),
             param.expert_input_prob,
             param.combine_gin_G2S_tokens,
-            param.combine_gin_G2S_prob,
             // OUTPUT
             param.gin_G2S_flags,
             smem_buffer_ptr,
@@ -5743,10 +5786,11 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
 #define COMBINE_N2N_INTER_TEMPLATE \
             combine_N2N_inter_warp<GIN_GROUP, cur_smem_t, TOKENS_PER_CHUNK, \
                                    MAX_TOKENS_PER_RANK, LSA_TEAMS, NBLOCKS, LSA_TEAM_SZ, BACKWARD_COMBINE, \
-                                   HIDDEN_DIM, kTokenDtype, kCombineRecipe>
+                                   HIDDEN_DIM, kTokenDtype, kCombineRecipe, OVERFLOW_DROP>
             COMBINE_N2N_INTER_TEMPLATE(
                 // INPUT
                 param.rdma_to_attn_map,
+                rdma_to_attn_map_wo_drop,
                 &param.mr_info,
                 // SCRATCH
                 smem_buffer_ptr,

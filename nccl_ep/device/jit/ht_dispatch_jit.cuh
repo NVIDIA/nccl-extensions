@@ -235,6 +235,10 @@ inline ncclResult_t launch_dispatch(
     variant.num_blocks = config.num_of_blocks;
     variant.block_dim = L.block_dim;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
+    ::ht_ep::model_config_t static_smem_model{};
+    static_smem_model.num_of_experts_per_rank = experts_per_rank;
+    static_smem_model.ranks_per_lsa_team = lsa_team_size;
+    variant.expected_static_smem_bytes = static_cast<int>(::ht_ep::calc_disp_static_smem(static_smem_model));
     variant.nucs = env != nullptr && nccl_ep_env_flag_on(env->nucs);
 
     // Dump the effective kernel parameters once per distinct variant, just before

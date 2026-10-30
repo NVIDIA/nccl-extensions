@@ -84,12 +84,16 @@ inline std::string combine_jit_source(
     int hidden_dim,
     ncclDataType_t token_dtype,
     ncclEpCombQuant_t recipe,
-    HtKernelImpl impl) {
+    HtKernelImpl impl,
+    bool overflow_drop) {
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
     const char* recipe_literal = ::nccl_ep::jit::combine_recipe_literal(recipe);
     const char* const impl_header = ht_impl_header(impl);
     const char* const ns = ht_impl_namespace(impl);
+    const bool unordered = impl == HtKernelImpl::kUnordered;
+    const std::string drop_arg =
+        unordered ? ",\n      " + std::string(::nccl_ep::jit::bool_literal(overflow_drop)) : std::string();
     std::ostringstream src;
     src << "#include \"" << impl_header << "\"\n"
         << "\n"
@@ -107,7 +111,8 @@ inline std::string combine_jit_source(
         << "extern \"C\" __launch_bounds__(LSA_RED_GROUP::size() + CROSS_LSA_RED_GROUP::size() + "
            "LSA_G2S_GROUP::size() + CROSS_LSA_G2S_GROUP::size() + GIN_GROUP::size(), 1)\n"
         << "__global__ void " << kCombineJitEntryName << "(\n"
-        << "    const __grid_constant__ " << ns << "::combine_kernel_param_t<" << lsa_team_size << "> param) {\n"
+        << "    const __grid_constant__ " << ns << "::combine_kernel_param_t<" << lsa_team_size << "> param"
+        << (unordered ? ",\n    const bool* rdma_to_attn_map_wo_drop" : "") << ") {\n"
         << "  extern __shared__ uint8_t smem_bytes[];\n"
         << "  " << ns << "::combine_kernel_impl<\n"
         << "      LSA_RED_GROUP,\n"
@@ -128,7 +133,8 @@ inline std::string combine_jit_source(
         << "      " << lsa_team_size << ",\n"
         << "      " << layout_literal << ",\n"
         << "      " << token_dtype_literal << ",\n"
-        << "      " << recipe_literal << ">(param, smem_bytes);\n"
+        << "      " << recipe_literal << drop_arg << ">(param, smem_bytes"
+        << (unordered ? ", rdma_to_attn_map_wo_drop" : "") << ");\n"
         << "}\n";
     return src.str();
 }
@@ -141,6 +147,7 @@ inline ncclResult_t launch_combine(
     ncclEpLayout_t layout,
     int hidden_dim,
     const ncclEpEnvConfig* env,  // for rank-0-gated verbose param dump; may be null
+    bool overflow_drop,
     void* param, // ptr to the packed kernel arguments buffer
     size_t param_size, // size of packed kernel arguments buffer
     int dynamic_smem_bytes,
@@ -174,7 +181,8 @@ inline ncclResult_t launch_combine(
              << ::nccl_ep::jit::layout_name_tag(layout)
              << ::nccl_ep::jit::token_dtype_name_tag(token_dtype)
              << ::nccl_ep::jit::combine_recipe_name_tag(recipe)
-             << (unordered_impl ? "_unordered" : "");
+             << (unordered_impl ? "_unordered" : "")
+             << (unordered_impl && overflow_drop ? "_drop" : "");
         return name.str();
     }();
     const std::string source = combine_jit_source(
@@ -192,7 +200,8 @@ inline ncclResult_t launch_combine(
         hidden_dim,
         token_dtype,
         recipe,
-        impl);
+        impl,
+        overflow_drop);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = unordered_impl ? "ht_combine_unordered" : "ht_combine";

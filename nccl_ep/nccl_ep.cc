@@ -1884,14 +1884,19 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // dispatch/combine kernels must use the same stride and chunk size.
     const int ht_max_tokens = ep_group->ht_aligned_max_tokens;
     const int ht_combine_tokens_per_chunk = ep_group->ht_combine_tokens_per_chunk;
+    const size_t combine_rows = static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1);
+    const size_t combine_prob_row_bytes = static_cast<size_t>(ep_group->num_local_experts * lsa_team_size) * sizeof(float);
+    // The unordered kernel packs each token row with its prob row into one slot, so it has no
+    // separate prob region.
+    const bool combine_packed_slots =
+        nccl_ep::ht::ht_select_kernel_impl(&ep_group->env) == nccl_ep::ht::HtKernelImpl::kUnordered;
     size_t combine_gin_RED_tokens_sz = align_size(
-        static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * ep_group->config.max_token_bytes,
+        combine_rows * (ep_group->config.max_token_bytes +
+                        (combine_packed_slots ? align_size(combine_prob_row_bytes, 16) : 0)),
         GIN_ALIGNMENT);
     size_t combine_gin_G2S_tokens_sz = combine_gin_RED_tokens_sz;
-    size_t combine_gin_RED_prob_sz = align_size(
-        static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * (ep_group->num_local_experts * lsa_team_size) *
-            sizeof(float),
-        GIN_ALIGNMENT);
+    size_t combine_gin_RED_prob_sz =
+        combine_packed_slots ? 0 : align_size(combine_rows * combine_prob_row_bytes, GIN_ALIGNMENT);
     size_t combine_gin_G2S_prob_sz = combine_gin_RED_prob_sz;
 
     int max_chunks_per_rank = nccl_ep::ceil_div(ht_max_tokens, ht_combine_tokens_per_chunk);
@@ -3338,6 +3343,12 @@ struct ncclEpHandle {
             //   - rdma_to_attn_map: inbound - "which remote tokens do I receive?" [src_node, token]
             bool* rdma_to_attn_map;
 
+            // Same map and layout, written at the same time, but never drop-cleared: the
+            // scan removes tokens past the recv capacity from rdma_to_attn_map, and combine
+            // needs the pre-drop set to number its packed RDMA slots the way the receiver
+            // does. Null unless overflow_policy is NCCL_EP_OVERFLOW_DROP.
+            bool* rdma_to_attn_map_wo_drop;
+
             // Attention-to-RDMA map: boolean mask indicating which local tokens need to be
             // SENT via RDMA (cross-LSA-team) to each remote LSA team.
             // Only allocated when num_lsa_teams > 1.
@@ -3694,7 +3705,7 @@ static size_t ll_handle_mem_size(ncclEpGroup_t ep_group, int num_topk) {
 // Single source of truth shared by ht_handle_mem_size() and ht_init_handle().
 struct HtBlockLayout {
     // global_routing_map and scan-only scratch are group-scoped; not part of handle_mem.
-    size_t sz_r2a, sz_a2r, sz_ler, sz_ntfe, sz_wire_pos;
+    size_t sz_r2a, sz_r2a_wo_drop, sz_a2r, sz_ler, sz_ntfe, sz_wire_pos;
     size_t sz_s2d, sz_rank_mask, sz_scan_tmp;
     size_t sz_topk_idx; // cached topk_idx (uint16 under pull-push, int32 expert ids elsewhere)
     size_t sz_pec_active; // EM only
@@ -3737,6 +3748,12 @@ struct HtBlockLayout {
 
         HtBlockLayout L = {};
         L.sz_r2a = align256(static_cast<size_t>(rdma_team_size) * padded_max_tokens * sizeof(bool));
+        // Pristine pre-drop copy of r2a; only the unordered internode combine reads it under DROP.
+        L.sz_r2a_wo_drop =
+            (ep_group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP && is_internode_available(ep_group) &&
+             nccl_ep::ht::ht_select_kernel_impl(&ep_group->env) == nccl_ep::ht::HtKernelImpl::kUnordered)
+                ? L.sz_r2a
+                : 0;
         L.sz_a2r =
             (rdma_team_size > 1) ? align256(static_cast<size_t>(max_tokens) * (rdma_team_size - 1) * sizeof(bool)) : 0;
         // LERM: per received token, which local experts it routes to. Count mode packs it as a
@@ -3867,7 +3884,7 @@ struct HtBlockLayout {
                 ? align256(static_cast<size_t>(ep_group->nRanks) *
                            (ep_group->nRanks + num_experts) * sizeof(int32_t))
                 : 0;
-        L.zero_region = L.sz_r2a + L.sz_a2r + L.sz_ler + L.sz_ntfe;
+        L.zero_region = L.sz_r2a + L.sz_r2a_wo_drop + L.sz_a2r + L.sz_ler + L.sz_ntfe;
         L.no_memset_region = L.sz_topk_idx + L.sz_pec_active + L.sz_eto +
                              L.sz_emuf_group_buf + L.sz_emuf_group_count + L.sz_flat2em_slot_map +
                              L.sz_count_scratch + L.sz_recv_slot_to_src +
@@ -4238,6 +4255,9 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     // global_routing_map: read directly from ep_group->ht_buffers (not duplicated on the handle).
     handle->ht.rdma_to_attn_map = reinterpret_cast<bool*>(ptr + offset);
     offset += L.sz_r2a;
+    handle->ht.rdma_to_attn_map_wo_drop =
+        (L.sz_r2a_wo_drop > 0) ? reinterpret_cast<bool*>(ptr + offset) : nullptr;
+    offset += L.sz_r2a_wo_drop;
     handle->ht.attn_to_rdma_map = is_internode_available(ep_group) ? reinterpret_cast<bool*>(ptr + offset) : nullptr;
     offset += L.sz_a2r;
     handle->ht.local_expert_routing_map = L.sz_ler > 0 ? reinterpret_cast<bool*>(ptr + offset) : nullptr;
@@ -5123,6 +5143,7 @@ ncclResult_t ncclEpUpdateHandle(
             // S2D is retained for flat DROP combine; pull does not need LERM.
             handle->ht.sparse_to_dense_map,
             handle->ht.rdma_to_attn_map,
+            handle->ht.rdma_to_attn_map_wo_drop,
             handle->ht.attn_to_rdma_map,
             handle->ht.token_rank_mask,
             handle->ht.num_tokens_for_experts,
@@ -7879,6 +7900,7 @@ ncclResult_t ncclEpCombine(
                 (params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? (params.s2d_inner_dim == handle->num_topk) :
                                                                  (params.s2d_inner_dim == group->lsa_team_size));
             params.rdma_to_attn_map = handle->ht.rdma_to_attn_map;
+            params.rdma_to_attn_map_wo_drop = handle->ht.rdma_to_attn_map_wo_drop;
             params.attn_to_rdma_map = handle->ht.attn_to_rdma_map;
             params.local_expert_routing_map = handle->ht.local_expert_routing_map;
             // Always pass a valid device pointer — see dispatch path comment.
@@ -7892,10 +7914,13 @@ ncclResult_t ncclEpCombine(
             params.combine_barrier_offset = group->dispatch_num_sms;
             const ncclWindow_t combine_token_window =
                 !combine_x_uses_external_window ? x->win_hdl : group->gin_config.nccl_window;
+            // The unordered kernel always sends the packed slots it staged in the group buffer.
+            const bool combine_packed_slots =
+                nccl_ep::ht::ht_select_kernel_impl(&group->env) == nccl_ep::ht::HtKernelImpl::kUnordered;
             const size_t combine_token_offset =
                 is_lsa_only ? 0 :
-                                 (!combine_x_uses_external_window ? static_cast<size_t>(x->win_offset) :
-                                                                    group->gin_config.combine_red_token_offset);
+                (!combine_x_uses_external_window && !combine_packed_slots) ? static_cast<size_t>(x->win_offset) :
+                                                                             group->gin_config.combine_red_token_offset;
             // Pass device communicators and windows
             // Always pass the devComm (single-LSA-team too): the HT LSA sync-guard now uses the
             // NCCL LSA barrier (needs comm.lsaBarrier). RDMA paths stay if-constexpr-gated.

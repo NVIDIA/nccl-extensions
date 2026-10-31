@@ -46,7 +46,7 @@ python -m pip install "nccl-extensions[cu13]"
 ```
 
 The CUDA extras are mutually exclusive. Each extra installs the corresponding
-CUDA runtime dependencies and **exactly NCCL 2.30.7**. Other NCCL versions have
+CUDA runtime dependencies and **exactly NCCL 2.32.3**. Other NCCL versions have
 not yet been validated and are not guaranteed to work.
 
 NCCL EP compiles kernels at runtime. Its CUDA toolkit, including `nvcc` and

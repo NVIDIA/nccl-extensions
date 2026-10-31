@@ -1370,7 +1370,7 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
         extra_tensors.append(mask_status)
 
         def query_mask() -> np.ndarray:
-            _ep_bindings.mask_query(ep_group.ptr, mask_status.data, int(stream.handle))
+            ep_group.mask_query(mask_status.tensor, stream=stream)
             result = np.empty(n_ranks, dtype=np.int32)
             d2h(result, mask_status.data, stream)
             stream.sync()
@@ -1380,28 +1380,52 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
             raise AssertionError(f"rank {my_rank}: initial active mask is not all-active")
         requested_mask = np.ones(n_ranks, dtype=np.int32)
         requested_mask[-1] = 0
-        _ep_bindings.mask_update(
-            ep_group.ptr, requested_mask.ctypes.data, int(stream.handle),
-        )
+        ep_group.mask_update(requested_mask, stream=stream)
         stream.sync()
         if not np.array_equal(query_mask(), requested_mask):
             raise AssertionError(f"rank {my_rank}: mask update/query mismatch")
-        if _ep_bindings.get_async_error(ep_group.ptr) != 0:
+        if ep_group.get_async_error() != 0:
             raise AssertionError("mask update unexpectedly raised the async timeout flag")
         all_active = np.ones(n_ranks, dtype=np.int32)
-        _ep_bindings.mask_update(
-            ep_group.ptr, all_active.ctypes.data, int(stream.handle),
-        )
+        ep_group.mask_update(all_active, stream=stream)
         stream.sync()
         if not np.array_equal(query_mask(), all_active):
             raise AssertionError(f"rank {my_rank}: mask restore update failed")
-        _ep_bindings.mask_clean(ep_group.ptr, int(stream.handle))
-        _ep_bindings.error_clear(ep_group.ptr)
+        ep_group.mask_clean(stream=stream)
         stream.sync()
+        ep_group.error_clear()
         if not np.array_equal(query_mask(), np.ones(n_ranks, dtype=np.int32)):
             raise AssertionError(f"rank {my_rank}: mask clean did not restore all ranks")
-        if _ep_bindings.get_async_error(ep_group.ptr) != 0:
+        if ep_group.get_async_error() != 0:
             raise AssertionError("async error flag was not clear after mask recovery")
+
+        # Capture the query once, then replay against two different masks.
+        err, = cudart.cudaStreamBeginCapture(
+            int(stream.handle), cudart.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal,
+        )
+        _check_cuda(err)
+        ep_group.mask_query(mask_status.tensor, stream=stream)
+        err, graph = cudart.cudaStreamEndCapture(int(stream.handle))
+        _check_cuda(err)
+        try:
+            err, graph_exec = cudart.cudaGraphInstantiateWithFlags(graph, 0)
+            _check_cuda(err)
+            try:
+                for expected_mask in (requested_mask, all_active):
+                    ep_group.mask_update(expected_mask, stream=stream)
+                    err, = cudart.cudaGraphLaunch(graph_exec, int(stream.handle))
+                    _check_cuda(err)
+                    result = np.empty(n_ranks, dtype=np.int32)
+                    d2h(result, mask_status.data, stream)
+                    stream.sync()
+                    if not np.array_equal(result, expected_mask):
+                        raise AssertionError(f"rank {my_rank}: captured mask query mismatch")
+            finally:
+                err, = cudart.cudaGraphExecDestroy(graph_exec)
+                _check_cuda(err)
+        finally:
+            err, = cudart.cudaGraphDestroy(graph)
+            _check_cuda(err)
         print(f"Rank {my_rank}: active-mask API lifecycle PASSED")
 
     # ===================================================================

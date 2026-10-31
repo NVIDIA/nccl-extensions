@@ -1730,7 +1730,9 @@ ncclResult_t dispatch_impl(
             return ncclInvalidArgument;
         }
 
-        const int max_smem = max_dynamic_smem;
+        // The kernel's static __shared__ comes out of the same device limit.
+        const int static_smem = static_cast<int>(::ht_ep::calc_disp_static_smem(d_model));
+        const int max_smem = std::max(0, max_dynamic_smem - static_smem);
         // Fit within the SMEM budget. If the requested in_flight_s2g admits no
         // fit (its min-stages floor is too tall), reduce it toward 1 -- lowering
         // in_flight_s2g lowers the required stages/pipeline. in_flight_s2g is
@@ -1757,8 +1759,8 @@ ncclResult_t dispatch_impl(
             std::fprintf(
                 stderr,
                 "[nccl_ep] dispatch shared memory cannot be fit to the device limit: requested "
-                "stages=%d, pipelines=%d need %zu bytes, limit=%d bytes%s.\n",
-                requested_stages, requested_pipelines, requested_smem, max_smem,
+                "stages=%d, pipelines=%d need %zu bytes, limit=%d bytes (%d reserved for static __shared__)%s.\n",
+                requested_stages, requested_pipelines, requested_smem, max_smem, static_smem,
                 (stages_from_env || pipelines_from_env) ? " (env-pinned values cannot be reduced)" : "");
             return ncclInvalidArgument;
         }

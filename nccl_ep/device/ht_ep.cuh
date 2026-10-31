@@ -764,6 +764,19 @@ inline disp_smem_cost_t calc_disp_smem_cost(
     }
 }
 
+// Static __shared__ of the dispatch kernel; callers subtract it from the dynamic budget.
+// Keep in sync with s_rank_base, s_s2d_chunks_ready, s_pub_off and s_raw_cnt. Always counts
+// 2 MAP warps: over-reserving costs ~1 KB, an under-count fails at launch.
+inline size_t calc_disp_static_smem(const model_config_t& model) {
+    constexpr size_t kMapWarps = 2;
+    const size_t mask_words = static_cast<size_t>(nccl_ep::bit_words(model.num_of_experts_per_rank));
+    const auto align16 = [](size_t n) { return (n + 15) & ~static_cast<size_t>(15); };
+    return align16(kMapWarps * model.ranks_per_lsa_team * sizeof(int32_t)) +  // s_rank_base
+           align16(kMapWarps * sizeof(int)) +                                 // s_s2d_chunks_ready
+           align16((64 * mask_words + 1) * sizeof(int64_t)) +                 // s_pub_off
+           align16(64 * mask_words * sizeof(int32_t));                        // s_raw_cnt
+}
+
 // kTokenSize drives the per-stage token-buffer stride; everything else
 // (probabilities, mbarriers, scales) is element-width-invariant.
 template <ncclDataType_t kTokenDtype,
@@ -4883,6 +4896,7 @@ __device__ __forceinline__ void dispatch_push_map_publish_outputs(
         // EM per-expert zone publish (padded prefix offsets, counts, caller outputs). Flat has
         // no zones: its per-expert counts are recounted from the LERM after dispatch.
         if (!is_flat && (expert_token_offsets_out || caller_offsets || caller_counts)) {
+            // Static SMEM: update calc_disp_static_smem.
             __shared__ int64_t s_pub_off[64 * MASK_WORDS + 1];
             __shared__ int32_t s_raw_cnt[64 * MASK_WORDS];
             const int em_align = (em_alignment > 1) ? em_alignment : 1;
@@ -5022,6 +5036,7 @@ __device__ __forceinline__ void dispatch_push_map_warp(
     ctx.count_rows = count_rows;
     ctx.hit_word_offset = rank_slice.word_offset;
     ctx.hit_bit_shift = rank_slice.bit_shift;
+    // Static SMEM: update calc_disp_static_smem.
     __shared__ int32_t s_rank_base[NUM_MAP_WARPS][MAX_DST_RANKS];
 
     // Rank-base prefixes shared by the s2d builders and the LERM pass. All MAP warps
@@ -5238,6 +5253,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     // this counter before each chunk's s2d prefetch, so G2S/N2N start immediately after the head
     // barrier. One s2d unit counter per MAP warp (round-robin units; see dispatch_push_map_warp).
     constexpr int kMapWarps = (MAP_GROUP::size() / 32 > 1) ? MAP_GROUP::size() / 32 : 1;
+    // Static SMEM: update calc_disp_static_smem.
     __shared__ int s_s2d_chunks_ready[kMapWarps];
     if (param.dispatch_push_count.active && threadIdx.x < kMapWarps) s_s2d_chunks_ready[threadIdx.x] = 0;
 

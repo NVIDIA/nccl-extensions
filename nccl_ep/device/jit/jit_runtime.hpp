@@ -37,6 +37,8 @@ struct JitKernelVariant {
     int num_blocks = 0;
     int block_dim = 0;
     int dynamic_smem_bytes = 0;
+    // Host-side estimate of the kernel's static __shared__; -1 skips the check against the compiled value.
+    int expected_static_smem_bytes = -1;
     int min_sm = 90;
     std::string_view target_arch;
     // Optional launch attributes (default = off).

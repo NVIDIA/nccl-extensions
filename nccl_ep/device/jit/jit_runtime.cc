@@ -426,6 +426,43 @@ JitKernelStatus load_function(
     return JitKernelStatus::kLaunched;
 }
 
+// Compares the host's static-SMEM estimate (which the budget fit subtracts) with the compiled value.
+// Over the estimate is fatal: the dynamic budget would not fit. Any other mismatch is logged once.
+JitKernelStatus check_static_smem(
+    JitCache& cache,
+    const std::string& key,
+    CUfunction function,
+    const JitKernelVariant& variant,
+    const std::string& log_prefix,
+    std::string* error) {
+    if (variant.expected_static_smem_bytes < 0) {
+        return JitKernelStatus::kLaunched;
+    }
+    int actual = 0;
+    const CUresult rc = cuFuncGetAttribute(&actual, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function);
+    if (rc != CUDA_SUCCESS) {
+        if (error != nullptr) {
+            *error = cu_error_string(rc);
+        }
+        return JitKernelStatus::kAttributeFailed;
+    }
+    if (actual == variant.expected_static_smem_bytes) {
+        return JitKernelStatus::kLaunched;
+    }
+    const std::string detail = "static_smem expected=" + std::to_string(variant.expected_static_smem_bytes) +
+                               " actual=" + std::to_string(actual);
+    warn_once_jit_event(
+        cache, key + ":static_smem", variant,
+        log_prefix + " " + detail + " variant=" + std::string(variant.variant_name));
+    if (actual > variant.expected_static_smem_bytes) {
+        if (error != nullptr) {
+            *error = detail;
+        }
+        return JitKernelStatus::kAttributeFailed;
+    }
+    return JitKernelStatus::kLaunched;
+}
+
 JitKernelStatus configure_smem(CUfunction function, int dynamic_smem_bytes, std::string* error) {
     CUresult rc = cuFuncSetAttribute(function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, dynamic_smem_bytes);
     if (rc != CUDA_SUCCESS) {
@@ -849,6 +886,12 @@ JitKernelStatus load_and_launch_kernel(
             variant,
             log_prefix + " module_load=failed key=" + key + " variant=" + std::string(variant.variant_name) +
                 "; using static path");
+        return status;
+    }
+
+    status = check_static_smem(cache, key, function, variant, log_prefix, error);
+    if (status != JitKernelStatus::kLaunched) {
+        cache.mark_failed(key);
         return status;
     }
 

@@ -10,10 +10,12 @@ from __future__ import annotations
 from dataclasses import field
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from nccl._extensions._binding_helpers import binding_dataclass
 
 from nccl.core.cuda import get_stream_ptr
-from nccl.core.typing import NcclInvalid, NcclStreamSpec
+from nccl.core.typing import NcclDataType, NcclInvalid, NcclStreamSpec
 
 from nccl._extensions.bindings import nccl_ep as _ep_bindings
 from nccl.ep.allocator import AllocConfig
@@ -83,9 +85,9 @@ class GroupConfig:
             (LL mode only). When ``True``, a per-rank mask buffer is
             allocated; remote ranks that time out during dispatch or
             combine are skipped rather than tripping a GPU trap, and a
-            host-visible error flag is set. The mask and async-error
-            APIs that inspect it (``ncclEpMaskQuery`` and friends) are not
-            wrapped in Python. Default: ``False``.
+            host-visible error flag is set. Use :meth:`Group.mask_query`
+            and :meth:`Group.get_async_error` to inspect these states.
+            Default: ``False``.
         timeout_ns: GPU-side wait-loop timeout in nanoseconds. ``0``
             selects the library default (~100 s). Setting too low risks
             false positives. The ``NCCL_EP_TIMEOUT_MS`` env var
@@ -144,6 +146,7 @@ class Group:
 
     def __init__(self, ptr: int) -> None:
         self._ptr = ptr
+        self._mask_num_ranks: int | None = None
 
     @classmethod
     def create(
@@ -163,8 +166,13 @@ class Group:
         See Also:
             :meth:`destroy`.
         """
+        mask_num_ranks = None
+        if config.enable_mask and config.algorithm == Algorithm.LOW_LATENCY:
+            mask_num_ranks = comm.nranks
         ptr = _ep_bindings.create_group(comm.ptr, config._lowpp.ptr)  # type: ignore[attr-defined]
-        return cls(ptr)
+        group = cls(ptr)
+        group._mask_num_ranks = mask_num_ranks
+        return group
 
     def _check_valid(self, operation: str) -> None:
         if not self._ptr:
@@ -292,6 +300,86 @@ class Group:
             handle_mem.ptr,
         )
         return Handle(ptr, handle_mem=handle_mem)
+
+    def _check_mask_enabled(self, operation: str) -> int:
+        self._check_valid(operation)
+        if self._mask_num_ranks is None:
+            raise NcclInvalid(
+                f"Cannot {operation}: create the Group with LOW_LATENCY "
+                "and enable_mask=True"
+            )
+        return self._mask_num_ranks
+
+    def mask_query(self, mask_status: Tensor, *, stream: NcclStreamSpec) -> None:
+        """Copy the rank mask into a preallocated GPU int32 tensor.
+
+        ``mask_status`` must be contiguous with shape ``[num_ranks]`` on
+        the group's CUDA device. Entries are 1 for active and 0 for masked.
+        This call allocates no GPU memory and can be captured in a CUDA
+        graph. Keep the output alive until the stream finishes, or until
+        the graph's final replay finishes. Order consumers on this stream
+        or establish an explicit dependency on it.
+        """
+        num_ranks = self._check_mask_enabled("query mask")
+        if (
+            mask_status.sizes != (num_ranks,)
+            or mask_status.datatype != NcclDataType.INT32
+            or not mask_status.data
+        ):
+            raise NcclInvalid(
+                f"mask_status must be a GPU int32 tensor of shape ({num_ranks},)"
+            )
+        _ep_bindings.mask_query(self._ptr, mask_status.data, get_stream_ptr(stream))
+
+    def mask_update(self, mask: np.ndarray, *, stream: NcclStreamSpec) -> None:
+        """Copy a CPU int32 rank mask to the group on the supplied stream.
+
+        ``mask`` must be a contiguous NumPy array of shape ``[num_ranks]``
+        containing only 0 (masked) or 1 (active). Keep it alive and unchanged
+        until the stream finishes. No temporary conversion is performed.
+        This host-input convenience method does not promise graph capture.
+        """
+        num_ranks = self._check_mask_enabled("update mask")
+        if (
+            not isinstance(mask, np.ndarray)
+            or mask.dtype != np.dtype(np.int32)
+            or mask.shape != (num_ranks,)
+            or not mask.flags.c_contiguous
+        ):
+            raise NcclInvalid(
+                f"mask must be a contiguous CPU NumPy int32 array of shape ({num_ranks},)"
+            )
+        if not np.all((mask == 0) | (mask == 1)):
+            raise NcclInvalid("mask entries must be 0 (masked) or 1 (active)")
+        _ep_bindings.mask_update(self._ptr, mask.ctypes.data, get_stream_ptr(stream))
+
+    def mask_clean(self, *, stream: NcclStreamSpec) -> None:
+        """Collectively reset masks and RDMA buffers on all surviving ranks.
+
+        Requires at least one LL handle to have been initialized. This
+        re-admits delayed ranks in the same communicator; it does not replace
+        failed ranks. It does not clear the async-error flag; call
+        :meth:`error_clear` separately after recovery has completed.
+        """
+        self._check_mask_enabled("clean mask")
+        _ep_bindings.mask_clean(self._ptr, get_stream_ptr(stream))
+
+    def get_async_error(self) -> int:
+        """Poll the host flag: 0 means no error, 1 means a rank timed out.
+
+        Does not synchronize the GPU or clear the flag.
+        """
+        self._check_mask_enabled("get async error")
+        return _ep_bindings.get_async_error(self._ptr)
+
+    def error_clear(self) -> None:
+        """Clear the host timeout flag without changing masks or synchronizing.
+
+        Use after recovery finishes, or to re-arm error detection while
+        surviving ranks continue with a degraded mask.
+        """
+        self._check_mask_enabled("clear async error")
+        _ep_bindings.error_clear(self._ptr)
 
     def destroy(self) -> None:
         """Release the group. Subsequent operations on this object are invalid."""

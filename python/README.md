@@ -111,6 +111,42 @@ HT expert-major, single-LSA-team path; input tokens are BF16 and
 `CombineInputs.scales` must be `None` because NCCL EP generates E8M0 scales
 internally.
 
+## NCCL EP active-mask fault tolerance
+
+Create an LL group with `GroupConfig(enable_mask=True)` to enable rank masking.
+The public group methods expose the mask and the separate host timeout flag:
+
+```python
+import numpy as np
+
+# mask_status is a preallocated ep.Tensor over contiguous GPU int32[num_ranks]
+# memory on the group's device. Allocate it before CUDA graph capture.
+group.mask_query(mask_status, stream=stream)
+
+# Update takes CPU memory; keep it alive and unchanged until stream completion.
+mask = np.ones(num_ranks, dtype=np.int32)
+mask[-1] = 0  # 1 = active, 0 = masked
+group.mask_update(mask, stream=stream)
+
+error = group.get_async_error()  # 0 = no error, 1 = a rank timed out
+
+# After at least one LL handle has been initialized, all surviving ranks
+# call clean together to reset RDMA buffers and re-admit delayed ranks.
+group.mask_clean(stream=stream)
+stream.sync()
+group.error_clear()  # Clean does not clear the timeout flag.
+```
+
+`mask_query` fills the supplied output without allocating or synchronizing and
+supports CUDA graph capture. Keep the output buffer alive through completion of
+all graph replays. Read it in stream order, or establish a dependency before
+using it on another stream. Reading on the CPU requires a device-to-host copy
+and synchronization. `mask_update` does not promise graph capture support.
+Error polling and clearing operate on the host without GPU synchronization.
+These methods are not supported for HT groups. Mask cleaning re-admits delayed
+ranks within the same communicator; replacing a failed rank requires a new
+communicator and EP group.
+
 ## Generated bindings
 
 Everything under `nccl/_extensions/bindings/` is generated and checked in. Do

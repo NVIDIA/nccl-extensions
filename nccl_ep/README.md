@@ -47,6 +47,7 @@ implemented on top of NCCL Device API: Load-Store Accessible (LSA) and GPU-Initi
 - [Usage Examples](docs/documentation/usage_examples.md) — end-to-end HT and LL walkthroughs
 - [Custom Allocators](docs/documentation/custom_allocators.md) — routing internal allocations through a caller pool
 - [Elastic Receive Buffers](docs/documentation/elastic_buffers.md) — GPU + CPU backed recv tensors
+- [Reading ep_bench Results](docs/documentation/benchmark_analysis.md) — effective bus bandwidth: which bytes the HT columns count for the selected routing, and why that is not observed link traffic
 
 # Overview
 

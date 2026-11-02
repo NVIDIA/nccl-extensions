@@ -5,8 +5,16 @@
 # See LICENSE.txt for more license information
 #
 
-include ../../../makefiles/common.mk
-include ../../../makefiles/examples.mk
+# Build against the vendored NCCL (../../third_party/nccl) unless NCCL_HOME is
+# set; the root Makefile passes NCCL_HOME explicitly.
+NCCL_EXTENSIONS_ROOT := $(abspath ../..)
+CXXSTD := -std=c++17
+include ../../makefiles/common.mk
+
+NCCL_HOME ?= $(NCCL_EXTENSIONS_ROOT)/third_party/nccl/build
+INCLUDES  = -I$(CUDA_HOME)/include -I$(NCCL_HOME)/include
+LIBRARIES = -L$(CUDA_HOME)/lib64 -L$(NCCL_HOME)/lib
+LDFLAGS   = -lcudart -lnccl -Wl,-rpath,$(NCCL_HOME)/lib
 
 TARGET = ft_handle_bench
 

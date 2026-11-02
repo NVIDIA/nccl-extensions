@@ -15,6 +15,9 @@ EXAMPLES = ft_handle_bench
 
 all: ft_handle $(EXAMPLES)
 
+# Entry point used by the repository root Makefile (make nccl_ft.build).
+build: all
+
 ft_handle:
 	$(MAKE) -C ft_handle
 
@@ -34,7 +37,7 @@ test: all
 	done
 
 help:
-	@echo "NCCL Contrib: Fault-Tolerant Collectives"
+	@echo "NCCL FT: Fault-Tolerant Collectives"
 	@echo "========================================"
 	@echo ""
 	@echo "Targets:"
@@ -45,7 +48,7 @@ help:
 	@echo "  help               - Show this help"
 	@echo ""
 	@echo "Build options (pass to make):"
-	@echo "  NCCL_HOME=<path>   Path to NCCL installation"
+	@echo "  NCCL_HOME=<path>   Path to NCCL build (default: vendored third_party/nccl/build)"
 	@echo "  CUDA_HOME=<path>   Path to CUDA installation"
 
-.PHONY: all clean test help ft_handle $(EXAMPLES)
+.PHONY: all build clean test help ft_handle $(EXAMPLES)

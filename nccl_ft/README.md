@@ -24,9 +24,9 @@ operations fall back to NCCL.
 ## Layout
 
 ```
-fault_tolerant_collectives/
+nccl_ft/
 ├── README.md
-├── Makefile                     # builds the ft_handle_bench C++ example
+├── Makefile                     # builds ft_handle, then the ft_handle_bench C++ example
 ├── docs/                        # design docs (see below)
 ├── ft_handle/                   # the library
 │   ├── ft_collective.{cu,h}     # FTCollectiveHandle C/CUDA implementation
@@ -47,35 +47,30 @@ fault_tolerant_collectives/
 
 ## Build & install
 
-The library needs an NCCL built from source (system NCCL lacks the Device API
-extensions this uses).
+The library needs an NCCL with the Device API (2.30.7 or newer, the version
+vendored in `third_party/nccl`). From the repository root:
 
 ```bash
-cd nccl   # repo root
+# 1. Build the vendored NCCL, then libft_collective.{so,a} and ft_handle_bench
+make nccl-submodule NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90"  # sm_100 for GB200
+make nccl_ft.build  NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90"
+#    (or point at your own NCCL build: make nccl_ft.build NCCL_HOME=/path/to/nccl/build)
 
-# 1. Build NCCL from source
-make -j src.build CUDA_HOME=/usr/local/cuda \
-    NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90"   # sm_90 H100/GH200, sm_100 GB200
+# 2. Runtime env
+export NCCL_HOME=$PWD/third_party/nccl/build
+export LD_LIBRARY_PATH=$NCCL_HOME/lib:$LD_LIBRARY_PATH
+export FT_COLLECTIVE_LIB=$PWD/nccl_ft/ft_handle/libft_collective.so
 
-# 2. Build libft_collective.so against that NCCL build
-make -C contrib/fault_tolerant_collectives/ft_handle \
-    NCCL_HOME=$PWD/build CUDA_HOME=/usr/local/cuda
+# 3. Install the Python package
+pip install nccl_ft/ft_handle/python/
 
-# 3. Runtime env
-export NCCL_HOME=$PWD/build
-export LD_LIBRARY_PATH=$PWD/build/lib:$LD_LIBRARY_PATH
-export FT_COLLECTIVE_LIB=$PWD/contrib/fault_tolerant_collectives/ft_handle/libft_collective.so
-
-# 4. Install the Python package
-pip install contrib/fault_tolerant_collectives/ft_handle/python/
-
-# 5. Verify
+# 4. Verify
 python3 -c "import ft_collective; print('OK')"
 ```
 
 > **Build error** `ncclGinBarrierSession::sync cannot be called with given argument
-> list` → `NCCL_HOME` points at a system NCCL instead of `$PWD/build`; the
-> timeout-taking `sync()` overload only exists in this repo's Device API headers.
+> list` → `NCCL_HOME` points at an older NCCL whose Device API lacks the
+> timeout-taking `sync()` overload; build against the vendored NCCL instead.
 
 ## Usage (PyTorch)
 
@@ -130,7 +125,7 @@ Run under the launcher (single host via `mp.spawn`, or multi-node under
 `srun`/`torchrun`):
 
 ```bash
-cd contrib/fault_tolerant_collectives/ft_handle/python
+cd nccl_ft/ft_handle/python
 python3 ft_correctness_test.py  --nranks 8      # every collective, eager + CUDA graph
 python3 test_ft_converge.py     --nranks 8      # membership-consensus agreement
 python3 test_fault_injection.py --nranks 8      # failures injected at each kernel stage

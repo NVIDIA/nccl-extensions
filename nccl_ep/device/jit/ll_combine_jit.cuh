@@ -128,7 +128,8 @@ inline std::string ll_combine_jit_source(
     bool topkIdxIsInt64,
     ncclDataType_t tokenDtype,
     LlCombineKernel kernel,
-    ncclDataType_t weightDtype) {
+    ncclDataType_t weightDtype,
+    int numThreads = 1024) {  // launch bound = the real block size (numWarps * 32): 896 threads allow 72 registers, 1024 only 64
     // Callers must pass a resolved, concrete kernel -- never the sentinels ll_combine_select_kernel
     // returns for "not yet resolved" (kNone) or "enforcement unreachable" (kInvalid); see its doc
     // comment.
@@ -141,7 +142,7 @@ inline std::string ll_combine_jit_source(
     src << "#include \"device/ll_ep.cuh\"\n"
         << "#include \"device/ll_ep_adapter.cuh\"\n"
         << "\n"
-        << "extern \"C\" __launch_bounds__(1024, 1)\n"
+        << "extern \"C\" __launch_bounds__(" << numThreads << ", 1)\n"
         << "__global__ void " << kLlCombineJitEntryName << "(\n"
         << "    const __grid_constant__ nccl_ep::ll::combine_kernel_args_t<" << weight_type << "> p) {\n";
     switch (kernel) {
@@ -288,6 +289,7 @@ inline ncclResult_t launch_ll_combine(
             (autoRmLsa ? 8u : 0u));
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(tokenDtype));
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(weightDtype));
+    key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(numWarps));  // launch bound
     variant.runtime_key = key;
     variant.num_blocks = numSms;
     variant.block_dim = numWarps * 32;
@@ -323,10 +325,12 @@ inline ncclResult_t launch_ll_combine(
              << (autoRmLsa ? "_autormlsa" : "")
              << (topkIdxIsInt64 ? "_topk64" : "_topk32")
              << ::nccl_ep::jit::token_dtype_name_tag(tokenDtype)
-             << (anyLsa ? "" : ::nccl_ep::jit::combine_recipe_name_tag(qrecipe));
+             << (anyLsa ? "" : ::nccl_ep::jit::combine_recipe_name_tag(qrecipe))
+             << "_t" << numWarps * 32;
         variant_name = name.str();
         const std::string source = ll_combine_jit_source(
-            useLogFmt, recipe_literal, hidden, num_topk, layout, topkIdxIsInt64, tokenDtype, kernel, weightDtype);
+            useLogFmt, recipe_literal, hidden, num_topk, layout, topkIdxIsInt64, tokenDtype, kernel, weightDtype,
+            numWarps * 32);
         variant.variant_name = variant_name;
         variant.source = source;
         status = ::nccl_ep::jit::launch_jit_kernel(

@@ -483,6 +483,8 @@ inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec,
         << "      reinterpret_cast<uint8_t*>(p.recv_scales_em),\n"
         << "      reinterpret_cast<const uint8_t*>(p.flat_scale_staging),\n"
         << "      p.scale_row_bytes,\n"
+        << "      p.scale_blocks,\n"
+        << "      p.scale_gemm_layout,\n"
         << "      p.flat2em_out,\n"
         << "      p.lerm_in,\n"
         << "      p.lerm_out,\n"
@@ -504,7 +506,8 @@ launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& par
         std::ostringstream name;
         name << "local_permute_dup_h" << hidden_int4 << "_v" << hidden_vec << "_b" << blocks_per_sm
              << (recipe != NCCL_EP_DISP_QUANT_NONE ? "_sf" : "")
-             << (flat_expert_ids ? "_topk" : "_map");
+             << (flat_expert_ids ? "_topk" : "_map")
+             << (param.scale_gemm_layout ? "_gemm" : "_wire");
         return name.str();
     }();
     const std::string source = local_permute_dup_jit_source(hidden_int4, hidden_vec, blocks_per_sm, recipe, flat_expert_ids);
@@ -524,7 +527,8 @@ launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& par
     variant.runtime_key = (static_cast<std::uint64_t>(hidden_int4) << 16) |
                           (static_cast<std::uint64_t>(hidden_vec) << 8) | static_cast<std::uint64_t>(blocks_per_sm) |
                           (static_cast<std::uint64_t>(static_cast<uint32_t>(recipe)) << 32) |
-                          (static_cast<std::uint64_t>(flat_expert_ids) << 40);
+                          (static_cast<std::uint64_t>(flat_expert_ids) << 40) |
+                          (static_cast<std::uint64_t>(param.scale_gemm_layout) << 41);
     variant.num_blocks = num_blocks * blocks_per_sm;
     variant.block_dim = ::ht_ep::kLocalPermuteThreads;
     variant.dynamic_smem_bytes = zero_smem_bytes;

@@ -354,6 +354,23 @@ static ncclResult_t validateDispatchRecipe(
             }
             return ncclSuccess;
         case NCCL_EP_DISP_QUANT_FWD: {
+            const auto scale_layout = config ? config->scale_layout : NCCL_EP_SCALE_LAYOUT_WIRE;
+            if (scale_layout != NCCL_EP_SCALE_LAYOUT_WIRE &&
+                scale_layout != NCCL_EP_SCALE_LAYOUT_BLOCK128_GEMM) {
+                return fail("invalid scale_layout");
+            }
+            if (scale_layout == NCCL_EP_SCALE_LAYOUT_BLOCK128_GEMM &&
+                (launch.algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT ||
+                 launch.layout != NCCL_EP_LAYOUT_EXPERT_MAJOR ||
+                 input_scales == nullptr || output_scales == nullptr ||
+                 tokens->datatype != ncclFloat8e4m3 ||
+                 input_scales->datatype != ncclFloat32 ||
+                 output_scales->datatype != ncclFloat32 || input_scales->ndim != 2 ||
+                 input_scales->sizes[1] < static_cast<size_t>(launch.hidden / 128) ||
+                 output_scales->ndim != 2 ||
+                 output_scales->sizes[1] < static_cast<size_t>(launch.hidden / 128))) {
+                return fail("BLOCK128_GEMM requires HT expert-major E4M3 tokens and FP32 scales");
+            }
             auto storage_aligned = [](const ncclEpTensor_t* tensor) {
                 return (tensor->data == nullptr ||
                         reinterpret_cast<std::uintptr_t>(tensor->data) % sizeof(int4) == 0) &&
@@ -7225,7 +7242,9 @@ ncclResult_t ncclEpDispatch(
                     perm_recv_scales_em,
                     perm_flat_scale_staging,
                     perm_scale_row_bytes,
-                    rebuild_em_map ? handle->ht.flat2em_slot_map : nullptr,
+                    hidden / 128,
+                    config && config->scale_layout == NCCL_EP_SCALE_LAYOUT_BLOCK128_GEMM,
+                    count_lean_build ? handle->ht.flat2em_slot_map : nullptr,
                     count_lean_build ? handle->ht.dispatch_push_count.lerm_landing : nullptr,
                     count_lean_build ? handle->ht.local_expert_routing_map : nullptr,
                     em_permute_cursors,

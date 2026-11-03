@@ -5,6 +5,8 @@
  */
 
 #pragma once
+#ifndef NCCL_EP_PUBLIC_API_H_
+#define NCCL_EP_PUBLIC_API_H_
 
 #include <stddef.h>
 #include <stdint.h>
@@ -906,6 +908,11 @@ typedef enum {
 } ncclEpDispQuant_t;
 
 typedef enum {
+    NCCL_EP_SCALE_LAYOUT_WIRE = 0,
+    NCCL_EP_SCALE_LAYOUT_BLOCK128_GEMM = 1,
+} ncclEpScaleLayout_t;
+
+typedef enum {
     NCCL_EP_COMB_QUANT_NONE = 0,
     // EXPERIMENTAL: LL-only BF16 expert-output transport. Its API contract,
     // supported shapes, and numerical behavior may change before graduation.
@@ -937,6 +944,7 @@ typedef struct {
   //   outputs->topk_weights / outputs->topk_idx.
     // New fields must be appended here to keep existing field offsets stable for ABI compatibility.
     ncclEpDispQuant_t quant_recipe; // NONE by default; selects the required scale tensors
+    ncclEpScaleLayout_t scale_layout; // WIRE by default; explicit block128 GEMM output
 } ncclEpDispatchConfig_t;
 
 #define NCCL_EP_DISPATCH_CONFIG_INIT \
@@ -948,12 +956,15 @@ typedef struct {
 #define NCCL_EP_DISPATCH_CONFIG_V1_SIZE 20u
 #define NCCL_EP_DISPATCH_CONFIG_V2_LAST_FIELD quant_recipe
 #define NCCL_EP_DISPATCH_CONFIG_V2_SIZE 24u
+#define NCCL_EP_DISPATCH_CONFIG_V3_LAST_FIELD scale_layout
+#define NCCL_EP_DISPATCH_CONFIG_V3_SIZE 28u
 
-#define NCCL_EP_DISPATCH_CONFIG_CURRENT_VERSION 2
+#define NCCL_EP_DISPATCH_CONFIG_CURRENT_VERSION 3
 
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpDispatchConfig_t, NCCL_EP_DISPATCH_CONFIG);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPATCH_CONFIG, 1);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPATCH_CONFIG, 2);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPATCH_CONFIG, 3);
 
 // Perform EP dispatch
 //   * Sends tokens and metadata to the experts according to routing decisions.
@@ -1315,3 +1326,5 @@ ncclResult_t ncclEpAfReturn(
 #ifdef __cplusplus
 }
 #endif
+
+#endif  // NCCL_EP_PUBLIC_API_H_

@@ -2459,6 +2459,8 @@ void launch_dispatch_permute(
     void* recv_scales_em,
     const void* flat_scale_staging,
     int scale_row_bytes,
+    int scale_blocks,
+    bool scale_gemm_layout,
     int32_t* flat2em_out,
     const bool* lerm_in,
     bool* lerm_out,
@@ -2496,6 +2498,8 @@ void launch_dispatch_permute(
     p.recv_scales_em = recv_scales_em;
     p.flat_scale_staging = flat_scale_staging;
     p.scale_row_bytes = scale_row_bytes;
+    p.scale_blocks = scale_blocks;
+    p.scale_gemm_layout = scale_gemm_layout;
     p.flat2em_out = flat2em_out;
     p.lerm_in = lerm_in;
     p.lerm_out = lerm_out;

@@ -6479,9 +6479,12 @@ struct local_permute_dup_param_t {
     void* recv_scales_em;
     const void* flat_scale_staging;
     int scale_row_bytes;
-    // Rebuild EM slots with per-expert atomic cursors, from decoded compact IDs
-    // or (dense count mode) the sender-written LERM. Null uses the pre-built map.
-    // Count mode also persists LERM in per-handle memory for later operations.
+    int scale_blocks;
+    bool scale_gemm_layout;
+    // Count mode: build the flat2em rows inline from the sender-written LERM rows,
+    // assigning em slots via per-expert atomic cursors (zero-seeded by the host).
+    // All null on the stock path (pre-built flat2em consumed as-is). lerm_out
+    // persists the LERM row into per-handle mem so combine reads a private copy.
     int32_t* flat2em_out;
     const bool* lerm_in;
     bool* lerm_out;
@@ -6520,6 +6523,8 @@ __device__ __forceinline__ void local_permute_dup(
     uint8_t* __restrict__ scale_dst,
     const uint8_t* __restrict__ scale_src,
     int scale_row_bytes,
+    int scale_blocks,
+    bool scale_gemm_layout,
     int32_t* __restrict__ flat2em_out,
     const bool* __restrict__ lerm_in,
     bool* __restrict__ lerm_out,
@@ -6598,12 +6603,23 @@ __device__ __forceinline__ void local_permute_dup(
                     reinterpret_cast<uint8_t*>(s_zero),
                     row_bytes);
                 if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
-                    cuda::ptx::cp_async_bulk(
-                        cuda::ptx::space_global,
-                        cuda::ptx::space_shared,
-                        scale_dst + static_cast<size_t>(slot) * scale_row_bytes,
-                        reinterpret_cast<uint8_t*>(s_zero),
-                        scale_row_bytes);
+                    if (scale_gemm_layout) {
+                        float* dst = reinterpret_cast<float*>(scale_dst);
+                        const int64_t count = zone_end - zone_start;
+                        if (count > 0) {
+                            for (int b = lane; b < scale_blocks; b += kThreadsPerSlot) {
+                                dst[static_cast<size_t>(zone_start) * scale_blocks +
+                                    static_cast<size_t>(b) * count + offs] = 0.0f;
+                            }
+                        }
+                    } else {
+                        cuda::ptx::cp_async_bulk(
+                            cuda::ptx::space_global,
+                            cuda::ptx::space_shared,
+                            scale_dst + static_cast<size_t>(slot) * scale_row_bytes,
+                            reinterpret_cast<uint8_t*>(s_zero),
+                            scale_row_bytes);
+                    }
                 }
                 if (zero_weights) {
                     recv_topk_weights_em[slot] = 0.0f;
@@ -6736,16 +6752,36 @@ __device__ __forceinline__ void local_permute_dup(
             }
 
             if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
-                const int scale_row_int4 = scale_row_bytes >> 4;
-                const int4* ssrc =
-                    reinterpret_cast<const int4*>(static_cast<const uint8_t*>(scale_src) + static_cast<size_t>(token) * scale_row_bytes);
-                for (int a = 0; a < cnt; ++a) {
-                    const int32_t as = s_active[warp_id][a];
-                    if (as < 0) continue;  // dropped slot
-                    int4* sdst = reinterpret_cast<int4*>(
-                        scale_dst + static_cast<size_t>(as) * scale_row_bytes);
-                    for (int j = lane; j < scale_row_int4; j += kThreadsPerSlot) {
-                        nccl_ep::st_cg_global(&sdst[j], ssrc[j]);
+                if (scale_gemm_layout) {
+                    const float* ssrc = reinterpret_cast<const float*>(scale_src) +
+                        static_cast<size_t>(token) * scale_blocks;
+                    float* dst_base = reinterpret_cast<float*>(scale_dst);
+                    for (int a = 0; a < cnt; ++a) {
+                        const int32_t as = s_active[warp_id][a];
+                        if (as < 0) continue;
+                        int e = 0;
+                        while (e + 1 < experts_per_rank &&
+                               as >= expert_token_offsets[e + 1]) ++e;
+                        const int64_t start = expert_token_offsets[e];
+                        const int64_t count = expert_token_offsets[e + 1] - start;
+                        const int64_t r = as - start;
+                        float* dst = dst_base + static_cast<size_t>(start) * scale_blocks + r;
+                        for (int b = lane; b < scale_blocks; b += kThreadsPerSlot) {
+                            dst[static_cast<size_t>(b) * count] = ssrc[b];
+                        }
+                    }
+                } else {
+                    const int scale_row_int4 = scale_row_bytes >> 4;
+                    const int4* ssrc = reinterpret_cast<const int4*>(
+                        static_cast<const uint8_t*>(scale_src) + static_cast<size_t>(token) * scale_row_bytes);
+                    for (int a = 0; a < cnt; ++a) {
+                        const int32_t as = s_active[warp_id][a];
+                        if (as < 0) continue;  // dropped slot
+                        int4* sdst = reinterpret_cast<int4*>(
+                            scale_dst + static_cast<size_t>(as) * scale_row_bytes);
+                        for (int j = lane; j < scale_row_int4; j += kThreadsPerSlot) {
+                            nccl_ep::st_cg_global(&sdst[j], ssrc[j]);
+                        }
                     }
                 }
             }
@@ -6771,9 +6807,19 @@ __device__ __forceinline__ void local_permute_dup(
                 for (int j = lane; j < row_int4; j += kThreadsPerSlot) tok_row[j] = int4{0, 0, 0, 0};
                 if (recv_topk_weights_em != nullptr && lane == 0) recv_topk_weights_em[slot] = 0.0f;
                 if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
-                    const int scale_row_int4 = scale_row_bytes >> 4;
-                    int4* sdst = reinterpret_cast<int4*>(scale_dst + static_cast<size_t>(slot) * scale_row_bytes);
-                    for (int j = lane; j < scale_row_int4; j += kThreadsPerSlot) sdst[j] = int4{0, 0, 0, 0};
+                    if (scale_gemm_layout) {
+                        const int64_t count = expert_token_offsets[e + 1] - expert_token_offsets[e];
+                        const int64_t r = slot - expert_token_offsets[e];
+                        float* dst = reinterpret_cast<float*>(scale_dst) +
+                            static_cast<size_t>(expert_token_offsets[e]) * scale_blocks + r;
+                        for (int b = lane; b < scale_blocks; b += kThreadsPerSlot) {
+                            dst[static_cast<size_t>(b) * count] = 0.0f;
+                        }
+                    } else {
+                        const int scale_row_int4 = scale_row_bytes >> 4;
+                        int4* sdst = reinterpret_cast<int4*>(scale_dst + static_cast<size_t>(slot) * scale_row_bytes);
+                        for (int j = lane; j < scale_row_int4; j += kThreadsPerSlot) sdst[j] = int4{0, 0, 0, 0};
+                    }
                 }
             }
         }

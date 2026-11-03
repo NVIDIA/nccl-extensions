@@ -194,6 +194,11 @@ fi
 #
 #   test_ll_epoch_protocol  single process, no NCCL; checks the epoch state
 #                           machine (bank parity, staged send/recv, rollover).
+#   test_lamport_state      single process, no NCCL; landing-region layout, double-buffering
+#                           state, sentinel encoding and arrival test of the Lamport combine.
+#   test_ll_lamport_combine Lamport combine (NCCL_EP_COMBINE_LSA=lamport) on a rank-major LL
+#                           group: back-to-back combines, sentinel payload words,
+#                           ncclEpMaskClean, and the fallback for an ineligible call.
 #   test_ll_group_epoch     two LL handles on one group; self-skips unless the
 #                           world size is exactly 4. A skip exits 0, so running
 #                           it at NUM_GPUS != 4 would report a pass without
@@ -219,7 +224,9 @@ run_fixed_rank_suite() {
 }
 
 run_fixed_rank_suite test_ll_epoch_protocol "EP LL Epoch Protocol Tests" 1
+run_fixed_rank_suite test_lamport_state     "EP Lamport Building Blocks Tests" 1
 run_fixed_rank_suite test_ll_group_epoch    "EP LL Group Epoch Tests"    4
+run_fixed_rank_suite test_ll_lamport_combine "EP LL Lamport Combine Tests"   4
 
 HT_EM_RERUN=1
 for mode in LOCAL_DUP NVLINK_DUP; do

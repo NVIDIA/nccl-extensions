@@ -191,6 +191,10 @@ communication in flight, and it must not appear inside a CUDA graph capture.
 Complete all pending staged operations with `ncclEpComplete` and synchronize
 their streams on all ranks before LL handle initialization. An explicit
 `rdma_buffer_size` prevents reallocation but not collective bank layout changes.
+With the Lamport combine (`NCCL_EP_COMBINE_LSA=lamport`), a handle whose
+`num_topk` exceeds the capacity of the Lamport landing region also re-creates
+the region collectively, with the same constraints; setting
+`ncclEpGroupConfig_t::num_topk` to the largest `num_topk` of any handle avoids it.
 Re-capture EP graphs after reallocation or shared bank layout changes. See the
 [`rdma_buffer_size` notes](../../README.md#algorithm-related-configurations).
 
@@ -559,6 +563,11 @@ The timeout is `ncclEpGroupConfig_t::timeout_ns` (0 = default, ~100 s), which
 `NCCL_EP_TIMEOUT_MS` overrides. Setting it too low risks masking merely slow
 ranks.
 
+With `NCCL_EP_COMBINE_LSA=lamport` the combine has no barrier, so after a timeout
+different column ranges of one output row may include the timed-out rank's
+contribution or not. Treat the rows of tokens routed to a timed-out rank as
+invalid.
+
 A typical recovery loop polls `ncclEpGetAsyncError`, inspects which ranks were
 masked with `ncclEpMaskQuery`, continues in degraded mode or re-admits ranks with
 `ncclEpMaskClean`, and then re-arms detection with `ncclEpErrorClear`.
@@ -583,6 +592,8 @@ ncclResult_t ncclEpMaskQuery(ncclEpGroup_t ep_group, int* mask_status, cudaStrea
 
 ```c
 // Set the mask for all ranks at once.
+//   With NCCL_EP_COMBINE_LSA=lamport, re-activating a masked rank requires
+//   ncclEpMaskClean: Update alone does not reset the Lamport landing region.
 //
 // Arguments:
 //   ep_group   - [IN] EP group with masking enabled

@@ -22,6 +22,7 @@
 #include <set>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <type_traits>
 #include <nccl.h>
@@ -39,6 +40,7 @@
 #include "device/ht_ep_adapter.cuh"
 #include "device/ht_ep_configs.cuh"
 #include "device/ll/ll_hier_delivery.cuh"
+#include "device/lamport.cuh"
 #include "device/jit/jit_runtime.hpp"
 
 namespace ll = nccl_ep::ll;
@@ -67,6 +69,9 @@ static ncclResult_t destroy_ht_internode(ncclEpGroup_t ep_group);
 
 // Forward declaration for LL helper (defined alongside ll_init_handle).
 static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_size);
+namespace {
+ll::LlCombineKernel resolve_combine_enforced_kernel(const ncclEpEnvConfig& env); // defined below
+} // namespace
 
 // Forward declarations used by mega-buffer sizing (definitions live later in this file).
 static bool is_internode_available(ncclEpGroup_t ep_group);
@@ -813,6 +818,14 @@ struct ncclEpGroup {
     size_t rdma_buffer_size_alloc;
     size_t ll_payload_slot_stride = 0;
     nccl_ep::LowLatencyEpochState* ll_epoch_state = nullptr;
+    // Double-buffering state of the Lamport combine (its own counter; the LL epoch above is not involved).
+    nccl_ep::LamportEpochState* ll_lamport_state = nullptr;
+    // The Lamport combine's landing region, at the tail of rdma_buffer and sized for the largest top-k of the group's
+    // rank-major handles (see nccl_ep::LamportRegion). Invalid until such a handle exists.
+    nccl_ep::LamportRegion ll_lamport_region;
+    // Largest LL layout (without the Lamport region) of any handle created so far: the region must not reach it.
+    size_t ll_max_layout_bytes = 0;
+    int last_ll_combine_kernel = -1; // Test/diagnostic record: the resolved ll::LlCombineKernel of the last combine
     ncclEpGroupConfig_t config;         // Stored configuration
 
     // Environment-variable configuration, populated once at group creation
@@ -3111,6 +3124,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
 
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->ll_epoch_state), sizeof(nccl_ep::LowLatencyEpochState)));
         CUDA_CHECK(cudaMemset(ep_group->ll_epoch_state, 0, sizeof(nccl_ep::LowLatencyEpochState)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->ll_lamport_state), sizeof(nccl_ep::LamportEpochState)));
+        CUDA_CHECK(cudaMemset(ep_group->ll_lamport_state, 0, sizeof(nccl_ep::LamportEpochState)));
 
         // Agree on the LL wire-layout inputs and CFT before endpoint setup and
         // mask-window registration, which require the same decision on every rank.
@@ -3126,7 +3141,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
                 uint8_t want_cft;
                 uint8_t enable_mask;
                 uint8_t zero_copy;
-                uint8_t pad_[1];
+                uint8_t combine_lsa_mode; // 0 = unset, otherwise 1 + the NCCL_EP_COMBINE_LSA choice
                 ncclEpCftPlatformFacts facts;
                 ncclEpCftPlatformFloors floors;
             };
@@ -3135,6 +3150,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             vote[ep_group->rank].want_cft = nccl_ep_env_flag_on(ep_group->env.ll_cft) ? 1 : 0;
             vote[ep_group->rank].enable_mask = ep_group->config.enable_mask ? 1 : 0;
             vote[ep_group->rank].zero_copy = ep_group->config.zero_copy == NCCL_EP_ZERO_COPY_ON;
+            vote[ep_group->rank].combine_lsa_mode =
+                ep_group->env.combine_lsa.is_set ? static_cast<uint8_t>(ep_group->env.combine_lsa.value.ul + 1) : 0;
             vote[ep_group->rank].facts = cft_facts;
             vote[ep_group->rank].floors = cft_floors;
             ncclAllGatherHost(vote.data(), sizeof(LlGroupVote), ep_group->rank, ep_group->nRanks, comm, stream);
@@ -3145,6 +3162,19 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
                             "(rank 0 = %u, rank %d = %u); it selects AFD rank roles and "
                             "the LL signaling layout\n",
                             vote[0].num_attn_ranks, r, vote[r].num_attn_ranks);
+                    return reject_group(ncclInvalidUsage);
+                }
+                if (vote[r].combine_lsa_mode != vote[0].combine_lsa_mode) {
+                    const auto mode_name = [](uint8_t mode) {
+                        return mode == 0 ? "unset" : ncclEpEnvConfig::combine_lsa_modes[mode - 1];
+                    };
+                    fprintf(stderr,
+                            "NCCL EP: %s must be set identically on every rank "
+                            "(rank 0 = %s, rank %d = %s); it selects the combine wire protocol (and, for lamport, "
+                            "makes handle creation collective), so a mixed setting desynchronises or hangs the "
+                            "ranks\n",
+                            ep_group->env.combine_lsa.name, mode_name(vote[0].combine_lsa_mode), r,
+                            mode_name(vote[r].combine_lsa_mode));
                     return reject_group(ncclInvalidUsage);
                 }
                 if (vote[0].want_cft && vote[r].zero_copy != vote[0].zero_copy) {
@@ -3391,6 +3421,10 @@ ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group) {
         if (ep_group->ll_epoch_state != nullptr) {
             CUDA_CHECK(cudaFree(ep_group->ll_epoch_state));
             ep_group->ll_epoch_state = nullptr;
+        }
+        if (ep_group->ll_lamport_state != nullptr) {
+            CUDA_CHECK(cudaFree(ep_group->ll_lamport_state));
+            ep_group->ll_lamport_state = nullptr;
         }
 
         if (ep_group->rdma_buffer) {
@@ -4141,6 +4175,7 @@ ncclResult_t ncclEpHandleMemSize(
     return ncclSuccess;
 }
 
+// Cross-rank fence: the local device is idle, then every rank has reached this point.
 static ncclResult_t quiesce_ll_buffer(ncclEpGroup_t group) {
     CUDA_CHECK(cudaDeviceSynchronize());
     cudaStream_t stream;
@@ -4148,6 +4183,39 @@ static ncclResult_t quiesce_ll_buffer(ncclEpGroup_t group) {
     NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaStreamDestroy(stream));
+    return ncclSuccess;
+}
+
+// Poisons both segments of the group's Lamport region (byte lamport::kSentinelByte), zeroes the round words and
+// restarts the round counter. Only for a new or moved region; a handle that finds the region as it is leaves it alone,
+// because the round words and the counter are protocol state. The device is synchronized so the poison is complete on
+// return.
+static ncclResult_t ll_lamport_poison(ncclEpGroup_t ep_group) {
+    const nccl_ep::LamportRegion& region = ep_group->ll_lamport_region;
+    char* const base = static_cast<char*>(ep_group->rdma_buffer);
+    CUDA_CHECK(cudaMemset(base + region.recv_offset, nccl_ep::lamport::kSentinelByte, 2 * region.segment_stride));
+    CUDA_CHECK(cudaMemset(base + region.round_offset, 0, region.recv_offset - region.round_offset));
+    CUDA_CHECK(cudaMemset(ep_group->ll_lamport_state, 0, sizeof(nccl_ep::LamportEpochState)));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return ncclSuccess;
+}
+
+// Creates the Lamport region in a live, registered buffer (a user-specified rdma_buffer_size that has room), where no
+// reallocation orders the poison against the peers.
+//
+// The API does not put a dispatch between a handle creation and the next Lamport combine (D(H1), create H2, C(H1) is
+// legal), so nothing but this function orders the install against a peer's traffic. It fences before and after: the
+// first fence makes every rank's earlier work complete and every rank arrive, so no peer's store or round-word publish
+// can still be landing in the region being re-created; the second makes every rank finish poisoning before any rank
+// returns, so no peer's first store of the next combine can precede this rank's poison. Callers must still not have a
+// dispatch or combine in flight on any rank during handle creation.
+//
+// A reallocation needs none of this: its barrier is the first fence, and the poison is written before the window
+// registration, a collective that keeps every peer out of the new buffer until all ranks have poisoned theirs.
+static ncclResult_t ll_lamport_install(ncclEpGroup_t ep_group) {
+    NCCLCHECK(quiesce_ll_buffer(ep_group));
+    NCCLCHECK(ll_lamport_poison(ep_group));
+    NCCLCHECK(quiesce_ll_buffer(ep_group));
     return ncclSuccess;
 }
 
@@ -4159,7 +4227,8 @@ static ncclResult_t quiesce_ll_buffer(ncclEpGroup_t group) {
 // In both cases the buffer is zeroed and rdma_buffer_size_alloc is updated.
 // Must be called by all ranks in the comm with the same new_size.
 static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_size) {
-    EP_HOST_ASSERT(new_size > ep_group->rdma_buffer_size_alloc);
+    // Equal is a same-size reallocation, which re-creates the buffer (and the Lamport region in it).
+    EP_HOST_ASSERT(new_size >= ep_group->rdma_buffer_size_alloc);
     // With NCCL_EP_AUTO, config.rdma_buffer_size is 0 (the AUTO sentinel) and
     // imposes no cap. With a user-specified value, the caller (ll_init_handle)
     // rejects layouts that don't fit before reaching here, and the group-time
@@ -4186,6 +4255,16 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
     NCCL_CHECK_RESULT(ncclMemAlloc(&ep_group->rdma_buffer, new_size));
     CUDA_CHECK(cudaMemset(ep_group->rdma_buffer, 0, new_size));
     ep_group->rdma_buffer_size_alloc = new_size;
+    // The Lamport region moves to the tail of the new buffer and is re-created there before the window registration
+    // below (see ll_lamport_install for why no fence is needed).
+    if (ep_group->ll_lamport_region.valid()) {
+        ep_group->ll_lamport_region = nccl_ep::lamport_region_at_tail(
+            nccl_ep::lamport_region_shape(
+                ep_group->config.max_dispatch_tokens_per_rank, ep_group->config.max_token_bytes, ep_group->nRanks,
+                ep_group->ll_lamport_region.capacity_topk),
+            new_size);
+        NCCLCHECK(ll_lamport_poison(ep_group));
+    }
 
     ncclWindow_t win_host;
     NCCL_CHECK_RESULT(ncclCommWindowRegister(ep_group->comm, ep_group->rdma_buffer, new_size, &win_host, 0));
@@ -4230,49 +4309,93 @@ static ncclResult_t validate_ll_geometry(const ncclEpGroup_t ep_group, int num_t
     return ncclSuccess;
 }
 
-static ncclResult_t
-ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor_t* handle_mem, int num_topk) {
-    NCCLCHECK(validate_ll_geometry(ep_group, num_topk));
 
-    auto layout = nccl_ep::LowLatencyLayout(
+// The LL buffer layout of a handle of the given kind and top-k.
+static nccl_ep::LowLatencyLayout ll_layout_for(const ncclEpGroup_t ep_group, ncclEpLayout_t handle_layout, int topk) {
+    return nccl_ep::LowLatencyLayout(
         ep_group->config.max_dispatch_tokens_per_rank,
         ep_group->config.max_token_bytes,
         ep_group->nRanks,
         ep_group->config.num_experts,
-        num_topk,
-        handle->layout,
+        topk,
+        handle_layout,
         ep_group->num_attn_ranks);
+}
 
-    auto hier = ep_group->ll_hier;
-    if (hier.numLogicalCtas != 0) {
-        ll::hierOverlayLayout(layout, hier, ep_group->config.max_dispatch_tokens_per_rank,
-                               ep_group->nRanks, ep_group->ll_payload_slot_stride);
-    }
-    const bool resized = layout.total_bytes > ep_group->rdma_buffer_size_alloc;
+// Makes the group's RDMA buffer hold a handle whose layout takes `layout_total_bytes` (the handle's own top-k), and the
+// Lamport region when that combine is enforced; see the comments below for the auto-sized and user-specified cases.
+// `*reallocated` reports whether the buffer was (re)allocated, and so zeroed.
+static ncclResult_t ll_ensure_buffer(
+    ncclEpGroup_t ep_group, ncclEpLayout_t handle_layout, size_t layout_total_bytes, int num_topk, bool* reallocated) {
+    *reallocated = false;
+    // Lamport combine: the landing region is at the tail of the buffer, sized for the largest top-k of the group's
+    // rank-major handles (nccl_ep::LamportRegion), so handles of different top-k coexist. A handle that needs a larger
+    // capacity, or whose layout would reach the region, grows the buffer like any other growth; the region is
+    // re-created in the new buffer. Otherwise the region is left as it is: its round words and the round counter are
+    // protocol state that survives handle creation.
+    const bool lamport_handle = resolve_combine_enforced_kernel(ep_group->env) == ll::LlCombineKernel::k2SidedLamportRmLsa &&
+                                handle_layout == NCCL_EP_LAYOUT_RANK_MAJOR && ep_group->num_attn_ranks == 0;
+    const int lamport_capacity_topk = std::max(ep_group->ll_lamport_region.capacity_topk, lamport_handle ? num_topk : 0);
+    const bool lamport_capacity_grows = lamport_capacity_topk != ep_group->ll_lamport_region.capacity_topk;
+    const nccl_ep::LamportRegion lamport_shape = nccl_ep::lamport_region_shape(
+        ep_group->config.max_dispatch_tokens_per_rank, ep_group->config.max_token_bytes, ep_group->nRanks,
+        lamport_capacity_topk);
+    const size_t layout_bytes = std::max(ep_group->ll_max_layout_bytes, layout_total_bytes);
+    const size_t needed_bytes = layout_bytes + lamport_shape.reserved_bytes;
 
-    // Ensure rdma_buffer is large enough for this handle's actual layout.
+    // Ensure rdma_buffer is large enough for this handle's actual layout and the Lamport region.
     // - NCCL_EP_AUTO: lazily allocate (first handle) or grow (later handle
     //   needing more, e.g. different layout or larger num_topk). Stored
     //   layouts on other live handles are pure offsets, so reallocation
     //   does not invalidate them.
     // - User-specified size: the buffer was already allocated to that exact
     //   value at group create. Reject the handle if it doesn't fit.
-    if (layout.total_bytes > ep_group->rdma_buffer_size_alloc) {
-        if (ep_group->config.rdma_buffer_size != NCCL_EP_AUTO) {
+    const bool auto_size = ep_group->config.rdma_buffer_size == NCCL_EP_AUTO;
+    if (needed_bytes > ep_group->rdma_buffer_size_alloc || (lamport_capacity_grows && auto_size)) {
+        if (!auto_size) {
             fprintf(
                 stderr,
                 "ncclEpInitHandle: requested layout needs %zu bytes but user-specified "
                 "rdma_buffer_size is %zu bytes; either increase rdma_buffer_size or use "
                 "NCCL_EP_AUTO to allow lazy sizing\n",
-                layout.total_bytes,
+                needed_bytes,
                 static_cast<size_t>(ep_group->config.rdma_buffer_size));
             return ncclInvalidUsage;
         }
-        const size_t new_size = ((layout.total_bytes + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES) *
-                                NUM_BUFFER_ALIGNMENT_BYTES;
+        const size_t new_size = std::max(
+            ((needed_bytes + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES,
+            ep_group->rdma_buffer_size_alloc);
+        // The resize re-creates the Lamport region (at the new capacity) before its collective registration.
+        ep_group->ll_lamport_region = lamport_shape;
         NCCLCHECK(ll_resize_rdma_buffer(ep_group, new_size));
+        *reallocated = true;
+    } else if (lamport_capacity_grows) {
+        // A user-specified buffer that has room: the region is created at the tail of the existing buffer.
+        ep_group->ll_lamport_region = nccl_ep::lamport_region_at_tail(lamport_shape, ep_group->rdma_buffer_size_alloc);
+        NCCLCHECK(ll_lamport_install(ep_group));
     }
-    assert(layout.total_bytes <= ep_group->rdma_buffer_size_alloc);
+    ep_group->ll_max_layout_bytes = layout_bytes;
+    assert(
+        layout_bytes <=
+        (ep_group->ll_lamport_region.valid() ? ep_group->ll_lamport_region.round_offset
+                                             : ep_group->rdma_buffer_size_alloc));
+    return ncclSuccess;
+}
+
+static ncclResult_t
+ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor_t* handle_mem, int num_topk) {
+    NCCLCHECK(validate_ll_geometry(ep_group, num_topk));
+
+    auto layout = ll_layout_for(ep_group, handle->layout, num_topk);
+
+    auto hier = ep_group->ll_hier;
+    if (hier.numLogicalCtas != 0) {
+        ll::hierOverlayLayout(layout, hier, ep_group->config.max_dispatch_tokens_per_rank,
+                               ep_group->nRanks, ep_group->ll_payload_slot_stride);
+    }
+
+    bool resized = false;
+    NCCLCHECK(ll_ensure_buffer(ep_group, handle->layout, layout.total_bytes, num_topk, &resized));
 
     if (hier.numLogicalCtas != 0) {
         if (!resized && ep_group->ll_payload_slot_stride != 0 &&
@@ -5542,14 +5665,19 @@ nccl_ep::ll::NcclEpDispatchLsaMode resolve_dispatch_lsa_mode(const ncclEpEnvConf
     }
 }
 
-// Maps env.combine_lsa (NCCL_EP_COMBINE_LSA, choices {"2sided", "1sided", "universal"} indexed
-// 0/1/2) to the kernel it enforces (ll::LlCombineKernel); unset is kNone (see combine_lsa's doc
-// comment in nccl_ep_env.h).
+// Maps env.combine_lsa (NCCL_EP_COMBINE_LSA, choices {"2sided", "1sided", "universal", "lamport"}
+// indexed 0/1/2/3) to the kernel it enforces (ll::LlCombineKernel); unset is kNone (see
+// combine_lsa's doc comment in nccl_ep_env.h). The case labels below are positions in
+// ncclEpEnvConfig::combine_lsa_modes; the assertions keep them tied to it.
+static_assert(std::string_view(ncclEpEnvConfig::combine_lsa_modes[0]) == "2sided", "combine_lsa_modes[0]");
+static_assert(std::string_view(ncclEpEnvConfig::combine_lsa_modes[1]) == "1sided", "combine_lsa_modes[1]");
+static_assert(std::string_view(ncclEpEnvConfig::combine_lsa_modes[3]) == "lamport", "combine_lsa_modes[3]");
 ll::LlCombineKernel resolve_combine_enforced_kernel(const ncclEpEnvConfig& env) {
     if (!env.combine_lsa.is_set) return ll::LlCombineKernel::kNone;
     switch (env.combine_lsa.value.ul) {
         case 0: return ll::LlCombineKernel::k2SidedRmLsa;
         case 1: return ll::LlCombineKernel::k1SidedRmLsa;
+        case 3: return ll::LlCombineKernel::k2SidedLamportRmLsa;
         default: return ll::LlCombineKernel::kDefault;
     }
 }
@@ -7730,6 +7858,8 @@ ncclResult_t ncclEpCombine(
                 params.rdmaBuf = rdma_buf;
                 params.sendOff = buffer.combine_rdma_send_buffer_offset;
                 params.recvOff = buffer.combine_rdma_recv_data_buffer_offset;
+                // The group's region, not the handle's layout: the offsets do not depend on the handle.
+                params.lamport = nccl_ep::LamportView(handle->group->ll_lamport_region, handle->group->ll_lamport_state);
                 params.recvFlagOff = buffer.combine_rdma_recv_flag_buffer_offset;
                 params.readDoneOffBase = buffer.combine_rdma_read_done_buffer_offset;
                 params.lsaSignalingCleanCount = buffer.lsa_signaling_clean_int_count;
@@ -7756,6 +7886,8 @@ ncclResult_t ncclEpCombine(
                 params.deviceSm = handle->group->device_sm;
                 params.maxDynamicSmem = handle->group->max_dynamic_smem;
                 params.resolvedWarpsPerGroup = &handle->group->last_ll_combine_warps_per_group;
+                params.resolvedKernelOut = &handle->group->last_ll_combine_kernel;
+                params.logFallback = nccl_ep_env_flag_on(handle->group->env.debug);
                 params.rankMask = handle->group->mask_buffer;
                 params.asyncErrorFlag = handle->group->async_error_flag;
                 params.timeoutCycles = handle->group->timeout_cycles;
@@ -8425,6 +8557,17 @@ ncclResult_t ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) {
     clean_params.timeoutCycles = ep_group->timeout_cycles;
     clean_params.deviceSm = ep_group->device_sm;
 
+    // Lamport combine: the clean kernel re-poisons both landing segments (byte lamport::kSentinelByte), zeroes the round
+    // words and restarts the round counter in its zero step, between its two mask-aware barriers: a rank that never
+    // arrives is skipped after the timeout, like for the cleaning itself, and the post-clean barrier orders the poison
+    // against every unmasked rank's next combine. (A communicator-wide barrier here would hang the survivors when a
+    // masked rank never arrives, which is the situation this function recovers from.) The region is the group's, not
+    // derived from the layout above, which is only used for the clean offsets.
+    if (ep_group->ll_lamport_region.valid()) {
+        const nccl_ep::LamportRegion& region = ep_group->ll_lamport_region;
+        clean_params.lamport = nccl_ep::LamportReset(rdma_base, region, ep_group->ll_lamport_state);
+    }
+
     NCCLCHECK(nccl_ep::ll::call_clean_low_latency_buffer(
         clean_params, stream, nccl_ep_env_flag_on(ep_group->env.nucs)));
 
@@ -8604,6 +8747,34 @@ ncclResult_t ncclEpGroup_test_setMaxDynamicSmem(ncclEpGroup_t group, int max_dyn
     group->max_dynamic_smem = max_dynamic_smem;
     group->last_ll_combine_warps_per_group = 0;
     return ncclSuccess;
+}
+
+ncclResult_t ncclEpGroup_test_setTimeoutCycles(ncclEpGroup_t group, unsigned long long cycles) {
+    if (group == nullptr || cycles == 0) {
+        return ncclInvalidArgument;
+    }
+    group->timeout_cycles = cycles;
+    return ncclSuccess;
+}
+
+unsigned long long ncclEpGroup_test_getTimeoutCycles(ncclEpGroup_t group) {
+    return group == nullptr ? 0 : group->timeout_cycles;
+}
+
+ncclResult_t ncclEpGroup_test_getLamportSegments(
+    ncclEpGroup_t group, const void** segment0, size_t* segment_stride, size_t* slot_bytes) {
+    if (group == nullptr || !group->ll_lamport_region.valid() || group->rdma_buffer == nullptr) {
+        return ncclInvalidUsage;
+    }
+    const nccl_ep::LamportRegion& region = group->ll_lamport_region;
+    *segment0 = static_cast<const char*>(group->rdma_buffer) + region.recv_offset;
+    *segment_stride = region.segment_stride;
+    *slot_bytes = region.slot_bytes;
+    return ncclSuccess;
+}
+
+int ncclEpGroup_test_getLastLlCombineKernel(ncclEpGroup_t group) {
+    return group == nullptr ? -1 : group->last_ll_combine_kernel;
 }
 
 int ncclEpGroup_test_getLastLlCombineWarpsPerGroup(ncclEpGroup_t group) {

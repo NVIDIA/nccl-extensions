@@ -71,6 +71,19 @@ int ncclEpGroup_test_getLastLlCombineWarpsPerGroup(ncclEpGroup_t group);
 // architecture it was resolved for, or zeros when the group has not launched one.
 void ncclEpGroup_test_getLastCombinePushLaunch(
     ncclEpGroup_t group, int* chunk_int4, unsigned int* device_sm);
+
+// The nccl_ep::ll::LlCombineKernel (device/ll_ep_adapter.cuh) that the last LL combine of the group resolved to, or -1
+// when none ran. Recorded on the host at call time, so it is valid right after ncclEpCombine returns.
+int ncclEpGroup_test_getLastLlCombineKernel(ncclEpGroup_t group);
+
+// Device wait timeout (GPU clock cycles) that later launches of the group use, for fault-injection tests; per process.
+ncclResult_t ncclEpGroup_test_setTimeoutCycles(ncclEpGroup_t group, unsigned long long cycles);
+unsigned long long ncclEpGroup_test_getTimeoutCycles(ncclEpGroup_t group);
+
+// Lamport combine: this rank's landing segment 0, the distance to segment 1 and the size of one receive slot, so a
+// test can inspect what peers have stored. ncclInvalidUsage when the group has no Lamport region yet.
+ncclResult_t ncclEpGroup_test_getLamportSegments(
+    ncclEpGroup_t group, const void** segment0, size_t* segment_stride, size_t* slot_bytes);
 // Return the group budgets (expert-major for HT); use the handle accessor for flat.
 void ncclEpGroup_test_getSmBudgets(
     ncclEpGroup_t group, unsigned int* dispatch_num_sms, unsigned int* combine_num_sms);

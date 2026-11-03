@@ -14,6 +14,7 @@
 #include "quantization_recipe.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 
 namespace nccl_ep {
@@ -340,8 +341,30 @@ ncclResult_t call_combine(const CombineParams<WeightT>& params, cudaStream_t str
         return ncclInvalidArgument;
     }
 
+    // An enforced LSA kernel is only honored where it can run (see ll_combine_select_kernel); say so once, on request.
+    if (params.logFallback && combine_kernel == LlCombineKernel::kDefault &&
+        params.enforced != LlCombineKernel::kNone && params.enforced != LlCombineKernel::kDefault) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            std::fprintf(
+                stderr,
+                "[nccl_ep] LL combine: the NCCL_EP_COMBINE_LSA kernel %s cannot run this call (nvlink_only=%d, "
+                "rank_major=%d, quantized=%d, logfmt=%d, cft=%d, attn_ranks=%d, hidden=%d); using the general "
+                "combine kernel. Logged once per process.\n",
+                jit::ll_combine_kernel_name(params.enforced), static_cast<int>(params.nvlinkOnly),
+                static_cast<int>(params.layout == NCCL_EP_LAYOUT_RANK_MAJOR),
+                static_cast<int>(params.quantizationRecipe != NCCL_EP_COMB_QUANT_NONE),
+                static_cast<int>(params.useLogFmt), static_cast<int>(params.cftEnabled), params.numAttnRanks,
+                params.hidden);
+        }
+    }
+
+    if (params.resolvedKernelOut != nullptr) {
+        *params.resolvedKernelOut = static_cast<int>(combine_kernel);
+    }
     const bool lsaCombineEligible = combine_kernel == LlCombineKernel::k2SidedRmLsa ||
-        combine_kernel == LlCombineKernel::k1SidedRmLsa || combine_kernel == LlCombineKernel::kAutoRmLsa;
+        combine_kernel == LlCombineKernel::k1SidedRmLsa || combine_kernel == LlCombineKernel::kAutoRmLsa ||
+        combine_kernel == LlCombineKernel::k2SidedLamportRmLsa;
     const int max_dynamic_smem_for_combine =
         params.maxDynamicSmem - (lsaCombineEligible ? combine_smem::kLsaStaticSmemBytes : 0);
     const combine_smem_config_t smem_config = choose_combine_smem_config(
@@ -405,6 +428,7 @@ ncclResult_t call_combine(const CombineParams<WeightT>& params, cudaStream_t str
     args.sendOff = params.sendOff;
     args.recvOff = params.recvOff;
     args.recvFlagOff = params.recvFlagOff;
+    args.lamport = params.lamport;
     args.readDoneOffBase = params.readDoneOffBase;
     args.combineSync = combineSync;
     args.want1SidedBuf = params.want1SidedBuf;
@@ -463,6 +487,7 @@ call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStr
     args.devComm = params.devComm;
     args.barrierSignalBase = params.barrierSignalBase;
     args.timeoutCycles = params.timeoutCycles;
+    args.lamport = params.lamport;
 
     return jit::launch_ll_clean_low_latency_buffer(args, params.deviceSm, stream, nucs);
 }

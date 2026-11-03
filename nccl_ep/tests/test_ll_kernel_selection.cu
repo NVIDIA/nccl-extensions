@@ -262,6 +262,48 @@ TEST(LlKernelSelection, OneSidedRequiresInDomainEligibility) {
         LlCombineKernel::kDefault);
 }
 
+// The Lamport combine owns its own epoch state and leaves the LL epoch and every signalling bank to dispatch, so a
+// Lamport request that the call cannot honor falls back to the default combine silently, like the 2-sided request: no
+// error, and no dependence of the dispatch on the environment value.
+TEST(LlKernelSelection, LamportFallsBackSilentlyWhenIneligible) {
+    const bool eligible = ll_combine_lsa_eligible(
+        true, NCCL_EP_COMB_QUANT_NONE, false, NCCL_EP_LAYOUT_RANK_MAJOR, false, 7168, ncclBfloat16,
+        NcclEpDispatchLsaMode::kTma);
+    ASSERT_TRUE(eligible);
+    EXPECT_EQ(
+        ll_combine_select_kernel(LlCombineKernel::k2SidedLamportRmLsa, eligible, false),
+        LlCombineKernel::k2SidedLamportRmLsa);
+    // One-sided eligibility is irrelevant to it.
+    EXPECT_EQ(
+        ll_combine_select_kernel(LlCombineKernel::k2SidedLamportRmLsa, eligible, true),
+        LlCombineKernel::k2SidedLamportRmLsa);
+
+    struct Ineligible {
+        bool nvlink_only;
+        ncclEpCombQuant_t recipe;
+        bool log_fmt;
+        ncclEpLayout_t layout;
+        int hidden;
+        int attn_ranks;
+    };
+    const Ineligible cases[] = {
+        {false, NCCL_EP_COMB_QUANT_NONE, false, NCCL_EP_LAYOUT_RANK_MAJOR, 7168, 0},     // not NVLink-only
+        {true, NCCL_EP_COMB_QUANT_NONE, true, NCCL_EP_LAYOUT_RANK_MAJOR, 7168, 0},       // LogFMT
+        {true, NCCL_EP_COMB_QUANT_NONE, false, NCCL_EP_LAYOUT_EXPERT_MAJOR, 7168, 0},    // expert-major
+        {true, NCCL_EP_COMB_QUANT_NONE, false, NCCL_EP_LAYOUT_RANK_MAJOR, 2880, 0},      // partial tile
+        {true, NCCL_EP_COMB_QUANT_NONE, false, NCCL_EP_LAYOUT_RANK_MAJOR, 7168, 2},      // attention ranks
+    };
+    for (const auto& c : cases) {
+        const bool not_eligible = ll_combine_lsa_eligible(
+            c.nvlink_only, c.recipe, c.log_fmt, c.layout, false, c.hidden, ncclBfloat16, NcclEpDispatchLsaMode::kTma,
+            c.attn_ranks);
+        EXPECT_FALSE(not_eligible);
+        EXPECT_EQ(
+            ll_combine_select_kernel(LlCombineKernel::k2SidedLamportRmLsa, not_eligible, false),
+            LlCombineKernel::kDefault);
+    }
+}
+
 // run_tests.sh runs these checks with NCCL_EP_LL_CFT_LSA both enabled and disabled.
 TEST(LlKernelSelection, CftDispatchSelection) {
     const auto expected = ll_cft_lsa_enabled() ? LlDispatchAlgo::kCftRmLsa : LlDispatchAlgo::kDefault;

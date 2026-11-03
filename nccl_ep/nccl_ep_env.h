@@ -112,25 +112,38 @@ struct ncclEpEnvConfig {
     // Unset: model-based AUTO. 0: baseline. 1: force Hierarchical (Direct/relay protocol).
     ncclEpEnvVar ll_hier_dispatch{"NCCL_EP_LL_HIER_DISPATCH", ncclEpEnvType::flag};
     ncclEpEnvVar ll_hier_full_gin{"NCCL_EP_LL_HIER_FULL_GIN", ncclEpEnvType::flag};
-    // Selects which LL dispatch kernel family an otherwise LSA-eligible call (nvlinkOnly,
-    // rank-major) uses: "simt" = dispatch_kernel_impl_2sided_rm_lsa, "tma" (default when unset) =
-    // dispatch_kernel_impl_2sided_rm_lsa_tma, "universal" = the general dispatch_kernel_impl in
-    // ll_ep.cuh regardless of LSA eligibility. See NcclEpDispatchLsaMode's doc comment in
-    // device/ll_ep_adapter.cuh.
+    // Selects which LL dispatch kernel family an otherwise LSA-eligible call uses: "simt" =
+    // dispatch_kernel_impl_2sided_rm_lsa, "tma" (default when unset) = dispatch_kernel_impl_2sided_rm_lsa_tma,
+    // "universal" = the general dispatch_kernel_impl in ll_ep.cuh regardless of LSA eligibility. The LSA kernels
+    // are LSA-only and come with limits, and forcing one only takes effect where it can run: the call must be
+    // rank-major, in an NVLink-only group, without an attention-FFN split, with a quantization recipe of NONE, FWD
+    // or DS_FP8E3M4, and a hidden size that is a multiple of the warp tile (with CFT: recipe NONE and
+    // NCCL_EP_LL_CFT_LSA enabled). Any other call uses the general kernel, without an error. See
+    // NcclEpDispatchLsaMode's doc comment in device/ll_ep_adapter.cuh.
     static constexpr const char* dispatch_lsa_modes[] = {"simt", "tma", "universal", nullptr};
     ncclEpEnvVar dispatch_lsa{"NCCL_EP_DISPATCH_LSA", ncclEpEnvType::choice, dispatch_lsa_modes};
     // Quantization workers in addition to the TMA/control warp, LL DSFP8 only.
     // Default is two workers. Invalid settings are rejected when launching
     // DSFP8 TMA dispatch rather than silently restoring the default.
     ncclEpEnvVar ll_tma_quant_warps{"NCCL_EP_LL_TMA_QUANT_WARPS", ncclEpEnvType::ulong};
-    // Selects the LL combine protocol: "2sided" always uses combine_kernel_impl_2sided_rm_lsa and
-    // "1sided" always uses combine_kernel_impl_1sided_rm_lsa, both requiring LSA eligibility
-    // (errors otherwise); "universal" always uses the general kDefault kernel regardless of LSA
-    // eligibility, mirroring dispatch_lsa's "universal"; UNSET (default) is "auto" -- the pick is
-    // made by dispatch (not combine), on-device, from whether any active peer's published count
-    // exceeds combine_lsa_threshold below, and consumed as-is by combine at kernel entry. See
-    // combine_lsa handling in nccl_ep.cc and LlCombineKernel in jit/ll_combine_jit.cuh.
-    static constexpr const char* combine_lsa_modes[] = {"2sided", "1sided", "universal", nullptr};
+    // Selects the LL combine protocol. Every kernel but "universal" is LSA-only and comes with limits, and
+    // forcing one only takes effect where it can run: a call that is not LSA-eligible uses the general kDefault
+    // kernel, without an error (NCCL_EP_DEBUG prints a line once). LSA-eligible means rank-major layout, an
+    // NVLink-only group, unquantized tokens (no recipe, no LogFMT), no attention-FFN split, a hidden size that
+    // is a multiple of the receive tile, and a dispatch that wipes the next bank (not general CFT).
+    //   "2sided":    combine_kernel_impl_2sided_rm_lsa for LSA-eligible calls.
+    //   "1sided":    combine_kernel_impl_1sided_rm_lsa; in addition BF16 tokens, STORE transport (no CFT), a
+    //                zero-copy group with a windowed input, and a dispatch that did not disqualify it. An
+    //                LSA-eligible call that cannot meet these fails with ncclInvalidArgument.
+    //   "lamport":   opt-in barrier-free receive, see docs/plc/401-ll-combine-lamport, for LSA-eligible
+    //                calls; it also makes handle creation collective.
+    //   "universal": the general kernel regardless of LSA eligibility, mirroring dispatch_lsa's "universal".
+    // The setting (unset included) must be the same on every rank: it selects the combine wire protocol, so
+    // ncclEpCreateGroup rejects a mismatch.
+    // UNSET (default) is "auto" -- the pick is made by dispatch (not combine), on-device, from whether any
+    // active peer's published count exceeds combine_lsa_threshold below, and consumed as-is by combine at
+    // kernel entry. See combine_lsa handling in nccl_ep.cc and LlCombineKernel in jit/ll_combine_jit.cuh.
+    static constexpr const char* combine_lsa_modes[] = {"2sided", "1sided", "universal", "lamport", nullptr};
     ncclEpEnvVar combine_lsa{"NCCL_EP_COMBINE_LSA", ncclEpEnvType::choice, combine_lsa_modes};
     // Threshold above which combine_lsa's auto mode picks 1-sided over 2-sided -- read and applied
     // by dispatch (dispatch_kernel_args_t::combineLsaThreshold), not combine. Unset defaults to 512

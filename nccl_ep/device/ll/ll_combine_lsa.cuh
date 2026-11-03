@@ -14,6 +14,7 @@
 #include "ll_common.cuh"
 #include "ll_lsa_primitives.cuh"
 #include "ll_mask.cuh"
+#include "../lamport.cuh"
 
 namespace cg = cooperative_groups;
 
@@ -96,6 +97,17 @@ __forceinline__ __device__ void sendRankFinishFlagLsa(
     }
 }
 
+// A peer timed out: mask it (a trap without a rank mask, since nothing could skip it) and raise the async error.
+__forceinline__ __device__ void maskTimedOutPeer(int* rankMask, int peer, int* asyncErrorFlag) {
+    if (rankMask == nullptr) {
+        trap();
+    }
+    atomicExch(rankMask + peer, 0);
+    if (asyncErrorFlag != nullptr) {
+        atomicExch_system(asyncErrorFlag, 1);
+    }
+}
+
 // Rank-centric recv-side readiness wait, mirroring ll_dispatch_lsa.cuh's
 // syncAndRecvCounts closely: up to numRanks threads each independently
 // confirm one active peer's finish flag has landed in parallel (relaxed
@@ -147,9 +159,7 @@ __forceinline__ __device__ void waitForAllRanksFinishLsa(
         } while (!flagReady && waitCost <= timeoutCycles);
         if (waitCost > timeoutCycles) {
             printf("Warning: NCCL EP timeout for combine receive, rank %d, src_rank %d\n", currRank, peer);
-            if (rankMask == nullptr) trap();
-            atomicExch(rankMask + peer, 0);
-            if (asyncErrorFlag != nullptr) atomicExch_system(asyncErrorFlag, 1);
+            maskTimedOutPeer(rankMask, peer, asyncErrorFlag);
         } else {
             // Confirmed ready by this CTA's own poll.
             atomicOr(&activeRankMask[peer / 32], 1u << (peer % 32));
@@ -200,16 +210,170 @@ __forceinline__ __device__ void decodeAndAccumulateLsa(
     }
 }
 
+// Inverse of decodeAndAccumulateLsa: packs the fp32 accumulators back to the BF16/FP16/FP32 wire words.
+template <int kNumRecvUnrolls, ncclDataType_t kTokenDtype>
+__forceinline__ __device__ void encodeCombinedLsa(uint32_t* stBuffer, const float* combinedData) {
+#pragma unroll
+    for (int k = 0; k < kNumRecvUnrolls * 4; ++k) {
+        uint32_t packed;
+        if constexpr (kTokenDtype == ncclFloat32) {
+            packed = *reinterpret_cast<const uint32_t*>(&combinedData[k]);
+        } else if constexpr (kTokenDtype == ncclFloat16) {
+            auto fp16Pack =
+                __half2(__float2half(combinedData[k * 2]), __float2half(combinedData[k * 2 + 1]));
+            packed = *reinterpret_cast<uint32_t*>(&fp16Pack);
+        } else {
+            auto bf16Pack = __nv_bfloat162(combinedData[k * 2], combinedData[k * 2 + 1]);
+            packed = *reinterpret_cast<uint32_t*>(&bf16Pack);
+        }
+        stBuffer[k] = packed;
+    }
+}
+
+// Lamport combine round words: roundWords[p] in this rank's memory is the number of combine rounds peer p has started
+// (p writes round + 1 during its round, after its sends). This rank may write round r into p's segment r % 2 only once
+// roundWords[p] >= r, i.e. p has started round r - 1 and therefore finished round r - 2, the previous user of that
+// segment. See docs/plc/401-ll-combine-lamport.
+
+// Publish "this rank is in `round`" (so its previous round has retired) to every active peer: one relaxed store per
+// peer, spread over the grid starting at the highest CTA (peer = (numSms - 1 - smId) + numSms * threadId): the lowest
+// CTAs hold the receive vectors of small batches, and their warps must not be delayed by the peer-pointer lookup. Called
+// after the sends.
+__forceinline__ __device__ void publishLamportRoundLsa(
+    int smId,
+    int numSms,
+    int threadId,
+    int numRanks,
+    int currRank,
+    unsigned int round,
+    int* roundWords,
+    size_t roundWordsOff,
+    int* rankMask,
+    const ncclWindow_t* windows,
+    ncclDevComm* devComm) {
+    const int peer = (numSms - 1 - smId) + numSms * threadId;
+    if (peer >= numRanks || isRankMasked(rankMask, peer)) {
+        return;
+    }
+    const uint64_t localPtr = reinterpret_cast<uint64_t>(roundWords + currRank);
+    const size_t localOff = roundWordsOff + static_cast<size_t>(currRank) * sizeof(int);
+    const uint64_t dstPtr = ncclGetP2pPtr(localPtr, localOff, currRank, peer, windows, devComm);
+    st_relaxed_sys_global(reinterpret_cast<int*>(dstPtr), static_cast<int>(round + 1));
+}
+
+// Wait until dstRank has started round `round - 1` (roundWords[dstRank] >= round, wrap-safe: lamport::round_reached)
+// before the first store into its segment: one warp-coalesced load in the common case. The word is read only here, by
+// the sending warps: a read by every thread at kernel entry made the single line a hot spot that cost about a
+// microsecond. Timeouts are handled
+// like a missing peer in the receive: the destination is masked, the error flag raised and false returned, and the
+// caller must not store into its segment (the peer may still be consuming round `round - 2` there). Warp-collective
+// (all lanes read the same word); the result is warp-uniform.
+__forceinline__ __device__ bool waitLamportRoundLsa(
+    const int* roundWord,
+    unsigned int round,
+    int dstRank,
+    int currRank,
+    int* rankMask,
+    uint64_t timeoutCycles,
+    int* asyncErrorFlag,
+    int* shTimeoutReports) {
+    const auto startTime = clock64();
+    bool ready = false;
+    bool expired = false;
+    do {
+        ready = __all_sync(
+            0xffffffffu, lamport::round_reached(static_cast<unsigned int>(ld_volatile_global(roundWord)), round));
+        expired = !ready && __any_sync(0xffffffffu, static_cast<uint64_t>(clock64() - startTime) > timeoutCycles);
+    } while (!ready && !expired);
+    if (!ready) {
+        if (atomicAdd(shTimeoutReports, 1) == 0) {
+            printf("Warning: NCCL EP timeout for Lamport combine round of peer %d, rank %d\n", dstRank, currRank);
+        }
+        maskTimedOutPeer(rankMask, dstRank, asyncErrorFlag);
+    }
+    return ready;
+}
+
+// Pending round check of a sending warp group (Lamport combine): consumed by processAndSendTokenLsa after the first
+// stage load has been issued and before the first bulk store, so that the word's latency overlaps the load. `word`
+// is nullptr when nothing is to be checked (2-sided combine, masked destination, or already done).
+struct LamportRoundCheck {
+    const int* word;
+    unsigned int round;
+    int dstRank;
+    uint64_t timeoutCycles;
+    int* asyncErrorFlag;
+    int* shTimeoutReports;
+    // Set when the wait timed out: the destination may still be consuming the segment's previous round, so this warp
+    // issues no store to it for the rest of the kernel. The struct outlives the tokens of the warp group, which is
+    // what carries the decision from the first token to the later ones.
+    bool closed;
+};
+
+// Runs the pending round check once (warp-collective) and records a timeout in `closed`. Returns whether this token may
+// store into the destination.
+__forceinline__ __device__ bool consumeLamportRoundCheck(LamportRoundCheck& roundCheck, int currRank, int* rankMask) {
+    if (roundCheck.word == nullptr) {
+        return true;
+    }
+    const bool dstOpen = waitLamportRoundLsa(
+        roundCheck.word, roundCheck.round, roundCheck.dstRank, currRank, rankMask, roundCheck.timeoutCycles,
+        roundCheck.asyncErrorFlag, roundCheck.shTimeoutReports);
+    roundCheck.word = nullptr;
+    roundCheck.closed = !dstOpen;
+    __syncwarp();
+    return dstOpen;
+}
+
+// Send-side hooks of processAndSendTokenLsa: what the Lamport combine adds to the 2-sided send, and what the plain
+// 2-sided send leaves out. Both are consumed through the same three calls.
+struct PlainSendHooks {
+    // The destination was closed by an earlier token (never, here).
+    __device__ constexpr bool closed() const {
+        return false;
+    }
+    // Runs once per warp group, after the first stage load is issued; whether this token may store.
+    __device__ constexpr bool openDestination(int, int*) {
+        return true;
+    }
+    // Rewrites the stage between its TMA load and the bulk store.
+    template <int kNumSendUnrolls>
+    __device__ void encodeStage(uint4*, int) const {}
+};
+
+// The Lamport combine: the destination's round check, and the sentinel rewrite of each stage in shared memory between
+// the TMA load and the bulk store, overlapped with the in-flight load of the next stage and the store of the previous
+// one. The round check is consumed once, after the first stage load is issued and before the first bulk store.
+template <uint32_t kSanitizedWord>
+struct LamportSendHooks {
+    LamportRoundCheck roundCheck;
+
+    __device__ bool closed() const {
+        return roundCheck.closed;
+    }
+    __device__ bool openDestination(int currRank, int* rankMask) {
+        return consumeLamportRoundCheck(roundCheck, currRank, rankMask);
+    }
+    template <int kNumSendUnrolls>
+    __device__ void encodeStage(uint4* stage, int laneId) const {
+        lamport::sanitize_stage<kNumSendUnrolls, kSanitizedWord>(stage, laneId);
+        tma_store_fence();
+        __syncwarp();
+    }
+};
+
 // LSA-only counterpart of processAndSendToken: copies one combined token's
 // payload via TMA from `srcDataInt4Ptr` (or the local send-staging slot,
 // when `zeroCopy` is set) directly into the peer's already-resolved,
 // already-nonzero P2P destination -- unquantized, non-LogFMT BF16-family
 // wire format only, so there is no smem quantization/packing step and no
 // RDMA fallback (dstP2pPtr is asserted nonzero, never checked against 0).
+// `hooks` (PlainSendHooks or LamportSendHooks) carry what differs between the plain 2-sided send and the Lamport one.
 template <
     int kNumSendUnrolls,
     int kNumStages,
     int kNumPrefetch,
+    typename SendHooksT,
     typename TmaBuffersT,
     typename FullBarriersT,
     typename TmaLoadAndArriveT>
@@ -223,8 +387,15 @@ __forceinline__ __device__ void processAndSendTokenLsa(
     FullBarriersT fullBarriers,
     uint32_t& tmaPhase,
     TmaLoadAndArriveT& tmaLoadAndArrive,
+    SendHooksT& hooks,
+    int currRank,
+    int* rankMask,
     int laneId) {
     EP_DEVICE_ASSERT(dstP2pPtr != 0);
+    // A destination closed by an earlier token: nothing is loaded or stored (warp-uniform).
+    if (hooks.closed()) {
+        return;
+    }
     const int kNumIters = hiddenBf16Int4 / (32 * kNumSendUnrolls);
     constexpr int kNumTmaBytes = 32 * kNumSendUnrolls * sizeof(int4);
 
@@ -236,6 +407,11 @@ __forceinline__ __device__ void processAndSendTokenLsa(
         tmaLoadAndArrive(0, copySrcPtr, kNumTmaBytes);
     }
     __syncwarp();
+    // False once the destination's round check has timed out: its segment may still be in use by round `round - 2`, so
+    // no store below may be issued for this token (its loads and barriers still run, which keeps the pipeline state
+    // consistent). Later tokens of the warp see hooks.closed() and return before issuing anything. In the shadow of the
+    // first stage load: no store below may be issued before the destination has started the previous round.
+    const bool dstOpen = hooks.openDestination(currRank, rankMask);
 
 #pragma unroll
     for (int i = laneId * kNumSendUnrolls, iterIdx = 0; i < hiddenBf16Int4; i += 32 * kNumSendUnrolls, ++iterIdx) {
@@ -253,8 +429,10 @@ __forceinline__ __device__ void processAndSendTokenLsa(
         EP_STATIC_ASSERT(kNumStages < 32, "Too many stages");
         mbarrier_wait<true>(fullBarriers[stageIdx], tmaPhase, stageIdx);
 
+        hooks.template encodeStage<kNumSendUnrolls>(reinterpret_cast<uint4*>(tmaBuffers[stageIdx]), laneId);
+
         // BF16-family original values, unquantized, no LogFMT packing.
-        if (elect_one_sync()) {
+        if (dstOpen && elect_one_sync()) {
             tma_store_1d(tmaBuffers[stageIdx], copyDstPtr + i, kNumTmaBytes);
         }
         __syncwarp();
@@ -314,21 +492,8 @@ __forceinline__ __device__ void combineReduceTokenLsa(
     }
     tma_store_wait<0>();
 
-#pragma unroll
-    for (int k = 0; k < kNumRecvUnrolls * 4; ++k) {
-        uint32_t packed;
-        if constexpr (kTokenDtype == ncclFloat32) {
-            packed = *reinterpret_cast<uint32_t*>(&combinedData[k]);
-        } else if constexpr (kTokenDtype == ncclFloat16) {
-            auto fp16Pack =
-                __half2(__float2half(combinedData[k * 2]), __float2half(combinedData[k * 2 + 1]));
-            packed = *reinterpret_cast<uint32_t*>(&fp16Pack);
-        } else {
-            auto bf16Pack = __nv_bfloat162(combinedData[k * 2], combinedData[k * 2 + 1]);
-            packed = *reinterpret_cast<uint32_t*>(&bf16Pack);
-        }
-        tmaStBuffers[decodeWarpIdx][kNumRecvUnrolls * 4 * laneId + k] = packed;
-    }
+    encodeCombinedLsa<kNumRecvUnrolls, kTokenDtype>(
+        &tmaStBuffers[decodeWarpIdx][kNumRecvUnrolls * 4 * laneId], combinedData);
     tma_store_fence();
     if (elect_one_sync()) {
         const int storeOffsetInt4 = decodeWarpIdx * kNumRecvUnrolls * 32;
@@ -338,6 +503,60 @@ __forceinline__ __device__ void combineReduceTokenLsa(
             kNumBF16PerWarpBytes);
     }
     __syncwarp();
+}
+
+// CTA-scope barrier, then election of the last-finishing CTA of the grid (one release-scoped atomic per CTA): that CTA
+// runs publishOnLast once, after the acquire that pairs with the atomics. Shared by the 2-sided finish handshake
+// (syncAndSendFinishLsa) and the Lamport combine, which publishes nothing and only needs the election (round advance).
+template <typename PublishFn>
+__forceinline__ __device__ bool electLastCtaLsa(
+    int warpId, int numWarps, int laneId, int* ctaDone, int numSms, PublishFn&& publishOnLast) {
+    // Step 1: CTA-scope barrier (also a full memory fence at CTA scope, per
+    // bar.sync semantics) -- every write issued above by any warp of this
+    // CTA (this round's token sends) is visible to every thread in this CTA
+    // from this point on.
+    __syncthreads();
+
+    __shared__ bool shIsLastCta;
+
+    // Steps 2-4: elect the last-finishing CTA in the grid and have it, once,
+    // run publishOnLast.
+    if (warpId == numWarps - 1) {
+        // Step 2: one release-scoped atomic per CTA (not per responsible-expert
+        // channel). Every CTA in the grid reaches this exactly once (including
+        // ones with no responsible experts this round), so gridDim.x (==
+        // numSms) is the correct total.
+        int prevDone = 0;
+        if (laneId == 0) {
+            prevDone = atomic_add_release_global(ctaDone, 1);
+        }
+        prevDone = __shfl_sync(0xffffffff, prevDone, 0);
+        const bool isLastCta = (prevDone + 1 == numSms);
+        if (laneId == 0) {
+            shIsLastCta = isLastCta;
+        }
+
+        if (isLastCta) {
+            // Step 3: pairing acquire fence for the atomic release on ctaDone
+            // above -- required to observe every other CTA's preceding writes
+            // (their token sends) before publishing for them. Acquire-only:
+            // the release half belongs to publishOnLast, if it publishes.
+            memory_fence_acquire_gpu();
+            __syncwarp();
+
+            // Step 4: whatever the caller does once per grid.
+            publishOnLast();
+
+            if (laneId == 0) {
+                *ctaDone = 0;
+            }
+        }
+    }
+    // Propagate shIsLastCta (and, transitively, the electing warp's own
+    // fences above) from warpId == numWarps-1 to every other warp of this
+    // CTA -- CTA-local only, not a grid-wide barrier.
+    __syncthreads();
+    return shIsLastCta;
 }
 
 // SEND-phase completion for combine_kernel_impl_2sided_rm_lsa, mirroring
@@ -365,62 +584,160 @@ __forceinline__ __device__ bool syncAndSendFinishLsa(
     int* rankMask,
     const ncclWindow_t* windows,
     ncclDevComm* devComm) {
-    // Step 1: CTA-scope barrier (also a full memory fence at CTA scope, per
-    // bar.sync semantics) -- every write issued above by any warp of this
-    // CTA (this round's token sends) is visible to every thread in this CTA
-    // from this point on.
-    __syncthreads();
-
-    __shared__ bool shIsLastCta;
-
-    // Steps 2-4: elect the last-finishing CTA in the grid and have it, once,
-    // publish readiness to every peer.
-    if (warpId == numWarps - 1) {
-        // Step 2: one release-scoped atomic per CTA (not per responsible-expert
-        // channel). Every CTA in the grid reaches this exactly once (including
-        // ones with no responsible experts this round), so gridDim.x (==
-        // numSms) is the correct total.
-        int prevDone = 0;
-        if (laneId == 0) {
-            prevDone = atomic_add_release_global(ctaDone, 1);
-        }
-        prevDone = __shfl_sync(0xffffffff, prevDone, 0);
-        const bool isLastCta = (prevDone + 1 == numSms);
-        if (laneId == 0) {
-            shIsLastCta = isLastCta;
-        }
-
-        if (isLastCta) {
-            // Step 3: pairing acquire fence for the atomic release on ctaDone
-            // above -- required to observe every other CTA's preceding writes
-            // (their token sends) before publishing readiness for them.
-            // Acquire-only: the release half is provided by the
-            // fence.release.sys in step 4, which orders this thread's earlier
-            // accesses (and, cumulatively, every write it observed) before
-            // the flag stores.
-            memory_fence_acquire_gpu();
-            __syncwarp();
-
-            // Step 4: publish this rank's writes for this round (now provably
-            // visible, via the acquire above) to the whole system before
-            // telling peers we're done, then one relaxed store per active
-            // peer (see sendRankFinishFlagLsa).
-            memory_fence_release_sys();
+    // Publish this rank's writes for this round (now provably visible, via
+    // the election's acquire) to the whole system before telling peers we're
+    // done, then one relaxed store per active peer (see sendRankFinishFlagLsa).
+    return electLastCtaLsa(warpId, numWarps, laneId, ctaDone, numSms, [&] {
+        memory_fence_release_sys();
 #pragma unroll 1
-            for (int dstRank = laneId; dstRank < numRanks; dstRank += 32) {
-                sendRankFinishFlagLsa(dstRank, currRank, recvFlagBuf, recvFlagOff, rankMask, windows, devComm);
+        for (int dstRank = laneId; dstRank < numRanks; dstRank += 32) {
+            sendRankFinishFlagLsa(dstRank, currRank, recvFlagBuf, recvFlagOff, rankMask, windows, devComm);
+        }
+    });
+}
+
+// SEND phase of the 2-sided LSA combine kernels. The warp group that owns responsibleExpertIdx TMA-pushes every token
+// it received from dstRank into that rank's landing slot (tokenIdx * numTopk + j_eff) of recvBuf, rank-major; the warps
+// of the group split the tokens. recvOff is recvBuf's offset in the window (p2p address translation).
+// `hooks`: PlainSendHooks, or LamportSendHooks to encode the payload for the Lamport receiver (processAndSendTokenLsa).
+template <int kHidden, int kNumTopk, ncclDataType_t kTokenDtype, typename SendHooksT>
+__device__ __forceinline__ void combineSendTokensLsa(
+    const void* inData,
+    const int* srcInfo,
+    int* rankMask,
+    void* sendBuf,
+    void* recvBuf,
+    size_t recvOff,
+    uint8_t* smemBuffer,
+    int warpId,
+    int laneId,
+    int subWarpId,
+    int responsibleExpertIdx,
+    int numWarpsPerGroup,
+    int maxTokensPerRank,
+    int numExperts,
+    int numLocalExperts,
+    int currRank,
+    int numRanks,
+    bool zeroCopy,
+    ncclDevComm* devComm,
+    const ncclWindow_t* windows,
+    SendHooksT hooks) {
+    constexpr int numTopk = kNumTopk;
+    constexpr int kElemBytes = (kTokenDtype == ncclFloat32) ? 4 : 2;
+    constexpr int kNumElemsPerInt4 = combine_smem::elements_per_int4(kElemBytes);
+    constexpr int kWarpSize = combine_smem::kWarpSize;
+    constexpr int64_t hiddenBf16Int4 = kHidden / kNumElemsPerInt4;
+    constexpr int kNumSendUnrolls = combine_smem::send_unrolls(kHidden, kElemBytes);
+    // Wire slot size, see numBytesPerSlot in the kernels.
+    constexpr size_t numBytesPerSlot = align(
+        static_cast<size_t>(kHidden * kElemBytes +
+                            kHidden / combine_smem::kLogFmtElementsPerMeta * sizeof(nv_bfloat162)),
+        sizeof(int4));
+
+    if (responsibleExpertIdx >= numExperts) {
+        return;
+    }
+    const auto dstRank = responsibleExpertIdx / numLocalExperts;
+    // Each pair of rank establish numLocalExperts channels for parallelization
+    const auto rankLaneIdx = responsibleExpertIdx % numLocalExperts;
+
+    auto slotsPerToken = numTopk + 1; // token_id + topk_idx's
+    // We have numRanks entries with per-rank count first, then the rest is (tokenId + numTopk) entries for each token
+    const auto localSrcInfo = srcInfo + numRanks + dstRank * maxTokensPerRank * slotsPerToken;
+
+    // TMA stuffs
+    constexpr int kNumTMABufferBytes = sizeof(int4) * kWarpSize * kNumSendUnrolls;
+    constexpr int kNumStages = combine_smem::kNumStages;
+    constexpr int kNumPrefetch = combine_smem::kNumTmaPrefetch;
+    EP_STATIC_ASSERT(kNumStages == 3 and kNumPrefetch == 1, "Invalid stages");
+
+    auto smemPtr =
+        smemBuffer + warpId * (kNumStages * (kNumTMABufferBytes + combine_smem::kTmaBarrierAndPaddingBytes));
+    uint32_t tmaPhase = 0;
+    auto tmaBuffers = PatternVisitor([=](const int& i) {
+        return reinterpret_cast<int4*>(
+            smemPtr + i * (kNumTMABufferBytes + combine_smem::kTmaBarrierAndPaddingBytes));
+    });
+    auto fullBarriers = PatternVisitor([=](const int& i) {
+        return reinterpret_cast<uint64_t*>(
+            smemPtr + i * (kNumTMABufferBytes + combine_smem::kTmaBarrierAndPaddingBytes) + kNumTMABufferBytes);
+    });
+    EP_STATIC_ASSERT(kNumSendUnrolls * kNumStages <= 12, "TMA buffer size exceed limit");
+
+    // Initialize m-barriers
+    if (laneId < kNumStages) {
+        mbarrier_init(fullBarriers[laneId], 1);
+        fence_barrier_init();
+    }
+    __syncwarp();
+
+    auto tmaLoadAndArrive = [&](const int& stageIdx, const int4* gmemPtr, const int& numBytes) {
+        tma_load_1d(tmaBuffers[stageIdx], gmemPtr, fullBarriers[stageIdx], numBytes);
+        mbarrier_arrive_and_expect_tx(fullBarriers[stageIdx], numBytes);
+    };
+
+    // Issue sends for each token from the responsible dstRank. Rank-major:
+    // one send per received slot. srcInfo[0] = linear slot into inData;
+    // srcInfo[1] = j_eff (topk return index). The receive slot is
+    // (tokenIdx * numTopk + j_eff) * numBytesPerSlot, placing each expert
+    // rank's contribution into a distinct position in the recv buffer.
+    if (not isRankMasked<true>(rankMask, dstRank)) {
+        // Read right before the loop: kept live across the TMA set-up it spilled.
+        const int numRecvTokens = __shfl_sync(0xffffffff, __ldg(srcInfo + dstRank), 0);
+        for (int i = subWarpId * numLocalExperts + rankLaneIdx; i < numRecvTokens;
+             i += numWarpsPerGroup * numLocalExperts) {
+            auto localSrcTokenInfo = localSrcInfo + i * slotsPerToken;
+            auto localSrcTopkInfo = localSrcTokenInfo + 1;
+            int tokenIdx = __shfl_sync(0xffffffff, __ldg(localSrcTokenInfo), 0);
+
+            int slot = __shfl_sync(0xffffffff, __ldg(localSrcTopkInfo + 0), 0);
+            int j_eff = (numTopk > 1) ? __shfl_sync(0xffffffff, __ldg(localSrcTopkInfo + 1), 0) : 0;
+            if (j_eff < 0) {  // no local expert found (shouldn't happen)
+                continue;
             }
 
-            if (laneId == 0) {
-                *ctaDone = 0;
-            }
+            // Byte offsets scale with slot (= srcRank*maxTokensPerRank + i)
+            // and tokenIdx*numTopk, which times numBytesPerSlot can exceed
+            // INT_MAX -- use size_t to avoid 32-bit truncation.
+            size_t sndTokenOffset = static_cast<size_t>(slot) * numBytesPerSlot;
+            size_t rcvTokenOffset = static_cast<size_t>(tokenIdx * numTopk + j_eff) * numBytesPerSlot;
+
+            const auto srcDataInt4Ptr = static_cast<const int4*>(inData) + (int64_t)slot * hiddenBf16Int4;
+            const auto sendBufUint8 = static_cast<uint8_t*>(sendBuf) + sndTokenOffset;
+            const auto sendBufPtr = reinterpret_cast<int4*>(sendBufUint8);
+            const auto recvPtr = reinterpret_cast<uint64_t>(recvBuf) + rcvTokenOffset;
+            const auto expectedDstOffset = recvOff + rcvTokenOffset;
+            const auto dstP2pPtr =
+                ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComm);
+
+            processAndSendTokenLsa<kNumSendUnrolls, kNumStages, kNumPrefetch>(
+                srcDataInt4Ptr,
+                sendBufPtr,
+                dstP2pPtr,
+                hiddenBf16Int4,
+                zeroCopy,
+                tmaBuffers,
+                fullBarriers,
+                tmaPhase,
+                tmaLoadAndArrive,
+                hooks,
+                currRank,
+                rankMask,
+                laneId);
         }
     }
-    // Propagate shIsLastCta (and, transitively, the electing warp's own
-    // fences above) from warpId == numWarps-1 to every other warp of this
-    // CTA -- CTA-local only, not a grid-wide barrier.
-    __syncthreads();
-    return shIsLastCta;
+    // Destroy m-barriers (per-warp, no cross-warp dependency -- each
+    // warp owns its own m-barrier region via smemPtr's warpId offset
+    // above, so no bar.sync is needed to gate this).
+    if (laneId < kNumStages) {
+        mbarrier_inval(fullBarriers[laneId]);
+        fence_barrier_init();
+    }
+    __syncwarp();
+
+    // Wait for all stores to complete
+    tma_store_wait_complete<0>();
 }
 
 // LSA-only, unquantized, rank-major-only LL combine entry point. See the
@@ -538,104 +855,12 @@ __device__ __forceinline__ void combine_kernel_impl_2sided_rm_lsa( // INPUT
         cleanNextRecvCntBufStrided(nextRecvCntBuf, lsaSignalingCleanCount, threadId, numThreads);
     }
 
-    // Issue tokens sending
-    if (responsibleExpertIdx < numExperts) {
-        const auto dstRank = responsibleExpertIdx / numLocalExperts;
-        // Each pair of rank establish numLocalExperts channels for parallelization
-        const auto rankLaneIdx = responsibleExpertIdx % numLocalExperts;
-
-        // Read # of tokens received from this rank and set it's source info
-        const auto numRecvTokens = __shfl_sync(0xffffffff, __ldg(srcInfo + dstRank), 0);
-
-        auto slotsPerToken = numTopk + 1; // token_id + topk_idx's
-        // We have numRanks entries with per-rank count first, then the rest is (tokenId + numTopk) entries for each token
-        const auto localSrcInfo = srcInfo + numRanks + dstRank * maxTokensPerRank * slotsPerToken;
-
-        // TMA stuffs
-        constexpr int kNumTMABufferBytes = sizeof(int4) * kWarpSize * kNumSendUnrolls;
-        constexpr int kNumStages = combine_smem::kNumStages;
-        constexpr int kNumPrefetch = combine_smem::kNumTmaPrefetch;
-        EP_STATIC_ASSERT(kNumStages == 3 and kNumPrefetch == 1, "Invalid stages");
-
-        auto smemPtr =
-            smemBuffer + warpId * (kNumStages * (kNumTMABufferBytes + combine_smem::kTmaBarrierAndPaddingBytes));
-        uint32_t tmaPhase = 0;
-        auto tmaBuffers = PatternVisitor([=](const int& i) {
-            return reinterpret_cast<int4*>(
-                smemPtr + i * (kNumTMABufferBytes + combine_smem::kTmaBarrierAndPaddingBytes));
-        });
-        auto fullBarriers = PatternVisitor([=](const int& i) {
-            return reinterpret_cast<uint64_t*>(
-                smemPtr + i * (kNumTMABufferBytes + combine_smem::kTmaBarrierAndPaddingBytes) + kNumTMABufferBytes);
-        });
-        EP_STATIC_ASSERT(kNumSendUnrolls * kNumStages <= 12, "TMA buffer size exceed limit");
-
-        // Initialize m-barriers
-        if (laneId < kNumStages) {
-            mbarrier_init(fullBarriers[laneId], 1);
-            fence_barrier_init();
-        }
-        __syncwarp();
-
-        auto tmaLoadAndArrive = [&](const int& stageIdx, const int4* gmemPtr, const int& numBytes) {
-            tma_load_1d(tmaBuffers[stageIdx], gmemPtr, fullBarriers[stageIdx], numBytes);
-            mbarrier_arrive_and_expect_tx(fullBarriers[stageIdx], numBytes);
-        };
-
-        // Issue sends for each token from the responsible dstRank. Rank-major:
-        // one send per received slot. srcInfo[0] = linear slot into inData;
-        // srcInfo[1] = j_eff (topk return index). The receive slot is
-        // (tokenIdx * numTopk + j_eff) * numBytesPerSlot, placing each expert
-        // rank's contribution into a distinct position in the recv buffer.
-        if (not isRankMasked<true>(rankMask, dstRank)) {
-            for (int i = subWarpId * numLocalExperts + rankLaneIdx; i < numRecvTokens;
-                 i += numWarpsPerGroup * numLocalExperts) {
-                auto localSrcTokenInfo = localSrcInfo + i * slotsPerToken;
-                auto localSrcTopkInfo = localSrcTokenInfo + 1;
-                int tokenIdx = __shfl_sync(0xffffffff, __ldg(localSrcTokenInfo), 0);
-
-                int slot = __shfl_sync(0xffffffff, __ldg(localSrcTopkInfo + 0), 0);
-                int j_eff = (numTopk > 1) ? __shfl_sync(0xffffffff, __ldg(localSrcTopkInfo + 1), 0) : 0;
-                if (j_eff < 0) continue; // no local expert found (shouldn't happen)
-
-                // Byte offsets scale with slot (= srcRank*maxTokensPerRank + i)
-                // and tokenIdx*numTopk, which times numBytesPerSlot can exceed
-                // INT_MAX -- use size_t to avoid 32-bit truncation.
-                size_t sndTokenOffset = static_cast<size_t>(slot) * numBytesPerSlot;
-                size_t rcvTokenOffset = static_cast<size_t>(tokenIdx * numTopk + j_eff) * numBytesPerSlot;
-
-                const auto srcDataInt4Ptr = static_cast<const int4*>(inData) + (int64_t)slot * hiddenBf16Int4;
-                const auto sendBufUint8 = static_cast<uint8_t*>(sendBuf) + sndTokenOffset;
-                const auto sendBufPtr = reinterpret_cast<int4*>(sendBufUint8);
-                const auto recvPtr = reinterpret_cast<uint64_t>(recvBuf) + rcvTokenOffset;
-                const auto expectedDstOffset = recvOff + rcvTokenOffset;
-                const auto dstP2pPtr =
-                    ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComm);
-
-                processAndSendTokenLsa<kNumSendUnrolls, kNumStages, kNumPrefetch>(
-                    srcDataInt4Ptr,
-                    sendBufPtr,
-                    dstP2pPtr,
-                    hiddenBf16Int4,
-                    zeroCopy,
-                    tmaBuffers,
-                    fullBarriers,
-                    tmaPhase,
-                    tmaLoadAndArrive,
-                    laneId);
-            }
-        }
-        // Destroy m-barriers (per-warp, no cross-warp dependency -- each
-        // warp owns its own m-barrier region via smemPtr's warpId offset
-        // above, so no bar.sync is needed to gate this).
-        if (laneId < kNumStages) {
-            mbarrier_inval(fullBarriers[laneId]);
-            fence_barrier_init();
-        }
-        __syncwarp();
-    
-        // Wait for all stores to complete
-        tma_store_wait_complete<0>();
+    {
+        // Scoped: the SEND-phase goto above must not jump over an initialisation.
+        combineSendTokensLsa<kHidden, kNumTopk, kTokenDtype>(
+            inData, srcInfo, rankMask, sendBuf, recvBuf, recvOff, smemBuffer, warpId, laneId, subWarpId,
+            responsibleExpertIdx, numWarpsPerGroup, maxTokensPerRank, numExperts, numLocalExperts, currRank, numRanks,
+            zeroCopy, devComm, windows, PlainSendHooks{});
     }
 
     // Every CTA that had a responsible expert (or none at all) has now
@@ -776,6 +1001,260 @@ LOW_LATENCY_COMBINE_LSA_RECV:
     }
 }
 
+// Take up to kGroup slots, lowest first, out of the `remaining` bit mask into slots[]; returns the bit mask of the
+// taken group positions (bit j set <=> slots[j] valid).
+template <int kGroup>
+__forceinline__ __device__ unsigned takeCombineSlots(unsigned& remaining, int (&slots)[kGroup]) {
+    unsigned taken = 0;
+#pragma unroll
+    for (int j = 0; j < kGroup; ++j) {
+        slots[j] = 0;
+        if (remaining) {
+            slots[j] = __ffs(remaining) - 1;
+            remaining &= remaining - 1;
+            taken |= 1u << j;
+        }
+    }
+    return taken;
+}
+
+// Timeout of a Lamport receive, as in the 2-sided receive: warn (once per CTA), trap without a rank mask, otherwise
+// mask the ranks of the `pending` group positions, raise the async error and let the caller go on without them.
+template <int kGroup, typename TopkIdxT>
+__forceinline__ __device__ void handleLamportRecvTimeout(
+    unsigned pending,
+    const int (&slots)[kGroup],
+    int tokenIdx,
+    int numTopk,
+    const TopkIdxT* inTopkIdx,
+    int numLocalExperts,
+    int currRank,
+    int* rankMask,
+    int* asyncErrorFlag,
+    int* shTimeoutReports) {
+    if (!pending) {
+        return;
+    }
+    if (atomicAdd(shTimeoutReports, 1) == 0) {
+        printf(
+            "Warning: NCCL EP timeout for Lamport combine receive, rank %d, token %d, pending slot mask 0x%x\n",
+            currRank, tokenIdx, pending);
+    }
+#pragma unroll
+    for (int j = 0; j < kGroup; ++j) {
+        if ((pending >> j) & 1u) {
+            const int peer = static_cast<int>(__ldg(inTopkIdx + tokenIdx * numTopk + slots[j])) / numLocalExperts;
+            maskTimedOutPeer(rankMask, peer, asyncErrorFlag);
+        }
+    }
+}
+
+// NCCL_EP_COMBINE_LSA=lamport: the 2-sided kernel's send phase into a sentinel-poisoned landing region
+// (LamportRegion: at the tail of the buffer, two segments selected by the combine round parity), no finish flag. The
+// receive has no barrier: each thread polls one 16-byte vector of every contributing slot until no word is the
+// sentinel, accumulates in top-k order and re-arms the slot. Before its first store into a peer's segment a sender
+// waits until that peer has started the previous round (round words), which keeps the segment's previous user out.
+// Protocol and the sentinel encoding: docs/plc/401-ll-combine-lamport.
+template <int kHidden, int kNumTopk, int kNumMaxUnrolls, typename TopkIdxT, ncclDataType_t kTokenDtype>
+__device__ __forceinline__ void combine_kernel_impl_2sided_lamport_rm_lsa( // INPUT
+    const void* inData,
+    const int* srcInfo,
+    const TopkIdxT* inTopkIdx,
+    int* rankMask,
+    int* asyncErrorFlag,
+    // OUTPUT
+    void* outData,
+    // INTERMEDIATE
+    void* commBuf,
+    int* ctaDone,
+    LamportView lamportRegion,
+    LowLatencyEpochState* epochState, // only its send_in_flight mark: the epoch itself is not touched
+    // CONFIG
+    int numCombinedTokens,
+    int maxTokensPerRank,
+    int numExperts,
+    int currRank,
+    int numRanks,
+    int numWarpGroups,
+    int numWarpsPerGroup,
+    int phases,
+    ncclDevComm* devComm,
+    const ncclWindow_t* windows,
+    uint64_t timeoutCycles) {
+    constexpr int numTopk = kNumTopk;
+    EP_STATIC_ASSERT(numTopk > 0, "numTopk must be positive");
+    // Token dtype derivations
+    constexpr int kElemBytes = (kTokenDtype == ncclFloat32) ? 4 : 2;
+
+    const auto smId = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
+    const auto numSms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
+    const auto threadId = static_cast<int>(threadIdx.x);
+    const auto numThreads = __shfl_sync(0xffffffff, static_cast<int>(blockDim.x), 0);
+    const auto warpId = __shfl_sync(0xffffffff, threadId / 32, 0), laneId = get_lane_id();
+    const auto numLocalExperts = numExperts / numRanks;
+    const auto numWarps = numWarpGroups * numWarpsPerGroup;
+    const auto warpGroupId = warpId / numWarpsPerGroup;
+    const auto subWarpId = warpId % numWarpsPerGroup;
+    const auto responsibleExpertIdx = smId * numWarpGroups + warpGroupId;
+
+    if (smId == 0 && threadId == 0) {
+        pairStagedLaunch(epochState, phases);
+    }
+
+    // Combine round, advanced by the last CTA at the end of the receive, so a SEND-only and its RECV-only launch read
+    // the same value. Its parity selects the landing segment. The LL epoch (dispatch's and the non-Lamport combine
+    // kernels' counter) is neither read nor advanced: this kernel uses no signalling bank and no payload slot, so
+    // consecutive dispatches alternate banks among themselves and a fallback combine in between sees the banks it
+    // expects.
+    const unsigned int round = lamportRegion.state->round;
+    const size_t recvOff = lamport::segment_offset(lamportRegion.recv_offset, lamportRegion.segment_stride, round);
+    char* const commBase = static_cast<char*>(commBuf);
+    void* const recvBuf = commBase + recvOff;
+    int* const roundWords = reinterpret_cast<int*>(commBase + lamportRegion.round_offset);
+    // Destination of this warp group's sends (rank-major); its round word is read by the sending warps only, inside
+    // the send pipeline (LamportRoundCheck), never here by every thread.
+    const int sendDstRank = responsibleExpertIdx < numExperts ? responsibleExpertIdx / numLocalExperts : -1;
+
+    extern __shared__ __align__(1024) uint8_t smemBuffer[];
+
+    // Data type staffs
+    constexpr int kNumElemsPerInt4 = combine_smem::elements_per_int4(kElemBytes);
+    constexpr int kWarpSize = combine_smem::kWarpSize;
+    constexpr int64_t hiddenBf16Int4 = kHidden / kNumElemsPerInt4;
+
+    // Use different unroll factors for send and recv phases
+    constexpr int kNumSendUnrolls = combine_smem::send_unrolls(kHidden, kElemBytes);
+    constexpr int kNumRecvUnrolls = combine_smem::recv_unrolls(kHidden, kElemBytes);
+    EP_STATIC_ASSERT(kNumRecvUnrolls > 0, "hidden too wide: no LL combine receive group fits a CTA");
+    EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumRecvUnrolls * kNumElemsPerInt4) == 0,
+                     "Partial tiles require universal combine");
+    EP_STATIC_ASSERT(kNumSendUnrolls <= kNumMaxUnrolls and kNumRecvUnrolls <= kNumMaxUnrolls, "Invalid unrolls");
+    EP_STATIC_ASSERT(hiddenBf16Int4 % kNumSendUnrolls == 0, "Invalid hidden");
+
+    // Message package: the NONE-recipe wire slot size, including its
+    // reserved (here, always-unused) LogFMT metadata tail -- see the
+    // top-of-file doc comment for why that tail stays.
+    constexpr size_t numBytesPerSlot = align(
+        static_cast<size_t>(kHidden * kElemBytes +
+                            kHidden / combine_smem::kLogFmtElementsPerMeta * sizeof(nv_bfloat162)),
+        sizeof(int4));
+    EP_STATIC_ASSERT(numBytesPerSlot % sizeof(int4) == 0, "Invalid vectorization");
+
+    // Declared ahead of the SEND/RECV goto for scope (see the 2-sided kernel).
+    bool isLastCta = false;
+    // Timeout warnings printed by this CTA's receive (first one only).
+    __shared__ int shTimeoutReports;
+    if (threadId == 0) {
+        shTimeoutReports = 0;
+    }
+    __syncthreads();
+
+    // Sending phase
+    if ((phases & LOW_LATENCY_SEND_PHASE) == 0) {
+        goto LOW_LATENCY_COMBINE_LAMPORT_RECV;
+    }
+
+    {
+        // Destination round check, consumed inside the send pipeline after its first stage load (see
+        // LamportRoundCheck). Scoped: the SEND-phase goto above must not jump over an initialisation.
+        LamportSendHooks<lamport::sanitized_word<kTokenDtype>()> hooks{LamportRoundCheck{
+            sendDstRank >= 0 ? roundWords + sendDstRank : nullptr, round, sendDstRank, timeoutCycles, asyncErrorFlag,
+            &shTimeoutReports, /*closed=*/false}};
+        combineSendTokensLsa<kHidden, kNumTopk, kTokenDtype>(
+            inData, srcInfo, rankMask, /*sendBuf=*/nullptr, recvBuf, recvOff, smemBuffer, warpId, laneId, subWarpId,
+            responsibleExpertIdx, numWarpsPerGroup, maxTokensPerRank, numExperts, numLocalExperts, currRank, numRanks,
+            /*zeroCopy=*/false, devComm, windows, hooks);
+    }
+    // Publish "in round `round`" to the peers after the sends rather than before them: the word only has to witness
+    // that the previous round has retired, and here the peer-pointer lookup overlaps the arrival of the first data
+    // instead of delaying the sends.
+    publishLamportRoundLsa(
+        smId, numSms, threadId, numRanks, currRank, round, roundWords, lamportRegion.round_offset, rankMask, windows,
+        devComm);
+
+    // No finish flag and no CTA barrier: a warp that finished its sends goes straight on to receiving. The last-CTA
+    // election for the round advance is at the end of the kernel.
+
+// Receiving phase
+LOW_LATENCY_COMBINE_LAMPORT_RECV:
+    if ((phases & LOW_LATENCY_RECV_PHASE) == 0) {
+        return;
+    }
+
+    // ---- Lamport-style receive: one 16-byte vector per thread, no barrier ----
+    constexpr int kVecBytes = lamport::kVecBytes;
+    constexpr int kVecsPerRow = kHidden * kElemBytes / kVecBytes;
+    constexpr int kElemsPerVec = kVecBytes / kElemBytes;
+    EP_STATIC_ASSERT(kVecsPerRow % kWarpSize == 0, "a warp must stay inside one token row");
+    EP_STATIC_ASSERT(numTopk <= kWarpSize, "numTopk must not exceed warp size (warpFirstTopKOccurence)");
+    const int64_t totalVecs = static_cast<int64_t>(numCombinedTokens) * kVecsPerRow;
+    const int64_t gridStride = static_cast<int64_t>(numSms) * numThreads;
+    int topkIdxByLane = 0;
+
+    // Every lane of a warp lies in one token row (kVecsPerRow % 32 == 0): the warp-collective calls below are uniform.
+    for (int64_t g = static_cast<int64_t>(smId) * numThreads + threadId; g < totalVecs; g += gridStride) {
+        const int tokenIdx = static_cast<int>(g / kVecsPerRow);
+        const int v = static_cast<int>(g % kVecsPerRow);
+
+        if (laneId < numTopk) {
+            topkIdxByLane = static_cast<int>(__ldg(inTopkIdx + tokenIdx * numTopk + laneId));
+        }
+        topkIdxByLane = warpFirstTopKOccurence(topkIdxByLane, numLocalExperts, laneId);
+
+        // Slots (top-k positions) that deliver a contribution: first occurrence of a valid rank that is not masked.
+        const int slotRank = topkIdxByLane < 0 ? -1 : topkIdxByLane / numLocalExperts;
+        const bool live = laneId < numTopk && slotRank >= 0 && !isRankMasked(rankMask, slotRank);
+        unsigned remaining = __ballot_sync(0xffffffffu, live);
+
+        float acc[kElemsPerVec];
+#pragma unroll
+        for (int e = 0; e < kElemsPerVec; ++e) {
+            acc[e] = 0.0f;
+        }
+
+        // Unweighted sum: the caller applies the per-rank weights before ncclEpCombine.
+        constexpr float kUnitWeight = 1.0f;
+        // Up to kLamportGroup live slots polled concurrently, in top-k order; 8 spilled registers.
+        constexpr int kLamportGroup = 4;
+        uint8_t* const vecBase = static_cast<uint8_t*>(recvBuf) +
+            static_cast<size_t>(tokenIdx) * numTopk * numBytesPerSlot + static_cast<size_t>(v) * kVecBytes;
+        while (remaining) {  // warp-uniform
+            int slots[kLamportGroup];
+            const unsigned takenMask = takeCombineSlots<kLamportGroup>(remaining, slots);
+            uint4 buf[kLamportGroup];
+            const auto slotPtr = [&](int j) {
+                return reinterpret_cast<uint4*>(vecBase + static_cast<size_t>(slots[j]) * numBytesPerSlot);
+            };
+            const unsigned pending = lamport::poll_vec_per_thread<kLamportGroup>(
+                takenMask, timeoutCycles, buf, [&](int j) { return ld_volatile_global(slotPtr(j)); });
+            handleLamportRecvTimeout<kLamportGroup>(
+                pending, slots, tokenIdx, numTopk, inTopkIdx, numLocalExperts, currRank, rankMask, asyncErrorFlag,
+                &shTimeoutReports);
+            __syncwarp();  // lanes leave the poll loop at different times; reconverge before the next warp-collective
+            // Slots that arrived: re-arm and accumulate in slot order.
+#pragma unroll
+            for (int j = 0; j < kLamportGroup; ++j) {
+                if (((takenMask >> j) & 1u) && !((pending >> j) & 1u)) {
+                    st_volatile_global(slotPtr(j), lamport::sentinel_vec());
+                    decodeAndAccumulateLsa<1, kTokenDtype>(reinterpret_cast<uint32_t*>(&buf[j]), acc, kUnitWeight);
+                }
+            }
+        }
+
+        uint32_t packed[4];
+        encodeCombinedLsa<1, kTokenDtype>(packed, acc);
+        reinterpret_cast<uint4*>(outData)[g] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+        __syncwarp();
+    }
+
+    // The last CTA to finish its receive advances the round. Every CTA read the counter at kernel entry; the election's
+    // release/acquire orders those reads before the bump.
+    isLastCta = electLastCtaLsa(warpId, numWarps, laneId, ctaDone, numSms, [] {});
+    if (isLastCta && threadId == 0) {
+        ++lamportRegion.state->round;
+    }
+}
+
 } // namespace ll
 
 } // namespace nccl_ep
@@ -813,9 +1292,7 @@ __forceinline__ __device__ void waitForAllReadDoneDistributedLsa(
                (waitCost = clock64() - startTime) <= timeoutCycles);
         if (waitCost > timeoutCycles) {
             printf("Warning: NCCL EP timeout for combine read-done ack, rank %d, peer %d\n", currRank, peer);
-            if (rankMask == nullptr) trap();
-            atomicExch(rankMask + peer, 0);
-            if (asyncErrorFlag != nullptr) atomicExch_system(asyncErrorFlag, 1);
+            maskTimedOutPeer(rankMask, peer, asyncErrorFlag);
         }
     }
 }

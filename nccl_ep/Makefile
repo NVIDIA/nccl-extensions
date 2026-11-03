@@ -91,7 +91,8 @@ NCCL_EP_JIT_HEADERS := \
     device/ll/ll_dispatch_cft_lsa.cuh \
     device/ll/ll_combine_lsa.cuh \
     device/cft.cuh \
-    device/ll_ep_cft.cuh
+    device/ll_ep_cft.cuh \
+    device/lamport.cuh
 NCCL_EP_JIT_STAGED_HEADERS := include/common.hpp include/ep_enums.h include/cuda_fp_features.h
 NCCL_EP_JIT_STAGED_TARGETS := $(NCCL_EP_JIT_STAGED_HEADERS:include/%=$(JIT_DIR)/%)
 NCCL_EP_JIT_HEADER_TARGETS := $(NCCL_EP_JIT_HEADERS:%=$(JIT_DIR)/%) $(NCCL_EP_JIT_STAGED_TARGETS)

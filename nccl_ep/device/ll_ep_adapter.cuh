@@ -44,7 +44,9 @@ enum class NcclEpDispatchLsaMode { kSimt, kTma, kUniversal };
 //                 kernel (for an unenforced, eligible call) -- nothing can request it directly.
 //   kInvalid:     an enforced request eligibility can't honor. Only ever a resolved kernel;
 //                 callers must check for it and fail, never launch a kernel.
-enum class LlCombineKernel { kNone, kDefault, k2SidedRmLsa, k1SidedRmLsa, kAutoRmLsa, kInvalid };
+//   k2SidedLamportRmLsa: opt-in only ("lamport"), never auto-selected. 2-sided send phase, barrier-free receive that
+//                 polls a sentinel-poisoned landing region (nccl_ep::LamportRegion).
+enum class LlCombineKernel { kNone, kDefault, k2SidedRmLsa, k1SidedRmLsa, kAutoRmLsa, kInvalid, k2SidedLamportRmLsa };
 
 // Keep shared-quantization eligibility identical in the host geometry, JIT
 // launch bounds, and device staging allocation.
@@ -338,6 +340,12 @@ struct combine_kernel_args_t {
     size_t sendOff;
     size_t recvOff;
     size_t recvFlagOff;
+    // k2SidedLamportRmLsa only: the sentinel-poisoned landing region, two segments
+    // (LamportRegion::recv_offset, segment_stride), the per-peer round words
+    // (LamportRegion::round_offset) and the double-buffering counter that selects the segment. The Lamport combine uses
+    // `lamport` (the region's offsets and the round counter) instead of the LL epoch: it neither reads nor advances the
+    // epoch, only epochState->send_in_flight.
+    LamportView lamport;
     // combine_kernel_impl_1sided_rm_lsa's read-done signaling region (see
     // LowLatencyBuffer::combine_rdma_read_done_buffer_offset's doc comment); banked using
     // signalSlotStride below, shared by every signaling kind (see its doc comment in common.hpp).
@@ -391,6 +399,8 @@ struct clean_low_latency_buffer_kernel_args_t {
     ncclDevComm* devComm;
     unsigned barrierSignalBase;
     uint64_t timeoutCycles;
+    // Lamport combine's region, re-created in the zero step (null and zero when the group has none).
+    LamportReset lamport;
 };
 
 // ============================================================================
@@ -547,6 +557,7 @@ struct CombineParams {
     size_t sendOff;
     size_t recvOff;
     size_t recvFlagOff;
+    LamportView lamport;           // k2SidedLamportRmLsa only; see combine_kernel_args_t
     size_t readDoneOffBase = 0;    // 1-sided only; see combine_kernel_args_t
     int lsaSignalingCleanCount = 0; // see combine_kernel_args_t::lsaSignalingCleanCount
     int64_t* waitStats;
@@ -579,6 +590,8 @@ struct CombineParams {
     unsigned int deviceSm;
     int maxDynamicSmem;
     int* resolvedWarpsPerGroup = nullptr; // Host-only test/diagnostic output
+    int* resolvedKernelOut = nullptr;     // Host-only test/diagnostic output: the resolved LlCombineKernel
+    bool logFallback = false;             // Host-only diagnostic (NCCL_EP_DEBUG): say once when an enforced kernel falls back
     int* rankMask = nullptr;
     int* asyncErrorFlag = nullptr;
     uint64_t timeoutCycles = NUM_TIMEOUT_CYCLES;
@@ -627,6 +640,7 @@ struct CleanLowLatencyBufferParams {
     ncclDevComm* devComm;
     unsigned barrierSignalBase;
     uint64_t timeoutCycles = NUM_TIMEOUT_CYCLES;
+    LamportReset lamport;           // see clean_low_latency_buffer_kernel_args_t
 };
 
 // ============================================================================

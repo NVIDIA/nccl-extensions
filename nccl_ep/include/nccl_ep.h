@@ -666,8 +666,17 @@ ncclResult_t ncclEpHandleMemSize(
 // * CUDA graph invalidation: This function must not be included in CUDA graph captures.
 //   Destroy and re-capture EP graphs after reallocation or shared bank layout changes.
 //
+// * Lamport combine (NCCL_EP_COMBINE_LSA=lamport): a handle whose num_topk exceeds the
+//   capacity of the Lamport landing region re-creates the region, which is collective
+//   with the same constraints (all ranks in lockstep, nothing in flight, no CUDA graph
+//   capture) also with an explicit rdma_buffer_size. The first Lamport handle does it
+//   too, unless the group declares ncclEpGroupConfig_t::num_topk. Set that field to the
+//   largest num_topk of any handle to avoid it: the region is then created with the
+//   group (explicit buffer) or with the first allocation (auto-sized) and never grows.
+//
 // Use an explicit, sufficiently large rdma_buffer_size if you need to
-// avoid reallocation. Hierarchical LL may still collectively change shared bank
+// avoid reallocation (with the Lamport combine, together with
+// ncclEpGroupConfig_t::num_topk). Hierarchical LL may still collectively change shared bank
 // offsets, requiring matching handle initialization across ranks and graph recapture.
 // Alternatively, to avoid CUDA graph invalidation, all Handles must be created
 // before the beginning of the CUDA graph capture.
@@ -1153,6 +1162,8 @@ ncclResult_t ncclEpMaskQuery(ncclEpGroup_t ep_group, int* mask_status, cudaStrea
 
 // Set the mask for all ranks at once.
 //   Requires enable_mask=true in the group config.
+//   With NCCL_EP_COMBINE_LSA=lamport, re-activating a masked rank requires
+//   ncclEpMaskClean: Update alone does not reset the Lamport landing region.
 //
 // Arguments:
 //   ep_group   - [IN] EP group with masking enabled

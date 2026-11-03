@@ -383,6 +383,21 @@ __device__ __forceinline__ int64_t ld_volatile_global(const uint64_t* ptr) {
     return ret;
 }
 
+__device__ __forceinline__ uint4 ld_volatile_global(const uint4* ptr) {
+    uint4 ret;
+    asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w)
+                 : "l"(ptr)
+                 : "memory");
+    return ret;
+}
+
+__device__ __forceinline__ void st_volatile_global(uint4* ptr, uint4 val) {
+    asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::"l"(ptr), "r"(val.x), "r"(val.y), "r"(val.z),
+                 "r"(val.w)
+                 : "memory");
+}
+
 // Load 64 bits at a byte offset; memcpy folds to LDG.E.64 (or split if unaligned).
 __device__ __forceinline__ uint64_t em_ld64(const uint8_t* row, int byte_off) {
     uint64_t v;

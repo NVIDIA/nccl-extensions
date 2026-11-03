@@ -158,6 +158,7 @@ set(NCCL_EP_JIT_HEADERS
     device/ll/ll_combine_lsa.cuh
     device/cft.cuh
     device/ll_ep_cft.cuh
+    device/lamport.cuh
 )
 
 file(MAKE_DIRECTORY "${NCCL_EP_JIT_SOURCE_DIR}")

@@ -92,6 +92,8 @@ inline LlCombineKernel ll_combine_select_kernel(
         case LlCombineKernel::k1SidedRmLsa:
             if (!lsaEligible) return LlCombineKernel::kDefault;
             return oneSidedEligible ? LlCombineKernel::k1SidedRmLsa : LlCombineKernel::kInvalid;
+        case LlCombineKernel::k2SidedLamportRmLsa:
+            return lsaEligible ? LlCombineKernel::k2SidedLamportRmLsa : LlCombineKernel::kDefault;
         case LlCombineKernel::k2SidedRmLsa:
             return lsaEligible ? LlCombineKernel::k2SidedRmLsa : LlCombineKernel::kDefault;
         case LlCombineKernel::kNone:
@@ -114,6 +116,7 @@ inline const char* ll_combine_kernel_name(LlCombineKernel kernel) {
         case LlCombineKernel::k2SidedRmLsa: return "k2SidedRmLsa";
         case LlCombineKernel::k1SidedRmLsa: return "k1SidedRmLsa";
         case LlCombineKernel::kAutoRmLsa: return "kAutoRmLsa";
+        case LlCombineKernel::k2SidedLamportRmLsa: return "k2SidedLamportRmLsa";
         case LlCombineKernel::kInvalid: return "kInvalid";
     }
     return "<unknown LlCombineKernel>";
@@ -129,7 +132,7 @@ inline std::string ll_combine_jit_source(
     ncclDataType_t tokenDtype,
     LlCombineKernel kernel,
     ncclDataType_t weightDtype,
-    int numThreads = 1024) {  // launch bound = the real block size (numWarps * 32): 896 threads allow 72 registers, 1024 only 64
+    int numThreads) {  // launch bound: the launched block size
     // Callers must pass a resolved, concrete kernel -- never the sentinels ll_combine_select_kernel
     // returns for "not yet resolved" (kNone) or "enforcement unreachable" (kInvalid); see its doc
     // comment.
@@ -196,6 +199,25 @@ inline std::string ll_combine_jit_source(
                 << "      p.phases, p.zeroCopy,\n"
                 << "      p.devComm, p.windows, p.timeoutCycles);\n";
             break;
+        case LlCombineKernel::k2SidedLamportRmLsa:
+            src << "  nccl_ep::ll::combine_kernel_impl_2sided_lamport_rm_lsa<\n"
+                << "      " << hidden << ",\n"
+                << "      " << num_topk << ",\n"
+                << "      " << kLlCombineMaxUnrolls << ",\n"
+                << "      " << topk_type << ",\n"
+                << "      " << token_dtype_literal << ">(\n"
+                << "      p.inData, p.srcInfo,\n"
+                << "      static_cast<const " << topk_type << "*>(p.inTopkIdx),\n"
+                << "      p.rankMask, p.asyncErrorFlag,\n"
+                << "      p.outData,\n"
+                << "      p.rdmaBuf,\n"
+                << "      p.combineSync, p.lamport, p.epochState,\n"
+                << "      p.numCombinedTokens, p.maxTokensPerRank,\n"
+                << "      p.numExperts, p.currRank, p.numRanks,\n"
+                << "      p.numWarpGroups, p.numWarpsPerGroup,\n"
+                << "      p.phases,\n"
+                << "      p.devComm, p.windows, p.timeoutCycles);\n";
+            break;
         case LlCombineKernel::kDefault:
             src << "  nccl_ep::ll::combine_kernel_impl<\n"
                 << "      " << weight_type << ",\n"
@@ -256,7 +278,8 @@ inline ncclResult_t launch_ll_combine(
     const bool twoSidedRmLsa = kernel == LlCombineKernel::k2SidedRmLsa;
     const bool oneSidedRmLsa = kernel == LlCombineKernel::k1SidedRmLsa;
     const bool autoRmLsa = kernel == LlCombineKernel::kAutoRmLsa;
-    const bool anyLsa = twoSidedRmLsa || oneSidedRmLsa || autoRmLsa;
+    const bool lamportRmLsa = kernel == LlCombineKernel::k2SidedLamportRmLsa;
+    const bool anyLsa = twoSidedRmLsa || oneSidedRmLsa || autoRmLsa || lamportRmLsa;
 
     const char* recipe_literal = anyLsa ? "" : ::nccl_ep::jit::combine_recipe_literal(qrecipe);
     if (!anyLsa && recipe_literal == nullptr) {
@@ -267,16 +290,27 @@ inline ncclResult_t launch_ll_combine(
     static const int variant_identity_2sided_rm_lsa = 0;
     static const int variant_identity_1sided_rm_lsa = 0;
     static const int variant_identity_auto_rm_lsa = 0;
+    static const int variant_identity_lamport_rm_lsa = 0;
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.device_sm = static_cast<int>(device_sm);
     variant.propagate_cache_errors = true;
-    variant.kernel_family = oneSidedRmLsa ? "ll_combine_1sided_rm_lsa" :
-        (twoSidedRmLsa ? "ll_combine_2sided_rm_lsa" : (autoRmLsa ? "ll_combine_auto_rm_lsa" : "ll_combine"));
+    variant.kernel_family = "ll_combine";
+    variant.identity = &variant_identity_default;
+    if (oneSidedRmLsa) {
+        variant.kernel_family = "ll_combine_1sided_rm_lsa";
+        variant.identity = &variant_identity_1sided_rm_lsa;
+    } else if (twoSidedRmLsa) {
+        variant.kernel_family = "ll_combine_2sided_rm_lsa";
+        variant.identity = &variant_identity_2sided_rm_lsa;
+    } else if (lamportRmLsa) {
+        variant.kernel_family = "ll_combine_2sided_lamport_rm_lsa";
+        variant.identity = &variant_identity_lamport_rm_lsa;
+    } else if (autoRmLsa) {
+        variant.kernel_family = "ll_combine_auto_rm_lsa";
+        variant.identity = &variant_identity_auto_rm_lsa;
+    }
     variant.entry_name = kLlCombineJitEntryName;
-    variant.identity = oneSidedRmLsa ? &variant_identity_1sided_rm_lsa :
-        (twoSidedRmLsa ? &variant_identity_2sided_rm_lsa :
-         (autoRmLsa ? &variant_identity_auto_rm_lsa : &variant_identity_default));
     // Derived from the raw parameters so the warm-cache launch path never has
     // to build the variant-name string.
     std::uint64_t key = ::nccl_ep::jit::kRuntimeKeySeed;
@@ -286,12 +320,13 @@ inline ncclResult_t launch_ll_combine(
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(qrecipe));
     key = ::nccl_ep::jit::runtime_key_mix(
         key, (useLogFmt ? 1u : 0u) | (topkIdxIsInt64 ? 2u : 0u) | (oneSidedRmLsa ? 4u : 0u) |
-            (autoRmLsa ? 8u : 0u));
+            (autoRmLsa ? 8u : 0u) | (lamportRmLsa ? 16u : 0u));
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(tokenDtype));
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(weightDtype));
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(numWarps));  // launch bound
     variant.runtime_key = key;
     variant.num_blocks = numSms;
+    // A whole number of warps: the Lamport receive polls and accumulates warp-collectively.
     variant.block_dim = numWarps * 32;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
     variant.nucs = nucs;
@@ -323,6 +358,7 @@ inline ncclResult_t launch_ll_combine(
              << (twoSidedRmLsa ? "_2sidedrmlsa" : "")
              << (oneSidedRmLsa ? "_1sidedrmlsa" : "")
              << (autoRmLsa ? "_autormlsa" : "")
+             << (lamportRmLsa ? "_lamportrmlsa" : "")
              << (topkIdxIsInt64 ? "_topk64" : "_topk32")
              << ::nccl_ep::jit::token_dtype_name_tag(tokenDtype)
              << (anyLsa ? "" : ::nccl_ep::jit::combine_recipe_name_tag(qrecipe))

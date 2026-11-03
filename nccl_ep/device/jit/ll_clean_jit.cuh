@@ -35,7 +35,8 @@ inline std::string ll_clean_jit_source() {
         << "      p.clean_1, p.num_clean_int_1,\n"
         << "      p.rankMask,\n"
         << "      p.syncBuffer, p.syncWindow,\n"
-        << "      p.devComm, p.barrierSignalBase, p.timeoutCycles);\n"
+        << "      p.devComm, p.barrierSignalBase, p.timeoutCycles,\n"
+        << "      p.lamport);\n"
         << "}\n";
     return src.str();
 }

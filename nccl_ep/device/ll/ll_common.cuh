@@ -12,6 +12,22 @@ namespace nccl_ep {
 
 namespace ll {
 
+// Pairs the send-only and recv-only launches of a split-phase call, on the control thread (smId 0, threadId 0): at most
+// one staged call per group, whatever kernel it runs. A send-only launch marks it in flight and the recv-only launch
+// that completes it clears the mark; any send launch started while one is pending is a misuse, as is a recv-only
+// launch with none. Shared with the Lamport combine, which uses no epoch otherwise.
+__device__ __forceinline__ void pairStagedLaunch(LowLatencyEpochState* epochState, int phases) {
+    if (phases & LOW_LATENCY_SEND_PHASE) {
+        EP_DEVICE_ASSERT(epochState->send_in_flight == 0);
+        if ((phases & LOW_LATENCY_RECV_PHASE) == 0) {
+            epochState->send_in_flight = 1;
+        }
+    } else {
+        EP_DEVICE_ASSERT(epochState->send_in_flight == 1);
+        epochState->send_in_flight = 0;
+    }
+}
+
 // Selects the epoch (send-buffer bank) for this launch and, on the control
 // thread, advances/pairs the send/recv halves of a split-phase launch so a
 // send-only call's epoch is picked up by the matching recv-only call.
@@ -20,10 +36,9 @@ __device__ __forceinline__ uint64_t selectLowLatencyEpoch(
     if (phases & LOW_LATENCY_SEND_PHASE) {
         const uint64_t epoch = epochState->epoch;
         if (smId == 0 && threadId == 0) {
-            EP_DEVICE_ASSERT(epochState->send_in_flight == 0);
+            pairStagedLaunch(epochState, phases);
             if ((phases & LOW_LATENCY_RECV_PHASE) == 0) {
                 epochState->pending_epoch = epoch;
-                epochState->send_in_flight = 1;
             }
         }
         return epoch;
@@ -31,10 +46,9 @@ __device__ __forceinline__ uint64_t selectLowLatencyEpoch(
 
     const uint64_t epoch = epochState->pending_epoch;
     if (smId == 0 && threadId == 0) {
-        EP_DEVICE_ASSERT(epochState->send_in_flight == 1);
+        pairStagedLaunch(epochState, phases);
         EP_DEVICE_ASSERT(epoch == epochState->epoch);
         ++epochState->epoch;
-        epochState->send_in_flight = 0;
     }
     return epoch;
 }

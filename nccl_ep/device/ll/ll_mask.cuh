@@ -10,6 +10,7 @@
 #include "nccl_device.h"
 #include "ll_gin.cuh"
 #include "ll_lsa_primitives.cuh"
+#include "../lamport.cuh"
 
 namespace nccl_ep {
 
@@ -161,7 +162,8 @@ __device__ __forceinline__ void clean_low_latency_buffer_kernel_impl(
     ncclWindow_t* syncWindow,
     ncclDevComm* devComm,
     unsigned barrierSignalBase,
-    uint64_t timeoutCycles) {
+    uint64_t timeoutCycles,
+    const LamportReset& lamportReset) {
     int threadId = static_cast<int>(threadIdx.x);
 
     // Pre-clean barrier
@@ -184,6 +186,14 @@ __device__ __forceinline__ void clean_low_latency_buffer_kernel_impl(
     // Zero out RDMA buffers
     for (int i = threadId; i < num_clean_int_0; i += kNumThreads) clean_0[i] = 0;
     for (int i = threadId; i < num_clean_int_1; i += kNumThreads) clean_1[i] = 0;
+    // Lamport combine (null/zero otherwise): reset both landing segments and the round state. Done here, between the
+    // two mask-aware barriers, so that a rank that never arrives is skipped after the timeout like in the cleaning
+    // above, and the post-clean barrier orders all of it against every unmasked rank's next combine.
+    if (lamportReset.poison_bytes != 0) {
+        lamport::reset_state<kNumThreads>(
+            lamportReset.poison, lamportReset.poison_bytes, lamportReset.words, lamportReset.word_bytes,
+            lamportReset.round, threadId);
+    }
     __threadfence_system();
 
     // Post-clean barrier

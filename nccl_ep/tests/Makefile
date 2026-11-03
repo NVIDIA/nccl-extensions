@@ -54,6 +54,8 @@ TEST_BINARIES := \
         $(DST_DIR)/test_lifecycle \
         $(DST_DIR)/test_ll_epoch_protocol \
         $(DST_DIR)/test_ll_group_epoch \
+        $(DST_DIR)/test_ll_lamport_combine \
+        $(DST_DIR)/test_lamport_state \
         $(DST_DIR)/test_ll_afd_selection \
         $(DST_DIR)/test_ll_kernel_selection \
         $(DST_DIR)/test_mxfp8_combine \

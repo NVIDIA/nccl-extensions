@@ -428,6 +428,114 @@ struct LowLatencyEpochState {
     unsigned int send_in_flight = 0;
 };
 
+// Double-buffering state of the Lamport combine (NCCL_EP_COMBINE_LSA=lamport): the counterpart of LowLatencyEpochState
+// for the sentinel-poisoned landing region (LamportRegion). One per group, device resident. The LL epoch
+// belongs to dispatch and to the non-Lamport combine kernels; the Lamport combine neither reads nor advances the epoch,
+// so a call that falls back to a non-Lamport combine kernel needs no coordination between the two counters. It shares
+// only send_in_flight, which allows one staged (send-only) call per group whichever kernel runs it.
+struct LamportEpochState {
+    // Lamport combines completed on this rank. Its parity selects the landing segment, and round + 1 is what the rank
+    // publishes into its peers' round words. Advanced by the last CTA of the combine's receive; reset to zero together
+    // with the round words (buffer reallocation, ncclEpMaskClean).
+    unsigned int round = 0;
+};
+
+// Landing region of the Lamport combine, at the tail of the group's RDMA buffer. Its contents persist across calls
+// (the sentinel poison, the round words), so its offset cannot come from a handle's layout; no handle layout reaches
+// the tail, because a handle needs its layout bytes plus the region.
+//
+//   [round words][segment 0][segment 1]
+//
+// Round words: one int per peer, the number of rounds that peer has started. They sit at the region start, so
+// growing the segments never moves them.
+//
+// The segment stride is a capacity: the largest top-k of any rank-major handle of the group. A handle addresses
+// its receive slots as (token * top-k + j) * slot_bytes inside a segment, so a handle with a smaller top-k fits in a
+// larger stride and the unused bytes stay sentinel.
+//
+// A larger capacity re-creates the region (by reallocating the group buffer, or in place in a fixed-size one):
+// poisoned segments, zero round words, round counter at zero. See docs/plc/401-ll-combine-lamport.
+struct LamportRegion {
+    // The region starts at a multiple of this, wherever the buffer ends: the round words are zeroed with 16-byte
+    // stores and the segments are polled and written as 16-byte vectors.
+    static constexpr size_t kAlign = 256;
+
+    size_t round_offset = 0;    // buffer-relative start of the region == the round words
+    size_t recv_offset = 0;     // segment 0
+    size_t segment_stride = 0;
+    size_t slot_bytes = 0;      // one combine receive slot (LowLatencyBuffer::num_bytes_per_combine_msg)
+    size_t bytes = 0;           // the whole region; zero when the group has none
+    size_t reserved_bytes = 0;  // to leave for it at the end of a buffer: bytes plus the slack of aligning its start
+    int capacity_topk = 0;      // the top-k the segments are sized for
+
+    bool valid() const { return bytes != 0; }
+};
+
+// What the Lamport combine kernels need of the region: byte offsets from the RDMA buffer base, and the group's
+// device-resident round counter.
+struct LamportView {
+    size_t recv_offset = 0;    // segment 0 (the other follows at segment_stride)
+    size_t segment_stride = 0;
+    size_t round_offset = 0;   // the per-peer "rounds started" words
+    LamportEpochState* state = nullptr;
+
+    LamportView() = default;
+    LamportView(const LamportRegion& region, LamportEpochState* round_state)
+        : recv_offset(region.recv_offset),
+          segment_stride(region.segment_stride),
+          round_offset(region.round_offset),
+          state(round_state) {}
+};
+
+// What ncclEpMaskClean's clean kernel resets in the Lamport region: both segments (poison), the round words and the
+// round counter. Null and zero when the group has none.
+struct LamportReset {
+    uint4* poison = nullptr;
+    size_t poison_bytes = 0;
+    uint4* words = nullptr;
+    size_t word_bytes = 0;
+    unsigned int* round = nullptr;
+
+    LamportReset() = default;
+    // The reset of `region`, placed in the RDMA buffer that starts at `rdma_base`, and of the counter in `round_state`
+    // (device memory: only its address is computed here).
+    LamportReset(char* rdma_base, const LamportRegion& region, LamportEpochState* round_state)
+        : poison(reinterpret_cast<uint4*>(rdma_base + region.recv_offset)),
+          poison_bytes(2 * region.segment_stride),
+          words(reinterpret_cast<uint4*>(rdma_base + region.round_offset)),
+          word_bytes(region.recv_offset - region.round_offset),
+          round(reinterpret_cast<unsigned int*>(
+              reinterpret_cast<char*>(round_state) + offsetof(LamportEpochState, round))) {}
+};
+
+// Size of the region for a given capacity, independent of where it is placed.
+inline LamportRegion lamport_region_shape(
+    int num_max_dispatch_tokens_per_rank, size_t max_token_bytes, int num_ranks, int capacity_topk) {
+    LamportRegion r;
+    if (capacity_topk <= 0) {
+        return r;
+    }
+    // The combine receive slot, as LowLatencyLayout sizes it (metadata space per 128 elements plus the token).
+    const size_t num_scales = max_token_bytes / sizeof(nv_bfloat16) / 128;
+    r.slot_bytes = align<size_t>(num_scales * sizeof(nv_bfloat162) + max_token_bytes, sizeof(int4));
+    r.segment_stride = align<size_t>(
+        static_cast<size_t>(num_max_dispatch_tokens_per_rank) * r.slot_bytes * capacity_topk, 256);
+    const size_t round_bytes = align<size_t>(static_cast<size_t>(num_ranks) * sizeof(int), 256);
+    r.recv_offset = round_bytes; // relative to the region until placed
+    r.bytes = round_bytes + 2 * r.segment_stride;
+    r.reserved_bytes = r.bytes + LamportRegion::kAlign - 1;
+    r.capacity_topk = capacity_topk;
+    return r;
+}
+
+// The region placed at the tail of an RDMA buffer of `alloc_bytes`, which need not be aligned: the start is rounded
+// down to kAlign, so a buffer meant to hold the region must have shape.reserved_bytes to spare.
+inline LamportRegion lamport_region_at_tail(LamportRegion shape, size_t alloc_bytes) {
+    shape.round_offset = (alloc_bytes - shape.bytes) & ~(LamportRegion::kAlign - 1);
+    shape.recv_offset += shape.round_offset;
+    return shape;
+}
+
 struct LowLatencyLayout {
     size_t total_bytes = 0;
     LowLatencyBuffer buffer;
@@ -608,6 +716,9 @@ inline unsigned long int get_low_latency_rdma_size_hint_for_layout(
                          layout,
                          num_attn_ranks)
                          .total_bytes;
+    // Upper bound: the Lamport combine's tail region at the largest top-k (zero extra bytes are not worth a flag).
+    num_bytes +=
+        lamport_region_shape(num_max_dispatch_tokens_per_rank, max_token_bytes, num_ranks, MAX_NUM_TOPK).reserved_bytes;
     return ((num_bytes + NUM_BUFFER_ALIGNMENT_BYTES) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES;
 }
 

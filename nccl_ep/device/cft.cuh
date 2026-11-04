@@ -7,10 +7,10 @@
 // CFT (Counted Fabric Transport) and local TMA helpers for LL dispatch.
 //
 // The fabric wrappers mirror NCCL 2.32.1's device CFT API. They are defined
-// locally to preserve the extension's bounded flush and pendingTxCount behavior.
-// LL dispatch uses Cft<ncclCoopThread>; the wider coops are retained for API
-// compatibility. The pendingTxCount field tracks submitted 16 B units until
-// the caller drains the completion phase.
+// locally because the pinned NCCL 2.30.7 headers lack that API. LL dispatch
+// uses Cft<ncclCoopThread>; the wider coops are retained for API compatibility.
+// The local extensions are a bounded flush and pendingTxCount, which tracks
+// submitted 16 B units until the caller drains the completion phase.
 //
 // Fabric and TMA-load waits return a timeout status that callers must treat
 // as fatal (see ll_ep_cft.cuh). Local TMA-store waits have no bounded form.

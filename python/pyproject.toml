@@ -52,11 +52,11 @@ dependencies = [
 bench = ["mpi4py"]
 cu12 = [
     "nccl4py[cu12]",
-    "nvidia-nccl-cu12==2.32.3",
+    "nvidia-nccl-cu12==2.30.7",
 ]
 cu13 = [
     "nccl4py[cu13]",
-    "nvidia-nccl-cu13==2.32.3",
+    "nvidia-nccl-cu13==2.30.7",
 ]
 
 [project.urls]

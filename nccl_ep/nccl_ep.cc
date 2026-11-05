@@ -822,8 +822,6 @@ struct ncclEpGroup {
         // GIN memory base pointer and window
         void* gin_base_ptr = nullptr;         // Base pointer for all GIN memory
         ncclWindow_t nccl_window = {};        // Single registered window handle (pointer-sized)
-        unsigned signals_base = 0;            // Base signal ID for dispatch
-        unsigned combine_signal_offset = 0;   // Signal offset for combine operations
         int num_total_signals = 0;            // Total number of signals
 
         // Used by kernels to calculate actual addresses for RDMA puts
@@ -839,11 +837,8 @@ struct ncclEpGroup {
         size_t gin_send_staging_offset = 0;
         size_t gin_recv_staging_offset = 0;  // Packed receive buffer (token+prob+sf)
 
-        // RDMA sync-guard readiness-flag regions (per direction)
-        size_t dispatch_guard_offset = 0;
-        size_t combine_guard_offset = 0;
-
-        unsigned signals_tail_base = 0;         // Base signal ID for tail tracking (sender -> receiver)
+        // RDMA sync-guard readiness-flag region, shared by dispatch and combine
+        size_t guard_offset = 0;
         int num_max_rdma_chunked_send_tokens = NCCL_EP_HT_DISPATCH_RDMA_BATCH_SIZE;
 
     } gin_config;
@@ -1781,7 +1776,6 @@ static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
 // Constants for GIN configuration
 static constexpr int NCCL_EP_HT_GIN_MAX_CONTEXTS = 32;
 static constexpr int NCCL_EP_HT_GIN_CTXS_PER_COMM = 4;
-static constexpr int MAX_BARRIER_SESSIONS = 32;
 
 static ncclResult_t commAllocHost(ncclComm_t comm, ncclDevComm_t** outDevComm, size_t* outBytes) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
@@ -1843,6 +1837,14 @@ static ncclResult_t devCommAllocAndCopyToDevice(ncclComm_t comm, ncclDevComm_t**
     free(*hostDevComm);
     *hostDevComm = nullptr;
     return ncclInternalError;
+}
+
+static int ht_n2n_channels(ncclEpGroup_t group) {
+    const auto channels = [](unsigned int blocks, int warps) { return static_cast<int>(blocks) * warps; };
+    return std::max({channels(group->dispatch_num_sms, NCCL_EP_HT_DISPATCH_N2N_WARPS),
+                     channels(group->flat_dispatch_num_sms, NCCL_EP_HT_DISPATCH_N2N_WARPS),
+                     channels(group->combine_num_sms, NCCL_EP_HT_COMBINE_N2N_WARPS),
+                     channels(group->flat_combine_num_sms, NCCL_EP_HT_COMBINE_N2N_WARPS)});
 }
 
 static ncclResult_t
@@ -1942,7 +1944,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     total_gin_buffer_size += combine_gin_RED_prob_sz;
     total_gin_buffer_size += combine_gin_G2S_prob_sz;
     total_gin_buffer_size += flags_sz * 2;
-    total_gin_buffer_size += guard_sz * 2;
+    total_gin_buffer_size += guard_sz * 1;
     total_gin_buffer_size += token_staging_sz;
     total_gin_buffer_size += dense_prob_sz;
     total_gin_buffer_size += rdma_send_staging_sz;
@@ -1977,8 +1979,6 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // RDMA sync-guard regions (dispatch, combine): addressed by window+offset only.
     CUDACHECK_RET(cudaMemset(ptr + offset, 0, guard_sz));
     offset += guard_sz;
-    CUDACHECK_RET(cudaMemset(ptr + offset, 0, guard_sz));
-    offset += guard_sz;
 
     ep_group->ht_buffers.token_staging_buffer = reinterpret_cast<void*>(ptr + offset);
     offset += token_staging_sz;
@@ -2004,9 +2004,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
 
     cur_offset += flags_sz * 2;
 
-    ep_group->gin_config.dispatch_guard_offset = cur_offset;
-    cur_offset += guard_sz;
-    ep_group->gin_config.combine_guard_offset = cur_offset;
+    ep_group->gin_config.guard_offset = cur_offset;
     cur_offset += guard_sz;
 
     ep_group->gin_config.token_staging_offset = cur_offset;
@@ -2033,31 +2031,91 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     }
 
     int qps_per_rank = ep_group->config.num_qp_per_rank;
-    // Only dispatch has dedicated cross-node warps per CTA. Combine selects
-    // channels from the resulting shared context pool, so its SM budget does
-    // not impose an additional per-CTA minimum here.
-    int min_required_ctx =
-        NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
-    if (qps_per_rank == 0) qps_per_rank = min_required_ctx;
-    if (qps_per_rank < min_required_ctx) {
+    const int n2n_channels = ht_n2n_channels(ep_group);
+    // Allocate for the worst case: every N2N warp must own its context exclusively in every
+    // configuration, so the budget follows the widest one. A smaller EP grid leaves the extra
+    // contexts unused.
+    int required_ctx = NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + n2n_channels;
+    if (qps_per_rank == 0) qps_per_rank = required_ctx;
+    if (qps_per_rank < required_ctx) {
         fprintf(stderr,
-                "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d for reserved + dedicated N2N warp contexts\n",
-                qps_per_rank, min_required_ctx);
+                "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d (%d reserved + %d N2N contexts)\n",
+                qps_per_rank, required_ctx, NCCL_EP_HT_RESERVED_GIN_GPU_CTXS, n2n_channels);
         return ncclInvalidUsage;
+    } else if (qps_per_rank > required_ctx) {
+        fprintf(stderr, "[HT GIN] Warning: num_qp_per_rank(%d) exceeds the %d contexts HT addresses; dropping %d\n",
+                qps_per_rank, required_ctx, qps_per_rank - required_ctx);
+        qps_per_rank = required_ctx;
     }
     ep_group->gin_config.qps_per_rank = qps_per_rank;
     // num_qp_per_rank is the total context budget; the data range is what's left after the reserved ones.
     ep_group->gin_config.num_ctx_per_comm = qps_per_rank - NCCL_EP_HT_RESERVED_GIN_GPU_CTXS;
 
-    int dispatch_signals = lsa_team_size * rdma_team_size * max_chunks_per_rank;
-    int combine_signals = lsa_team_size * rdma_team_size * max_chunks_per_rank;
-    int streaming_tail_signals = rdma_team_size * rdma_team_size * lsa_team_size * max_chunks_per_rank;
-    int streaming_head_signals = rdma_team_size * rdma_team_size * lsa_team_size;
-    ep_group->gin_config.num_total_signals =
-        dispatch_signals + combine_signals + streaming_tail_signals + streaming_head_signals + MAX_BARRIER_SESSIONS;
-    ep_group->gin_config.signals_base = 0;
-    ep_group->gin_config.combine_signal_offset = dispatch_signals;
-    ep_group->gin_config.signals_tail_base = dispatch_signals + combine_signals;
+    const int num_data_ctx = ep_group->gin_config.num_ctx_per_comm;
+    const int max_chunk_per_rails = (rdma_team_size - 1) * max_chunks_per_rank;
+    const auto gin_signals_per_phase_for = [&](unsigned int blocks, int warps) {
+        const int channels = static_cast<int>(blocks) * warps;
+        if (channels <= 0) return 0;
+        return (rdma_team_size - 1) * ((max_chunks_per_rank + channels - 1) / channels);
+    };
+    // A smaller EP group spreads the same chunks over fewer GIN contexts, so each context
+    // carries more signals; each phase is sized by its narrowest configuration.
+    const int gin_signals_per_phase =
+        std::max({gin_signals_per_phase_for(ep_group->dispatch_num_sms, NCCL_EP_HT_DISPATCH_N2N_WARPS),
+                  gin_signals_per_phase_for(ep_group->flat_dispatch_num_sms, NCCL_EP_HT_DISPATCH_N2N_WARPS),
+                  gin_signals_per_phase_for(ep_group->combine_num_sms, NCCL_EP_HT_COMBINE_N2N_WARPS),
+                  gin_signals_per_phase_for(ep_group->flat_combine_num_sms, NCCL_EP_HT_COMBINE_N2N_WARPS)});
+
+    ep_group->gin_config.num_total_signals = gin_signals_per_phase;
+
+    if (nccl_ep_env_verbose(ep_group->env)) {
+        fprintf(stderr,
+                "[HT GIN] signal pool (dispatch+combine shared): %d[chunks/rank], %d[rail chunks] "
+                "over %d[data ctx]; channels dispatch %u/%u flat, combine %u/%u flat; "
+                "%d[ids/ctx], %d[total signals] over %d[ctx]\n",
+                max_chunks_per_rank, max_chunk_per_rails, num_data_ctx,
+                ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS,
+                ep_group->flat_dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS,
+                ep_group->combine_num_sms * NCCL_EP_HT_COMBINE_N2N_WARPS,
+                ep_group->flat_combine_num_sms * NCCL_EP_HT_COMBINE_N2N_WARPS,
+                ep_group->gin_config.num_total_signals,
+                ep_group->gin_config.num_total_signals * qps_per_rank, qps_per_rank);
+    }
+
+    if (nccl_ep_env_flag_on(ep_group->env.debug) && ep_group->env.rank == 0) {
+        // Chunk geometry first: the wire-chunk count is what the signal depth is derived from, and
+        // it grows with the LSA team count, so it is the root of how the pool scales with nodes.
+        fprintf(stderr,
+                "[HT GIN] chunks: %d[tokens/rank] / %d[tokens/chunk] = %d[chunks/rank] "
+                "x %d remote LSA teams = %d[rail chunks]\n",
+                ht_max_tokens, ht_combine_tokens_per_chunk, max_chunks_per_rank, rdma_team_size - 1,
+                max_chunk_per_rails);
+        fprintf(stderr,
+                "[HT GIN] %d ctx created (%d reserved + %d data); signals per ctx = %d; "
+                "total signals = %d\n",
+                qps_per_rank, NCCL_EP_HT_RESERVED_GIN_GPU_CTXS, num_data_ctx,
+                ep_group->gin_config.num_total_signals,
+                ep_group->gin_config.num_total_signals * qps_per_rank);
+        const struct {
+            const char* name;
+            unsigned int blocks;
+            int warps;
+        } cfgs[] = {
+            {"dispatch expert-major", ep_group->dispatch_num_sms, NCCL_EP_HT_DISPATCH_N2N_WARPS},
+            {"dispatch flat", ep_group->flat_dispatch_num_sms, NCCL_EP_HT_DISPATCH_N2N_WARPS},
+            {"combine  expert-major", ep_group->combine_num_sms, NCCL_EP_HT_COMBINE_N2N_WARPS},
+            {"combine  flat", ep_group->flat_combine_num_sms, NCCL_EP_HT_COMBINE_N2N_WARPS},
+        };
+        for (const auto& c : cfgs) {
+            const int channels = static_cast<int>(c.blocks) * c.warps;
+            const int needed = gin_signals_per_phase_for(c.blocks, c.warps);
+            fprintf(stderr,
+                    "[HT GIN]   %-22s channels = %3d (%u blocks x %d n2n warps), "
+                    "signals per ctx needed = %3d%s\n",
+                    c.name, channels, c.blocks, c.warps, needed,
+                    needed == ep_group->gin_config.num_total_signals ? "  <-- sets the pool" : "");
+        }
+    }
 
     // =========================================================================
     // Phase 3: comm setup (DevCommCreate + WindowRegister)
@@ -2083,6 +2141,8 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
             nccl_ep::ceil_div<int>(max_chunks_per_rank, ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
         reqs.ginQueueDepth =
             std::min(chunks_per_channel, NCCL_EP_HT_DISPATCH_GIN_WINDOW) * (3 * ht_combine_tokens_per_chunk + 1);
+        // NCCL EP uses GIN indexed signals; VA signals are not needed.
+        reqs.ginVaSignalsRequired = false;
         // Dispatch uses sessions [0, dispatch_num_sms); all combine CTAs rendezvous
         // through one tail CTA at session dispatch_num_sms. Therefore
         // combine_num_sms does not affect this resource count.
@@ -2667,9 +2727,9 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     }
 
     if (ep_group->config.num_qp_per_rank == NCCL_EP_AUTO) {
-        // Dispatch dedicates N2N warps per CTA; combine reuses this pool.
+        // Each N2N warp dedicates a context; both phases draw from this pool.
         ep_group->config.num_qp_per_rank =
-            NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
+            NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + ht_n2n_channels(ep_group);
     }
 
     // Resolve timeout_cycles: env var > config field > compile-time default
@@ -6592,11 +6652,9 @@ ncclResult_t ncclEpDispatch(
             is_lsa_only ? 0 : group->gin_config.gin_send_staging_offset;
         params.mr_info.gin_recv_staging_offset =
             is_lsa_only ? 0 : group->gin_config.gin_recv_staging_offset;
-        params.mr_info.guard_offset = is_lsa_only ? 0 : group->gin_config.dispatch_guard_offset;
+        params.mr_info.guard_offset = is_lsa_only ? 0 : group->gin_config.guard_offset;
         params.mr_info.bytes_per_entry = bytes_per_entry;
         params.mr_info.max_tokens_per_dest = static_cast<size_t>(group->config.max_dispatch_tokens_per_rank);
-        params.mr_info.signals_tail_base =
-            is_lsa_only ? 0 : static_cast<unsigned>(group->gin_config.signals_tail_base);
         params.mr_info.num_max_rdma_chunked_send_tokens =
             is_lsa_only ? 0 : group->gin_config.num_max_rdma_chunked_send_tokens;
         params.local_rank = group->lsa_rank;
@@ -7949,8 +8007,8 @@ ncclResult_t ncclEpCombine(
             params.rdma_to_attn_map = handle->ht.rdma_to_attn_map;
             params.attn_to_rdma_map = handle->ht.attn_to_rdma_map;
             params.local_expert_routing_map = handle->ht.local_expert_routing_map;
-            // Always pass a valid device pointer — see dispatch path comment.
-            params.expected_gin_flag_val = group->ht_buffers.combine_expected_gin_flag_val;
+            // Always pass a valid device pointer.
+            params.expected_gin_flag_val = group->ht_buffers.dispatch_expected_gin_flag_val;
             params.gin_G2S_flags =
                 is_lsa_only ? nullptr : group->ht_buffers.combine_gin_G2S_flags;
             params.expected_lsa_flag_val = group->ht_buffers.combine_expected_lsa_flag_val;
@@ -7973,8 +8031,6 @@ ncclResult_t ncclEpCombine(
             params.nccl_internal_window = group->gin_config.nccl_window;
             params.num_ctx_per_comm = is_lsa_only ? 0 : group->gin_config.num_ctx_per_comm;
             params.gin_base_ptr = is_lsa_only ? nullptr : group->gin_config.gin_base_ptr;
-            params.signals_base = group->gin_config.signals_base;
-            params.combine_signal_offset = group->gin_config.combine_signal_offset;
             // Use offsets relative to gin_base_ptr
             params.mr_info = {
                 .combine_red_token_offset = combine_token_offset,
@@ -7983,7 +8039,7 @@ ncclResult_t ncclEpCombine(
                 .combine_red_prob_offset = is_lsa_only ? 0 : group->gin_config.combine_red_prob_offset,
                 .combine_g2s_prob_offset =
                     is_lsa_only ? 0 : group->gin_config.combine_g2s_prob_offset,
-                .guard_offset = is_lsa_only ? 0 : group->gin_config.combine_guard_offset,
+                .guard_offset = is_lsa_only ? 0 : group->gin_config.guard_offset,
             };
             params.local_rank = group->lsa_rank;
             params.lsa_team = group->rdma_rank;

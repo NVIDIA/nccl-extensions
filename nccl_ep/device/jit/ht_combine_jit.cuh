@@ -651,6 +651,7 @@ inline ncclResult_t launch_combine_push(
             << "      p.my_lsa_rank,\n"
             << "      p.tokens_per_rank,\n"
             << "      p.lsa_team_size,\n"
+            << "      p.row_flag_offset,\n"
             << "      p.topk_weights_em,\n"
             << "      p.srcpos_map,\n"
             << "      p.unfused_sync,\n"

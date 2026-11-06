@@ -1399,7 +1399,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     ep_group->ht_buffers.token_staging_slots = token_staging_slots;
     // kPullPush sizes the dispatch token + prob staging to just per-rank
     // capacity: both back the non-window pull fallback (token rows and forward topk_weights that
-    // peers pull from). The combine prob region is unused (presence derived locally).
+    // peers pull from). The combine prob region holds the pushed-row flags under overflow drop.
     const bool pull_push = ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush;
     const size_t per_rank_tokens = static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank);
     size_t expert_output_token_sz = (pull_push ? per_rank_tokens : token_staging_slots) * max_token_bytes;
@@ -1416,9 +1416,12 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         pull_push ? token_staging_slots * nccl_ep::ht::comb_stage_stride_bytes(
                         static_cast<int>(max_token_bytes), /*reserve_prob=*/true)
                   : token_staging_slots * max_token_bytes;
-    size_t expert_input_prob_sz = pull_push
-        ? 0
-        : token_staging_slots * num_local_experts * lsa_ranks * sizeof(float);
+    // kPullPush with overflow drop keeps one int32 pushed-row flag per (token, source rank) here.
+    size_t expert_input_prob_sz = token_staging_slots * num_local_experts * lsa_ranks * sizeof(float);
+    if (pull_push) {
+        const bool drop_flags = ep_group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP;
+        expert_input_prob_sz = drop_flags ? per_rank_tokens * lsa_ranks * sizeof(int32_t) : 0;
+    }
 
     // zero_copy elides both token regions (windowed tensors required). Under kPullPush the token
     // staging still backs the non-window pull fallback (input windowing is opt-in independently of
@@ -1558,6 +1561,11 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         ep_group->ht_buffers.ipc_combine_token_offset + combine_token_aligned;
     ep_group->ht_buffers.expert_input_prob =
         reinterpret_cast<float*>(mega_base + ep_group->ht_buffers.ipc_combine_prob_offset);
+
+    // One-time arm of the push-combine row flags (-1: no row pushed); combine_reduce re-arms them.
+    if (pull_push && ep_group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP) {
+        CUDA_CHECK(cudaMemsetAsync(ep_group->ht_buffers.expert_input_prob, 0xFF, expert_input_prob_sz, stream));
+    }
 
     ep_group->ht_buffers.ipc_pull_meta_offset =
         dispatch_token_aligned + dispatch_prob_aligned +
@@ -7417,6 +7425,20 @@ ncclResult_t ncclEpDispatch(
     return ncclSuccess;
 }
 
+// Rows the push combine reduce skips under overflow drop: Flat its scan map, expert-major its pushed-row flags.
+static int32_t* ht_combine_retained_slots(ncclEpGroup_t group, ncclEpHandle_t handle) {
+    if (group->config.overflow_policy != NCCL_EP_OVERFLOW_DROP) {
+        return nullptr;
+    }
+    if (handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+        return reinterpret_cast<int32_t*>(group->ht_buffers.expert_input_prob);
+    }
+    if (handle->layout == NCCL_EP_LAYOUT_FLAT) {
+        return handle->ht.sparse_to_dense_map;
+    }
+    return nullptr;
+}
+
 ncclResult_t ncclEpCombine(
     ncclEpHandle_t handle,
     const ncclEpCombineInputs_t* inputs,
@@ -7959,10 +7981,7 @@ ncclResult_t ncclEpCombine(
             }
             const int team_size = group->lsa_team_size;
             void* staging = group->ht_buffers.expert_input_token;
-            // Which (t,R) partials exist is derived locally in the reduce from this rank's
-            // own routing (per-handle uint16 topk snapshot), so no per-(t,R) valid flag is
-            // pushed over NVLink and no flag zero-init is needed. Unwritten staging rows
-            // are still skipped, so the full staging memset is avoided.
+            // Present partials come from this rank's own routing (uint16 topk snapshot); see em_drop below for drop.
             assert(handle->ht.topk_idx != nullptr &&
                    "HT push combine: topk_idx snapshot missing (ncclEpUpdateHandle not called?)");
             const uint16_t* self_topk_idx = static_cast<const uint16_t*>(handle->ht.topk_idx);
@@ -7970,6 +7989,9 @@ ncclResult_t ncclEpCombine(
             // this rank's slice of handle->ht.token_rank_mask and skip the per-lane topk
             // decode + __match_any_sync dedup entirely; backward still needs the per-lane
             // src_rank_of_lane for the srcpos pad lookup.
+            // Expert-major drop: combine_push flags pushed rows; the reduce skips unflagged ones.
+            int32_t* retained_slots = ht_combine_retained_slots(group, handle);
+            const bool em_drop = handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR && retained_slots != nullptr;
             // Peer staging + flag (+ backward prob-staging) base pointers ride the kernel
             // launch arg (marshaled per call), so there is no shared host staging to race.
             NCCLCHECK(nccl_ep::ht::launch_combine_push(
@@ -8004,7 +8026,9 @@ ncclResult_t ncclEpCombine(
                          ? group->env.ht_combine_dynamic_claim_min_tokens.value.ul
                          : 512UL),
                 nccl_ep_env_flag_on(group->env.nucs),
-                handle->layout == NCCL_EP_LAYOUT_FLAT));
+                handle->layout == NCCL_EP_LAYOUT_FLAT,
+                em_drop ? group->ht_buffers.ipc_combine_prob_offset - group->ht_buffers.ipc_combine_token_offset
+                        : 0));
             NCCLCHECK(nccl_ep::ht::launch_combine_reduce_stage(
                 combined_x->data,
                 staging,
@@ -8023,8 +8047,7 @@ ncclResult_t ncclEpCombine(
                 backward_combine ? static_cast<float*>(combined_topk_weights->data) : nullptr,
                 backward_combine ? handle->num_topk : 0,
                 backward_combine,
-                handle->layout == NCCL_EP_LAYOUT_FLAT && group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP
-                    ? handle->ht.sparse_to_dense_map : nullptr,
+                retained_slots,
                 handle->layout == NCCL_EP_LAYOUT_FLAT));
         } else {
             if (em_permute_combine) {

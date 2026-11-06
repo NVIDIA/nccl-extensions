@@ -8133,6 +8133,8 @@ struct combine_push_param_t {
     bool unfused_sync;
     // Rows are claimed dynamically only when set; otherwise each warp walks a static range.
     bool claim_dynamic;
+    // Byte offset to the per-row pushed flags (0 = off); see combine_reduce_param_t::retained_slots.
+    size_t row_flag_offset;
 };
 
 // Unpack one int4 of BF16 into four float pairs by bit placement; fewer instructions than
@@ -8360,6 +8362,32 @@ struct combine_push_claim_t {
     }
 };
 
+// Overflow drop: mark row dst_row of a peer's staging pushed; the tail sync orders it before combine_reduce.
+__device__ __forceinline__ void mark_row_pushed(void* peer_staging, size_t row_flag_offset, int64_t dst_row) {
+    reinterpret_cast<int32_t*>(static_cast<uint8_t*>(peer_staging) + row_flag_offset)[dst_row] = 0;
+}
+
+// Drop mode: write every pad float so the reduce never reads a stale one.
+__device__ __forceinline__ void write_drop_prob_pad(
+    float* prob_dst, int32_t prob_p, float prob_w, int top_k, int wlane) {
+    float w = 0.0f;
+    for (int j = 0; j < top_k; ++j) {
+        const int32_t pp = __shfl_sync(0xFFFFFFFFu, prob_p, j);
+        const float pw = __shfl_sync(0xFFFFFFFFu, prob_w, j);
+        if (pp == wlane) {
+            w = pw;
+        }
+    }
+    if (wlane < top_k) {
+        prob_dst[wlane] = w;
+    }
+}
+
+// Re-arm the read pushed-row flag (-1) for the next call.
+__device__ __forceinline__ void rearm_row_flag(int32_t* flags, int t, int lsa_team_size, int src_rank) {
+    flags[static_cast<size_t>(t) * lsa_team_size + src_rank] = -1;
+}
+
 // One recv slot per warp (kSlotsPerBlock in parallel), identical
 // gather-reduce to local_permute_reduce; the reduced row is assembled in a per-warp smem buffer
 // and pushed to the remote destination staging slot [t*team_size + R], one TMA store per row
@@ -8387,6 +8415,7 @@ __device__ __forceinline__ void combine_push(
     int my_lsa_rank,
     int tokens_per_rank,
     int lsa_team_size,
+    size_t row_flag_offset,
     // Backward-only: sparse-direct prob scatter into the token staging pad (null/unused on forward).
     const float* __restrict__ topk_weights_em = nullptr,
     const int32_t* __restrict__ srcpos_map = nullptr,
@@ -8500,6 +8529,9 @@ __device__ __forceinline__ void combine_push(
                 s_dst[slot_in_block] = reinterpret_cast<int4*>(
                     static_cast<uint8_t*>(peer_staging_ptrs[dst_rank]) +
                     static_cast<size_t>(dst_row) * comb_stage_push_stride_bytes(kPushRowBytes, kMxfp8, BACKWARD_COMBINE));
+                if (row_flag_offset != 0) {
+                    mark_row_pushed(peer_staging_ptrs[dst_rank], row_flag_offset, dst_row);
+                }
             }
         }
         __syncwarp();
@@ -8703,9 +8735,11 @@ __device__ __forceinline__ void combine_push(
             // Backward: store the prefetched weight to its srcpos in this (t,R) token row's trailing
             // pad (co-located, one remote write per slot), after the token push has hidden the load.
             if constexpr (BACKWARD_COMBINE) {
-                if (prob_p >= 0) {
-                    float* prob_dst = reinterpret_cast<float*>(
-                        reinterpret_cast<uint8_t*>(dst_int4) + kPushRowBytes);
+                float* prob_dst = reinterpret_cast<float*>(
+                    reinterpret_cast<uint8_t*>(dst_int4) + kPushRowBytes);
+                if (row_flag_offset != 0) {
+                    write_drop_prob_pad(prob_dst, prob_p, prob_w, top_k, wlane);
+                } else if (prob_p >= 0) {
                     prob_dst[prob_p] = prob_w;
                 }
             }
@@ -8723,9 +8757,9 @@ __device__ __forceinline__ void combine_push(
 }
 
 struct combine_reduce_param_t {
-    // Optional scan-built [source token, destination rank] map. Negative means
-    // the receiver dropped the contribution; never read its stale staging row.
-    const int32_t* retained_slots;
+    // Optional [source token, destination rank] map; negative = dropped, never read its staging row.
+    // Flat: scan-built. Expert-major: pushed-row flags, re-armed by the reduce.
+    int32_t* retained_slots;
     // Outputs
     void* attn_output;                // [num_combined_tokens, hidden]
     float* combined_topk_weights;     // backward-only: [num_combined_tokens, top_k] gathered weights
@@ -8762,7 +8796,7 @@ __device__ __forceinline__ void combine_reduce(
     // Backward-only: gather each srcpos weight from the token staging pad into combined_topk_weights.
     float* __restrict__ combined_topk_weights,
     int top_k,
-    const int32_t* retained_slots) {
+    int32_t* retained_slots) {
     constexpr int kRowBytes = HiddenInt4 * 16;
     constexpr bool kMxfp8 = (kCombineRecipe == NCCL_EP_COMB_QUANT_MXFP8);
     static_assert(!kMxfp8 || (kTokenDtype == ncclBfloat16 && !Flat),
@@ -8820,6 +8854,11 @@ __device__ __forceinline__ void combine_reduce(
         const unsigned same_rank = __match_any_sync(0xFFFFFFFFu, src_rank_of_lane);
         const bool rank_leader = rank_valid && ((__ffs(static_cast<int>(same_rank)) - 1) == wlane);
         const unsigned present_ranks = __ballot_sync(0xFFFFFFFFu, rank_leader);
+        if constexpr (CheckRetained && !Flat) {
+            if (rank_leader) {
+                rearm_row_flag(retained_slots, t, lsa_team_size, src_rank_of_lane);
+            }
+        }
 
         // Backward: srcpos slot `slot_thread` was pushed by the rank hosting that expert
         // (src_rank_of_lane), co-located in that rank's token staging row pad (offset kRowBytes).

@@ -569,7 +569,9 @@ ncclResult_t launch_combine_push(
     // Claim rows dynamically (true) or walk static per-warp ranges (false).
     bool claim_dynamic,
     bool nucs,
-    bool flat);
+    bool flat,
+    // Overflow-drop expert-major: byte offset from a peer staging base to its row flags (0 = off).
+    size_t row_flag_offset);
 
 ncclResult_t launch_combine_reduce_stage(
     void* attn_output,
@@ -590,7 +592,7 @@ ncclResult_t launch_combine_reduce_stage(
     float* combined_topk_weights,
     int top_k,
     bool backward,
-    const int32_t* retained_slots,
+    int32_t* retained_slots,
     bool flat);
 
 // Inverse of launch_dispatch_permute: gather caller EM combine input into

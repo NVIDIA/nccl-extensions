@@ -2771,7 +2771,8 @@ ncclResult_t launch_combine_push(
     bool unfused_sync,
     bool claim_dynamic,
     bool nucs,
-    bool flat) {
+    bool flat,
+    size_t row_flag_offset) {
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
     assert(sm_count > 0);
@@ -2816,6 +2817,7 @@ ncclResult_t launch_combine_push(
     p.srcpos_map = srcpos_map;
     p.unfused_sync = unfused_sync;
     p.claim_dynamic = claim_dynamic;
+    p.row_flag_offset = row_flag_offset;
 
     if (unfused_sync) NCCLCHECK(jit::launch_lsa_head_sync(dcomm, head_sync_flag, stream));
     const ncclResult_t status = ::nccl_ep::ht::jit::launch_combine_push(
@@ -2846,7 +2848,7 @@ ncclResult_t launch_combine_reduce_stage(
     float* combined_topk_weights,
     int top_k,
     bool backward,
-    const int32_t* retained_slots,
+    int32_t* retained_slots,
     bool flat) {
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(sm_count > 0);

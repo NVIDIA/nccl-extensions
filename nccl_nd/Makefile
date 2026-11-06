@@ -57,9 +57,14 @@ NVCUFLAGS += --expt-relaxed-constexpr -Xcompiler=-fPIC,-fvisibility=hidden,-Wall
              -I$(NCCL_ND_ROOT)/include -I$(NCCL_ND_ROOT) \
              -isystem $(NCCL_HOME)/include -isystem $(CUDA_HOME)/include/cccl
 NCCL_LDFLAGS := -Xlinker $(abspath $(NCCL_LIB))
+TEST_NVCUFLAGS := -ccbin $(CXX) $(NVCC_GENCODE) $(CXXSTD) -O2 -Xcompiler=-Wall,-Wextra \
+                  -I$(NCCL_ND_ROOT)/include -isystem $(NCCL_HOME)/include
 endif
 
-.PHONY: all build lib install clean help
+TESTDIR := $(BUILDDIR)/test/nccl_nd
+GPU_TEST := $(TESTDIR)/nd_test
+
+.PHONY: all build lib install clean help tests
 all build: lib
 lib: $(LIBTARGET) $(LIBDIR)/$(SONAME) $(LIBDIR)/libnccl_nd.so $(INCDIR)/nccl_nd.h
 
@@ -82,6 +87,13 @@ $(INCDIR)/nccl_nd.h: $(HEADER)
 	@mkdir -p $(dir $@)
 	cp $< $@
 
+# nd_test links the library from $(LIBDIR); set LD_LIBRARY_PATH to run it.
+tests: $(GPU_TEST)
+
+$(GPU_TEST): $(NCCL_ND_ROOT)/tests/nd_test.cu $(HEADER) lib
+	@mkdir -p $(dir $@)
+	$(NVCC) $(TEST_NVCUFLAGS) $< -L$(LIBDIR) -lnccl_nd $(NCCL_LDFLAGS) -o $@
+
 install: lib
 	install -d $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include
 	install -m 755 $(LIBTARGET) $(DESTDIR)$(PREFIX)/lib/
@@ -91,11 +103,11 @@ install: lib
 
 clean:
 	rm -f $(OBJECT) $(OBJECT:.o=.d) $(LIBTARGET) $(LIBDIR)/$(SONAME) \
-	  $(LIBDIR)/libnccl_nd.so $(INCDIR)/nccl_nd.h
+	  $(LIBDIR)/libnccl_nd.so $(INCDIR)/nccl_nd.h $(GPU_TEST)
 
 help:
-	@echo 'Targets: build (default), lib, install, clean, help'
+	@echo 'Targets: build (default), lib, install, tests, clean, help'
 	@echo 'GPU build: CUDA_HOME (CUDA >=12.5), NCCL_HOME (Device API build), NVCC_GENCODE'
-	@echo 'Output: BUILDDIR or NCCL_ND_BUILDDIR (default: repository build/)'
+	@echo 'Output: BUILDDIR or NCCL_ND_BUILDDIR (default: repository build/); tests in test/nccl_nd/'
 
 -include $(OBJECT:.o=.d)

@@ -72,3 +72,13 @@ target_link_options(nccl_nd PRIVATE "LINKER:-z,defs")
 
 install(TARGETS nccl_nd LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 install(FILES include/nccl_nd.h DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+
+option(NCCL_ND_BUILD_TESTS "Build nd_test" OFF)
+if(NCCL_ND_BUILD_TESTS)
+  set(_nd_test_dir "${NCCL_ND_BUILDDIR}/test/nccl_nd")
+  add_executable(nd_test tests/nd_test.cu)
+  set_target_properties(nd_test PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${_nd_test_dir}"
+      CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+  target_link_libraries(nd_test PRIVATE nccl_nd)
+endif()

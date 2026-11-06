@@ -127,8 +127,7 @@ mapping of the input to the local output.
 Other dimensions and axis pairs, non-dense strides, uneven splits, in-place
 operation and network fallback are unsupported. Explicit strides must match
 canonical dense storage. Missing requirements return an error; there is no
-fallback. This library revision still requires native GPU/Graph validation;
-CPU address-mapping checks alone do not establish CUDA runtime correctness.
+fallback.
 
 ## Memory and execution contract
 
@@ -188,3 +187,20 @@ cmake --build build-nd -j
 No Python, FlashInfer, MPI or performance harness is a library dependency.
 Performance experiments and their historical source remain outside this module;
 old standalone measurements are not validation of this library revision.
+
+## Tests
+
+`nd_test` needs one node with two or more GPUs. It compares outputs bitwise
+with an independently computed host reference: FP16/BF16/FP32, both
+directions, 2-D and 4-D (B > 1) tensors, nonzero window offsets, forward +
+inverse round trip, Q/K/V of different sizes, repeated eager calls and CUDA
+Graph replays with new inputs, and rejected misuse.
+
+```sh
+make -C nccl_nd tests NCCL_HOME=/path/to/nccl      # or CMake with -DNCCL_ND_BUILD_TESTS=ON
+export LD_LIBRARY_PATH=$PWD/build/lib:/path/to/nccl/lib:$LD_LIBRARY_PATH
+nccl_nd/tests/run_tests.sh 2 8                     # rank counts; default: all GPUs
+```
+
+`run_tests.sh` starts one `nd_test` process per GPU; no MPI or job scheduler
+is needed.

@@ -9,13 +9,14 @@
 //
 // This file compiles the library source with NCCL_ND_FAULT_INJECTION, which
 // adds test-only hooks that fail the entry barrier launch, one copy submission
-// or the exit barrier launch. Every rank injects the same fault, so the
-// barriers that were enqueued still match across ranks and the stream
-// completes. Each case checks the returned error and the cleared host group,
-// then follows step 3 of the README recovery procedure on its own
-// communicator: every rank failed alike and injected faults leave the CUDA
-// context usable, so once the stream synchronizes without error, destroy the
-// handle, deregister its windows and abort.
+// or the exit barrier launch, and record the order copies are issued in.
+// Every rank injects the same fault, so the barriers that were enqueued still
+// match across ranks and the stream completes. Each case checks the returned
+// error and the cleared host group, then follows step 3 of the README recovery
+// procedure on its own communicator: every rank failed alike and injected
+// faults leave the CUDA context usable, so once the stream synchronizes without
+// error, destroy the handle, deregister its windows and abort. A final
+// case checks the issued copy order for NCCL_ND_COPY_ORDER=peer and tensor.
 #define NCCL_ND_FAULT_INJECTION 1
 #include "../nccl_nd.cu"
 #include "test_common.hpp"
@@ -115,6 +116,37 @@ void runCase(const std::string& path, Fault fault, bool grouped) {
   NCCL_CHECK(ncclCommAbort(comm));
 }
 
+// A group of three calls must issue copies peer-major by default: for each
+// rotation step, that step's copy of every call. With NCCL_ND_COPY_ORDER=tensor,
+// all steps of one call, then the next. Indices are call * P + step.
+void checkCopyOrder(ncclComm_t comm, const char* order) {
+  setenv("NCCL_ND_COPY_ORDER", order, 1);
+  ncclNdHandle_t h;
+  NCCL_CHECK(ncclNdCreate(&h, comm));
+  unsetenv("NCCL_ND_COPY_ORDER");
+  cudaStream_t s;
+  CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+  const size_t p = static_cast<size_t>(gWorld), calls = 3;
+  std::vector<std::unique_ptr<Tensor>> tensors;
+  for (size_t i = 0; i < calls; ++i) tensors.emplace_back(new Tensor(comm, 4 * p));
+  std::vector<size_t> trace, expected;
+  const bool tensorMajor = std::string(order) == "tensor";
+  for (size_t outer = 0; outer < (tensorMajor ? calls : p); ++outer)
+    for (size_t inner = 0; inner < (tensorMajor ? p : calls); ++inner)
+      expected.push_back(tensorMajor ? outer * p + inner : inner * p + outer);
+  nccl_nd::faultPlan = {};
+  nccl_nd::faultPlan.trace = &trace;
+  NCCL_CHECK(ncclNdGroupStart());
+  for (auto& t : tensors) NCCL_CHECK(t->call(h, s));
+  const ncclResult_t end = ncclNdGroupEnd();
+  nccl_nd::faultPlan = {};
+  CUDA_CHECK(cudaStreamSynchronize(s));
+  check(end == ncclSuccess && trace == expected, std::string("NCCL_ND_COPY_ORDER=") + order + ": issued copy order");
+  NCCL_CHECK(ncclNdDestroy(h));
+  tensors.clear();
+  CUDA_CHECK(cudaStreamDestroy(s));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -131,9 +163,11 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Sum failures over ranks on a fresh communicator.
+  // Check the issued copy order, then sum failures over ranks.
   paths.push_back(uidFile + ".sum");
   ncclComm_t comm = initComm(paths.back());
+  checkCopyOrder(comm, "peer");
+  checkCopyOrder(comm, "tensor");
   cudaStream_t s;
   CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
   const int total = reduceFailures(comm, s);

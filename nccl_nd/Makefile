@@ -64,8 +64,9 @@ endif
 TESTDIR := $(BUILDDIR)/test/nccl_nd
 GPU_TEST := $(TESTDIR)/nd_test
 FAULT_TEST := $(TESTDIR)/nd_fault_test
+QKV_BENCH := $(BUILDDIR)/bench/nccl_nd/qkv_bench
 
-.PHONY: all build lib install clean help tests
+.PHONY: all build lib install clean help tests bench
 all build: lib
 lib: $(LIBTARGET) $(LIBDIR)/$(SONAME) $(LIBDIR)/libnccl_nd.so $(INCDIR)/nccl_nd.h
 
@@ -100,6 +101,13 @@ $(FAULT_TEST): $(NCCL_ND_ROOT)/tests/nd_fault_test.cu $(NCCL_ND_ROOT)/tests/test
 	@mkdir -p $(dir $@)
 	$(NVCC) $(TEST_NVCUFLAGS) --expt-relaxed-constexpr -isystem $(CUDA_HOME)/include/cccl $< $(NCCL_LDFLAGS) -o $@
 
+# Q/K/V latency benchmark; links the library like nd_test. Run with bench/run_bench.sh.
+bench: $(QKV_BENCH)
+
+$(QKV_BENCH): $(NCCL_ND_ROOT)/bench/qkv_bench.cu $(NCCL_ND_ROOT)/bench/bench_common.hpp $(HEADER) lib
+	@mkdir -p $(dir $@)
+	$(NVCC) $(TEST_NVCUFLAGS) $< -L$(LIBDIR) -lnccl_nd $(NCCL_LDFLAGS) -o $@
+
 install: lib
 	install -d $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include
 	install -m 755 $(LIBTARGET) $(DESTDIR)$(PREFIX)/lib/
@@ -109,11 +117,11 @@ install: lib
 
 clean:
 	rm -f $(OBJECT) $(OBJECT:.o=.d) $(LIBTARGET) $(LIBDIR)/$(SONAME) \
-	  $(LIBDIR)/libnccl_nd.so $(INCDIR)/nccl_nd.h $(GPU_TEST) $(FAULT_TEST)
+	  $(LIBDIR)/libnccl_nd.so $(INCDIR)/nccl_nd.h $(GPU_TEST) $(FAULT_TEST) $(QKV_BENCH)
 
 help:
-	@echo 'Targets: build (default), lib, install, tests, clean, help'
+	@echo 'Targets: build (default), lib, install, tests, bench, clean, help'
 	@echo 'GPU build: CUDA_HOME (CUDA >=12.5), NCCL_HOME (Device API build), NVCC_GENCODE'
-	@echo 'Output: BUILDDIR or NCCL_ND_BUILDDIR (default: repository build/); tests in test/nccl_nd/'
+	@echo 'Output: BUILDDIR or NCCL_ND_BUILDDIR (default: repository build/); tests in test/nccl_nd/, bench in bench/nccl_nd/'
 
 -include $(OBJECT:.o=.d)

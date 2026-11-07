@@ -95,3 +95,12 @@ if(NCCL_ND_BUILD_TESTS)
   target_link_directories(nd_fault_test PRIVATE "${_nccl_libdir}")
   target_link_libraries(nd_fault_test PRIVATE "-l:${_nccl_libname}" CUDA::cudart)
 endif()
+
+option(NCCL_ND_BUILD_BENCH "Build the qkv_bench benchmark" OFF)
+if(NCCL_ND_BUILD_BENCH)
+  add_executable(qkv_bench bench/qkv_bench.cu)
+  set_target_properties(qkv_bench PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${NCCL_ND_BUILDDIR}/bench/nccl_nd"
+      CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+  target_link_libraries(qkv_bench PRIVATE nccl_nd)
+endif()

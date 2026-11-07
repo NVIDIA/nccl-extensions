@@ -11,6 +11,8 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <vector>
@@ -22,6 +24,7 @@ struct ncclNdHandle {
   int world;
   int rank;
   size_t maxPitch;
+  bool tensorMajor;  // NCCL_ND_COPY_ORDER=tensor; see tensorMajorOrder
 };
 
 namespace nccl_nd {
@@ -134,7 +137,8 @@ __global__ void rankBarrier(ncclDevComm devComm) {
 struct FaultPlan {
   bool entryBarrier = false;
   bool exitBarrier = false;
-  long copyIndex = -1;  // issue-order index of the copy to fail; -1 for none
+  long copyIndex = -1;                 // issue-order index of the copy to fail; -1 for none
+  std::vector<size_t>* trace = nullptr;  // receives each enqueued copy's index into copies
 };
 FaultPlan faultPlan;
 #endif
@@ -153,6 +157,7 @@ cudaError_t enqueueCopy(const std::vector<cudaMemcpy3DParms>& copies, size_t ind
                         cudaStream_t stream) {
 #ifdef NCCL_ND_FAULT_INJECTION
   if (faultPlan.copyIndex >= 0 && issued == static_cast<size_t>(faultPlan.copyIndex)) return cudaErrorInvalidValue;
+  if (faultPlan.trace != nullptr) faultPlan.trace->push_back(index);
 #else
   (void)issued;
 #endif
@@ -216,15 +221,18 @@ ncclResult_t prepareCopies(ncclNdHandle_t handle, const ncclNdTensor_t* input, c
 // fails. Such a failure is collective-fatal: output is undefined on every rank.
 //
 // copies holds one block of world descriptors per call, each block in the same
-// rotated peer order. Copies are issued peer-major: for each rotation step, the
-// copy of every call from that step's peer, in recording order. With several
-// calls this keeps one source per rank and step, so ranks that drift apart do
-// not converge on the same source GPU at a call boundary. A single call is
-// unaffected.
+// rotated peer order. Copies are issued peer-major by default: for each rotation
+// step, the copy of every call from that step's peer, in recording order. With
+// several calls this keeps one source per rank and step, so ranks that drift
+// apart do not converge on the same source GPU at a call boundary. Tensor-major
+// order (every peer of one call, then the next call) exists only for benchmark
+// comparison. A single call is unaffected.
 ncclResult_t submitCopies(ncclNdHandle_t handle, const std::vector<cudaMemcpy3DParms>& copies, cudaStream_t stream) {
   const size_t world = static_cast<size_t>(handle->world);
   if (copies.size() % world != 0) return ncclInternalError;
   const size_t calls = copies.size() / world;
+  const size_t outer = handle->tensorMajor ? calls : world;
+  const size_t inner = handle->tensorMajor ? world : calls;
   ncclDevComm devComm = handle->devComm;
   cudaError_t launch = launchBarrier(&devComm, stream, false);
   if (launch != cudaSuccess) {
@@ -233,9 +241,11 @@ ncclResult_t submitCopies(ncclNdHandle_t handle, const std::vector<cudaMemcpy3DP
     return ncclUnhandledCudaError;
   }
   ncclResult_t result = ncclSuccess;
-  for (size_t step = 0; step < world && result == ncclSuccess; ++step) {
-    for (size_t call = 0; call < calls; ++call) {
-      const size_t issued = step * calls + call;
+  for (size_t o = 0; o < outer && result == ncclSuccess; ++o) {
+    for (size_t i = 0; i < inner; ++i) {
+      const size_t call = handle->tensorMajor ? o : i;
+      const size_t step = handle->tensorMajor ? i : o;
+      const size_t issued = o * inner + i;
       const cudaError_t copyStatus = enqueueCopy(copies, call * world + step, issued, stream);
       if (copyStatus != cudaSuccess) {
         // Peers already passed the entry barrier; still enqueue the exit barrier so they do not hang.
@@ -333,6 +343,19 @@ ncclResult_t validateCall(ncclNdHandle_t handle, const ncclNdTensor_t* input, co
   return validateStorage(handle, input, output, *layout);
 }
 
+// NCCL_ND_COPY_ORDER selects the grouped copy order: peer (default) or tensor.
+// It exists for benchmark comparison and debugging, is read once per handle,
+// and is not part of the API or its compatibility guarantees. The order is
+// local to the rank, so ranks may differ; an invalid value warns and keeps the
+// default rather than failing one rank of a collective create.
+bool tensorMajorOrder() {
+  const char* value = getenv("NCCL_ND_COPY_ORDER");
+  if (value == nullptr || strcmp(value, "peer") == 0) return false;
+  if (strcmp(value, "tensor") == 0) return true;
+  warn("NCCL_ND_COPY_ORDER=%s is invalid; expected peer or tensor; using peer", value);
+  return false;
+}
+
 }  // namespace nccl_nd
 
 extern "C" ncclResult_t ncclNdGetVersion(int* version) {
@@ -375,6 +398,7 @@ extern "C" ncclResult_t ncclNdCreate(ncclNdHandle_t* handle, ncclComm_t comm) {
   result->world = properties.nRanks;
   result->rank = properties.rank;
   result->maxPitch = deviceProperties.memPitch;
+  result->tensorMajor = tensorMajorOrder();
   ncclDevCommRequirements requirements = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
   requirements.lsaBarrierCount = 1;
   status = ncclDevCommCreate(comm, &requirements, &result->devComm);

@@ -13,8 +13,9 @@
 // Q/K/V of different sizes, repeated eager calls and CUDA Graph replays with
 // the input rewritten in stream order, and rejected misuse. Groups: grouped
 // versus separate Q/K/V, nesting, repeated grouped calls and grouped
-// capture/replay, and the group contract (binding, sticky first error,
-// Create/Destroy rejection, capture boundaries, balanced start/end).
+// capture/replay, tensor-major copy order, and the group contract (binding,
+// sticky first error, Create/Destroy rejection, capture boundaries, balanced
+// start/end).
 #include <cuda_runtime.h>
 #include <nccl.h>
 
@@ -321,6 +322,33 @@ void testGroupReuse(ncclNdHandle_t h, cudaStream_t s, int iterations) {
   CUDA_CHECK(cudaGraphDestroy(graph));
 }
 
+// NCCL_ND_COPY_ORDER=tensor changes only the grouped copy order; outputs must
+// still match. nd_fault_test checks the issued order itself. An invalid value
+// warns and keeps the default, so ncclNdCreate still succeeds.
+void testCopyOrder(cudaStream_t s) {
+  setenv("NCCL_ND_COPY_ORDER", "bogus", 1);
+  ncclNdHandle_t h = nullptr;
+  const ncclResult_t invalid = ncclNdCreate(&h, gComm);
+  check(invalid == ncclSuccess && h != nullptr, "group: invalid NCCL_ND_COPY_ORDER falls back to the default");
+  NCCL_CHECK(ncclNdDestroy(h));
+  setenv("NCCL_ND_COPY_ORDER", "tensor", 1);
+  NCCL_CHECK(ncclNdCreate(&h, gComm));
+  unsetenv("NCCL_ND_COPY_ORDER");
+  std::vector<std::unique_ptr<Buffers>> b;
+  for (int i = 0; i < 3; ++i) {
+    b.emplace_back(new Buffers(qkvShape(i), 64 * i));
+    b[i]->writeInput(hostInput(qkvShape(i), gRank, 40 + i), s);
+  }
+  NCCL_CHECK(ncclNdGroupStart());
+  for (auto& buffer : b) NCCL_CHECK(buffer->call(h, s));
+  NCCL_CHECK(ncclNdGroupEnd());
+  CUDA_CHECK(cudaStreamSynchronize(s));
+  bool ok = true;
+  for (int i = 0; i < 3; ++i) ok = ok && b[i]->readOutput() == reference(qkvShape(i), 40 + i);
+  check(ok, "group: tensor-major copy order (NCCL_ND_COPY_ORDER=tensor) matches the reference");
+  NCCL_CHECK(ncclNdDestroy(h));
+}
+
 // Every rank takes the same rejection path, so no collective work is pending.
 // A failed group must enqueue nothing, so outputs stay untouched.
 void testGroupMisuse(ncclNdHandle_t h, cudaStream_t s) {
@@ -471,6 +499,7 @@ int main(int argc, char** argv) {
   testGroupQkv(h, s);
   testGroupReuse(h, s, 10);
   testGroupMisuse(h, s);
+  testCopyOrder(s);
 
   const int total = reduceFailures(gComm, s);
   NCCL_CHECK(ncclNdDestroy(h));

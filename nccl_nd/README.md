@@ -80,30 +80,49 @@ Each operation enqueues, in one explicit CUDA stream:
 2. One `cudaMemcpy3DAsync` call per peer, directly into the final output.
 3. An NCCL device LSA barrier to finish all peer reads before input reuse.
 
-`cudaMemcpy3DAsync` is a host-side CUDA Runtime API call. NCCL Device API calls
-execute inside the two barrier kernels; payload copies are separate stream
-operations. Graph capture records this sequence for replay.
+Copy geometry comes from the axis pair and the dense shapes; there is no
+direction flag, payload scratch, packing kernel or device allocation. Each
+barrier kernel is one CTA of 32 threads per rank. The copies are host-issued
+stream operations, so this is not a single fused kernel, and CUDA may run the
+local self copy on a compute channel.
 
-Copy geometry is derived from the supported sequence/head pair and the dense
-input/output shapes. There is no forward/reverse layout flag. Copy width covers
-one peer's contiguous head slice (including D in 4-D), height covers its sequence
-slice, and depth is B (or 1 in 2-D). Source and destination pitches and plane
-heights come from their respective shapes. Destination rank selects the input
-split; source rank selects the output concat slice.
+## Grouped calls
 
-There is no payload scratch, packing kernel, input-to-window staging, or
-device allocation inside `ncclNdAllToAll`. Host copy descriptors are temporary
-and CUDA consumes them when the call returns (or captures their values into the
-graph).
+`ncclNdGroupStart` and `ncclNdGroupEnd` batch several redistributions, such as
+Q, K and V, under one barrier pair:
 
-Each synchronization kernel launches one CTA of 32 threads per rank and uses
-barrier slot 0. Stream ordering places the full copy sequence between the two
-rank barriers. Serialized calls and graph replays reuse the slot with advancing
-epochs. There is no public CTA setting and no payload CTA grid.
+```c
+ncclNdGroupStart();
+ncclNdAllToAll(handle, &q_in, &q_out, 2, 1, stream);
+ncclNdAllToAll(handle, &k_in, &k_out, 2, 1, stream);
+ncclNdAllToAll(handle, &v_in, &v_out, 2, 1, stream);
+ncclNdGroupEnd();  // entry barrier, 3*P copies, exit barrier
+```
 
-CUDA can execute the local self copy on a compute channel. This path is neither
-a single fused kernel nor a zero-SM collective; API choice alone does not prove
-the physical engine used for every copy.
+Each call is validated and its copy descriptors are resolved when it is
+recorded. The outermost `ncclNdGroupEnd` enqueues one entry barrier, every
+recorded copy and one exit barrier. Copy order and synchronization within a
+group are implementation details, not API guarantees; copies are currently
+issued peer-major (for each peer in the rotated order `(rank + i) % P`, that
+peer's copy of every call).
+
+`include/nccl_nd.h` holds the full contract of each function. In summary:
+
+- **Scope and binding.** Group state is local to the host thread. The first
+  recorded call binds the handle, the stream and the capture state it sees
+  (outside capture, or one capture session); later calls and the outermost end
+  must match, and the outermost end runs with the handle's device current.
+- **Errors.** A rejected `ncclNdAllToAll`, `ncclNdCreate` or `ncclNdDestroy`
+  invalidates the whole local group. The first error is kept, and the
+  outermost end returns it, enqueues nothing and clears the group. Start and
+  end stay balanced after errors. A rejection submits nothing on this rank
+  only; it is not a distributed rollback, so every rank must record the same
+  calls in the same order.
+- **Dependencies.** Grouped calls must be independent: no output may overlap
+  another call's input or output (not checked), and no call may consume
+  another's output.
+- **Native NCCL groups.** ND and native NCCL groups keep independent state and
+  do not group each other's operations.
 
 ## Requirements and supported scope
 
@@ -131,37 +150,36 @@ fallback.
 
 ## Memory and execution contract
 
-The caller owns the communicator and tensor allocations. Register the input
-collectively with `ncclCommWindowRegister(..., NCCL_WIN_COLL_SYMMETRIC)` (typically
-using `ncclMemAlloc` storage). Pass its window and byte offset in the input
-descriptor; its `data` field must be null. A successful ordinary registration or
-allocation alone is not the symmetric-window contract.
+The caller owns the communicator, windows and storage. Register the input
+collectively with `ncclCommWindowRegister(..., NCCL_WIN_COLL_SYMMETRIC)`
+(typically on `ncclMemAlloc` storage) and pass its window and byte offset; pass
+the output as a plain device pointer. The library checks input window ranges
+and local input/output overlap; matching metadata and registration across ranks
+are the caller's responsibility.
 
-The output descriptor takes a device pointer and a null window. The output may
-itself have a separately registered window for a subsequent inverse operation.
-The caller guarantees output capacity, matching metadata and registration
-contracts across ranks. The library checks input window ownership/ranges and
-local input/output overlap, but cannot infer every caller-managed alias or verify
-collective metadata agreement.
+Create and destroy handles outside capture. Use an explicit nondefault stream,
+serialize calls and replays that share a handle, and keep the handle,
+communicator, windows and storage alive until the last replay completes.
+Captured addresses and shapes are fixed. Stream completion makes the output
+ready and the input reusable.
 
-Create a handle with `ncclNdCreate(&handle, comm)` and destroy it with
-`ncclNdDestroy(handle)`, both outside capture. Pass `scatter_dim` and
-`gather_dim` directly to `ncclNdAllToAll`; no config struct or public CTA
-setting is needed.
+A rejected call enqueues nothing on this rank. A submission failure
+(`ncclUnhandledCudaError`) can leave partial collective work and is fatal for
+the handle and the communicator; the failing rank prints `NCCL ND WARN ...` to
+stderr. Recover on every rank:
 
-Use an explicit nondefault stream and serialize operations/replays sharing a
-handle. Keep the handle, communicator, windows, and allocations alive until the
-final replay has completed. The function
-consumes host descriptors before returning. Captured addresses and shapes remain
-fixed; changing host metadata does not update a graph. Stream completion makes
-the output ready and the input reusable, including reads performed by peers.
+1. Stop using the communicator and notify the other ranks out of band; peers
+   may be stuck in a barrier, so a stream synchronize may never return.
+2. Unless every rank is known to have failed the same way, call `ncclCommAbort`
+   and abandon the handle and windows without calling `ncclNdDestroy`.
+3. If every rank failed the same way, and the stream then synchronizes without
+   error and the CUDA context is still usable, destroy the handle, deregister
+   its windows, then abort the communicator. After a sticky CUDA error the
+   context is unusable: abandon everything and restart the process.
+4. Create a new communicator and handle.
 
-An enqueue error can occur after partial collective submission. Do not retry it
-as an eager operation or assume transactional rollback. Such an error is fatal
-for the communicator: abort it with `ncclCommAbort` on every rank. The failing
-rank prints the CUDA error and, for a copy, the peer to stderr as
-`NCCL ND WARN ...`; the return code stays `ncclUnhandledCudaError`. After successful work,
-synchronize before destroying the handle, deregistering windows or freeing memory.
+After successful work, synchronize before destroying the handle, deregistering
+windows or freeing memory.
 
 ## Build
 

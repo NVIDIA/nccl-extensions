@@ -47,6 +47,20 @@ inline ncclResult_t checkCapture(cudaStream_t stream, bool allowActive = false) 
   return allowActive && capture == cudaStreamCaptureStatusActive ? ncclSuccess : ncclInvalidUsage;
 }
 
+// Capture session of stream: *capturing is false and *id 0 outside capture.
+// CUDA gives every capture sequence a unique id, so equal ids mean one session.
+inline ncclResult_t captureSession(cudaStream_t stream, bool* capturing, unsigned long long* id) {
+  cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+  unsigned long long captureId = 0;
+  const cudaError_t status = cudaStreamGetCaptureInfo(stream, &capture, &captureId);
+  if (status == cudaErrorStreamCaptureImplicit) return ncclInvalidUsage;
+  if (status != cudaSuccess) return ncclUnhandledCudaError;
+  if (capture == cudaStreamCaptureStatusInvalidated) return ncclInvalidUsage;
+  *capturing = capture == cudaStreamCaptureStatusActive;
+  *id = *capturing ? captureId : 0;
+  return ncclSuccess;
+}
+
 inline bool addressEnd(uintptr_t first, size_t bytes, uintptr_t* end) {
   if (bytes > std::numeric_limits<uintptr_t>::max() - first) return false;
   *end = first + bytes;
@@ -114,43 +128,72 @@ __global__ void rankBarrier(ncclDevComm devComm) {
   barrier.sync(coop, cuda::memory_order_acq_rel);
 }
 
-ncclResult_t enqueueCopies(ncclNdHandle_t handle, const ncclNdTensor_t* input,
-                          const ncclNdTensor_t* output, const Layout& layout, cudaStream_t stream) {
+ncclResult_t describePeer(ncclNdHandle_t handle, const ncclNdTensor_t* input, const ncclNdTensor_t* output,
+                          const Layout& layout, int peer, cudaMemcpy3DParms* copy) {
+  const size_t offset = static_cast<size_t>(input->win_offset);
+  void* source = nullptr;
+  void* last = nullptr;
+  ncclResult_t status = ncclGetLsaDevicePointer(input->win_hdl, offset, peer, &source);
+  if (status != ncclSuccess) return status;
+  status = ncclGetLsaDevicePointer(input->win_hdl, offset + layout.totalBytes - 1, peer, &last);
+  if (status != ncclSuccess) return status;
+  if (source == nullptr || last == nullptr) return ncclInvalidArgument;
+  const uintptr_t sourceAddress = reinterpret_cast<uintptr_t>(source);
+  uintptr_t sourceEnd;
+  if (sourceAddress % 16 != 0 || !addressEnd(sourceAddress, layout.totalBytes, &sourceEnd)) {
+    return ncclInvalidArgument;
+  }
+  const CopyGeometry geometry = copyGeometry(layout, handle->rank, peer);
+  // DeviceToDevice treats both LSA pointers as device memory, as the driver-level device copy does.
+  *copy = cudaMemcpy3DParms{};
+  copy->srcPtr = make_cudaPitchedPtr(reinterpret_cast<void*>(sourceAddress + geometry.inputOffset), geometry.srcPitch,
+                                     geometry.width, geometry.srcHeight);
+  copy->dstPtr = make_cudaPitchedPtr(static_cast<char*>(output->data) + geometry.outputOffset, geometry.dstPitch,
+                                     geometry.width, geometry.dstHeight);
+  copy->extent = make_cudaExtent(geometry.width, geometry.height, geometry.depth);
+  copy->kind = cudaMemcpyDeviceToDevice;
+  return ncclSuccess;
+}
+
+// Append one descriptor per peer to copies, in rotated order (rank + index) % world.
+// submitCopies relies on this block layout. On failure, copies is left unchanged.
+ncclResult_t prepareCopies(ncclNdHandle_t handle, const ncclNdTensor_t* input, const ncclNdTensor_t* output,
+                           const Layout& layout, std::vector<cudaMemcpy3DParms>* copies) {
   if (layout.copy.srcPitch > handle->maxPitch || layout.copy.dstPitch > handle->maxPitch)
     return ncclInvalidArgument;
-  std::vector<cudaMemcpy3DParms> copies;
+  const size_t first = copies->size();
   try {
-    copies.resize(handle->world);
+    copies->resize(first + handle->world);
   } catch (const std::bad_alloc&) {
     return ncclSystemError;
   }
   // Resolve every peer before enqueueing any collective work. These are host
   // metadata queries; AllToAll never allocates or registers device memory.
-  const size_t offset = static_cast<size_t>(input->win_offset);
   for (int index = 0; index < handle->world; ++index) {
     const int peer = static_cast<int>((static_cast<size_t>(index) + handle->rank) % handle->world);
-    void* source = nullptr;
-    void* last = nullptr;
-    ncclResult_t status = ncclGetLsaDevicePointer(input->win_hdl, offset, peer, &source);
-    if (status != ncclSuccess) return status;
-    status = ncclGetLsaDevicePointer(input->win_hdl, offset + layout.totalBytes - 1, peer, &last);
-    if (status != ncclSuccess) return status;
-    if (source == nullptr || last == nullptr) return ncclInvalidArgument;
-    const uintptr_t sourceAddress = reinterpret_cast<uintptr_t>(source);
-    uintptr_t sourceEnd;
-    if (sourceAddress % 16 != 0 || !addressEnd(sourceAddress, layout.totalBytes, &sourceEnd)) {
-      return ncclInvalidArgument;
+    const ncclResult_t status = describePeer(handle, input, output, layout, peer, &(*copies)[first + index]);
+    if (status != ncclSuccess) {
+      copies->resize(first);
+      return status;
     }
-    const CopyGeometry geometry = copyGeometry(layout, handle->rank, peer);
-    // DeviceToDevice treats both LSA pointers as device memory, as the driver-level device copy does.
-    auto& copy = copies[index];
-    copy.srcPtr = make_cudaPitchedPtr(reinterpret_cast<void*>(sourceAddress + geometry.inputOffset), geometry.srcPitch,
-                                      geometry.width, geometry.srcHeight);
-    copy.dstPtr = make_cudaPitchedPtr(static_cast<char*>(output->data) + geometry.outputOffset, geometry.dstPitch,
-                                      geometry.width, geometry.dstHeight);
-    copy.extent = make_cudaExtent(geometry.width, geometry.height, geometry.depth);
-    copy.kind = cudaMemcpyDeviceToDevice;
   }
+  return ncclSuccess;
+}
+
+// Enqueue entry barrier, all copies, and exit barrier. Once the entry barrier is
+// enqueued, peers depend on the exit barrier, so it is enqueued even if a copy
+// fails. Such a failure is collective-fatal: output is undefined on every rank.
+//
+// copies holds one block of world descriptors per call, each block in the same
+// rotated peer order. Copies are issued peer-major: for each rotation step, the
+// copy of every call from that step's peer, in recording order. With several
+// calls this keeps one source per rank and step, so ranks that drift apart do
+// not converge on the same source GPU at a call boundary. A single call is
+// unaffected.
+ncclResult_t submitCopies(ncclNdHandle_t handle, const std::vector<cudaMemcpy3DParms>& copies, cudaStream_t stream) {
+  const size_t world = static_cast<size_t>(handle->world);
+  if (copies.size() % world != 0) return ncclInternalError;
+  const size_t calls = copies.size() / world;
   ncclDevComm devComm = handle->devComm;
   void* arguments[] = {&devComm};
   const auto barrier = reinterpret_cast<const void*>(rankBarrier);
@@ -161,15 +204,18 @@ ncclResult_t enqueueCopies(ncclNdHandle_t handle, const ncclNdTensor_t* input,
     return ncclUnhandledCudaError;
   }
   ncclResult_t result = ncclSuccess;
-  for (int index = 0; index < handle->world; ++index) {
-    const cudaError_t copyStatus = cudaMemcpy3DAsync(&copies[index], stream);
-    if (copyStatus != cudaSuccess) {
-      // Peers already passed the entry barrier; still enqueue the exit barrier so they do not hang.
-      // The output is undefined and the operation is collective-fatal. Do not retry or fall back.
-      warn("rank %d: cudaMemcpy3DAsync from peer %d failed: %s after %d of %d copies", handle->rank,
-           (handle->rank + index) % handle->world, cudaGetErrorName(copyStatus), index, handle->world);
-      result = ncclUnhandledCudaError;
-      break;
+  for (size_t step = 0; step < world && result == ncclSuccess; ++step) {
+    for (size_t call = 0; call < calls; ++call) {
+      const cudaError_t copyStatus = cudaMemcpy3DAsync(&copies[call * world + step], stream);
+      if (copyStatus != cudaSuccess) {
+        // Peers already passed the entry barrier; still enqueue the exit barrier so they do not hang.
+        // The output is undefined and the operation is collective-fatal. Do not retry or fall back.
+        warn("rank %d: cudaMemcpy3DAsync from peer %zu for recorded call %zu failed: %s after %zu of %zu copies",
+             handle->rank, (static_cast<size_t>(handle->rank) + step) % world, call, cudaGetErrorName(copyStatus),
+             step * calls + call, copies.size());
+        result = ncclUnhandledCudaError;
+        break;
+      }
     }
   }
   launch = cudaLaunchKernel(barrier, dim3(1), dim3(32), arguments, 0, stream);
@@ -178,6 +224,83 @@ ncclResult_t enqueueCopies(ncclNdHandle_t handle, const ncclNdTensor_t* input,
     return ncclUnhandledCudaError;
   }
   return result;
+}
+
+// Calls recorded between ncclNdGroupStart and the outermost ncclNdGroupEnd on
+// this host thread. Descriptors are resolved while recording, so caller tensor
+// metadata need not outlive the recording call. The first recorded call binds
+// the handle, the stream and the stream's capture session.
+struct GroupState {
+  int depth = 0;
+  ncclResult_t error = ncclSuccess;
+  ncclNdHandle_t handle = nullptr;
+  cudaStream_t stream = nullptr;
+  bool capturing = false;
+  unsigned long long captureId = 0;
+  std::vector<cudaMemcpy3DParms> copies;
+};
+
+thread_local GroupState group;
+
+void clearGroup() {
+  group.depth = 0;
+  group.error = ncclSuccess;
+  group.handle = nullptr;
+  group.stream = nullptr;
+  group.capturing = false;
+  group.captureId = 0;
+  group.copies.clear();
+}
+
+// Keep the first error; the outermost GroupEnd reports it and enqueues nothing.
+ncclResult_t failGroup(ncclResult_t status) {
+  if (group.error == ncclSuccess) group.error = status;
+  return status;
+}
+
+// The stream must stay in the capture session, or outside capture, that the
+// first recorded call saw.
+ncclResult_t checkGroupSession() {
+  bool capturing = false;
+  unsigned long long id = 0;
+  const ncclResult_t status = captureSession(group.stream, &capturing, &id);
+  if (status != ncclSuccess) return status;
+  return capturing == group.capturing && id == group.captureId ? ncclSuccess : ncclInvalidUsage;
+}
+
+ncclResult_t recordCall(ncclNdHandle_t handle, const ncclNdTensor_t* input, const ncclNdTensor_t* output,
+                        const Layout& layout, cudaStream_t stream) {
+  if (group.error != ncclSuccess) return group.error;
+  // One barrier pair covers the whole group, so every call must share it.
+  if (group.handle == nullptr) {
+    const ncclResult_t status = captureSession(stream, &group.capturing, &group.captureId);
+    if (status != ncclSuccess) return failGroup(status);
+    group.handle = handle;
+    group.stream = stream;
+  } else if (group.handle != handle || group.stream != stream) {
+    return failGroup(ncclInvalidUsage);
+  } else {
+    const ncclResult_t status = checkGroupSession();
+    if (status != ncclSuccess) return failGroup(status);
+  }
+  const ncclResult_t status = prepareCopies(handle, input, output, layout, &group.copies);
+  return status == ncclSuccess ? ncclSuccess : failGroup(status);
+}
+
+ncclResult_t validateCall(ncclNdHandle_t handle, const ncclNdTensor_t* input, const ncclNdTensor_t* output,
+                          int scatter, int gather, cudaStream_t stream, Layout* layout) {
+  if (handle == nullptr) return ncclInvalidArgument;
+  if (stream == nullptr || stream == cudaStreamLegacy || stream == cudaStreamPerThread) return ncclInvalidUsage;
+  ncclResult_t status = buildLayout(input, output, scatter, gather, handle->world, layout);
+  if (status != ncclSuccess) return status;
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess) return ncclUnhandledCudaError;
+  if (device != handle->device) return ncclInvalidUsage;
+  // All resources already exist. Validation only queries host metadata; the launch is captured
+  // with parameters copied by CUDA. Invalidated captures must still fail before enqueue.
+  status = checkCapture(stream, true);
+  if (status != ncclSuccess) return status;
+  return validateStorage(handle, input, output, *layout);
 }
 
 }  // namespace nccl_nd
@@ -190,9 +313,10 @@ extern "C" ncclResult_t ncclNdGetVersion(int* version) {
 
 extern "C" ncclResult_t ncclNdCreate(ncclNdHandle_t* handle, ncclComm_t comm) {
   using namespace nccl_nd;
-  if (handle == nullptr) return ncclInvalidArgument;
-  *handle = nullptr;
-  if (comm == nullptr) return ncclInvalidArgument;
+  if (handle != nullptr) *handle = nullptr;
+  // Unsupported inside an open group; the rejection also invalidates the batch.
+  if (group.depth > 0) return failGroup(ncclInvalidUsage);
+  if (handle == nullptr || comm == nullptr) return ncclInvalidArgument;
 
   ncclResult_t status = checkCapture(nullptr);
   if (status != ncclSuccess) return status;
@@ -239,6 +363,8 @@ extern "C" ncclResult_t ncclNdCreate(ncclNdHandle_t* handle, ncclComm_t comm) {
 
 extern "C" ncclResult_t ncclNdDestroy(ncclNdHandle_t handle) {
   using namespace nccl_nd;
+  // Unsupported inside an open group, for any handle; the rejection also invalidates the batch.
+  if (group.depth > 0) return failGroup(ncclInvalidUsage);
   if (handle == nullptr) return ncclSuccess;
   ncclResult_t status = checkCapture(nullptr);
   if (status != ncclSuccess) return status;
@@ -255,20 +381,44 @@ extern "C" ncclResult_t ncclNdDestroy(ncclNdHandle_t handle) {
 extern "C" ncclResult_t ncclNdAllToAll(ncclNdHandle_t handle, const ncclNdTensor_t* input, ncclNdTensor_t* output,
                                        int scatter_dim, int gather_dim, cudaStream_t stream) {
   using namespace nccl_nd;
-  if (handle == nullptr) return ncclInvalidArgument;
-  if (stream == nullptr || stream == cudaStreamLegacy || stream == cudaStreamPerThread) return ncclInvalidUsage;
+  const bool grouped = group.depth > 0;
+  // A failed group returns its first error to every later recorded call, valid or not.
+  if (grouped && group.error != ncclSuccess) return group.error;
   Layout layout{};
-  ncclResult_t status = buildLayout(input, output, scatter_dim, gather_dim, handle->world, &layout);
-  if (status != ncclSuccess) return status;
-  int device = -1;
-  if (cudaGetDevice(&device) != cudaSuccess) return ncclUnhandledCudaError;
-  if (device != handle->device) return ncclInvalidUsage;
-  // All resources already exist. Validation only queries host metadata; the launch is captured
-  // with parameters copied by CUDA. Invalidated captures must still fail before enqueue.
-  status = checkCapture(stream, true);
-  if (status != ncclSuccess) return status;
-  status = validateStorage(handle, input, output, layout);
-  if (status != ncclSuccess) return status;
+  ncclResult_t status = validateCall(handle, input, output, scatter_dim, gather_dim, stream, &layout);
+  if (status != ncclSuccess) return grouped ? failGroup(status) : status;
+  if (grouped) return recordCall(handle, input, output, layout, stream);
 
-  return enqueueCopies(handle, input, output, layout, stream);
+  std::vector<cudaMemcpy3DParms> copies;
+  status = prepareCopies(handle, input, output, layout, &copies);
+  if (status != ncclSuccess) return status;
+  return submitCopies(handle, copies, stream);
+}
+
+extern "C" ncclResult_t ncclNdGroupStart(void) {
+  using namespace nccl_nd;
+  if (group.depth == std::numeric_limits<int>::max()) return ncclInvalidUsage;
+  ++group.depth;
+  return ncclSuccess;
+}
+
+extern "C" ncclResult_t ncclNdGroupEnd(void) {
+  using namespace nccl_nd;
+  if (group.depth == 0) return ncclInvalidUsage;
+  // An inner end only closes a level; errors are reported by the outermost end.
+  if (--group.depth > 0) return ncclSuccess;
+  ncclResult_t status = group.error;
+  if (status == ncclSuccess && group.handle != nullptr) {
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+      status = ncclUnhandledCudaError;
+    } else if (device != group.handle->device) {
+      status = ncclInvalidUsage;
+    } else {
+      status = checkGroupSession();
+      if (status == ncclSuccess) status = submitCopies(group.handle, group.copies, group.stream);
+    }
+  }
+  clearGroup();
+  return status;
 }

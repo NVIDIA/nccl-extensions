@@ -224,7 +224,7 @@ protected:
     size_t row_words() const { return static_cast<size_t>(hidden()) * elem_bytes(dtype()) / sizeof(uint32_t); }
     size_t row_bytes() const { return static_cast<size_t>(hidden()) * elem_bytes(dtype()); }
 
-    void create_group(size_t rdma_buffer_size) {
+    ncclResult_t try_create_group(size_t rdma_buffer_size, unsigned int num_topk) {
         ncclEpGroupConfig_t cfg = NCCL_EP_GROUP_CONFIG_INIT;
         cfg.algorithm = NCCL_EP_ALGO_LOW_LATENCY;
         cfg.num_experts = static_cast<unsigned int>(g_nranks);
@@ -232,14 +232,43 @@ protected:
         cfg.max_recv_tokens_per_rank = static_cast<unsigned int>(g_nranks * kLamMaxTokens);
         cfg.max_token_bytes = row_bytes();
         cfg.rdma_buffer_size = rdma_buffer_size;
+        cfg.num_topk = num_topk; // the group's top-k bound, 0 when the group declares none
         cfg.num_qp_per_rank = NCCL_EP_AUTO;
         cfg.num_channels = NCCL_EP_AUTO;
         cfg.enable_mask = true; // ncclEpMaskClean needs it
-        NCCL_ASSERT(ncclEpCreateGroup(&group_, g_comm, &cfg));
+        return ncclEpCreateGroup(&group_, g_comm, &cfg);
+    }
+
+    // An explicit rdma_buffer_size that holds a handle of either layout at `topk` plus the Lamport region at `topk`.
+    size_t explicit_buffer_bytes(int topk) {
+        size_t layout_bytes = 0;
+        for (const ncclEpLayout_t layout : {NCCL_EP_LAYOUT_EXPERT_MAJOR, NCCL_EP_LAYOUT_RANK_MAJOR}) {
+            layout_bytes = std::max(
+                layout_bytes,
+                nccl_ep::LowLatencyLayout(kLamMaxTokens, row_bytes(), g_nranks, g_nranks, topk, layout, 0).total_bytes);
+        }
+        const size_t bytes =
+            layout_bytes + nccl_ep::lamport_region_shape(kLamMaxTokens, row_bytes(), g_nranks, topk).reserved_bytes;
+        return (bytes + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
+    }
+
+    void create_group(size_t rdma_buffer_size, unsigned int num_topk) {
+        NCCL_ASSERT(try_create_group(rdma_buffer_size, num_topk));
+    }
+
+    // Replaces the group (and the handle made on it) with a new one.
+    void recreate_group(size_t rdma_buffer_size, unsigned int num_topk) {
+        if (handle_) {
+            ncclEpHandleDestroy(handle_);
+            handle_ = nullptr;
+        }
+        NCCL_ASSERT(ncclEpGroupDestroy(group_));
+        group_ = nullptr;
+        create_group(rdma_buffer_size, num_topk);
     }
 
     void SetUp() override {
-        create_group(NCCL_EP_AUTO);
+        create_group(NCCL_EP_AUTO, 0);
 
         const size_t recv_rows = static_cast<size_t>(g_nranks) * kLamMaxTokens;
         CUDA_ASSERT(cudaMalloc(&d_input_, kLamMaxTokens * row_bytes()));
@@ -659,9 +688,7 @@ TEST_P(LamportCombineTest, FixedSizeGroupCreatesTheRegionInPlace) {
     if (dtype() != ncclBfloat16 || rank_major_kernel() != LlCombineKernel::k2SidedLamportRmLsa) {
         GTEST_SKIP() << "needs the BF16 Lamport case";
     }
-    NCCL_ASSERT(ncclEpGroupDestroy(group_));
-    group_ = nullptr;
-    create_group(nccl_ep::get_low_latency_rdma_size_hint(kLamMaxTokens, row_bytes(), g_nranks, g_nranks));
+    recreate_group(explicit_buffer_bytes(kLamTopk), 0);
     create_expert_major_handle();
     if (HasFatalFailure()) return;
     int iteration = 0;
@@ -698,6 +725,70 @@ TEST_P(LamportCombineTest, FixedSizeGroupCreatesTheRegionInPlace) {
         ++iteration;
         if (HasFatalFailure()) return;
     }
+}
+
+// A group that declares a top-k bound (ncclEpGroupConfig_t::num_topk) gets the Lamport region at that capacity from the
+// start: in a user-specified buffer at group creation, in an auto-sized one at its first Lamport handle. A handle of a
+// smaller top-k then finds the region large enough, and the region does not move.
+TEST_P(LamportCombineTest, DeclaredTopkSizesTheRegionFromTheStart) {
+    if (dtype() != ncclBfloat16 || rank_major_kernel() != LlCombineKernel::k2SidedLamportRmLsa) {
+        GTEST_SKIP() << "needs the BF16 Lamport case";
+    }
+    const unsigned int kDeclared = static_cast<unsigned int>(g_nranks); // the group has g_nranks experts
+    const nccl_ep::LamportRegion expected =
+        nccl_ep::lamport_region_shape(kLamMaxTokens, row_bytes(), g_nranks, kDeclared);
+    const void* segment0 = nullptr;
+    size_t stride = 0, slot_bytes = 0;
+
+    // User-specified buffer: the region exists before any handle.
+    recreate_group(explicit_buffer_bytes(kDeclared), kDeclared);
+    NCCL_ASSERT(ncclEpGroup_test_getLamportSegments(group_, &segment0, &stride, &slot_bytes));
+    EXPECT_EQ(stride, expected.segment_stride);
+    create_handle(Routing::kDense);
+    const void* segment0_after = nullptr;
+    NCCL_ASSERT(ncclEpGroup_test_getLamportSegments(group_, &segment0_after, &stride, &slot_bytes));
+    EXPECT_EQ(segment0_after, segment0);
+    EXPECT_EQ(stride, expected.segment_stride);
+    run_burst(0, false, 3);
+    if (HasFatalFailure()) return;
+
+    // Auto-sized buffer: no region until the first Lamport handle, which creates it at the declared capacity.
+    recreate_group(NCCL_EP_AUTO, kDeclared);
+    EXPECT_EQ(ncclEpGroup_test_getLamportSegments(group_, &segment0, &stride, &slot_bytes), ncclInvalidUsage);
+    create_handle(Routing::kDense);
+    NCCL_ASSERT(ncclEpGroup_test_getLamportSegments(group_, &segment0, &stride, &slot_bytes));
+    EXPECT_EQ(stride, expected.segment_stride);
+    create_handle(Routing::kSparse);
+    NCCL_ASSERT(ncclEpGroup_test_getLamportSegments(group_, &segment0_after, &stride, &slot_bytes));
+    EXPECT_EQ(segment0_after, segment0);
+    run_burst(1, false, 3);
+}
+
+// A handle above the group's declared top-k bound is rejected.
+TEST_P(LamportCombineTest, HandleAboveTheDeclaredTopkIsRejected) {
+    if (dtype() != ncclBfloat16 || rank_major_kernel() != LlCombineKernel::k2SidedLamportRmLsa) {
+        GTEST_SKIP() << "needs the BF16 Lamport case";
+    }
+    recreate_group(NCCL_EP_AUTO, kLamTopk - 1);
+    CUDA_ASSERT(cudaMemset(d_topk_, 0, kLamMaxTokens * kLamTopk * sizeof(int32_t)));
+    ncclEpHandle_t rejected = nullptr;
+    EXPECT_EQ(
+        ncclEpCreateHandle(&rejected, group_, NCCL_EP_LAYOUT_RANK_MAJOR, t_topk_, nullptr, nullptr, g_stream),
+        ncclInvalidUsage);
+}
+
+// A user-specified buffer that cannot hold the region at the declared top-k is rejected at group creation.
+TEST_P(LamportCombineTest, UserBufferTooSmallForTheDeclaredRegionIsRejected) {
+    if (dtype() != ncclBfloat16 || rank_major_kernel() != LlCombineKernel::k2SidedLamportRmLsa) {
+        GTEST_SKIP() << "needs the BF16 Lamport case";
+    }
+    const unsigned int kDeclared = static_cast<unsigned int>(g_nranks); // the group has g_nranks experts
+    const nccl_ep::LamportRegion shape =
+        nccl_ep::lamport_region_shape(kLamMaxTokens, row_bytes(), g_nranks, kDeclared);
+    NCCL_ASSERT(ncclEpGroupDestroy(group_));
+    group_ = nullptr;
+    EXPECT_EQ(try_create_group(shape.reserved_bytes - 1, kDeclared), ncclInvalidUsage);
+    EXPECT_EQ(group_, nullptr);
 }
 
 // Fault injection: a destination whose round check times out must receive no stores at all from that warp, not only

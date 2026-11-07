@@ -322,6 +322,11 @@ typedef struct {
     // where it sizes internal buffers. When set, ncclEpInitHandle validates the
     // handle's num_topk against it. A supported positive value also enables
     // AUTO pull-push selection; zero retains push-pull.
+    // LL: ncclEpInitHandle rejects a handle above it, and the first allocation
+    // of an auto-sized buffer is sized for it, so the buffer does not grow with
+    // later handles of a larger top-k. With NCCL_EP_COMBINE_LSA=lamport it also
+    // sizes the Lamport landing region (a user-specified rdma_buffer_size must
+    // hold it), which then never grows either.
     unsigned int num_topk;
     unsigned char padding_v2[4]; // consumes V2 tail padding; future fields append after it
     // Dispatch SM budget. AUTO inherits max_num_sms when set; otherwise HT

@@ -67,8 +67,9 @@ static ncclResult_t
 init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* config, cudaStream_t stream);
 static ncclResult_t destroy_ht_internode(ncclEpGroup_t ep_group);
 
-// Forward declaration for LL helper (defined alongside ll_init_handle).
+// Forward declarations for LL helpers (defined alongside ll_init_handle).
 static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_size);
+static ncclResult_t ll_init_user_buffer(ncclEpGroup_t ep_group);
 namespace {
 ll::LlCombineKernel resolve_combine_enforced_kernel(const ncclEpEnvConfig& env); // defined below
 } // namespace
@@ -3286,7 +3287,10 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         // NCCL_EP_AUTO, allocation is deferred until ll_init_handle so it can
         // size the buffer with the actual (layout, num_topk).
         if (ep_group->config.rdma_buffer_size != NCCL_EP_AUTO) {
-            NCCLCHECK(ll_resize_rdma_buffer(ep_group, ep_group->config.rdma_buffer_size));
+            const ncclResult_t user_buffer_res = ll_init_user_buffer(ep_group);
+            if (user_buffer_res != ncclSuccess) {
+                return reject_group(user_buffer_res);
+            }
         }
 
         // Setup succeeds or returns an error collectively. Return setup
@@ -4287,6 +4291,12 @@ static ncclResult_t validate_ll_geometry(const ncclEpGroup_t ep_group, int num_t
                 num_topk, ep_group->config.num_experts, MAX_NUM_TOPK);
         return ncclInvalidArgument;
     }
+    // The group's declared top-k bound holds for every handle, as for HT.
+    if (ep_group->config.num_topk > 0 && static_cast<unsigned int>(num_topk) > ep_group->config.num_topk) {
+        fprintf(stderr, "ncclEpInitHandle: LL top-k %d exceeds ncclEpGroupConfig_t::num_topk=%u\n", num_topk,
+                ep_group->config.num_topk);
+        return ncclInvalidUsage;
+    }
 
     const int num_device_sms = static_cast<int>(ep_group->dispatch_num_sms);
     if (num_device_sms <= 0) return ncclInvalidUsage;
@@ -4309,6 +4319,38 @@ static ncclResult_t validate_ll_geometry(const ncclEpGroup_t ep_group, int num_t
     return ncclSuccess;
 }
 
+// The group's declared top-k bound (ncclEpGroupConfig_t::num_topk), clamped to what an LL handle can have; zero when
+// the group declares none. No handle exceeds it (validate_ll_geometry).
+static int ll_declared_topk(const ncclEpGroup_t ep_group) {
+    const unsigned int cap =
+        std::min<unsigned int>(ep_group->config.num_experts, static_cast<unsigned int>(MAX_NUM_TOPK));
+    return static_cast<int>(std::min(ep_group->config.num_topk, cap));
+}
+
+// Allocates the user-specified rdma_buffer_size at group creation, before any handle exists. With the Lamport combine
+// enforced and a top-k bound declared, the Lamport region is created in this allocation, at the declared capacity,
+// which no handle can exceed, so no later handle has to create or grow it; a buffer too small to hold it is rejected
+// here.
+static ncclResult_t ll_init_user_buffer(ncclEpGroup_t ep_group) {
+    const size_t size = ep_group->config.rdma_buffer_size;
+    const int declared_topk = ll_declared_topk(ep_group);
+    if (declared_topk > 0 && ep_group->num_attn_ranks == 0 &&
+        resolve_combine_enforced_kernel(ep_group->env) == ll::LlCombineKernel::k2SidedLamportRmLsa) {
+        const nccl_ep::LamportRegion shape = nccl_ep::lamport_region_shape(
+            ep_group->config.max_dispatch_tokens_per_rank, ep_group->config.max_token_bytes, ep_group->nRanks,
+            declared_topk);
+        if (shape.reserved_bytes > size) {
+            fprintf(
+                stderr,
+                "ncclEpCreateGroup: the Lamport combine region for num_topk=%d needs %zu bytes but "
+                "rdma_buffer_size is %zu bytes\n",
+                declared_topk, shape.reserved_bytes, size);
+            return ncclInvalidUsage;
+        }
+        ep_group->ll_lamport_region = shape;
+    }
+    return ll_resize_rdma_buffer(ep_group, size);
+}
 
 // The LL buffer layout of a handle of the given kind and top-k.
 static nccl_ep::LowLatencyLayout ll_layout_for(const ncclEpGroup_t ep_group, ncclEpLayout_t handle_layout, int topk) {
@@ -4328,19 +4370,32 @@ static nccl_ep::LowLatencyLayout ll_layout_for(const ncclEpGroup_t ep_group, ncc
 static ncclResult_t ll_ensure_buffer(
     ncclEpGroup_t ep_group, ncclEpLayout_t handle_layout, size_t layout_total_bytes, int num_topk, bool* reallocated) {
     *reallocated = false;
+    // The first allocation of an auto-sized buffer is sized for the group's declared top-k bound, when there is one, so
+    // that it already covers the group's later handles; a user-specified buffer is checked against this handle only.
+    const bool auto_size = ep_group->config.rdma_buffer_size == NCCL_EP_AUTO;
+    const int sizing_topk = std::max(num_topk, ll_declared_topk(ep_group));
+    size_t sizing_layout_bytes = layout_total_bytes;
+    if (auto_size && sizing_topk != num_topk) {
+        // Never below this handle's own layout, which may carry the hierarchical dispatch overlay.
+        sizing_layout_bytes =
+            std::max(layout_total_bytes, ll_layout_for(ep_group, handle_layout, sizing_topk).total_bytes);
+    }
+
     // Lamport combine: the landing region is at the tail of the buffer, sized for the largest top-k of the group's
     // rank-major handles (nccl_ep::LamportRegion), so handles of different top-k coexist. A handle that needs a larger
     // capacity, or whose layout would reach the region, grows the buffer like any other growth; the region is
     // re-created in the new buffer. Otherwise the region is left as it is: its round words and the round counter are
     // protocol state that survives handle creation.
-    const bool lamport_handle = resolve_combine_enforced_kernel(ep_group->env) == ll::LlCombineKernel::k2SidedLamportRmLsa &&
-                                handle_layout == NCCL_EP_LAYOUT_RANK_MAJOR && ep_group->num_attn_ranks == 0;
-    const int lamport_capacity_topk = std::max(ep_group->ll_lamport_region.capacity_topk, lamport_handle ? num_topk : 0);
+    const bool lamport_handle =
+        resolve_combine_enforced_kernel(ep_group->env) == ll::LlCombineKernel::k2SidedLamportRmLsa &&
+        handle_layout == NCCL_EP_LAYOUT_RANK_MAJOR && ep_group->num_attn_ranks == 0;
+    const int lamport_capacity_topk =
+        std::max(ep_group->ll_lamport_region.capacity_topk, lamport_handle ? sizing_topk : 0);
     const bool lamport_capacity_grows = lamport_capacity_topk != ep_group->ll_lamport_region.capacity_topk;
     const nccl_ep::LamportRegion lamport_shape = nccl_ep::lamport_region_shape(
         ep_group->config.max_dispatch_tokens_per_rank, ep_group->config.max_token_bytes, ep_group->nRanks,
         lamport_capacity_topk);
-    const size_t layout_bytes = std::max(ep_group->ll_max_layout_bytes, layout_total_bytes);
+    const size_t layout_bytes = std::max(ep_group->ll_max_layout_bytes, sizing_layout_bytes);
     const size_t needed_bytes = layout_bytes + lamport_shape.reserved_bytes;
 
     // Ensure rdma_buffer is large enough for this handle's actual layout and the Lamport region.
@@ -4350,7 +4405,6 @@ static ncclResult_t ll_ensure_buffer(
     //   does not invalidate them.
     // - User-specified size: the buffer was already allocated to that exact
     //   value at group create. Reject the handle if it doesn't fit.
-    const bool auto_size = ep_group->config.rdma_buffer_size == NCCL_EP_AUTO;
     if (needed_bytes > ep_group->rdma_buffer_size_alloc || (lamport_capacity_grows && auto_size)) {
         if (!auto_size) {
             fprintf(

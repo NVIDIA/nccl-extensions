@@ -512,7 +512,9 @@ typedef struct {
     unsigned int num_topk;                      // Upper bound on per-token top-k across the group's
                                                 //   handles. Optional (0 = unset); required for HT
                                                 //   eager mode with the expert-major layout;
-                                                //   see docs/documentation/eager_mode.md.
+                                                //   see docs/documentation/eager_mode.md. LL: a handle
+                                                //   above it is rejected and the first auto-sized
+                                                //   allocation is sized for it (also the Lamport region).
     unsigned char padding_v2[4];                // Consumes V2 tail padding; future fields append after
     unsigned int dispatch_num_sms;              // Dispatch budget (AUTO inherits max_num_sms/default)
     unsigned int combine_num_sms;               // Combine budget (AUTO inherits max_num_sms/default)

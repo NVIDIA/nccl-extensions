@@ -630,10 +630,7 @@ __device__ __forceinline__ void combineSendTokensLsa(
     constexpr int64_t hiddenBf16Int4 = kHidden / kNumElemsPerInt4;
     constexpr int kNumSendUnrolls = combine_smem::send_unrolls(kHidden, kElemBytes);
     // Wire slot size, see numBytesPerSlot in the kernels.
-    constexpr size_t numBytesPerSlot = align(
-        static_cast<size_t>(kHidden * kElemBytes +
-                            kHidden / combine_smem::kLogFmtElementsPerMeta * sizeof(nv_bfloat162)),
-        sizeof(int4));
+    constexpr size_t numBytesPerSlot = combine_smem::none_slot_bytes(kHidden, kElemBytes);
 
     if (responsibleExpertIdx >= numExperts) {
         return;
@@ -823,10 +820,7 @@ __device__ __forceinline__ void combine_kernel_impl_2sided_rm_lsa( // INPUT
     // Message package: the NONE-recipe wire slot size, including its
     // reserved (here, always-unused) LogFMT metadata tail -- see the
     // top-of-file doc comment for why that tail stays.
-    constexpr size_t numBytesPerSlot = align(
-        static_cast<size_t>(kHidden * kElemBytes +
-                            kHidden / combine_smem::kLogFmtElementsPerMeta * sizeof(nv_bfloat162)),
-        sizeof(int4));
+    constexpr size_t numBytesPerSlot = combine_smem::none_slot_bytes(kHidden, kElemBytes);
     EP_STATIC_ASSERT(numBytesPerSlot % sizeof(int4) == 0, "Invalid vectorization");
 
     // Set by syncAndSendFinishLsa below; declared (and default-initialized)
@@ -1134,10 +1128,7 @@ __device__ __forceinline__ void combine_kernel_impl_2sided_lamport_rm_lsa( // IN
     // Message package: the NONE-recipe wire slot size, including its
     // reserved (here, always-unused) LogFMT metadata tail -- see the
     // top-of-file doc comment for why that tail stays.
-    constexpr size_t numBytesPerSlot = align(
-        static_cast<size_t>(kHidden * kElemBytes +
-                            kHidden / combine_smem::kLogFmtElementsPerMeta * sizeof(nv_bfloat162)),
-        sizeof(int4));
+    constexpr size_t numBytesPerSlot = combine_smem::none_slot_bytes(kHidden, kElemBytes);
     EP_STATIC_ASSERT(numBytesPerSlot % sizeof(int4) == 0, "Invalid vectorization");
 
     // Declared ahead of the SEND/RECV goto for scope (see the 2-sided kernel).

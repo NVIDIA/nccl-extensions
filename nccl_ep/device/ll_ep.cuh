@@ -1969,9 +1969,7 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
         if constexpr (kRecipe == NCCL_EP_COMB_QUANT_NVFP4) {
             return Recipe::template slot_bytes<kHidden>();
         }
-        constexpr size_t bytes =
-            kHidden * kElemBytes + kHidden / kLogFmtElementsPerMeta * sizeof(nv_bfloat162);
-        return align(bytes, sizeof(int4));
+        return static_cast<size_t>(combine_smem::none_slot_bytes(kHidden, kElemBytes));
     }();
     EP_STATIC_ASSERT(numBytesPerSlot % sizeof(int4) == 0, "Invalid vectorization");
 

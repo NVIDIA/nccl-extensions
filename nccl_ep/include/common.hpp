@@ -327,6 +327,38 @@ __host__ __forceinline__ size_t get_dispatch_hdr_sz(int num_topk, ncclEpLayout_t
     return layout == NCCL_EP_LAYOUT_RANK_MAJOR ? get_dispatch_hdr_sz<NCCL_EP_LAYOUT_RANK_MAJOR>(num_topk) :
                                                  get_dispatch_hdr_sz<NCCL_EP_LAYOUT_EXPERT_MAJOR>(num_topk);
 }
+
+// Wire size of one LL combine receive slot, per recipe: what the buffer layout reserves and what the kernels index
+// with. Shared by host and device (the shared-memory layout of the combine kernel is in device/ll/ll_ep_smem.cuh).
+namespace combine_wire {
+
+constexpr int kMetaElementBytes = sizeof(std::uint32_t);
+constexpr int kLogFmtElementsPerMeta = 128;
+constexpr int kNvfp4ElementsPerPackedByte = 2;
+constexpr int kNvfp4ElementsPerScale = 16;
+constexpr int kNvfp4GlobalScaleBytes = sizeof(float);
+
+// Reserved metadata space of a token of `hidden` elements: one element per kLogFmtElementsPerMeta.
+constexpr int meta_bytes(int hidden) {
+    return hidden / kLogFmtElementsPerMeta * kMetaElementBytes;
+}
+
+constexpr int align_to_int4(int bytes) {
+    return ((bytes + static_cast<int>(sizeof(int4)) - 1) / static_cast<int>(sizeof(int4))) *
+           static_cast<int>(sizeof(int4));
+}
+
+constexpr int nvfp4_slot_bytes(int hidden) {
+    return align_to_int4(
+        hidden / kNvfp4ElementsPerPackedByte + hidden / kNvfp4ElementsPerScale + kNvfp4GlobalScaleBytes);
+}
+
+// The NONE recipe: the token plus the reserved metadata space, 16-byte aligned.
+constexpr int none_slot_bytes(int hidden, int elem_bytes) {
+    return align_to_int4(hidden * elem_bytes + meta_bytes(hidden));
+}
+
+} // namespace combine_wire
 } // namespace ll
 
 template <typename dtype_t>
@@ -508,6 +540,14 @@ struct LamportReset {
               reinterpret_cast<char*>(round_state) + offsetof(LamportEpochState, round))) {}
 };
 
+// The combine receive slot as the buffer layout sizes it. The dtype is not known when the layout is sized, so the token
+// is counted as 2-byte elements: exact for BF16 and FP16, an upper bound for FP32 (the kernels use the exact size,
+// ll::combine_wire::none_slot_bytes with the real element size).
+inline size_t ll_layout_combine_slot_bytes(size_t max_token_bytes) {
+    return static_cast<size_t>(ll::combine_wire::none_slot_bytes(
+        static_cast<int>(max_token_bytes / sizeof(nv_bfloat16)), static_cast<int>(sizeof(nv_bfloat16))));
+}
+
 // Size of the region for a given capacity, independent of where it is placed.
 inline LamportRegion lamport_region_shape(
     int num_max_dispatch_tokens_per_rank, size_t max_token_bytes, int num_ranks, int capacity_topk) {
@@ -515,9 +555,7 @@ inline LamportRegion lamport_region_shape(
     if (capacity_topk <= 0) {
         return r;
     }
-    // The combine receive slot, as LowLatencyLayout sizes it (metadata space per 128 elements plus the token).
-    const size_t num_scales = max_token_bytes / sizeof(nv_bfloat16) / 128;
-    r.slot_bytes = align<size_t>(num_scales * sizeof(nv_bfloat162) + max_token_bytes, sizeof(int4));
+    r.slot_bytes = ll_layout_combine_slot_bytes(max_token_bytes); // as LowLatencyLayout sizes it
     r.segment_stride = align<size_t>(
         static_cast<size_t>(num_max_dispatch_tokens_per_rank) * r.slot_bytes * capacity_topk, 256);
     const size_t round_bytes = align<size_t>(static_cast<size_t>(num_ranks) * sizeof(int), 256);
@@ -570,14 +608,10 @@ struct LowLatencyLayout {
         // Per-slot sizes for buffer allocation are datatype-agnostic at the API;
         // max_token_bytes upper-bounds the entire dispatch payload. Recipe
         // validation ensures the selected token and scale payload fits that bound.
-        // Combine reserves its existing per-128-token-element metadata space.
-        const size_t num_scales = max_token_bytes / sizeof(nv_bfloat16) / 128;
-        size_t scale_metadata_bytes = num_scales * sizeof(nv_bfloat162);
-
         size_t disp_hdr_sz = ll::get_dispatch_hdr_sz(num_topk, layout);
         size_t num_bytes_per_dispatch_msg = disp_hdr_sz + max_token_bytes;
-        size_t num_bytes_per_combine_msg =
-            align<size_t>(scale_metadata_bytes + max_token_bytes, sizeof(int4));
+        // Combine reserves its existing per-128-token-element metadata space.
+        size_t num_bytes_per_combine_msg = ll_layout_combine_slot_bytes(max_token_bytes);
 
         // Per-op send and recv sizes. AFD rank-major groups split the world
         // into token-owning attention ranks and expert-owning FFN ranks. Only

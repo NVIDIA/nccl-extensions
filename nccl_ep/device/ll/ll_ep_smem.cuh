@@ -8,10 +8,23 @@
 
 #include <cuda_runtime.h>
 
+#include "common.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
 namespace nccl_ep::ll::combine_smem {
+
+// Wire sizes of a combine slot (common.hpp), under the names this namespace has always used.
+using combine_wire::align_to_int4;
+using combine_wire::kLogFmtElementsPerMeta;
+using combine_wire::kMetaElementBytes;
+using combine_wire::kNvfp4ElementsPerPackedByte;
+using combine_wire::kNvfp4ElementsPerScale;
+using combine_wire::kNvfp4GlobalScaleBytes;
+using combine_wire::meta_bytes;
+using combine_wire::none_slot_bytes;
+using combine_wire::nvfp4_slot_bytes;
 
 // These values define the LL combine kernel's dynamic shared-memory layout.
 // Keep all host launch accounting and device layout derivations based on them.
@@ -41,17 +54,12 @@ constexpr int kRecvTmaBarrierBytes = kNumRecvTmaBarriers * sizeof(std::uint64_t)
 constexpr int kRecvTmaPaddingBytes = sizeof(int4);
 constexpr int kRecvTmaEmptyBarrierOffsetBytes = sizeof(std::uint64_t);
 constexpr int kRecvTmaPayloadOffsetBytes = kRecvTmaBarrierBytes;
-constexpr int kMetaElementBytes = sizeof(std::uint32_t);
-constexpr int kLogFmtElementsPerMeta = 128;
 constexpr int kLogFmtInputBytesPerChunk = 16;
 constexpr int kLogFmtOutputBytesPerChunk = 10;
 constexpr int kNumRecvMetaBuffers = 3;
 constexpr int kTwoByteElementBytes = sizeof(std::uint16_t);
 constexpr int kMaxRecvGroupsForTwoByteElements = 2;
 constexpr int kMaxRecvGroupsForOtherElements = 1;
-constexpr int kNvfp4ElementsPerPackedByte = 2;
-constexpr int kNvfp4ElementsPerScale = 16;
-constexpr int kNvfp4GlobalScaleBytes = sizeof(float);
 
 constexpr int elements_per_int4(int elem_bytes) {
     return static_cast<int>(sizeof(int4)) / elem_bytes;
@@ -109,20 +117,6 @@ constexpr int recv_decode_warps(int hidden, int elem_bytes) {
 
 constexpr int max_recv_groups(int elem_bytes) {
     return elem_bytes == kTwoByteElementBytes ? kMaxRecvGroupsForTwoByteElements : kMaxRecvGroupsForOtherElements;
-}
-
-constexpr int meta_bytes(int hidden) {
-    return hidden / kLogFmtElementsPerMeta * kMetaElementBytes;
-}
-
-constexpr int align_to_int4(int bytes) {
-    return ((bytes + static_cast<int>(sizeof(int4)) - 1) / static_cast<int>(sizeof(int4))) *
-           static_cast<int>(sizeof(int4));
-}
-
-constexpr int nvfp4_slot_bytes(int hidden) {
-    return align_to_int4(
-        hidden / kNvfp4ElementsPerPackedByte + hidden / kNvfp4ElementsPerScale + kNvfp4GlobalScaleBytes);
 }
 
 constexpr int send_warp_smem_bytes(int hidden, int elem_bytes) {

@@ -7,6 +7,7 @@
 #pragma once
 
 #include "device/ht_ep.cuh"
+#include "device/ht_ep_adapter.cuh"
 #include "device/jit/jit_runtime.hpp"
 #include "device/jit/jit_utils.hpp"
 #include "device/jit/jit_source_literals.hpp"
@@ -82,30 +83,38 @@ inline std::string combine_jit_source(
     ncclEpLayout_t layout,
     int hidden_dim,
     ncclDataType_t token_dtype,
-    ncclEpCombQuant_t recipe) {
+    ncclEpCombQuant_t recipe,
+    HtKernelImpl impl,
+    bool overflow_drop) {
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
     const char* recipe_literal = ::nccl_ep::jit::combine_recipe_literal(recipe);
+    const char* const impl_header = ht_impl_header(impl);
+    const char* const ns = ht_impl_namespace(impl);
+    const bool unordered = impl == HtKernelImpl::kUnordered;
+    const std::string drop_arg =
+        unordered ? ",\n      " + std::string(::nccl_ep::jit::bool_literal(overflow_drop)) : std::string();
     std::ostringstream src;
-    src << "#include \"device/ht_ep.cuh\"\n"
+    src << "#include \"" << impl_header << "\"\n"
         << "\n"
-        << "using LSA_RED_GROUP = ht_ep::warp_group<" << L.lsa_red_group_warps << ", "
+        << "using LSA_RED_GROUP = " << ns << "::warp_group<" << L.lsa_red_group_warps << ", "
         << L.lsa_red_group_start << ">;\n"
-        << "using CROSS_LSA_RED_GROUP = ht_ep::warp_group<" << L.cross_lsa_red_group_warps << ", "
+        << "using CROSS_LSA_RED_GROUP = " << ns << "::warp_group<" << L.cross_lsa_red_group_warps << ", "
         << L.cross_lsa_red_group_start << ">;\n"
-        << "using LSA_G2S_GROUP = ht_ep::warp_group<" << L.lsa_g2s_group_warps << ", "
+        << "using LSA_G2S_GROUP = " << ns << "::warp_group<" << L.lsa_g2s_group_warps << ", "
         << L.lsa_g2s_group_start << ">;\n"
-        << "using CROSS_LSA_G2S_GROUP = ht_ep::warp_group<" << L.cross_lsa_g2s_group_warps << ", "
+        << "using CROSS_LSA_G2S_GROUP = " << ns << "::warp_group<" << L.cross_lsa_g2s_group_warps << ", "
         << L.cross_lsa_g2s_group_start << ">;\n"
-        << "using GIN_GROUP = ht_ep::warp_group<" << L.cross_lsa_rdma_group_warps << ", "
+        << "using GIN_GROUP = " << ns << "::warp_group<" << L.cross_lsa_rdma_group_warps << ", "
         << L.cross_lsa_rdma_group_start << ">;\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(LSA_RED_GROUP::size() + CROSS_LSA_RED_GROUP::size() + "
            "LSA_G2S_GROUP::size() + CROSS_LSA_G2S_GROUP::size() + GIN_GROUP::size(), 1)\n"
         << "__global__ void " << kCombineJitEntryName << "(\n"
-        << "    const __grid_constant__ ht_ep::combine_kernel_param_t<" << lsa_team_size << "> param) {\n"
+        << "    const __grid_constant__ " << ns << "::combine_kernel_param_t<" << lsa_team_size << "> param"
+        << (unordered ? ",\n    const bool* rdma_to_attn_map_wo_drop" : "") << ") {\n"
         << "  extern __shared__ uint8_t smem_bytes[];\n"
-        << "  ht_ep::combine_kernel_impl<\n"
+        << "  " << ns << "::combine_kernel_impl<\n"
         << "      LSA_RED_GROUP,\n"
         << "      CROSS_LSA_RED_GROUP,\n"
         << "      LSA_G2S_GROUP,\n"
@@ -124,7 +133,8 @@ inline std::string combine_jit_source(
         << "      " << lsa_team_size << ",\n"
         << "      " << layout_literal << ",\n"
         << "      " << token_dtype_literal << ",\n"
-        << "      " << recipe_literal << ">(param, smem_bytes);\n"
+        << "      " << recipe_literal << drop_arg << ">(param, smem_bytes"
+        << (unordered ? ", rdma_to_attn_map_wo_drop" : "") << ");\n"
         << "}\n";
     return src.str();
 }
@@ -137,6 +147,7 @@ inline ncclResult_t launch_combine(
     ncclEpLayout_t layout,
     int hidden_dim,
     const ncclEpEnvConfig* env,  // for rank-0-gated verbose param dump; may be null
+    bool overflow_drop,
     void* param, // ptr to the packed kernel arguments buffer
     size_t param_size, // size of packed kernel arguments buffer
     int dynamic_smem_bytes,
@@ -145,6 +156,9 @@ inline ncclResult_t launch_combine(
     ncclEpCombQuant_t recipe) {
     const combine_warp_layout_t L =
         compute_combine_warp_layout(num_lsa_teams, config.num_pipelines);
+
+    const HtKernelImpl impl = ht_select_kernel_impl(env);
+    const bool unordered_impl = impl == HtKernelImpl::kUnordered;
 
     static const int fwd_variant_identity = 0;
     static const int bwd_variant_identity = 0;
@@ -166,7 +180,9 @@ inline ncclResult_t launch_combine(
              << (config.backward_combine ? "_bwd" : "_fwd")
              << ::nccl_ep::jit::layout_name_tag(layout)
              << ::nccl_ep::jit::token_dtype_name_tag(token_dtype)
-             << ::nccl_ep::jit::combine_recipe_name_tag(recipe);
+             << ::nccl_ep::jit::combine_recipe_name_tag(recipe)
+             << (unordered_impl ? "_unordered" : "")
+             << (unordered_impl && overflow_drop ? "_drop" : "");
         return name.str();
     }();
     const std::string source = combine_jit_source(
@@ -183,10 +199,12 @@ inline ncclResult_t launch_combine(
         layout,
         hidden_dim,
         token_dtype,
-        recipe);
+        recipe,
+        impl,
+        overflow_drop);
 
     ::nccl_ep::jit::JitKernelVariant variant;
-    variant.kernel_family = "ht_combine";
+    variant.kernel_family = unordered_impl ? "ht_combine_unordered" : "ht_combine";
     variant.variant_name = variant_name;
     variant.source = source;
     variant.entry_name = kCombineJitEntryName;

@@ -24,6 +24,29 @@
 namespace nccl_ep {
 namespace ht {
 
+// Selects which HT kernel implementation gets JIT-compiled.
+//   kOrdered:   device/ht_ep.cuh, namespace ht_ep. The default.
+//   kUnordered: device/ht/ht_gin_unordered.cuh, namespace ht_gin_unordered.
+// Honoured by the dispatch and combine entry points only; see the
+// NCCL_EP_HT_GIN_PROTOCOL section of README.md for the scope.
+enum class HtKernelImpl { kOrdered, kUnordered };
+
+inline HtKernelImpl ht_select_kernel_impl(const ncclEpEnvConfig* env) {
+    // Index into nccl_ep_env.h's ht_gin_protocols: 0 = ORDERED, 1 = UNORDERED.
+    const bool unordered = env != nullptr && env->ht_gin_protocol.is_set && env->ht_gin_protocol.value.ul == 1;
+    return unordered ? HtKernelImpl::kUnordered : HtKernelImpl::kOrdered;
+}
+
+// Path of the implementation header, as the JIT -I roots resolve it.
+inline const char* ht_impl_header(HtKernelImpl impl) {
+    return impl == HtKernelImpl::kUnordered ? "device/ht/ht_gin_unordered.cuh" : "device/ht_ep.cuh";
+}
+
+// Namespace enclosing the kernel templates in that header.
+inline const char* ht_impl_namespace(HtKernelImpl impl) {
+    return impl == HtKernelImpl::kUnordered ? "ht_gin_unordered" : "ht_ep";
+}
+
 // Source-token granularity of flat fused metadata. Each chunk carries one
 // deduplicated count per destination rank; payload width does not affect it.
 constexpr int kFlatMetadataChunkTokens = 256;
@@ -284,6 +307,7 @@ ncclResult_t call_metadata_preprocessing(
     int32_t*
         sparse_to_dense_map, // Output: unified S2D — flat stores token->rank->slot; expert-major stores packed (rank, slot) entries
     bool* rdma_to_attn_map, // Output: which tokens come from RDMA
+    bool* rdma_to_attn_map_wo_drop, // Output: pristine pre-drop copy; null unless policy is DROP
     bool* attn_to_rdma_map, // Output: which tokens go to RDMA
     void* token_rank_mask, // Scratch rank masks, sized by get_rank_mask_elem_size().
     int32_t* num_tokens_for_experts, // Output: total tokens for local experts
@@ -792,6 +816,7 @@ struct CombineParams {
     int s2d_inner_dim; // Inner dim of unified S2D (num_topk in expert-major, ranks per LSA team in flat).
     ncclEpLayout_t layout; // Output layout (selects kernel template specialization).
     const bool* rdma_to_attn_map;
+    const bool* rdma_to_attn_map_wo_drop;
     const bool* attn_to_rdma_map; // For multi-LSA-team RDMA routing
     const bool* local_expert_routing_map; // For backward gradient routing
 

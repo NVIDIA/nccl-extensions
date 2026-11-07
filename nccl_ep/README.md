@@ -700,6 +700,19 @@ excess tokens and lets the pipeline continue. LL ignores the field.
 Refer to the [Recv Overflow Policy](docs/documentation/overflow_policy.md)
 documentation for more details.
 
+### GIN ordered/unordered network EP HT kernel type
+
+`NCCL_EP_HT_GIN_PROTOCOL` selects which kernel HT dispatch and combine run:
+
+- `UNORDERED`: the kernel for unordered networks. Work in progress: it still
+  relies on the network delivering in order.
+- `ORDERED` or unset: the ordered network (GIN strong signals) kernel. This is the default.
+
+The selection applies only to kernels that communicate through the GIN network
+layer, which is what may be ordered or unordered. Kernels that carry no GIN
+traffic are unaffected, such as the single-node pull dispatch and push combine
+selected by `NCCL_EP_HT_PULL_PUSH=1`.
+
 ## LL-specific modifiers
 
 ### `rdma_buffer_size` and lazy allocation (LL only)

@@ -34,7 +34,8 @@ inline std::string scan_flat_jit_source(
     bool enable_per_expert_counts,
     bool enable_em_permute,
     bool out_is_int64,
-    bool use_topk_idx) {
+    bool use_topk_idx,
+    bool overflow_drop) {
     constexpr int rank_mask_word_bits = CHAR_BIT * static_cast<int>(sizeof(uint64_t));
     const int rank_mask_words = (lsa_team_size + rank_mask_word_bits - 1) / rank_mask_word_bits;
     // EM padded-counts / out-offsets dtype, baked as a template arg.
@@ -55,8 +56,10 @@ inline std::string scan_flat_jit_source(
         << "      " << ::nccl_ep::jit::bool_literal(enable_em_permute) << ",\n"
         << "      " << ((enable_em_permute || use_topk_idx) ? experts_per_rank : 0) << ",\n"
         << "      " << em_out_type << ",\n"
-        << "      " << ::nccl_ep::jit::bool_literal(use_topk_idx) << ">(\n"
-        << "      p.input_routing_map, p.tmp, p.sparse_to_dense_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"
+        << "      " << ::nccl_ep::jit::bool_literal(use_topk_idx) << ",\n"
+        << "      " << ::nccl_ep::jit::bool_literal(overflow_drop) << ">(\n"
+        << "      p.input_routing_map, p.tmp, p.sparse_to_dense_map, p.rdma_to_attn_map, p.rdma_to_attn_map_wo_drop,\n"
+        << "      p.attn_to_rdma_map,\n"
         << "      reinterpret_cast<ht_ep::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
         << "      p.num_of_tokens_for_experts, p.local_expert_routing_map, p.per_expert_token_counts,\n"
         << "      p.lsa_team, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank,\n"
@@ -76,7 +79,7 @@ inline std::string scan_flat_jit_source(
 }
 
 inline std::string
-scan_em_jit_source(int num_threads_per_block, int num_of_blocks, int num_lsa_teams, int lsa_team_size) {
+scan_em_jit_source(int num_threads_per_block, int num_of_blocks, int num_lsa_teams, int lsa_team_size, bool overflow_drop) {
     constexpr int rank_mask_word_bits = CHAR_BIT * static_cast<int>(sizeof(uint64_t));
     const int rank_mask_words = (lsa_team_size + rank_mask_word_bits - 1) / rank_mask_word_bits;
     std::ostringstream src;
@@ -89,8 +92,9 @@ scan_em_jit_source(int num_threads_per_block, int num_of_blocks, int num_lsa_tea
         << "      " << num_threads_per_block << ",\n"
         << "      " << num_of_blocks << ",\n"
         << "      " << num_lsa_teams << ",\n"
-        << "      " << lsa_team_size << ">(\n"
-        << "      p.input_routing_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"
+        << "      " << lsa_team_size << ",\n"
+        << "      " << ::nccl_ep::jit::bool_literal(overflow_drop) << ">(\n"
+        << "      p.input_routing_map, p.rdma_to_attn_map, p.rdma_to_attn_map_wo_drop, p.attn_to_rdma_map,\n"
         << "      reinterpret_cast<ht_ep::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
         << "      p.lsa_team, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank);\n"
         << "}\n";
@@ -107,6 +111,7 @@ inline void launch_scan_flat(
     bool enable_em_permute,
     bool out_is_int64,
     bool use_topk_idx,
+    bool overflow_drop,
     ::ht_ep::scan_flat_kernel_param_t& param,
     int dynamic_smem_bytes,
     cudaStream_t stream) {
@@ -121,6 +126,7 @@ inline void launch_scan_flat(
             name << "_epr" << experts_per_rank << (out_is_int64 ? "_i64" : "_i32");
         }
         if (use_topk_idx) name << "_tkidx";
+        if (overflow_drop) name << "_drop";
         return name.str();
     }();
     const std::string source = scan_flat_jit_source(
@@ -132,7 +138,8 @@ inline void launch_scan_flat(
         enable_per_expert_counts,
         enable_em_permute,
         out_is_int64,
-        use_topk_idx);
+        use_topk_idx,
+        overflow_drop);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_scan_flat";
@@ -164,6 +171,7 @@ inline void launch_scan_em(
     int num_of_blocks,
     int num_lsa_teams,
     int lsa_team_size,
+    bool overflow_drop,
     ::ht_ep::scan_em_kernel_param_t& param,
     cudaStream_t stream) {
     static const int variant_identity = 0;
@@ -172,9 +180,11 @@ inline void launch_scan_em(
         name << "scan_em"
              << "_LSATeams" << num_lsa_teams << "_lsa" << lsa_team_size << "_threads" << num_threads_per_block << "_blocks"
              << num_of_blocks;
+        if (overflow_drop) name << "_drop";
         return name.str();
     }();
-    const std::string source = scan_em_jit_source(num_threads_per_block, num_of_blocks, num_lsa_teams, lsa_team_size);
+    const std::string source =
+        scan_em_jit_source(num_threads_per_block, num_of_blocks, num_lsa_teams, lsa_team_size, overflow_drop);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_scan_em";

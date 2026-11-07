@@ -354,6 +354,23 @@ static ncclResult_t validateDispatchRecipe(
             }
             return ncclSuccess;
         case NCCL_EP_DISP_QUANT_FWD: {
+            const auto scale_layout = config ? config->scale_layout : NCCL_EP_SCALE_LAYOUT_WIRE;
+            if (scale_layout != NCCL_EP_SCALE_LAYOUT_WIRE &&
+                scale_layout != NCCL_EP_SCALE_LAYOUT_BLOCK128_GEMM) {
+                return fail("invalid scale_layout");
+            }
+            if (scale_layout == NCCL_EP_SCALE_LAYOUT_BLOCK128_GEMM &&
+                (launch.algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT ||
+                 launch.layout != NCCL_EP_LAYOUT_EXPERT_MAJOR ||
+                 input_scales == nullptr || output_scales == nullptr ||
+                 tokens->datatype != ncclFloat8e4m3 ||
+                 input_scales->datatype != ncclFloat32 ||
+                 output_scales->datatype != ncclFloat32 || input_scales->ndim != 2 ||
+                 input_scales->sizes[1] < static_cast<size_t>(launch.hidden / 128) ||
+                 output_scales->ndim != 2 ||
+                 output_scales->sizes[1] < static_cast<size_t>(launch.hidden / 128))) {
+                return fail("BLOCK128_GEMM requires HT expert-major E4M3 tokens and FP32 scales");
+            }
             auto storage_aligned = [](const ncclEpTensor_t* tensor) {
                 return (tensor->data == nullptr ||
                         reinterpret_cast<std::uintptr_t>(tensor->data) % sizeof(int4) == 0) &&
@@ -3811,7 +3828,8 @@ struct HtBlockLayout {
 
         // Fused-meta-dispatch sizing gate (same helper the runtime path uses). When capable,
         // weights alias the own-rank IPC table region (see ht_init_handle) and flat2em/LERM live
-        // in per-handle scratch; the scan-only token_to_recv_slot is not allocated.
+        // in per-handle scratch. token_to_recv_slot remains allocated so the count path can
+        // expose the same routing snapshot as the scan path.
         const bool count_mode_capable = dispatch_push_count_capable(ep_group, layout);
 
         HtBlockLayout L = {};
@@ -3896,10 +3914,10 @@ struct HtBlockLayout {
                 ? align256(max_flat_recv_tokens * num_topk * sizeof(int32_t))
                 : 0;
         // [num_total_attn_tokens] FLAT recv slot per global attention token, filled by
-        // scan_impl_flat (scan and pull paths; count never runs the scan that fills it).
+        // scan_impl_flat (scan and pull paths) or rebuilt from recv_slot_to_src (count path).
         // num_total_attn_tokens = max_tokens * lsa_team_size * rdma_team_size.
         L.sz_token_to_recv_slot =
-            (em_permute && !count_mode_capable) ?
+            em_permute ?
                 align256(static_cast<size_t>(max_tokens) * lsa_team_size * rdma_team_size * sizeof(int32_t)) :
                 0;
         // Count-mode scratch (EM-permute): sender-local per-chunk per-dest-rank counts and the
@@ -4537,6 +4555,19 @@ static ncclResult_t ht_update_handle_count_mode(
             stream_ntok,
             ep_group->rdma_rank, handle->ht.rdma_to_attn_map, r2a_offset,
             ep_group->preprocess_num_sms, stream);
+    }
+
+    // Count mode never runs scan_impl_flat, but the routing-export ABI needs the
+    // same token -> FLAT slot snapshot. The dispatch MAP phase builds the inverse
+    // map incrementally; seed the snapshot here so unused/invalid entries are -1.
+    if (handle->ht.token_to_recv_slot != nullptr) {
+        const size_t total_tokens =
+            static_cast<size_t>(max_tokens) * lsa_team_size * num_lsa_teams;
+        CUDA_CHECK(cudaMemsetAsync(
+            handle->ht.token_to_recv_slot,
+            0xFF,
+            total_tokens * sizeof(int32_t),
+            stream));
     }
 
     // Unfused path (caller supplies layout_info): AllGather count rows now and derive the
@@ -5250,6 +5281,52 @@ ncclResult_t ncclEpUpdateHandle(
             pull,
             stream));
 
+    return ncclSuccess;
+}
+
+ncclResult_t ncclEpExportExpertMajorRouting(
+    ncclEpHandle_t handle,
+    const ncclEpTensor_t* token_to_slot,
+    const ncclEpTensor_t* flat_to_expert,
+    cudaStream_t stream) {
+    if (handle == nullptr || !handle->num_tokens_set) return ncclInvalidUsage;
+    auto* group = handle->group;
+    // NOTE: the single-LSA-team restriction came in with the export feature
+    // itself (5e90d00) as a conservative gate for the only-validated
+    // configuration, not as protection against a diagnosed cross-node failure.
+    // Cross-node smoke evidence supports lifting it: scan writes
+    // token_to_recv_slot for all global tokens (buffer sized nRanks*max_tokens)
+    // and the consumer derives the sender view via a world-group all_to_all, so
+    // multi-LSA semantics are defined. Rejection below keeps the other
+    // prerequisites intact.
+    if (group->config.algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT ||
+        handle->layout != NCCL_EP_LAYOUT_EXPERT_MAJOR ||
+        group->ht_em_mode != ncclEpGroup::HtEmMode::kLocalPermute ||
+        group->eager_mode) {
+        return ncclInvalidUsage;
+    }
+    if (handle->ht.token_to_recv_slot == nullptr || handle->ht.flat2em_slot_map == nullptr)
+        return ncclInvalidUsage;
+    if (token_to_slot == nullptr || flat_to_expert == nullptr) return ncclInvalidArgument;
+    token_to_slot = tensor_required(token_to_slot);
+    flat_to_expert = tensor_required(flat_to_expert);
+    const size_t source_slots =
+        static_cast<size_t>(group->nRanks) * group->config.max_dispatch_tokens_per_rank;
+    const size_t recv_slots = group->config.max_recv_tokens_per_rank;
+    if (token_to_slot->datatype != ncclInt32 || token_to_slot->ndim != 1 ||
+        token_to_slot->sizes[0] != source_slots || token_to_slot->data == nullptr ||
+        flat_to_expert->datatype != ncclInt32 || flat_to_expert->ndim != 2 ||
+        flat_to_expert->sizes[0] != recv_slots ||
+        flat_to_expert->sizes[1] != static_cast<size_t>(handle->num_topk) ||
+        flat_to_expert->data == nullptr ||
+        token_to_slot->win_hdl != ncclWindow_t{} || flat_to_expert->win_hdl != ncclWindow_t{}) {
+        return ncclInvalidArgument;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(token_to_slot->data, handle->ht.token_to_recv_slot,
+                               source_slots * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(flat_to_expert->data, handle->ht.flat2em_slot_map,
+                               recv_slots * handle->num_topk * sizeof(int32_t),
+                               cudaMemcpyDeviceToDevice, stream));
     return ncclSuccess;
 }
 
@@ -7083,6 +7160,7 @@ ncclResult_t ncclEpDispatch(
                     handle->ht.flat2em_slot_map,
                     handle->ht.srcpos_map,
                     handle->ht.recv_slot_to_src,
+                    handle->ht.token_to_recv_slot,
                     peer_in,
                     deliver_weights ? peer_w : nullptr,
                     deliver_scales ? peer_scale : nullptr,
@@ -7164,7 +7242,9 @@ ncclResult_t ncclEpDispatch(
                     perm_recv_scales_em,
                     perm_flat_scale_staging,
                     perm_scale_row_bytes,
-                    rebuild_em_map ? handle->ht.flat2em_slot_map : nullptr,
+                    hidden / 128,
+                    config && config->scale_layout == NCCL_EP_SCALE_LAYOUT_BLOCK128_GEMM,
+                    count_lean_build ? handle->ht.flat2em_slot_map : nullptr,
                     count_lean_build ? handle->ht.dispatch_push_count.lerm_landing : nullptr,
                     count_lean_build ? handle->ht.local_expert_routing_map : nullptr,
                     em_permute_cursors,

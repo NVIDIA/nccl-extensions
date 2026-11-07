@@ -699,48 +699,4 @@ struct LowLatencyLayout {
     }
 };
 
-// Size for a specific LL layout, rounded up to the buffer alignment.
-inline unsigned long int get_low_latency_rdma_size_hint_for_layout(
-    int num_max_dispatch_tokens_per_rank,
-    size_t max_token_bytes,
-    int num_ranks,
-    int num_experts,
-    ncclEpLayout_t layout,
-    int num_attn_ranks = 0) {
-    auto num_bytes = LowLatencyLayout(
-                         num_max_dispatch_tokens_per_rank,
-                         max_token_bytes,
-                         num_ranks,
-                         num_experts,
-                         MAX_NUM_TOPK,
-                         layout,
-                         num_attn_ranks)
-                         .total_bytes;
-    // Upper bound: the Lamport combine's tail region at the largest top-k (zero extra bytes are not worth a flag).
-    num_bytes +=
-        lamport_region_shape(num_max_dispatch_tokens_per_rank, max_token_bytes, num_ranks, MAX_NUM_TOPK).reserved_bytes;
-    return ((num_bytes + NUM_BUFFER_ALIGNMENT_BYTES) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES;
-}
-
-// Worst case across all LL layouts (upper bound on what may be needed once the
-// per-handle layout is known). Used as the upper limit for the configured
-// rdma_buffer_size; the actual allocation may start smaller and grow.
-inline unsigned long int get_low_latency_rdma_size_hint(
-    int num_max_dispatch_tokens_per_rank,
-    size_t max_token_bytes,
-    int num_ranks,
-    int num_experts,
-    int num_attn_ranks = 0) {
-    auto bytes_for = [&](ncclEpLayout_t layout) {
-        return get_low_latency_rdma_size_hint_for_layout(
-            num_max_dispatch_tokens_per_rank,
-            max_token_bytes,
-            num_ranks,
-            num_experts,
-            layout,
-            num_attn_ranks);
-    };
-    return std::max(bytes_for(NCCL_EP_LAYOUT_EXPERT_MAJOR), bytes_for(NCCL_EP_LAYOUT_RANK_MAJOR));
-}
-
 } // namespace nccl_ep

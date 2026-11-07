@@ -33,11 +33,17 @@ Building requires a CUDA toolkit and a Cython toolchain.
 Stage native artifacts before building a distributable wheel:
 
 ```text
-python/nccl/ep/lib/cu{12,13}/libnccl_ep.so
+python/nccl/ep/lib/cu{12,13}/libnccl_ep.so.0
 python/nccl/ep/include/**
 python/nccl/m2n/lib/cu{12,13}/libnccl_m2n.so
 python/nccl/m2n/include/**
 ```
+
+EP wheels include one regular SONAME file (currently `libnccl_ep.so.0`) in
+each `nccl/ep/lib/cu{12,13}/` directory. The Python loader opens this file
+directly. Native consumers can link with `-l:libnccl_ep.so.0` (or its full
+path) and set RPATH/RUNPATH to the matching CUDA variant directory. Wheels
+do not include the unversioned linker name or the full release-version name.
 
 For a complete Linux wheel build, the internal
 [`build_assets/build_wheels.sh`](build_assets/README.md) script builds and

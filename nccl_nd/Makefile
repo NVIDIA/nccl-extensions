@@ -63,6 +63,7 @@ endif
 
 TESTDIR := $(BUILDDIR)/test/nccl_nd
 GPU_TEST := $(TESTDIR)/nd_test
+FAULT_TEST := $(TESTDIR)/nd_fault_test
 
 .PHONY: all build lib install clean help tests
 all build: lib
@@ -88,11 +89,16 @@ $(INCDIR)/nccl_nd.h: $(HEADER)
 	cp $< $@
 
 # nd_test links the library from $(LIBDIR); set LD_LIBRARY_PATH to run it.
-tests: $(GPU_TEST)
+# nd_fault_test compiles the library source with test-only fault hooks instead.
+tests: $(GPU_TEST) $(FAULT_TEST)
 
-$(GPU_TEST): $(NCCL_ND_ROOT)/tests/nd_test.cu $(HEADER) lib
+$(GPU_TEST): $(NCCL_ND_ROOT)/tests/nd_test.cu $(NCCL_ND_ROOT)/tests/test_common.hpp $(HEADER) lib
 	@mkdir -p $(dir $@)
 	$(NVCC) $(TEST_NVCUFLAGS) $< -L$(LIBDIR) -lnccl_nd $(NCCL_LDFLAGS) -o $@
+
+$(FAULT_TEST): $(NCCL_ND_ROOT)/tests/nd_fault_test.cu $(NCCL_ND_ROOT)/tests/test_common.hpp $(NCCL_ND_ROOT)/nccl_nd.cu $(NCCL_ND_ROOT)/nccl_nd_layout.hpp $(HEADER)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(TEST_NVCUFLAGS) --expt-relaxed-constexpr -isystem $(CUDA_HOME)/include/cccl $< $(NCCL_LDFLAGS) -o $@
 
 install: lib
 	install -d $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include
@@ -103,7 +109,7 @@ install: lib
 
 clean:
 	rm -f $(OBJECT) $(OBJECT:.o=.d) $(LIBTARGET) $(LIBDIR)/$(SONAME) \
-	  $(LIBDIR)/libnccl_nd.so $(INCDIR)/nccl_nd.h $(GPU_TEST)
+	  $(LIBDIR)/libnccl_nd.so $(INCDIR)/nccl_nd.h $(GPU_TEST) $(FAULT_TEST)
 
 help:
 	@echo 'Targets: build (default), lib, install, tests, clean, help'

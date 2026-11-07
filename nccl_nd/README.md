@@ -212,7 +212,16 @@ old standalone measurements are not validation of this library revision.
 with an independently computed host reference: FP16/BF16/FP32, both
 directions, 2-D and 4-D (B > 1) tensors, nonzero window offsets, forward +
 inverse round trip, Q/K/V of different sizes, repeated eager calls and CUDA
-Graph replays with new inputs, and rejected misuse.
+Graph replays with new inputs, and rejected misuse. For groups it compares
+grouped and separate Q/K/V, covers nested groups, repeated grouped calls,
+grouped capture/replay with new inputs, and checks the group contract:
+binding, sticky first error, Create/Destroy rejection, capture-boundary
+crossing and balanced start/end after errors.
+
+`nd_fault_test` compiles the library source with test-only hooks that fail the
+entry barrier launch, a copy after earlier copies were submitted, or the exit
+barrier launch, on every rank. It checks the returned error and the cleared
+group, then runs step 3 of the recovery procedure above.
 
 ```sh
 make -C nccl_nd tests NCCL_HOME=/path/to/nccl      # or CMake with -DNCCL_ND_BUILD_TESTS=ON
@@ -220,5 +229,6 @@ export LD_LIBRARY_PATH=$PWD/build/lib:/path/to/nccl/lib:$LD_LIBRARY_PATH
 nccl_nd/tests/run_tests.sh 2 8                     # rank counts; default: all GPUs
 ```
 
-`run_tests.sh` starts one `nd_test` process per GPU; no MPI or job scheduler
-is needed.
+`run_tests.sh` starts one process per GPU for `nd_test` and, when built,
+`nd_fault_test`; no MPI or job scheduler is needed.
+

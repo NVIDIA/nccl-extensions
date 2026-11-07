@@ -5,62 +5,34 @@
  */
 // GPU correctness test for ncclNdAllToAll. One process per GPU on one node:
 //   nd_test --rank=N --nranks=N --uid-file=PATH
-// tests/run_tests.sh starts the processes. Rank r uses visible GPU r.
-// Rank 0 writes the ncclUniqueId to PATH; the other ranks poll it.
+// tests/run_tests.sh starts the processes; test_common.hpp has the launch helpers.
 //
 // Outputs are compared bitwise with a host reference computed independently
 // from output element indices. Covered: both directions, FP16/BF16/FP32, 2-D
 // and 4-D with B > 1, nonzero window offsets, forward + inverse round trip,
 // Q/K/V of different sizes, repeated eager calls and CUDA Graph replays with
-// the input rewritten in stream order, and rejected misuse.
+// the input rewritten in stream order, and rejected misuse. Groups: grouped
+// versus separate Q/K/V, nesting, repeated grouped calls and grouped
+// capture/replay, and the group contract (binding, sticky first error,
+// Create/Destroy rejection, capture boundaries, balanced start/end).
 #include <cuda_runtime.h>
 #include <nccl.h>
 
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
-#include <thread>
 #include <unistd.h>
 #include <vector>
 
 #include "nccl_nd.h"
-
-#define CUDA_CHECK(x)                                                                                        \
-  do {                                                                                                       \
-    cudaError_t e_ = (x);                                                                                    \
-    if (e_ != cudaSuccess) {                                                                                 \
-      fprintf(stderr, "[rank %d] CUDA %s at %s:%d: %s\n", gRank, cudaGetErrorString(e_), __FILE__, __LINE__, \
-              #x);                                                                                           \
-      exit(2);                                                                                               \
-    }                                                                                                        \
-  } while (0)
-#define NCCL_CHECK(x)                                                                                        \
-  do {                                                                                                       \
-    ncclResult_t r_ = (x);                                                                                   \
-    if (r_ != ncclSuccess) {                                                                                 \
-      fprintf(stderr, "[rank %d] NCCL %s at %s:%d: %s\n", gRank, ncclGetErrorString(r_), __FILE__, __LINE__, \
-              #x);                                                                                           \
-      exit(2);                                                                                               \
-    }                                                                                                        \
-  } while (0)
+#include "test_common.hpp"
 
 namespace {
 
-int gRank = -1, gWorld = 0, gFailures = 0;
 ncclComm_t gComm;
-
-void check(bool ok, const std::string& name) {
-  if (!ok) {
-    ++gFailures;
-    fprintf(stderr, "[rank %d] FAIL %s\n", gRank, name.c_str());
-  } else if (gRank == 0) {
-    printf("PASS %s\n", name.c_str());
-  }
-  fflush(stdout);
-}
 
 uint32_t hashValue(int rank, size_t index, uint32_t seed) {
   uint64_t x = (static_cast<uint64_t>(seed) << 40) ^ (static_cast<uint64_t>(rank) << 32) ^ index;
@@ -166,6 +138,11 @@ struct Buffers {
   void writeInput(const std::vector<uint8_t>& h, cudaStream_t s) {
     CUDA_CHECK(cudaMemcpyAsync(inputData(), h.data(), bytes, cudaMemcpyHostToDevice, s));
   }
+  void resetOutput() {
+    CUDA_CHECK(cudaMemset(out, 0xab, bytes));
+    CUDA_CHECK(cudaDeviceSynchronize());
+  }
+  bool outputUntouched() const { return readOutput() == std::vector<uint8_t>(bytes, 0xab); }
   std::vector<uint8_t> readOutput() const {
     std::vector<uint8_t> h(bytes);
     CUDA_CHECK(cudaMemcpy(h.data(), out, bytes, cudaMemcpyDeviceToHost));
@@ -268,69 +245,208 @@ void testMisuse(ncclNdHandle_t h, cudaStream_t s) {
   check(b.readOutput() == reference(shape, 5), "call after rejected calls");
 }
 
-bool parseInt(const char* text, int* out) {
-  char* end = nullptr;
-  const long value = strtol(text, &end, 10);
-  if (end == text || *end != '\0' || value < 0 || value > 1 << 20) return false;
-  *out = static_cast<int>(value);
-  return true;
+Shape qkvShape(int i) {
+  const size_t heads = 4 * static_cast<size_t>(gWorld);
+  const Shape shapes[] = {{{2, 64, 2 * heads, 64}, 2, 1, ncclBfloat16},
+                          {{2, 64, heads, 64}, 2, 1, ncclBfloat16},
+                          {{2, 32, heads, 128}, 2, 1, ncclBfloat16}};
+  return shapes[i];
 }
 
-void bootstrap(const std::string& path, ncclUniqueId* id) {
-  if (gRank == 0) {
-    NCCL_CHECK(ncclGetUniqueId(id));
-    const std::string tmp = path + ".tmp";
-    FILE* f = fopen(tmp.c_str(), "wb");
-    if (f == nullptr || fwrite(id, sizeof(*id), 1, f) != 1 || fclose(f) != 0 || rename(tmp.c_str(), path.c_str())) {
-      perror("write unique id");
-      exit(2);
-    }
-    return;
+// Q, K and V of different sizes in one nested group must match the reference
+// and the same calls issued separately. The inner end must enqueue nothing.
+void testGroupQkv(ncclNdHandle_t h, cudaStream_t s) {
+  std::vector<std::unique_ptr<Buffers>> grouped, separate;
+  for (int i = 0; i < 3; ++i) {
+    grouped.emplace_back(new Buffers(qkvShape(i), 64 * i));
+    separate.emplace_back(new Buffers(qkvShape(i), 64 * i));
+    grouped[i]->writeInput(hostInput(qkvShape(i), gRank, 20 + i), s);
+    separate[i]->writeInput(hostInput(qkvShape(i), gRank, 20 + i), s);
+    CUDA_CHECK(cudaStreamSynchronize(s));
   }
-  for (int i = 0; i < 12000; ++i) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (f != nullptr) {
-      const bool ok = fread(id, sizeof(*id), 1, f) == 1;
-      fclose(f);
-      if (ok) return;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  for (auto& b : separate) NCCL_CHECK(b->call(h, s));
+  NCCL_CHECK(ncclNdGroupStart());
+  NCCL_CHECK(ncclNdGroupStart());
+  for (auto& b : grouped) NCCL_CHECK(b->call(h, s));
+  NCCL_CHECK(ncclNdGroupEnd());
+  CUDA_CHECK(cudaStreamSynchronize(s));
+  bool pending = true;
+  for (auto& b : grouped) pending = pending && b->outputUntouched();
+  NCCL_CHECK(ncclNdGroupEnd());
+  CUDA_CHECK(cudaStreamSynchronize(s));
+  check(pending, "group: inner end enqueues nothing");
+  bool ok = true;
+  for (int i = 0; i < 3; ++i) {
+    const std::vector<uint8_t> out = grouped[i]->readOutput();
+    ok = ok && out == reference(qkvShape(i), 20 + i) && out == separate[i]->readOutput();
   }
-  fprintf(stderr, "[rank %d] timed out waiting for %s\n", gRank, path.c_str());
-  exit(2);
+  check(ok, "group: Q/K/V of different sizes match the reference and separate calls");
+}
+
+// Repeated groups alternate with replays of a graph that captured the whole
+// group. Inputs are rewritten in stream order after each group.
+void testGroupReuse(ncclNdHandle_t h, cudaStream_t s, int iterations) {
+  std::vector<std::unique_ptr<Buffers>> b;
+  for (int i = 0; i < 3; ++i) b.emplace_back(new Buffers(qkvShape(i), 128 * i));
+  const auto group = [&]() {
+    NCCL_CHECK(ncclNdGroupStart());
+    for (auto& buffer : b) NCCL_CHECK(buffer->call(h, s));
+    NCCL_CHECK(ncclNdGroupEnd());
+  };
+  cudaGraph_t graph;
+  cudaGraphExec_t exec;
+  CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+  group();
+  CUDA_CHECK(cudaStreamEndCapture(s, &graph));
+  CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
+  std::vector<std::vector<std::vector<uint8_t>>> outputs(iterations);
+  for (int i = 0; i < iterations; ++i) {
+    for (int j = 0; j < 3; ++j) b[j]->writeInput(hostInput(qkvShape(j), gRank, 300 + 3 * i + j), s);
+    if (i % 2 == 0) {
+      group();
+    } else {
+      CUDA_CHECK(cudaGraphLaunch(exec, s));
+    }
+    for (auto& buffer : b) {
+      outputs[i].emplace_back(buffer->bytes);
+      CUDA_CHECK(cudaMemcpyAsync(outputs[i].back().data(), buffer->out, buffer->bytes, cudaMemcpyDeviceToHost, s));
+    }
+  }
+  CUDA_CHECK(cudaStreamSynchronize(s));
+  bool ok = true;
+  for (int i = 0; i < iterations; ++i)
+    for (int j = 0; j < 3; ++j) ok = ok && outputs[i][j] == reference(qkvShape(j), 300 + 3 * i + j);
+  check(ok, "group: " + std::to_string(iterations) + " grouped calls and grouped graph replays with new inputs");
+  CUDA_CHECK(cudaGraphExecDestroy(exec));
+  CUDA_CHECK(cudaGraphDestroy(graph));
+}
+
+// Every rank takes the same rejection path, so no collective work is pending.
+// A failed group must enqueue nothing, so outputs stay untouched.
+void testGroupMisuse(ncclNdHandle_t h, cudaStream_t s) {
+  const Shape shape{{2, 32, 2 * static_cast<size_t>(gWorld), 64}, 2, 1, ncclBfloat16};
+  Buffers a(shape), b(shape, 256);
+  a.writeInput(hostInput(shape, gRank, 30), s);
+  b.writeInput(hostInput(shape, gRank, 31), s);
+  CUDA_CHECK(cudaStreamSynchronize(s));
+  cudaStream_t s2;
+  CUDA_CHECK(cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking));
+  ncclNdHandle_t h2;
+  NCCL_CHECK(ncclNdCreate(&h2, gComm));
+  const auto nothingEnqueued = [&](bool ok, const char* name) {
+    CUDA_CHECK(cudaDeviceSynchronize());
+    check(ok && a.outputUntouched() && b.outputUntouched(), std::string("group: ") + name);
+  };
+  const auto badCall = [&]() { return ncclNdAllToAll(h, &b.input, &b.output, 1, 1, s); };
+  const ncclResult_t ok = ncclSuccess, usage = ncclInvalidUsage, argument = ncclInvalidArgument;
+
+  nothingEnqueued(ncclNdGroupEnd() == usage, "end without start");
+  {
+    NCCL_CHECK(ncclNdGroupStart());
+    const ncclResult_t first = a.call(h, s), other = b.call(h, s2), later = b.call(h, s), end = ncclNdGroupEnd();
+    nothingEnqueued(first == ok && other == usage && later == usage && end == usage, "rejects a second stream");
+  }
+  {
+    NCCL_CHECK(ncclNdGroupStart());
+    const ncclResult_t first = a.call(h, s), other = b.call(h2, s), end = ncclNdGroupEnd();
+    nothingEnqueued(first == ok && other == usage && end == usage, "rejects a second handle");
+  }
+  {
+    NCCL_CHECK(ncclNdGroupStart());
+    const ncclResult_t first = a.call(h, s), bad = badCall(), later = b.call(h, s), other = b.call(h, nullptr);
+    const ncclResult_t end = ncclNdGroupEnd();
+    nothingEnqueued(first == ok && bad == argument && later == argument && other == argument && end == argument,
+                    "keeps the first error, also for a later call with a different error");
+  }
+  {
+    NCCL_CHECK(ncclNdGroupStart());
+    ncclNdHandle_t created = h;
+    const ncclResult_t first = a.call(h, s), create = ncclNdCreate(&created, gComm), end = ncclNdGroupEnd();
+    nothingEnqueued(first == ok && create == usage && created == nullptr && end == usage, "rejects ncclNdCreate");
+  }
+  {
+    NCCL_CHECK(ncclNdGroupStart());
+    const ncclResult_t first = a.call(h, s), destroy = ncclNdDestroy(h2), end = ncclNdGroupEnd();
+    nothingEnqueued(first == ok && destroy == usage && end == usage, "rejects ncclNdDestroy of another handle");
+  }
+  {
+    NCCL_CHECK(ncclNdGroupStart());
+    const ncclResult_t destroy = ncclNdDestroy(h), end = ncclNdGroupEnd();
+    nothingEnqueued(destroy == usage && end == usage, "rejects ncclNdDestroy before any call");
+  }
+  {
+    NCCL_CHECK(ncclNdGroupStart());
+    NCCL_CHECK(ncclNdGroupStart());
+    const ncclResult_t bad = badCall(), inner = ncclNdGroupEnd(), outer = ncclNdGroupEnd(), extra = ncclNdGroupEnd();
+    nothingEnqueued(bad == argument && inner == ok && outer == argument && extra == usage,
+                    "stays balanced after an error and clears at the outermost end");
+  }
+  {
+    cudaGraph_t graph;
+    size_t nodes = 1;
+    NCCL_CHECK(ncclNdGroupStart());
+    const ncclResult_t first = a.call(h, s);
+    CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+    const ncclResult_t end = ncclNdGroupEnd();
+    CUDA_CHECK(cudaStreamEndCapture(s, &graph));
+    CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &nodes));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    nothingEnqueued(first == ok && end == usage && nodes == 0, "rejects capture begun while open");
+  }
+  {
+    cudaGraph_t graph;
+    size_t nodes = 1;
+    CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+    NCCL_CHECK(ncclNdGroupStart());
+    const ncclResult_t first = a.call(h, s);
+    CUDA_CHECK(cudaStreamEndCapture(s, &graph));
+    const ncclResult_t end = ncclNdGroupEnd();
+    CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &nodes));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    nothingEnqueued(first == ok && end == usage && nodes == 0, "rejects capture ended while open");
+  }
+  {
+    cudaGraph_t graphs[2];
+    size_t nodes[2] = {1, 1};
+    CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+    NCCL_CHECK(ncclNdGroupStart());
+    const ncclResult_t first = a.call(h, s);
+    CUDA_CHECK(cudaStreamEndCapture(s, &graphs[0]));
+    CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+    const ncclResult_t second = b.call(h, s);
+    CUDA_CHECK(cudaStreamEndCapture(s, &graphs[1]));
+    const ncclResult_t end = ncclNdGroupEnd();
+    for (int i = 0; i < 2; ++i) {
+      CUDA_CHECK(cudaGraphGetNodes(graphs[i], nullptr, &nodes[i]));
+      CUDA_CHECK(cudaGraphDestroy(graphs[i]));
+    }
+    nothingEnqueued(first == ok && second == usage && end == usage && nodes[0] == 0 && nodes[1] == 0,
+                    "rejects a second capture session");
+  }
+  {
+    NCCL_CHECK(ncclNdGroupStart());
+    int version = 0;
+    const ncclResult_t get = ncclNdGetVersion(&version), first = a.call(h, s), second = b.call(h, s);
+    const ncclResult_t end = ncclNdGroupEnd();
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    check(get == ok && version == NCCL_ND_VERSION_CODE && first == ok && second == ok && end == ok &&
+              a.readOutput() == reference(shape, 30) && b.readOutput() == reference(shape, 31),
+          "group: ncclNdGetVersion inside does not participate; group after failed groups works");
+  }
+  a.resetOutput();
+  NCCL_CHECK(a.call(h2, s));
+  CUDA_CHECK(cudaStreamSynchronize(s));
+  check(a.readOutput() == reference(shape, 30), "group: handle survives the rejected ncclNdDestroy");
+  NCCL_CHECK(ncclNdDestroy(h2));
+  CUDA_CHECK(cudaStreamDestroy(s2));
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   std::string uidFile;
-  bool valid = true;
-  for (int i = 1; i < argc; ++i) {
-    const std::string arg = argv[i];
-    if (arg.rfind("--rank=", 0) == 0) {
-      valid = valid && parseInt(argv[i] + 7, &gRank);
-    } else if (arg.rfind("--nranks=", 0) == 0) {
-      valid = valid && parseInt(argv[i] + 9, &gWorld);
-    } else if (arg.rfind("--uid-file=", 0) == 0) {
-      uidFile = arg.substr(11);
-    } else {
-      valid = false;
-    }
-  }
-  if (!valid || gWorld < 2 || gRank < 0 || gRank >= gWorld || uidFile.empty()) {
-    fprintf(stderr, "usage: %s --rank=N --nranks=N --uid-file=PATH (nranks >= 2)\n", argv[0]);
-    return 2;
-  }
-  int devices = 0;
-  CUDA_CHECK(cudaGetDeviceCount(&devices));
-  if (devices < gWorld) {
-    fprintf(stderr, "[rank %d] %d ranks need as many visible GPUs, found %d\n", gRank, gWorld, devices);
-    return 2;
-  }
-  CUDA_CHECK(cudaSetDevice(gRank));
-  ncclUniqueId id;
-  bootstrap(uidFile, &id);
-  NCCL_CHECK(ncclCommInitRank(&gComm, gWorld, id, gRank));
+  if (!initRank(argc, argv, &uidFile)) return 2;
+  gComm = initComm(uidFile);
 
   int version = 0, ncclVersion = 0;
   NCCL_CHECK(ncclNdGetVersion(&version));
@@ -352,20 +468,13 @@ int main(int argc, char** argv) {
   testQkv(h, s);
   testReuse(h, s, {{2, 128, 4 * p, 64}, 2, 1, ncclBfloat16}, 20);
   testMisuse(h, s);
+  testGroupQkv(h, s);
+  testGroupReuse(h, s, 10);
+  testGroupMisuse(h, s);
 
-  // Sum failures over ranks.
-  int* failures;
-  CUDA_CHECK(cudaMalloc(&failures, sizeof(int)));
-  CUDA_CHECK(cudaMemcpy(failures, &gFailures, sizeof(int), cudaMemcpyHostToDevice));
-  NCCL_CHECK(ncclAllReduce(failures, failures, 1, ncclInt32, ncclSum, gComm, s));
-  int total = 0;
-  CUDA_CHECK(cudaMemcpyAsync(&total, failures, sizeof(int), cudaMemcpyDeviceToHost, s));
-  CUDA_CHECK(cudaStreamSynchronize(s));
-  if (gRank == 0) printf("%s: %d failure(s) across %d ranks\n", total == 0 ? "ALL PASSED" : "FAILED", total, gWorld);
-
+  const int total = reduceFailures(gComm, s);
   NCCL_CHECK(ncclNdDestroy(h));
   CUDA_CHECK(cudaStreamDestroy(s));
-  CUDA_CHECK(cudaFree(failures));
   NCCL_CHECK(ncclCommDestroy(gComm));
   if (gRank == 0) unlink(uidFile.c_str());
   return total == 0 ? 0 : 1;

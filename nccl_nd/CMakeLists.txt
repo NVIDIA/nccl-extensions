@@ -73,7 +73,7 @@ target_link_options(nccl_nd PRIVATE "LINKER:-z,defs")
 install(TARGETS nccl_nd LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 install(FILES include/nccl_nd.h DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
 
-option(NCCL_ND_BUILD_TESTS "Build nd_test" OFF)
+option(NCCL_ND_BUILD_TESTS "Build nd_test and nd_fault_test" OFF)
 if(NCCL_ND_BUILD_TESTS)
   set(_nd_test_dir "${NCCL_ND_BUILDDIR}/test/nccl_nd")
   add_executable(nd_test tests/nd_test.cu)
@@ -81,4 +81,17 @@ if(NCCL_ND_BUILD_TESTS)
       RUNTIME_OUTPUT_DIRECTORY "${_nd_test_dir}"
       CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
   target_link_libraries(nd_test PRIVATE nccl_nd)
+  # Compiles the library source with test-only fault hooks; does not link nccl_nd.
+  add_executable(nd_fault_test tests/nd_fault_test.cu)
+  set_target_properties(nd_fault_test PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${_nd_test_dir}"
+      CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+  target_include_directories(nd_fault_test PRIVATE "${_nd_include}")
+  target_include_directories(nd_fault_test SYSTEM PRIVATE "${NCCL_HOME}/include")
+  foreach(cuda_include IN LISTS CUDAToolkit_INCLUDE_DIRS)
+    target_include_directories(nd_fault_test SYSTEM PRIVATE "${cuda_include}/cccl")
+  endforeach()
+  target_compile_options(nd_fault_test PRIVATE --expt-relaxed-constexpr)
+  target_link_directories(nd_fault_test PRIVATE "${_nccl_libdir}")
+  target_link_libraries(nd_fault_test PRIVATE "-l:${_nccl_libname}" CUDA::cudart)
 endif()

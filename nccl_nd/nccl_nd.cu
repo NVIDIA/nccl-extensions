@@ -128,6 +128,37 @@ __global__ void rankBarrier(ncclDevComm devComm) {
   barrier.sync(coop, cuda::memory_order_acq_rel);
 }
 
+#ifdef NCCL_ND_FAULT_INJECTION
+// Test-only hooks. tests/nd_fault_test.cu compiles this file with the macro to
+// fail selected submissions; the shipped library has no hooks.
+struct FaultPlan {
+  bool entryBarrier = false;
+  bool exitBarrier = false;
+  long copyIndex = -1;  // issue-order index of the copy to fail; -1 for none
+};
+FaultPlan faultPlan;
+#endif
+
+cudaError_t launchBarrier(ncclDevComm* devComm, cudaStream_t stream, bool exit) {
+#ifdef NCCL_ND_FAULT_INJECTION
+  if (exit ? faultPlan.exitBarrier : faultPlan.entryBarrier) return cudaErrorLaunchFailure;
+#else
+  (void)exit;
+#endif
+  void* arguments[] = {devComm};
+  return cudaLaunchKernel(reinterpret_cast<const void*>(rankBarrier), dim3(1), dim3(32), arguments, 0, stream);
+}
+
+cudaError_t enqueueCopy(const std::vector<cudaMemcpy3DParms>& copies, size_t index, size_t issued,
+                        cudaStream_t stream) {
+#ifdef NCCL_ND_FAULT_INJECTION
+  if (faultPlan.copyIndex >= 0 && issued == static_cast<size_t>(faultPlan.copyIndex)) return cudaErrorInvalidValue;
+#else
+  (void)issued;
+#endif
+  return cudaMemcpy3DAsync(&copies[index], stream);
+}
+
 ncclResult_t describePeer(ncclNdHandle_t handle, const ncclNdTensor_t* input, const ncclNdTensor_t* output,
                           const Layout& layout, int peer, cudaMemcpy3DParms* copy) {
   const size_t offset = static_cast<size_t>(input->win_offset);
@@ -195,9 +226,7 @@ ncclResult_t submitCopies(ncclNdHandle_t handle, const std::vector<cudaMemcpy3DP
   if (copies.size() % world != 0) return ncclInternalError;
   const size_t calls = copies.size() / world;
   ncclDevComm devComm = handle->devComm;
-  void* arguments[] = {&devComm};
-  const auto barrier = reinterpret_cast<const void*>(rankBarrier);
-  cudaError_t launch = cudaLaunchKernel(barrier, dim3(1), dim3(32), arguments, 0, stream);
+  cudaError_t launch = launchBarrier(&devComm, stream, false);
   if (launch != cudaSuccess) {
     // Nothing of this operation is enqueued on this rank, but peers may already wait in the entry barrier.
     warn("rank %d: entry barrier launch failed: %s", handle->rank, cudaGetErrorName(launch));
@@ -206,19 +235,20 @@ ncclResult_t submitCopies(ncclNdHandle_t handle, const std::vector<cudaMemcpy3DP
   ncclResult_t result = ncclSuccess;
   for (size_t step = 0; step < world && result == ncclSuccess; ++step) {
     for (size_t call = 0; call < calls; ++call) {
-      const cudaError_t copyStatus = cudaMemcpy3DAsync(&copies[call * world + step], stream);
+      const size_t issued = step * calls + call;
+      const cudaError_t copyStatus = enqueueCopy(copies, call * world + step, issued, stream);
       if (copyStatus != cudaSuccess) {
         // Peers already passed the entry barrier; still enqueue the exit barrier so they do not hang.
         // The output is undefined and the operation is collective-fatal. Do not retry or fall back.
         warn("rank %d: cudaMemcpy3DAsync from peer %zu for recorded call %zu failed: %s after %zu of %zu copies",
              handle->rank, (static_cast<size_t>(handle->rank) + step) % world, call, cudaGetErrorName(copyStatus),
-             step * calls + call, copies.size());
+             issued, copies.size());
         result = ncclUnhandledCudaError;
         break;
       }
     }
   }
-  launch = cudaLaunchKernel(barrier, dim3(1), dim3(32), arguments, 0, stream);
+  launch = launchBarrier(&devComm, stream, true);
   if (launch != cudaSuccess) {
     warn("rank %d: exit barrier launch failed: %s", handle->rank, cudaGetErrorName(launch));
     return ncclUnhandledCudaError;

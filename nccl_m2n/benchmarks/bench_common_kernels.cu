@@ -11,6 +11,9 @@
 #include <cstdio>
 #include <cstdlib>
 
+// Grid size cap for the grid-stride init/validate kernels below.
+static constexpr int kMaxGridBlocks = 65535;
+
 // ============================================================================
 // Validation Kernels
 // ============================================================================
@@ -19,8 +22,8 @@ static __global__ void benchInitSourceDataKernel(char* pBuffer, size_t dim0, siz
                                                  size_t globalStart0, size_t globalStart1, size_t globalStart2,
                                                  size_t globalDim1, size_t globalDim2, unsigned salt) {
   size_t total = dim0 * dim1 * (nDims == 3 ? dim2 : 1);
-  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  size_t stride = blockDim.x * gridDim.x;
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t stride = (size_t)blockDim.x * gridDim.x;
 
   for (size_t i = idx; i < total; i += stride) {
     size_t d2 = (nDims == 3) ? (i % dim2) : 0;
@@ -42,8 +45,8 @@ static __global__ void benchValidateDestDataKernel(
   size_t globalStart2, size_t globalDim1, size_t globalDim2, unsigned salt, unsigned long long* pErrorCount,
   size_t* pFirstErrorIdx, char* pFirstErrorExpected, char* pFirstErrorActual) {
   size_t total = dim0 * dim1 * (nDims == 3 ? dim2 : 1);
-  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  size_t stride = blockDim.x * gridDim.x;
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t stride = (size_t)blockDim.x * gridDim.x;
 
   for (size_t i = idx; i < total; i += stride) {
     size_t d2 = (nDims == 3) ? (i % dim2) : 0;
@@ -88,7 +91,8 @@ void benchInitSourceData(char* pBuffer, const size_t pLocalDims[], int nDims, in
 
   int blockSize = 256;
   size_t total = pLocalDims[0] * pLocalDims[1] * (nDims == 3 ? pLocalDims[2] : 1);
-  int numBlocks = (total + blockSize - 1) / blockSize;
+  size_t blocks = (total + blockSize - 1) / blockSize;
+  int numBlocks = blocks > kMaxGridBlocks ? kMaxGridBlocks : (int)blocks;
 
   benchInitSourceDataKernel<<<numBlocks, blockSize, 0, stream>>>(
     pBuffer, pLocalDims[0], pLocalDims[1], nDims == 3 ? pLocalDims[2] : 1, nDims, globalStart[0], globalStart[1],
@@ -120,7 +124,8 @@ bool benchValidateDestData(const char* pBuffer, const size_t pLocalDims[], int n
 
   int blockSize = 256;
   size_t total = pLocalDims[0] * pLocalDims[1] * (nDims == 3 ? pLocalDims[2] : 1);
-  int numBlocks = (total + blockSize - 1) / blockSize;
+  size_t blocks = (total + blockSize - 1) / blockSize;
+  int numBlocks = blocks > kMaxGridBlocks ? kMaxGridBlocks : (int)blocks;
 
   benchValidateDestDataKernel<<<numBlocks, blockSize, 0, stream>>>(
     pBuffer, pLocalDims[0], pLocalDims[1], nDims == 3 ? pLocalDims[2] : 1, nDims, globalStart[0], globalStart[1],

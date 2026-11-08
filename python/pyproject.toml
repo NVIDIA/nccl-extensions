@@ -82,8 +82,8 @@ include = ["nccl._extensions*", "nccl.ep*", "nccl.m2n*"]
 [tool.setuptools.package-data]
 "nccl._extensions.bindings" = ["cynccl_*.pxd", "nccl_*.pxd"]
 "nccl.ep" = [
-    "lib/cu12/libnccl_ep.so",
-    "lib/cu13/libnccl_ep.so",
+    "lib/cu12/libnccl_ep.so.0",
+    "lib/cu13/libnccl_ep.so.0",
     "include/*.h",
     "include/nccl_ep/*.h",
     "include/nccl_ep/*.hpp",

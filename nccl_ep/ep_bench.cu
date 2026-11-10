@@ -5430,6 +5430,8 @@ void printUsage(const char* programName, int myRank) {
         printf("  --max-num-sms <N>       Shared dispatch/combine SM fallback (0 = auto, default: 0)\n");
         printf("  --dispatch-num-sms <N>  Dispatch SM budget (0 = inherit shared budget)\n");
         printf("  --combine-num-sms <N>   Combine SM budget (0 = inherit shared budget)\n");
+        printf("  --dispatch-bwd-num-sms <N>  HT backward dispatch SM budget (0 = inherit forward budget)\n");
+        printf("  --combine-bwd-num-sms <N>   HT backward combine SM budget (0 = inherit forward budget)\n");
         printf("  --shuffle-sms <N> SMs for the token permutation (shuffle) kernels (0 = auto, default: 0)\n");
         printf("  --preprocess-num-sms <N> SMs for the preprocessing scan kernels (0 = auto, default: 0)\n");
         printf(
@@ -5511,6 +5513,8 @@ int main(int argc, char* argv[]) {
     unsigned int dispatch_num_sms = NCCL_EP_AUTO;
     unsigned int combine_num_sms = NCCL_EP_AUTO;
     unsigned int num_qp_per_rank = NCCL_EP_AUTO;
+    unsigned int dispatch_bwd_num_sms = NCCL_EP_AUTO;
+    unsigned int combine_bwd_num_sms = NCCL_EP_AUTO;
     bool ht_em_local_dup = false;
     bool ht_em_mode_explicit = false;
     bool ht_em_local_permute_explicit = false;
@@ -5561,6 +5565,8 @@ int main(int argc, char* argv[]) {
         {"ht-em-mode", required_argument, 0, 'm'},
         {"dispatch-num-sms", required_argument, 0, 1006},
         {"combine-num-sms", required_argument, 0, 1007},
+        {"dispatch-bwd-num-sms", required_argument, 0, 1015},
+        {"combine-bwd-num-sms", required_argument, 0, 1017},
         {"shuffle-sms", required_argument, 0, 'X'},
         {"preprocess-num-sms", required_argument, 0, 'P'},
         {"mask-test", no_argument, 0, 'T'},
@@ -5697,6 +5703,12 @@ int main(int argc, char* argv[]) {
             num_qp_per_rank = static_cast<unsigned int>(value);
             break;
         }
+        case 1015:
+            dispatch_bwd_num_sms = static_cast<unsigned int>(atoi(optarg));
+            break;
+        case 1017:
+            combine_bwd_num_sms = static_cast<unsigned int>(atoi(optarg));
+            break;
         case 'm':
             ht_em_mode_explicit = true;
             ht_em_local_dup = false;
@@ -6195,6 +6207,16 @@ int main(int argc, char* argv[]) {
         else printf("  Dispatch SMs:    %u\n", dispatch_num_sms);
         if (combine_num_sms == NCCL_EP_AUTO) printf("  Combine SMs:     inherit\n");
         else printf("  Combine SMs:     %u\n", combine_num_sms);
+        if (dispatch_bwd_num_sms == NCCL_EP_AUTO) {
+            printf("  Dispatch bwd SMs: inherit\n");
+        } else {
+            printf("  Dispatch bwd SMs: %u\n", dispatch_bwd_num_sms);
+        }
+        if (combine_bwd_num_sms == NCCL_EP_AUTO) {
+            printf("  Combine bwd SMs: inherit\n");
+        } else {
+            printf("  Combine bwd SMs: %u\n", combine_bwd_num_sms);
+        }
         printf("  Tokens:          %u\n", max_tokens_per_rank);
         if (include_uniform_less_than_max) {
             printf("  Sub-test:        Uniform tokens (num<max=%u)\n", num_dispatch_tokens);
@@ -6375,6 +6397,8 @@ int main(int argc, char* argv[]) {
     }
     config.dispatch_num_sms = dispatch_num_sms;
     config.combine_num_sms = combine_num_sms;
+    config.dispatch_bwd_num_sms = dispatch_bwd_num_sms;
+    config.combine_bwd_num_sms = combine_bwd_num_sms;
     if (shuffle_sms != NCCL_EP_AUTO) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%u", shuffle_sms);
@@ -7474,11 +7498,11 @@ int main(int argc, char* argv[]) {
                 combine_quantization,
                 dispatch_only);
 
-            // ===== Backward correctness validation (EM round-trip) =====
-            // grad_tokens must equal the unweighted per-token sum of its expert copies, and
+            // ===== Backward correctness validation (round-trip) =====
+            // grad_tokens must equal the unweighted per-token sum of its dispatched copies, and
             // grad_topk_weights must round-trip the original weights (forward dispatch delivers
             // recv weights at their source top-k slot; backward combine scatters them back).
-            if (validate_data && !dispatch_only && em_layout) {
+            if (validate_data && !dispatch_only) {
                 if (myRank == 0) {
                     printf("\n=== Backward Data Validation ===\n");
                     fflush(stdout);
@@ -7495,8 +7519,7 @@ int main(int argc, char* argv[]) {
                     void* dst_w;
                     NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.topk_weights, &src_w));
                     NCCLCHECK(epGetTensorData(alloc, bwd_combine_in_topk_weights, &dst_w));
-                    CUDACHECK(cudaMemcpy(dst_w, src_w, static_cast<size_t>(num_recv_tokens) * sizeof(float),
-                                         cudaMemcpyDeviceToDevice));
+                    CUDACHECK(cudaMemcpy(dst_w, src_w, bwd_tw_elems * sizeof(float), cudaMemcpyDeviceToDevice));
                 }
                 // (b) Backward dispatch: repopulate the expert token rows (weights off) and
                 //     rewire combine to consume the recv weights for the grad scatter.
@@ -7518,7 +7541,7 @@ int main(int argc, char* argv[]) {
                 // forward, so the recipe applies here too and the reference has to predict it.
                 ValidationResult bwd_tok = validateCombineOutputHT(
                     alloc, combine_outputs, num_tokens, hidden, num_experts, top_k, myRank, nRanks, topk_idx_host,
-                    /*expert_major=*/true, token_dtype,
+                    em_layout, token_dtype,
                     /*is_mxfp8=*/combine_quantization == NCCL_EP_COMB_QUANT_MXFP8);
                 ValidationResult bwd_w = validateBackwardCombineWeightsHT(
                     alloc, combine_outputs, topk_weights, num_tokens, top_k, topk_idx_host, num_experts);
@@ -7534,6 +7557,7 @@ int main(int argc, char* argv[]) {
                 int local_bwd_pass = (bwd_tok.passed && bwd_w.passed) ? 1 : 0;
                 int global_bwd_pass;
                 MPICHECK(MPI_Allreduce(&local_bwd_pass, &global_bwd_pass, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD));
+                validation_passed = validation_passed && global_bwd_pass;
                 if (myRank == 0) {
                     printf("\nGlobal backward validation: %s\n", global_bwd_pass ? "PASSED" : "FAILED");
                     fflush(stdout);

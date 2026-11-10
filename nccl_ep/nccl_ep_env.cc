@@ -116,6 +116,8 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_ulong(cfg->comm_num_sms);
     parse_ulong(cfg->dispatch_num_sms);
     parse_ulong(cfg->combine_num_sms);
+    parse_ulong(cfg->dispatch_bwd_num_sms);
+    parse_ulong(cfg->combine_bwd_num_sms);
     parse_ulong(cfg->shuffle_sms);
     parse_ulong(cfg->preprocess_num_sms);
     parse_ulong(cfg->tokens_per_chunk);
@@ -154,6 +156,8 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.comm_num_sms,
         &cfg.dispatch_num_sms,
         &cfg.combine_num_sms,
+        &cfg.dispatch_bwd_num_sms,
+        &cfg.combine_bwd_num_sms,
         &cfg.shuffle_sms,
         &cfg.preprocess_num_sms,
         &cfg.tokens_per_chunk,

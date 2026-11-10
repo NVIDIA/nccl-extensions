@@ -1524,6 +1524,7 @@ template <typename TOKEN_DATA_TYPE>
     kp.pad_alignment = params.pad_alignment;
     kp.expected_gin_flag_val = params.expected_gin_flag_val;
     kp.expected_lsa_flag_val = params.expected_lsa_flag_val;
+    kp.expected_tail_signal_val = params.expected_tail_signal_val;
     kp.gin_G2S_flags = params.gin_G2S_flags;
     kp.lsa_S2G_flags = params.lsa_S2G_flags;
     kp.dispatch_grid_barrier_counter = params.dispatch_grid_barrier_counter;

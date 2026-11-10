@@ -1237,6 +1237,8 @@ struct dispatch_kernel_param_base_t {
     // this kernel's tail so CUDA-graph capture+replay self-sequences.
     uint64_t* expected_gin_flag_val;
     uint32_t* expected_lsa_flag_val;
+    // Tail round counter; aliases expected_gin_flag_val unless split pass grids keep one per direction.
+    uint64_t* expected_tail_signal_val;
     int local_rank;
     int lsa_team;
     // Capacity determines routing and sparse-map strides.
@@ -5430,7 +5432,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             SF_BYTES_PER_TOKEN,
             param.compact_prob,
             prob_bytes,
-            *param.expected_gin_flag_val,
+            *param.expected_tail_signal_val,
             *param.dcomm,
             param.num_ctx_per_comm,
             param.gin_base_ptr,
@@ -5580,7 +5582,12 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                         my_lteam,
                         LSA_TEAMS,
                         expected);
-                if (tail_rdma_warp::thread_rank() == 0) *param.expected_gin_flag_val = expected + 1ull;
+                if (tail_rdma_warp::thread_rank() == 0) {
+                    *param.expected_gin_flag_val = expected + 1ull;
+                    if (param.expected_tail_signal_val != param.expected_gin_flag_val) {
+                        *param.expected_tail_signal_val += 1ull;
+                    }
+                }
             }
         }
     }
@@ -5932,7 +5939,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             }
         } else if (tail_tid < tail_reset_warp::size() + tail_rdma_warp::size() + tail_lsa_warp::size()) {
             // warp 2: intra-LSA LSA WAR barrier. Relaxed -- the tail __syncthreads already drained this
-            // round's reads. Index = dispatch's block count (disjoint from dispatch's per-block [0, NB)).
+            // round's reads. Index = combine_barrier_offset, the same for both passes.
             if constexpr (LSA_TEAM_SZ != 1) {
                 if (param.guard_enabled) {
                     ncclLsaBarrierSession<ncclCoopWarp> bar(

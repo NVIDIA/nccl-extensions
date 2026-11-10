@@ -215,6 +215,8 @@ ctypedef struct ncclEpGroupConfig_t 'ncclEpGroupConfig_t':
     ncclEpMetaExchangePolicy_t meta_exchange_policy
     unsigned int num_attn_ranks
     unsigned char padding_v4[4]
+    unsigned int dispatch_bwd_num_sms
+    unsigned int combine_bwd_num_sms
 
 
 ###############################################################################

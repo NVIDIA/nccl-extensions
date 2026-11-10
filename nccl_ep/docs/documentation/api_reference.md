@@ -63,6 +63,16 @@ ncclResult_t ncclEpCreateGroup(
 );
 ```
 
+In HT mode, `dispatch_num_sms` / `combine_num_sms` set the forward budgets and
+`dispatch_bwd_num_sms` / `combine_bwd_num_sms` the backward ones
+(`pass_direction = NCCL_EP_BWD_PASS`); a backward field left AUTO inherits the
+resolved forward budget. Each budget resolves, highest first, from its
+operation environment variable, `NCCL_EP_COMM_SMS`, its field, `max_num_sms`,
+then the algorithm default. LL groups ignore the backward fields. All ranks must
+resolve the same budgets for every layout and pass, otherwise the call returns
+`ncclInvalidUsage`. See the
+[SM-budget controls](../../README.md#high-throughput-tuning) for environment overrides.
+
 ### `ncclEpGroupDestroy()`
 
 ```c

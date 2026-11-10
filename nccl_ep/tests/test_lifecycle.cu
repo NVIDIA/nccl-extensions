@@ -394,7 +394,7 @@ TEST_F(LifecycleTest, ResolvesIndependentSmBudgetsAndEnvironmentPrecedence) {
     // One operation-specific field does not change the other's shared fallback.
     ncclEpGroup_t group = make_group(dispatch, NCCL_EP_AUTO);
     unsigned int resolved_dispatch = 0, resolved_combine = 0;
-    ncclEpGroup_test_getSmBudgets(group, &resolved_dispatch, &resolved_combine);
+    ncclEpGroup_test_getSmBudgets(group, NCCL_EP_FWD_PASS, &resolved_dispatch, &resolved_combine);
     EXPECT_EQ(resolved_dispatch, dispatch);
     EXPECT_EQ(resolved_combine, shared);
     NCCL_ASSERT(ncclEpGroupDestroy(group));
@@ -408,7 +408,7 @@ TEST_F(LifecycleTest, ResolvesIndependentSmBudgetsAndEnvironmentPrecedence) {
     setenv("NCCL_EP_DISPATCH_SMS", env_dispatch_str.c_str(), 1);
     setenv("NCCL_EP_COMBINE_SMS", invalid_str.c_str(), 1);
     group = make_group(dispatch, shared - 1);
-    ncclEpGroup_test_getSmBudgets(group, &resolved_dispatch, &resolved_combine);
+    ncclEpGroup_test_getSmBudgets(group, NCCL_EP_FWD_PASS, &resolved_dispatch, &resolved_combine);
     EXPECT_EQ(resolved_dispatch, env_dispatch);
     EXPECT_EQ(resolved_combine, env_shared);
     NCCL_ASSERT(ncclEpGroupDestroy(group));

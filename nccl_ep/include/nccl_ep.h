@@ -62,7 +62,7 @@ extern "C" {
 //       .tokens = my_tokens,
 //   };
 // ============================================================================
-#define NCCL_EP_API_VERSION 4
+#define NCCL_EP_API_VERSION 5
 #define NCCL_EP_MAGIC 0xC00FFFEEu
 
 #define NCCL_EP_STRUCT_INIT(type_, magic_) \
@@ -286,8 +286,9 @@ typedef struct {
     //     reallocation is ever performed.
     //     (NOTE: for optimal sizing, a way to query the required size is planned for future release)
     unsigned long int rdma_buffer_size;
-    // Multi-LSA HT minimum: 1 + 2 * group dispatch SMs (AUTO: 49 non-Rubin,
-    // 65 Rubin). Group resources reserve expert-major capacity even for flat.
+    // Multi-LSA HT minimum: 1 + 2 * the larger of the forward and backward
+    // dispatch SMs (AUTO: 49 non-Rubin, 65 Rubin). Group resources reserve
+    // expert-major capacity even for flat.
     unsigned int num_qp_per_rank;        // Number of QPs per rank (NCCL_EP_AUTO for auto)
     // Number of channels per rank (NCCL_EP_AUTO for auto).
     // In high throughput collectives, each channel occupies 2 SMs
@@ -329,11 +330,12 @@ typedef struct {
     // hold it), which then never grows either.
     unsigned int num_topk;
     unsigned char padding_v2[4]; // consumes V2 tail padding; future fields append after it
-    // Dispatch SM budget. AUTO inherits max_num_sms when set; otherwise HT
+    // Dispatch SM budget (HT: forward pass). AUTO inherits max_num_sms when set; otherwise HT
     // defaults to 16 flat, or 32 on Rubin (SM107) / 24 elsewhere for expert-major.
     unsigned int dispatch_num_sms;
-    // Combine SM budget. AUTO follows dispatch defaults, except HT flat uses 32
-    // when max_dispatch_tokens_per_rank >= 8192. Environment overrides still apply.
+    // Combine SM budget (HT: forward pass). AUTO follows dispatch defaults, except HT flat uses 32
+    // when max_dispatch_tokens_per_rank >= 8192. NCCL_EP_COMM_SMS overrides dispatch_num_sms and
+    // combine_num_sms; NCCL_EP_DISPATCH_SMS / NCCL_EP_COMBINE_SMS override their own field and NCCL_EP_COMM_SMS.
     unsigned int combine_num_sms;
     // HT dispatch/combine flow. All ranks must resolve to the same flow;
     // inconsistent API or environment configuration is unsupported. An
@@ -359,6 +361,12 @@ typedef struct {
     // dispatch/combine recipes. Zero preserves classic EP.
     unsigned int num_attn_ranks;
     unsigned char padding_v4[4];
+    // HT backward dispatch SMs; AUTO inherits forward per layout. LL ignores it.
+    // Must resolve identically on all ranks. NCCL_EP_COMM_SMS, then NCCL_EP_DISPATCH_BWD_SMS, override it.
+    unsigned int dispatch_bwd_num_sms;
+    // HT backward combine SMs; AUTO inherits forward. LL ignores it.
+    // Same rules as dispatch_bwd_num_sms; NCCL_EP_COMBINE_BWD_SMS overrides it.
+    unsigned int combine_bwd_num_sms;
 } ncclEpGroupConfig_t;
 
 #define NCCL_EP_GROUP_CONFIG_INIT \
@@ -379,13 +387,16 @@ typedef struct {
 #define NCCL_EP_GROUP_CONFIG_V3_SIZE 120u
 #define NCCL_EP_GROUP_CONFIG_V4_LAST_FIELD padding_v4
 #define NCCL_EP_GROUP_CONFIG_V4_SIZE 136u
-#define NCCL_EP_GROUP_CONFIG_CURRENT_VERSION 4
+#define NCCL_EP_GROUP_CONFIG_V5_LAST_FIELD combine_bwd_num_sms
+#define NCCL_EP_GROUP_CONFIG_V5_SIZE 144u
+#define NCCL_EP_GROUP_CONFIG_CURRENT_VERSION 5
 
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 1);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 2);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 3);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 4);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 5);
 
 // Opaque type forward declaration
 typedef struct ncclEpGroup* ncclEpGroup_t;
@@ -936,7 +947,8 @@ typedef struct {
     unsigned int round_scales; // whether to round the scaling factors tensor into a power of 2
     ncclEpPassDir_t pass_direction; // forward (default) or backward pass; HT-only.
   //   FWD requires inputs->topk_weights; BWD forbids it and forbids
-  //   outputs->topk_weights / outputs->topk_idx.
+  //   outputs->topk_weights / outputs->topk_idx. Other values return
+  //   ncclInvalidArgument.
     // New fields must be appended here to keep existing field offsets stable for ABI compatibility.
     ncclEpDispQuant_t quant_recipe; // NONE by default; selects the required scale tensors
 } ncclEpDispatchConfig_t;
@@ -1056,7 +1068,7 @@ typedef struct {
     //   supported for LL mode only; output tensors must still be preallocated
     ncclEpPassDir_t pass_direction; // forward (default) or backward pass; HT-only.
     //   FWD forbids inputs->topk_weights; BWD requires inputs->topk_weights
-    //   and outputs->topk_weights.
+    //   and outputs->topk_weights. Other values return ncclInvalidArgument.
     // New fields must be appended here to keep existing field offsets stable for ABI compatibility.
     ncclEpCombQuant_t quant_recipe; // NONE by default; see recipe documentation above
 } ncclEpCombineConfig_t;

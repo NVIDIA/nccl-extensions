@@ -273,6 +273,20 @@ class EpApiParityTest(unittest.TestCase):
                 with self.assertRaises(NcclInvalid):
                     invalid_group.get_async_error()
 
+    def test_group_config_bwd_sms_round_trip(self) -> None:
+        dispatch_bwd = 24
+        combine_bwd = 40
+        config = ep.GroupConfig(
+            dispatch_bwd_num_sms=dispatch_bwd,
+            combine_bwd_num_sms=combine_bwd,
+        )
+
+        # Facade field and Cython property read the same value.
+        self.assertEqual(config.dispatch_bwd_num_sms, dispatch_bwd)
+        self.assertEqual(config.combine_bwd_num_sms, combine_bwd)
+        self.assertEqual(config._lowpp.dispatch_bwd_num_sms, dispatch_bwd)
+        self.assertEqual(config._lowpp.combine_bwd_num_sms, combine_bwd)
+
     def test_from_buffer_preserves_exporter_mutability(self) -> None:
         lowpp_type = ep_bindings.HandleConfig
         dtype = ep_bindings.handle_config_dtype

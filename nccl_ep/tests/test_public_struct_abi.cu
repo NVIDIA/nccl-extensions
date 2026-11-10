@@ -10,7 +10,10 @@
 
 #include "test_common.h"
 #include <algorithm>
+#include <deque>
 #include <nccl_device.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include "nccl_ep/common.hpp"
 
 // These checks freeze every public-struct field offset in the 64-bit NCCL EP
@@ -73,7 +76,9 @@ void ncclEpGroupConfig_backwards_compat_test() {
     static_assert(offsetof(ncclEpGroupConfig_t, meta_exchange_policy) == 124);
     static_assert(offsetof(ncclEpGroupConfig_t, num_attn_ranks) == 128);
     static_assert(offsetof(ncclEpGroupConfig_t, padding_v4) == 132);
-    static_assert(sizeof(ncclEpGroupConfig_t) == 136);
+    static_assert(offsetof(ncclEpGroupConfig_t, dispatch_bwd_num_sms) == 136);
+    static_assert(offsetof(ncclEpGroupConfig_t, combine_bwd_num_sms) == 140);
+    static_assert(sizeof(ncclEpGroupConfig_t) == 144);
 }
 
 void ncclEpLayoutInfo_backwards_compat_test() {
@@ -357,7 +362,7 @@ TEST_F(PublicStructAbiRuntimeTest, HtDefaultsAndOverridesApplyPerHandleLayout) {
             ASSERT_EQ(ncclEpCreateHandle(&handle, group, layout, topk_idx_, nullptr, nullptr, g_stream), ncclSuccess);
             ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
             unsigned int dispatch_sms = 0, combine_sms = 0;
-            ncclEpHandle_test_getSmBudgets(handle, &dispatch_sms, &combine_sms);
+            ncclEpHandle_test_getSmBudgets(handle, NCCL_EP_FWD_PASS, &dispatch_sms, &combine_sms);
             EXPECT_EQ(dispatch_sms, expected_d);
             EXPECT_EQ(combine_sms, expected_c);
             const int expected_chunk = ncclTeamLsa(g_comm).nRanks == g_nranks
@@ -367,6 +372,127 @@ TEST_F(PublicStructAbiRuntimeTest, HtDefaultsAndOverridesApplyPerHandleLayout) {
         }
         EXPECT_EQ(ncclEpGroupDestroy(group), ncclSuccess);
     }
+}
+
+TEST_F(PublicStructAbiRuntimeTest, BackwardSmBudgets) {
+    const char* const kSmEnv[] = {"NCCL_EP_COMM_SMS", "NCCL_EP_DISPATCH_SMS", "NCCL_EP_COMBINE_SMS",
+                                  "NCCL_EP_DISPATCH_BWD_SMS", "NCCL_EP_COMBINE_BWD_SMS"};
+    std::deque<ScopedEnvVar> cleared;
+    for (const char* name : kSmEnv) {
+        cleared.emplace_back(name, nullptr);
+    }
+    {
+        ScopedEnvVar chunk_env("NCCL_EP_TOKENS_PER_CHUNK", nullptr);
+        ScopedEnvVar dispatch_chunk_env("NCCL_EP_DISPATCH_TOKENS_PER_CHUNK", nullptr);
+        struct BwdCase {
+            unsigned int shared_config, dispatch_config, combine_config, dispatch_bwd_config, combine_bwd_config;
+            const char* env[5];  // kSmEnv values
+            // Zero expects the forward budget of the same layout.
+            unsigned int expected_dispatch_bwd, expected_combine_bwd;
+        };
+        const BwdCase cases[] = {
+            // Explicit backward fields below and above forward.
+            {0, 20, 24, 8, 40, {}, 8, 40},
+            // A forward operation variable reaches backward only through AUTO.
+            {0, 0, 0, 40, 0, {nullptr, "12"}, 40, 0},
+            // Backward variables apply last; NCCL_EP_COMM_SMS applies to explicit backward fields.
+            {0, 20, 24, 8, 0, {nullptr, nullptr, nullptr, "30"}, 30, 0},
+            {0, 20, 24, 8, 40, {"22"}, 22, 22},
+            // AUTO inherits the resolved forward budget, NCCL_EP_COMM_SMS included.
+            {0, 20, 24, 0, 0, {"22"}, 22, 22},
+            {20, 0, 0, 0, 0, {"22"}, 22, 22},
+            // Invalid backward variables are ignored.
+            {0, 0, 0, 0, 0, {nullptr, nullptr, nullptr, "0", "0"}, 0, 0},
+        };
+        for (const auto& test_case : cases) {
+            std::deque<ScopedEnvVar> overrides;
+            for (int i = 0; i < 5; ++i) {
+                overrides.emplace_back(kSmEnv[i], test_case.env[i]);
+            }
+            ncclEpGroupConfig_t config = htFlowTestConfig();
+            config.max_num_sms = test_case.shared_config;
+            config.dispatch_num_sms = test_case.dispatch_config;
+            config.combine_num_sms = test_case.combine_config;
+            config.dispatch_bwd_num_sms = test_case.dispatch_bwd_config;
+            config.combine_bwd_num_sms = test_case.combine_bwd_config;
+            ncclEpGroup_t group = nullptr;
+            ASSERT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclSuccess);
+            for (auto layout : {NCCL_EP_LAYOUT_FLAT, NCCL_EP_LAYOUT_EXPERT_MAJOR}) {
+                SCOPED_TRACE(::testing::Message() << "layout=" << layout << " dispatch_bwd="
+                             << test_case.dispatch_bwd_config << " combine_bwd=" << test_case.combine_bwd_config);
+                ncclEpHandle_t handle = nullptr;
+                ASSERT_EQ(ncclEpCreateHandle(&handle, group, layout, topk_idx_, nullptr, nullptr, g_stream), ncclSuccess);
+                ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+                unsigned int fwd_dispatch = 0, fwd_combine = 0, bwd_dispatch = 0, bwd_combine = 0;
+                ncclEpHandle_test_getSmBudgets(handle, NCCL_EP_FWD_PASS, &fwd_dispatch, &fwd_combine);
+                ncclEpHandle_test_getSmBudgets(handle, NCCL_EP_BWD_PASS, &bwd_dispatch, &bwd_combine);
+                // Backward settings leave an explicit forward budget unchanged.
+                if (test_case.dispatch_config != 0 && test_case.env[0] == nullptr) {
+                    EXPECT_EQ(fwd_dispatch, test_case.dispatch_config);
+                    EXPECT_EQ(fwd_combine, test_case.combine_config);
+                }
+                EXPECT_EQ(bwd_dispatch, test_case.expected_dispatch_bwd ? test_case.expected_dispatch_bwd : fwd_dispatch);
+                EXPECT_EQ(bwd_combine, test_case.expected_combine_bwd ? test_case.expected_combine_bwd : fwd_combine);
+                // The shared chunk layout follows the forward dispatch budget.
+                const int expected_chunk = ncclTeamLsa(g_comm).nRanks == g_nranks
+                    ? static_cast<int>(nccl_ep::align(4 * fwd_dispatch, 32u)) : 64;
+                EXPECT_EQ(ncclEpHandle_test_getCombineTokensPerChunk(handle), expected_chunk);
+                EXPECT_EQ(ncclEpHandleDestroy(handle), ncclSuccess);
+            }
+            EXPECT_EQ(ncclEpGroupDestroy(group), ncclSuccess);
+        }
+    }
+    {
+        // Legacy-sized configs end at a guard page, so any read past their size faults.
+        const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        for (unsigned int size : {NCCL_EP_GROUP_CONFIG_V4_SIZE, NCCL_EP_GROUP_CONFIG_V3_SIZE}) {
+            SCOPED_TRACE(::testing::Message() << "size=" << size);
+            ncclEpGroupConfig_t config = htFlowTestConfig();
+            config.size = size;
+            config.dispatch_num_sms = 20;
+            config.combine_num_sms = 24;
+            config.dispatch_bwd_num_sms = 8;
+            config.combine_bwd_num_sms = 40;
+            char* map = static_cast<char*>(
+                mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+            ASSERT_NE(map, MAP_FAILED);
+            ASSERT_EQ(mprotect(map + page, page, PROT_NONE), 0);
+            auto* legacy = reinterpret_cast<ncclEpGroupConfig_t*>(map + page - size);
+            memcpy(legacy, &config, size);
+            ncclEpGroup_t group = nullptr;
+            ASSERT_EQ(ncclEpCreateGroup(&group, g_comm, legacy), ncclSuccess);
+            unsigned int bwd_dispatch = 0, bwd_combine = 0;
+            ncclEpGroup_test_getSmBudgets(group, NCCL_EP_BWD_PASS, &bwd_dispatch, &bwd_combine);
+            EXPECT_EQ(bwd_dispatch, 20u);
+            EXPECT_EQ(bwd_combine, 24u);
+            EXPECT_EQ(ncclEpGroupDestroy(group), ncclSuccess);
+            EXPECT_EQ(munmap(map, 2 * page), 0);
+        }
+    }
+    ncclEpGroup_t group = nullptr;
+    ncclEpGroupConfig_t config = htFlowTestConfig();
+
+    int device = 0;
+    cudaDeviceProp prop{};
+    ASSERT_EQ(cudaGetDevice(&device), cudaSuccess);
+    ASSERT_EQ(cudaGetDeviceProperties(&prop, device), cudaSuccess);
+    const unsigned int above_device = static_cast<unsigned int>(prop.multiProcessorCount) + 1;
+    // One rank with an out-of-range backward budget fails group creation on every rank.
+    if (g_rank == 0) {
+        config.dispatch_bwd_num_sms = above_device;
+    }
+    EXPECT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclInvalidUsage);
+    EXPECT_EQ(group, nullptr);
+
+    if (g_nranks < 2) {
+        GTEST_SKIP() << "rank mismatch needs at least two ranks";
+    }
+
+    // Every rank sees the mismatch and fails group creation.
+    config = htFlowTestConfig();
+    config.combine_bwd_num_sms = 8 + static_cast<unsigned int>(g_rank % 2);
+    EXPECT_EQ(ncclEpCreateGroup(&group, g_comm, &config), ncclInvalidUsage);
+    EXPECT_EQ(group, nullptr);
 }
 
 TEST_F(PublicStructAbiRuntimeTest, AutoFlowDefaultsToPullPushForBothLayouts) {

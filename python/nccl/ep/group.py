@@ -76,6 +76,12 @@ class GroupConfig:
             shared budget. NCCL_EP_DISPATCH_SMS overrides it.
         combine_num_sms: Combine SM budget. 0 inherits the resolved
             shared budget. NCCL_EP_COMBINE_SMS overrides it.
+        dispatch_bwd_num_sms: HT backward dispatch SMs; LL ignores it. 0
+            inherits forward. NCCL_EP_DISPATCH_BWD_SMS overrides it. Raising
+            it above the forward budget raises the minimum ``num_qp_per_rank``
+            of a multi-LSA group.
+        combine_bwd_num_sms: HT backward combine SMs; LL ignores it. 0
+            inherits forward. NCCL_EP_COMBINE_BWD_SMS overrides it.
         num_attn_ranks: Number of leading attention ranks for AFD. Non-zero
             values require universal LL kernels, rank-major layout, and a
             square attention-to-expert-rank partition. Default: 0.
@@ -127,6 +133,8 @@ class GroupConfig:
     max_num_sms: int = 0
     dispatch_num_sms: int = 0
     combine_num_sms: int = 0
+    dispatch_bwd_num_sms: int = 0
+    combine_bwd_num_sms: int = 0
     ht_flow: HtFlow = HtFlow.AUTO
     meta_exchange_policy: MetaExchangePolicy = MetaExchangePolicy.AUTO
     num_attn_ranks: int = 0

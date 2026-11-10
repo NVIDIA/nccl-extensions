@@ -92,6 +92,8 @@ struct ncclEpEnvConfig {
     ncclEpEnvVar comm_num_sms{"NCCL_EP_COMM_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar dispatch_num_sms{"NCCL_EP_DISPATCH_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar combine_num_sms{"NCCL_EP_COMBINE_SMS", ncclEpEnvType::ulong};
+    ncclEpEnvVar dispatch_bwd_num_sms{"NCCL_EP_DISPATCH_BWD_SMS", ncclEpEnvType::ulong};
+    ncclEpEnvVar combine_bwd_num_sms{"NCCL_EP_COMBINE_BWD_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar shuffle_sms{"NCCL_EP_SHUFFLE_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar preprocess_num_sms{"NCCL_EP_PREPROCESS_NUM_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar tokens_per_chunk{"NCCL_EP_TOKENS_PER_CHUNK", ncclEpEnvType::ulong};

@@ -721,6 +721,8 @@ struct DispatchParams {
     // bumped by the dispatch kernel tail so CUDA-graph replays self-sequence.
     uint64_t* expected_gin_flag_val;
     uint32_t* expected_lsa_flag_val;
+    // Tail round counter; aliases expected_gin_flag_val unless split pass grids keep one per direction.
+    uint64_t* expected_tail_signal_val;
     uint64_t* gin_G2S_flags;
     uint32_t* lsa_S2G_flags;
     // Dispatch tail counter followed by its head-sync counter.

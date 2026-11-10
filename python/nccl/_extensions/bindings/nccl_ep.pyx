@@ -2420,8 +2420,8 @@ cdef class CombineOutputs:
 cdef _get_group_config_dtype_offsets():
     cdef ncclEpGroupConfig_t pod
     return _numpy.dtype({
-        'names': ['size_', 'magic', 'version', 'algorithm', 'num_experts', 'max_dispatch_tokens_per_rank', 'max_recv_tokens_per_rank', 'max_token_bytes', 'rdma_buffer_size', 'num_qp_per_rank', 'num_channels', 'max_num_sms', 'alloc', 'enable_mask', 'timeout_ns', 'zero_copy', 'overflow_policy', 'num_topk', 'padding_v2', 'dispatch_num_sms', 'combine_num_sms', 'ht_flow', 'meta_exchange_policy', 'num_attn_ranks', 'padding_v4'],
-        'formats': [_numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.dtype(('V', sizeof(unsigned long int))), _numpy.uint32, _numpy.uint32, _numpy.uint32, alloc_config_dtype, _numpy.uint32, _numpy.uint64, _numpy.int32, _numpy.int32, _numpy.uint32, (_numpy.uint8, 4), _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.int32, _numpy.uint32, (_numpy.uint8, 4)],
+        'names': ['size_', 'magic', 'version', 'algorithm', 'num_experts', 'max_dispatch_tokens_per_rank', 'max_recv_tokens_per_rank', 'max_token_bytes', 'rdma_buffer_size', 'num_qp_per_rank', 'num_channels', 'max_num_sms', 'alloc', 'enable_mask', 'timeout_ns', 'zero_copy', 'overflow_policy', 'num_topk', 'padding_v2', 'dispatch_num_sms', 'combine_num_sms', 'ht_flow', 'meta_exchange_policy', 'num_attn_ranks', 'padding_v4', 'dispatch_bwd_num_sms', 'combine_bwd_num_sms'],
+        'formats': [_numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.dtype(('V', sizeof(unsigned long int))), _numpy.uint32, _numpy.uint32, _numpy.uint32, alloc_config_dtype, _numpy.uint32, _numpy.uint64, _numpy.int32, _numpy.int32, _numpy.uint32, (_numpy.uint8, 4), _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.int32, _numpy.uint32, (_numpy.uint8, 4), _numpy.uint32, _numpy.uint32],
         'offsets': [
             (<intptr_t>&(pod.size)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.magic)) - (<intptr_t>&pod),
@@ -2448,6 +2448,8 @@ cdef _get_group_config_dtype_offsets():
             (<intptr_t>&(pod.meta_exchange_policy)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.num_attn_ranks)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.padding_v4)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.dispatch_bwd_num_sms)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.combine_bwd_num_sms)) - (<intptr_t>&pod),
         ],
         'itemsize': sizeof(ncclEpGroupConfig_t),
     })
@@ -2477,7 +2479,7 @@ cdef class GroupConfig:
         self._ptr[0].size = sizeof(ncclEpGroupConfig_t)
         self._ptr[0].magic = 0xC00FFFEE
         # = NCCL_EP_API_VERSION; bump with the header.
-        self._ptr[0].version = 4
+        self._ptr[0].version = 5
 
     def __dealloc__(self):
         cdef ncclEpGroupConfig_t *ptr
@@ -2816,6 +2818,28 @@ cdef class GroupConfig:
         cdef _cyb_view.array arr = _cyb_view.array(shape=(4,), itemsize=sizeof(unsigned char), format="B", mode="c")
         arr[:] = _numpy.asarray(val, dtype=_numpy.uint8)
         _cyb_memcpy(<void *>(&(self._ptr[0].padding_v4)), <void *>(arr.data), sizeof(unsigned char) * len(val))
+
+    @property
+    def dispatch_bwd_num_sms(self):
+        """int: HT backward dispatch SM budget; zero inherits the forward budget."""
+        return self._ptr[0].dispatch_bwd_num_sms
+
+    @dispatch_bwd_num_sms.setter
+    def dispatch_bwd_num_sms(self, val):
+        if self._readonly:
+            raise ValueError("This GroupConfig instance is read-only")
+        self._ptr[0].dispatch_bwd_num_sms = val
+
+    @property
+    def combine_bwd_num_sms(self):
+        """int: HT backward combine SM budget; zero inherits the forward budget."""
+        return self._ptr[0].combine_bwd_num_sms
+
+    @combine_bwd_num_sms.setter
+    def combine_bwd_num_sms(self, val):
+        if self._readonly:
+            raise ValueError("This GroupConfig instance is read-only")
+        self._ptr[0].combine_bwd_num_sms = val
 
     @staticmethod
     def from_buffer(buffer):

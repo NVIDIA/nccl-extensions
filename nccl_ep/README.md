@@ -404,6 +404,10 @@ Dispatch/combine SM-budget controls (LL and HT):
     export NCCL_EP_DISPATCH_SMS=12
     export NCCL_EP_COMBINE_SMS=24
 
+    # HT-only backward overrides (pass_direction = NCCL_EP_BWD_PASS); unset inherits forward
+    export NCCL_EP_DISPATCH_BWD_SMS=16
+    export NCCL_EP_COMBINE_BWD_SMS=32
+
     # Shuffle and preprocessing default to all device SMs
     export NCCL_EP_SHUFFLE_SMS=<number_of_sms>
     export NCCL_EP_PREPROCESS_NUM_SMS=<number_of_sms>
@@ -419,11 +423,18 @@ fields and variables unset uses that default; setting one
 operation does not alter the other. Values must be in [1, device_sm_count]
 after resolution and must satisfy the LL warp-group geometry when LL is used.
 
+HT backward calls (`pass_direction = NCCL_EP_BWD_PASS`) use `dispatch_bwd_num_sms`
+and `combine_bwd_num_sms` (`NCCL_EP_DISPATCH_BWD_SMS` / `NCCL_EP_COMBINE_BWD_SMS`)
+with the same precedence. AUTO inherits the resolved forward budget; LL groups ignore both fields.
+Budgets must resolve identically on all ranks, otherwise `ncclEpCreateGroup`
+returns `ncclInvalidUsage`. The handle's chunk layout follows the forward dispatch
+budget.
+
 For multi-LSA HT groups, `num_qp_per_rank` must cover one reserved context plus
-two contexts per group dispatch SM. With automatic SM settings this is 49
-contexts on non-Rubin devices and 65 on Rubin, including for flat-only groups
-because group resources support both layouts. AUTO provisions that minimum;
-an explicit smaller value fails group creation.
+two contexts per SM of the larger forward or backward dispatch budget. With
+automatic SM settings this is 49 contexts on non-Rubin devices and 65 on Rubin,
+including for flat-only groups because group resources support both layouts.
+AUTO provisions that minimum; an explicit smaller value fails group creation.
 
 The non-Rubin expert-major default gives a 96-token chunk. Adaptive dispatch
 chunk selection is limited to validated defaults of 64, 128, and 256, so
@@ -520,6 +531,8 @@ typedef struct {
     unsigned int combine_num_sms;               // Combine budget (AUTO inherits max_num_sms/default)
     unsigned int num_attn_ranks;                // AFD A-side ranks; 0 = classic EP (universal LL only)
     unsigned char padding_v4[4];                // Consumes V4 tail padding; future fields append after
+    unsigned int dispatch_bwd_num_sms;          // HT backward dispatch budget (AUTO inherits forward)
+    unsigned int combine_bwd_num_sms;           // HT backward combine budget (AUTO inherits forward)
 } ncclEpGroupConfig_t;
 
 // Use NCCL_EP_GROUP_CONFIG_INIT to pre-fill size/magic/version correctly.

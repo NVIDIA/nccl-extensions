@@ -782,6 +782,19 @@ static ncclResult_t ncclBarrier(ncclComm_t comm, cudaStream_t stream, void* work
     return ncclSuccess;
 }
 
+// Resolved SM budgets of one pass; flat is the flat layout's budget, the others expert-major.
+struct HtSmBudgets {
+    unsigned int dispatch = 0;
+    unsigned int combine = 0;
+    unsigned int flat_dispatch = 0;
+    unsigned int flat_combine = 0;
+
+    bool operator==(const HtSmBudgets& o) const {
+        return dispatch == o.dispatch && combine == o.combine && flat_dispatch == o.flat_dispatch &&
+               flat_combine == o.flat_combine;
+    }
+};
+
 // Opaque struct definitions
 struct ncclEpGroup {
     ncclComm_t comm;
@@ -880,6 +893,7 @@ struct ncclEpGroup {
         size_t combine_guard_offset = 0;
 
         unsigned signals_tail_base = 0;         // Base signal ID for tail tracking (sender -> receiver)
+        unsigned signals_tail_bwd_base = 0;     // Backward dispatch tail; own range when the grid differs by pass
         int num_max_rdma_chunked_send_tokens = NCCL_EP_HT_DISPATCH_RDMA_BATCH_SIZE;
 
     } gin_config;
@@ -899,10 +913,8 @@ struct ncclEpGroup {
     // it (see ncclEpDispatch) without re-querying the device on every call.
     // NOTE: consumed by the EM pull-push path only for now; other EM modes do not yet use it.
     size_t device_smem_optin;
-    unsigned int dispatch_num_sms; // Resolved dispatch SM budget.
-    unsigned int combine_num_sms;  // Resolved combine SM budget.
-    unsigned int flat_dispatch_num_sms = 0;
-    unsigned int flat_combine_num_sms = 0;
+    HtSmBudgets fwd_sms;           // Resolved forward budgets.
+    HtSmBudgets bwd_sms;           // NCCL_EP_BWD_PASS budgets; equal to forward unless set (HT only).
     nccl_ep::ht::DispatchCopyMode dispatch_copy_mode;
     unsigned int shuffle_sms; // Resolved SM count for the shuffle kernels (local_dup, local_reduce, push-combine reduce).
     unsigned int
@@ -985,6 +997,8 @@ struct ncclEpGroup {
         uint32_t* dispatch_expected_lsa_flag_val = nullptr;
         uint64_t* combine_expected_gin_flag_val = nullptr;
         uint32_t* combine_expected_lsa_flag_val = nullptr;
+        uint64_t* dispatch_fwd_tail_signal_val = nullptr;
+        uint64_t* dispatch_bwd_tail_signal_val = nullptr;
 
     // Group-shared count-mode / EM local-permute scratch. Written-before-read within each
     // dispatch/combine, so group-scoping stays PP-safe. Managed by alloc/free helpers.
@@ -1071,7 +1085,7 @@ struct ncclEpGroup {
           cuda_device_id(0), lsa_team_size(0),
           lsa_rank(0), rdma_team_size(0), rdma_rank(0), rdma_buffer(nullptr), rdma_buffer_size_alloc(0), config{},
           num_local_experts(0), num_attn_ranks(0), max_recv_tokens(0), device_sm(0), device_sm_count(0), max_dynamic_smem(0),
-          last_ll_combine_warps_per_group(0), device_smem_optin(0), dispatch_num_sms(0), combine_num_sms(0),
+          last_ll_combine_warps_per_group(0), device_smem_optin(0),
           dispatch_copy_mode(nccl_ep::ht::DispatchCopyMode::kTma), shuffle_sms(0),
           preprocess_num_sms(0), ht_em_mode(HtEmMode::kLocalPermute), alloc{}, gpus_per_node(0), rank_in_node(0),
           node_id(0), num_nccl_comms(0), nccl_comms{}, nccl_dev_comm(nullptr), nccl_wins(nullptr),
@@ -1364,6 +1378,18 @@ static void free_ht_count_scratch(ncclEpGroup_t ep_group) {
     }
 }
 
+// Dispatch SMs used to size resources shared by both passes; launches use per-pass budgets.
+static int ht_dispatch_sms_capacity(ncclEpGroup_t ep_group) {
+    return static_cast<int>(std::max(ep_group->fwd_sms.dispatch, ep_group->bwd_sms.dispatch));
+}
+
+// Multi-LSA pass grids that differ need separate GIN tail signals and epochs.
+static bool ht_dispatch_tail_signals_per_pass(ncclEpGroup_t ep_group) {
+    return is_internode_available(ep_group) &&
+           (ep_group->bwd_sms.dispatch != ep_group->fwd_sms.dispatch ||
+            ep_group->bwd_sms.flat_dispatch != ep_group->fwd_sms.flat_dispatch);
+}
+
 // HT Intra-LSA Initialization (adapted for public NCCL APIs)
 static ncclResult_t
 init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, cudaStream_t stream) {
@@ -1628,8 +1654,13 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     //   [28..32) dispatch_head_sync_counter         (uint32_t)
     //   [32..36) combine_grid_barrier_counter       (uint32_t)
     //   [36..40) combine_head_sync_counter          (uint32_t; pull/push combine_push pool counter)
+    // Only split multi-LSA dispatch grids (ht_dispatch_tail_signals_per_pass) add:
+    //   [40..48) dispatch_fwd_tail_signal_val       (uint64_t)
+    //   [48..56) dispatch_bwd_tail_signal_val       (uint64_t)
     {
-        constexpr size_t kCounterBlockBytes = 40;
+        const bool split_tail = ht_dispatch_tail_signals_per_pass(ep_group);
+        constexpr size_t kCounterBlockBytesMax = 56;
+        const size_t kCounterBlockBytes = split_tail ? kCounterBlockBytesMax : 40;
         void* block = nullptr;
         CUDA_CHECK(ep_group->alloc.alloc_fn(&block, kCounterBlockBytes, ep_group->alloc.context));
         ep_group->ht_buffers.dev_counter_block = block;
@@ -1640,6 +1671,11 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         ep_group->ht_buffers.combine_expected_lsa_flag_val = reinterpret_cast<uint32_t*>(base + 20);
         ep_group->ht_buffers.dispatch_grid_barrier_counter = reinterpret_cast<uint32_t*>(base + 24);
         ep_group->ht_buffers.combine_grid_barrier_counter = reinterpret_cast<uint32_t*>(base + 32);
+        // Both directions share the dispatch GIN epoch unless split grids give each its own.
+        ep_group->ht_buffers.dispatch_fwd_tail_signal_val =
+            split_tail ? reinterpret_cast<uint64_t*>(base + 40) : ep_group->ht_buffers.dispatch_expected_gin_flag_val;
+        ep_group->ht_buffers.dispatch_bwd_tail_signal_val =
+            split_tail ? reinterpret_cast<uint64_t*>(base + 48) : ep_group->ht_buffers.dispatch_expected_gin_flag_val;
 
         // Initialize the expected counters to the first-invocation value
         // (grid-barrier counters stay at 0). Bootstrap is outside any user
@@ -1647,11 +1683,15 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         const bool is_single_node = !is_internode_available(ep_group);  // no cross-LSA-team RDMA
         const uint64_t init_rdma = is_single_node ? 0ull : 1ull;
         const uint32_t init_intra = static_cast<uint32_t>(ep_group->lsa_team_size);
-        uint8_t host_init[kCounterBlockBytes] = {0};
+        uint8_t host_init[kCounterBlockBytesMax] = {0};
         std::memcpy(host_init + 0, &init_rdma, sizeof(init_rdma));
         std::memcpy(host_init + 8, &init_rdma, sizeof(init_rdma));
         std::memcpy(host_init + 16, &init_intra, sizeof(init_intra));
         std::memcpy(host_init + 20, &init_intra, sizeof(init_intra));
+        if (split_tail) {
+            std::memcpy(host_init + 40, &init_rdma, sizeof(init_rdma));
+            std::memcpy(host_init + 48, &init_rdma, sizeof(init_rdma));
+        }
         CUDA_CHECK(cudaMemcpyAsync(block, host_init, kCounterBlockBytes, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
@@ -1784,6 +1824,8 @@ static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
         ep_group->ht_buffers.dispatch_expected_lsa_flag_val = nullptr;
         ep_group->ht_buffers.combine_expected_gin_flag_val = nullptr;
         ep_group->ht_buffers.combine_expected_lsa_flag_val = nullptr;
+        ep_group->ht_buffers.dispatch_fwd_tail_signal_val = nullptr;
+        ep_group->ht_buffers.dispatch_bwd_tail_signal_val = nullptr;
     }
 
     // Free group-shared count-mode / EM local-permute scratch
@@ -1904,7 +1946,7 @@ static void init_ll_hier_layout(ncclEpGroup_t group) {
 static ncclResult_t configure_ll_hier(ncclEpGroup_t group, cudaStream_t stream) {
     const auto& env = group->env;
     const bool fullGin = !env.ll_hier_full_gin.is_set || env.ll_hier_full_gin.value.flag;
-    const int numLogicalCtas = ll::hierLogicalCtas(group->dispatch_num_sms, group->device_sm_count);
+    const int numLogicalCtas = ll::hierLogicalCtas(group->fwd_sms.dispatch, group->device_sm_count);
     const bool supported = env.ll_hier_full_gin.valid && fullGin && numLogicalCtas >= 2 &&
         ncclTeamRail(group->comm).nRanks > 1 && !group->num_attn_ranks &&
         !group->config.enable_mask && !nccl_ep_env_flag_on(env.ll_cft) &&
@@ -1972,7 +2014,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         // so its SM budget does not increase the required session count.
         // Keep the compile-time dispatch range available for specialized kernels.
         reqs.lsaBarrierCount =
-            std::max<int>(ep_group->dispatch_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
+            std::max<int>(ht_dispatch_sms_capacity(ep_group), NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
         size_t dcomm_bytes = 0;
         NCCLCHECK(devCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomm, &dcomm_bytes));
         NCCLCHECK(devCommAllocAndCopyToDevice(
@@ -2143,7 +2185,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // channels from the resulting shared context pool, so its SM budget does
     // not impose an additional per-CTA minimum here.
     int min_required_ctx =
-        NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
+        NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ht_dispatch_sms_capacity(ep_group) * NCCL_EP_HT_DISPATCH_N2N_WARPS);
     if (qps_per_rank == 0) qps_per_rank = min_required_ctx;
     if (qps_per_rank < min_required_ctx) {
         fprintf(stderr,
@@ -2164,6 +2206,11 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     ep_group->gin_config.signals_base = 0;
     ep_group->gin_config.combine_signal_offset = dispatch_signals;
     ep_group->gin_config.signals_tail_base = dispatch_signals + combine_signals;
+    ep_group->gin_config.signals_tail_bwd_base = ep_group->gin_config.signals_tail_base;
+    if (ht_dispatch_tail_signals_per_pass(ep_group)) {
+        ep_group->gin_config.signals_tail_bwd_base = ep_group->gin_config.num_total_signals;
+        ep_group->gin_config.num_total_signals += streaming_tail_signals;
+    }
 
     // =========================================================================
     // Phase 3: comm setup (DevCommCreate + WindowRegister)
@@ -2185,15 +2232,16 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         reqs.ginContextCount = ep_group->gin_config.qps_per_rank; // reserved + data contexts
         // N2N window: up to GIN_WINDOW chunks of (3 WQEs/token + signal) per peer. Dispatch chunk == combine
         // chunk with several LSA teams.
+        // The smaller dispatch grid puts the most chunks on a channel.
+        const int min_dispatch_sms =
+            static_cast<int>(std::min(ep_group->fwd_sms.dispatch, ep_group->bwd_sms.dispatch));
         const int chunks_per_channel =
-            nccl_ep::ceil_div<int>(max_chunks_per_rank, ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
+            nccl_ep::ceil_div<int>(max_chunks_per_rank, min_dispatch_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
         reqs.ginQueueDepth =
             std::min(chunks_per_channel, NCCL_EP_HT_DISPATCH_GIN_WINDOW) * (3 * ht_combine_tokens_per_chunk + 1);
-        // Dispatch uses sessions [0, dispatch_num_sms); all combine CTAs rendezvous
-        // through one tail CTA at session dispatch_num_sms. Therefore
-        // combine_num_sms does not affect this resource count.
+        // Dispatch and the pull gate use sessions 0-1; combine uses one more at a pass-independent index.
         reqs.lsaBarrierCount =
-            std::max<int>(ep_group->dispatch_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
+            std::max<int>(ht_dispatch_sms_capacity(ep_group), NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
         NCCLCHECK(devCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomm, &dcomm_bytes));
     }
 
@@ -2389,16 +2437,63 @@ static unsigned int ht_flat_sm_budget(
     return resolved;
 }
 
+// Per-rank SM budgets exchanged across HT ranks at group creation.
+struct HtSmFacts {
+    HtSmBudgets fwd;
+    HtSmBudgets bwd;
+    // 0 if this rank's backward SM budget was out of range.
+    unsigned int valid = 0;
+};
+
+// Ranks exchange their hostname and SM budgets in one gather; only HT checks the budgets.
+struct HtRankFacts {
+    char hostname[256];
+    HtSmFacts sm;
+};
+
+static void print_sm_budgets(const char* prefix, const HtSmFacts& f) {
+    fprintf(stderr, "%sSM budgets fwd/bwd: dispatch %u/%u combine %u/%u; flat dispatch %u/%u combine %u/%u\n",
+            prefix, f.fwd.dispatch, f.bwd.dispatch, f.fwd.combine, f.bwd.combine,
+            f.fwd.flat_dispatch, f.bwd.flat_dispatch, f.fwd.flat_combine, f.bwd.flat_combine);
+}
+
+// Fails on all ranks if any rank's budgets differ or are invalid.
+static ncclResult_t check_sm_budgets_agree(ncclEpGroup_t group, const std::vector<HtRankFacts>& all_ranks) {
+    for (int r = 0; r < group->nRanks; ++r) {
+        if (all_ranks[r].sm.valid == 0) {
+            fprintf(stderr, "ncclEpCreateGroup: rank %d supplied an out-of-range HT backward SM budget\n", r);
+            return ncclInvalidUsage;
+        }
+    }
+    const HtSmFacts& local = all_ranks[group->rank].sm;
+    for (int r = 0; r < group->nRanks; ++r) {
+        const HtSmFacts& remote = all_ranks[r].sm;
+        if (!(remote.fwd == local.fwd && remote.bwd == local.bwd)) {
+            fprintf(stderr, "ncclEpCreateGroup: SM budgets differ between ranks %d and %d\n", group->rank, r);
+            char prefix[64];
+            snprintf(prefix, sizeof(prefix), "ncclEpCreateGroup: rank %d ", group->rank);
+            print_sm_budgets(prefix, local);
+            snprintf(prefix, sizeof(prefix), "ncclEpCreateGroup: rank %d ", r);
+            print_sm_budgets(prefix, remote);
+            return ncclInvalidUsage;
+        }
+    }
+    if (nccl_ep_env_verbose(group->env)) {
+        print_sm_budgets("[nccl_ep] ", local);
+    }
+    return ncclSuccess;
+}
+
 static void init_ht_chunks(ncclEpGroup_t ep_group) {
     const int chunk = nccl_ep_resolve_combine_chunk(
-        ep_group->env, static_cast<int>(ep_group->dispatch_num_sms), ep_group->rdma_team_size);
+        ep_group->env, static_cast<int>(ep_group->fwd_sms.dispatch), ep_group->rdma_team_size);
     ep_group->ht_combine_tokens_per_chunk = chunk;
     ep_group->ht_dispatch_tokens_per_chunk =
         nccl_ep_resolve_dispatch_chunk(ep_group->env, chunk, ep_group->rdma_team_size);
-    const int flat_chunk = ep_group->flat_dispatch_num_sms == ep_group->dispatch_num_sms
+    const int flat_chunk = ep_group->fwd_sms.flat_dispatch == ep_group->fwd_sms.dispatch
                                ? chunk
                                : nccl_ep_resolve_combine_chunk(
-                                     ep_group->env, ep_group->flat_dispatch_num_sms, ep_group->rdma_team_size);
+                                     ep_group->env, ep_group->fwd_sms.flat_dispatch, ep_group->rdma_team_size);
     ep_group->ht_flat_combine_tokens_per_chunk = flat_chunk;
     ep_group->ht_flat_dispatch_tokens_per_chunk = flat_chunk == chunk
         ? ep_group->ht_dispatch_tokens_per_chunk
@@ -2633,9 +2728,9 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         return ncclSuccess;
     };
     NCCL_CHECK_RESULT(resolve_config_sms(
-        "dispatch_num_sms", in_config->dispatch_num_sms, shared_num_sms, &ep_group->dispatch_num_sms));
+        "dispatch_num_sms", in_config->dispatch_num_sms, shared_num_sms, &ep_group->fwd_sms.dispatch));
     NCCL_CHECK_RESULT(resolve_config_sms(
-        "combine_num_sms", in_config->combine_num_sms, shared_num_sms, &ep_group->combine_num_sms));
+        "combine_num_sms", in_config->combine_num_sms, shared_num_sms, &ep_group->fwd_sms.combine));
     ep_group->shuffle_sms =
         in_config->max_num_sms == NCCL_EP_AUTO ? ep_group->device_sm_count : in_config->max_num_sms;
     // Preprocessing defaults to all device SMs so a small communication budget
@@ -2657,17 +2752,46 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             nccl_ep_env_print(env);
         }
     };
-    apply_sms_override(ep_group->env.comm_num_sms, ep_group->dispatch_num_sms);
-    apply_sms_override(ep_group->env.comm_num_sms, ep_group->combine_num_sms);
-    apply_sms_override(ep_group->env.dispatch_num_sms, ep_group->dispatch_num_sms);
-    apply_sms_override(ep_group->env.combine_num_sms, ep_group->combine_num_sms);
+    apply_sms_override(ep_group->env.comm_num_sms, ep_group->fwd_sms.dispatch);
+    apply_sms_override(ep_group->env.comm_num_sms, ep_group->fwd_sms.combine);
+    apply_sms_override(ep_group->env.dispatch_num_sms, ep_group->fwd_sms.dispatch);
+    apply_sms_override(ep_group->env.combine_num_sms, ep_group->fwd_sms.combine);
     // Only the algorithm fallback varies by layout; explicit overrides stay shared.
-    ep_group->flat_dispatch_num_sms = ht_flat_sm_budget(
+    ep_group->fwd_sms.flat_dispatch = ht_flat_sm_budget(
         ep_group, in_config, in_config->dispatch_num_sms, ep_group->env.dispatch_num_sms,
-        ep_group->dispatch_num_sms, nccl_ep::kHtFlatDefaultSms);
-    ep_group->flat_combine_num_sms = ht_flat_sm_budget(
+        ep_group->fwd_sms.dispatch, nccl_ep::kHtFlatDefaultSms);
+    ep_group->fwd_sms.flat_combine = ht_flat_sm_budget(
         ep_group, in_config, in_config->combine_num_sms, ep_group->env.combine_num_sms,
-        ep_group->combine_num_sms, nccl_ep::ht_flat_combine_default_sms(in_config->max_dispatch_tokens_per_rank));
+        ep_group->fwd_sms.combine, nccl_ep::ht_flat_combine_default_sms(in_config->max_dispatch_tokens_per_rank));
+    // AUTO inherits the resolved forward budget for each layout.
+    auto resolve_bwd_sms = [&](const char* name, unsigned int requested, const ncclEpEnvVar& op_env,
+                               unsigned int& target) -> ncclResult_t {
+        NCCLCHECK(resolve_config_sms(name, requested, target, &target));
+        if (requested != NCCL_EP_AUTO) {
+            apply_sms_override(ep_group->env.comm_num_sms, target);
+        }
+        apply_sms_override(op_env, target);
+        return ncclSuccess;
+    };
+    ep_group->bwd_sms.dispatch = ep_group->fwd_sms.dispatch;
+    ep_group->bwd_sms.combine = ep_group->fwd_sms.combine;
+    // An invalid rank still joins the exchange so all ranks reject together.
+    bool bwd_sms_valid = true;
+    if (ht_mode) {
+        const bool dispatch_ok =
+            resolve_bwd_sms("dispatch_bwd_num_sms", in_config->dispatch_bwd_num_sms,
+                            ep_group->env.dispatch_bwd_num_sms, ep_group->bwd_sms.dispatch) == ncclSuccess;
+        const bool combine_ok =
+            resolve_bwd_sms("combine_bwd_num_sms", in_config->combine_bwd_num_sms,
+                            ep_group->env.combine_bwd_num_sms, ep_group->bwd_sms.combine) == ncclSuccess;
+        bwd_sms_valid = dispatch_ok && combine_ok;
+    }
+    ep_group->bwd_sms.flat_dispatch = ht_flat_sm_budget(
+        ep_group, in_config, in_config->dispatch_bwd_num_sms, ep_group->env.dispatch_bwd_num_sms,
+        ep_group->bwd_sms.dispatch, ep_group->fwd_sms.flat_dispatch);
+    ep_group->bwd_sms.flat_combine = ht_flat_sm_budget(
+        ep_group, in_config, in_config->combine_bwd_num_sms, ep_group->env.combine_bwd_num_sms,
+        ep_group->bwd_sms.combine, ep_group->fwd_sms.flat_combine);
     apply_sms_override(ep_group->env.shuffle_sms, ep_group->shuffle_sms);
     apply_sms_override(ep_group->env.preprocess_num_sms, ep_group->preprocess_num_sms);
     const auto& copy_mode = ep_group->env.dispatch_copy_mode;
@@ -2683,8 +2807,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             const char* operation;
             unsigned int sms;
         } budgets[] = {
-            {"dispatch", ep_group->dispatch_num_sms},
-            {"combine", ep_group->combine_num_sms},
+            {"dispatch", ep_group->fwd_sms.dispatch},
+            {"combine", ep_group->fwd_sms.combine},
         };
         for (const auto& budget : budgets) {
             const int numWarpGroups = (num_experts + static_cast<int>(budget.sms) - 1) / budget.sms;
@@ -2700,16 +2824,21 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         }
     }
 
-    // Determine number of nodes by gathering hostnames and counting unique ones
-    constexpr size_t HOSTNAME_LEN = 256;
-    std::vector<char> all_hostnames(HOSTNAME_LEN * ep_group->nRanks, 0);
-    gethostname(all_hostnames.data() + ep_group->rank * HOSTNAME_LEN, HOSTNAME_LEN);
-    ncclAllGatherHost(all_hostnames.data(), HOSTNAME_LEN, ep_group->rank, ep_group->nRanks, comm, stream);
+    // Determine number of nodes by gathering hostnames and counting unique ones.
+    // The same gather exchanges the SM budgets.
     std::set<std::string> unique_hosts;
-    for (int i = 0; i < ep_group->nRanks; ++i) {
-        unique_hosts.insert(std::string(all_hostnames.data() + i * HOSTNAME_LEN));
+    std::vector<HtRankFacts> ht_ranks(ep_group->nRanks);
+    HtRankFacts& local_facts = ht_ranks[ep_group->rank];
+    gethostname(local_facts.hostname, sizeof(local_facts.hostname));
+    local_facts.sm = {ep_group->fwd_sms, ep_group->bwd_sms, bwd_sms_valid ? 1u : 0u};
+    ncclAllGatherHost(ht_ranks.data(), sizeof(HtRankFacts), ep_group->rank, ep_group->nRanks, comm, stream);
+    for (const auto& rank_facts : ht_ranks) {
+        unique_hosts.insert(std::string(rank_facts.hostname));
     }
     ep_group->nNodes = static_cast<int>(unique_hosts.size());
+    if (ht_mode && check_sm_budgets_agree(ep_group, ht_ranks) != ncclSuccess) {
+        return reject_group(ncclInvalidUsage);
+    }
 
     ep_group->num_attn_ranks = num_attn_ranks;
     ep_group->num_local_experts = ep_group->config.num_experts / (ep_group->nRanks - ep_group->num_attn_ranks);
@@ -2774,7 +2903,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
 
     // Dispatch dedicates N2N warps per CTA; combine reuses this pool.
     const unsigned autoGinContexts =
-        NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
+        NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ht_dispatch_sms_capacity(ep_group) * NCCL_EP_HT_DISPATCH_N2N_WARPS);
     if (ep_group->config.num_qp_per_rank == NCCL_EP_AUTO) {
         ep_group->config.num_qp_per_rank = autoGinContexts;
     }
@@ -3893,12 +4022,22 @@ static HtProbWire ht_prob_wire_mode(ncclEpGroup_t group, int num_topk) {
     return HtProbWire::kCompact;
 }
 
-static unsigned int ht_dispatch_num_sms(ncclEpGroup_t group, ncclEpLayout_t layout) {
-    return layout == NCCL_EP_LAYOUT_FLAT ? group->flat_dispatch_num_sms : group->dispatch_num_sms;
+static bool ht_backward_pass(ncclEpPassDir_t pass_direction) {
+    return pass_direction == NCCL_EP_BWD_PASS;
 }
 
-static unsigned int ht_combine_num_sms(ncclEpGroup_t group, ncclEpLayout_t layout) {
-    return layout == NCCL_EP_LAYOUT_FLAT ? group->flat_combine_num_sms : group->combine_num_sms;
+static const HtSmBudgets& ht_pass_sms(ncclEpGroup_t group, ncclEpPassDir_t pass_direction) {
+    return ht_backward_pass(pass_direction) ? group->bwd_sms : group->fwd_sms;
+}
+
+static unsigned int ht_dispatch_num_sms(ncclEpGroup_t group, ncclEpLayout_t layout, ncclEpPassDir_t pass_direction) {
+    const HtSmBudgets& sms = ht_pass_sms(group, pass_direction);
+    return layout == NCCL_EP_LAYOUT_FLAT ? sms.flat_dispatch : sms.dispatch;
+}
+
+static unsigned int ht_combine_num_sms(ncclEpGroup_t group, ncclEpLayout_t layout, ncclEpPassDir_t pass_direction) {
+    const HtSmBudgets& sms = ht_pass_sms(group, pass_direction);
+    return layout == NCCL_EP_LAYOUT_FLAT ? sms.flat_combine : sms.combine;
 }
 
 static int ht_combine_chunk(ncclEpGroup_t group, ncclEpLayout_t layout) {
@@ -3916,8 +4055,10 @@ static nccl_ep::HtDispatchChunkPolicy ht_dispatch_chunk_policy(ncclEpGroup_t gro
     if (group->env.dispatch_tokens_per_chunk.is_set) {
         explicit_chunk = fallback;
     }
+    // Both passes share the handle's chunk layout; dispatch CTAs stride over chunks, so it follows forward.
     return {explicit_chunk, fallback,
-            group->rdma_team_size, static_cast<int>(ht_dispatch_num_sms(group, layout)), supported_layout};
+            group->rdma_team_size, static_cast<int>(ht_dispatch_num_sms(group, layout, NCCL_EP_FWD_PASS)),
+            supported_layout};
 }
 
 // Returns the total buffer size (in bytes) for a LL handle_mem block.
@@ -4298,7 +4439,7 @@ static ncclResult_t validate_ll_geometry(const ncclEpGroup_t ep_group, int num_t
         return ncclInvalidUsage;
     }
 
-    const int num_device_sms = static_cast<int>(ep_group->dispatch_num_sms);
+    const int num_device_sms = static_cast<int>(ep_group->fwd_sms.dispatch);
     if (num_device_sms <= 0) return ncclInvalidUsage;
     const int num_warp_groups = (ep_group->config.num_experts + num_device_sms - 1) / num_device_sms;
     if (num_warp_groups <= 0 || num_warp_groups > nccl_ep::ll::kLlDispatchMaxWarpGroups) {
@@ -5917,6 +6058,10 @@ ncclResult_t ncclEpDispatch(
 
     const unsigned int send_only = config ? config->send_only : 0;
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
+    if (pass_direction != NCCL_EP_FWD_PASS && pass_direction != NCCL_EP_BWD_PASS) {
+        fprintf(stderr, "ncclEpDispatch: invalid pass_direction=%d\n", (int)pass_direction);
+        return ncclInvalidArgument;
+    }
     const ncclEpDispQuant_t recipe =
         config ? config->quant_recipe : NCCL_EP_DISP_QUANT_NONE;
     ncclEpGroup_t group = handle->group;
@@ -6280,7 +6425,7 @@ ncclResult_t ncclEpDispatch(
                 params.rankSentCnt = group->ws_dispatch_rankSentCnt;
                 params.rankArrivedCnt = group->ws_dispatch_rankArrivedCnt;
                 params.rankDone = group->ws_dispatch_rankDone;
-                params.numDeviceSms = group->dispatch_num_sms;
+                params.numDeviceSms = group->fwd_sms.dispatch;
                 params.deviceSm = group->device_sm;
                 params.deviceSmCount = group->device_sm_count;
                 params.rankMask = group->mask_buffer;
@@ -6963,6 +7108,11 @@ ncclResult_t ncclEpDispatch(
         // Always pass a valid device pointer — the kernel unconditionally
         // dereferences this even in single-LSA-team mode (the value is just unused).
         params.expected_gin_flag_val = group->ht_buffers.dispatch_expected_gin_flag_val;
+        const bool backward_grid = ht_backward_pass(pass_direction);
+        params.expected_tail_signal_val = backward_grid ? group->ht_buffers.dispatch_bwd_tail_signal_val
+                                                        : group->ht_buffers.dispatch_fwd_tail_signal_val;
+        const unsigned signals_tail_base = static_cast<unsigned>(
+            backward_grid ? group->gin_config.signals_tail_bwd_base : group->gin_config.signals_tail_base);
         params.gin_G2S_flags = is_lsa_only ? nullptr : group->ht_buffers.dispatch_gin_G2S_flags;
         params.expected_lsa_flag_val = group->ht_buffers.dispatch_expected_lsa_flag_val;
         params.lsa_S2G_flags = group->ht_buffers.dispatch_lsa_S2G_flags;
@@ -7012,8 +7162,7 @@ ncclResult_t ncclEpDispatch(
         params.mr_info.guard_offset = is_lsa_only ? 0 : group->gin_config.dispatch_guard_offset;
         params.mr_info.bytes_per_entry = bytes_per_entry;
         params.mr_info.max_tokens_per_dest = static_cast<size_t>(group->config.max_dispatch_tokens_per_rank);
-        params.mr_info.signals_tail_base =
-            is_lsa_only ? 0 : static_cast<unsigned>(group->gin_config.signals_tail_base);
+        params.mr_info.signals_tail_base = is_lsa_only ? 0 : signals_tail_base;
         params.mr_info.num_max_rdma_chunked_send_tokens =
             is_lsa_only ? 0 : group->gin_config.num_max_rdma_chunked_send_tokens;
         params.local_rank = group->lsa_rank;
@@ -7045,7 +7194,7 @@ ncclResult_t ncclEpDispatch(
                     group->rdma_team_size,
                     recipe,
                     pass_direction,
-                    static_cast<int>(ht_dispatch_num_sms(group, handle->layout)),
+                    static_cast<int>(ht_dispatch_num_sms(group, handle->layout, pass_direction)),
                     group->max_dynamic_smem,
                     sf_bytes_per_token,
                     &group->env,
@@ -7514,9 +7663,8 @@ ncclResult_t ncclEpDispatch(
                     caller_num_recv_tokens,
                     static_cast<int>(group->config.max_dispatch_tokens_per_rank),
                     lsa_ranks,
-                    // Pull is the dispatch, so it uses the dispatch SM budget
-                    // (dispatch_num_sms), not the shuffle or combine budget.
-                    static_cast<int>(ht_dispatch_num_sms(group, handle->layout)),
+                    // Pull is the dispatch, so it uses this pass's dispatch budget.
+                    static_cast<int>(ht_dispatch_num_sms(group, handle->layout, pass_direction)),
                     0u,
                     recipe,
                     group->gin_config.d_dcomm,
@@ -7666,6 +7814,10 @@ ncclResult_t ncclEpCombine(
 
     const unsigned int send_only = config ? config->send_only : 0;
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
+    if (pass_direction != NCCL_EP_FWD_PASS && pass_direction != NCCL_EP_BWD_PASS) {
+        fprintf(stderr, "ncclEpCombine: invalid pass_direction=%d\n", (int)pass_direction);
+        return ncclInvalidArgument;
+    }
     const ncclEpCombQuant_t quantization_recipe =
         config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
     ncclEpGroup_t group = handle->group;
@@ -7936,7 +8088,7 @@ ncclResult_t ncclEpCombine(
                 params.signalsBase = signal_base;
                 params.combineSync = handle->group->ws_combine_sync;
                 params.want1SidedBuf = handle->ll.dispatch_want_1sided;
-                params.numDeviceSms = handle->group->combine_num_sms;
+                params.numDeviceSms = handle->group->fwd_sms.combine;
                 params.deviceSm = handle->group->device_sm;
                 params.maxDynamicSmem = handle->group->max_dynamic_smem;
                 params.resolvedWarpsPerGroup = &handle->group->last_ll_combine_warps_per_group;
@@ -8216,7 +8368,7 @@ ncclResult_t ncclEpCombine(
                 group->nRanks,
                 group->device_sm,
                 // Push combine is a comm kernel (NVLink push), so it uses the combine SM budget.
-                static_cast<int>(ht_combine_num_sms(group, handle->layout)),
+                static_cast<int>(ht_combine_num_sms(group, handle->layout, pass_direction)),
                 0u,
                 stream,
                 x->datatype,
@@ -8428,7 +8580,7 @@ ncclResult_t ncclEpCombine(
             params.combine_grid_barrier_counter = group->ht_buffers.combine_grid_barrier_counter;
             params.lsa_S2G_flags = group->ht_buffers.combine_lsa_S2G_flags;
             params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
-            params.combine_barrier_offset = group->dispatch_num_sms;
+            params.combine_barrier_offset = ht_dispatch_sms_capacity(group);
             const ncclWindow_t combine_token_window =
                 !combine_x_uses_external_window ? x->win_hdl : group->gin_config.nccl_window;
             const size_t combine_token_offset =
@@ -8501,7 +8653,7 @@ ncclResult_t ncclEpCombine(
                     ht_combine_chunk(group, handle->layout), // tokens per combine chunk
                     group->rdma_team_size, // num_lsa_teams (RDMA domain size)
                     backward_combine, // backward mode flag
-                    static_cast<int>(ht_combine_num_sms(group, handle->layout)),
+                    static_cast<int>(ht_combine_num_sms(group, handle->layout, pass_direction)),
                     group->max_dynamic_smem,
                     &group->env,
                     stream));
@@ -8843,19 +8995,26 @@ void ncclEpGroup_test_getLastCombinePushLaunch(
 }
 
 void ncclEpGroup_test_getSmBudgets(
-    ncclEpGroup_t group, unsigned int* dispatch_num_sms, unsigned int* combine_num_sms) {
+    ncclEpGroup_t group, ncclEpPassDir_t pass_direction, unsigned int* dispatch_num_sms,
+    unsigned int* combine_num_sms) {
     if (group == nullptr) return;
-    if (dispatch_num_sms != nullptr) *dispatch_num_sms = group->dispatch_num_sms;
-    if (combine_num_sms != nullptr) *combine_num_sms = group->combine_num_sms;
+    const HtSmBudgets& sms = ht_pass_sms(group, pass_direction);
+    if (dispatch_num_sms != nullptr) {
+        *dispatch_num_sms = sms.dispatch;
+    }
+    if (combine_num_sms != nullptr) {
+        *combine_num_sms = sms.combine;
+    }
 }
 
 void ncclEpHandle_test_getSmBudgets(
-    ncclEpHandle_t handle, unsigned int* dispatch_num_sms, unsigned int* combine_num_sms) {
+    ncclEpHandle_t handle, ncclEpPassDir_t pass_direction, unsigned int* dispatch_num_sms,
+    unsigned int* combine_num_sms) {
     if (dispatch_num_sms) {
-        *dispatch_num_sms = ht_dispatch_num_sms(handle->group, handle->layout);
+        *dispatch_num_sms = ht_dispatch_num_sms(handle->group, handle->layout, pass_direction);
     }
     if (combine_num_sms) {
-        *combine_num_sms = ht_combine_num_sms(handle->group, handle->layout);
+        *combine_num_sms = ht_combine_num_sms(handle->group, handle->layout, pass_direction);
     }
 }
 

@@ -48,6 +48,7 @@ TEST_BINARIES := \
         $(DST_DIR)/test_ht_dispatch_async \
         $(DST_DIR)/test_ht_dispatch_pp_interleave \
         $(DST_DIR)/test_ht_overflow_drop \
+        $(DST_DIR)/test_ht_pull_chunk_ring \
         $(DST_DIR)/test_ht_stale_routing_map \
         $(DST_DIR)/test_lifecycle \
         $(DST_DIR)/test_ll_epoch_protocol \

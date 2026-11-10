@@ -158,6 +158,7 @@ SUITES=(
     "test_ht_combine_pp_interleave|EP HT Combine PP Interleave Tests|1"
     "test_ht_dispatch_pp_interleave|EP HT Dispatch PP Interleave Tests|1"
     "test_ht_overflow_drop|EP HT Overflow Drop Tests|0"
+    "test_ht_pull_chunk_ring|EP HT Pull Chunk Ring Tests|0"
     "test_tensor_create|EP Tensor Create Tests|0"
     "test_quantization_recipe|EP Quantization Recipe Tests|1"
     "test_zero_copy|EP Zero-Copy forced|0"
@@ -264,7 +265,7 @@ unset NCCL_EP_HT_COUNT_UNFUSED
 # phantom-row overflow path via the local-permute tests, plus the flat prefix-DROP case.
 # Other overflow tests exercise specific transports or early layout-query contracts and
 # are excluded from this focused rerun.
-PULL_PUSH_SUITES="test_output_layout test_ht_bwd test_quantization_recipe test_ht_combine_pp_interleave test_ht_dispatch_pp_interleave test_ht_compact_prob"
+PULL_PUSH_SUITES="test_output_layout test_ht_bwd test_quantization_recipe test_ht_combine_pp_interleave test_ht_dispatch_pp_interleave test_ht_compact_prob test_ht_pull_chunk_ring"
 export NCCL_EP_HT_PULL_PUSH=1
 export NCCL_LSA_TEAM_SIZE="${NUM_GPUS}"
 for entry in "${SUITES[@]}"; do

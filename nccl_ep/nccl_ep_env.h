@@ -65,6 +65,11 @@ struct ncclEpEnvConfig {
     // the read site (nccl_ep.cc), not here.
     ncclEpEnvVar ht_combine_dynamic_claim_min_tokens{
         "NCCL_EP_HT_COMBINE_DYNAMIC_CLAIM_MIN_TOKENS", ncclEpEnvType::ulong};
+    // Pull-push dispatch claims MAP chunks dynamically only when the handle's tokens per rank >= this
+    // value; smaller batches use the static chunk assignment. 0 always claims. Unset defaults to
+    // 2048 at the read site (nccl_ep.cc), not here.
+    ncclEpEnvVar ht_dispatch_dynamic_claim_min_tokens{
+        "NCCL_EP_HT_DISPATCH_DYNAMIC_CLAIM_MIN_TOKENS", ncclEpEnvType::ulong};
     // Count exchange is the default HT path for EM local-permute and Flat handles; set to fall
     // back to the routing-map AllGather + scan path instead. Honored only under
     // meta_exchange_policy AUTO; see

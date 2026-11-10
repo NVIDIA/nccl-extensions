@@ -518,7 +518,9 @@ ncclResult_t launch_dispatch_pull(
     bool flat,
     int64_t* recv_topk_idx,
     int output_expert_base,
-    int32_t* retained_slots);
+    int32_t* retained_slots,
+    // Claim MAP chunks dynamically (true) or keep the static chunk assignment (false).
+    bool claim_dynamic);
 
 // Minimum shared-memory bytes launch_dispatch_pull requires for a given row width
 // (int4 units): what a single pull warp needs, static and dynamic. Callers compare this

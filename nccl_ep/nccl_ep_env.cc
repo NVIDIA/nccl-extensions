@@ -125,6 +125,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_ulong(cfg->ll_cft_debug_min_driver);
     parse_ulong(cfg->combine_lsa_threshold);
     parse_ulong(cfg->ht_combine_dynamic_claim_min_tokens);
+    parse_ulong(cfg->ht_dispatch_dynamic_claim_min_tokens);
 }
 
 void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
@@ -163,6 +164,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.combine_lsa,
         &cfg.combine_lsa_threshold,
         &cfg.ht_combine_dynamic_claim_min_tokens,
+        &cfg.ht_dispatch_dynamic_claim_min_tokens,
     };
 
     std::fprintf(stderr, "[nccl_ep][env] NCCL EP environment configuration:\n");

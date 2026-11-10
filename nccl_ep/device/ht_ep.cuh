@@ -6817,6 +6817,30 @@ constexpr int kPullDispatchMaxActive = 32;
 // Fused pull-count: two MAP warps build the recv-slot/EM maps in-kernel. Barrier 0 is
 // reserved for block-wide sync; the MAP warps use barrier 1.
 constexpr int kPullDispatchMapWarps = 2;
+// A MAP warp claims its next chunk from a grid counter only while fewer than this many of its
+// chunks are unclaimed by pull warps, so the last chunks go to the CTAs that drain first.
+constexpr int kPullDispatchChunkLookahead = 2;
+// Tokens per MAP chunk (one source rank). A chunk is also one pull-warp ticket "unit".
+constexpr int kPullDispatchChunkTokens = 32;
+// Recv slots a pull warp claims per ticket; kPullDispatchChunkTokens / kPullDispatchSlotBatch
+// pull-warp claims read each chunk's ring entry.
+constexpr unsigned kPullDispatchSlotBatch = 4;
+static_assert(kPullDispatchChunkTokens % kPullDispatchSlotBatch == 0, "slot batch must divide the chunk");
+constexpr unsigned kPullDispatchChunkReaders = kPullDispatchChunkTokens / kPullDispatchSlotBatch;
+// Per-MAP-warp slots in the chunk_ranges ring. A MAP warp reuses a slot only after every reader
+// of its previous chunk has acked (chunks_read), so the ring size is not a correctness bound; it
+// only needs to exceed the lookahead so the ack wait is rarely hit.
+constexpr int kPullDispatchChunkRing = 8;
+static_assert(kPullDispatchChunkRing >= 2 * kPullDispatchChunkLookahead + 2,
+              "chunk_ranges ring must exceed the lookahead so ring reuse rarely waits on readers");
+// layout_ready is an array of kPullLayoutReadyWords words (pull_recv_cursor tail), zeroed together.
+constexpr int kPullLayoutFlagWord = 0;    // grid-wide "layout published" flag
+constexpr int kPullChunkClaimWord = 1;    // grid-wide MAP chunk-claim counter
+constexpr int kPullLayoutReadyWords = 2;
+__device__ __forceinline__ void pull_layout_ready_reset(int32_t* layout_ready) {
+    layout_ready[kPullLayoutFlagWord] = 0;
+    layout_ready[kPullChunkClaimWord] = 0;
+}
 // Static smem of the MAP layout scan; counted in the host smem budget.
 constexpr size_t kPullDispatchMapScanBytes = kPullDispatchMapWarps * sizeof(int);
 constexpr int kPullMapBarrierId = 1;
@@ -6956,12 +6980,14 @@ struct dispatch_pull_param_t {
     int topk_off_bytes;                 // byte offset of the uint16 topk half within a slice
     int32_t* rank_cursor;               // [lsa_team_size] per-source-rank recv-slot cursor (zeroed)
     int32_t* expert_cursor;             // [experts_per_rank] per-expert EM-slot cursor (zeroed)
-    int32_t* layout_ready;              // single grid-wide "layout published" flag (zeroed)
+    int32_t* layout_ready;              // [kPullLayoutReadyWords] layout-published flag + chunk-claim counter (zeroed)
     int my_rank;                        // this rank's slot within the LSA team
     int max_recv_tokens_per_rank;       // EM-slot budget (em_slot overflow bound)
     int flat_recv_capacity;             // FLAT recv-slot overflow bound
     int em_alignment;
     bool allow_overflow_drop;
+    // MAP chunks beyond each warp's first are claimed dynamically; false keeps static assignment.
+    bool claim_dynamic;
     // Publish handle-local snapshots at dispatch so batched UpdateHandles stay independent.
     const int32_t* own_row;             // [lsa_team_size + num_experts]
     const uint16_t* own_topk_snapshot;  // [tokens_per_rank, top_k] this rank's packed topk
@@ -7100,7 +7126,12 @@ __device__ __forceinline__ void dispatch_pull_map_warp(
     size_t meta_stride,
     int2* chunk_ranges,
     unsigned* chunks_ready,
-    const int32_t* cached_cnt_rows) {
+    unsigned* chunks_done,
+    unsigned* chunks_read,
+    unsigned* chunk_next,
+    int32_t* chunk_claim,
+    const int32_t* cached_cnt_rows,
+    bool claim_dynamic) {
     constexpr int nMapThreads = kPullDispatchMapWarps * 32;
     const int tid = map_idx * 32 + lane;
     const int nRanks = lsa_team_size;
@@ -7260,14 +7291,33 @@ __device__ __forceinline__ void dispatch_pull_map_warp(
     const int max_hits = top_k;
     const int num_cblocks = nccl_ep::ceil_div(tokens_per_rank, 32);
     const size_t total_chunks = static_cast<size_t>(nRanks) * num_cblocks;
-    const size_t stride = static_cast<size_t>(gridDim.x) * kPullDispatchMapWarps;
-    const size_t warp_base = static_cast<size_t>(blockIdx.x) * kPullDispatchMapWarps + static_cast<size_t>(map_idx);
     // Use vector loads and stores when top-k rows have the required alignment.
     const bool row_vec_ok = (top_k % 8 == 0) && ((topk_off_bytes & 15) == 0);
     const bool map_vec_ok = (top_k % 4 == 0) &&
         (((reinterpret_cast<uintptr_t>(flat2em_slot_map) | reinterpret_cast<uintptr_t>(srcpos_map)) & 15) == 0);
     unsigned built = 0;
-    for (size_t chunk = warp_base; chunk < total_chunks; chunk += stride) {
+    // Each MAP warp's first chunk is static. Later chunks are claimed from the grid counter, or follow
+    // the same stride when claiming is off. round is warp-uniform (built is only advanced by lane 0).
+    const size_t stride = static_cast<size_t>(gridDim.x) * kPullDispatchMapWarps;
+    unsigned round = 0;
+    for (;;) {
+        size_t chunk = round * stride + static_cast<size_t>(blockIdx.x) * kPullDispatchMapWarps + map_idx;
+        if (claim_dynamic && round > 0) {
+            int claimed = 0;
+            if (lane == 0) {
+                cuda::atomic_ref<unsigned, cuda::thread_scope_block> next(*chunk_next);
+                while (built * kPullDispatchMapWarps + map_idx >=
+                       next.load(cuda::memory_order_relaxed) / kPullDispatchChunkTokens +
+                           kPullDispatchChunkLookahead * kPullDispatchMapWarps) {
+                }
+                claimed = atomicAdd(chunk_claim, 1);
+            }
+            chunk = stride + static_cast<size_t>(__shfl_sync(0xffffffffu, claimed, 0));
+        }
+        if (chunk >= total_chunks) {
+            break;
+        }
+        ++round;
         const int cblock = static_cast<int>(chunk / nRanks);
         const int r = static_cast<int>(chunk % nRanks);
         const int t = cblock * 32 + lane;
@@ -7354,14 +7404,56 @@ __device__ __forceinline__ void dispatch_pull_map_warp(
         __syncwarp();
         const unsigned pmask = __ballot_sync(0xffffffffu, produce);
         if (lane == 0) {
-            chunk_ranges[built * kPullDispatchMapWarps + map_idx] =
+            const unsigned ring_slot = (built % kPullDispatchChunkRing) * kPullDispatchMapWarps + map_idx;
+            // Before reusing the slot, wait until every reader of its previous chunk has read it.
+            cuda::atomic_ref<unsigned, cuda::thread_scope_block> read(chunks_read[ring_slot]);
+            const unsigned reads_needed = (built / kPullDispatchChunkRing) * kPullDispatchChunkReaders;
+            while (read.load(cuda::memory_order_acquire) < reads_needed) {
+            }
+            chunk_ranges[ring_slot] =
                 make_int2(s_base[r] + base_r, __popc(pmask));
             cuda::atomic_ref<unsigned, cuda::thread_scope_block> ready(chunks_ready[map_idx]);
             ready.store(++built, cuda::memory_order_release);
         }
     }
+    if (lane == 0) {
+        cuda::atomic_ref<unsigned, cuda::thread_scope_block> done(chunks_done[map_idx]);
+        done.store(1, cuda::memory_order_release);
+    }
 }
 
+
+// Result of waiting for a MAP chunk: usable, skipped (owner exhausted), or all MAP warps drained.
+enum class PullChunkState { kReady, kSkip, kFinished };
+
+// Lane 0 of a pull warp: wait for chunk idx of its owner MAP warp and read its range.
+__device__ __forceinline__ PullChunkState dispatch_pull_wait_chunk(
+    unsigned* chunks_ready, unsigned* chunks_done, unsigned* chunks_read, const int2* chunk_ranges, int owner,
+    unsigned idx, int& first, int& count) {
+    cuda::atomic_ref<unsigned, cuda::thread_scope_block> ready(chunks_ready[owner]);
+    cuda::atomic_ref<unsigned, cuda::thread_scope_block> done(chunks_done[owner]);
+    while (ready.load(cuda::memory_order_acquire) <= idx) {
+        if (done.load(cuda::memory_order_acquire) != 0 && ready.load(cuda::memory_order_acquire) <= idx) {
+            PullChunkState state = PullChunkState::kFinished;
+            for (int w = 0; w < kPullDispatchMapWarps; ++w) {
+                cuda::atomic_ref<unsigned, cuda::thread_scope_block> rw(chunks_ready[w]);
+                cuda::atomic_ref<unsigned, cuda::thread_scope_block> dw(chunks_done[w]);
+                if (dw.load(cuda::memory_order_acquire) == 0 || rw.load(cuda::memory_order_acquire) > idx) {
+                    state = PullChunkState::kSkip;
+                }
+            }
+            return state;
+        }
+    }
+    const unsigned ring_slot = (idx % kPullDispatchChunkRing) * kPullDispatchMapWarps + owner;
+    const int2 range = chunk_ranges[ring_slot];
+    first = range.x;
+    count = range.y;
+    // Ack the read: the MAP warp may overwrite this slot once all kPullDispatchChunkReaders have.
+    cuda::atomic_ref<unsigned, cuda::thread_scope_block> read(chunks_read[ring_slot]);
+    read.fetch_add(1, cuda::memory_order_release);
+    return PullChunkState::kReady;
+}
 
 // ScaleInt4PerLane: per-lane int4 capacity for the QUANT_FWD scale row (loaded once
 // into registers, scattered to every EM slot). JIT-sized from the actual scale row
@@ -7478,9 +7570,17 @@ __device__ __forceinline__ void dispatch_pull(
     }
 
     __shared__ unsigned s_chunks_ready[kFusedMap ? kPullDispatchMapWarps : 1];
+    __shared__ unsigned s_chunks_done[kFusedMap ? kPullDispatchMapWarps : 1];
+    __shared__ unsigned s_chunks_read[kFusedMap ? kPullDispatchChunkRing * kPullDispatchMapWarps : 1];
     __shared__ unsigned s_chunk_next;
     if constexpr (kFusedMap) {
-        if (threadIdx.x < kMapWarps) s_chunks_ready[threadIdx.x] = 0;
+        if (threadIdx.x < kMapWarps) {
+            s_chunks_ready[threadIdx.x] = 0;
+            s_chunks_done[threadIdx.x] = 0;
+        }
+        for (int i = threadIdx.x; i < kPullDispatchChunkRing * kPullDispatchMapWarps; i += blockDim.x) {
+            s_chunks_read[i] = 0;
+        }
         if (threadIdx.x == 0) s_chunk_next = 0;
         __syncthreads();
     }
@@ -7588,7 +7688,7 @@ __device__ __forceinline__ void dispatch_pull(
                                                       static_cast<int>(gridDim.x));
             if (head_leader) {
                 if (threadIdx.x == 0) {
-                    *layout_ready = 0;
+                    pull_layout_ready_reset(layout_ready);
                     atomicExch(grid_barrier_counter, 0u);
                 }
                 // Reset the slot cursors (and the trailing arrival counter) before any block claims.
@@ -7615,7 +7715,8 @@ __device__ __forceinline__ void dispatch_pull(
                 max_recv_tokens_per_rank, flat_recv_capacity, em_alignment, allow_overflow_drop,
                 caller_offsets, caller_counts, caller_recv_total, caller_out_is_int64,
                 map_idx, lane, own_meta_staging, meta_stride, s_chunk_ranges, s_chunks_ready,
-                cached_cnt_rows);
+                s_chunks_done, s_chunks_read, &s_chunk_next, layout_ready + kPullChunkClaimWord, cached_cnt_rows,
+                dp.claim_dynamic);
         } else if (is_pad) {
             if (lane == 0) {
                 while (nccl_ep::ld_acquire_sys_global(layout_ready) == 0) {
@@ -7638,31 +7739,38 @@ __device__ __forceinline__ void dispatch_pull(
     } else {
         if constexpr (kFusedMap) {
             if (!is_map) {
-                const size_t total_chunks = static_cast<size_t>(lsa_team_size) * nccl_ep::ceil_div(tokens_per_rank, 32);
-                const size_t first_chunk = static_cast<size_t>(blockIdx.x) * kMapWarps;
-                const size_t chunk_stride = static_cast<size_t>(gridDim.x) * kMapWarps;
-                // Claim small batches from 32 slot positions per chunk; skip the unused tail.
-                constexpr unsigned kSlotBatch = 4;
+                // Claim small batches from the slot positions of each chunk; skip the unused tail.
+                constexpr unsigned kSlotBatch = kPullDispatchSlotBatch;
                 for (;;) {
                     unsigned ticket = 0;
                     if (lane == 0) ticket = atomicAdd(&s_chunk_next, kSlotBatch);
                     ticket = __shfl_sync(0xffffffffu, ticket, 0);
-                    const unsigned unit = ticket / 32;
+#ifdef NCCL_EP_TEST_PULL_TICKET0_STALL_US
+                    // Test only: hold the block's first ticket before reading its chunk range, so the
+                    // MAP warps run ahead across a ring wrap (see test_ht_pull_chunk_ring).
+                    if (lane == 0 && ticket == 0) {
+                        for (unsigned waited_us = 0; waited_us < NCCL_EP_TEST_PULL_TICKET0_STALL_US; waited_us += 100) {
+                            __nanosleep(100000);
+                        }
+                    }
+                    __syncwarp();
+#endif
+                    const unsigned unit = ticket / kPullDispatchChunkTokens;
                     const int owner = unit % kMapWarps;
-                    const size_t chunk = first_chunk + (unit / kMapWarps) * chunk_stride + owner;
-                    if (chunk >= total_chunks) break;
-                    int first = 0, count = 0;
+                    const unsigned idx = unit / kMapWarps;
+                    int first = 0, count = 0, state = 0;
                     if (lane == 0) {
-                        cuda::atomic_ref<unsigned, cuda::thread_scope_block> ready(s_chunks_ready[owner]);
-                        while (ready.load(cuda::memory_order_acquire) <= unit / kMapWarps) {}
-                        const int2 range = s_chunk_ranges[unit];
-                        first = range.x;
-                        count = range.y;
+                        state = static_cast<int>(dispatch_pull_wait_chunk(
+                            s_chunks_ready, s_chunks_done, s_chunks_read, s_chunk_ranges, owner, idx, first, count));
                     }
                     first = __shfl_sync(0xffffffffu, first, 0);
                     count = __shfl_sync(0xffffffffu, count, 0);
+                    state = __shfl_sync(0xffffffffu, state, 0);
                     __syncwarp();
-                    const int offset = ticket % 32;
+                    if (state == static_cast<int>(PullChunkState::kFinished)) {
+                        break;
+                    }
+                    const int offset = ticket % kPullDispatchChunkTokens;
                     const int end = min(offset + static_cast<int>(kSlotBatch), count);
                     for (int i = offset; i < end; ++i) process_slot(first + i);
                 }

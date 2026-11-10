@@ -1615,11 +1615,11 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // Pull-count map-build cursors (per-rank recv + per-expert EM); zeroed per dispatch.
     // +1 trailing int: DROP-mode phantom-row fixup's grid arrival counter (mirrors
     // em_permute_cursors above; see allow_overflow_drop's doc comment on
-    // local_permute_dup_param_t in ht_ep.cuh).
+    // local_permute_dup_param_t in ht_ep.cuh). +1 more: MAP chunk claim counter after layout_ready.
     if (group_pull_count_capable) {
         CUDA_CHECK(ep_group->alloc.alloc_fn(
             reinterpret_cast<void**>(&ep_group->ht_buffers.pull_recv_cursor),
-            static_cast<size_t>(lsa_ranks + num_local_experts + 2) * sizeof(int32_t), ep_group->alloc.context));
+            static_cast<size_t>(lsa_ranks + num_local_experts + 3) * sizeof(int32_t), ep_group->alloc.context));
     }
 
     // =========================================================================
@@ -7129,7 +7129,12 @@ ncclResult_t ncclEpDispatch(
                     handle->layout == NCCL_EP_LAYOUT_FLAT,
                     forward_dispatch && recv_topk_idx ? static_cast<int64_t*>(recv_topk_idx->data) : nullptr,
                     output_id_kind == NCCL_EP_EXPERT_ID_GLOBAL ? group->rank * group->num_local_experts : 0,
-                    handle->layout == NCCL_EP_LAYOUT_FLAT ? handle->ht.sparse_to_dense_map : nullptr));
+                    handle->layout == NCCL_EP_LAYOUT_FLAT ? handle->ht.sparse_to_dense_map : nullptr,
+                    // Dynamic MAP chunk claiming from the handle's token count; threshold defaults to 2048 here.
+                    static_cast<unsigned long>(handle->num_tokens) >=
+                        (group->env.ht_dispatch_dynamic_claim_min_tokens.is_set
+                             ? group->env.ht_dispatch_dynamic_claim_min_tokens.value.ul
+                             : 2048UL)));
             } else {
                 // Compact decode fills flat2em with packed local IDs. The permute
                 // replaces them with EM slots in the same weight order. Dense count

@@ -2508,7 +2508,9 @@ void launch_dispatch_permute(
 __global__ void lsa_map_publish_kernel(::ht_ep::lsa_map_publish_param_t p) {
     // Reset layout_ready to 0 before any publish stores complete so the downstream head-sync
     // kernel (ordered after this kernel on the same stream) sees a clean state for this round.
-    if (blockIdx.x == 0 && threadIdx.x == 0) *p.layout_ready = 0;
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        ::ht_ep::pull_layout_ready_reset(p.layout_ready);
+    }
     const size_t meta_stride = ::ht_ep::pull_meta_stride(p.topk_off_bytes, p.tokens_per_rank);
     ::ht_ep::dispatch_pull_map_publish_grid(p.own_row, p.own_topk_snapshot, p.meta_ptrs, meta_stride,
         p.topk_off_bytes, p.tokens_per_rank, p.top_k, p.my_rank, p.lsa_team_size);
@@ -2591,7 +2593,8 @@ ncclResult_t launch_dispatch_pull(
     bool flat,
     int64_t* recv_topk_idx,
     int output_expert_base,
-    int32_t* retained_slots) {
+    int32_t* retained_slots,
+    bool claim_dynamic) {
     assert(experts_per_rank > 0 && top_k <= ::ht_ep::kPullDispatchMaxActive);
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
@@ -2649,6 +2652,7 @@ ncclResult_t launch_dispatch_pull(
         p.flat_recv_capacity = flat_recv_capacity;
         p.em_alignment = em_alignment;
         p.allow_overflow_drop = allow_overflow_drop;
+        p.claim_dynamic = claim_dynamic;
         p.own_row = own_row;
         p.own_topk_snapshot = own_topk_snapshot;
         p.own_meta_staging = own_meta_staging;

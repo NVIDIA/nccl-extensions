@@ -526,6 +526,7 @@ inline ncclResult_t launch_combine_push(
     int ep_size,
     ::ht_ep::combine_push_param_t& param,
     cudaStream_t stream,
+    ncclEpCombQuant_t recipe,
     ncclDataType_t token_dtype = ncclBfloat16,
     bool backward = false,
     bool nucs = false) {
@@ -533,7 +534,15 @@ inline ncclResult_t launch_combine_push(
     assert((row_bytes % 16) == 0);
     const int hidden_int4 = row_bytes / 16;
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
+    const char* recipe_literal = ::nccl_ep::jit::combine_recipe_literal(recipe);
     const char* backward_literal = backward ? "true" : "false";
+    if (recipe_literal == nullptr) {
+        std::fprintf(stderr, "[nccl_ep jit] combine push: unsupported combine recipe %d\n", static_cast<int>(recipe));
+        return ncclInvalidArgument;
+    }
+    const bool mxfp8 = recipe == NCCL_EP_COMB_QUANT_MXFP8;
+    // MXFP8 sizes the per-warp smem row by the in-place quantize buffer.
+    const int row_int4 = mxfp8 ? ::ht_ep::combine_push_mxfp8_fused_int4(hidden_int4) : hidden_int4;
     // Size the block so the per-warp smem row buffer fits the device opt-in cap, before building
     // the source so __launch_bounds__ matches the actual block (right register budget per block
     // size, not a fixed max that would spill small blocks).
@@ -547,7 +556,7 @@ inline ncclResult_t launch_combine_push(
     const int requested_int4 = [&] {
         // Flat relays the row without EM gather/reduction accumulators. Use a
         // full-row TMA stage and size the warp count to its shared-memory cost.
-        if (param.flat) {
+        if (param.flat || mxfp8) {
             return 0;
         }
         constexpr int kOneTile = 1;  // rounds up to one tile in combine_push_chunk_size
@@ -581,17 +590,18 @@ inline ncclResult_t launch_combine_push(
         }
         return int4s;
     }();
-    const int chunk_size = ::ht_ep::combine_push_chunk_size(hidden_int4, requested_int4);
+    const int chunk_size = ::ht_ep::combine_push_chunk_size(row_int4, requested_int4);
+    const int kernel_chunk_size = mxfp8 ? 0 : chunk_size;
     const int slots = param.flat
         ? std::min(::ht_ep::kCombinePushMaxSlots, smem_cap / (row_bytes + 16))
-        : ::ht_ep::combine_push_slots_per_block(hidden_int4, smem_cap, chunk_size);
+        : ::ht_ep::combine_push_slots_per_block(row_int4, smem_cap, chunk_size);
     if (slots == 0) {
         std::fprintf(stderr, "[nccl_ep] combine push: a %d-byte row exceeds the %d-byte shared memory budget\n",
                      row_bytes, smem_cap);
         return ncclInvalidArgument;
     }
     const int block_dim = slots * 32;
-    const int chunk_bytes = ::ht_ep::combine_push_buf_int4(hidden_int4, chunk_size) * 16;
+    const int chunk_bytes = ::ht_ep::combine_push_buf_int4(row_int4, chunk_size) * 16;
     if (!param.flat && chunk_bytes > smem_cap - ::ht_ep::combine_push_meta_reserve_bytes()) {
         std::fprintf(stderr,
                      "[nccl_ep] combine push: a %d-byte chunk does not fit the %d-byte shared memory cap; "
@@ -605,7 +615,8 @@ inline ncclResult_t launch_combine_push(
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "combine_push_topk" << top_k << "_h" << hidden_int4
-             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype) << (backward ? "_bwd" : "")
+             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype) << ::nccl_ep::jit::combine_recipe_name_tag(recipe)
+             << (backward ? "_bwd" : "")
              << "_c" << chunk_size << (param.flat ? "_flat" : "") << "_w" << slots;
         return name.str();
     }();
@@ -623,7 +634,7 @@ inline ncclResult_t launch_combine_push(
         }
         src << "  extern __shared__ uint8_t smem_bytes[];\n"
             << "  ::ht_ep::combine_push<" << top_k << ", " << hidden_int4 << ", " << token_dtype_literal
-            << ", " << backward_literal << ", " << chunk_size << ">(\n"
+            << ", " << recipe_literal << ", " << backward_literal << ", " << kernel_chunk_size << ">(\n"
             << "      p.peer_staging_ptrs,\n"
             << "      reinterpret_cast<const uint8_t*>(p.recv_x_em),\n"
             << "      p.flat2em_slot_map,\n"
@@ -659,7 +670,7 @@ inline ncclResult_t launch_combine_push(
     variant.num_blocks = num_blocks;
     variant.block_dim = block_dim;
     variant.dynamic_smem_bytes = param.flat ? slots * (row_bytes + 16) : static_cast<int>(
-        ::ht_ep::combine_push_dynamic_smem_bytes(hidden_int4, slots, chunk_size));
+        ::ht_ep::combine_push_dynamic_smem_bytes(row_int4, slots, chunk_size));
     variant.nucs = nucs;
 
     std::string error;
@@ -679,6 +690,7 @@ inline ncclResult_t launch_combine_reduce_stage(
     int num_blocks,
     ::ht_ep::combine_reduce_param_t& param,
     cudaStream_t stream,
+    ncclEpCombQuant_t recipe,
     ncclDataType_t token_dtype,
     bool backward,
     bool flat) {
@@ -687,11 +699,17 @@ inline ncclResult_t launch_combine_reduce_stage(
     const int hidden_int4 = row_bytes / 16;
     const int block_dim = flat ? ::ht_ep::kLocalPermuteReduceThreads : ::ht_ep::kCombineReduceThreads;
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
+    const char* recipe_literal = ::nccl_ep::jit::combine_recipe_literal(recipe);
     const char* backward_literal = backward ? "true" : "false";
+    if (recipe_literal == nullptr) {
+        std::fprintf(stderr, "[nccl_ep jit] combine reduce: unsupported combine recipe %d\n", static_cast<int>(recipe));
+        return ncclInvalidArgument;
+    }
 
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "combine_reduce_h" << hidden_int4 << ::nccl_ep::jit::token_dtype_name_tag(token_dtype)
+             << ::nccl_ep::jit::combine_recipe_name_tag(recipe)
              << (backward ? "_bwd" : "") << (param.retained_slots ? "_drop" : "");
         if (flat) {
             name << "_flat_k" << param.num_topk << "_e" << param.experts_per_rank
@@ -707,7 +725,8 @@ inline ncclResult_t launch_combine_reduce_stage(
             << "__global__ void " << kCombineReduceJitEntryName << "(\n"
             << "    const __grid_constant__ ::ht_ep::combine_reduce_param_t p) {\n"
             << "  ::ht_ep::combine_reduce<" << hidden_int4 << ", " << token_dtype_literal << ", "
-            << backward_literal << ", " << ::nccl_ep::jit::bool_literal(param.retained_slots != nullptr)
+            << recipe_literal << ", " << backward_literal << ", "
+            << ::nccl_ep::jit::bool_literal(param.retained_slots != nullptr)
             << ", " << ::nccl_ep::jit::bool_literal(flat) << ">(\n"
             << "      reinterpret_cast<uint8_t*>(p.attn_output),\n"
             << "      reinterpret_cast<const uint8_t*>(p.staging),\n"
@@ -732,6 +751,7 @@ inline ncclResult_t launch_combine_reduce_stage(
     variant.identity = &variant_identity;
     variant.runtime_key = (static_cast<std::uint64_t>(backward) << 63) |
         (static_cast<std::uint64_t>(param.retained_slots != nullptr) << 62) |
+        (static_cast<std::uint64_t>(recipe) << 56) |
         (static_cast<std::uint64_t>(token_dtype) << 48) | static_cast<std::uint64_t>(hidden_int4);
     // Keep EM dimensions runtime-configurable; specialize only flat rank decoding.
     if (flat) {

@@ -528,7 +528,8 @@ size_t dispatch_pull_smem_bytes(int hidden_int4);
 // Push-combine staging row stride (bytes) for a given token row width. The combine
 // input staging must be sized by this so the buffer matches the stride combine_push
 // writes and combine_reduce reads. reserve_prob (backward) co-locates the prob row
-// in the token row's trailing pad.
+// in the token row's trailing pad. MXFP8 rows are staged at the BF16 row width; the device
+// stride (comb_stage_push_stride_bytes) rounds the packed row up to 128 B.
 size_t comb_stage_stride_bytes(int row_bytes, bool reserve_prob);
 
 // Push EM combine (mirror of pull EM dispatch). The push kernel does the local
@@ -555,6 +556,8 @@ ncclResult_t launch_combine_push(
     unsigned int shuffle_sms,
     cudaStream_t stream,
     ncclDataType_t token_dtype,
+    // MXFP8 quantizes in the push and stages the packed [FP8 H | E8M0 H/32] row.
+    ncclEpCombQuant_t combine_recipe,
     // Backward combine (sparse-direct prob scatter into the token staging pad); null/false on forward.
     const float* topk_weights_em,
     const int32_t* srcpos_map,
@@ -578,6 +581,7 @@ ncclResult_t launch_combine_reduce_stage(
     unsigned int shuffle_sms,
     cudaStream_t stream,
     ncclDataType_t token_dtype,
+    ncclEpCombQuant_t combine_recipe,
     // Backward combine: gather each srcpos weight from the token staging pad into combined_topk_weights.
     float* combined_topk_weights,
     int top_k,

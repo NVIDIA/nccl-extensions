@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * HT intra-node MXFP8 combine. Quantization is always internal: the app hands over BF16
- * rows and local_permute_reduce emits packed [FP8 E4M3 | E8M0] before transport, so the
- * recipe is only available on the expert-major local-permute path.
+ * rows and local_permute_reduce (or the push combine kernel) emits packed [FP8 E4M3 | E8M0]
+ * before transport, so the recipe is only available on the expert-major paths.
  */
 
 #include "test_common.h"
@@ -30,8 +30,8 @@ static_assert(nccl_ep::combine_recipe_traits<NCCL_EP_COMB_QUANT_NONE>::kWireByte
 static_assert(nccl_ep::combine_recipe_traits<NCCL_EP_COMB_QUANT_NONE>::kScaleBlock == 0,
     "NONE recipe must have no scale block");
 
-static constexpr int kMxHidden = 512;           // must be a multiple of 32 (MXFP8 block)
-static constexpr int kMxElemsTested = 10;       // first N elements per token to validate
+static constexpr int kMxHidden = 1536;          // 48 scale blocks: a full and a partial 32-lane round
+static constexpr int kMxPatternPeriod = 10;     // row pattern period, spans the whole row
 
 static ncclEpGroup_t make_mxfp8_ht_group(ncclEpHtFlow_t flow) {
     ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
@@ -50,17 +50,17 @@ static ncclEpGroup_t make_mxfp8_ht_group(ncclEpHtFlow_t flow) {
     return group;
 }
 
-// Fill BF16 expert output rows: first kMxElemsTested elements = (j+1)*2, rest = 0.
-__global__ void fill_bf16_expert_rows_kernel(nv_bfloat16* rows, int num_rows, int hidden, int elems) {
+// Fill BF16 expert output rows: element j = ((j % period) + 1) * 2 across the whole row.
+__global__ void fill_bf16_expert_rows_kernel(nv_bfloat16* rows, int num_rows, int hidden, int period) {
     const int row = blockIdx.x;
     if (row >= num_rows) return;
     nv_bfloat16* r = rows + static_cast<size_t>(row) * hidden;
     for (int j = threadIdx.x; j < hidden; j += blockDim.x)
-        r[j] = (j < elems) ? __float2bfloat16(static_cast<float>((j + 1) * 2)) : __float2bfloat16(0.0f);
+        r[j] = __float2bfloat16(static_cast<float>((j % period + 1) * 2));
 }
 
 static void fill_bf16_expert_rows(nv_bfloat16* d, int num_rows) {
-    fill_bf16_expert_rows_kernel<<<num_rows, 128, 0, g_stream>>>(d, num_rows, kMxHidden, kMxElemsTested);
+    fill_bf16_expert_rows_kernel<<<num_rows, 128, 0, g_stream>>>(d, num_rows, kMxHidden, kMxPatternPeriod);
     CUDA_ASSERT(cudaGetLastError());
     CUDA_ASSERT(cudaStreamSynchronize(g_stream));
 }
@@ -132,13 +132,13 @@ static void run_forward_dispatch_bf16(
     *recv_tensor_out = t_recv;
 }
 
-// Verify BF16 combine output: expected = slot_count * (j+1)*2 per element.
+// Verify BF16 combine output: expected = slot_count * ((j % period) + 1) * 2 per element.
 static void verify_bf16_combine_output(nv_bfloat16* d_combined, int slot_count, float rel_tol = 0.05f) {
     std::vector<nv_bfloat16> h(kNumTokens * kMxHidden);
     CUDA_ASSERT(cudaMemcpy(h.data(), d_combined, h.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
     for (int i = 0; i < kNumTokens; ++i) {
-        for (int j = 0; j < kMxElemsTested; ++j) {
-            const float expected = static_cast<float>(slot_count * (j + 1) * 2);
+        for (int j = 0; j < kMxHidden; ++j) {
+            const float expected = static_cast<float>(slot_count * (j % kMxPatternPeriod + 1) * 2);
             const float actual   = __bfloat162float(h[static_cast<size_t>(i) * kMxHidden + j]);
             EXPECT_NEAR(actual, expected, expected * rel_tol)
                 << "token=" << i << " elem=" << j << " rank=" << g_rank;
@@ -150,8 +150,8 @@ class Mxfp8CombineTest : public EpTestBase {
 protected:
     // MXFP8 combine is expert-major only: the quantizing prologue lives in
     // local_permute_reduce, which no other layout runs.
-    void run_mxfp8_combine_case() {
-        ncclEpGroup_t group = make_mxfp8_ht_group(NCCL_EP_HT_FLOW_PUSH_PULL);
+    void run_mxfp8_combine_case(ncclEpHtFlow_t ht_flow) {
+        ncclEpGroup_t group = make_mxfp8_ht_group(ht_flow);
         ASSERT_NE(group, nullptr);
 
         ncclEpHandle_t handle = nullptr;
@@ -205,21 +205,27 @@ protected:
 };
 
 TEST_F(Mxfp8CombineTest, ExpertMajorCombineMatchesReference) {
-    run_mxfp8_combine_case();
+    run_mxfp8_combine_case(NCCL_EP_HT_FLOW_PUSH_PULL);
+}
+
+// Pull dispatch + push combine: the quantize runs in the push kernel's reduce epilogue and the
+// final team_size reduce dequantizes.
+TEST_F(Mxfp8CombineTest, ExpertMajorPushCombineMatchesReference) {
+    run_mxfp8_combine_case(NCCL_EP_HT_FLOW_PULL_PUSH);
 }
 
 // Backward combine takes the same recipe: neither the host gating nor the kernel templates
-// tie MXFP8 to the forward pass, and backward reduces gradients through the same
-// local_permute_reduce prologue. This is the only case that instantiates the backward MXFP8
-// JIT variant, and it pins the split of concerns: the token path is quantized, while the
-// FP32 weight gradients must round-trip bit-exactly through it.
-TEST_F(Mxfp8CombineTest, ExpertMajorBackwardCombineMatchesReference) {
-    ncclEpGroup_t group = make_mxfp8_ht_group(NCCL_EP_HT_FLOW_PUSH_PULL);
+// tie MXFP8 to the forward pass, and backward reduces gradients through the same reduce stage
+// (local_permute_reduce, or the push kernel). This is the only case that instantiates the
+// backward MXFP8 JIT variant, and it pins the split of concerns: the token path is quantized,
+// while the FP32 weight gradients must round-trip bit-exactly through it.
+static void run_backward_combine_case(ncclEpHtFlow_t ht_flow, ncclEpTensor_t* topk_idx_em) {
+    ncclEpGroup_t group = make_mxfp8_ht_group(ht_flow);
     ASSERT_NE(group, nullptr);
 
     ncclEpHandle_t handle = nullptr;
     EXPECT_EQ(ncclEpCreateHandle(
-        &handle, group, NCCL_EP_LAYOUT_EXPERT_MAJOR, topk_idx_em_, nullptr, nullptr, g_stream),
+        &handle, group, NCCL_EP_LAYOUT_EXPERT_MAJOR, topk_idx_em, nullptr, nullptr, g_stream),
         ncclSuccess);
     EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
     ASSERT_NE(handle, nullptr);
@@ -291,6 +297,14 @@ TEST_F(Mxfp8CombineTest, ExpertMajorBackwardCombineMatchesReference) {
     NCCL_ASSERT(ncclEpGroupDestroy(group));
 }
 
+TEST_F(Mxfp8CombineTest, ExpertMajorBackwardCombineMatchesReference) {
+    run_backward_combine_case(NCCL_EP_HT_FLOW_PUSH_PULL, topk_idx_em_);
+}
+
+TEST_F(Mxfp8CombineTest, ExpertMajorPushBackwardCombineMatchesReference) {
+    run_backward_combine_case(NCCL_EP_HT_FLOW_PULL_PUSH, topk_idx_em_);
+}
+
 // MXFP8 has no quantizing prologue outside the expert-major local-permute path, so a FLAT
 // handle must be rejected rather than silently transporting unquantized BF16.
 TEST_F(Mxfp8CombineTest, RejectsFlatLayout) {
@@ -325,7 +339,7 @@ TEST_F(Mxfp8CombineTest, RejectsFlatLayout) {
     NCCL_ASSERT(ncclEpGroupDestroy(group));
 }
 
-TEST_F(Mxfp8CombineTest, AutoPullPushRejectsMxfp8) {
+TEST_F(Mxfp8CombineTest, AutoPullPushAcceptsMxfp8) {
     if (ncclTeamLsa(g_comm).nRanks != g_nranks) {
         GTEST_SKIP() << "AUTO pull-push requires one LSA team";
     }
@@ -351,7 +365,7 @@ TEST_F(Mxfp8CombineTest, AutoPullPushRejectsMxfp8) {
     inputs.tokens = recv;
     outputs.tokens = output;
     config.quant_recipe = NCCL_EP_COMB_QUANT_MXFP8;
-    EXPECT_EQ(ncclEpCombine(handle, &inputs, &outputs, &config, g_stream), ncclInvalidArgument);
+    EXPECT_EQ(ncclEpCombine(handle, &inputs, &outputs, &config, g_stream), ncclSuccess);
     EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
     NCCL_ASSERT(ncclEpTensorDestroy(recv));
     NCCL_ASSERT(ncclEpTensorDestroy(output));

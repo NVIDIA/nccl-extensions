@@ -582,7 +582,7 @@ static ncclResult_t validateCombineRecipe(
                 fprintf(stderr, "NCCL EP warning: MXFP8 combine requires CUDA 12.8+ (__nv_fp8_e8m0)\n");
                 return ncclInvalidUsage;
             }
-            // Quantization is internal and fused into local_permute_reduce, so the caller
+            // Quantization is internal (local_permute_reduce or the push epilogue), so the caller
             // always hands over BF16 rows and never a scale tensor. The layout requirement
             // that follows from that is checked in ncclEpCombine, where the layout is known.
             // Packed row is H + H/32 bytes; 16-byte alignment requires
@@ -7686,16 +7686,13 @@ ncclResult_t ncclEpCombine(
             fprintf(stderr, "ncclEpCombine: NCCL_EP_HT_PULL_PUSH push combine is single-LSA-team only\n");
             return ncclInvalidUsage;
         }
-        // MXFP8 quantization is fused into local_permute_reduce, which only runs in
-        // expert-major local-permute mode. Any other layout or EM mode has no kernel that
-        // could produce FP8+E8M0, so reject instead of silently transporting BF16.
-        // kPullPush satisfies em_permute_combine but routes through combine_push /
-        // combine_reduce_stage, neither of which quantizes, so reject it here too --
-        // before the branch split, so both paths are covered.
-        if (mxfp8_combine && (!em_permute_combine || comb_push)) {
+        // MXFP8 quantization is fused into the expert-major reduce: local_permute_reduce
+        // (local-permute) or combine_push (push combine). Any other layout or EM mode has no
+        // kernel that could produce FP8+E8M0, so reject instead of silently transporting BF16.
+        if (mxfp8_combine && !em_permute_combine) {
             fprintf(
                 stderr,
-                "NCCL EP error: MXFP8 combine requires the expert-major local-permute path. "
+                "NCCL EP error: MXFP8 combine requires the expert-major local-permute or push path. "
                 "Set group ht_flow=NCCL_EP_HT_FLOW_PUSH_PULL and zero_copy=AUTO or OFF "
                 "without EM duplication overrides "
                 "(layout=%d, em_permute=%d, push_combine=%d)\n",
@@ -7715,9 +7712,9 @@ ncclResult_t ncclEpCombine(
             return ncclInvalidUsage;
         }
         if (comb_push) {
-            // Push EM combine (FWD, NONE, single LSA team): each expert rank locally
-            // reduces its K em copies and pushes the row into the destination attn
-            // rank's staging over NVLink; a final team_size reduce writes attn_output.
+            // Push EM combine (single LSA team): each expert rank locally reduces its K em
+            // copies and pushes the row (MXFP8: quantized to the packed row) into the destination
+            // attn rank's staging over NVLink; a final team_size reduce writes attn_output.
             const int row_bytes = hidden * ncclTypeSize(x->datatype);
             if (row_bytes <= 0 || (row_bytes % 16) != 0) {
                 return ncclInvalidArgument; // int4-vectorized row copy requires 16B-aligned row
@@ -7758,6 +7755,7 @@ ncclResult_t ncclEpCombine(
                 0u,
                 stream,
                 x->datatype,
+                mxfp8_combine ? NCCL_EP_COMB_QUANT_MXFP8 : NCCL_EP_COMB_QUANT_NONE,
                 backward_combine ? static_cast<const float*>(topk_weights->data) : nullptr,
                 backward_combine ? handle->ht.srcpos_map : nullptr,
                 backward_combine,
@@ -7778,6 +7776,7 @@ ncclResult_t ncclEpCombine(
                 group->shuffle_sms,
                 stream,
                 x->datatype,
+                mxfp8_combine ? NCCL_EP_COMB_QUANT_MXFP8 : NCCL_EP_COMB_QUANT_NONE,
                 backward_combine ? static_cast<float*>(combined_topk_weights->data) : nullptr,
                 backward_combine ? handle->num_topk : 0,
                 backward_combine,

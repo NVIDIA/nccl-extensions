@@ -6436,6 +6436,13 @@ __host__ __device__ constexpr int combine_push_buf_int4(int hidden_int4, int chu
     const int size = combine_push_chunk_size(hidden_int4, chunk_size);
     return size < hidden_int4 ? size : hidden_int4;
 }
+// Fused MXFP8 per-warp buffer in int4: the loaded BF16 row, quantized in place to the packed record,
+// plus a scale scratch that is moved behind the FP8 bytes once the BF16 row is consumed.
+__host__ __device__ constexpr int combine_push_mxfp8_fused_int4(int hidden_int4) {
+    using Mxfp8Traits = nccl_ep::combine_recipe_traits<NCCL_EP_COMB_QUANT_MXFP8>;
+    const int hidden = hidden_int4 * (16 / nccl_ep::size_u8<ncclBfloat16>());
+    return hidden_int4 + nccl_ep::ceil_div(Mxfp8Traits::scale_bytes_per_token(hidden), 16);
+}
 // Dynamic smem = slots * buffer bytes (one per-warp row/chunk buffer each). Static metadata separate.
 __host__ __device__ constexpr size_t combine_push_dynamic_smem_bytes(
     int hidden_int4, int slots, int chunk_size) {
@@ -7712,6 +7719,55 @@ __device__ __forceinline__ void dispatch_pull(
     if (!unfused_sync) lsa_grid_tail_barrier(dcomm, grid_barrier_counter, head_sync_flag);
 }
 
+// Quantize one lane's kVec reduced BF16 int4s (u-th at j0 + u * kJStride) to MXFP8: 8 FP8 bytes at
+// payload_dst0[u * kJStride] and the E8M0 byte at scale_row[j >> 2]. A 32-element block is 4
+// consecutive lanes, so amax reduces over lane distances 1 and 2. All lanes must call (shuffles);
+// valid[u] only gates the stores.
+template <int kVec, int kPairs, int kJStride>
+__device__ __forceinline__ void mxfp8_quantize_tile(
+    const float2 (&acc)[kVec][kPairs], const bool (&valid)[kVec], int j0, uint2* payload_dst0,
+    uint8_t* scale_row) {
+    static_assert(kPairs * 2 == static_cast<int>(sizeof(uint2)), "one int4 of BF16 narrows into a uint2");
+    float amax[kVec];
+#pragma unroll
+    for (int u = 0; u < kVec; u++) {
+        amax[u] = 0.0f;
+        if (valid[u]) {
+#pragma unroll
+            for (int p = 0; p < kPairs; p++) {
+                amax[u] = fmaxf(amax[u], fmaxf(fabsf(acc[u][p].x), fabsf(acc[u][p].y)));
+            }
+        }
+    }
+#pragma unroll
+    for (int u = 0; u < kVec; u++) {
+        amax[u] = fmaxf(amax[u], __shfl_xor_sync(0xFFFFFFFFu, amax[u], 1));
+    }
+#pragma unroll
+    for (int u = 0; u < kVec; u++) {
+        amax[u] = fmaxf(amax[u], __shfl_xor_sync(0xFFFFFFFFu, amax[u], 2));
+    }
+#pragma unroll
+    for (int u = 0; u < kVec; u++) {
+        if (!valid[u]) {
+            continue;
+        }
+        const int j = j0 + u * kJStride;
+        const uint8_t e8m0 = nccl_ep::mxfp8::float_to_e8m0(amax[u]);
+        if ((j & 3) == 0) {
+            scale_row[j >> 2] = e8m0;
+        }
+        const float scale_inv = nccl_ep::mxfp8::e8m0_to_scale_inv(e8m0);
+        uint2 out;
+        uint16_t* out_pairs = reinterpret_cast<uint16_t*>(&out);
+#pragma unroll
+        for (int p = 0; p < kPairs; p++) {
+            out_pairs[p] = nccl_ep::mxfp8::pack_e4m3x2_scaled(acc[u][p], scale_inv);
+        }
+        payload_dst0[u * kJStride] = out;
+    }
+}
+
 // Local EM reduce kernel (inverse of local_permute_dup). Sums the top_k EM
 // rows that share a FLAT recv slot and writes the result back into FLAT staging:
 // the caller's dtype for NONE, packed [FP8 H | E8M0 H/32] for MXFP8.
@@ -7870,41 +7926,9 @@ __device__ __forceinline__ void local_permute_reduce(
                 }
 
                 if constexpr (kCombineRecipe == NCCL_EP_COMB_QUANT_MXFP8) {
-                    // One MXFP8 block spans 32 elements = 4 consecutive BF16 int4s, and
-                    // consecutive j land on consecutive lanes, so amax reduces over the lane
-                    // pair distances 1 and 2. Scale index is j>>2; the FP8 payload for one
-                    // int4 is 8 B at byte offset j*8.
-                    //
-                    // Quantize one u at a time so the e8m0/out temporaries do not multiply by
-                    // kHiddenVec. Every lane runs the shuffles to keep the warp converged.
-                    uint8_t* dst_scale = out_row + kHidden;
-#pragma unroll
-                    for (int u = 0; u < kHiddenVec; u++) {
-                        float amax = 0.0f;
-                        if (valid_u[u]) {
-#pragma unroll
-                            for (int p = 0; p < kPairs; p++) {
-                                amax = fmaxf(
-                                    amax, fmaxf(fabsf(acc[u][p].x), fabsf(acc[u][p].y)));
-                            }
-                        }
-                        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1));
-                        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2));
-
-                        if (valid_u[u]) {
-                            const int j = js[u];
-                            const uint8_t e8m0 = nccl_ep::mxfp8::float_to_e8m0(amax);
-                            if ((j & 3) == 0) dst_scale[j >> 2] = e8m0;
-                            const float scale_inv = nccl_ep::mxfp8::e8m0_to_scale_inv(e8m0);
-                            uint2 out;
-                            uint16_t* out_pairs = reinterpret_cast<uint16_t*>(&out);
-#pragma unroll
-                            for (int p = 0; p < kPairs; p++)
-                                out_pairs[p] =
-                                    nccl_ep::mxfp8::pack_e4m3x2_scaled(acc[u][p], scale_inv);
-                            *reinterpret_cast<uint2*>(out_row + static_cast<size_t>(j) * 8) = out;
-                        }
-                    }
+                    // The FP8 payload for int4 j is 8 B at byte offset j*8.
+                    mxfp8_quantize_tile<kHiddenVec, kPairs, kThreadsPerSlot>(
+                        acc, valid_u, js[0], reinterpret_cast<uint2*>(out_row) + js[0], out_row + kHidden);
                 } else {
                     int4* dst_int4 = reinterpret_cast<int4*>(out_row);
 #pragma unroll
@@ -7936,6 +7960,12 @@ __host__ __device__ constexpr int comb_stage_stride_bytes(int row_bytes, bool re
         return (s % 768 == 0) ? s + 256 : s;  // +512 keeps the co-located stride anti-camping
     }
     return row_bytes + ((row_bytes % 768 == 0) ? 256 : 0);
+}
+
+// Push staging stride. The packed MXFP8 record is rounded up to 128 B so every pushed row starts
+// line-aligned; other recipes use the token row.
+__host__ __device__ constexpr int comb_stage_push_stride_bytes(int row_bytes, bool mxfp8, bool reserve_prob) {
+    return comb_stage_stride_bytes(mxfp8 ? nccl_ep::align(row_bytes, 128) : row_bytes, reserve_prob);
 }
 
 // ============================================================================
@@ -7993,6 +8023,154 @@ struct combine_push_param_t {
     bool unfused_sync;
 };
 
+// Unpack one int4 of BF16 into four float pairs by bit placement; fewer instructions than
+// ld_token_pair<ncclBfloat16> in the fused quantize loop.
+__device__ __forceinline__ void combine_push_unpack_bf16x8(const int4& v, float2 (&out)[4]) {
+    const uint32_t w[4] = {static_cast<uint32_t>(v.x), static_cast<uint32_t>(v.y), static_cast<uint32_t>(v.z),
+                           static_cast<uint32_t>(v.w)};
+#pragma unroll
+    for (int p = 0; p < 4; p++) {
+        out[p] = make_float2(__uint_as_float(w[p] << 16), __uint_as_float(w[p] & 0xFFFF0000u));
+    }
+}
+
+// Lane-rotated int4 index within a scale block. Lanes are 64 B apart, so in-order access makes
+// 8 lanes of a 128-bit access phase share 2 bank groups (4-way conflict); rot = (lane / 2) % 4
+// gives them distinct banks.
+__device__ __forceinline__ int combine_push_rot_idx(int q, int rot) {
+    return (q + rot) & 3;
+}
+
+// Fused MXFP8 push: sum one 32-element scale block (four int4) over a row's copies. Copy 0 is
+// read from the smem row buffer, the other copies from global.
+template <int MaxTopK, int HiddenInt4>
+__device__ __forceinline__ void combine_push_sum_block(
+    float2 (&acc)[4][4],
+    const uint8_t* __restrict__ row,
+    const uint8_t* __restrict__ recv_x_em,
+    const int32_t* __restrict__ f2e,
+    int n,
+    int b,
+    int rot) {
+    // Copies loaded before they are summed: enough loads in flight to hide global latency, while the
+    // 8 int4 held per batch plus the 32-register accumulator stay in the per-thread register budget.
+    constexpr int kCopyBatch = 2;
+#pragma unroll
+    for (int q = 0; q < 4; q++) {
+#pragma unroll
+        for (int p = 0; p < 4; p++) {
+            acc[q][p] = make_float2(0.0f, 0.0f);
+        }
+    }
+    if (n > 0) {
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            const int4 v = *reinterpret_cast<const int4*>(row + static_cast<size_t>(b) * 64 + combine_push_rot_idx(q, rot) * 16);
+            combine_push_unpack_bf16x8(v, acc[q]);
+        }
+    }
+#pragma unroll
+    for (int kb = 1; kb < MaxTopK; kb += kCopyBatch) {
+        if (kb >= n) {
+            break;
+        }
+        int4 buf[kCopyBatch][4];
+#pragma unroll
+        for (int kk = 0; kk < kCopyBatch; kk++) {
+            if (kb + kk >= n || kb + kk >= MaxTopK) {
+                continue;
+            }
+            const uint8_t* src = recv_x_em + static_cast<size_t>(f2e[kb + kk]) * (HiddenInt4 * 16) +
+                                 static_cast<size_t>(b) * 64;
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                buf[kk][q] = *reinterpret_cast<const int4*>(src + combine_push_rot_idx(q, rot) * 16);
+            }
+        }
+#pragma unroll
+        for (int kk = 0; kk < kCopyBatch; kk++) {
+            if (kb + kk >= n || kb + kk >= MaxTopK) {
+                continue;
+            }
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                float2 f[4];
+                combine_push_unpack_bf16x8(buf[kk][q], f);
+#pragma unroll
+                for (int p = 0; p < 4; p++) {
+                    acc[q][p].x += f[p].x;
+                    acc[q][p].y += f[p].y;
+                }
+            }
+        }
+    }
+}
+
+// Quantize one summed scale block in place: FP8 bytes go to row + 32 * b (over BF16 bytes already
+// consumed) and the E8M0 byte to scratch[b]. Lane-rotated chunk order avoids bank conflicts.
+__device__ __forceinline__ void combine_push_quant_block(
+    const float2 (&acc)[4][4], uint8_t* __restrict__ row, uint8_t* __restrict__ scratch, int b, int rot) {
+    float amax = 0.0f;
+#pragma unroll
+    for (int q = 0; q < 4; q++) {
+        amax = fmaxf(amax, nccl_ep::mxfp8::amax_x8(acc[q]));
+    }
+    const uint8_t e8m0 = nccl_ep::mxfp8::float_to_e8m0(amax);
+    scratch[b] = e8m0;
+    const float scale_inv = nccl_ep::mxfp8::e8m0_to_scale_inv(e8m0);
+#pragma unroll
+    for (int q = 0; q < 4; q++) {
+        *reinterpret_cast<uint2*>(row + static_cast<size_t>(b) * 32 + combine_push_rot_idx(q, rot) * 8) =
+            nccl_ep::mxfp8::pack_e4m3x8_scaled(acc[q], scale_inv);
+    }
+}
+
+// Fused MXFP8 push row: copy 0 is TMA-loaded into the row buffer and quantized in place, one scale
+// block per lane per round. Scales stage in a scratch behind the row and move after the FP8 bytes.
+template <int MaxTopK, int HiddenInt4>
+__device__ __forceinline__ void combine_push_quant_row(
+    uint8_t* __restrict__ row,
+    uint64_t* mbar,
+    uint32_t& mbar_phase,
+    const uint8_t* __restrict__ recv_x_em,
+    const int32_t* __restrict__ f2e,
+    int n,
+    int wlane) {
+    using Mxfp8Traits = nccl_ep::combine_recipe_traits<NCCL_EP_COMB_QUANT_MXFP8>;
+    constexpr int kElemsPerInt4 = 16 / nccl_ep::size_u8<ncclBfloat16>();
+    constexpr int kRowBytes = HiddenInt4 * 16;
+    constexpr int kHidden = HiddenInt4 * kElemsPerInt4;
+    constexpr int kBlocks = kHidden / Mxfp8Traits::kScaleBlock;
+    constexpr int kScaleBytes = Mxfp8Traits::scale_bytes_per_token(kHidden);
+    static_assert(Mxfp8Traits::kScaleBlock == 4 * kElemsPerInt4, "a scale block spans four int4");
+    static_assert(HiddenInt4 % 4 == 0, "hidden is a whole number of scale blocks");
+    constexpr int kRounds = nccl_ep::ceil_div(kBlocks, 32);
+    uint8_t* const scratch = row + kRowBytes;
+    if (n > 0) {
+        if (wlane == 0) {
+            nccl_ep::mbarrier_arrive_and_expect_tx(mbar, kRowBytes);
+            nccl_ep::tma_load_1d(row, recv_x_em + static_cast<size_t>(f2e[0]) * kRowBytes, mbar, kRowBytes);
+        }
+        nccl_ep::mbarrier_wait(mbar, mbar_phase);
+    }
+    const int rot = (wlane >> 1) & 3;
+    for (int m = 0; m < kRounds; m++) {
+        const int b = m * 32 + wlane;
+        float2 acc[4][4];
+        if (b < kBlocks) {
+            combine_push_sum_block<MaxTopK, HiddenInt4>(acc, row, recv_x_em, f2e, n, b, rot);
+        }
+        __syncwarp();  // every lane has read this round before its output overwrites it
+        if (b < kBlocks) {
+            combine_push_quant_block(acc, row, scratch, b, rot);
+        }
+    }
+    __syncwarp();
+    for (int i = wlane; i < kScaleBytes; i += 32) {
+        row[kHidden + i] = scratch[i];
+    }
+}
+
 // One recv slot per warp (kSlotsPerBlock in parallel), identical
 // gather-reduce to local_permute_reduce; the reduced row is assembled in a per-warp smem buffer
 // and pushed to the remote destination staging slot [t*team_size + R], one TMA store per row
@@ -8001,8 +8179,10 @@ struct combine_push_param_t {
 //                launch_combine_push); a chunk covering the whole row takes the single-chunk path,
 //                whose prefetch-pipelined reduce needs extra registers. The multi-chunk path stays
 //                register-frugal and relies on high occupancy to hide gather latency.
-template <int MaxTopK, int HiddenInt4, ncclDataType_t kTokenDtype, bool BACKWARD_COMBINE = false,
-          int kChunkSize = 0>
+//   kCombineRecipe - NONE pushes the reduced caller-dtype row; MXFP8 (whole-row, BF16) quantizes it
+//                in place in the smem row buffer and pushes the packed [FP8 H | E8M0 H/32] row.
+template <int MaxTopK, int HiddenInt4, ncclDataType_t kTokenDtype, ncclEpCombQuant_t kCombineRecipe,
+          bool BACKWARD_COMBINE = false, int kChunkSize = 0>
 __device__ __forceinline__ void combine_push(
     void* const* __restrict__ peer_staging_ptrs,
     const uint8_t* __restrict__ recv_x_em,
@@ -8024,6 +8204,16 @@ __device__ __forceinline__ void combine_push(
     bool unfused_sync = false,
     uint8_t* __restrict__ smem_bytes = nullptr) {
     constexpr int kRowBytes = HiddenInt4 * 16;
+    constexpr bool kMxfp8 = (kCombineRecipe == NCCL_EP_COMB_QUANT_MXFP8);
+    static_assert(!kMxfp8 || kTokenDtype == ncclBfloat16, "MXFP8 push combine reduces BF16 rows");
+    // Wire row pushed to the peer staging: the caller row for NONE, packed [FP8 H | E8M0 H/32] for MXFP8.
+    using Mxfp8Traits = nccl_ep::combine_recipe_traits<NCCL_EP_COMB_QUANT_MXFP8>;
+    constexpr int kHidden = HiddenInt4 * 8;
+    constexpr int kPushRowBytes = kMxfp8 ? Mxfp8Traits::template packed_bytes<ncclBfloat16>(kHidden) : kRowBytes;
+    static_assert(!kMxfp8 || (kPushRowBytes % 16 == 0 && HiddenInt4 % 64 == 0),
+                  "MXFP8 push row must be 16B-aligned (hidden multiple of 512)");
+    static_assert(!kMxfp8 || Mxfp8Traits::kScaleBlock == 32, "MXFP8 scale blocks span four int4");
+    static_assert(!kMxfp8 || kChunkSize == 0, "MXFP8 push is whole-row");
     // One warp per recv slot: narrow reduction granularity keeps many rows in flight per
     // block, saturating the NVLink write path. Each token is reduced into a per-warp smem row,
     // then pushed with one whole-row TMA (cp.async.bulk) store. The hidden is walked in
@@ -8053,8 +8243,9 @@ __device__ __forceinline__ void combine_push(
     const int slot_in_block = tid / kThreadsPerSlot;
     const int wlane = tid % kThreadsPerSlot;
     // This warp's push staging buffer (one chunk of the row).
-    constexpr int kBufInt4 = combine_push_buf_int4(HiddenInt4, kChunkSize);
-    constexpr bool kSingleChunk = combine_push_num_chunks(HiddenInt4, kChunkSize) == 1;
+    constexpr int kBufInt4 =
+        kMxfp8 ? combine_push_mxfp8_fused_int4(HiddenInt4) : combine_push_buf_int4(HiddenInt4, kChunkSize);
+    constexpr bool kSingleChunk = kMxfp8 || combine_push_num_chunks(HiddenInt4, kChunkSize) == 1;
     int4* const my_row = s_rows + static_cast<size_t>(slot_in_block) * kBufInt4;
 
     const int num_recv = *num_recv_tokens_dev;
@@ -8120,7 +8311,7 @@ __device__ __forceinline__ void combine_push(
                 const int64_t dst_row = static_cast<int64_t>(t) * lsa_team_size + my_lsa_rank;
                 s_dst[slot_in_block] = reinterpret_cast<int4*>(
                     static_cast<uint8_t*>(peer_staging_ptrs[dst_rank]) +
-                    static_cast<size_t>(dst_row) * comb_stage_stride_bytes(kRowBytes, BACKWARD_COMBINE));
+                    static_cast<size_t>(dst_row) * comb_stage_push_stride_bytes(kPushRowBytes, kMxfp8, BACKWARD_COMBINE));
             }
         }
         __syncwarp();
@@ -8166,7 +8357,13 @@ __device__ __forceinline__ void combine_push(
                 // (mean valid-copies per slot ~= top_k / lsa_team_size), so this matters more as
                 // EP grows even though it's a small win at low EP.
                 bool filled = false;
-                if (n == 1) {
+                if constexpr (kMxfp8) {
+                    // Copy 0 is TMA-loaded and quantized in place; the other copies are summed in.
+                    combine_push_quant_row<MaxTopK, HiddenInt4>(
+                        reinterpret_cast<uint8_t*>(my_row), &s_mbar[slot_in_block], mbar_phase, recv_x_em,
+                        smem_flat2em_slot_map[slot_in_block], n, wlane);
+                    filled = true;
+                } else if (n == 1) {
                     const int32_t em0 = smem_flat2em_slot_map[slot_in_block][0];
                     const int4* src0 =
                         reinterpret_cast<const int4*>(recv_x_em + static_cast<size_t>(em0) * kRowBytes);
@@ -8229,12 +8426,15 @@ __device__ __forceinline__ void combine_push(
                     }
 #pragma unroll
                     for (int u = 0; u < kHiddenVec; u++) {
-                        if (!tile_valid(tile, u)) continue;
+                        if (!tile_valid(tile, u)) {
+                            continue;
+                        }
                         // n == 1 is handled by the TMA relay above, so n >= 2 here: always repack.
                         int4 out;
 #pragma unroll
-                        for (int p = 0; p < kPairs; p++)
+                        for (int p = 0; p < kPairs; p++) {
                             nccl_ep::st_token_pair<kTokenDtype>(&out, p, acc[u][p]);
+                        }
                         my_row[src_j(tile, u)] = out;
                     }
                     int4* tmp = pf_cur; pf_cur = pf_nxt; pf_nxt = tmp;
@@ -8242,7 +8442,9 @@ __device__ __forceinline__ void combine_push(
                 }  // end if (!filled): scalar reduce path
                 nccl_ep::tma_store_fence();
                 __syncwarp();
-                if (wlane == 0) nccl_ep::tma_store_1d(my_row, dst_int4, kRowBytes);
+                if (wlane == 0) {
+                    nccl_ep::tma_store_1d(my_row, dst_int4, kPushRowBytes);
+                }
             } else {
             for (int chunk = 0; chunk < kNumChunks; chunk++) {
                 const int tile0 = chunk * kChunkTiles;
@@ -8290,17 +8492,22 @@ __device__ __forceinline__ void combine_push(
                     }
 #pragma unroll
                     for (int u = 0; u < kHiddenVec; u++) {
-                        if (!tile_valid(tile, u)) continue;
+                        if (!tile_valid(tile, u)) {
+                            continue;
+                        }
                         int4 out;
 #pragma unroll
-                        for (int p = 0; p < kPairs; p++)
+                        for (int p = 0; p < kPairs; p++) {
                             nccl_ep::st_token_pair<kTokenDtype>(&out, p, acc[u][p]);
+                        }
                         my_row[src_j(tile, u) - base_j] = out;
                     }
                 }
                 nccl_ep::tma_store_fence();
                 __syncwarp();
-                if (wlane == 0) nccl_ep::tma_store_1d(my_row, dst_int4 + base_j, (end_j - base_j) * 16);
+                if (wlane == 0) {
+                    nccl_ep::tma_store_1d(my_row, dst_int4 + base_j, (end_j - base_j) * 16);
+                }
             }
             }
 
@@ -8309,7 +8516,7 @@ __device__ __forceinline__ void combine_push(
             if constexpr (BACKWARD_COMBINE) {
                 if (prob_p >= 0) {
                     float* prob_dst = reinterpret_cast<float*>(
-                        reinterpret_cast<uint8_t*>(dst_int4) + kRowBytes);
+                        reinterpret_cast<uint8_t*>(dst_int4) + kPushRowBytes);
                     prob_dst[prob_p] = prob_w;
                 }
             }
@@ -8351,7 +8558,7 @@ struct combine_reduce_param_t {
 // [t*team_size + 0..team_size) into attn_output[t]. Which partials exist is derived from
 // this rank's own routing (topk_idx): token t has a partial from rank R iff one of its
 // top-k experts lives on R -- unwritten slots are skipped (no staging zero-init needed).
-template <int HiddenInt4, ncclDataType_t kTokenDtype, bool BACKWARD_COMBINE,
+template <int HiddenInt4, ncclDataType_t kTokenDtype, ncclEpCombQuant_t kCombineRecipe, bool BACKWARD_COMBINE,
           bool CheckRetained, bool Flat>
 __device__ __forceinline__ void combine_reduce(
     uint8_t* __restrict__ attn_output,
@@ -8368,6 +8575,14 @@ __device__ __forceinline__ void combine_reduce(
     int top_k,
     const int32_t* retained_slots) {
     constexpr int kRowBytes = HiddenInt4 * 16;
+    constexpr bool kMxfp8 = (kCombineRecipe == NCCL_EP_COMB_QUANT_MXFP8);
+    static_assert(!kMxfp8 || (kTokenDtype == ncclBfloat16 && !Flat),
+                  "MXFP8 push combine reduces BF16 rows in the expert-major layout");
+    // Staging row as pushed by combine_push: packed [FP8 H | E8M0 H/32] for MXFP8.
+    constexpr int kHidden = HiddenInt4 * 8;
+    constexpr int kStageRowBytes = kMxfp8
+        ? nccl_ep::combine_recipe_traits<NCCL_EP_COMB_QUANT_MXFP8>::template packed_bytes<ncclBfloat16>(kHidden)
+        : kRowBytes;
     // Flat spreads small batches across CTAs with four warps per token.
     constexpr int kThreadsPerSlot = Flat
         ? kLocalPermuteReduceThreads / kLocalPermuteReduceSlotsPerBlock : 32;
@@ -8426,7 +8641,7 @@ __device__ __forceinline__ void combine_reduce(
                 if (src_rank_of_lane >= 0) {
                     const float* prob_row = reinterpret_cast<const float*>(
                         staging + (static_cast<size_t>(t) * lsa_team_size + src_rank_of_lane) *
-                                      comb_stage_stride_bytes(kRowBytes, /*reserve_prob=*/true) + kRowBytes);
+                                      comb_stage_push_stride_bytes(kStageRowBytes, kMxfp8, /*reserve_prob=*/true) + kStageRowBytes);
                     w = prob_row[slot_thread];
                 }
                 combined_topk_weights[static_cast<size_t>(t) * top_k + slot_thread] = w;
@@ -8435,7 +8650,7 @@ __device__ __forceinline__ void combine_reduce(
 
         int4* dst_int4 = reinterpret_cast<int4*>(attn_output + static_cast<size_t>(t) * kRowBytes);
         const size_t base_row = static_cast<size_t>(t) * lsa_team_size;
-        const size_t stage_stride = comb_stage_stride_bytes(kRowBytes, BACKWARD_COMBINE);
+        const size_t stage_stride = comb_stage_push_stride_bytes(kStageRowBytes, kMxfp8, BACKWARD_COMBINE);
 
 #pragma unroll 1
         for (int c = 0; c < kNumChunks; c++) {
@@ -8460,6 +8675,8 @@ __device__ __forceinline__ void combine_reduce(
             unsigned bl = present_ranks;
             while (bl != 0u) {
                 int4 buf[kRankGroup][kUnroll];
+                uint2 qbuf[kRankGroup][kUnroll];
+                float qscale[kRankGroup][kUnroll];
                 bool have[kRankGroup];
 #pragma unroll
                 for (int g = 0; g < kRankGroup; g++) {
@@ -8468,10 +8685,18 @@ __device__ __forceinline__ void combine_reduce(
                     const int r = __shfl_sync(0xFFFFFFFFu, src_rank_of_lane, have[g] ? lead : 0);
                     bl &= (bl - 1u);
                     if (have[g]) {
-                        const int4* src = reinterpret_cast<const int4*>(staging + (base_row + r) * stage_stride);
+                        const uint8_t* row = staging + (base_row + r) * stage_stride;
 #pragma unroll
                         for (int u = 0; u < kUnroll; u++) {
-                            if (valid_u[u]) buf[g][u] = src[js[u]];
+                            if (!valid_u[u]) {
+                                continue;
+                            }
+                            if constexpr (kMxfp8) {
+                                qbuf[g][u] = reinterpret_cast<const uint2*>(row)[js[u]];
+                                qscale[g][u] = nccl_ep::mxfp8::e8m0_to_scale(row[kHidden + (js[u] >> 2)]);
+                            } else {
+                                buf[g][u] = reinterpret_cast<const int4*>(row)[js[u]];
+                            }
                         }
                     }
                 }
@@ -8483,7 +8708,13 @@ __device__ __forceinline__ void combine_reduce(
                         if (!valid_u[u]) continue;
 #pragma unroll
                         for (int p = 0; p < kPairs; p++) {
-                            float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&buf[g][u], p);
+                            float2 f;
+                            if constexpr (kMxfp8) {
+                                f = nccl_ep::mxfp8::dequant_x2_scaled(
+                                    reinterpret_cast<const uint16_t*>(&qbuf[g][u])[p], qscale[g][u]);
+                            } else {
+                                f = nccl_ep::ld_token_pair<kTokenDtype>(&buf[g][u], p);
+                            }
                             acc[u][p].x += f.x;
                             acc[u][p].y += f.y;
                         }

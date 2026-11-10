@@ -2760,6 +2760,7 @@ ncclResult_t launch_combine_push(
     unsigned int shuffle_sms,
     cudaStream_t stream,
     ncclDataType_t token_dtype,
+    ncclEpCombQuant_t combine_recipe,
     const float* topk_weights_em,
     const int32_t* srcpos_map,
     bool backward,
@@ -2776,6 +2777,14 @@ ncclResult_t launch_combine_push(
     // weights are null, so only require topk_weights_em when it has recv tokens.
     assert(!backward || (srcpos_map != nullptr &&
                          (topk_weights_em != nullptr || caller_num_recv_tokens == 0)));
+    // The packed MXFP8 row is only 16B-aligned for hidden multiples of NCCL_EP_MXFP8_HIDDEN_ALIGN,
+    // and only the expert-major reduce quantizes; validateCombineRecipe enforces both at the API.
+    if (combine_recipe == NCCL_EP_COMB_QUANT_MXFP8 &&
+        (flat || token_dtype != ncclBfloat16 || ((row_bytes / 2) % NCCL_EP_MXFP8_HIDDEN_ALIGN) != 0)) {
+        fprintf(stderr, "NCCL EP error: MXFP8 push combine needs expert-major BF16 rows, hidden a multiple of %d\n",
+                NCCL_EP_MXFP8_HIDDEN_ALIGN);
+        return ncclInternalError;
+    }
 
     const unsigned int grid = local_permute_grid(sm_count, shuffle_sms);
 
@@ -2804,7 +2813,8 @@ ncclResult_t launch_combine_push(
 
     if (unfused_sync) NCCLCHECK(jit::launch_lsa_head_sync(dcomm, head_sync_flag, stream));
     const ncclResult_t status = ::nccl_ep::ht::jit::launch_combine_push(
-        top_k, row_bytes, static_cast<int>(grid), ep_size, p, stream, token_dtype, backward, nucs);
+        top_k, row_bytes, static_cast<int>(grid), ep_size, p, stream, combine_recipe, token_dtype,
+        backward, nucs);
     if (status != ncclSuccess) return status; // skip the tail sync: the kernel never launched
     if (unfused_sync) {
         NCCLCHECK(jit::launch_lsa_tail_sync(dcomm, grid_barrier_counter, head_sync_flag, stream));
@@ -2826,6 +2836,7 @@ ncclResult_t launch_combine_reduce_stage(
     unsigned int shuffle_sms,
     cudaStream_t stream,
     ncclDataType_t token_dtype,
+    ncclEpCombQuant_t combine_recipe,
     float* combined_topk_weights,
     int top_k,
     bool backward,
@@ -2858,7 +2869,7 @@ ncclResult_t launch_combine_reduce_stage(
     p.top_k = top_k;
 
     return ::nccl_ep::ht::jit::launch_combine_reduce_stage(
-        row_bytes, static_cast<int>(grid), p, stream, token_dtype, backward, flat);
+        row_bytes, static_cast<int>(grid), p, stream, combine_recipe, token_dtype, backward, flat);
 }
 
 } // namespace ht

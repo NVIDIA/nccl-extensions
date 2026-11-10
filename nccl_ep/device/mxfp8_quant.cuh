@@ -86,5 +86,26 @@ __device__ __forceinline__ uint16_t pack_e4m3x2_scaled(float2 v, float scale_inv
     const float2 scaled = make_float2(v.x * scale_inv, v.y * scale_inv);
     return static_cast<uint16_t>(__nv_cvt_float2_to_fp8x2(scaled, __NV_SATFINITE, __NV_E4M3));
 }
+
+// Max |x| over four packed pairs (8 elements).
+__device__ __forceinline__ float amax_x8(const float2* v) {
+    float amax = 0.0f;
+#pragma unroll
+    for (int p = 0; p < 4; p++) {
+        amax = fmaxf(amax, fmaxf(fabsf(v[p].x), fabsf(v[p].y)));
+    }
+    return amax;
+}
+
+// Quantize 8 elements (four pairs) to 8 packed E4M3 bytes with a reciprocal block scale.
+__device__ __forceinline__ uint2 pack_e4m3x8_scaled(const float2* v, float scale_inv) {
+    uint2 out;
+    uint16_t* const pairs = reinterpret_cast<uint16_t*>(&out);
+#pragma unroll
+    for (int p = 0; p < 4; p++) {
+        pairs[p] = pack_e4m3x2_scaled(v[p], scale_inv);
+    }
+    return out;
+}
 } // namespace mxfp8
 } // namespace nccl_ep

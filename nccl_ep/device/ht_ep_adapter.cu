@@ -2765,6 +2765,7 @@ ncclResult_t launch_combine_push(
     const int32_t* srcpos_map,
     bool backward,
     bool unfused_sync,
+    bool claim_dynamic,
     bool nucs,
     bool flat) {
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
@@ -2810,6 +2811,7 @@ ncclResult_t launch_combine_push(
     p.topk_weights_em = topk_weights_em;
     p.srcpos_map = srcpos_map;
     p.unfused_sync = unfused_sync;
+    p.claim_dynamic = claim_dynamic;
 
     if (unfused_sync) NCCLCHECK(jit::launch_lsa_head_sync(dcomm, head_sync_flag, stream));
     const ncclResult_t status = ::nccl_ep::ht::jit::launch_combine_push(

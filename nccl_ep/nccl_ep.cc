@@ -1580,7 +1580,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     //   [24..28) dispatch_grid_barrier_counter      (uint32_t)
     //   [28..32) dispatch_head_sync_counter         (uint32_t)
     //   [32..36) combine_grid_barrier_counter       (uint32_t)
-    //   [36..40) combine_head_sync_counter          (uint32_t)
+    //   [36..40) combine_head_sync_counter          (uint32_t; pull/push combine_push pool counter)
     {
         constexpr size_t kCounterBlockBytes = 40;
         void* block = nullptr;
@@ -7760,6 +7760,11 @@ ncclResult_t ncclEpCombine(
                 backward_combine ? handle->ht.srcpos_map : nullptr,
                 backward_combine,
                 nccl_ep_env_flag_on(group->env.ht_unfused_sync),
+                // Dynamic row claiming from the handle's token count; threshold defaults to 512 here.
+                static_cast<unsigned long>(handle->num_tokens) >=
+                    (group->env.ht_combine_dynamic_claim_min_tokens.is_set
+                         ? group->env.ht_combine_dynamic_claim_min_tokens.value.ul
+                         : 512UL),
                 nccl_ep_env_flag_on(group->env.nucs),
                 handle->layout == NCCL_EP_LAYOUT_FLAT));
             NCCLCHECK(nccl_ep::ht::launch_combine_reduce_stage(

@@ -564,6 +564,8 @@ ncclResult_t launch_combine_push(
     bool backward,
     // When true, run the intra-LSA head/tail sync as separate kernels around this launch.
     bool unfused_sync,
+    // Claim rows dynamically (true) or walk static per-warp ranges (false).
+    bool claim_dynamic,
     bool nucs,
     bool flat);
 

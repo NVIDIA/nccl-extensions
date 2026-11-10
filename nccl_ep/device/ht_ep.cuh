@@ -208,7 +208,7 @@ struct combine_memory_region_info_t {
     size_t guard_offset; // RDMA sync-guard: offset of combine's internal-buffer readiness flags
 } __attribute__((__aligned__(8)));
 
-// ============================================================================
+// =====================================================================
 // Warp-parallel memory copy helper for RDMA staging
 // All 32 threads participate using int4 (16-byte) loads/stores for maximum bandwidth
 // ============================================================================
@@ -6911,6 +6911,8 @@ __device__ __forceinline__ void lsa_grid_tail_barrier(
         if (threadIdx.x == 0) {
             atomicExch(grid_barrier_counter, 0u);
             atomicExch(head_sync_flag, 0u);
+            // combine_push pool counter (combine_head_sync_counter word).
+            atomicExch(grid_barrier_counter + 1, 0u);
         }
     }
 }
@@ -8021,6 +8023,8 @@ struct combine_push_param_t {
     int lsa_team_size;                // decode dst_rank; staging row = t*team_size + R
     // When set, head/tail sync runs as separate kernels; this kernel skips the inline sync.
     bool unfused_sync;
+    // Rows are claimed dynamically only when set; otherwise each warp walks a static range.
+    bool claim_dynamic;
 };
 
 // Unpack one int4 of BF16 into four float pairs by bit placement; fewer instructions than
@@ -8171,6 +8175,83 @@ __device__ __forceinline__ void combine_push_quant_row(
     }
 }
 
+// Row claiming for combine_push. Dynamic: a block claims rows of its own region one by one (shared
+// counter); the last 1/kPoolDiv of every region is a grid-wide pool claimed by ticket t, which maps to
+// region (t % grid) at pool position (t / grid). Rows up to kPoolMinRowBytes skip the pool. Static:
+// each warp walks a contiguous range. Both rotate regions by rank so concurrent senders start on
+// different destinations.
+template <bool kDynamic>
+struct combine_push_claim_t {
+    static constexpr int kPoolDiv = 4;
+    static constexpr int kPoolMinRowBytes = 8192;
+    int num_recv;
+    int grid_blocks;
+    int num_per_block;
+    int own_per_block;
+    int rot_offset;
+    int own_start;
+    int own_end;
+    int num_tickets;
+    bool own_done;
+    int static_next;
+    int static_end;
+
+    __device__ __forceinline__ void init(int num_recv_in, int my_lsa_rank, int lsa_team_size, int row_bytes,
+                                         int slots_per_block, int slot_in_block) {
+        num_recv = num_recv_in;
+        grid_blocks = static_cast<int>(gridDim.x);
+        if constexpr (!kDynamic) {
+            const int n_sub = slots_per_block * grid_blocks;
+            const int warp_idx = slot_in_block * grid_blocks + static_cast<int>(blockIdx.x);
+            const int per_warp = nccl_ep::ceil_div(num_recv, n_sub);
+            static_next = ((warp_idx + my_lsa_rank * (n_sub / lsa_team_size)) % n_sub) * per_warp;
+            static_end = min(static_next + per_warp, num_recv);
+            return;
+        }
+        num_per_block = nccl_ep::ceil_div(num_recv, grid_blocks);
+        const int pool_per_block = row_bytes > kPoolMinRowBytes ? num_per_block / kPoolDiv : 0;
+        own_per_block = num_per_block - pool_per_block;
+        rot_offset = my_lsa_rank * (grid_blocks / lsa_team_size);
+        own_start = ((static_cast<int>(blockIdx.x) + rot_offset) % grid_blocks) * num_per_block;
+        own_end = min(own_start + own_per_block, num_recv);
+        num_tickets = grid_blocks * pool_per_block;
+        own_done = false;
+    }
+
+    // Warp-uniform. Returns the next row for this warp, or num_recv when none are left.
+    __device__ __forceinline__ int next(int* s_claim, uint32_t* pool_counter, int wlane) {
+        if constexpr (!kDynamic) {
+            return static_next < static_end ? static_next++ : num_recv;
+        }
+        if (!own_done) {
+            int idx = 0;
+            if (wlane == 0) {
+                idx = atomicAdd(s_claim, 1);
+            }
+            idx = __shfl_sync(0xFFFFFFFFu, idx, 0);
+            if (own_start + idx < own_end) {
+                return own_start + idx;
+            }
+            own_done = true;
+        }
+        while (true) {
+            int ticket = 0;
+            if (wlane == 0) {
+                ticket = static_cast<int>(atomicAdd(pool_counter, 1u));
+            }
+            ticket = __shfl_sync(0xFFFFFFFFu, ticket, 0);
+            if (ticket >= num_tickets) {
+                return num_recv;
+            }
+            const int region = (ticket % grid_blocks + rot_offset) % grid_blocks;
+            const int claimed = region * num_per_block + own_per_block + ticket / grid_blocks;
+            if (claimed < num_recv) {
+                return claimed;
+            }
+        }
+    }
+};
+
 // One recv slot per warp (kSlotsPerBlock in parallel), identical
 // gather-reduce to local_permute_reduce; the reduced row is assembled in a per-warp smem buffer
 // and pushed to the remote destination staging slot [t*team_size + R], one TMA store per row
@@ -8182,7 +8263,7 @@ __device__ __forceinline__ void combine_push_quant_row(
 //   kCombineRecipe - NONE pushes the reduced caller-dtype row; MXFP8 (whole-row, BF16) quantizes it
 //                in place in the smem row buffer and pushes the packed [FP8 H | E8M0 H/32] row.
 template <int MaxTopK, int HiddenInt4, ncclDataType_t kTokenDtype, ncclEpCombQuant_t kCombineRecipe,
-          bool BACKWARD_COMBINE = false, int kChunkSize = 0>
+          bool BACKWARD_COMBINE = false, int kChunkSize = 0, bool kClaimDynamic>
 __device__ __forceinline__ void combine_push(
     void* const* __restrict__ peer_staging_ptrs,
     const uint8_t* __restrict__ recv_x_em,
@@ -8249,23 +8330,21 @@ __device__ __forceinline__ void combine_push(
     int4* const my_row = s_rows + static_cast<size_t>(slot_in_block) * kBufInt4;
 
     const int num_recv = *num_recv_tokens_dev;
-    // Contiguous per-warp range with SM-spread global ordering: consecutive global warps land on
-    // different SMs (even last-wave spread) and each warp streams a contiguous slot range (writes
-    // become sequential per peer once slots are dst-grouped). Output-independent.
-    const int kNSub = kSlotsPerBlock * static_cast<int>(gridDim.x);
-    const int global_warp_idx = slot_in_block * static_cast<int>(gridDim.x) + static_cast<int>(blockIdx.x);
-    const int num_per_warp = (num_recv + kNSub - 1) / kNSub;
-    // Cross-rank rotation: offset each rank's warp->range assignment by its own rank so the
-    // concurrent senders begin on different dst regions, balancing the receiver-side NVLink
-    // links when slots are dst-grouped. A permutation of the same slots -> output-independent.
-    const int rot_warp = (global_warp_idx + my_lsa_rank * (kNSub / lsa_team_size)) % kNSub;
-    const int slot_start = rot_warp * num_per_warp;
+    // Rows are claimed dynamically (see combine_push_claim_t). The pool counter is the
+    // combine_head_sync_counter word (idle in pull/push), cleared by lsa_grid_tail_barrier.
+    __shared__ int s_claim;
+    uint32_t* const pool_counter = grid_barrier_counter + 1;
+    combine_push_claim_t<kClaimDynamic> claim;
+    claim.init(num_recv, my_lsa_rank, lsa_team_size, kRowBytes, kSlotsPerBlock, slot_in_block);
 
     // TMA-load relay: init this warp's mbarrier once (1 arrival: the load's complete_tx).
     uint32_t mbar_phase = 0;
     if constexpr (kSingleChunk) {
         if (wlane == 0) nccl_ep::mbarrier_init(&s_mbar[slot_in_block], 1);
         nccl_ep::fence_barrier_init();
+    }
+    if (tid == 0) {
+        s_claim = 0;
     }
     __syncthreads();
 
@@ -8278,10 +8357,11 @@ __device__ __forceinline__ void combine_push(
         next_s = (ok && wlane < top_k) ? __ldg(flat2em_slot_map + static_cast<size_t>(sl) * top_k + wlane) : -1;
         next_g = (ok && wlane == 0) ? __ldg(recv_slot_to_src + sl) : 0;
     };
-    load_meta(slot_start, num_per_warp > 0);
+    int slot = claim.next(&s_claim, pool_counter, wlane);
+    int next_slot = 0;
+    load_meta(slot, slot < num_recv);
 
-    for (int wave = 0; wave < num_per_warp; ++wave) {
-        const int slot = slot_start + wave;
+    for (; slot < num_recv; slot = next_slot) {
         const bool slot_valid = (slot < num_recv);
 
         static_assert(MaxTopK <= 32, "cooperative pack assumes MaxTopK <= 32");
@@ -8315,7 +8395,8 @@ __device__ __forceinline__ void combine_push(
             }
         }
         __syncwarp();
-        load_meta(slot + 1, wave + 1 < num_per_warp);
+        next_slot = claim.next(&s_claim, pool_counter, wlane);
+        load_meta(next_slot, next_slot < num_recv);
 
         if (slot_valid) {
             const int n = s_nvalid[slot_in_block];

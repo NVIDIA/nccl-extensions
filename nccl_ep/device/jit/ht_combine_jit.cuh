@@ -617,7 +617,8 @@ inline ncclResult_t launch_combine_push(
         name << "combine_push_topk" << top_k << "_h" << hidden_int4
              << ::nccl_ep::jit::token_dtype_name_tag(token_dtype) << ::nccl_ep::jit::combine_recipe_name_tag(recipe)
              << (backward ? "_bwd" : "")
-             << "_c" << chunk_size << (param.flat ? "_flat" : "") << "_w" << slots;
+             << "_c" << chunk_size << (param.claim_dynamic ? "_dyn" : "") << (param.flat ? "_flat" : "")
+             << "_w" << slots;
         return name.str();
     }();
     const std::string source = [&] {
@@ -634,7 +635,8 @@ inline ncclResult_t launch_combine_push(
         }
         src << "  extern __shared__ uint8_t smem_bytes[];\n"
             << "  ::ht_ep::combine_push<" << top_k << ", " << hidden_int4 << ", " << token_dtype_literal
-            << ", " << recipe_literal << ", " << backward_literal << ", " << kernel_chunk_size << ">(\n"
+            << ", " << recipe_literal << ", " << backward_literal << ", " << kernel_chunk_size << ", "
+            << (param.claim_dynamic ? "true" : "false") << ">(\n"
             << "      p.peer_staging_ptrs,\n"
             << "      reinterpret_cast<const uint8_t*>(p.recv_x_em),\n"
             << "      p.flat2em_slot_map,\n"

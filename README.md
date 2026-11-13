@@ -19,6 +19,13 @@ Experimental library for resharding a tensor between two disjoint groups of
 GPU processes (e.g. trainer and inference ranks) in a single, zero-copy call,
 built on NCCL's window API.
 
+### [`nccl_ft/`](nccl_ft/) — Fault-Tolerant Collectives
+AllGather, AllReduce, AllToAll and variable-size collectives that keep making
+progress when peers fail: each kernel takes a timeout and an active-rank mask
+and returns the set of ranks that contributed instead of hanging. Includes
+communicator-preserving membership shrink/rejoin and a `torch.distributed`
+backend (`ft_nccl`). Built on NCCL's Device API.
+
 ### [`python/`](python/) — Python bindings
 Python package (`nccl-extensions`) providing Pythonic wrappers for `nccl_ep`
 and `nccl_m2n` as `nccl.ep` and `nccl.m2n`. See
@@ -92,6 +99,7 @@ artifacts into the shared build tree:
 ```bash
 make nccl_ep.build   # build/{lib,include,...}
 make nccl_m2n.build  # build/{lib,include,...}
+make nccl_ft.build   # nccl_ft/ft_handle/libft_collective.{so,a}
 ```
 
 Unless `NCCL_HOME` is set, plain `make` initializes and builds the vendored

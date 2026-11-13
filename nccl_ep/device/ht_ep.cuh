@@ -170,25 +170,9 @@ struct dispatch_memory_region_info_t {
     size_t bytes_per_entry; // Size of packed entry (token + prob + sf)
     size_t max_tokens_per_dest; // Max tokens that can be staged per destination
     // Streaming RDMA signals
-    unsigned signals_tail_base; // Base signal ID for tail tracking (sender -> receiver)
     // Streaming buffer configuration
     int num_max_rdma_chunked_send_tokens; // Batch size per RDMA put (default: 6)
 } __attribute__((__aligned__(8)));
-
-// Tail-signal id for the (src_lteam -> dst_lteam) edge of (local_rank, chunk);
-// namespace [src][dst][local_rank][chunk].
-__forceinline__ __device__ unsigned dispatch_tail_signal_id(
-    unsigned signals_tail_base,
-    int src_lteam,
-    int dst_lteam,
-    int local_rank,
-    int cidx,
-    int lsa_teams,
-    int ranks_per_lsa_team,
-    int max_chunks_per_rank) {
-    return signals_tail_base +
-           ((src_lteam * lsa_teams + dst_lteam) * ranks_per_lsa_team + local_rank) * max_chunks_per_rank + cidx;
-}
 
 // Byte offset (from the packed inter-lsa-team receive region start) of one source slot's chunk.
 // Packed layout is [remote_slot][token-in-slot], each entry bytes_per_entry (token + prob + sf).
@@ -1246,8 +1230,6 @@ struct combine_kernel_param_base_t {
     ncclWindow_t dest_window; // Destination window handle
     int num_ctx_per_comm; // Number of contexts per communicator
     void* gin_base_ptr; // Base pointer for offset calculations
-    unsigned signals_base; // Base signal ID
-    unsigned combine_signal_offset; // Signal offset for combine operations
     // qp info and mr info
     struct combine_memory_region_info_t mr_info;
     // Cross-round WAR sync-guards: LSA (intra-LSA staging) uses the NCCL LSA barrier; RDMA
@@ -1278,8 +1260,63 @@ __forceinline__ __device__ void arrive_and_wait(uint32_t num_threads, uint32_t b
 }
 
 // Map a data channel onto its GIN context, skipping the reserved contexts.
-__forceinline__ __device__ int get_data_ctx(int channel, int num_ctx_per_comm) {
-    return NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (channel % num_ctx_per_comm);
+__forceinline__ __device__ int get_data_ctx(int channel, int num_channels) {
+    return NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (channel % num_channels);
+}
+
+struct gin_chunk_signal_t {
+    int ctx_idx;      // GIN context to signal on / wait on
+    unsigned sig_id;  // signal id within that context
+};
+
+__forceinline__ __device__ int gin_ids_per_channel(int num_chunks, int channels) {
+    return nccl_ep::ceil_div(num_chunks, channels);
+}
+
+__forceinline__ __device__ gin_chunk_signal_t
+gin_split_chunk(int cidx, int channels, unsigned id_base) {
+    gin_chunk_signal_t s;
+    s.ctx_idx = get_data_ctx(cidx, channels);
+    s.sig_id = id_base + static_cast<unsigned>(cidx / channels);
+    return s;
+}
+
+// Best explained via example. cidx = chunk idx, gcidx = global cidx,
+// team_idx = the sending team's slot at this receiver.
+// gcidx enumerates (cidx, team_idx) pairs in order as below for example LSA_TEAMS=4:
+//  cidx0_team0, cidx0_team1, cidx0_team2, cidx1_team0, cidx1_team1 ...
+// NBLOCKS=2, DISPATCH_N2N_WARPS=2 (4 warps), receiver team = team 0:
+//
+//   warp 0 / gin_ctx_1              warp 1 / gin_ctx_2              warp 2 / gin_ctx_3              warp 3 / gin_ctx_4
+//   gcidx team_idx gin_sig_idx      gcidx team_idx gin_sig_idx      gcidx team_idx gin_sig_idx      gcidx team_idx gin_sig_idx
+//      0       0           2            3       0           2            6       0           2            9       0           2
+//      1       1           1            4       1           1            7       1           1           10       1           1
+//      2       2           0            5       2           0            8       2           0           11       2           0
+//
+// Each warp takes a contiguous run of 3: one chunk's worth of teams.
+__forceinline__ __device__ gin_chunk_signal_t gin_dispatch_chunk_signal(
+    int src_lteam, int dst_lteam, int cidx, int max_chunks_per_rank, int channels) {
+    const int src_slot = src_lteam > dst_lteam ? src_lteam - 1 : src_lteam;
+    const unsigned id_base = src_slot * gin_ids_per_channel(max_chunks_per_rank, channels);
+    return gin_split_chunk(cidx, channels, id_base);
+}
+
+// Same enumeration as gin_dispatch_chunk_signal above.
+// NBLOCKS=2, COMBINE_N2N_WARPS=1 (2 warps), receiver team = team 0:
+//
+//   warp 0 / gin_ctx_1              warp 1 / gin_ctx_2
+//   gcidx team_idx gin_sig_idx      gcidx team_idx gin_sig_idx
+//      0       0           0            1       1           0
+//      2       2           1            3       0           1
+//      4       1           2            5       2           2
+//      6       0           3            7       1           3
+//      8       2           4            9       0           4
+//     10       1           5           11       2           5
+//
+// Each warp takes every other index, so half the warps carry twice the ids.
+__forceinline__ __device__ gin_chunk_signal_t
+gin_combine_chunk_signal(int cidx, int channels) {
+    return gin_split_chunk(cidx, channels, /*id_base=*/0);
 }
 
 // Advance a ring-buffer slot; on wrap (slot == num_slots) reset to 0 and flip phase parity.
@@ -1394,7 +1431,6 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     const uint8_t* attn_input_token_scaling_factor,
     const int lteam_id,
     const int my_lteam,
-    const int local_rank,
     const int cidx,
     const uint64_t expected_flag_value,
     const int HIDDEN_DIM,
@@ -1414,22 +1450,18 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
 
     if (lteam_id != my_lteam) {
         // Remote: wait for the RDMA arrival signal, then point at this tile+chunk in the packed buffer.
+        // Wait on lteam_id's own id for this chunk.
         constexpr int MAX_CHUNKS_PER_RANK = MAX_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
-        unsigned tail_signal_id = dispatch_tail_signal_id(
-            mr_info->signals_tail_base,
-            lteam_id,
-            my_lteam,
-            local_rank,
-            cidx,
-            LSA_TEAMS,
-            LSA_TEAM_SZ,
-            MAX_CHUNKS_PER_RANK);
-        constexpr int N2N_WARPS = (LSA_TEAMS == 1) ? 1 : NCCL_EP_HT_DISPATCH_N2N_WARPS;
-        int signal_channel = cidx % (NBLOCKS * N2N_WARPS);
-
-        int ctx_idx = get_data_ctx(signal_channel, num_ctx_per_comm);
-        ncclGin net(dcomm, ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
-        net.waitSignal(ncclCoopThread(), tail_signal_id, expected_flag_value);
+        // Divide by the sender's channel count, not num_ctx_per_comm: the sender walked cidx with
+        // this stride and split it on the same quantity. Both sides are this kernel, so NBLOCKS and
+        // the warp count are the same compile-time constants on each.
+        constexpr int CHUNK_STRIDE = NBLOCKS * NCCL_EP_HT_DISPATCH_N2N_WARPS;
+        const gin_chunk_signal_t sig =
+            gin_dispatch_chunk_signal(lteam_id, my_lteam, cidx, MAX_CHUNKS_PER_RANK, CHUNK_STRIDE);
+        ncclGin net(dcomm, sig.ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
+        // Already a single lane here.
+        net.increaseSignalShadow(sig.sig_id, 1ull);
+        net.waitSignalMeetShadow(ncclCoopThread(), sig.sig_id);
 
         const int remote_slot = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
         const int chunk_first_token = cidx * TOKENS_PER_CHUNK;
@@ -1732,7 +1764,6 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     // INPUT
     const bool* attn_to_rdma_map,
     // CONFIG
-    const int local_rank,
     const int my_lteam,
     const int num_of_tokens_per_rank,
     const int HIDDEN_DIM,
@@ -1772,9 +1803,14 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     constexpr int MAX_CHUNKS_PER_RANK = MAX_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
     constexpr int NUM_REMOTE_LSA = LSA_TEAMS - 1;
 
+    constexpr int CHUNK_STRIDE = NBLOCKS * N2N_WARPS;
+    constexpr int GLOBAL_CHANNELS = CHUNK_STRIDE;
+    static_assert(N2N_WARPS == NCCL_EP_HT_DISPATCH_N2N_WARPS,
+                  "dispatch channel count must match the host's, which sizes the GIN context pool");
+
     // GIN device side setup. Single communicator; ctx_idx spreads QP traffic.
     int global_channel = blockIdx.x * N2N_WARPS + n2n_warp_id;
-    int ctx_idx = get_data_ctx(global_channel, num_ctx_per_comm);
+    int ctx_idx = get_data_ctx(global_channel, GLOBAL_CHANNELS);
 
     ncclGin net(dcomm, ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
     ncclTeam rail = ncclTeamRail(dcomm);
@@ -1782,7 +1818,6 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     // At most GIN_WINDOW chunks per rail peer in flight. Compiled in only when it can engage: the mere
     // presence of wait/flushAsync in this loop slows posting.
     constexpr int GIN_WINDOW = NCCL_EP_HT_DISPATCH_GIN_WINDOW;
-    constexpr int CHUNK_STRIDE = NBLOCKS * N2N_WARPS;
     constexpr bool USE_WINDOW = MAX_CHUNKS_PER_RANK > GIN_WINDOW * CHUNK_STRIDE;
     const int n_mine = nccl_ep::ceil_div(MAX_CHUNKS_PER_RANK - global_channel, CHUNK_STRIDE);
     ncclGinRequest_t chunk_done[GIN_WINDOW][NUM_REMOTE_LSA];
@@ -1861,21 +1896,15 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                 dense_dst_offset += __popc(need_write_bitmask[word]) * entry_bytes;
             }
 
-            // Signal chunk completion on the SAME put comm: same-QP ordering makes all
-            // preceding puts visible at the remote before this signal arrives.
-            unsigned tail_signal_id = dispatch_tail_signal_id(
-                smem_mr_info_ptr->signals_tail_base,
-                my_lteam,
-                remote_lteam_id,
-                local_rank,
-                cidx,
-                LSA_TEAMS,
-                LSA_TEAM_SZ,
-                MAX_CHUNKS_PER_RANK);
+            // Signal on the SAME put comm, into this team's own band at the destination. Routed
+            // through the same entry point the waiter uses, so the two cannot drift.
+            const unsigned sig_id =
+                gin_dispatch_chunk_signal(my_lteam, remote_lteam_id, cidx, MAX_CHUNKS_PER_RANK, CHUNK_STRIDE)
+                    .sig_id;
             net.signal(
                 rail,
                 remote_lteam_id,
-                ncclGin_SignalAdd{tail_signal_id, 1},
+                ncclGin_SignalAdd{sig_id, 1},
                 ncclCoopWarp(),
                 ncclGin_None{},
                 cuda::thread_scope_thread,
@@ -2272,7 +2301,6 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                     attn_input_token_scaling_factor,
                     lteam_id,
                     my_lteam,
-                    local_rank,
                     cidx,
                     expected_flag_value,
                     HIDDEN_DIM,
@@ -2576,6 +2604,13 @@ combine_chunk_meta(int cidx, int my_lteam, int cpr, int rem_chunk_sz) {
     c.chunk_id = cidx / (LSA_TEAMS - 1);
     c.csize = (rem_chunk_sz != 0 && c.chunk_id == cpr - 1) ? rem_chunk_sz : TOKENS_PER_CHUNK;
     return c;
+}
+
+// The receiver inverts the mapping above to recover the sender's cidx.
+template <int LSA_TEAMS>
+__forceinline__ __device__ int
+combine_chunk_meta_inverse(int src_lteam, int dst_lteam, int chunk_id) {
+    return chunk_id * (LSA_TEAMS - 1) + ((dst_lteam - src_lteam - 1 + LSA_TEAMS) % LSA_TEAMS);
 }
 
 // Intra-LSA G2S warp for the combine kernel. Exactly one such warp per block.
@@ -3279,20 +3314,13 @@ __forceinline__ __device__ void combine_n2n_put_active_tokens(
 }
 
 // Signal the remote LSA team (via ncclGin) that this chunk has been delivered. Lane 0 only.
-template <int MAX_TOKENS_PER_RANK, int TOKENS_PER_CHUNK, int LSA_TEAMS>
+template <int NBLOCKS>
 __forceinline__ __device__ void combine_n2n_signal_remote(
     ncclGin& net,
     ncclTeam rail,
     int lteam_id,
-    int local_rank,
-    int my_lteam,
-    int chunk_id,
-    unsigned signals_base,
-    unsigned combine_signal_offset) {
-    constexpr int MAX_CHUNKS_PER_RANK = MAX_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
-    unsigned signal_id = signals_base + combine_signal_offset +
-                         local_rank * (LSA_TEAMS * MAX_CHUNKS_PER_RANK) + my_lteam * MAX_CHUNKS_PER_RANK +
-                         chunk_id;
+    int cidx) {
+    unsigned signal_id = gin_combine_chunk_signal(cidx, NBLOCKS).sig_id;
     net.signal(
         rail,
         lteam_id,
@@ -3325,7 +3353,6 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     // SCRATCH
     SMEM_TYPE* smem_buffer_ptr,
     // CONFIG
-    const int local_rank,
     const int my_lteam,
     const int num_of_tokens_per_rank,
     const int experts_per_rank,
@@ -3336,9 +3363,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     ncclWindow_t nccl_prob_window,
     ncclWindow_t nccl_internal_window,
     int num_ctx_per_comm,
-    void* gin_base_ptr,
-    unsigned signals_base,
-    unsigned combine_signal_offset) {
+    void* gin_base_ptr) {
     // Token RDMA offsets/sizes below scale by size_u8 (4 B for FP32, 2 B for BF16/FP16);
     // prob is always float and is unaffected.
     // Load rdma_to_attn_map using LDG.128. Each token will need 1 bool from this map.
@@ -3373,6 +3398,12 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     const int rdma_per_lsa_sz = nccl_ep::align(num_of_tokens_per_rank, 16);
     uint32_t token_consumer_parity = 0;
     uint32_t cumulative_sent = 0; // Cumulative active tokens RDMA-put across all chunks (never reset).
+
+    const int ctx_idx = get_data_ctx(blockIdx.x, NBLOCKS);
+    // Exclusive per warp: this context belongs to a single gin warp, and only lane 0 issues the
+    // gin.put operations on it.
+    ncclGin net(*dcomm, ctx_idx, NCCL_GIN_RESOURCE_SHARING_THREAD);
+
     for (int cidx = blockIdx.x; cidx < total_chunks; cidx += NBLOCKS) {
         // LSA-team/chunk mapping shared with the G2S receiver so signals match.
         const auto meta = combine_chunk_meta<LSA_TEAMS, TOKENS_PER_CHUNK>(cidx, my_lteam, cpr, rem_chunk_sz);
@@ -3382,10 +3413,6 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
         const int rank_in_remote = lteam_id < my_lteam ? my_lteam - 1 : my_lteam;
         const bool is_residue = (chunk_id >= cpr);
 
-        // Distribute chunks across communicator contexts for parallelism.
-        int global_channel = chunk_id % num_ctx_per_comm;
-        int ctx_idx = get_data_ctx(global_channel, num_ctx_per_comm);
-        ncclGin net(*dcomm, ctx_idx);
         ncclTeam rail = ncclTeamRail(*dcomm);
         int rdma_tile_id = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
         int chunk_base_token_idx = lteam_id * rdma_per_lsa_sz + chunk_id * TOKENS_PER_CHUNK;
@@ -3424,8 +3451,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
             // Signal remote
             __syncwarp();
             if (GIN_GROUP::thread_rank() == 0) {
-                combine_n2n_signal_remote<MAX_TOKENS_PER_RANK, TOKENS_PER_CHUNK, LSA_TEAMS>(
-                    net, rail, lteam_id, local_rank, my_lteam, chunk_id, signals_base, combine_signal_offset);
+                combine_n2n_signal_remote<NBLOCKS>(net, rail, lteam_id, cidx);
             }
             __syncwarp();
 
@@ -3454,8 +3480,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
             // Signal remote
             __syncwarp();
             if (GIN_GROUP::thread_rank() == 0) {
-                combine_n2n_signal_remote<MAX_TOKENS_PER_RANK, TOKENS_PER_CHUNK, LSA_TEAMS>(
-                    net, rail, lteam_id, local_rank, my_lteam, chunk_id, signals_base, combine_signal_offset);
+                combine_n2n_signal_remote<NBLOCKS>(net, rail, lteam_id, cidx);
             }
             __syncwarp();
         }
@@ -3624,7 +3649,6 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     uint64_t* gin_G2S_flags,
     SMEM_TYPE* smem_buffer_ptr,
     // CONFIG
-    const int local_rank,
     const int my_lteam,
     const int num_of_tokens_per_rank,
     const int experts_per_rank,
@@ -3633,8 +3657,6 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     const bool combine_local_reduce_enabled,
     // CONFIG: ncclGin RDMA plumbing
     ncclDevComm_t* dcomm,
-    unsigned signals_base,
-    unsigned combine_signal_offset,
     int num_ctx_per_comm) {
     // The G2S group is split into single-warp pipelines (warp == pipeline), matching the cross-LSA-team red
     // group; each warp owns an equal slice of the G2S FIFO.
@@ -3705,16 +3727,12 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
             attn_to_rdma_map_base = attn_to_rdma_map + (cidx * TOKENS_PER_CHUNK) * (LSA_TEAMS - 1);
 
             if (lane_id == 0) {
-                constexpr int MAX_CHUNKS_PER_RANK = MAX_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
-                int global_channel = cidx % num_ctx_per_comm;
-                int ctx_idx = get_data_ctx(global_channel, num_ctx_per_comm);
-                ncclGin net(*dcomm, ctx_idx);
                 for (int n = 1; n < LSA_TEAMS; n++) {
-                    int signal_lteam_id = my_lteam >= n ? my_lteam - n : my_lteam + LSA_TEAMS - n;
-                    unsigned signal_id = signals_base + combine_signal_offset +
-                                         local_rank * (LSA_TEAMS * MAX_CHUNKS_PER_RANK) +
-                                         signal_lteam_id * MAX_CHUNKS_PER_RANK + cidx;
-                    net.waitSignal(ncclCoopThread(), signal_id, expected_flag_value);
+                    const int src_lteam = my_lteam >= n ? my_lteam - n : my_lteam + LSA_TEAMS - n;
+                    const int global_cidx = combine_chunk_meta_inverse<LSA_TEAMS>(src_lteam, my_lteam, cidx);
+                    const gin_chunk_signal_t sig = gin_combine_chunk_signal(global_cidx, NBLOCKS);
+                    ncclGin net(*dcomm, sig.ctx_idx);
+                    net.waitSignalMeetShadow(ncclCoopThread(), sig.sig_id);
                 }
             }
             __syncwarp(0xffffffff);
@@ -5292,7 +5310,6 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                               MAX_TOKENS_PER_RANK, LSA_TEAMS, LSA_TEAM_SZ, NBLOCKS, FORWARD_DISPATCH, HAS_SF>
             DISPATCH_N2N_TEMPLATE(
                 param.attn_to_rdma_map,
-                param.local_rank,
                 my_lteam,
                 param.num_of_tokens_per_rank,
                 HIDDEN_DIM,
@@ -5588,6 +5605,18 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     using head_rdma_warp = warp_group<1, 1>; // warp 1
     const int head_tid = (int)threadIdx.x;
     if (head_tid < head_init_warp::size()) {
+        // Every chunk will wait for a signal, so prepare the expectation here.
+        if constexpr (LSA_TEAMS != 1) {
+            if (head_leader) {
+                const int total_wire = (LSA_TEAMS - 1) * MAX_CHUNKS_PER_RANK;
+                for (int g = head_tid; g < total_wire; g += head_init_warp::size()) {
+                    const gin_chunk_signal_t sig = gin_combine_chunk_signal(g, NBLOCKS);
+                    ncclGin net(*param.dcomm, sig.ctx_idx);
+                    net.increaseSignalShadow(sig.sig_id, 1ull);
+                }
+            }
+        }
+        __syncwarp();
         if (head_tid == 0) {
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
             _wt_head_start = clock64();
@@ -5739,7 +5768,6 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             param.gin_G2S_flags,
             smem_buffer_ptr,
             // CONFIG
-            param.local_rank,
             my_lteam,
             param.num_of_tokens_per_rank,
             param.experts_per_rank,
@@ -5747,8 +5775,6 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             *param.expected_gin_flag_val,
             param.combine_local_reduce_enabled,
             param.dcomm,
-            param.signals_base,
-            param.combine_signal_offset,
             param.num_ctx_per_comm);
 #undef COMBINE_G2S_INTER_TEMPLATE
     } else if (
@@ -5767,7 +5793,6 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 // SCRATCH
                 smem_buffer_ptr,
                 // CONFIG
-                param.local_rank,
                 my_lteam,
                 param.num_of_tokens_per_rank,
                 param.experts_per_rank,
@@ -5777,9 +5802,8 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 param.prob_window,
                 param.dest_window,
                 param.num_ctx_per_comm,
-                param.gin_base_ptr,
-                param.signals_base,
-                param.combine_signal_offset);
+                param.gin_base_ptr);
+
 #undef COMBINE_N2N_INTER_TEMPLATE
         }
     } else {

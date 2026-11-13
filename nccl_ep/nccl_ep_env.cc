@@ -104,6 +104,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_timeout_ms(cfg->timeout_ms);
     parse_choice(cfg->ht_recv_topk_order);
     parse_choice(cfg->dispatch_copy_mode);
+    parse_choice(cfg->ht_gin_protocol);
     parse_choice(cfg->dispatch_lsa);
     parse_ulong(cfg->ll_tma_quant_warps, true);
     parse_choice(cfg->combine_lsa);
@@ -143,6 +144,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.ht_count_unfused,
         &cfg.ht_recv_topk_order,
         &cfg.dispatch_copy_mode,
+        &cfg.ht_gin_protocol,
         &cfg.disable_guard,
         &cfg.ll_cft,
         &cfg.timeout_ms,

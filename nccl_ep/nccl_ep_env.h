@@ -86,6 +86,10 @@ struct ncclEpEnvConfig {
     ncclEpEnvVar ht_recv_topk_order{"NCCL_EP_HT_RECV_TOPK_ORDER", ncclEpEnvType::choice, ht_recv_topk_orders};
     static constexpr const char* dispatch_copy_modes[] = {"CE", "SIMT", "TMA", nullptr};
     ncclEpEnvVar dispatch_copy_mode{"NCCL_EP_DISPATCH_COPY_MODE", ncclEpEnvType::choice, dispatch_copy_modes};
+    // Selects the HT EP kernel type by the GIN network protocol: ORDERED or
+    // UNORDERED. Default is ORDERED.
+    static constexpr const char* ht_gin_protocols[] = {"ORDERED", "UNORDERED", nullptr};
+    ncclEpEnvVar ht_gin_protocol{"NCCL_EP_HT_GIN_PROTOCOL", ncclEpEnvType::choice, ht_gin_protocols};
     ncclEpEnvVar disable_guard{"NCCL_EP_DISABLE_GUARD", ncclEpEnvType::flag};
     ncclEpEnvVar timeout_ms{"NCCL_EP_TIMEOUT_MS", ncclEpEnvType::ulong};
     ncclEpEnvVar comm_num_sms{"NCCL_EP_COMM_SMS", ncclEpEnvType::ulong};

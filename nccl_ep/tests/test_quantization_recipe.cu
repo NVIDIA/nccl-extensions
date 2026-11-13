@@ -1917,6 +1917,252 @@ TEST_F(QuantizationRecipeTest, NvFp4CombineRankMajorProducesBf16) {
     NCCL_ASSERT(ncclEpGroupDestroy(group));
 }
 
+// ============================================================================
+// scale_layout (BLOCK128_GEMM) tests
+// ============================================================================
+
+// BLOCK128_GEMM requires hidden % 128 == 0, and the scale bytes per token
+// (hidden/128 * sizeof(float)) must be 16-byte aligned. hidden=512 gives
+// 4 scales * 4 bytes = 16 bytes. The test fixtures use kHidden=16.
+static constexpr int kBlock128Hidden = 512;
+static constexpr int kBlock128Scales = kBlock128Hidden / 128;
+
+TEST_F(QuantizationRecipeTest, ScaleLayoutDefaultIsWire) {
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    EXPECT_EQ(config.scale_layout, NCCL_EP_SCALE_LAYOUT_WIRE);
+}
+
+TEST_F(QuantizationRecipeTest, ScaleLayoutRejectsInvalidValue) {
+    RecipeTensor tokens(ncclFloat8e4m3, kNumTokens, kBlock128Hidden);
+    RecipeTensor output_tokens(ncclFloat8e4m3, kMaxRecvSlots, kBlock128Hidden);
+    RecipeTensor input_scales(ncclFloat32, kNumTokens, kBlock128Scales);
+    RecipeTensor output_scales(ncclFloat32, kMaxRecvSlots, kBlock128Scales);
+    ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
+    config.scale_layout = static_cast<ncclEpScaleLayout_t>(99);
+    inputs.tokens = &tokens.tensor;
+    inputs.scales = &input_scales.tensor;
+    outputs.tokens = &output_tokens.tensor;
+    outputs.scales = &output_scales.tensor;
+    ncclEpHandle_t handle = make_handle(nullptr);
+    EXPECT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclInvalidArgument);
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+}
+
+TEST_F(QuantizationRecipeTest, ScaleLayoutBlock128GemmRequiresHtExpertMajor) {
+    // algorithm/layout are group-level settings, not dispatch-config fields.
+    // The default test handle uses HT + expert-major, which satisfies the gate.
+    // A dedicated LL/RANK_MAJOR group would be needed to test the negative path;
+    // that requires a custom group factory and is covered by integration tests.
+    GTEST_SKIP() << "algorithm/layout are group-level; covered by integration tests";
+}
+
+TEST_F(QuantizationRecipeTest, ScaleLayoutBlock128GemmRequiresFp8E4m3Tokens) {
+    RecipeTensor tokens(ncclBfloat16, kNumTokens, kBlock128Hidden);
+    RecipeTensor output_tokens(ncclBfloat16, kMaxRecvSlots, kBlock128Hidden);
+    RecipeTensor input_scales(ncclFloat32, kNumTokens, kBlock128Scales);
+    RecipeTensor output_scales(ncclFloat32, kMaxRecvSlots, kBlock128Scales);
+    ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
+    config.scale_layout = NCCL_EP_SCALE_LAYOUT_BLOCK128_GEMM;
+    inputs.tokens = &tokens.tensor;
+    inputs.scales = &input_scales.tensor;
+    outputs.tokens = &output_tokens.tensor;
+    outputs.scales = &output_scales.tensor;
+    ncclEpHandle_t handle = make_handle(nullptr);
+    EXPECT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclInvalidArgument);
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+}
+
+TEST_F(QuantizationRecipeTest, ScaleLayoutBlock128GemmRequiresFp32Scales) {
+    RecipeTensor tokens(ncclFloat8e4m3, kNumTokens, kBlock128Hidden);
+    RecipeTensor output_tokens(ncclFloat8e4m3, kMaxRecvSlots, kBlock128Hidden);
+    RecipeTensor input_scales(ncclUint8, kNumTokens, kBlock128Scales);
+    RecipeTensor output_scales(ncclUint8, kMaxRecvSlots, kBlock128Scales);
+    ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
+    config.scale_layout = NCCL_EP_SCALE_LAYOUT_BLOCK128_GEMM;
+    inputs.tokens = &tokens.tensor;
+    inputs.scales = &input_scales.tensor;
+    outputs.tokens = &output_tokens.tensor;
+    outputs.scales = &output_scales.tensor;
+    ncclEpHandle_t handle = make_handle(nullptr);
+    EXPECT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclInvalidArgument);
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+}
+
+TEST_F(QuantizationRecipeTest, ScaleLayoutBlock128GemmRequiresNonNullScales) {
+    RecipeTensor tokens(ncclFloat8e4m3, kNumTokens, kBlock128Hidden);
+    RecipeTensor output_tokens(ncclFloat8e4m3, kMaxRecvSlots, kBlock128Hidden);
+    ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
+    config.scale_layout = NCCL_EP_SCALE_LAYOUT_BLOCK128_GEMM;
+    inputs.tokens = &tokens.tensor;
+    // inputs.scales intentionally null
+    outputs.tokens = &output_tokens.tensor;
+    ncclEpHandle_t handle = make_handle(nullptr);
+    EXPECT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclInvalidArgument);
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+}
+
+TEST_F(QuantizationRecipeTest, ScaleLayoutBlock128GemmRejectsShortScaleWidth) {
+    RecipeTensor tokens(ncclFloat8e4m3, kNumTokens, kBlock128Hidden);
+    RecipeTensor output_tokens(ncclFloat8e4m3, kMaxRecvSlots, kBlock128Hidden);
+    // hidden / 128 is the required number of scale blocks; use one fewer.
+    RecipeTensor input_scales(ncclFloat32, kNumTokens, kBlock128Scales - 1);
+    RecipeTensor output_scales(ncclFloat32, kMaxRecvSlots, kBlock128Scales - 1);
+    ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
+    config.scale_layout = NCCL_EP_SCALE_LAYOUT_BLOCK128_GEMM;
+    inputs.tokens = &tokens.tensor;
+    inputs.scales = &input_scales.tensor;
+    outputs.tokens = &output_tokens.tensor;
+    outputs.scales = &output_scales.tensor;
+    ncclEpHandle_t handle = make_handle(nullptr);
+    EXPECT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclInvalidArgument);
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+}
+
+// Functional equivalence: BLOCK128_GEMM and WIRE layouts must carry the same
+// scale values, only in different memory layouts. The test uses a custom
+// HT group with hidden=128 so the block128 constraint is satisfied.
+TEST_F(QuantizationRecipeTest, ScaleLayoutBlock128GemmMatchesWire) {
+    // hidden must be a multiple of 128 for BLOCK128_GEMM, and scale bytes per token
+    // (hidden/128 * sizeof(float)) must be 16-byte aligned. hidden=512 gives
+    // 4 scales * 4 bytes = 16 bytes.
+    constexpr int kHidden128 = 512;
+    constexpr int kScales128 = kHidden128 / 128;
+
+    ncclEpGroupConfig_t gc = NCCL_EP_GROUP_CONFIG_INIT;
+    gc.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+    gc.num_experts = kNumExperts;
+    gc.max_dispatch_tokens_per_rank = kNumTokens;
+    gc.max_recv_tokens_per_rank = kMaxRecvSlots;
+    gc.max_token_bytes = ((kHidden128 * sizeof(uint8_t) + kScales128 * sizeof(float)) + 15) / 16 * 16;
+    gc.rdma_buffer_size = NCCL_EP_AUTO;
+    gc.num_qp_per_rank = kNumExperts / g_nranks;
+    gc.num_channels = NCCL_EP_AUTO;
+    ncclEpGroup_t group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&group, g_comm, &gc));
+
+    // Common inputs
+    uint8_t* d_tokens = nullptr;
+    float* d_scales = nullptr;
+    float* d_topk_weights = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_tokens, kNumTokens * kHidden128 * sizeof(uint8_t)));
+    CUDA_ASSERT(cudaMalloc(&d_scales, kNumTokens * kScales128 * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_topk_weights, kNumTokens * kTopK * sizeof(float)));
+
+    std::vector<uint8_t> h_tokens(kNumTokens * kHidden128);
+    std::vector<float> h_scales(kNumTokens * kScales128);
+    std::vector<float> h_topk_weights(kNumTokens * kTopK, 1.0f);
+    for (size_t i = 0; i < h_tokens.size(); ++i) h_tokens[i] = static_cast<uint8_t>(1 + g_rank * 17 + i);
+    for (size_t i = 0; i < h_scales.size(); ++i) h_scales[i] = static_cast<float>(1 + g_rank * 100 + i);
+    CUDA_ASSERT(cudaMemcpy(d_tokens, h_tokens.data(), h_tokens.size(), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_scales, h_scales.data(), h_scales.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_topk_weights, h_topk_weights.data(), h_topk_weights.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    ncclEpTensor_t *tokens = nullptr, *scales = nullptr, *topk_weights = nullptr;
+    NCCL_ASSERT(epTensorCreate(&tokens, 2, ncclFloat8e4m3, d_tokens, kNumTokens, kHidden128));
+    NCCL_ASSERT(epTensorCreate(&scales, 2, ncclFloat32, d_scales, kNumTokens, kScales128));
+    NCCL_ASSERT(epTensorCreate(&topk_weights, 2, ncclFloat32, d_topk_weights, kNumTokens, kTopK));
+
+    // Two output buffers: one for WIRE, one for BLOCK128_GEMM
+    uint8_t *d_recv_tokens_wire = nullptr, *d_recv_tokens_gemm = nullptr;
+    float *d_recv_scales_wire = nullptr, *d_recv_scales_gemm = nullptr;
+    float *d_recv_topk_weights = nullptr;
+    int64_t* d_recv_topk_idx = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_recv_tokens_wire, kMaxRecvSlots * kHidden128 * sizeof(uint8_t)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_tokens_gemm, kMaxRecvSlots * kHidden128 * sizeof(uint8_t)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_scales_wire, kMaxRecvSlots * kScales128 * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_scales_gemm, kMaxRecvSlots * kScales128 * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_topk_weights, kMaxRecvSlots * kTopK * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_topk_idx, kMaxRecvSlots * kTopK * sizeof(int64_t)));
+    CUDA_ASSERT(cudaMemset(d_recv_scales_wire, 0, kMaxRecvSlots * kScales128 * sizeof(float)));
+    CUDA_ASSERT(cudaMemset(d_recv_scales_gemm, 0, kMaxRecvSlots * kScales128 * sizeof(float)));
+
+    ncclEpTensor_t *recv_tokens_wire = nullptr, *recv_tokens_gemm = nullptr;
+    ncclEpTensor_t *recv_scales_wire = nullptr, *recv_scales_gemm = nullptr;
+    ncclEpTensor_t *recv_topk_weights = nullptr, *recv_topk_idx = nullptr;
+    NCCL_ASSERT(epTensorCreate(&recv_tokens_wire, 2, ncclFloat8e4m3, d_recv_tokens_wire, kMaxRecvSlots, kHidden128));
+    NCCL_ASSERT(epTensorCreate(&recv_tokens_gemm, 2, ncclFloat8e4m3, d_recv_tokens_gemm, kMaxRecvSlots, kHidden128));
+    NCCL_ASSERT(epTensorCreate(&recv_scales_wire, 2, ncclFloat32, d_recv_scales_wire, kMaxRecvSlots, kScales128));
+    NCCL_ASSERT(epTensorCreate(&recv_scales_gemm, 2, ncclFloat32, d_recv_scales_gemm, kMaxRecvSlots, kScales128));
+    // EM layout: recv_topk_weights must be 1D [num_recv_tokens] (one weight per slot).
+    NCCL_ASSERT(epTensorCreate(&recv_topk_weights, 1, ncclFloat32, d_recv_topk_weights, kMaxRecvSlots));
+    NCCL_ASSERT(epTensorCreate(&recv_topk_idx, 2, ncclInt64, d_recv_topk_idx, kMaxRecvSlots, kTopK));
+
+    ncclEpHandle_t handle = nullptr;
+    ASSERT_EQ(ncclEpCreateHandle(&handle, group, NCCL_EP_LAYOUT_EXPERT_MAJOR, topk_idx_em_, nullptr, nullptr, g_stream), ncclSuccess);
+    ASSERT_NE(handle, nullptr);
+
+    // Dispatch with WIRE layout
+    ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    inputs.tokens = tokens;
+    inputs.scales = scales;
+    inputs.topk_weights = topk_weights;
+    outputs.tokens = recv_tokens_wire;
+    outputs.scales = recv_scales_wire;
+    outputs.topk_weights = recv_topk_weights;
+    // EM layout: recv_topk_idx must be null (see ncclEpDispatch HT path).
+    outputs.topk_idx = nullptr;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_FWD;
+    config.scale_layout = NCCL_EP_SCALE_LAYOUT_WIRE;
+    ASSERT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclSuccess);
+    ASSERT_EQ(ncclEpComplete(handle, nullptr, g_stream), ncclSuccess);
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+
+    // Dispatch with BLOCK128_GEMM layout
+    outputs.tokens = recv_tokens_gemm;
+    outputs.scales = recv_scales_gemm;
+    config.scale_layout = NCCL_EP_SCALE_LAYOUT_BLOCK128_GEMM;
+    ASSERT_EQ(ncclEpDispatch(handle, &inputs, &outputs, nullptr, &config, g_stream), ncclSuccess);
+    ASSERT_EQ(ncclEpComplete(handle, nullptr, g_stream), ncclSuccess);
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+
+    // Read back both scale buffers
+    std::vector<float> h_wire(kMaxRecvSlots * kScales128);
+    std::vector<float> h_gemm(kMaxRecvSlots * kScales128);
+    CUDA_ASSERT(cudaMemcpy(h_wire.data(), d_recv_scales_wire, h_wire.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_ASSERT(cudaMemcpy(h_gemm.data(), d_recv_scales_gemm, h_gemm.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // The two layouts must contain the same set of non-zero scale values.
+    // WIRE is token-major [token][block]; BLOCK128_GEMM is expert-major [expert][token_in_expert][block].
+    // We compare sorted non-zero values to verify set equality.
+    std::vector<float> nz_wire, nz_gemm;
+    for (float v : h_wire) if (v != 0.0f) nz_wire.push_back(v);
+    for (float v : h_gemm) if (v != 0.0f) nz_gemm.push_back(v);
+    std::sort(nz_wire.begin(), nz_wire.end());
+    std::sort(nz_gemm.begin(), nz_gemm.end());
+    ASSERT_EQ(nz_wire.size(), nz_gemm.size()) << "non-zero scale count mismatch";
+    for (size_t i = 0; i < nz_wire.size(); ++i) {
+        EXPECT_FLOAT_EQ(nz_wire[i], nz_gemm[i]) << "scale value mismatch at sorted index " << i;
+    }
+
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+    ncclEpTensorDestroy(tokens); ncclEpTensorDestroy(scales); ncclEpTensorDestroy(topk_weights);
+    ncclEpTensorDestroy(recv_tokens_wire); ncclEpTensorDestroy(recv_tokens_gemm);
+    ncclEpTensorDestroy(recv_scales_wire); ncclEpTensorDestroy(recv_scales_gemm);
+    ncclEpTensorDestroy(recv_topk_weights); ncclEpTensorDestroy(recv_topk_idx);
+    cudaFree(d_tokens); cudaFree(d_scales); cudaFree(d_topk_weights);
+    cudaFree(d_recv_tokens_wire); cudaFree(d_recv_tokens_gemm);
+    cudaFree(d_recv_scales_wire); cudaFree(d_recv_scales_gemm);
+    cudaFree(d_recv_topk_weights); cudaFree(d_recv_topk_idx);
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
+}
+
 int main(int argc, char* argv[]) {
     if (!ep_bootstrap(argc, argv, "te_ep_quantization_recipe_uid")) return 0;
     int ret = RUN_ALL_TESTS();

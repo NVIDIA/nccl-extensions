@@ -1091,7 +1091,8 @@ ncclResult_t call_metadata_preprocessing(
             sp.out_is_int64 = out_is_int64;
             sp.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
             sp.allow_overflow_drop = allow_overflow_drop;
-            sp.token_to_recv_slot = nullptr;  // not needed: recv slot known at emit
+            // Preserve the prepared map for routing-aware source quantizers.
+            sp.token_to_recv_slot = token_to_recv_slot;
             // EM-permute outputs.
             sp.expert_scan_tmp = expert_scan_tmp;
             sp.flat2em_slot_map = flat2em_slot_map;
@@ -2458,6 +2459,8 @@ void launch_dispatch_permute(
     void* recv_scales_em,
     const void* flat_scale_staging,
     int scale_row_bytes,
+    int scale_blocks,
+    bool scale_gemm_layout,
     int32_t* flat2em_out,
     const bool* lerm_in,
     bool* lerm_out,
@@ -2495,6 +2498,8 @@ void launch_dispatch_permute(
     p.recv_scales_em = recv_scales_em;
     p.flat_scale_staging = flat_scale_staging;
     p.scale_row_bytes = scale_row_bytes;
+    p.scale_blocks = scale_blocks;
+    p.scale_gemm_layout = scale_gemm_layout;
     p.flat2em_out = flat2em_out;
     p.lerm_in = lerm_in;
     p.lerm_out = lerm_out;
@@ -2549,6 +2554,7 @@ ncclResult_t launch_dispatch_pull(
     int32_t* flat2em_slot_map,
     int32_t* srcpos_map,
     int32_t* recv_slot_to_src,
+    int32_t* token_to_recv_slot,
     const void* const* peer_input_ptrs,
     const float* const* peer_weight_ptrs,
     const void* const* peer_scale_ptrs,
@@ -2619,6 +2625,7 @@ ncclResult_t launch_dispatch_pull(
     p.flat2em_slot_map = flat2em_slot_map;
     p.srcpos_map = srcpos_map;
     p.recv_slot_to_src = recv_slot_to_src;
+    p.token_to_recv_slot = token_to_recv_slot;
     EP_HOST_ASSERT(lsa_team_size > 0 && lsa_team_size <= ::ht_ep::kPullMaxLsaRanks);
     for (int i = 0; i < lsa_team_size; i++) {
         p.peer_input_ptrs[i] = peer_input_ptrs[i];

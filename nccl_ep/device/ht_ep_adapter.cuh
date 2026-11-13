@@ -431,11 +431,13 @@ void launch_dispatch_permute(
     void* recv_scales_em,
     const void* flat_scale_staging,
     int scale_row_bytes,
+    int scale_blocks,
+    bool scale_gemm_layout,
     int32_t* flat2em_out,
     const bool* lerm_in,
     bool* lerm_out,
     int32_t* em_permute_cursors,
-    // Map rebuild + DROP: gates an in-kernel phantom-row correction (see
+    // Count mode + DROP only: gates an in-kernel phantom-row correction (see
     // local_permute_dup_param_t::allow_overflow_drop in ht_ep.cuh for why it's needed).
     // Ignored (no correction) when em_permute_cursors is null.
     bool allow_overflow_drop,
@@ -471,6 +473,7 @@ ncclResult_t launch_dispatch_pull(
     int32_t* flat2em_slot_map,
     int32_t* srcpos_map,
     int32_t* recv_slot_to_src,
+    int32_t* token_to_recv_slot,
     const void* const* peer_input_ptrs,
     const float* const* peer_weight_ptrs,
     const void* const* peer_scale_ptrs,

@@ -2990,6 +2990,11 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             reqs.ginForceEnable = true;
             reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
             reqs.worldGinBarrierCount = 1;
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 5)
+            // LL signals and its GIN barrier use indexed signals only, so do not
+            // require VA signals from the GIN backend.
+            reqs.ginVaSignalsRequired = false;
+#endif
         }
         ncclDevComm_t* nccl_dev_comm_host = nullptr;
         size_t dcomm_bytes = 0;

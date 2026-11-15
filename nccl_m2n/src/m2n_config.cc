@@ -77,6 +77,20 @@ bool parsePipeNetModeEnv(const char* s, ReshardPipeNetMode* out) {
   return false;
 }
 
+bool parsePackNetModeEnv(const char* s, ReshardPackNetMode* out) {
+  if (s == nullptr || out == nullptr) return false;
+  if (strcasecmp(s, "RMA") == 0) {
+    *out = RESHARD_PACK_NET_RMA;
+    return true;
+  }
+  if (strcasecmp(s, "HOST_SENDRECV") == 0 || strcasecmp(s, "HOST-SENDRECV") == 0 ||
+      strcasecmp(s, "HOSTSENDRECV") == 0 || strcasecmp(s, "SENDRECV") == 0) {
+    *out = RESHARD_PACK_NET_HOST_SENDRECV;
+    return true;
+  }
+  return false;
+}
+
 bool parseLbModeEnv(const char* s, ReshardLoadBalanceMode* out) {
   if (s == nullptr || out == nullptr) return false;
   if (strcasecmp(s, "UNIFORM") == 0) {
@@ -142,6 +156,7 @@ void resetReshardRuntimeConfig() {
   gReshardLbMode = RESHARD_LB_UNIFORM;
   gReshardCopyAlgorithm = RESHARD_COPY_ALGO_PACK;
   gReshardPipeNetMode = RESHARD_PIPE_NET_DEVICE;
+  gReshardPackNetMode = RESHARD_PACK_NET_RMA;
   gReshardStagingRuntimeConfig = {};
   gReshardAutoUniformBcast = true;
   gReshardAutoUniformBcastSet = false;
@@ -287,6 +302,17 @@ void applyReshardEnv() {
   ReshardPipeNetMode pipeNetMode;
   if (parsePipeNetModeEnv(getenv("NCCL_RESHARD_PIPE_NET_MODE"), &pipeNetMode)) {
     gReshardPipeNetMode = pipeNetMode;
+  }
+
+  const char* packNetModeEnv = getenv("NCCL_RESHARD_PACK_NET_MODE");
+  ReshardPackNetMode packNetMode;
+  if (packNetModeEnv != nullptr) {
+    if (parsePackNetModeEnv(packNetModeEnv, &packNetMode)) {
+      gReshardPackNetMode = packNetMode;
+    } else {
+      RESHARD_WARN(-1, "NCCL_RESHARD_PACK_NET_MODE=\"%s\" is not supported; accepted values are RMA and HOST_SENDRECV",
+                   packNetModeEnv);
+    }
   }
 
   ReshardLoadBalanceMode lb;

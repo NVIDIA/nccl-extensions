@@ -215,6 +215,12 @@ add_test(NAME basic_api_test_local
 add_test(NAME basic_api_pack_local
          COMMAND basic_api_test_local --api default --copy-algorithm pack
          WORKING_DIRECTORY "${NCCL_M2N_RUNTIME_DIR}")
+add_test(NAME basic_api_pack_host_sendrecv_local
+         COMMAND basic_api_test_local --api default --copy-algorithm pack
+                 --gtest_filter=Matrix/BasicApiLocalTest.*
+         WORKING_DIRECTORY "${NCCL_M2N_RUNTIME_DIR}")
+set_tests_properties(basic_api_pack_host_sendrecv_local
+                     PROPERTIES ENVIRONMENT "NCCL_RESHARD_PACK_NET_MODE=HOST_SENDRECV")
 # basic_api_test_mpi is launched under mpirun, not registered as a plain
 # ctest entry.
 

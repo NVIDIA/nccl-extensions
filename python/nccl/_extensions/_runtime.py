@@ -26,7 +26,9 @@ def cuda_major() -> int:
 def bundled_library(libname: str) -> str | None:
     """Return the bundled library matching the installed ``cuda.bindings``."""
     package_dir = Path(__file__).resolve().parent.parent / libname.removeprefix("nccl_")
-    library = package_dir / "lib" / f"cu{cuda_major()}" / f"lib{libname}.so"
+    # EP's bundled ABI major is fixed by this package's native build.
+    filename = "libnccl_ep.so.0" if libname == "nccl_ep" else f"lib{libname}.so"
+    library = package_dir / "lib" / f"cu{cuda_major()}" / filename
     return str(library) if library.is_file() else None
 
 

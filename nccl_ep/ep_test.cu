@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
 #include "cuda_runtime.h"
 #include "nccl.h"
 #include "nccl_ep.h"

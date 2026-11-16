@@ -24,6 +24,7 @@ enum class JitKernelStatus {
     kLoadFailed,
     kAttributeFailed,
     kLaunchFailed,
+    kInsufficientResidency,
 };
 
 struct JitKernelVariant {
@@ -36,12 +37,20 @@ struct JitKernelVariant {
     int num_blocks = 0;
     int block_dim = 0;
     int dynamic_smem_bytes = 0;
+    // Host-side estimate of the kernel's static __shared__; -1 skips the check against the compiled value.
+    int expected_static_smem_bytes = -1;
     int min_sm = 90;
+    int device_sm = 0;  // Optional architecture cached at group creation.
+    // LL propagates cache errors; false preserves HT cache eviction and fallback.
+    bool propagate_cache_errors = false;
     std::string_view target_arch;
     // Optional launch attributes (default = off).
     // Cooperative launch enables cg::this_grid().sync() inside the kernel.
     // Cluster dim > 1 enables distributed shared memory across the cluster.
+    bool nucs = false;
     bool cooperative = false;
+    // Validate grid residency using the compiled kernel before enqueueing it.
+    bool require_full_residency = false;
     int cluster_dim_x = 1;
     int cluster_dim_y = 1;
     int cluster_dim_z = 1;
@@ -81,6 +90,9 @@ JitKernelStatus launch_jit_kernel_cached(
     std::size_t kernel_param_size,
     cudaStream_t stream,
     std::string* error);
+
+// Returns whether NUCS is available with both the build headers and runtime driver.
+bool ensure_nucs_available();
 
 JitKernelStatus launch_jit_kernel(
     const JitKernelVariant& variant,

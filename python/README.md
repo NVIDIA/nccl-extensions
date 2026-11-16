@@ -33,11 +33,17 @@ Building requires a CUDA toolkit and a Cython toolchain.
 Stage native artifacts before building a distributable wheel:
 
 ```text
-python/nccl/ep/lib/cu{12,13}/libnccl_ep.so
+python/nccl/ep/lib/cu{12,13}/libnccl_ep.so.0
 python/nccl/ep/include/**
 python/nccl/m2n/lib/cu{12,13}/libnccl_m2n.so
 python/nccl/m2n/include/**
 ```
+
+EP wheels include one regular SONAME file (currently `libnccl_ep.so.0`) in
+each `nccl/ep/lib/cu{12,13}/` directory. The Python loader opens this file
+directly. Native consumers can link with `-l:libnccl_ep.so.0` (or its full
+path) and set RPATH/RUNPATH to the matching CUDA variant directory. Wheels
+do not include the unversioned linker name or the full release-version name.
 
 For a complete Linux wheel build, the internal
 [`build_assets/build_wheels.sh`](build_assets/README.md) script builds and
@@ -69,6 +75,83 @@ and its headers must match the selected CUDA major.
 > **Do not run Python from inside `python/`.** There is no `nccl/__init__.py`
 > there, so that directory resolves only as a namespace portion and these
 > modules become invisible. Always go through the editable install.
+
+## NCCL EP handle lifecycle
+
+`Group.create_handle(...)` remains the fused route. The v0.2 facade also
+exposes the split and imported-handle C APIs, which let applications allocate
+routing memory before CUDA graph capture or restore a prepared HT routing
+buffer:
+
+```python
+import nccl.ep as ep
+from nccl.core.typing import NcclDataType
+
+# device_uint8_buffer must provide at least this many bytes.
+num_bytes = group.handle_mem_size(ep.Layout.EXPERT_MAJOR, num_topk=-1)
+handle_mem = ep.Tensor(device_uint8_buffer)
+
+handle = group.init_handle(
+    ep.Layout.EXPERT_MAJOR,
+    num_topk=-1,
+    handle_mem=handle_mem,
+)
+handle.update(topk_idx, layout_info=layout_info, stream=stream)
+
+# After copying a prepared HT handle buffer, bind the snapshot locally.
+state = ep.HandleState(
+    num_tokens=num_tokens,
+    num_topk=num_topk,
+    topk_idx_datatype=NcclDataType.INT32,
+)
+restored = group.import_handle(
+    ep.Layout.EXPERT_MAJOR,
+    state,
+    restored_handle_mem,
+)
+```
+
+Combine-side MXFP8 is selected with
+`CombineConfig(quantization_recipe=CombineQuantizationRecipe.MXFP8)`. It is an
+HT expert-major, single-LSA-team path; input tokens are BF16 and
+`CombineInputs.scales` must be `None` because NCCL EP generates E8M0 scales
+internally.
+
+## NCCL EP active-mask fault tolerance
+
+Create an LL group with `GroupConfig(enable_mask=True)` to enable rank masking.
+The public group methods expose the mask and the separate host timeout flag:
+
+```python
+import numpy as np
+
+# mask_status is a preallocated ep.Tensor over contiguous GPU int32[num_ranks]
+# memory on the group's device. Allocate it before CUDA graph capture.
+group.mask_query(mask_status, stream=stream)
+
+# Update takes CPU memory; keep it alive and unchanged until stream completion.
+mask = np.ones(num_ranks, dtype=np.int32)
+mask[-1] = 0  # 1 = active, 0 = masked
+group.mask_update(mask, stream=stream)
+
+error = group.get_async_error()  # 0 = no error, 1 = a rank timed out
+
+# After at least one LL handle has been initialized, all surviving ranks
+# call clean together to reset RDMA buffers and re-admit delayed ranks.
+group.mask_clean(stream=stream)
+stream.sync()
+group.error_clear()  # Clean does not clear the timeout flag.
+```
+
+`mask_query` fills the supplied output without allocating or synchronizing and
+supports CUDA graph capture. Keep the output buffer alive through completion of
+all graph replays. Read it in stream order, or establish a dependency before
+using it on another stream. Reading on the CPU requires a device-to-host copy
+and synchronization. `mask_update` does not promise graph capture support.
+Error polling and clearing operate on the host without GPU synchronization.
+These methods are not supported for HT groups. Mask cleaning re-admits delayed
+ranks within the same communicator; replacing a failed rank requires a new
+communicator and EP group.
 
 ## Generated bindings
 

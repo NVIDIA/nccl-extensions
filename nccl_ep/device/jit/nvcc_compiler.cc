@@ -206,6 +206,9 @@ std::vector<std::string> NvccCompiler::compile_options(const JitCompileConfig& c
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     options.push_back("-DNCCL_EP_HT_ENABLE_WARP_TIMING=1");
 #endif
+#ifdef NCCL_EP_COMBINE_MAX_ACC
+    options.push_back("-DNCCL_EP_COMBINE_MAX_ACC=" + std::to_string(NCCL_EP_COMBINE_MAX_ACC));
+#endif
 #ifdef NDEBUG
     options.push_back("-DNDEBUG=1");
 #endif

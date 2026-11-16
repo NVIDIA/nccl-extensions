@@ -51,54 +51,6 @@ static ncclResult_t fillStagingPlan(StagingTransferPlan* sp, const ncclReshardTr
   return ncclSuccess;
 }
 
-/* Helper to derive both meshes' local dims/strides from the half the
- * caller actually provided, matching prepareReshardParams's behaviour
- * for asymmetric ranks. */
-static ncclResult_t resolveLocalDims(const size_t* srcTensorDims, const size_t* dstTensorDims, int ndims,
-                                     int srcShardDim, int srcShardCount, int dstShardDim, int dstShardCount,
-                                     bool isSource, bool isDest, size_t srcDims[NCCL_RESHARD_MAX_TENSOR_DIMS],
-                                     size_t dstDims[NCCL_RESHARD_MAX_TENSOR_DIMS],
-                                     size_t srcStrides[NCCL_RESHARD_MAX_TENSOR_DIMS],
-                                     size_t dstStrides[NCCL_RESHARD_MAX_TENSOR_DIMS]) {
-  if (isSource) {
-    for (int d = 0; d < ndims; d++) {
-      srcDims[d] = srcTensorDims[d];
-    }
-    NCCL_M2N_CHECK(computeStridesChecked(srcDims, ndims, srcStrides));
-  }
-  if (isDest) {
-    for (int d = 0; d < ndims; d++) {
-      dstDims[d] = dstTensorDims[d];
-    }
-    NCCL_M2N_CHECK(computeStridesChecked(dstDims, ndims, dstStrides));
-  }
-  if (isSource && !isDest) {
-    for (int d = 0; d < ndims; d++) {
-      size_t globalSize = srcTensorDims[d];
-      if (d == srcShardDim) {
-        NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(srcTensorDims[d], (size_t)srcShardCount, &globalSize), -1,
-                           "[STAGING] source global dim overflow at dim %d: local=%zu shardCount=%d", d,
-                           srcTensorDims[d], srcShardCount);
-      }
-      dstDims[d] = (d == dstShardDim) ? globalSize / dstShardCount : globalSize;
-    }
-    NCCL_M2N_CHECK(computeStridesChecked(dstDims, ndims, dstStrides));
-  }
-  if (isDest && !isSource) {
-    for (int d = 0; d < ndims; d++) {
-      size_t globalSize = dstTensorDims[d];
-      if (d == dstShardDim) {
-        NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(dstTensorDims[d], (size_t)dstShardCount, &globalSize), -1,
-                           "[STAGING] destination global dim overflow at dim %d: local=%zu shardCount=%d", d,
-                           dstTensorDims[d], dstShardCount);
-      }
-      srcDims[d] = (d == srcShardDim) ? globalSize / srcShardCount : globalSize;
-    }
-    NCCL_M2N_CHECK(computeStridesChecked(srcDims, ndims, srcStrides));
-  }
-  return ncclSuccess;
-}
-
 static int pickLocalRepIndex(int sourcePosition, int numSources, int numLocalReps) {
   if (numSources <= 0 || numLocalReps <= 0) {
     return 0;
@@ -147,48 +99,16 @@ static int computeStagingPeerGroupSizeBound(const StagingTransferDescriptor* des
   return bound;
 }
 
-static ncclResult_t deriveGlobalDimsFromLocal(int worldRank, const char* side, const size_t* localDims, int ndims,
-                                              int shardTensorDim, int shardCount,
-                                              size_t globalDims[NCCL_RESHARD_MAX_TENSOR_DIMS]) {
-  NCCL_M2N_CHECK_ARG(localDims != nullptr, worldRank,
-                     "validateStagingPlanLimits: %s local shape array must be non-null", side);
-  NCCL_M2N_CHECK_ARG(shardCount > 0, worldRank, "validateStagingPlanLimits: %s shard count must be positive", side);
-  for (int d = 0; d < ndims; d++) {
-    NCCL_M2N_CHECK_ARG(localDims[d] > 0, worldRank,
-                       "validateStagingPlanLimits: %s localShape[%d]=%zu must be positive, including on inactive "
-                       "ranks",
-                       side, d, localDims[d]);
-    if (d == shardTensorDim) {
-      NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(localDims[d], static_cast<size_t>(shardCount), &globalDims[d]), worldRank,
-                         "validateStagingPlanLimits: %s localShape[%d]=%zu overflows global shape with shard count %d",
-                         side, d, localDims[d], shardCount);
-    } else {
-      globalDims[d] = localDims[d];
-    }
-  }
-  return ncclSuccess;
-}
-
-static ncclResult_t compareGlobalDims(int worldRank, const size_t srcGlobalDims[], const size_t dstGlobalDims[],
-                                      int ndims) {
-  for (int d = 0; d < ndims; d++) {
-    NCCL_M2N_CHECK_ARG(srcGlobalDims[d] == dstGlobalDims[d], worldRank,
-                       "validateStagingPlanLimits: src/dst global shape mismatch at dim %d (%zu != %zu)", d,
-                       srcGlobalDims[d], dstGlobalDims[d]);
-  }
-  return ncclSuccess;
-}
-
 static ncclResult_t computeMaxShardEdgeBytes(int worldRank, const size_t srcDims[], const size_t srcStrides[],
-                                             int srcShardDim, int srcShardCount, const size_t dstDims[],
-                                             const size_t dstStrides[], int dstShardDim, int dstShardCount, int ndims,
+                                             const ncclReshardShardLayout_t& srcShardLayout, int srcShardCount, const size_t dstDims[],
+                                             const size_t dstStrides[], const ncclReshardShardLayout_t& dstShardLayout, int dstShardCount, int ndims,
                                              size_t* maxEdgeBytes) {
   NCCL_M2N_CHECK_ARG(maxEdgeBytes != nullptr, worldRank, "computeMaxShardEdgeBytes: output must be non-null");
   *maxEdgeBytes = 0;
   for (int ss = 0; ss < srcShardCount; ss++) {
     for (int ds = 0; ds < dstShardCount; ds++) {
       ncclReshardTransferPlan plan;
-      NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, ss, dstDims, dstStrides, dstShardDim,
+      NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, ss, dstDims, dstStrides, dstShardLayout,
                                                 ds, ndims, /*elementsPerChunk=*/1, &plan));
       if (plan.totalInnerTransfers == 0) {
         continue;
@@ -203,57 +123,13 @@ static ncclResult_t computeMaxShardEdgeBytes(int worldRank, const size_t srcDims
   return ncclSuccess;
 }
 
-static ncclResult_t deriveLocalDimsFromGlobal(int worldRank, const char* side, const size_t globalDims[], int ndims,
-                                              int shardTensorDim, int shardCount,
-                                              size_t localDims[NCCL_RESHARD_MAX_TENSOR_DIMS]) {
-  NCCL_M2N_CHECK_ARG(shardCount > 0, worldRank, "validateStagingPlanLimits: %s shard count must be positive", side);
-  for (int d = 0; d < ndims; d++) {
-    if (d == shardTensorDim) {
-      NCCL_M2N_CHECK_ARG(globalDims[d] % static_cast<size_t>(shardCount) == 0, worldRank,
-                         "validateStagingPlanLimits: %s global shape dim %d (%zu) is not divisible by shard count %d",
-                         side, d, globalDims[d], shardCount);
-      localDims[d] = globalDims[d] / static_cast<size_t>(shardCount);
-    } else {
-      localDims[d] = globalDims[d];
-    }
-  }
-  return ncclSuccess;
-}
-
-static ncclResult_t resolvePreflightDims(int worldRank, const size_t* srcTensorDims, const size_t* dstTensorDims,
-                                         int ndims, int srcShardDim, int srcShardCount, int dstShardDim,
-                                         int dstShardCount, size_t srcDims[NCCL_RESHARD_MAX_TENSOR_DIMS],
-                                         size_t dstDims[NCCL_RESHARD_MAX_TENSOR_DIMS],
-                                         size_t srcStrides[NCCL_RESHARD_MAX_TENSOR_DIMS],
-                                         size_t dstStrides[NCCL_RESHARD_MAX_TENSOR_DIMS]) {
-  size_t srcGlobalDims[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
-  size_t dstGlobalDims[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
-  size_t globalDims[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
-
-  NCCL_M2N_CHECK(deriveGlobalDimsFromLocal(worldRank, "src", srcTensorDims, ndims, srcShardDim, srcShardCount,
-                                           srcGlobalDims));
-  NCCL_M2N_CHECK(deriveGlobalDimsFromLocal(worldRank, "dst", dstTensorDims, ndims, dstShardDim, dstShardCount,
-                                           dstGlobalDims));
-  NCCL_M2N_CHECK(compareGlobalDims(worldRank, srcGlobalDims, dstGlobalDims, ndims));
-
-  for (int d = 0; d < ndims; d++) {
-    globalDims[d] = srcGlobalDims[d];
-  }
-
-  NCCL_M2N_CHECK(deriveLocalDimsFromGlobal(worldRank, "src", globalDims, ndims, srcShardDim, srcShardCount, srcDims));
-  NCCL_M2N_CHECK(deriveLocalDimsFromGlobal(worldRank, "dst", globalDims, ndims, dstShardDim, dstShardCount, dstDims));
-  NCCL_M2N_CHECK(computeStridesChecked(srcDims, ndims, srcStrides));
-  NCCL_M2N_CHECK(computeStridesChecked(dstDims, ndims, dstStrides));
-  return ncclSuccess;
-}
-
-static int countOverlappingDstShards(const size_t srcDims[], const size_t srcStrides[], int srcShardDim,
+static int countOverlappingDstShards(const size_t srcDims[], const size_t srcStrides[], const ncclReshardShardLayout_t& srcShardLayout,
                                      int srcShardIdx, const size_t dstDims[], const size_t dstStrides[],
-                                     int dstShardDim, int dstShardCount, int ndims) {
+                                     const ncclReshardShardLayout_t& dstShardLayout, int dstShardCount, int ndims) {
   int count = 0;
   for (int dstShard = 0; dstShard < dstShardCount; dstShard++) {
     ncclReshardTransferPlan plan;
-    computeTransferPlan(srcDims, srcStrides, srcShardDim, srcShardIdx, dstDims, dstStrides, dstShardDim, dstShard,
+    computeTransferPlan(srcDims, srcStrides, srcShardLayout, srcShardIdx, dstDims, dstStrides, dstShardLayout, dstShard,
                         ndims, /*elementsPerChunk=*/1, &plan);
     if (plan.totalInnerTransfers > 0) {
       count++;
@@ -262,13 +138,13 @@ static int countOverlappingDstShards(const size_t srcDims[], const size_t srcStr
   return count;
 }
 
-static int countOverlappingSrcShards(const size_t srcDims[], const size_t srcStrides[], int srcShardDim,
+static int countOverlappingSrcShards(const size_t srcDims[], const size_t srcStrides[], const ncclReshardShardLayout_t& srcShardLayout,
                                      int srcShardCount, const size_t dstDims[], const size_t dstStrides[],
-                                     int dstShardDim, int dstShardIdx, int ndims) {
+                                     const ncclReshardShardLayout_t& dstShardLayout, int dstShardIdx, int ndims) {
   int count = 0;
   for (int srcShard = 0; srcShard < srcShardCount; srcShard++) {
     ncclReshardTransferPlan plan;
-    computeTransferPlan(srcDims, srcStrides, srcShardDim, srcShard, dstDims, dstStrides, dstShardDim, dstShardIdx,
+    computeTransferPlan(srcDims, srcStrides, srcShardLayout, srcShard, dstDims, dstStrides, dstShardLayout, dstShardIdx,
                         ndims, /*elementsPerChunk=*/1, &plan);
     if (plan.totalInnerTransfers > 0) {
       count++;
@@ -309,8 +185,8 @@ static ncclResult_t validateRankStagingCounts(
     const int targetRepCount = targetRepEnd - targetRepStart;
     if (targetRepCount > 0) {
       const int overlapDstCount =
-        countOverlappingDstShards(srcDims, srcStrides, fullSrcInfo->shardTensorDim, srcInfo.shardIdx, dstDims,
-                                  dstStrides, fullDstInfo->shardTensorDim, fullDstInfo->shardCount, ndims);
+        countOverlappingDstShards(srcDims, srcStrides, fullSrcInfo->shardLayout, srcInfo.shardIdx, dstDims,
+                                  dstStrides, fullDstInfo->shardLayout, fullDstInfo->shardCount, ndims);
       if (copyAlgo == RESHARD_COPY_ALGO_DIRECT) {
         size_t directTargets = 0;
         NCCL_M2N_CHECK_ARG(
@@ -326,8 +202,8 @@ static ncclResult_t validateRankStagingCounts(
   if (isDest) {
     ncclReshardMeshGroupInfo dstInfo;
     computeMeshGroupInfo(dstTensor, rank, &dstInfo);
-    numSources = countOverlappingSrcShards(srcDims, srcStrides, fullSrcInfo->shardTensorDim, fullSrcInfo->shardCount,
-                                           dstDims, dstStrides, fullDstInfo->shardTensorDim, dstInfo.shardIdx, ndims);
+    numSources = countOverlappingSrcShards(srcDims, srcStrides, fullSrcInfo->shardLayout, fullSrcInfo->shardCount,
+                                           dstDims, dstStrides, fullDstInfo->shardLayout, dstInfo.shardIdx, ndims);
 
     if (copyAlgo != RESHARD_COPY_ALGO_DIRECT && numSources > 0) {
       int sourceRep = getSourceRepForDest(lb, dstInfo.repIdx);
@@ -478,9 +354,10 @@ ncclResult_t validateStagingPlanLimits(int worldRank, const ncclDistTensor_t* sr
   size_t dstDims[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
   size_t srcStrides[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
   size_t dstStrides[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
-  NCCL_M2N_CHECK(resolvePreflightDims(worldRank, srcTensorDims, dstTensorDims, srcTensor->ndims,
-                                      fullSrcInfo.shardTensorDim, fullSrcInfo.shardCount, fullDstInfo.shardTensorDim,
-                                      fullDstInfo.shardCount, srcDims, dstDims, srcStrides, dstStrides));
+  NCCL_M2N_CHECK(resolveReshardDims(worldRank, srcTensorDims, fullSrcInfo.shardLayout, dstTensorDims,
+                                    fullDstInfo.shardLayout, srcTensor->ndims, srcDims, dstDims));
+  NCCL_M2N_CHECK(computeStridesChecked(srcDims, srcTensor->ndims, srcStrides));
+  NCCL_M2N_CHECK(computeStridesChecked(dstDims, dstTensor->ndims, dstStrides));
 
   ncclReshardRepLoadBalancer lb = {};
   lb.srcRepCount = fullSrcInfo.repCount;
@@ -543,8 +420,8 @@ ncclResult_t buildStagingTransferDescriptor(
   computeMeshGroupInfo(srcTensor, srcMesh->startRank, &fullSrcInfo);
   computeMeshGroupInfo(dstTensor, dstMesh->startRank, &fullDstInfo);
 
-  int srcShardDim = fullSrcInfo.shardTensorDim;
-  int dstShardDim = fullDstInfo.shardTensorDim;
+  const ncclReshardShardLayout_t& srcShardLayout = fullSrcInfo.shardLayout;
+  const ncclReshardShardLayout_t& dstShardLayout = fullDstInfo.shardLayout;
   int srcShardCount = fullSrcInfo.shardCount;
   int dstShardCount = fullDstInfo.shardCount;
 
@@ -552,8 +429,10 @@ ncclResult_t buildStagingTransferDescriptor(
   size_t dstDims[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
   size_t srcStrides[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
   size_t dstStrides[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
-  NCCL_M2N_CHECK(resolveLocalDims(srcTensorDims, dstTensorDims, ndims, srcShardDim, srcShardCount, dstShardDim,
-                                  dstShardCount, isSource, isDest, srcDims, dstDims, srcStrides, dstStrides));
+  NCCL_M2N_CHECK(resolveReshardDims(worldRank, srcTensorDims, srcShardLayout, dstTensorDims,
+                                    dstShardLayout, ndims, srcDims, dstDims));
+  NCCL_M2N_CHECK(computeStridesChecked(srcDims, ndims, srcStrides));
+  NCCL_M2N_CHECK(computeStridesChecked(dstDims, ndims, dstStrides));
 
   ncclReshardMeshGroupInfo srcInfo{}, dstInfo{};
   if (isSource) {
@@ -569,8 +448,8 @@ ncclResult_t buildStagingTransferDescriptor(
     desc->srcStrides[d] = srcStrides[d];
     desc->dstStrides[d] = dstStrides[d];
   }
-  NCCL_M2N_CHECK(computeMaxShardEdgeBytes(worldRank, srcDims, srcStrides, srcShardDim, srcShardCount, dstDims,
-                                          dstStrides, dstShardDim, dstShardCount, ndims, &desc->maxEdgeBytes));
+  NCCL_M2N_CHECK(computeMaxShardEdgeBytes(worldRank, srcDims, srcStrides, srcShardLayout, srcShardCount, dstDims,
+                                          dstStrides, dstShardLayout, dstShardCount, ndims, &desc->maxEdgeBytes));
   desc->hasLocalFanout = fullDstInfo.repCount > 1;
 
   const int srcGpd = std::max(1, srcGpusPerDomain);
@@ -632,8 +511,8 @@ ncclResult_t buildStagingTransferDescriptor(
 
     for (int dstShard = 0; dstShard < dstShardCount; dstShard++) {
       ncclReshardTransferPlan plan;
-      NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, srcInfo.shardIdx, dstDims, dstStrides,
-                                                dstShardDim, dstShard, ndims, epc_dummy, &plan));
+      NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, srcInfo.shardIdx, dstDims, dstStrides,
+                                                dstShardLayout, dstShard, ndims, epc_dummy, &plan));
 
       if (plan.totalInnerTransfers == 0) {
         continue;
@@ -650,8 +529,8 @@ ncclResult_t buildStagingTransferDescriptor(
       int myPosition = 0;
       for (int ss = 0; ss < srcShardCount; ss++) {
         ncclReshardTransferPlan check;
-        NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, ss, dstDims, dstStrides,
-                                                  dstShardDim, dstShard, ndims, epc_dummy, &check));
+        NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, ss, dstDims, dstStrides,
+                                                  dstShardLayout, dstShard, ndims, epc_dummy, &check));
         if (check.totalInnerTransfers > 0) {
           if (ss < srcInfo.shardIdx) {
             myPosition++;
@@ -769,7 +648,7 @@ ncclResult_t buildStagingTransferDescriptor(
     bool sourcesTruncated = false;
     for (int ss = 0; ss < srcShardCount; ss++) {
       ncclReshardTransferPlan check;
-      NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, ss, dstDims, dstStrides, dstShardDim,
+      NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, ss, dstDims, dstStrides, dstShardLayout,
                                                 dstInfo.shardIdx, ndims, epc_dummy, &check));
       if (check.totalInnerTransfers > 0 && numAllSources < MAX_SOURCES) {
         allSourceShards[numAllSources++] = ss;
@@ -964,7 +843,7 @@ ncclResult_t buildStagingTransferDescriptor(
       int srcTargetCount = 0;
       for (int ds = 0; ds < dstShardCount; ds++) {
         ncclReshardTransferPlan dsPlan;
-        computeTransferPlan(srcDims, srcStrides, srcShardDim, ss, dstDims, dstStrides, dstShardDim, ds, ndims,
+        computeTransferPlan(srcDims, srcStrides, srcShardLayout, ss, dstDims, dstStrides, dstShardLayout, ds, ndims,
                             epc_dummy, &dsPlan);
         if (dsPlan.totalInnerTransfers == 0) {
           continue;
@@ -993,7 +872,7 @@ ncclResult_t buildStagingTransferDescriptor(
       bool isMyRdma = (handlerRepIdx == myLocalRepIdx);
 
       ncclReshardTransferPlan plan;
-      NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, ss, dstDims, dstStrides, dstShardDim,
+      NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, ss, dstDims, dstStrides, dstShardLayout,
                                                 dstInfo.shardIdx, ndims, epc_dummy, &plan));
 
       if (desc->numSources >= MAX_SOURCES) {
@@ -1053,8 +932,8 @@ ncclResult_t buildStagingTransferDescriptor(
 
           for (int ds = 0; ds < dstShardCount; ds++) {
             ncclReshardTransferPlan dsPlan;
-            NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, ss, dstDims, dstStrides,
-                                                      dstShardDim, ds, ndims, epc_dummy, &dsPlan));
+            NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, ss, dstDims, dstStrides,
+                                                      dstShardLayout, ds, ndims, epc_dummy, &dsPlan));
             if (dsPlan.totalInnerTransfers == 0) {
               continue;
             }
@@ -1066,8 +945,8 @@ ncclResult_t buildStagingTransferDescriptor(
             int posSs = 0;
             for (int qq = 0; qq < srcShardCount; qq++) {
               ncclReshardTransferPlan q;
-              NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, qq, dstDims, dstStrides,
-                                                        dstShardDim, ds, ndims, epc_dummy, &q));
+              NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, qq, dstDims, dstStrides,
+                                                        dstShardLayout, ds, ndims, epc_dummy, &q));
               if (q.totalInnerTransfers > 0) {
                 if (qq < ss) {
                   posSs++;
@@ -1127,8 +1006,8 @@ ncclResult_t buildStagingTransferDescriptor(
         bool foundHandlerTarget = false;
         for (int ds = 0; ds < dstShardCount; ds++) {
           ncclReshardTransferPlan dsPlan;
-          NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, ss, dstDims, dstStrides,
-                                                    dstShardDim, ds, ndims, epc_dummy, &dsPlan));
+          NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, ss, dstDims, dstStrides,
+                                                    dstShardLayout, ds, ndims, epc_dummy, &dsPlan));
           if (dsPlan.totalInnerTransfers == 0) {
             continue;
           }
@@ -1140,8 +1019,8 @@ ncclResult_t buildStagingTransferDescriptor(
           int posSs = 0;
           for (int qq = 0; qq < srcShardCount; qq++) {
             ncclReshardTransferPlan q;
-            NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, qq, dstDims, dstStrides,
-                                                      dstShardDim, ds, ndims, epc_dummy, &q));
+            NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, qq, dstDims, dstStrides,
+                                                      dstShardLayout, ds, ndims, epc_dummy, &q));
             if (q.totalInnerTransfers > 0) {
               if (qq < ss) {
                 posSs++;
@@ -1207,7 +1086,7 @@ ncclResult_t buildStagingTransferDescriptor(
       int ss = allSourceShards[idx];
 
       ncclReshardTransferPlan plan;
-      NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, ss, dstDims, dstStrides, dstShardDim,
+      NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, ss, dstDims, dstStrides, dstShardLayout,
                                                 dstInfo.shardIdx, ndims, epc_dummy, &plan));
 
       for (int r = 0; r < numLocalReps; r++) {
@@ -1253,8 +1132,8 @@ ncclResult_t buildStagingTransferDescriptor(
                         desc->numTargets, MAX_TARGETS);
         }
         ncclReshardTransferPlan plan;
-        NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, ss, dstDims, dstStrides,
-                                                  dstShardDim, dstInfo.shardIdx, ndims, epc_dummy, &plan));
+        NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, ss, dstDims, dstStrides,
+                                                  dstShardLayout, dstInfo.shardIdx, ndims, epc_dummy, &plan));
 
         int ti = desc->numTargets++;
         desc->numRingTargets++;
@@ -1328,8 +1207,8 @@ ncclResult_t buildStagingDirectTransferDescriptor(ncclComm_t globalComm, void* s
   computeMeshGroupInfo(srcTensor, srcMesh->startRank, &fullSrcInfo);
   computeMeshGroupInfo(dstTensor, dstMesh->startRank, &fullDstInfo);
 
-  int srcShardDim = fullSrcInfo.shardTensorDim;
-  int dstShardDim = fullDstInfo.shardTensorDim;
+  const auto& srcShardLayout = fullSrcInfo.shardLayout;
+  const auto& dstShardLayout = fullDstInfo.shardLayout;
   int srcShardCount = fullSrcInfo.shardCount;
   int dstShardCount = fullDstInfo.shardCount;
 
@@ -1337,8 +1216,10 @@ ncclResult_t buildStagingDirectTransferDescriptor(ncclComm_t globalComm, void* s
   size_t dstDims[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
   size_t srcStrides[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
   size_t dstStrides[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
-  NCCL_M2N_CHECK(resolveLocalDims(srcTensorDims, dstTensorDims, ndims, srcShardDim, srcShardCount, dstShardDim,
-                                  dstShardCount, isSource, isDest, srcDims, dstDims, srcStrides, dstStrides));
+  NCCL_M2N_CHECK(resolveReshardDims(worldRank, srcTensorDims, srcShardLayout, dstTensorDims,
+                                    dstShardLayout, ndims, srcDims, dstDims));
+  NCCL_M2N_CHECK(computeStridesChecked(srcDims, ndims, srcStrides));
+  NCCL_M2N_CHECK(computeStridesChecked(dstDims, ndims, dstStrides));
 
   ncclReshardMeshGroupInfo srcInfo{}, dstInfo{};
   if (isSource) {
@@ -1374,8 +1255,8 @@ ncclResult_t buildStagingDirectTransferDescriptor(ncclComm_t globalComm, void* s
 
     for (int dstShard = 0; dstShard < dstShardCount; dstShard++) {
       ncclReshardTransferPlan plan;
-      NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, srcInfo.shardIdx, dstDims, dstStrides,
-                                                dstShardDim, dstShard, ndims, epc_dummy, &plan));
+      NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, srcInfo.shardIdx, dstDims, dstStrides,
+                                                dstShardLayout, dstShard, ndims, epc_dummy, &plan));
 
       if (plan.totalInnerTransfers == 0) {
         continue;
@@ -1388,8 +1269,8 @@ ncclResult_t buildStagingDirectTransferDescriptor(ncclComm_t globalComm, void* s
       int myPosition = 0;
       for (int ss = 0; ss < srcShardCount; ss++) {
         ncclReshardTransferPlan check;
-        NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, ss, dstDims, dstStrides,
-                                                  dstShardDim, dstShard, ndims, epc_dummy, &check));
+        NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, ss, dstDims, dstStrides,
+                                                  dstShardLayout, dstShard, ndims, epc_dummy, &check));
         if (check.totalInnerTransfers > 0) {
           if (ss < srcInfo.shardIdx) {
             myPosition++;
@@ -1441,7 +1322,7 @@ ncclResult_t buildStagingDirectTransferDescriptor(ncclComm_t globalComm, void* s
 
     for (int ss = 0; ss < srcShardCount; ss++) {
       ncclReshardTransferPlan plan;
-      NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, ss, dstDims, dstStrides, dstShardDim,
+      NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, ss, dstDims, dstStrides, dstShardLayout,
                                                 dstInfo.shardIdx, ndims, epc_dummy, &plan));
 
       if (plan.totalInnerTransfers == 0) {
@@ -1468,8 +1349,8 @@ ncclResult_t buildStagingDirectTransferDescriptor(ncclComm_t globalComm, void* s
       int totalOverlapping = 0;
       for (int ds = 0; ds < dstShardCount; ds++) {
         ncclReshardTransferPlan check;
-        NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardDim, ss, dstDims, dstStrides,
-                                                  dstShardDim, ds, ndims, epc_dummy, &check));
+        NCCL_M2N_CHECK(computeTransferPlanChecked(srcDims, srcStrides, srcShardLayout, ss, dstDims, dstStrides,
+                                                  dstShardLayout, ds, ndims, epc_dummy, &check));
         if (check.totalInnerTransfers > 0) {
           if (ds < dstInfo.shardIdx) {
             overlappingBeforeMe++;

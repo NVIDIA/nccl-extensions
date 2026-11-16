@@ -81,9 +81,11 @@ inline std::string combine_jit_source(
     int lsa_team_size,
     ncclEpLayout_t layout,
     int hidden_dim,
-    ncclDataType_t token_dtype = ncclBfloat16) {
+    ncclDataType_t token_dtype,
+    ncclEpCombQuant_t recipe) {
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
+    const char* recipe_literal = ::nccl_ep::jit::combine_recipe_literal(recipe);
     std::ostringstream src;
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
@@ -121,12 +123,13 @@ inline std::string combine_jit_source(
         << "      " << hidden_dim << ",\n"
         << "      " << lsa_team_size << ",\n"
         << "      " << layout_literal << ",\n"
-        << "      " << token_dtype_literal << ">(param, smem_bytes);\n"
+        << "      " << token_dtype_literal << ",\n"
+        << "      " << recipe_literal << ">(param, smem_bytes);\n"
         << "}\n";
     return src.str();
 }
 
-inline void launch_combine(
+inline ncclResult_t launch_combine(
     const ::ht_ep::combine_config_t& config,
     int max_tokens_per_rank,
     int num_lsa_teams,
@@ -138,13 +141,20 @@ inline void launch_combine(
     size_t param_size, // size of packed kernel arguments buffer
     int dynamic_smem_bytes,
     cudaStream_t stream,
-    ncclDataType_t token_dtype = ncclBfloat16) {
+    ncclDataType_t token_dtype,
+    ncclEpCombQuant_t recipe) {
     const combine_warp_layout_t L =
         compute_combine_warp_layout(num_lsa_teams, config.num_pipelines);
 
     static const int fwd_variant_identity = 0;
     static const int bwd_variant_identity = 0;
     const int& variant_identity = config.backward_combine ? bwd_variant_identity : fwd_variant_identity;
+    // combine_recipe_literal() returns null for a recipe with no enumerator name; the source
+    // builders stream it straight into an ostringstream, where null would be UB.
+    if (::nccl_ep::jit::combine_recipe_literal(recipe) == nullptr) {
+        std::fprintf(stderr, "[nccl_ep jit] combine: unsupported HT combine recipe %d\n", static_cast<int>(recipe));
+        return ncclInvalidArgument;
+    }
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "combine"
@@ -155,7 +165,8 @@ inline void launch_combine(
              << config.num_of_blocks
              << (config.backward_combine ? "_bwd" : "_fwd")
              << ::nccl_ep::jit::layout_name_tag(layout)
-             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype);
+             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype)
+             << ::nccl_ep::jit::combine_recipe_name_tag(recipe);
         return name.str();
     }();
     const std::string source = combine_jit_source(
@@ -171,7 +182,8 @@ inline void launch_combine(
         lsa_team_size,
         layout,
         hidden_dim,
-        token_dtype);
+        token_dtype,
+        recipe);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_combine";
@@ -183,6 +195,7 @@ inline void launch_combine(
     variant.num_blocks = config.num_of_blocks;
     variant.block_dim = L.block_dim;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
+    variant.nucs = env != nullptr && nccl_ep_env_flag_on(env->nucs);
 
     // Dump the effective kernel parameters once per distinct variant, just before
     // the launch, when the env config asks for verbose output on this rank.
@@ -220,11 +233,12 @@ inline void launch_combine(
         ::nccl_ep::jit::launch_jit_kernel(variant, param, param_size, stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
-        std::fprintf(stderr, "[nccl_ep jit] fatal combine JIT launch failure for %s: %s%s%s\n", variant_name.c_str(),
+        std::fprintf(stderr, "[nccl_ep jit] combine JIT launch failure for %s: %s%s%s\n", variant_name.c_str(),
                      ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
                      error.empty() ? "" : error.c_str());
-        std::abort();
+        return ncclInternalError;
     }
+    return ncclSuccess;
 }
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
@@ -404,6 +418,7 @@ inline void launch_local_reduce(
 constexpr const char* kLocalPermuteReduceJitEntryName = "nccl_ep_jit_local_permute_reduce_kernel";
 
 // 2 blocks/SM at small hidden; reg pressure fits without spilling. Grid bumped 2x in caller.
+// MXFP8 does not change this budget: the quantize epilogue only adds per-iteration temporaries.
 inline int pick_reduce_blocks_per_sm(int hidden_int4) {
     return (hidden_int4 <= 256) ? 2 : ::ht_ep::kLocalPermuteReduceBlocksPerSM;
 }
@@ -412,8 +427,10 @@ inline std::string local_permute_reduce_jit_source(
     int top_k,
     int hidden_int4,
     int blocks_per_sm,
-    ncclDataType_t token_dtype = ncclBfloat16) {
+    ncclDataType_t token_dtype,
+    ncclEpCombQuant_t recipe) {
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
+    const char* recipe_literal = ::nccl_ep::jit::combine_recipe_literal(recipe);
     std::ostringstream src;
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
@@ -422,7 +439,7 @@ inline std::string local_permute_reduce_jit_source(
         << "__global__ void " << kLocalPermuteReduceJitEntryName << "(\n"
         << "    const __grid_constant__ ::ht_ep::local_permute_reduce_param_t p) {\n"
         << "  ::ht_ep::local_permute_reduce<" << top_k << ", " << hidden_int4 << ", " << token_dtype_literal
-        << ">(\n"
+        << ", " << recipe_literal << ">(\n"
         << "      reinterpret_cast<uint8_t*>(p.flat_staging),\n"
         << "      reinterpret_cast<const uint8_t*>(p.recv_x_em),\n"
         << "      p.flat2em_slot_map,\n"
@@ -436,24 +453,39 @@ inline std::string local_permute_reduce_jit_source(
     return src.str();
 }
 
-inline void launch_local_permute_reduce(
+inline ncclResult_t launch_local_permute_reduce(
     int top_k,
-    int row_bytes,
+    int input_row_bytes,
     int num_blocks,
     ::ht_ep::local_permute_reduce_param_t& param,
     cudaStream_t stream,
-    ncclDataType_t token_dtype = ncclBfloat16) {
+    ncclDataType_t token_dtype,
+    ncclEpCombQuant_t recipe) {
     static const int variant_identity = 0;
-    assert((row_bytes % 16) == 0);
-    const int hidden_int4 = row_bytes / 16;
+    // The caller passes the row the kernel reads, so hidden_int4 needs no per-recipe
+    // reasoning: the packed output width is the adapter's business, not this launcher's.
+    if ((input_row_bytes % 16) != 0) {
+        std::fprintf(stderr,
+                     "[nccl_ep jit] local-permute-reduce: %d B input row is not 16B-aligned\n",
+                     input_row_bytes);
+        return ncclInternalError;
+    }
+    // Same null contract as launch_combine: the source builder streams the literal directly.
+    if (::nccl_ep::jit::combine_recipe_literal(recipe) == nullptr) {
+        std::fprintf(
+            stderr, "[nccl_ep jit] local-permute-reduce: unsupported combine recipe %d\n", static_cast<int>(recipe));
+        return ncclInvalidArgument;
+    }
+    const int hidden_int4 = input_row_bytes / 16;
     const int blocks_per_sm = pick_reduce_blocks_per_sm(hidden_int4);
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "local_permute_reduce_topk" << top_k << "_h" << hidden_int4 << "_b" << blocks_per_sm
-             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype);
+             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype)
+             << ::nccl_ep::jit::combine_recipe_name_tag(recipe);
         return name.str();
     }();
-    const std::string source = local_permute_reduce_jit_source(top_k, hidden_int4, blocks_per_sm, token_dtype);
+    const std::string source = local_permute_reduce_jit_source(top_k, hidden_int4, blocks_per_sm, token_dtype, recipe);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "local_permute_reduce";
@@ -461,7 +493,8 @@ inline void launch_local_permute_reduce(
     variant.source = source;
     variant.entry_name = kLocalPermuteReduceJitEntryName;
     variant.identity = &variant_identity;
-    variant.runtime_key = (static_cast<std::uint64_t>(token_dtype) << 48) |
+    variant.runtime_key = (static_cast<std::uint64_t>(recipe) << 56) |
+                          (static_cast<std::uint64_t>(token_dtype) << 48) |
                           (static_cast<std::uint64_t>(hidden_int4) << 32) |
                           (static_cast<std::uint64_t>(blocks_per_sm) << 16) | static_cast<std::uint64_t>(top_k);
     variant.num_blocks = num_blocks * blocks_per_sm;
@@ -472,11 +505,12 @@ inline void launch_local_permute_reduce(
     const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
-        std::fprintf(stderr, "[nccl_ep jit] fatal local-permute-reduce JIT launch failure for %s: %s%s%s\n",
+        std::fprintf(stderr, "[nccl_ep jit] local-permute-reduce JIT launch failure for %s: %s%s%s\n",
                      variant_name.c_str(), ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
                      error.empty() ? "" : error.c_str());
-        std::abort();
+        return ncclInternalError;
     }
+    return ncclSuccess;
 }
 
 // ======================== Push EM combine + reduce =========================
@@ -489,28 +523,102 @@ inline ncclResult_t launch_combine_push(
     int top_k,
     int row_bytes,
     int num_blocks,
+    int ep_size,
     ::ht_ep::combine_push_param_t& param,
     cudaStream_t stream,
+    ncclEpCombQuant_t recipe,
     ncclDataType_t token_dtype = ncclBfloat16,
-    bool backward = false) {
+    bool backward = false,
+    bool nucs = false) {
     static const int variant_identity = 0;
     assert((row_bytes % 16) == 0);
     const int hidden_int4 = row_bytes / 16;
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
+    const char* recipe_literal = ::nccl_ep::jit::combine_recipe_literal(recipe);
     const char* backward_literal = backward ? "true" : "false";
+    if (recipe_literal == nullptr) {
+        std::fprintf(stderr, "[nccl_ep jit] combine push: unsupported combine recipe %d\n", static_cast<int>(recipe));
+        return ncclInvalidArgument;
+    }
+    const bool mxfp8 = recipe == NCCL_EP_COMB_QUANT_MXFP8;
+    // MXFP8 sizes the per-warp smem row by the in-place quantize buffer.
+    const int row_int4 = mxfp8 ? ::ht_ep::combine_push_mxfp8_fused_int4(hidden_int4) : hidden_int4;
     // Size the block so the per-warp smem row buffer fits the device opt-in cap, before building
     // the source so __launch_bounds__ matches the actual block (right register budget per block
     // size, not a fixed max that would spill small blocks).
     int smem_cap = 0, dev = 0;
     (void)cudaGetDevice(&dev);
     (void)cudaDeviceGetAttribute(&smem_cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-    const int slots = ::ht_ep::combine_push_slots_per_block(hidden_int4, smem_cap);
+    // NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE is the chunk width in hidden elements. Unset auto-selects
+    // the default by EP size: one tile for EP < 16, the whole row for EP >= 16 (chunking wins at
+    // small EP but not large). 0 forces the whole row; other values round up to whole tiles,
+    // clamped to the row.
+    const int requested_int4 = [&] {
+        // Flat relays the row without EM gather/reduction accumulators. Use a
+        // full-row TMA stage and size the warp count to its shared-memory cost.
+        if (param.flat || mxfp8) {
+            return 0;
+        }
+        constexpr int kOneTile = 1;  // rounds up to one tile in combine_push_chunk_size
+        constexpr int kAutoNoChunkEpSize = 16;  // EP >= this uses the whole row by default
+        const int auto_default = ep_size >= kAutoNoChunkEpSize ? 0 : kOneTile;
+        const std::string raw_value = ::nccl_ep::jit::env_value("NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE");
+        if (raw_value.empty()) return auto_default;
+        char* end = nullptr;
+        const long elems = std::strtol(raw_value.c_str(), &end, 10);
+        if (end == raw_value.c_str() || *end != '\0' || elems < 0 || elems > INT_MAX / 4) {
+            if (::nccl_ep::jit::announce_once("combine_push_chunk_size_bad_h" + std::to_string(hidden_int4))) {
+                std::fprintf(stderr,
+                             "[nccl_ep][env] NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE=\"%s\" is not a non-negative "
+                             "integer; using the default chunk\n",
+                             raw_value.c_str());
+            }
+            return auto_default;
+        }
+        if (elems == 0) return 0;
+        const int elem_bytes = token_dtype == ncclFloat32 ? 4
+                               : (token_dtype == ncclFloat8e4m3 || token_dtype == ncclFloat8e5m2 ||
+                                  token_dtype == ncclFloat4x2)
+                                   ? 1
+                                   : 2;
+        const int int4s = static_cast<int>((elems * elem_bytes + 15) / 16);
+        if (::nccl_ep::jit::announce_once("combine_push_chunk_size_h" + std::to_string(hidden_int4))) {
+            std::fprintf(stderr,
+                         "[nccl_ep][env] NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE: combine push h%d chunk=%d elems "
+                         "(%d int4 before rounding to tiles)\n",
+                         hidden_int4, elems, int4s);
+        }
+        return int4s;
+    }();
+    const int chunk_size = ::ht_ep::combine_push_chunk_size(row_int4, requested_int4);
+    const int kernel_chunk_size = mxfp8 ? 0 : chunk_size;
+    const int slots = param.flat
+        ? std::min(::ht_ep::kCombinePushMaxSlots, smem_cap / (row_bytes + 16))
+        : ::ht_ep::combine_push_slots_per_block(row_int4, smem_cap, chunk_size);
+    if (slots == 0) {
+        std::fprintf(stderr, "[nccl_ep] combine push: a %d-byte row exceeds the %d-byte shared memory budget\n",
+                     row_bytes, smem_cap);
+        return ncclInvalidArgument;
+    }
     const int block_dim = slots * 32;
+    const int chunk_bytes = ::ht_ep::combine_push_buf_int4(row_int4, chunk_size) * 16;
+    if (!param.flat && chunk_bytes > smem_cap - ::ht_ep::combine_push_meta_reserve_bytes()) {
+        std::fprintf(stderr,
+                     "[nccl_ep] combine push: a %d-byte chunk does not fit the %d-byte shared memory cap; "
+                     "set NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE to a smaller chunk\n",
+                     chunk_bytes, smem_cap);
+        return ncclInvalidArgument;
+    }
 
+    // chunk_size is baked into the source and variant name: it sets the per-warp buffer width and
+    // the reduce strategy at compile time, so each distinct value is its own JIT compile.
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "combine_push_topk" << top_k << "_h" << hidden_int4
-             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype) << (backward ? "_bwd" : "");
+             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype) << ::nccl_ep::jit::combine_recipe_name_tag(recipe)
+             << (backward ? "_bwd" : "")
+             << "_c" << chunk_size << (param.claim_dynamic ? "_dyn" : "") << (param.flat ? "_flat" : "")
+             << "_w" << slots;
         return name.str();
     }();
     const std::string source = [&] {
@@ -519,16 +627,22 @@ inline ncclResult_t launch_combine_push(
             << "\n"
             << "extern \"C\" __launch_bounds__(" << block_dim << ", 1)\n"
             << "__global__ void " << kCombinePushJitEntryName << "(\n"
-            << "    const __grid_constant__ ::ht_ep::combine_push_param_t p) {\n"
-            << "  extern __shared__ uint8_t smem_bytes[];\n"
+            << "    const __grid_constant__ ::ht_ep::combine_push_param_t p) {\n";
+        if (param.flat) {
+            src << "  ::ht_ep::combine_push_flat<" << hidden_int4 << ", " << slots << ", "
+                << backward_literal << ">(p);\n}\n";
+            return src.str();
+        }
+        src << "  extern __shared__ uint8_t smem_bytes[];\n"
             << "  ::ht_ep::combine_push<" << top_k << ", " << hidden_int4 << ", " << token_dtype_literal
-            << ", " << backward_literal << ">(\n"
+            << ", " << recipe_literal << ", " << backward_literal << ", " << kernel_chunk_size << ", "
+            << (param.claim_dynamic ? "true" : "false") << ">(\n"
             << "      p.peer_staging_ptrs,\n"
             << "      reinterpret_cast<const uint8_t*>(p.recv_x_em),\n"
             << "      p.flat2em_slot_map,\n"
             << "      p.recv_slot_to_src,\n"
             << "      p.num_recv_tokens_dev,\n"
-            << "      p.dcomms,\n"
+            << "      p.dcomm,\n"
             << "      p.head_sync_flag,\n"
             << "      p.grid_barrier_counter,\n"
             << "      p.top_k,\n"
@@ -551,13 +665,15 @@ inline ncclResult_t launch_combine_push(
     variant.source = source;
     variant.entry_name = kCombinePushJitEntryName;
     variant.identity = &variant_identity;
-    variant.runtime_key = (static_cast<std::uint64_t>(backward) << 63) |
-                          (static_cast<std::uint64_t>(token_dtype) << 48) |
-                          (static_cast<std::uint64_t>(hidden_int4) << 16) | static_cast<std::uint64_t>(top_k);
+    // Hash the variant name: it already carries every specialization parameter unmasked, and a
+    // hand-packed bitfield would silently alias once a field overflows its allotted bits - see
+    // launch_dispatch_pull for the same rationale.
+    variant.runtime_key = static_cast<std::uint64_t>(std::hash<std::string>{}(variant_name));
     variant.num_blocks = num_blocks;
     variant.block_dim = block_dim;
-    variant.dynamic_smem_bytes =
-        static_cast<int>(::ht_ep::combine_push_dynamic_smem_bytes(hidden_int4, slots));
+    variant.dynamic_smem_bytes = param.flat ? slots * (row_bytes + 16) : static_cast<int>(
+        ::ht_ep::combine_push_dynamic_smem_bytes(row_int4, slots, chunk_size));
+    variant.nucs = nucs;
 
     std::string error;
     const ::nccl_ep::jit::JitKernelStatus status =
@@ -576,40 +692,55 @@ inline ncclResult_t launch_combine_reduce_stage(
     int num_blocks,
     ::ht_ep::combine_reduce_param_t& param,
     cudaStream_t stream,
-    ncclDataType_t token_dtype = ncclBfloat16,
-    bool backward = false) {
+    ncclEpCombQuant_t recipe,
+    ncclDataType_t token_dtype,
+    bool backward,
+    bool flat) {
     static const int variant_identity = 0;
     assert((row_bytes % 16) == 0);
     const int hidden_int4 = row_bytes / 16;
+    const int block_dim = flat ? ::ht_ep::kLocalPermuteReduceThreads : ::ht_ep::kCombineReduceThreads;
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
+    const char* recipe_literal = ::nccl_ep::jit::combine_recipe_literal(recipe);
     const char* backward_literal = backward ? "true" : "false";
+    if (recipe_literal == nullptr) {
+        std::fprintf(stderr, "[nccl_ep jit] combine reduce: unsupported combine recipe %d\n", static_cast<int>(recipe));
+        return ncclInvalidArgument;
+    }
 
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "combine_reduce_h" << hidden_int4 << ::nccl_ep::jit::token_dtype_name_tag(token_dtype)
-             << (backward ? "_bwd" : "");
+             << ::nccl_ep::jit::combine_recipe_name_tag(recipe)
+             << (backward ? "_bwd" : "") << (param.retained_slots ? "_drop" : "");
+        if (flat) {
+            name << "_flat_k" << param.num_topk << "_e" << param.experts_per_rank
+                 << "_n" << param.lsa_team_size;
+        }
         return name.str();
     }();
     const std::string source = [&] {
         std::ostringstream src;
         src << "#include \"device/ht_ep.cuh\"\n"
             << "\n"
-            << "extern \"C\" __launch_bounds__(" << ::ht_ep::kLocalPermuteReduceThreads << ", 1)\n"
+            << "extern \"C\" __launch_bounds__(" << block_dim << ", 1)\n"
             << "__global__ void " << kCombineReduceJitEntryName << "(\n"
             << "    const __grid_constant__ ::ht_ep::combine_reduce_param_t p) {\n"
             << "  ::ht_ep::combine_reduce<" << hidden_int4 << ", " << token_dtype_literal << ", "
-            << backward_literal << ">(\n"
+            << recipe_literal << ", " << backward_literal << ", "
+            << ::nccl_ep::jit::bool_literal(param.retained_slots != nullptr)
+            << ", " << ::nccl_ep::jit::bool_literal(flat) << ">(\n"
             << "      reinterpret_cast<uint8_t*>(p.attn_output),\n"
             << "      reinterpret_cast<const uint8_t*>(p.staging),\n"
             << "      p.topk_idx,\n"
-            << "      p.num_topk,\n"
-            << "      p.experts_per_rank,\n"
-            << "      p.experts_per_lsa_team,\n"
+            << "      " << (flat ? std::to_string(param.num_topk) : "p.num_topk") << ",\n"
+            << "      " << (flat ? std::to_string(param.experts_per_rank) : "p.experts_per_rank") << ",\n"
+            << "      " << (flat ? std::to_string(param.experts_per_lsa_team) : "p.experts_per_lsa_team") << ",\n"
             << "      p.num_combined_tokens,\n"
-            << "      p.lsa_team_size,\n"
+            << "      " << (flat ? std::to_string(param.lsa_team_size) : "p.lsa_team_size") << ",\n"
             << "      p.row_bytes,\n"
             << "      p.combined_topk_weights,\n"
-            << "      p.top_k);\n"
+            << "      p.top_k, p.retained_slots);\n"
             << "}\n";
         return src.str();
     }();
@@ -621,9 +752,19 @@ inline ncclResult_t launch_combine_reduce_stage(
     variant.entry_name = kCombineReduceJitEntryName;
     variant.identity = &variant_identity;
     variant.runtime_key = (static_cast<std::uint64_t>(backward) << 63) |
+        (static_cast<std::uint64_t>(param.retained_slots != nullptr) << 62) |
+        (static_cast<std::uint64_t>(recipe) << 56) |
         (static_cast<std::uint64_t>(token_dtype) << 48) | static_cast<std::uint64_t>(hidden_int4);
+    // Keep EM dimensions runtime-configurable; specialize only flat rank decoding.
+    if (flat) {
+        variant.runtime_key |= std::uint64_t{1} << 61;
+        for (int value : {param.num_topk, param.experts_per_rank,
+                          param.experts_per_lsa_team, param.lsa_team_size}) {
+            variant.runtime_key = ::nccl_ep::jit::runtime_key_mix(variant.runtime_key, value);
+        }
+    }
     variant.num_blocks = num_blocks;
-    variant.block_dim = ::ht_ep::kLocalPermuteReduceThreads;
+    variant.block_dim = block_dim;
     variant.dynamic_smem_bytes = 0;
 
     std::string error;

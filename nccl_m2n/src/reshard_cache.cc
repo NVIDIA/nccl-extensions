@@ -27,12 +27,11 @@
 struct DevCommCacheEntry {
   ReshardDevCommCacheKey key;
   bool valid;
+  bool reserved;
   ncclDevComm devComm;
-  /* Recorded after each launch that used this DevComm, so retirement can prove
-   * the GPU is done with it rather than inferring it from host-call state.
-   * useState is present only in user-stream mode, where it serializes event
-   * reuse and quarantines an entry if neither the event nor its stream can
-   * provide a completion fence. */
+  /* Per-entry ordering/failure fence. Shared uses are additionally drained by
+   * existing PACK-slot / PIPE-lane events before cache teardown. No DevComm is
+   * evicted during the runtime epoch. */
   cudaEvent_t completionEvent;
   std::shared_ptr<ReshardDevCommUseState> useState;
 };
@@ -50,9 +49,9 @@ struct StreamPoolEntry {
 };
 
 static WindowCache gInternalWindowCache = {};
-static DevCommCacheEntry gDevcommCache[MAX_DEVCOMM_CACHE_ENTRIES];
+static std::unique_ptr<DevCommCacheEntry[]> gDevcommCache;
 static int gDevcommCacheCount = 0;
-static int gDevcommCacheNextIdx = 0;
+static int gDevcommCacheCapacity = 0;
 
 /* CUDA handle lifetimes are tied to the last finalize call in the
  * process-lifetime init/finalize epoch (so we can destroy them before the CUDA
@@ -172,7 +171,6 @@ static ncclWindow_t* findCachedWindowByPtr(WindowCache* cache, ncclComm_t comm, 
  * with the lock released - a rank that is not evicting would never join. Defer
  * instead, and drain once this process has no other public call in flight. */
 static std::vector<WindowCacheEntry> gRetiredWindowCacheEntries;
-static std::vector<DevCommCacheEntry> gRetiredDevcommCacheEntries;
 
 static ncclResult_t reclaimRetiredWindowEntriesIfIdle() {
   if (m2nApiHasConcurrentCalls() || gRetiredWindowCacheEntries.empty()) {
@@ -248,34 +246,6 @@ static ncclResult_t releaseDevCommCacheEntry(DevCommCacheEntry* entry) {
   return destroyDevCommCacheEntry(entry);
 }
 
-static ncclResult_t reclaimRetiredDevCommEntriesIfIdle() {
-  if (m2nApiHasConcurrentCalls() || gRetiredDevcommCacheEntries.empty()) {
-    return ncclSuccess;
-  }
-  std::vector<DevCommCacheEntry> retired;
-  retired.swap(gRetiredDevcommCacheEntries);
-  ncclResult_t result = ncclSuccess;
-  {
-    M2nApiUnlock apiUnlock;
-    for (DevCommCacheEntry& entry : retired) {
-      if (entry.valid) {
-        const ncclResult_t releaseResult = releaseDevCommCacheEntry(&entry);
-        if (result == ncclSuccess) {
-          result = releaseResult;
-        }
-      }
-    }
-  }
-  if (reshardResourcesNeedQuarantine()) {
-    NCCL_M2N_FAIL(ncclSystemError, -1,
-                  "Unable to reclaim a retired DevComm because its completion could not be proven");
-  }
-  if (result != ncclSuccess) {
-    NCCL_M2N_FAIL(result, -1, "Failed to destroy a retired DevComm cache entry");
-  }
-  return result;
-}
-
 static ncclResult_t cacheWindow(WindowCache* cache, ncclComm_t comm, void* windowBuffer, size_t windowSize,
                                 ReshardInternalWindowKind kind, ncclWindow_t window) {
   int idx;
@@ -342,10 +312,49 @@ ncclDevComm* findCachedDevComm(const ReshardDevCommCacheKey& key, cudaEvent_t* o
   return nullptr;
 }
 
-ncclResult_t cacheDevComm(const ReshardDevCommCacheKey& key, const ncclDevComm* devComm) {
-  NCCL_M2N_CHECK(reclaimRetiredDevCommEntriesIfIdle());
+ReshardDevCommCacheReservation::~ReshardDevCommCacheReservation() {
+  if (index >= 0) gDevcommCache[index].reserved = false;
+}
 
-  /* Created before any eviction so a failure here leaves the cache untouched. */
+ncclResult_t reserveDevCommCacheEntry(ReshardDevCommCacheReservation* reservation) {
+  NCCL_M2N_CHECK_ARG(reservation != nullptr && reservation->index < 0, -1,
+                     "DevComm cache reservation must be empty");
+  if (gDevcommCache == nullptr) {
+    NCCL_M2N_CHECK_ARG(gReshardDevCommCacheCapacity > 0, -1, "Invalid DevComm cache capacity");
+    try {
+      gDevcommCache.reset(new DevCommCacheEntry[gReshardDevCommCacheCapacity]());
+    } catch (const std::bad_alloc&) {
+      NCCL_M2N_FAIL(ncclSystemError, -1, "Failed to allocate DevComm cache with capacity %d",
+                    gReshardDevCommCacheCapacity);
+    }
+    gDevcommCacheCapacity = gReshardDevCommCacheCapacity;
+  }
+  int idx = 0;
+  while (idx < gDevcommCacheCount && (gDevcommCache[idx].valid || gDevcommCache[idx].reserved)) ++idx;
+  if (idx == gDevcommCacheCapacity) {
+    NCCL_M2N_FAIL(ncclInvalidUsage, -1,
+                  "DevComm cache capacity exhausted (%d entries); runtime eviction is disabled. "
+                  "Increase NCCL_RESHARD_DEVCOMM_CACHE_CAPACITY before initialization and restart. "
+                  "Capacity errors are local; abort the distributed job on error",
+                  gDevcommCacheCapacity);
+  }
+  if (idx == gDevcommCacheCount) ++gDevcommCacheCount;
+  gDevcommCache[idx].reserved = true;
+  reservation->index = idx;
+  return ncclSuccess;
+}
+
+ncclResult_t cacheDevComm(const ReshardDevCommCacheKey& key, const ncclDevComm* devComm,
+                           bool retainPersistentState, ReshardDevCommCacheReservation* reservation) {
+  ReshardDevCommCacheReservation localReservation;
+  if (reservation == nullptr) {
+    NCCL_M2N_CHECK(reserveDevCommCacheEntry(&localReservation));
+    reservation = &localReservation;
+  }
+  NCCL_M2N_CHECK_ARG(reservation->index >= 0 && reservation->index < gDevcommCacheCount &&
+                         gDevcommCache[reservation->index].reserved, -1, "Invalid DevComm cache reservation");
+
+  /* A failure leaves existing entries untouched and releases the reservation. */
   cudaEvent_t completionEvent = nullptr;
   std::shared_ptr<ReshardDevCommUseState> useState;
   const cudaError_t eventResult = cudaEventCreateWithFlags(&completionEvent, cudaEventDisableTiming);
@@ -360,35 +369,16 @@ ncclResult_t cacheDevComm(const ReshardDevCommCacheKey& key, const ncclDevComm* 
     NCCL_M2N_FAIL(ncclSystemError, -1, "Failed to create DevComm use state");
   }
   useState->bSerializeUses = !reshardUseInternalStreams();
+  useState->bRetainPersistentState = retainPersistentState;
 
-  int idx;
-  if (gDevcommCacheCount >= MAX_DEVCOMM_CACHE_ENTRIES) {
-    idx = gDevcommCacheNextIdx;
-    DevCommCacheEntry& old = gDevcommCache[idx];
-    RESHARD_WARN(-1, "DevComm cache full (%d entries), replacing entry at index %d", MAX_DEVCOMM_CACHE_ENTRIES, idx);
-    if (old.valid) {
-      if (m2nApiHasConcurrentCalls()) {
-        try {
-          gRetiredDevcommCacheEntries.push_back(old);
-        } catch (const std::bad_alloc&) {
-          NCCL_M2N_CUDACHECK_WARN(cudaEventDestroy(completionEvent));
-          NCCL_M2N_FAIL(ncclSystemError, -1, "failed to retain an in-use DevComm cache entry");
-        }
-      } else {
-        M2nApiUnlock apiUnlock;
-        NCCL_M2N_CHECK_WARN(releaseDevCommCacheEntry(&old));
-      }
-    }
-    gDevcommCacheNextIdx = (gDevcommCacheNextIdx + 1) % MAX_DEVCOMM_CACHE_ENTRIES;
-  } else {
-    idx = gDevcommCacheCount++;
-  }
-  DevCommCacheEntry& e = gDevcommCache[idx];
+  DevCommCacheEntry& e = gDevcommCache[reservation->index];
   e.key = key;
   e.devComm = *devComm;
   e.completionEvent = completionEvent;
   e.useState = std::move(useState);
   e.valid = true;
+  e.reserved = false;
+  reservation->index = -1;
   return ncclSuccess;
 }
 
@@ -533,8 +523,8 @@ void cacheFinalize() {
       gDevcommCache[i] = {};
     }
     gDevcommCacheCount = 0;
-    gDevcommCacheNextIdx = 0;
-    gRetiredDevcommCacheEntries.clear();
+    gDevcommCache.reset();
+    gDevcommCacheCapacity = 0;
     gStreamPool.clear();
     for (int i = 0; i < gStagingPoolCount; i++) {
       gStagingPool[i] = {};
@@ -547,7 +537,6 @@ void cacheFinalize() {
 
   /* Drain anything deferred by an eviction that raced a concurrent call. */
   (void)reclaimRetiredWindowEntriesIfIdle();
-  (void)reclaimRetiredDevCommEntriesIfIdle();
 
   /* Only the window/DevComm teardown below is collective. The stream pool and
    * staging teardown that follow touch process-local state and must stay under
@@ -571,6 +560,8 @@ void cacheFinalize() {
       }
     }
     gDevcommCacheCount = 0;
+    gDevcommCache.reset();
+    gDevcommCacheCapacity = 0;
   }
 
   for (StreamPoolEntry& e : gStreamPool) {

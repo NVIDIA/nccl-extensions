@@ -40,6 +40,7 @@
 #include "nccl.h"
 #include "nccl_m2n.h"
 #include "reshard_types.h"
+#include "reshard_pipe_resources.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -114,6 +115,12 @@ struct ReshardSplitComms {
 
   /* Slot within commB's DevComm. */
   int slotIdx;
+  int slotCount;
+  int commBPoolOwnerIndex;
+  /* Stable PIPE FIFO-history namespace; unlike slotIdx, this never wraps
+   * with execution concurrency. PACK does not use these fields. */
+  int pipeNamespaceId;
+  int pipeNamespaceCapacity;
 
   bool valid; /* internal: entry has been populated */
 };
@@ -213,11 +220,10 @@ typedef struct {
   size_t dstStrides[NCCL_RESHARD_MAX_TENSOR_DIMS];
   int ndims;
 
-  int srcShardTensorDim;
-  int dstShardTensorDim;
+  ncclReshardShardLayout_t srcShardLayout;
+  ncclReshardShardLayout_t dstShardLayout;
   int srcShardCount;
   int dstShardCount;
-  bool sameShardDim;
 
   bool isSource;
   bool isDest;
@@ -310,16 +316,23 @@ ncclResult_t reshardGetOrCreatePersistentControlSlot(ncclComm_t parentComm,
  * safe to call every reshard. Pass null DevComm outputs when only split windows
  * are needed.
  *
- * commA and commB use the shared event-ordered DevComm cache. commB's RAIL
- * entries include its slot-partitioned resource requirements, so differing
- * PACK and PIPE layouts never replace an in-flight DevComm. */
+ * commA and commB use the shared event-ordered DevComm cache. PACK sizes commB
+ * resources by physical lanes; PIPE sizes persistent signals/counters by
+ * reserved parent namespaces and contexts by execution lanes. A pooled PIPE
+ * owner's resource plan cannot change while persistent FIFO state is live. */
 ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stagingBuffer, size_t stagingCapacity,
                                          int barrierCount, ReshardDevCommBarrierKind barrierKind, int ginSignalCountA,
-                                         int ginCounterCountA, int signalsPerSlotB, int countersPerSlotB,
-                                         int ctxPerSlotB, int maxConcurrency, cudaStream_t stream,
+                                         int ginCounterCountA, const ReshardCommBResourcePlan& resourcesB,
+                                         cudaStream_t stream,
                                          ncclWindow_t* outWindowA, ncclWindow_t* outWindowB, ncclDevComm* outDevCommA,
                                          ReshardDevCommUse* outDevCommAUse, ncclDevComm* outDevCommB,
                                          ReshardDevCommUse* outDevCommBUse);
+
+/* Order reuse of one commB resource lane across parent communicators. PACK's
+ * staging-slot event already provides the same fence, so these are active for
+ * PIPE only. */
+ncclResult_t reshardSplitPrepareCommBResourceLane(const ReshardSplitComms* sc, cudaStream_t stream);
+ncclResult_t reshardSplitRecordCommBResourceLane(const ReshardSplitComms* sc, cudaStream_t stream);
 
 /* ======================================================================
  * reshard_split_prepare.cc — cross-comm RING param builder

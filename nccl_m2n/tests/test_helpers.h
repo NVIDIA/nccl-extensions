@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 #include <cuda_runtime.h>
 #include <nccl.h>
 
@@ -68,7 +69,7 @@ static inline bool testUsesNonBlockingComm() {
 #define TEST_NCCLCHECK(cmd)                                                                 \
   do {                                                                                      \
     ncclResult_t r = (cmd);                                                                 \
-    if (r != ncclSuccess) {                                                                 \
+    if (r != ncclSuccess && r != ncclInProgress) {                                          \
       fprintf(stderr, "NCCL error %s:%d: %s\n", __FILE__, __LINE__, ncclGetErrorString(r)); \
       abort();                                                                              \
     }                                                                                       \
@@ -78,6 +79,12 @@ static inline bool testUsesNonBlockingComm() {
  * leave the operation pending on a non-blocking communicator. */
 static inline ncclResult_t testWaitCommReady(ncclComm_t comm) {
   return m2nWaitCommReady(comm);
+}
+
+static inline void testWaitComms(const std::vector<ncclComm_t>& comms) {
+  for (ncclComm_t comm : comms) {
+    TEST_NCCLCHECK(testWaitCommReady(comm));
+  }
 }
 
 #define TEST_NCCL_COMM_CHECK(comm, cmd)                                                        \
@@ -92,6 +99,23 @@ static inline ncclResult_t testWaitCommReady(ncclComm_t comm) {
       fprintf(stderr, "NCCL error %s:%d: %s\n", __FILE__, __LINE__, ncclGetErrorString(r)); \
       abort();                                                                                 \
     }                                                                                          \
+  } while (0)
+
+/* Supply comm to wait after the call. Omit it for calls such as destroy,
+ * which invalidate the communicator and cannot be polled afterward. */
+#define ASSERT_NCCL(cmd, ...) \
+  do { \
+    ncclResult_t ncclAssertResult = (cmd); \
+    auto checkComm = [ncclAssertResult](ncclComm_t comm = nullptr) { \
+      if (comm != nullptr) { \
+        return testWaitCommReady(comm); \
+      } \
+      return ncclAssertResult; \
+    }; \
+    if (ncclAssertResult == ncclSuccess || ncclAssertResult == ncclInProgress) { \
+      ncclAssertResult = checkComm(__VA_ARGS__); \
+    } \
+    ASSERT_EQ(ncclSuccess, ncclAssertResult) << #cmd; \
   } while (0)
 
 static inline ncclResult_t testFinalizeComm(ncclComm_t comm) {

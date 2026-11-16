@@ -64,6 +64,7 @@ add_custom_target(nccl-submodule
 # Source files
 set(NCCL_EP_HOST_SRC
     nccl_ep.cc
+    nccl_ep_cft.cc
     nccl_ep_env.cc
     device/jit/jit_utils.cc
     device/jit/jit_cache.cc
@@ -131,14 +132,30 @@ endif()
 set(NCCL_EP_JIT_CONFIG_HEADER "${NCCL_EP_JIT_SOURCE_DIR}/config.h")
 set(NCCL_EP_JIT_HEADERS
     device/ht_ep.cuh
+    device/ht_compact_prob.cuh
+    ht_compact_prob.h
+    device/mxfp8_quant.cuh
+    device/quant_recipe.cuh
     device/device_primitives.cuh
     device/ht_ep_configs.cuh
     device/cuda_compat_shims.cuh
     device/scan_kernel.cuh
+    device/count_kernel.cuh
     device/macros.cuh
     device/ll_ep.cuh
     device/ll_ep_adapter.cuh
-    device/ll_ep_smem.cuh
+    device/ll/ll_common.cuh
+    device/ll/ll_dispatch_recipe.cuh
+    device/ll/ll_ep_smem.cuh
+    device/ll/ll_gin.cuh
+    device/ll/ll_lsa_primitives.cuh
+    device/ll/ll_mask.cuh
+    device/ll/ll_logfmt.cuh
+    device/ll/ll_dispatch_lsa.cuh
+    device/ll/ll_dispatch_cft_lsa.cuh
+    device/ll/ll_combine_lsa.cuh
+    device/cft.cuh
+    device/ll_ep_cft.cuh
 )
 
 file(MAKE_DIRECTORY "${NCCL_EP_JIT_SOURCE_DIR}")
@@ -156,6 +173,7 @@ foreach(header IN LISTS NCCL_EP_JIT_HEADERS)
 endforeach()
 configure_file(include/common.hpp "${NCCL_EP_JIT_SOURCE_DIR}/common.hpp" COPYONLY)
 configure_file(include/ep_enums.h "${NCCL_EP_JIT_SOURCE_DIR}/ep_enums.h" COPYONLY)
+configure_file(include/cuda_fp_features.h "${NCCL_EP_JIT_SOURCE_DIR}/cuda_fp_features.h" COPYONLY)
 
 set(NCCL_EP_INCLUDE_DIRS
     ${NCCL_EP_INCDIR}
@@ -167,6 +185,14 @@ set(NCCL_EP_INCLUDE_DIRS
 )
 # In-tree sources (nccl_ep.cc, device/jit/*.hpp included from device/*.cu)
 set(NCCL_EP_SOURCE_INCDIR ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Largest NUM_ACC the combine RED loops keep register-resident. Consumed by the
+# pipeline-count heuristic in device/ht_ep_adapter.cu; ht_ep.cuh supplies the same
+# default when it is not defined. Mirrors `make COMBINE_MAX_ACC=N`; configure with
+# -DNCCL_EP_COMBINE_MAX_ACC=N. Applied to CXX and CUDA alike, since nvcc_compiler.cc
+# (host) forwards the value into the JIT -D flags and ht_ep_adapter.cu (device TU)
+# reads it directly.
+set(NCCL_EP_COMBINE_MAX_ACC 64 CACHE STRING "Largest combine RED NUM_ACC kept register-resident")
 
 # Allow device code to call host constexpr with --expt-relaxed-constexpr
 # Hides all symbols by default in the host compiled object files with -fvisibility=hidden
@@ -182,6 +208,7 @@ foreach(t IN LISTS NCCL_EP_TARGETS)
     else()
         target_link_libraries(${t} PUBLIC cuda)
     endif()
+    target_compile_definitions(${t} PRIVATE NCCL_EP_COMBINE_MAX_ACC=${NCCL_EP_COMBINE_MAX_ACC})
     target_include_directories(${t} PUBLIC ${NCCL_EP_INCLUDE_DIRS})
     target_include_directories(${t} PRIVATE ${NCCL_EP_SOURCE_INCDIR})
     target_link_directories(${t} PUBLIC ${NCCL_LIBDIR})
@@ -207,6 +234,7 @@ endforeach()
 install(FILES
     include/common.hpp
     include/ep_enums.h
+    include/cuda_fp_features.h
     DESTINATION "${NCCL_EP_INCDIR}/nccl_ep"
 )
 

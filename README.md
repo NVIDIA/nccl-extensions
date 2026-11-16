@@ -24,6 +24,11 @@ Python package (`nccl-extensions`) providing Pythonic wrappers for `nccl_ep`
 and `nccl_m2n` as `nccl.ep` and `nccl.m2n`. See
 [`python/README.md`](python/README.md) for details.
 
+## Blogs and Papers
+
+- [NCCL EP powers dropless MoE training in JAX](https://developer.nvidia.com/blog/accelerating-dropless-moe-training-in-jax-with-nvidia-transformer-engine/)
+- [NCCL M2N: A Layout- and Topology-Aware Collective for Distributed Tensor Resharding](https://arxiv.org/abs/2610.07516)
+
 ## Installation
 
 Prebuilt Python wheels are available from
@@ -41,8 +46,8 @@ python -m pip install "nccl-extensions[cu13]"
 ```
 
 The CUDA extras are mutually exclusive. Each extra installs the corresponding
-CUDA runtime dependencies and **exactly NCCL 2.30.7**. Other NCCL versions have
-not yet been validated and are not guaranteed to work.
+CUDA runtime dependencies and **NCCL 2.32.3 or newer**, matching the vendored NCCL
+submodule. Older NCCL runtimes are rejected at startup.
 
 NCCL EP compiles kernels at runtime. Its CUDA toolkit, including `nvcc` and
 headers, must match the selected CUDA major version. Set `CUDA_HOME` when the

@@ -14,8 +14,8 @@ function: [Quantization](quantization.md), [Zero-Copy](zero_copy.md),
 | [Library](#library) | `ncclEpGetVersion` |
 | [Group Management](#group-management) | `ncclEpCreateGroup`, `ncclEpGroupDestroy` |
 | [Tensor Descriptors](#tensor-descriptors) | `ncclEpTensorAlloc`, `ncclEpTensorDestroy` |
-| [Handle Management](#handle-management) | `ncclEpCreateHandle`, `ncclEpInitHandle`, `ncclEpUpdateHandle`, `ncclEpHandleMemSize`, `ncclEpHandleDestroy` |
-| [Communication Operations](#communication-operations) | `ncclEpDispatch`, `ncclEpCombine`, `ncclEpComplete` |
+| [Handle Management](#handle-management) | `ncclEpCreateHandle`, `ncclEpInitHandle`, `ncclEpUpdateHandle`, `ncclEpHandleMemSize`, `ncclEpImportHandle`, `ncclEpHandleDestroy` |
+| [Communication Operations](#communication-operations) | `ncclEpDispatch`, `ncclEpCombine`, `ncclEpAfDispatch`, `ncclEpAfRecv`, `ncclEpAfCombine`, `ncclEpAfReturn`, `ncclEpComplete` |
 | [Fault Tolerance](#fault-tolerance) | `ncclEpMaskQuery`, `ncclEpMaskUpdate`, `ncclEpMaskClean`, `ncclEpGetAsyncError`, `ncclEpErrorClear` |
 
 ## Library
@@ -81,9 +81,16 @@ ncclResult_t ncclEpGroupDestroy(
 
 ## Handle Management
 
-### Handle usage limitations
+An NCCL EP handle represents the state that connects related dispatch and combine
+operations — a dispatch/combine pair on the LL path, or both the forward and
+backward passes in HT mode. The handle holds only the metadata-related state; the
+staging buffers are owned by the EP group.
 
-Currently,  HT mode supports 1F1B mode allowing multiple handles to be active on the same EP group. LL mode currently is limited to a single Handle per Group due to a known issue (see [NCCL EP v0.2 Release Notes](../release/RELEASE_NOTES_v0.2.md#ll-one-handle-per-group))
+### Multiple handles per group
+
+Both HT and LL support several handles being active on the same EP group, as a
+1F1B / pipeline-parallel schedule requires. Creating or updating one handle does
+not disturb another handle's pending dispatch or combine.
 
 ### `ncclEpCreateHandle()`
 
@@ -214,9 +221,10 @@ is detected and where `recv_total_counter` is written. See
 ### `ncclEpHandleMemSize()`
 
 ```c
-// Query the device bytes required for a handle's routing buffers, for callers
-// that want to supply handle memory themselves via the handle_mem argument of
-// ncclEpInitHandle / ncclEpCreateHandle.
+// Query the device bytes required for a handle's persistent routing state, for
+// callers that want to supply handle memory themselves via the handle_mem argument
+// of ncclEpInitHandle / ncclEpCreateHandle. Group-owned update-only scan workspace
+// is allocated lazily by ncclEpInitHandle and is not included in size_out.
 //
 // Arguments:
 //   ep_group  - [IN]  A valid EP group
@@ -234,6 +242,43 @@ ncclResult_t ncclEpHandleMemSize(
     size_t* size_out,
     int num_topk);
 ```
+
+### `ncclEpImportHandle()` (HT only)
+
+Binds a handle to a `handle_mem` buffer already prepared by `ncclEpUpdateHandle`
+on a *different* handle, without rerunning the collective. Intended for callers
+that snapshot a prepared `handle_mem` and later rebind it at a different address
+— `ncclEpHandleState_t` carries the host metadata needed to reinterpret that
+snapshot.
+
+```c
+// Import an HT handle from a caller-owned handle buffer already prepared by
+// ncclEpUpdateHandle with matching group, layout, config, and state metadata.
+// Local only: no device-state copy, CUDA launch, or metadata scan. Dispatch
+// and Combine can use the returned handle without another UpdateHandle.
+//
+// Arguments:
+//   handle     - [OUT] Newly imported handle
+//   ep_group   - [IN]  The EP group used to prepare handle_mem
+//   layout     - [IN]  The layout used to prepare handle_mem
+//   config     - [IN]  Handle configuration used to prepare handle_mem. NULL = defaults.
+//   state      - [IN]  Host metadata describing the prepared state
+//   handle_mem - [IN]  Caller-owned prepared 1D ncclUint8 device buffer
+//
+// Returns: ncclResult_t error code
+
+ncclResult_t ncclEpImportHandle(
+    ncclEpHandle_t* handle,
+    ncclEpGroup_t ep_group,
+    ncclEpLayout_t layout,
+    const ncclEpHandleConfig_t* config,
+    const ncclEpHandleState_t* state,
+    const ncclEpTensor_t* handle_mem);
+```
+
+`ncclEpHandleState_t` (`num_tokens`, `num_topk`, `topk_idx_datatype`) is
+caller-constructed from the values used to prepare the snapshot; initialize it
+with `NCCL_EP_HANDLE_STATE_INIT`.
 
 ## Tensor Descriptors
 
@@ -304,6 +349,15 @@ ncclResult_t ncclEpTensorDestroy(ncclEpTensor_t* tensor);
 ### `ncclEpDispatch()`
 
 Perform EP dispatch: send tokens to experts according to routing decisions.
+
+LL rank-major dispatch accepts FP32 or BF16 routing weights in
+`inputs->topk_weights` with shape `[num_tokens, top_k]`. The corresponding
+`outputs->topk_weights` tensor must use the same dtype and shape
+`[num_ranks, max_dispatch_tokens_per_rank, top_k]`. The JIT specializes weight
+loads and stores by dtype; the internal routing wire header remains FP32.
+LL expert-major combine also accepts FP32 or BF16 routing weights in
+`outputs->topk_weights`; BF16 weights are widened in registers before the
+FP32 weighted reduction. HT routing weights remain FP32.
 
 ```c
 // Perform EP dispatch
@@ -389,6 +443,75 @@ ncclResult_t ncclEpCombine(
     cudaStream_t stream
 );
 ```
+
+### AFD role wrappers
+
+Attention-FFN Disaggregation (AFD) partitions an LL rank-major group into a
+leading prefix of attention ranks and a trailing set of expert ranks, selected
+by `ncclEpGroupConfig_t::num_attn_ranks`. The four role-named APIs validate the
+calling rank and then forward to the ordinary dispatch or combine operation.
+They do not create separate collectives: every rank must call its matching side
+of each row below in the same order.
+
+| Collective | Attention ranks | Expert ranks |
+|---|---|---|
+| Dispatch | `ncclEpAfDispatch` | `ncclEpAfRecv` |
+| Combine | `ncclEpAfCombine` | `ncclEpAfReturn` |
+
+```c
+ncclResult_t ncclEpAfDispatch(
+    ncclEpHandle_t handle,
+    const ncclEpDispatchInputs_t* inputs,
+    const ncclEpDispatchOutputs_t* outputs,
+    const ncclEpLayoutInfo_t* layout_info,
+    const ncclEpDispatchConfig_t* config,
+    cudaStream_t stream);
+
+ncclResult_t ncclEpAfRecv(
+    ncclEpHandle_t handle,
+    const ncclEpDispatchInputs_t* inputs,
+    const ncclEpDispatchOutputs_t* outputs,
+    const ncclEpLayoutInfo_t* layout_info,
+    const ncclEpDispatchConfig_t* config,
+    cudaStream_t stream);
+
+ncclResult_t ncclEpAfCombine(
+    ncclEpHandle_t handle,
+    const ncclEpCombineInputs_t* inputs,
+    const ncclEpCombineOutputs_t* outputs,
+    const ncclEpCombineConfig_t* config,
+    cudaStream_t stream);
+
+ncclResult_t ncclEpAfReturn(
+    ncclEpHandle_t handle,
+    const ncclEpCombineInputs_t* inputs,
+    const ncclEpCombineOutputs_t* outputs,
+    const ncclEpCombineConfig_t* config,
+    cudaStream_t stream);
+```
+
+On attention ranks, dispatch receive tensors and combine `inputs->tokens` are
+omitted. On expert ranks, dispatch `inputs->topk_weights` is omitted, while the
+rank-major dispatch receive tensors and combine input tensor are required. A
+wrong-role call returns `ncclInvalidUsage`; an invalid handle returns
+`ncclInvalidArgument`.
+
+AFD follows the ordinary LL `AUTO` zero-copy contract: window use must be
+consistent across the collective. When dispatch output tokens are window-backed,
+every rank participates in the same `ncclCommWindowRegister` call and attaches
+the resulting handle to `outputs->tokens`. F-ranks register the full receive
+allocation. A-ranks may register a minimal placeholder allocation because NCCL
+supports asymmetric window sizes; their local allocation is not written. If no
+rank attaches a window, dispatch uses library staging as usual. Mixing windowed
+and non-windowed descriptors across ranks is unsupported, as in classic LL EP.
+
+Python exposes the same role checks as `Handle.af_dispatch`, `Handle.af_recv`,
+`Handle.af_combine`, and `Handle.af_return`.
+
+AFD currently supports unquantized communication only. Both sides of dispatch
+must use `NCCL_EP_DISP_QUANT_NONE`, and both sides of combine must use
+`NCCL_EP_COMB_QUANT_NONE`. Other quantization recipes are not supported with
+`num_attn_ranks > 0`.
 
 ### `ncclEpComplete()` (LL mode only)
 

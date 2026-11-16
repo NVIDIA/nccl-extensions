@@ -7,6 +7,45 @@ delivers performance optimizations and bug fixes, and lifts several hard-coded l
 A versioned ABI keeps v0.1-compiled applications working against v0.2, and new
 environment knobs expose SM allocation, HT pipelining, and build configuration.
 
+## HT default flow compatibility
+
+AUTO now selects pull dispatch / push combine for both flat and expert-major
+when the group specifies top-k in [1, 32], at most 65535 experts, and one LSA
+team of at most 128 ranks, without explicit EM duplication modes. Unspecified
+top-k retains push/pull. Explicit flow and environment overrides remain supported.
+Invalid flow environment values warn and use the AUTO policy.
+
+MXFP8 combine is unsupported with pull/push and fails with an actionable error.
+Use explicit `NCCL_EP_HT_FLOW_PUSH_PULL` with expert-major local-permute
+(`zero_copy` AUTO/OFF, no duplication overrides) for this recipe. Pull/push
+retains staging even with `zero_copy=ON`, which can increase group memory.
+Input tokens, weights, and scales can independently use windows or staging;
+the backing choice for each operand must match across ranks.
+
+## HT communication SM defaults
+
+Expert-major dispatch and combine default to 24 SMs on non-Rubin devices and
+32 on Rubin SM107. Flat dispatch defaults to 16; flat combine defaults to 32
+when group `max_dispatch_tokens_per_rank >= 8192`, otherwise 16. The threshold
+uses configured capacity, not the current handle batch. Explicit SM overrides
+retain their precedence.
+
+Multi-LSA HT group resources require `num_qp_per_rank >= 1 + 2 * group dispatch
+SMs`: automatic defaults require 49 contexts, or 65 on Rubin, even for flat-only
+users. AUTO provisions them; smaller explicit budgets are rejected. The 24-SM
+expert-major default produces a 96-token chunk, outside the adaptive dispatch
+chunk policy's validated defaults; dispatch overrides must divide that chunk.
+
+## HT benchmark defaults
+
+`ep_bench` requests fused metadata by default where supported; use
+`--unfused-meta-dispatch` for comparison. Random-routing receive capacity now
+uses `ceil(1.15 * top_k * max_tokens_per_rank)`, plus expert-major padding.
+This is a benchmark policy, not a worst-case guarantee. Explicit budgets and
+legacy duplication staging requirements remain authoritative. Existing default
+benchmark time series change with these defaults; explicit push/pull rows
+retain coverage of the legacy implementation.
+
 ## New Features
 
 ### Quantization support
@@ -149,6 +188,8 @@ Added FP16 and FP32 data type support.
 - **HT zero receive in eager mode** — ranks receiving no tokens are now handled correctly.
 - **HT `local_permute_dup` out-of-bounds write** on overflow.
 - **LL combine stage reuse** now correctly fenced.
+- **LL epoch ring is now group-owned** — concurrent LL handles on one group no longer race on
+  the shared double-buffered RDMA banks, and CUDA-graph replay advances the bank selector.
 - **HT sync guard for consecutive same-direction ops** — enabled by default, disable via env for
   testing.
 - **Byte-padded HT routing map** to fix a scan layout mismatch.
@@ -208,20 +249,6 @@ Internal changes with no API impact, but worth knowing.
   `NCCL_EP_DISABLE_GUARD`.
 
 ## Known Limitations
-
-### LL: one handle per group
-
-LL has a single double-buffered RDMA allocation per **group**, but the bank selector is
-per-handle and is host-advanced on each dispatch or combine. Two handles on the same group
-therefore compute identical offsets into the same two banks while advancing independent
-parities. This causes data corruption due to a cross-rank race condition.
-
-CUDA-graph capture has the same ownership problem in a different form: capture bakes a
-host-selected bank parity into the graph, and replay does not advance the selector.
-
-**Use one LL handle per group, and do not capture LL dispatch or combine into a CUDA graph.**
-A fix that moves bank selection to group-owned state is available on the development branch and
-is targeted at a following release.
 
 ### HT: at most 33 RDMA domains
 

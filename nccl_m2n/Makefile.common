@@ -168,6 +168,7 @@ LIB_HDRS := $(SRCDIR)/nccl_m2n.h \
             $(SRCDIR)/reshard_types.h \
             $(SRCDIR)/reshard_limits.h \
             $(SRCDIR)/reshard_split.h \
+            $(SRCDIR)/reshard_pipe_resources.h \
             $(SRCDIR)/m2n_checks.h \
             $(SRCDIR)/m2n_env_parse.h \
             $(SRCDIR)/m2n_checked_math.h \

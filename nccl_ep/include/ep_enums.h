@@ -6,6 +6,17 @@
 
 #pragma once
 
+// NCCL reserves value 12 for ncclFloat4x2: one byte containing two packed
+// 4-bit floating-point values. The NCCL version used to build this library
+// may not expose the enumerator yet, and NCCL collectives do not support it.
+// Define the matching value here (shared by the public API in nccl_ep.h and the
+// library-internal headers) so EP can use it solely for its byte-copy QUANT_FWD
+// recipe. This also works with a newer NCCL header, where it
+// expands to that same reserved enum value.
+#ifndef ncclFloat4x2
+#define ncclFloat4x2 ((ncclDataType_t)12)
+#endif
+
 // Auto configuration constant for dynamic/automatic sizing
 #define NCCL_EP_AUTO 0
 
@@ -164,6 +175,27 @@ typedef enum {
     NCCL_EP_ZERO_COPY_OFF,
     NCCL_EP_ZERO_COPY_ON
 } ncclEpZeroCopyMode_t;
+
+// HT dispatch/combine data flow. The names describe dispatch followed by
+// combine. AUTO selects pull-push within one supported LSA team with a known
+// supported group top-k, and push-pull elsewhere, respecting explicit EM
+// duplication modes. NCCL_EP_HT_PULL_PUSH
+// overrides AUTO (0 selects push-pull, 1 selects pull-push).
+// AUTO pull-push requires one LSA team of at most 128 ranks, top-k in [1, 32],
+// and at most 65535 experts. MXFP8 combine requires PUSH_PULL local-permute.
+typedef enum {
+    NCCL_EP_HT_FLOW_AUTO = NCCL_EP_AUTO,
+    NCCL_EP_HT_FLOW_PUSH_PULL,
+    NCCL_EP_HT_FLOW_PULL_PUSH,
+} ncclEpHtFlow_t;
+
+// HT metadata-exchange policy. Fused exchange publishes routing metadata as
+// part of dispatch instead of exchanging it during ncclEpUpdateHandle.
+typedef enum {
+    NCCL_EP_META_EXCHANGE_AUTO = NCCL_EP_AUTO,
+    NCCL_EP_META_EXCHANGE_REQUIRE_FUSED,
+    NCCL_EP_META_EXCHANGE_FORCE_SCAN,
+} ncclEpMetaExchangePolicy_t;
 
 /**
  * Numbering convention for the recv_topk_idx output of dispatch.

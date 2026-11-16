@@ -46,7 +46,7 @@ ifeq ($(origin NVCC_GENCODE),file)
   endif
 endif
 
-.PHONY: all build clean lib ep_test ep_bench
+.PHONY: all build clean lib ep_test ep_bench af_test
 
 # Build layout:
 #   NCCL_HOME — input: NCCL core headers + libnccl.so
@@ -66,15 +66,31 @@ JIT_CONFIG_HEADER := $(JIT_DIR)/config.h
 # NVCC JIT support is required for HT and LL modes.
 NCCL_EP_JIT_HEADERS := \
     device/ht_ep.cuh \
+    device/ht_compact_prob.cuh \
+    ht_compact_prob.h \
+    device/mxfp8_quant.cuh \
+    device/quant_recipe.cuh \
     device/device_primitives.cuh \
     device/ht_ep_configs.cuh \
     device/cuda_compat_shims.cuh \
     device/scan_kernel.cuh \
+    device/count_kernel.cuh \
     device/macros.cuh \
     device/ll_ep.cuh \
     device/ll_ep_adapter.cuh \
-    device/ll_ep_smem.cuh
-NCCL_EP_JIT_STAGED_HEADERS := include/common.hpp include/ep_enums.h
+    device/ll/ll_common.cuh \
+    device/ll/ll_dispatch_recipe.cuh \
+    device/ll/ll_ep_smem.cuh \
+    device/ll/ll_gin.cuh \
+    device/ll/ll_lsa_primitives.cuh \
+    device/ll/ll_mask.cuh \
+    device/ll/ll_logfmt.cuh \
+    device/ll/ll_dispatch_lsa.cuh \
+    device/ll/ll_dispatch_cft_lsa.cuh \
+    device/ll/ll_combine_lsa.cuh \
+    device/cft.cuh \
+    device/ll_ep_cft.cuh
+NCCL_EP_JIT_STAGED_HEADERS := include/common.hpp include/ep_enums.h include/cuda_fp_features.h
 NCCL_EP_JIT_STAGED_TARGETS := $(NCCL_EP_JIT_STAGED_HEADERS:include/%=$(JIT_DIR)/%)
 NCCL_EP_JIT_HEADER_TARGETS := $(NCCL_EP_JIT_HEADERS:%=$(JIT_DIR)/%) $(NCCL_EP_JIT_STAGED_TARGETS)
 NCCL_EP_JIT_DEFS := -include $(abspath $(JIT_CONFIG_HEADER))
@@ -108,11 +124,16 @@ NVCUFLAGS += -DNCCL_EP_HT_ENABLE_WARP_TIMING
 CXXFLAGS  += -DNCCL_EP_HT_ENABLE_WARP_TIMING
 endif
 
+# Default for COMBINE_MAX_ACC; the single authoritative -D block is near the end of
+# this file (after EP_TEST_NVCUFLAGS and EP_BENCH_NVCUFLAGS are defined) so that all
+# four flag variables are populated exactly once.
+COMBINE_MAX_ACC ?= 64
+
 # Dependency generation flags for automatic header tracking
 DEPFLAGS = -MMD -MP
 
 # Source files for library
-HOST_SRC := nccl_ep.cc nccl_ep_env.cc
+HOST_SRC := nccl_ep.cc nccl_ep_cft.cc nccl_ep_env.cc
 DEVICE_SRC := device/ll_ep_adapter.cu \
               device/ht_ep_adapter.cu
 HOST_SRC += device/jit/jit_utils.cc \
@@ -152,7 +173,7 @@ SOLIBLINKS   := $(LIBDIR)/$(SOLIBSONAME) $(LIBDIR)/$(SOLIBNAME)
 HEADERS := include/nccl_ep.h
 HEADER_TARGETS := $(HEADERS:include/%=$(INCDIR)/%)
 # Build targets
-all: lib ep_test ep_bench
+all: lib ep_test ep_bench af_test
 build: lib
 
 lib: $(LIBTARGET) $(SOLIBTARGET) $(SOLIBLINKS) $(HEADER_TARGETS) $(NCCL_EP_JIT_HEADER_TARGETS)
@@ -164,6 +185,10 @@ $(OBJDIR)/%.o: %.cc $(JIT_CONFIG_HEADER) $(HEADER_TARGETS) $(NCCL_EP_JIT_HEADER_
 	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # Compile device code (with automatic header dependency generation)
+# LL launch planning runs on the CPU; preserve its host optimization flags.
+$(OBJDIR)/device/ll_ep_adapter.o: NVCUFLAGS += $(addprefix -Xcompiler=,$(filter -O%,$(CXXFLAGS)))
+$(OBJDIR)/device/ll_ep_adapter.o: Makefile
+
 $(OBJDIR)/%.o: %.cu $(JIT_CONFIG_HEADER) $(HEADER_TARGETS) $(NCCL_EP_JIT_HEADER_TARGETS)
 	@echo "Compiling $<"
 	@mkdir -p $(dir $@)
@@ -214,7 +239,7 @@ $(JIT_CONFIG_HEADER):
 	@printf '#define NCCL_EP_JIT_BUILD_INCLUDE_DIR "%s"\n' "$(abspath $(NCCL_INCDIR))" >> $@
 	@printf '#define NCCL_EP_JIT_CUDA_INCLUDE_DIR "%s"\n' "$(abspath $(CUDA_INC))" >> $@
 
-# Staged top-level headers (common.hpp, ep_enums.h) from include/
+# Staged top-level headers (common.hpp, ep_enums.h, cuda_fp_features.h) from include/
 $(JIT_DIR)/%: include/%
 	@echo "Installing JIT header $<"
 	@mkdir -p $(dir $@)
@@ -227,6 +252,9 @@ $(JIT_DIR)/%: %
 
 # Include generated dependency files (the - prefix silences errors if files don't exist yet)
 -include $(ALL_OBJ:.o=.d)
+# ep_test/ep_bench are built outside ALL_OBJ, so pick up their dependency files too: both pull in
+# private headers (ht_compact_prob.h) that no explicit prerequisite lists.
+-include $(DST_DIR)/ep_test.d $(DST_DIR)/ep_bench.d
 
 # Detect CUPTI headers at compile time (optional; enables kernel-level GPU timing)
 CUPTI_AVAILABLE := $(shell echo '\#include <cupti.h>' | $(NVCC_CXX_COMPILER) -x c++ -E - >/dev/null 2>&1 && echo 1)
@@ -245,7 +273,7 @@ endif
 # they were built against rather than risk binding a stale system libnccl.
 # --no-as-needed keeps libnccl in DT_NEEDED despite its weak-only exports.
 EP_EXE_NCCL_LDFLAGS := -L$(LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -Xlinker --no-as-needed -lnccl -Xlinker --as-needed \
-                       -Xlinker -rpath -Xlinker $(abspath $(NCCL_LIBDIR)) -Xlinker -rpath -Xlinker $(abspath $(LIBDIR))
+                       -Xlinker -rpath -Xlinker $(abspath $(LIBDIR)) -Xlinker -rpath -Xlinker $(abspath $(NCCL_LIBDIR))
 
 # Build ep_test and ep_bench (require MPI)
 ifeq ($(MPI), 1)
@@ -260,21 +288,32 @@ EP_BENCH_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) -I$(NCCL_INCDIR) $(MPI_CFLAGS)
 EP_BENCH_NVLDFLAGS := $(EP_EXE_NCCL_LDFLAGS) $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(CUPTI_LDFLAGS)
 ep_test: lib $(DST_DIR)/ep_test
 ep_bench: lib $(DST_DIR)/ep_bench
+af_test: lib $(DST_DIR)/af_test
 
 $(DST_DIR)/ep_test.o: ep_test.cu $(HEADER_TARGETS)
 	@printf "Compiling  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
-	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) -c $<
+	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) $(DEPFLAGS) -c $<
 
 $(DST_DIR)/ep_test: $(DST_DIR)/ep_test.o $(SOLIBTARGET)
 	@printf "Linking    %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
 	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) $< $(EP_TEST_NVLDFLAGS)
 
-$(DST_DIR)/ep_bench.o: ep_bench.cu $(HEADER_TARGETS)
+$(DST_DIR)/af_test.o: af_test.cu $(HEADER_TARGETS)
 	@printf "Compiling  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
-	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) -c $<
+	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) -c $<
+
+$(DST_DIR)/af_test: $(DST_DIR)/af_test.o $(SOLIBTARGET)
+	@printf "Linking    %-35s > %s\n" $< $@
+	@mkdir -p $(DST_DIR)
+	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) $< $(EP_TEST_NVLDFLAGS)
+
+$(DST_DIR)/ep_bench.o: ep_bench.cu ep_bench_recv_budget.hpp $(HEADER_TARGETS)
+	@printf "Compiling  %-35s > %s\n" $< $@
+	@mkdir -p $(DST_DIR)
+	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) $(DEPFLAGS) -c $<
 
 $(DST_DIR)/ep_bench: $(DST_DIR)/ep_bench.o $(SOLIBTARGET)
 	@printf "Linking    %-35s > %s\n" $< $@
@@ -291,31 +330,59 @@ EP_BENCH_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) $(CUPTI_CFLAGS) 
 EP_BENCH_NVLDFLAGS := $(EP_EXE_NCCL_LDFLAGS) $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(CUPTI_LDFLAGS)
 ep_test: lib $(DST_DIR)/ep_test
 ep_bench: lib $(DST_DIR)/ep_bench
+af_test: lib $(DST_DIR)/af_test
 
 $(DST_DIR)/ep_test.o: ep_test.cu $(HEADER_TARGETS)
 	@printf "Compiling  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
-	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) -c $<
+	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) $(DEPFLAGS) -c $<
 
 $(DST_DIR)/ep_test: $(DST_DIR)/ep_test.o $(SOLIBTARGET)
 	@printf "Linking    %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
 	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) $< $(EP_TEST_NVLDFLAGS)
 
-$(DST_DIR)/ep_bench.o: ep_bench.cu $(HEADER_TARGETS)
+$(DST_DIR)/af_test.o: af_test.cu $(HEADER_TARGETS)
 	@printf "Compiling  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
-	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) -c $<
+	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) -c $<
+
+$(DST_DIR)/af_test: $(DST_DIR)/af_test.o $(SOLIBTARGET)
+	@printf "Linking    %-35s > %s\n" $< $@
+	@mkdir -p $(DST_DIR)
+	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) $< $(EP_TEST_NVLDFLAGS)
+
+$(DST_DIR)/ep_bench.o: ep_bench.cu ep_bench_recv_budget.hpp $(HEADER_TARGETS)
+	@printf "Compiling  %-35s > %s\n" $< $@
+	@mkdir -p $(DST_DIR)
+	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) $(DEPFLAGS) -c $<
 
 $(DST_DIR)/ep_bench: $(DST_DIR)/ep_bench.o $(SOLIBTARGET)
 	@printf "Linking    %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
 	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) $< $(EP_BENCH_NVLDFLAGS)
 else
-ep_test ep_bench:
-	@echo "Skipping ep_test/ep_bench (MPI not enabled). Use MPI=1 to build."
+ep_test ep_bench af_test:
+	@echo "Skipping ep_test/ep_bench/af_test (MPI not enabled). Use MPI=1 to build."
 endif
 endif
+
+# Largest NUM_ACC kept register-resident by the RED loops (default 64; override with
+# COMBINE_MAX_ACC=N on the make command line).  Propagated to all four flag sets here
+# — after EP_TEST_NVCUFLAGS and EP_BENCH_NVCUFLAGS are fully defined above — so each
+# variable receives exactly one -D.
+#   - CXXFLAGS            : nvcc_compiler.cc bakes value into JIT -D flags at runtime
+#   - NVCUFLAGS           : static .cu instantiations in the library
+#   - EP_TEST_NVCUFLAGS   : ep_test host JIT path
+#   - EP_BENCH_NVCUFLAGS  : ep_bench host JIT path
+# Sweep example: make -C nccl_ep COMBINE_MAX_ACC=32 lib ep_bench
+# Build-time only. The pipeline-count heuristic that consumes MAX_ACC runs in the
+# compiled host adapter, so passing -DNCCL_EP_COMBINE_MAX_ACC through NVCC_EXTRA_FLAGS
+# changes only the JIT'd device code and not the launch configuration it picks.
+CXXFLAGS           += -DNCCL_EP_COMBINE_MAX_ACC=$(COMBINE_MAX_ACC)
+NVCUFLAGS          += -DNCCL_EP_COMBINE_MAX_ACC=$(COMBINE_MAX_ACC)
+EP_TEST_NVCUFLAGS  += -DNCCL_EP_COMBINE_MAX_ACC=$(COMBINE_MAX_ACC)
+EP_BENCH_NVCUFLAGS += -DNCCL_EP_COMBINE_MAX_ACC=$(COMBINE_MAX_ACC)
 
 clean:
 	rm -rf $(OBJDIR) $(LIBTARGET) $(SOLIBTARGET) $(SOLIBLINKS) $(HEADER_TARGETS) $(JIT_DIR) $(DST_DIR)

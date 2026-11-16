@@ -20,6 +20,7 @@
 #include "reshard_internal.h"
 #include "staging_buffer.h"
 #include "staging_types.h"
+#include "test_helpers.h"
 
 namespace {
 
@@ -171,15 +172,15 @@ protected:
     if (rank_ == 0) ASSERT_EQ(ncclSuccess, ncclGetUniqueId(&id));
     ASSERT_EQ(MPI_SUCCESS, MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD));
 
-    ASSERT_EQ(ncclSuccess, ncclCommInitRank(comm, world_, id, rank_));
+    ASSERT_NCCL(ncclCommInitRankConfig(comm, world_, id, rank_, nullptr), *comm);
   }
 
-  void preparePipeParams(ncclComm_t comm, const size_t (&tensorDims)[2], ncclDistTensor_t* src,
-                         ncclDistTensor_t* dst, int srcGpusPerDomain, int dstGpusPerDomain,
-                         StagingTransferDescriptor* desc, StagingKernelParams* params) {
+  void preparePipeParams(ncclComm_t comm, ncclDistTensor_t* src, ncclDistTensor_t* dst,
+                         int srcGpusPerDomain, int dstGpusPerDomain, StagingTransferDescriptor* desc,
+                         StagingKernelParams* params) {
     ASSERT_EQ(ncclSuccess,
-              buildStagingTransferDescriptor(comm, src->dataPtr, tensorDims, 2, src, dst->dataPtr, tensorDims, dst,
-                                             srcGpusPerDomain, dstGpusPerDomain, 0, desc));
+              buildStagingTransferDescriptor(comm, src->dataPtr, src->localShape, 2, src, dst->dataPtr,
+                                             dst->localShape, dst, srcGpusPerDomain, dstGpusPerDomain, 0, desc));
     desc->controlSlot = 0;
     desc->pipeGinPeerCapacity = 4;
     desc->pipeGinChannelsPerPeer = 4;
@@ -210,7 +211,6 @@ TEST_F(PipeGraphPathTest, Dsv3LikeFourSourceShardsTwoLocalDestinationReplicas) {
   int dstPlacements[2] = {NCCL_RESHARD_SHARD(1), NCCL_RESHARD_REPLICATE};
   size_t srcLocalShape[2] = {1, 4};
   size_t dstLocalShape[2] = {4, 2};
-  const size_t tensorDims[2] = {4, 4};
 
   ncclMesh_t srcMesh = NCCL_M2N_MESH_INITIALIZER;
   srcMesh.ndims = 2;
@@ -238,7 +238,7 @@ TEST_F(PipeGraphPathTest, Dsv3LikeFourSourceShardsTwoLocalDestinationReplicas) {
 
   StagingTransferDescriptor desc = {};
   StagingKernelParams params = {};
-  preparePipeParams(comm, tensorDims, &src, &dst, 1, 2, &desc, &params);
+  preparePipeParams(comm, &src, &dst, 1, 2, &desc, &params);
 
   if (rank_ < 4) {
     EXPECT_TRUE(desc.isSource);
@@ -290,7 +290,7 @@ TEST_F(PipeGraphPathTest, Dsv3LikeFourSourceShardsTwoLocalDestinationReplicas) {
 
   gReshardCopyAlgorithm = savedCopyAlgorithm;
   ASSERT_EQ(MPI_SUCCESS, MPI_Barrier(MPI_COMM_WORLD));
-  ASSERT_EQ(ncclSuccess, ncclCommDestroy(comm));
+  ASSERT_NCCL(ncclCommDestroy(comm));
 }
 
 TEST_F(PipeGraphPathTest, FourRanksCoverPointToPointTrainerFaninAndTrainerFanout) {
@@ -308,7 +308,6 @@ TEST_F(PipeGraphPathTest, FourRanksCoverPointToPointTrainerFaninAndTrainerFanout
   int srcMeshDims[2] = {2, 1};
   int srcPlacements[2] = {NCCL_RESHARD_SHARD(0), NCCL_RESHARD_REPLICATE};
   size_t srcLocalShape[2] = {1, 2};
-  const size_t tensorDims[2] = {2, 2};
   ncclMesh_t srcMesh = NCCL_M2N_MESH_INITIALIZER;
   srcMesh.ndims = 2;
   srcMesh.dims = srcMeshDims;
@@ -339,7 +338,7 @@ TEST_F(PipeGraphPathTest, FourRanksCoverPointToPointTrainerFaninAndTrainerFanout
 
     StagingTransferDescriptor desc = {};
     StagingKernelParams params = {};
-    preparePipeParams(comm, tensorDims, &src, &dst, 1, 1, &desc, &params);
+    preparePipeParams(comm, &src, &dst, 1, 1, &desc, &params);
     EXPECT_EQ(1, desc.isSource ? countRdmaTargets(desc) : countRdmaSources(desc));
     EXPECT_EQ(0, desc.numLsaFollowers);
     EXPECT_EQ(0, params.numLsaTargets + params.numLsaSources);
@@ -364,7 +363,7 @@ TEST_F(PipeGraphPathTest, FourRanksCoverPointToPointTrainerFaninAndTrainerFanout
 
     StagingTransferDescriptor desc = {};
     StagingKernelParams params = {};
-    preparePipeParams(comm, tensorDims, &src, &dst, 1, 1, &desc, &params);
+    preparePipeParams(comm, &src, &dst, 1, 1, &desc, &params);
     if (rank_ == 2) {
       EXPECT_EQ(2, countRdmaSources(desc));
       EXPECT_EQ(2, params.numRdmaSources);
@@ -376,7 +375,7 @@ TEST_F(PipeGraphPathTest, FourRanksCoverPointToPointTrainerFaninAndTrainerFanout
   {
     int dstMeshDims[2] = {1, 2};
     int dstPlacements[2] = {NCCL_RESHARD_SHARD(1), NCCL_RESHARD_REPLICATE};
-    size_t dstLocalShape[2] = {2, 1};
+    size_t dstLocalShape[2] = {2, 2};
     ncclMesh_t dstMesh = NCCL_M2N_MESH_INITIALIZER;
     dstMesh.ndims = 2;
     dstMesh.dims = dstMeshDims;
@@ -391,7 +390,7 @@ TEST_F(PipeGraphPathTest, FourRanksCoverPointToPointTrainerFaninAndTrainerFanout
 
     StagingTransferDescriptor desc = {};
     StagingKernelParams params = {};
-    preparePipeParams(comm, tensorDims, &src, &dst, 1, 2, &desc, &params);
+    preparePipeParams(comm, &src, &dst, 1, 2, &desc, &params);
     if (rank_ >= 2) {
       EXPECT_EQ(1, countRdmaSources(desc));
       EXPECT_EQ(1, desc.numSources - countRdmaSources(desc));
@@ -404,7 +403,7 @@ TEST_F(PipeGraphPathTest, FourRanksCoverPointToPointTrainerFaninAndTrainerFanout
 
   gReshardCopyAlgorithm = savedCopyAlgorithm;
   ASSERT_EQ(MPI_SUCCESS, MPI_Barrier(MPI_COMM_WORLD));
-  ASSERT_EQ(ncclSuccess, ncclCommDestroy(comm));
+  ASSERT_NCCL(ncclCommDestroy(comm));
 }
 
 TEST_F(PipeGraphPathTest, ThreeDestinationDomainsCoverGeneratorRingIngressForwardingAndFanout) {
@@ -424,8 +423,7 @@ TEST_F(PipeGraphPathTest, ThreeDestinationDomainsCoverGeneratorRingIngressForwar
   int srcPlacements[2] = {NCCL_RESHARD_SHARD(0), NCCL_RESHARD_REPLICATE};
   int dstPlacements[2] = {NCCL_RESHARD_SHARD(1), NCCL_RESHARD_REPLICATE};
   size_t srcLocalShape[2] = {1, 3};
-  size_t dstLocalShape[2] = {2, 1};
-  const size_t tensorDims[2] = {2, 3};
+  size_t dstLocalShape[2] = {2, 3};
 
   ncclMesh_t srcMesh = NCCL_M2N_MESH_INITIALIZER;
   srcMesh.ndims = 2;
@@ -453,7 +451,7 @@ TEST_F(PipeGraphPathTest, ThreeDestinationDomainsCoverGeneratorRingIngressForwar
 
   StagingTransferDescriptor desc = {};
   StagingKernelParams params = {};
-  preparePipeParams(comm, tensorDims, &src, &dst, 1, 2, &desc, &params);
+  preparePipeParams(comm, &src, &dst, 1, 2, &desc, &params);
 
   if (rank_ < 2) {
     EXPECT_TRUE(desc.isSource);
@@ -481,7 +479,7 @@ TEST_F(PipeGraphPathTest, ThreeDestinationDomainsCoverGeneratorRingIngressForwar
 
   gReshardCopyAlgorithm = savedCopyAlgorithm;
   ASSERT_EQ(MPI_SUCCESS, MPI_Barrier(MPI_COMM_WORLD));
-  ASSERT_EQ(ncclSuccess, ncclCommDestroy(comm));
+  ASSERT_NCCL(ncclCommDestroy(comm));
 }
 
 } // namespace

@@ -12,16 +12,6 @@
 #include <nccl.h>
 #include "nccl_ep/ep_enums.h"
 
-// NCCL reserves value 12 for ncclFloat4x2: one byte containing two packed
-// 4-bit floating-point values. The NCCL version used to build this library
-// may not expose the enumerator yet, and NCCL collectives do not support it.
-// Define the matching value here so EP can use it solely for its byte-copy
-// QUANT_FWD recipe. This also works with a newer NCCL header, where it
-// expands to that same reserved enum value.
-#ifndef ncclFloat4x2
-#define ncclFloat4x2 ((ncclDataType_t)12)
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -31,7 +21,7 @@ extern "C" {
 // shared library's VERSION/SOVERSION (libnccl_ep.so.MAJOR.MINOR.PATCH with
 // a libnccl_ep.so.MAJOR soname symlink).
 #define NCCL_EP_MAJOR 0
-#define NCCL_EP_MINOR 2
+#define NCCL_EP_MINOR 3
 #define NCCL_EP_PATCH 0
 
 // Packed version code: MAJOR*10000 + MINOR*100 + PATCH. Mirrors NCCL_VERSION_CODE.
@@ -72,7 +62,7 @@ extern "C" {
 //       .tokens = my_tokens,
 //   };
 // ============================================================================
-#define NCCL_EP_API_VERSION 2
+#define NCCL_EP_API_VERSION 4
 #define NCCL_EP_MAGIC 0xC00FFFEEu
 
 #define NCCL_EP_STRUCT_INIT(type_, magic_) \
@@ -296,12 +286,14 @@ typedef struct {
     //     reallocation is ever performed.
     //     (NOTE: for optimal sizing, a way to query the required size is planned for future release)
     unsigned long int rdma_buffer_size;
+    // Multi-LSA HT minimum: 1 + 2 * group dispatch SMs (AUTO: 49 non-Rubin,
+    // 65 Rubin). Group resources reserve expert-major capacity even for flat.
     unsigned int num_qp_per_rank;        // Number of QPs per rank (NCCL_EP_AUTO for auto)
     // Number of channels per rank (NCCL_EP_AUTO for auto).
     // In high throughput collectives, each channel occupies 2 SMs
     unsigned int num_channels;
-    // Maximum number of SMs to use for EP kernels (dispatch, combine, preprocessing).
-    // Default: NCCL_EP_AUTO — algorithm-dependent default.
+    // Shared maximum number of SMs for dispatch and combine. Retained as the
+    // fallback for dispatch_num_sms/combine_num_sms. Default: NCCL_EP_AUTO.
     unsigned int max_num_sms;
     // Device memory allocator; zero-init (all NULL) uses cudaMalloc/cudaFree.
     ncclEpAllocConfig_t alloc;
@@ -328,9 +320,40 @@ typedef struct {
     // Upper bound on per-token top-k across all handles of this group. Optional
     // (0 = unset); required only for HT eager mode with the Expert-Major layout,
     // where it sizes internal buffers. When set, ncclEpInitHandle validates the
-    // handle's num_topk against it.
+    // handle's num_topk against it. A supported positive value also enables
+    // AUTO pull-push selection; zero retains push-pull.
     unsigned int num_topk;
     unsigned char padding_v2[4]; // consumes V2 tail padding; future fields append after it
+    // Dispatch SM budget. AUTO inherits max_num_sms when set; otherwise HT
+    // defaults to 16 flat, or 32 on Rubin (SM107) / 24 elsewhere for expert-major.
+    unsigned int dispatch_num_sms;
+    // Combine SM budget. AUTO follows dispatch defaults, except HT flat uses 32
+    // when max_dispatch_tokens_per_rank >= 8192. Environment overrides still apply.
+    unsigned int combine_num_sms;
+    // HT dispatch/combine flow. All ranks must resolve to the same flow;
+    // inconsistent API or environment configuration is unsupported. An
+    // explicit value is authoritative. AUTO selects pull/push within a supported
+    // single LSA team: at most 128 ranks, num_topk in [1, 32], and at most
+    // 65535 experts, without EM duplication overrides. Other cases retain push/pull.
+    // MXFP8 combine requires explicit PUSH_PULL with expert-major local-permute;
+    // PULL_PUSH returns ncclInvalidArgument for that recipe. NCCL_EP_HT_PULL_PUSH
+    // overrides AUTO (0 = push/pull, 1 = pull/push).
+    // PUSH_PULL and PULL_PUSH support flat and expert-major layouts;
+    // PULL_PUSH requires a single LSA domain.
+    ncclEpHtFlow_t ht_flow;
+    // HT metadata exchange. All ranks must resolve to the same policy;
+    // inconsistent API or environment configuration is unsupported. An
+    // explicit policy is authoritative. AUTO permits legacy environment
+    // overrides, fuses with dispatch when supported, and keeps existing
+    // fallbacks otherwise. REQUIRE_FUSED rejects handles/calls that need
+    // early exchange or scan; FORCE_SCAN selects the legacy scan path.
+    ncclEpMetaExchangePolicy_t meta_exchange_policy;
+    // AFD (Attention-FFN Disaggregation), universal LL kernel only. Ranks
+    // [0, num_attn_ranks) own source tokens; remaining ranks own all experts.
+    // AFD requires num_experts > communicator ranks and supports only unquantized
+    // dispatch/combine recipes. Zero preserves classic EP.
+    unsigned int num_attn_ranks;
+    unsigned char padding_v4[4];
 } ncclEpGroupConfig_t;
 
 #define NCCL_EP_GROUP_CONFIG_INIT \
@@ -347,11 +370,17 @@ typedef struct {
 #define NCCL_EP_GROUP_CONFIG_V2_LAST_FIELD padding_v2
 #define NCCL_EP_GROUP_CONFIG_V2_SIZE 112u
 
-#define NCCL_EP_GROUP_CONFIG_CURRENT_VERSION 2
+#define NCCL_EP_GROUP_CONFIG_V3_LAST_FIELD combine_num_sms
+#define NCCL_EP_GROUP_CONFIG_V3_SIZE 120u
+#define NCCL_EP_GROUP_CONFIG_V4_LAST_FIELD padding_v4
+#define NCCL_EP_GROUP_CONFIG_V4_SIZE 136u
+#define NCCL_EP_GROUP_CONFIG_CURRENT_VERSION 4
 
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 1);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 2);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 3);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 4);
 
 // Opaque type forward declaration
 typedef struct ncclEpGroup* ncclEpGroup_t;
@@ -383,17 +412,29 @@ ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group);
 // Tensor-descriptor fields are optional (NULL = not provided). Each tensor
 // field is a pointer to a caller-owned descriptor (stack/static/struct-embedded
 // or from ncclEpTensorAlloc).
+// HT count mode can publish expert_counters and recv_total_counter during
+// Dispatch instead of UpdateHandle. Requesting either output (or EM offsets)
+// at UpdateHandle selects early metadata production: all ranks must agree on
+// whether any such update-time output is requested. Output buffers are local
+// and may differ across ranks. recv_topk_idx_kind alone does not request counts.
 typedef struct {
     unsigned int size;                // = sizeof(this struct); first field, never moves
     unsigned int magic;               // = NCCL_EP_MAGIC; second field, never moves
     ncclEpTensor_t* expert_counters;     // 1D [num_local_experts] int32 (or int64 for HT EM)
                                          //   HT (handle time): per-expert recv counts. Flat: unpadded int32.
                                          //                     EM: padded counts (sum equals output slot count).
+  //   HT Flat: number of received slots whose recv_topk_idx row names the local expert (a
+  //   token routed to several local experts counts once in each). Under
+  //   NCCL_EP_OVERFLOW_DROP the handle-time value is pre-drop; the dispatch-time value
+  //   (layout_info passed to ncclEpDispatch) is the delivered, post-drop count.
   //   LL/expert-major layout: per-expert received token counts (dispatch time).
     ncclEpTensor_t* src_rank_counters; // 1D [num_ranks] int32
   //   LL/rank-major layout only: per-source-rank token counts (dispatch time).
+  //   On AFD expert ranks, only [0, num_attn_ranks) is written; the remaining
+  //   entries are unspecified. AFD attention ranks do not write this tensor.
     ncclEpTensor_t* expert_offsets; // 1D [num_local_experts] int32 or int64
   //   HT (Handle time), expert-major layout only: prefix sum of padded per-expert counts.
+  //   Ignored for the Flat layout (no per-expert zones), at handle and dispatch time alike.
     ncclEpTensor_t* recv_total_counter; // 1D [1] int32 or int64
   //   HT (Handle time): scalar total recv token count.
   //     * Flat layout: unpadded.
@@ -432,9 +473,10 @@ typedef struct {
     unsigned int size; // = sizeof(this struct); first field, never moves
     unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
     ncclEpTensor_t* tokens; // required; 2D [num_tokens, hidden]
-    ncclEpTensor_t* topk_weights; // optional; 2D [num_tokens, top_k], ncclFloat32
-  //   LL rank-major: per-token routing weights
-  //   HT forward: routing weights (topk_idx taken from handle)
+    ncclEpTensor_t* topk_weights; // optional; 2D [num_tokens, top_k]
+  //   LL rank-major: FP32 or BF16 routing weights; receive dtype must match.
+  //   AFD: required on attention ranks and omitted on expert ranks
+  //   HT forward: FP32 routing weights (topk_idx taken from handle)
     ncclEpTensor_t* scales;       // required by QUANT_FWD; caller-provided scales are forwarded
                                   // without conversion (see the recipe contract below)
 } ncclEpDispatchInputs_t;
@@ -458,14 +500,18 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchInputs_t, NCCL_EP_DISPAT
 typedef struct {
     unsigned int size; // = sizeof(this struct); first field, never moves
     unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
-    ncclEpTensor_t* tokens; // required; received tokens
-    ncclEpTensor_t* topk_weights; // optional; LL rank-major or HT: received top-k weights
-  //   LL rank-major: ncclFloat32 [num_ranks, max_dispatch_tokens_per_rank, top_k]
+    ncclEpTensor_t* tokens; // required received tokens; omitted on AFD attention ranks
+    ncclEpTensor_t* topk_weights; // optional; LL rank-major: input dtype; HT: FP32 received top-k weights
+  //   LL rank-major: [num_ranks, max_dispatch_tokens_per_rank, top_k]
     ncclEpTensor_t* scales;       // required by recipes that forward or generate scales; received per-token scales
     ncclEpTensor_t* topk_idx; // optional; LL rank-major or HT FLAT: received top-k expert indices
   // Per-slot values are either the local or global expert id, selected via
   // ncclEpLayoutInfo_t::recv_topk_idx_kind (AUTO/LOCAL/GLOBAL; AUTO resolves
   // to LOCAL today). -1 marks slots not routed to this rank.
+  // HT compact push: local matches are packed at the start of each row in the
+  // source top-k order, paired with their weights; unused columns are -1/zero.
+  // Set NCCL_EP_HT_RECV_TOPK_ORDER=expert-ascend before group creation to retain ascending
+  // expert order. Dense fallback and pull-push retain their existing behavior.
 } ncclEpDispatchOutputs_t;
 
 #define NCCL_EP_DISPATCH_OUTPUTS_INIT \
@@ -487,12 +533,15 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchOutputs_t, NCCL_EP_DISPA
 typedef struct {
     unsigned int size; // = sizeof(this struct); first field, never moves
     unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
-    ncclEpTensor_t* tokens; // required; post-expert activation tensor
+    ncclEpTensor_t* tokens; // required post-expert activations; omitted on AFD attention ranks
     ncclEpTensor_t* topk_weights; // optional; HT backward combine only:
   //   2D [num_recv_tokens, top_k], ncclFloat32
-    // Experimental NVFP4 combine only: FP32 per-expert-token global quantization scales.
-    // For each valid token row, pass 2688 / amax(abs(tokens[row, :])); use 0 when amax is 0.
-    // This scale is computed from the post-expert activation before ncclEpCombine.
+    // Optional; recipe-dependent:
+    // - NCCL_EP_COMB_QUANT_NONE / NCCL_EP_COMB_QUANT_MXFP8: must be NULL
+    //   (MXFP8 generates its E8M0 block scales internally).
+    // - NCCL_EP_COMB_QUANT_NVFP4 (experimental): FP32 per-expert-token global quantization
+    //   scales. For each valid token row, pass 2688 / amax(abs(tokens[row, :])); use 0 when
+    //   amax is 0. Computed from the post-expert activation before ncclEpCombine.
     ncclEpTensor_t* scales;
 } ncclEpCombineInputs_t;
 
@@ -519,9 +568,9 @@ typedef struct {
     unsigned int size; // = sizeof(this struct); first field, never moves
     unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
     ncclEpTensor_t* tokens; // required; combined output in original token order
-    ncclEpTensor_t* topk_weights; // optional; 2D [num_tokens, top_k], ncclFloat32
-  //   LL expert-major: per-token routing weights applied on receive side
-  //   HT backward: combined routing weights output
+    ncclEpTensor_t* topk_weights; // optional; 2D [num_tokens, top_k]
+  //   LL expert-major: FP32 or BF16 routing weights; reduction uses FP32.
+  //   HT backward: FP32 combined routing weights output
 } ncclEpCombineOutputs_t;
 
 #define NCCL_EP_COMBINE_OUTPUTS_INIT \
@@ -560,7 +609,31 @@ typedef struct {
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpHandleConfig_t, NCCL_EP_HANDLE_CONFIG);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpHandleConfig_t, NCCL_EP_HANDLE_CONFIG, 1);
 
-// Query the device bytes required for a handle's routing buffers.
+// Host metadata needed to import an already-prepared HT handle buffer.
+typedef struct {
+    unsigned int size; // = sizeof(this struct); first field, never moves
+    unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
+    int num_tokens;
+    int num_topk;
+    ncclDataType_t topk_idx_datatype; // ncclInt32 or ncclInt64
+} ncclEpHandleState_t;
+
+#define NCCL_EP_HANDLE_STATE_INIT \
+    NCCL_EP_STRUCT_INIT(ncclEpHandleState_t, NCCL_EP_MAGIC)
+
+#define NCCL_EP_HANDLE_STATE_SIZE ((unsigned int)sizeof(ncclEpHandleState_t))
+
+#define NCCL_EP_HANDLE_STATE_V1_LAST_FIELD topk_idx_datatype
+#define NCCL_EP_HANDLE_STATE_V1_SIZE 20u
+
+#define NCCL_EP_HANDLE_STATE_CURRENT_VERSION 1
+
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpHandleState_t, NCCL_EP_HANDLE_STATE);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpHandleState_t, NCCL_EP_HANDLE_STATE, 1);
+
+// Query the device bytes required for a handle's persistent routing state.
+// Group-owned update-only scan workspace is allocated lazily by ncclEpInitHandle
+// and is not included in size_out.
 //
 // Arguments:
 //   ep_group  - [IN]  A valid EP group
@@ -620,6 +693,39 @@ ncclResult_t ncclEpInitHandle(
     const ncclEpTensor_t* handle_mem // NULL = library allocates internally
 );
 
+// Import an HT handle from a caller-owned handle buffer already prepared by
+// ncclEpUpdateHandle with matching group, layout, config, and state metadata.
+// Local only: no device-state copy, CUDA launch, or metadata scan. Dispatch
+// and Combine can use the returned handle without another UpdateHandle.
+//
+// For forward dispatch: handle_mem may be snapshotted any time after
+// ncclEpUpdateHandle completes on the source stream.
+//
+// For backward dispatch or combine in count mode (expert-major local-permute
+// and Flat; see ncclEpDispatch's layout_info notes): handle_mem must be
+// snapshotted after the matching forward ncclEpDispatch has completed, with
+// the copy ordered after that work. ncclEpUpdateHandle alone does not write
+// the per-token maps that backward dispatch and combine read. Outside count
+// mode the per-token maps are complete after ncclEpUpdateHandle.
+//
+// Arguments:
+//   handle     - [OUT] Newly imported handle
+//   ep_group   - [IN]  The EP group used to prepare handle_mem
+//   layout     - [IN]  The layout used to prepare handle_mem
+//   config     - [IN]  Handle configuration used to prepare handle_mem. NULL = defaults.
+//   state      - [IN]  Host metadata describing the prepared state
+//   handle_mem - [IN]  Caller-owned prepared 1D ncclUint8 device buffer
+//
+// Returns: ncclResult_t error code
+
+ncclResult_t ncclEpImportHandle(
+    ncclEpHandle_t* handle,
+    ncclEpGroup_t ep_group,
+    ncclEpLayout_t layout,
+    const ncclEpHandleConfig_t* config,
+    const ncclEpHandleState_t* state,
+    const ncclEpTensor_t* handle_mem);
+
 // Per-step collective: prepare the handle for the given top-k routing decisions.
 // Must be called after ncclEpInitHandle and before ncclEpDispatch.
 //
@@ -677,7 +783,9 @@ ncclResult_t ncclEpCreateHandle(
 
 ncclResult_t ncclEpHandleDestroy(ncclEpHandle_t handle);
 
-// Query the device bytes required for a handle's routing buffers.
+// Query the device bytes required for a handle's persistent routing state.
+// Group-owned update-only scan workspace is allocated lazily by ncclEpInitHandle
+// and is not included in size_out.
 //
 // Arguments:
 //   ep_group  - [IN]  A valid EP group
@@ -789,6 +897,17 @@ typedef enum {
     // The caller supplies FP32 global scales through combine inputs->scales;
     // the kernel follows the DeepEP-LL NVFP4 pack/dequantize contract.
     NCCL_EP_COMB_QUANT_NVFP4 = 1,
+    // MXFP8: inputs->tokens are BF16 and inputs->scales must be NULL. The library
+    // quantizes to FP8 E4M3 + per-block E8M0 block scales (block 32) internally,
+    // transports the packed row, and de-quantizes in the FP32 weighted reduction;
+    // combine output is BF16. Requires expert-major local-permute path (HT only)
+    // and a single LSA team: the packed row is an intra-node NVLink wire format,
+    // so a group spanning multiple LSA teams (inter-node) is rejected.
+    // Hidden must be a multiple of 512: the packed [FP8 H | E8M0 H/32] row is
+    // 16-byte aligned iff H % 512 == 0 (and the scale row is then >= 16 B for TMA).
+    // Requires a CUDA 12.8 or newer toolkit: the E8M0 reciprocal-scale conversion
+    // uses __nv_fp8_e8m0. The call is rejected on builds made with older toolkits.
+    NCCL_EP_COMB_QUANT_MXFP8 = 2,
 } ncclEpCombQuant_t;
 
 // EP dispatch configuration structure
@@ -830,9 +949,10 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPAT
 //   inputs        - [IN]     Named input tensors (see ncclEpDispatchInputs_t).
 //                            inputs->tokens is required for all modes and layouts.
 //                            For LL mode (rank-major layout) and HT mode (all layouts, forward pass),
-//                            inputs->topk_weights must be provided.
+//                            inputs->topk_weights must be provided. AFD expert ranks omit it.
 //   outputs       - [IN,OUT] Named preallocated output tensors (see ncclEpDispatchOutputs_t).
-//                            outputs->tokens is required; other fields depend on the layout and pass direction.
+//                            outputs->tokens is required except on AFD attention ranks, which omit all
+//                            dispatch receive tensors. Other fields depend on the layout and pass direction.
 //                            HT mode:
 //                              The sizing of the output tensors relies on `num_recv_slots`.
 //
@@ -874,12 +994,27 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPAT
 //                                * outputs->topk_idx [num_ranks, max_dispatch_tokens_per_rank, num_topk]
 //                                The actual number of tokens received by rank `r` is obtained via
 //                                layout_info->src_rank_counters[`r`] (see below).
+//                                AFD expert ranks provide all three receive slabs. AFD attention
+//                                ranks omit them unless outputs->tokens carries the placeholder
+//                                window descriptor required by collective zero-copy registration.
 //   layout_info   - [IN,OUT] Named local tensors for layout-specific counters (see ncclEpLayoutInfo_t).
-//                              * For HT mode should be NULL, the counter information is available through ncclEpUpdateHandle.
+//                              * For HT mode normally NULL: the counter information is available through
+//                                ncclEpUpdateHandle. Exception: HT count mode (expert-major local-permute
+//                                and Flat) may instead pass expert_counters and recv_total_counter here,
+//                                published by dispatch itself rather than ncclEpUpdateHandle. Supplying
+//                                any of these to ncclEpUpdateHandle selects the unfused count exchange
+//                                (they are then written there, before dispatch); omitting them keeps
+//                                the fused exchange, in which the recv count is known only after the
+//                                first forward dispatch. Outside count mode (multiple LSA teams,
+//                                NCCL_EP_HT_AG_SCAN_MODE, EM duplication modes) dispatch leaves
+//                                these tensors untouched; request them from ncclEpUpdateHandle there.
 //                              * For LL mode, layout-specific counter tensors must be provided (see ncclEpLayoutInfo_t doc).
 //                                * Expert-major layout: expert_counters tensor is required.
 //                                * Rank-major layout: src_rank_counters is optional; when provided,
 //                                  it receives one token count per source rank.
+//                                  On AFD expert ranks, only attention-source entries
+//                                  [0, num_attn_ranks) are written; later entries are unspecified.
+//                                  AFD attention ranks do not write src_rank_counters.
 //   config        - [IN]     Dispatch configuration (see ncclEpDispatchConfig_t). NULL = defaults.
 //   stream        - [IN]     CUDA stream. If `ncclEpDispatch()` is called on a different stream than the stream used in
 //                            `ncclEpCreateHandle()`,
@@ -933,7 +1068,8 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpCombineConfig_t, NCCL_EP_COMBINE
 //   inputs           - [IN]     Named input tensors (see ncclEpCombineInputs_t).
 //                               The shapes of the tensors are identical to the shapes of the respective
 //                               output tensors of the corresponding `ncclEpDispatch()` call.
-//                               The inputs->tokens tensor is required.
+//                               The inputs->tokens tensor is required except on AFD attention ranks,
+//                               which receive combined results but send no expert outputs.
 //                               For the backward pass in HT mode, the inputs->topk_weights must also be provided.
 //   outputs          - [IN,OUT] Named preallocated output tensors (see ncclEpCombineOutputs_t).
 //                               outputs->tokens [num_tokens, hidden] is required; returns tokens in the original order.
@@ -1067,6 +1203,99 @@ ncclResult_t ncclEpGetAsyncError(ncclEpGroup_t ep_group, int* error_out);
 // Returns: ncclResult_t error code
 
 ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group);
+
+// Dispatch tokens from an AFD attention rank.
+//   Role-checked wrapper around ncclEpDispatch(). Every rank in the AFD group
+//   participates in the same collective: attention ranks call
+//   ncclEpAfDispatch(), while expert ranks call ncclEpAfRecv(). The group must
+//   use LL mode with num_attn_ranks > 0 and a rank-major handle. Quantized AFD
+//   is unsupported; config->quant_recipe must be NCCL_EP_DISP_QUANT_NONE.
+//
+// Arguments:
+//   handle      - [IN,OUT] Handle on an attention rank.
+//   inputs      - [IN]     Attention-side dispatch inputs, including tokens and topk_weights.
+//   outputs     - [IN,OUT] Dispatch outputs with receive tensor fields omitted (NULL).
+//                          For zero-copy, tokens instead carries this rank's handle
+//                          from the collective (possibly asymmetric-size) window registration;
+//                          its local placeholder allocation is not written.
+//   layout_info - [IN,OUT] Optional layout metadata; A-ranks write no src_rank_counters.
+//   config      - [IN]     Dispatch configuration. NULL = defaults.
+//   stream      - [IN]     CUDA stream.
+//
+// Returns: ncclSuccess, ncclInvalidArgument for an invalid handle, or
+// ncclInvalidUsage when the handle is not an AFD attention-rank handle.
+ncclResult_t ncclEpAfDispatch(
+    ncclEpHandle_t handle,
+    const ncclEpDispatchInputs_t* inputs,
+    const ncclEpDispatchOutputs_t* outputs,
+    const ncclEpLayoutInfo_t* layout_info,
+    const ncclEpDispatchConfig_t* config,
+    cudaStream_t stream);
+
+// Receive dispatched tokens on an AFD expert rank.
+//   Expert-rank collective counterpart to ncclEpAfDispatch().
+//
+// Arguments:
+//   handle      - [IN,OUT] Handle on an expert rank, created or updated with a
+//                          zero-row topk_idx tensor.
+//   inputs      - [IN]     Expert-side dispatch inputs. tokens is a zero-row descriptor;
+//                          topk_weights is omitted (NULL).
+//   outputs     - [IN,OUT] Preallocated rank-major receive tensors.
+//   layout_info - [IN,OUT] Optional metadata, including src_rank_counters when requested.
+//   config      - [IN]     Dispatch configuration. NULL = defaults.
+//   stream      - [IN]     CUDA stream.
+//
+// Returns: ncclSuccess, ncclInvalidArgument for an invalid handle, or
+// ncclInvalidUsage when the handle is not an AFD expert-rank handle.
+ncclResult_t ncclEpAfRecv(
+    ncclEpHandle_t handle,
+    const ncclEpDispatchInputs_t* inputs,
+    const ncclEpDispatchOutputs_t* outputs,
+    const ncclEpLayoutInfo_t* layout_info,
+    const ncclEpDispatchConfig_t* config,
+    cudaStream_t stream);
+
+// Receive combined results on an AFD attention rank.
+//   Role-checked wrapper around ncclEpCombine(). Every rank in the AFD group
+//   participates in the same collective: attention ranks call
+//   ncclEpAfCombine(), while expert ranks call ncclEpAfReturn(). Quantized AFD
+//   is unsupported; config->quant_recipe must be NCCL_EP_COMB_QUANT_NONE.
+//
+// Arguments:
+//   handle  - [IN,OUT] Handle on an attention rank, reused from dispatch.
+//   inputs  - [IN]     Combine inputs with tokens omitted (NULL).
+//   outputs - [IN,OUT] Preallocated combined tokens in original token order.
+//   config  - [IN]     Combine configuration. NULL = defaults.
+//   stream  - [IN]     CUDA stream.
+//
+// Returns: ncclSuccess, ncclInvalidArgument for an invalid handle, or
+// ncclInvalidUsage when the handle is not an AFD attention-rank handle.
+ncclResult_t ncclEpAfCombine(
+    ncclEpHandle_t handle,
+    const ncclEpCombineInputs_t* inputs,
+    const ncclEpCombineOutputs_t* outputs,
+    const ncclEpCombineConfig_t* config,
+    cudaStream_t stream);
+
+// Return expert outputs from an AFD expert rank.
+//   Expert-rank collective counterpart to ncclEpAfCombine().
+//
+// Arguments:
+//   handle  - [IN,OUT] Handle on an expert rank, reused from receive and bound
+//                      to a zero-row topk_idx tensor.
+//   inputs  - [IN]     Post-expert rank-major activation tensor.
+//   outputs - [IN,OUT] Zero-row expert-side combine output descriptor.
+//   config  - [IN]     Combine configuration. NULL = defaults.
+//   stream  - [IN]     CUDA stream.
+//
+// Returns: ncclSuccess, ncclInvalidArgument for an invalid handle, or
+// ncclInvalidUsage when the handle is not an AFD expert-rank handle.
+ncclResult_t ncclEpAfReturn(
+    ncclEpHandle_t handle,
+    const ncclEpCombineInputs_t* inputs,
+    const ncclEpCombineOutputs_t* outputs,
+    const ncclEpCombineConfig_t* config,
+    cudaStream_t stream);
 
 #ifdef __cplusplus
 }

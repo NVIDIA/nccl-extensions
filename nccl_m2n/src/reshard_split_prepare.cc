@@ -51,11 +51,10 @@ void buildSplitReshardParams(const ncclReshardParams* base, const ReshardSplitCo
     out->dstStrides[d] = base->dstStrides[d];
   }
   out->ndims = ndims;
-  out->srcShardTensorDim = base->srcShardTensorDim;
-  out->dstShardTensorDim = base->dstShardTensorDim;
+  out->srcShardLayout = base->srcShardLayout;
+  out->dstShardLayout = base->dstShardLayout;
   out->srcShardCount = base->srcShardCount;
   out->dstShardCount = base->dstShardCount;
-  out->sameShardDim = base->sameShardDim;
 
   out->isSource = base->isSource;
   out->isDest = base->isDest;

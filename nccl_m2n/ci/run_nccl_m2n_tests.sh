@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-# Run the no-MPI basic API matrix within an existing Slurm allocation. The
-# binary creates one local pthread per GPU, so srun launches one process only.
+# Run host geometry checks and the no-MPI basic API matrix within an existing
+# Slurm allocation. The API binary creates one local pthread per GPU, so srun
+# launches one process only.
 
 set -euo pipefail
 
@@ -36,6 +37,17 @@ fi
 
 log="$(mktemp)"
 trap 'rm -f "${log}"' EXIT
+
+geometryBinary="${NCCL_HOME}/bin/multi_dim_geometry_test"
+if [[ ! -x "${geometryBinary}" ]]; then
+  echo "Missing executable geometry test: ${geometryBinary}" >&2
+  exit 1
+fi
+"${geometryBinary}" 2>&1 | tee "${log}"
+if ! grep -Fxq 'MULTI_DIM_GEOMETRY_PASS pairs=109872' "${log}"; then
+  echo "multi_dim_geometry_test did not complete all 109872 geometry pairs." >&2
+  exit 1
+fi
 
 "${binary}" -N "${numGpus}" 2>&1 | tee "${log}"
 

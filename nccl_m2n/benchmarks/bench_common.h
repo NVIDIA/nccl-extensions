@@ -20,6 +20,7 @@
 #include <initializer_list>
 #include <limits>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -88,11 +89,22 @@ static inline bool benchArgIs(const char* value, const char* expected) {
 #define NCCLCHECK(cmd)                                                                               \
   do {                                                                                               \
     ncclResult_t r = cmd;                                                                            \
-    if (r != ncclSuccess) {                                                                          \
+    if (r != ncclSuccess && r != ncclInProgress) {                                                   \
       fprintf(stderr, "Failed, NCCL error %s:%d '%s'\n", __FILE__, __LINE__, ncclGetErrorString(r)); \
       abort();                                                                                       \
     }                                                                                                \
   } while (0)
+
+// Use public NCCL APIs to finish communicator work before consuming its outputs.
+static inline ncclResult_t benchWaitCommReady(ncclComm_t comm) {
+  ncclResult_t state = ncclInProgress;
+  while (state == ncclInProgress) {
+    ncclResult_t result = ncclCommGetAsyncError(comm, &state);
+    if (result != ncclSuccess) return result;
+    if (state == ncclInProgress) std::this_thread::yield();
+  }
+  return state;
+}
 
 // ============================================================================
 // Argument Parsing Helpers

@@ -15,6 +15,26 @@
 //   s2d[token][k] = packed(rank_id<<24 | slot), or -1.
 const int32_t* ncclEpHandle_test_getSparseToDenseMap(ncclEpHandle_t handle);
 
+// FWD inline weights + IDs: selected payload width in words, or zero on fallback.
+int ncclEpHandle_test_getCompactProbWireFloats(ncclEpHandle_t handle);
+
+enum ncclEpTestMetadataMode {
+    NCCL_EP_TEST_META_SCAN = 0,
+    NCCL_EP_TEST_META_UNFUSED = 1,
+    NCCL_EP_TEST_META_FUSED = 2
+};
+
+// Resolved metadata mode after UpdateHandle, including handle-specific fallbacks.
+int ncclEpHandle_test_getMetadataMode(ncclEpHandle_t handle);
+
+// Returns the HT scan-only workspace pointers wired into a handle. These buffers
+// are group-owned and may be reused after ncclEpUpdateHandle completes.
+void ncclEpHandle_test_getScanScratch(
+    ncclEpHandle_t handle,
+    const void** token_rank_mask,
+    const void** preprocessing_scan_tmp,
+    const int32_t** token_to_recv_slot);
+
 // Returns num_topk stored in the handle.
 int ncclEpHandle_test_getNumTopk(ncclEpHandle_t handle);
 
@@ -36,6 +56,9 @@ ncclResult_t ncclEpHandle_test_getNumRecvTokens(ncclEpHandle_t handle, unsigned 
 // scatter (backward, no-routing) mode.  HT only.
 void ncclEpHandle_test_clearTopkIdx(ncclEpHandle_t handle);
 
+// Returns the HT dispatch_tokens_per_chunk selected for this handle.
+int ncclEpHandle_test_getDispatchTokensPerChunk(ncclEpHandle_t handle);
+
 // Override the cached dynamic shared-memory limit for an internally-created
 // test group. This is test-only and lets unit tests exercise launch fitting on
 // devices whose physical limit is larger than the target budget.
@@ -44,3 +67,14 @@ ncclResult_t ncclEpGroup_test_setMaxDynamicSmem(ncclEpGroup_t group, int max_dyn
 // Returns the last LL combine launch's resolved warps-per-group, or zero when
 // that group has not launched LL combine.
 int ncclEpGroup_test_getLastLlCombineWarpsPerGroup(ncclEpGroup_t group);
+// Return the group budgets (expert-major for HT); use the handle accessor for flat.
+void ncclEpGroup_test_getSmBudgets(
+    ncclEpGroup_t group, unsigned int* dispatch_num_sms, unsigned int* combine_num_sms);
+
+// Return the resolved HT flow for testing AUTO selection and explicit overrides.
+ncclEpHtFlow_t ncclEpGroup_test_getHtFlow(ncclEpGroup_t group);
+
+// Effective HT handle budgets, including the layout-specific default.
+void ncclEpHandle_test_getSmBudgets(
+    ncclEpHandle_t handle, unsigned int* dispatch_num_sms, unsigned int* combine_num_sms);
+int ncclEpHandle_test_getCombineTokensPerChunk(ncclEpHandle_t handle);

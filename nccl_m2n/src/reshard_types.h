@@ -62,20 +62,21 @@ typedef enum {
  * ====================================================================*/
 
 typedef struct {
-  int shardMeshDim;
+  /* Replicated axes have size 1 and tensor dimension -1. Shard indices
+   * flatten the sharded mesh axes in placement order (last axis fastest). */
+  int axisSizes[NCCL_RESHARD_MESH_NDIMS];
+  int axisTensorDims[NCCL_RESHARD_MESH_NDIMS];
+  int shardCounts[NCCL_RESHARD_MAX_TENSOR_DIMS];
+} ncclReshardShardLayout_t;
+
+typedef struct {
+  ncclReshardShardLayout_t shardLayout;
   int repMeshDim;
-  int shardTensorDim;
   int shardCount;
   int repCount;
-
-  int meshPos[2];
+  int meshPos[NCCL_RESHARD_MESH_NDIMS];
   int shardIdx;
   int repIdx;
-
-  int shardGroupStart;
-  int shardGroupStride;
-  int repGroupStart;
-  int repGroupStride;
 } ncclReshardMeshGroupInfo;
 
 /* ======================================================================
@@ -139,11 +140,10 @@ typedef struct {
   size_t dstStrides[NCCL_RESHARD_MAX_TENSOR_DIMS];
   int ndims;
 
-  int srcShardTensorDim;
-  int dstShardTensorDim;
+  ncclReshardShardLayout_t srcShardLayout;
+  ncclReshardShardLayout_t dstShardLayout;
   int srcShardCount;
   int dstShardCount;
-  bool sameShardDim;
 
   bool isSource;
   bool isDest;
@@ -217,8 +217,8 @@ typedef struct {
   size_t dstStrides[NCCL_RESHARD_MAX_TENSOR_DIMS];
   int ndims;
 
-  int srcShardTensorDim;
-  int dstShardTensorDim;
+  ncclReshardShardLayout_t srcShardLayout;
+  ncclReshardShardLayout_t dstShardLayout;
   int srcShardCount;
   int dstShardCount;
 

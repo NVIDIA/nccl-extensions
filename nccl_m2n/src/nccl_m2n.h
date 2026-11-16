@@ -27,8 +27,8 @@
 // version this library ships as. Distinct from NCCL_M2N_API_VERSION below,
 // which guards the public struct ABI and moves only when that layout changes.
 #define NCCL_M2N_MAJOR 0
-#define NCCL_M2N_MINOR 2
-#define NCCL_M2N_PATCH 0
+#define NCCL_M2N_MINOR 3
+#define NCCL_M2N_PATCH 1
 
 // Packed version code: MAJOR*10000 + MINOR*100 + PATCH. Mirrors NCCL_VERSION_CODE.
 #define NCCL_M2N_VERSION_CODE (NCCL_M2N_MAJOR * 10000 + NCCL_M2N_MINOR * 100 + NCCL_M2N_PATCH)
@@ -148,8 +148,12 @@ typedef struct ncclDistTensor_v2 {
    * placements[i] is one of:
    *     NCCL_RESHARD_REPLICATE   Axis replicates the tensor slice.
    *     NCCL_RESHARD_SHARD(d)    Axis shards tensor dimension d.
-   * A sharded layout must have exactly one SHARD axis.  A fully replicated
-   * layout uses REPLICATE on every active axis. */
+   * Any combination of REPLICATE and SHARD is supported. SHARD dimensions
+   * must satisfy 0 <= d < ndims. Mesh axes are applied in array order:
+   * if both axes use SHARD(d), axis 1 subdivides the pieces from axis 0.
+   * All ranks on one side must have the same localShape, with equally sized,
+   * contiguous tiles and globalShape[d] = localShape[d] times the product
+   * of mesh sizes whose placement is SHARD(d). */
   int* placements;
 } ncclDistTensor_t;
 

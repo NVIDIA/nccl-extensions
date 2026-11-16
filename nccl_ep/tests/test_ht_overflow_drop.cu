@@ -68,18 +68,32 @@ TEST_F(HtOverflowDropTest, DispatchCombineContinueOnOverflow) {
     ASSERT_NE(h, nullptr);
 
     // recv_total_counter: true (pre-drop) per-rank recv total, written by the
-    // preprocessing scan in ncclEpUpdateHandle.
+    // scan at handle update, or fused metadata at dispatch.
     int32_t* d_recv_total = nullptr;
     CUDA_ASSERT(cudaMalloc(&d_recv_total, sizeof(int32_t)));
     CUDA_ASSERT(cudaMemset(d_recv_total, 0, sizeof(int32_t)));
     ncclEpTensor_t* t_recv_total = nullptr;
     NCCL_ASSERT(epTensorCreate(&t_recv_total, 1, ncclInt32, d_recv_total, 1));
 
+    // expert_counters: Flat per-expert hit counts (see ncclEpLayoutInfo_t). Poisoned so an
+    // unwritten tensor cannot pass.
+    const int E_local = kNumExperts / g_nranks;
+    int32_t* d_expert_cnt = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_expert_cnt, E_local * sizeof(int32_t)));
+    CUDA_ASSERT(cudaMemset(d_expert_cnt, 0xA5, E_local * sizeof(int32_t)));
+    ncclEpTensor_t* t_expert_cnt = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_expert_cnt, 1, ncclInt32, d_expert_cnt, E_local));
+
     ncclEpLayoutInfo_t li = NCCL_EP_LAYOUT_INFO_INIT;
     li.recv_total_counter = t_recv_total;
+    li.expert_counters = t_expert_cnt;
 
-    // UpdateHandle runs the scan; with DROP it must not trap on overflow.
-    NCCL_ASSERT(ncclEpUpdateHandle(h, t_topk_, &li, g_stream));
+    // Use the same case for scan and fused metadata, without duplicating the test.
+    const bool fused = ht_pull_push_active() && !ht_em_local_dup_active() && !ht_em_nvlink_dup_active() &&
+                       !ht_ag_scan_mode_active() && !ht_count_unfused_active() &&
+                       ncclEpHandle_test_getNRanksPerNode(h) == g_nranks;
+    NCCL_ASSERT(ncclEpUpdateHandle(h, t_topk_, fused ? nullptr : &li, g_stream));
+    EXPECT_EQ(ht_count_fused_active(h), fused);
     ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess)
         << "Rank " << g_rank << ": ncclEpUpdateHandle trapped on recv overflow; "
            "NCCL_EP_OVERFLOW_DROP should drop tokens instead of __trap().";
@@ -97,18 +111,37 @@ TEST_F(HtOverflowDropTest, DispatchCombineContinueOnOverflow) {
             ? static_cast<int32_t>(kDropRecvBudget)
             : expected_true_total;
 
-    int32_t h_recv_total = -1;
-    CUDA_ASSERT(cudaMemcpy(&h_recv_total, d_recv_total, sizeof(int32_t), cudaMemcpyDeviceToHost));
-    EXPECT_EQ(h_recv_total, expected_true_total)
-        << "Rank " << g_rank << ": recv_total_counter should report the true "
-           "pre-drop recv total so callers can detect dropped tokens.";
+    if (!fused) {
+        int32_t h_recv_total = -1;
+        CUDA_ASSERT(cudaMemcpy(&h_recv_total, d_recv_total, sizeof(int32_t), cudaMemcpyDeviceToHost));
+        EXPECT_EQ(h_recv_total, expected_true_total)
+            << "Rank " << g_rank << ": recv_total_counter should report the true "
+               "pre-drop recv total so callers can detect dropped tokens.";
 
-    // Internal recv count is clamped to the budget (overflow tokens dropped).
-    unsigned int num_recv = 0;
-    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
-    EXPECT_EQ(num_recv, static_cast<unsigned int>(expected_kept))
-        << "Rank " << g_rank << ": internal recv count must be clamped to "
-           "max_recv_tokens_per_rank on overflow.";
+        // Internal recv count is clamped to the budget (overflow tokens dropped).
+        unsigned int num_recv = 0;
+        NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+        EXPECT_EQ(num_recv, static_cast<unsigned int>(expected_kept))
+            << "Rank " << g_rank << ": internal recv count must be clamped to "
+               "max_recv_tokens_per_rank on overflow.";
+
+    }
+
+    // Every token hits local expert 0 of rank 0 only. The handle-time Flat count is pre-drop on
+    // every path (see ncclEpLayoutInfo_t::expert_counters); the dispatch-time count is delivered.
+    auto expect_expert_counts = [&](int32_t expected_e0, const char* stage) {
+        std::vector<int32_t> h_cnt(E_local);
+        CUDA_ASSERT(cudaMemcpy(h_cnt.data(), d_expert_cnt, E_local * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        for (int e = 0; e < E_local; ++e) {
+            const int32_t expected = (g_rank == 0 && e == 0) ? expected_e0 : 0;
+            EXPECT_EQ(h_cnt[e], expected)
+                << "Rank " << g_rank << " local expert " << e << " expert_counters at " << stage;
+        }
+    };
+    if (!fused) {
+        expect_expert_counts(expected_true_total, "UpdateHandle");
+        CUDA_ASSERT(cudaMemset(d_expert_cnt, 0xA5, E_local * sizeof(int32_t)));
+    }
 
     // ── Forward dispatch ──────────────────────────────────────────────────────
     std::vector<nv_bfloat16> h_tok(kNumTokens * kHidden);
@@ -150,12 +183,30 @@ TEST_F(HtOverflowDropTest, DispatchCombineContinueOnOverflow) {
     d_out.topk_idx     = t_recv_idx;
     ncclEpDispatchConfig_t dcfg = NCCL_EP_DISPATCH_CONFIG_INIT;
 
-    EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclSuccess);
+    // Dispatch-time layout_info: the count path recounts the delivered (post-drop) per-expert
+    // hits from the kept LERM rows; other paths leave the tensor untouched.
+    EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, &li, &dcfg, g_stream), ncclSuccess);
     EXPECT_EQ(ncclEpComplete(h, nullptr, g_stream), ncclSuccess);
     EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess)
         << "Rank " << g_rank << ": dispatch must complete cleanly after dropping "
            "overflow tokens (got CUDA error "
         << cudaGetErrorName(cudaGetLastError()) << ").";
+    if (fused || ht_count_mode_active(h)) {
+        expect_expert_counts(expected_kept, "dispatch");
+    }
+
+    int32_t h_recv_total = -1;
+    CUDA_ASSERT(cudaMemcpy(&h_recv_total, d_recv_total, sizeof(int32_t), cudaMemcpyDeviceToHost));
+    EXPECT_EQ(h_recv_total, expected_true_total)
+        << "Rank " << g_rank << ": recv_total_counter should report the true "
+           "pre-drop recv total so callers can detect dropped tokens.";
+
+    // Internal recv count is clamped to the budget (overflow tokens dropped).
+    unsigned int num_recv = 0;
+    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+    EXPECT_EQ(num_recv, static_cast<unsigned int>(expected_kept))
+        << "Rank " << g_rank << ": internal recv count must be clamped to "
+           "max_recv_tokens_per_rank on overflow.";
 
     // ── Forward combine (round-trip back to the senders) ──────────────────────
     nv_bfloat16* d_combined = nullptr;
@@ -176,6 +227,21 @@ TEST_F(HtOverflowDropTest, DispatchCombineContinueOnOverflow) {
            "dispatch (got CUDA error "
         << cudaGetErrorName(cudaGetLastError()) << ").";
 
+    // Rank-major DROP retains a prefix of source rows. Checking every output
+    // catches stale staging reads for dropped tokens as well as missing survivors.
+    std::vector<nv_bfloat16> combined(kNumTokens * kHidden);
+    CUDA_ASSERT(cudaMemcpy(combined.data(), d_combined,
+                           combined.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+    for (int t = 0; t < kNumTokens; ++t) {
+        const int source_row = g_rank * kNumTokens + t;
+        const float expected = source_row < static_cast<int>(kDropRecvBudget)
+                                   ? static_cast<float>(source_row + 1) : 0.0f;
+        for (int d = 0; d < kHidden; ++d) {
+            EXPECT_EQ(__bfloat162float(combined[t * kHidden + d]), expected)
+                << "source rank " << g_rank << " token " << t << " column " << d;
+        }
+    }
+
     // ── Cleanup ───────────────────────────────────────────────────────────────
     ncclEpTensorDestroy(t_combined);
     cudaFree(d_combined);
@@ -189,9 +255,136 @@ TEST_F(HtOverflowDropTest, DispatchCombineContinueOnOverflow) {
     cudaFree(d_w);
     cudaFree(d_recv);
     cudaFree(d_tok);
+    ncclEpTensorDestroy(t_expert_cnt);
+    cudaFree(d_expert_cnt);
     ncclEpTensorDestroy(t_recv_total);
     cudaFree(d_recv_total);
     (void)ncclEpHandleDestroy(h);
+}
+
+// Fused count path under a real overflow: no layout info at UpdateHandle, so the dispatch MAP
+// warps build the maps and publish the pre-drop total, and the LERM recount reports the
+// delivered (post-drop) per-expert hits. Replayed from a CUDA graph so the captured memset
+// before the recount is exercised too.
+TEST_F(HtOverflowDropTest, FlatFusedDropRecount) {
+    ncclEpHandle_t h = nullptr;
+    NCCL_ASSERT(ncclEpInitHandle(&h, g_ep_group_drop, NCCL_EP_LAYOUT_FLAT,
+                                 /*config=*/nullptr, kTopK, /*handle_mem=*/nullptr));
+    ASSERT_NE(h, nullptr);
+    NCCL_ASSERT(ncclEpUpdateHandle(h, t_topk_, nullptr, g_stream));
+    if (!ht_count_fused_active(h)) {
+        CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+        (void)ncclEpHandleDestroy(h);
+        GTEST_SKIP() << "fused count mode only";
+    }
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+
+    const int E_local = kNumExperts / g_nranks;
+    const int32_t expected_true_total = (g_rank == 0) ? (g_nranks * kNumTokens) : 0;
+    const int32_t expected_kept =
+        (static_cast<unsigned>(expected_true_total) > kDropRecvBudget)
+            ? static_cast<int32_t>(kDropRecvBudget)
+            : expected_true_total;
+    if (g_rank == 0) {
+        ASSERT_GT(expected_true_total, static_cast<int32_t>(kDropRecvBudget));
+    }
+
+    int32_t* d_total = nullptr;
+    int32_t* d_cnt = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_total, sizeof(int32_t)));
+    CUDA_ASSERT(cudaMalloc(&d_cnt, E_local * sizeof(int32_t)));
+    ncclEpTensor_t* t_total = nullptr;
+    ncclEpTensor_t* t_cnt = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_total, 1, ncclInt32, d_total, 1));
+    NCCL_ASSERT(epTensorCreate(&t_cnt, 1, ncclInt32, d_cnt, E_local));
+    ncclEpLayoutInfo_t li = NCCL_EP_LAYOUT_INFO_INIT;
+    li.recv_total_counter = t_total;
+    li.expert_counters = t_cnt;
+
+    std::vector<nv_bfloat16> h_tok(kNumTokens * kHidden, __float2bfloat16(1.0f));
+    std::vector<float> h_w(kNumTokens * kTopK, 1.0f);
+    nv_bfloat16 *d_tok = nullptr, *d_recv = nullptr;
+    float *d_w = nullptr, *d_recv_w = nullptr;
+    int64_t* d_recv_idx = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_tok, kNumTokens * kHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_recv, kDropRecvBudget * kHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_w, kNumTokens * kTopK * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_w, kDropRecvBudget * kTopK * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_idx, kDropRecvBudget * kTopK * sizeof(int64_t)));
+    CUDA_ASSERT(cudaMemcpy(d_tok, h_tok.data(), h_tok.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_w, h_w.data(), h_w.size() * sizeof(float), cudaMemcpyHostToDevice));
+    ncclEpTensor_t *t_tok = nullptr, *t_recv = nullptr, *t_w = nullptr, *t_recv_w = nullptr, *t_recv_idx = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_tok, 2, ncclBfloat16, d_tok, kNumTokens, kHidden));
+    NCCL_ASSERT(epTensorCreate(&t_recv, 2, ncclBfloat16, d_recv, kDropRecvBudget, kHidden));
+    NCCL_ASSERT(epTensorCreate(&t_w, 2, ncclFloat32, d_w, kNumTokens, kTopK));
+    NCCL_ASSERT(epTensorCreate(&t_recv_w, 2, ncclFloat32, d_recv_w, kDropRecvBudget, kTopK));
+    NCCL_ASSERT(epTensorCreate(&t_recv_idx, 2, ncclInt64, d_recv_idx, kDropRecvBudget, kTopK));
+
+    ncclEpDispatchInputs_t d_in = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t d_out = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    d_in.tokens = t_tok;
+    d_in.topk_weights = t_w;
+    d_out.tokens = t_recv;
+    d_out.topk_weights = t_recv_w;
+    d_out.topk_idx = t_recv_idx;
+    ncclEpDispatchConfig_t dcfg = NCCL_EP_DISPATCH_CONFIG_INIT;
+
+    auto poison = [&]() {
+        CUDA_ASSERT(cudaMemset(d_total, 0xA5, sizeof(int32_t)));
+        CUDA_ASSERT(cudaMemset(d_cnt, 0xA5, E_local * sizeof(int32_t)));
+    };
+    auto expect_published = [&](const char* stage) {
+        int32_t h_total = -1;
+        std::vector<int32_t> h_cnt(E_local);
+        CUDA_ASSERT(cudaMemcpy(&h_total, d_total, sizeof(int32_t), cudaMemcpyDeviceToHost));
+        CUDA_ASSERT(cudaMemcpy(h_cnt.data(), d_cnt, E_local * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        EXPECT_EQ(h_total, expected_true_total) << "Rank " << g_rank << " pre-drop total at " << stage;
+        for (int e = 0; e < E_local; ++e) {
+            const int32_t expected = (g_rank == 0 && e == 0) ? expected_kept : 0;
+            EXPECT_EQ(h_cnt[e], expected) << "Rank " << g_rank << " local expert " << e << " delivered at " << stage;
+        }
+        unsigned int num_recv = 0;
+        NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+        EXPECT_EQ(num_recv, static_cast<unsigned int>(expected_kept)) << "Rank " << g_rank << " at " << stage;
+    };
+
+    poison();
+    NCCL_ASSERT(ncclEpDispatch(h, &d_in, &d_out, &li, &dcfg, g_stream));
+    NCCL_ASSERT(ncclEpComplete(h, nullptr, g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+    expect_published("first dispatch");
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    CUDA_ASSERT(cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeRelaxed));
+    NCCL_ASSERT(ncclEpDispatch(h, &d_in, &d_out, &li, &dcfg, g_stream));
+    NCCL_ASSERT(ncclEpComplete(h, nullptr, g_stream));
+    CUDA_ASSERT(cudaStreamEndCapture(g_stream, &graph));
+    CUDA_ASSERT(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    for (int replay = 0; replay < 2; ++replay) {
+        poison();
+        CUDA_ASSERT(cudaGraphLaunch(exec, g_stream));
+        CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+        expect_published(replay == 0 ? "first replay" : "second replay");
+    }
+    CUDA_ASSERT(cudaGraphExecDestroy(exec));
+    CUDA_ASSERT(cudaGraphDestroy(graph));
+
+    ncclEpTensorDestroy(t_recv_idx);
+    ncclEpTensorDestroy(t_recv_w);
+    ncclEpTensorDestroy(t_w);
+    ncclEpTensorDestroy(t_recv);
+    ncclEpTensorDestroy(t_tok);
+    ncclEpTensorDestroy(t_cnt);
+    ncclEpTensorDestroy(t_total);
+    cudaFree(d_recv_idx);
+    cudaFree(d_recv_w);
+    cudaFree(d_w);
+    cudaFree(d_recv);
+    cudaFree(d_tok);
+    cudaFree(d_cnt);
+    cudaFree(d_total);
+    NCCL_ASSERT(ncclEpHandleDestroy(h));
 }
 
 // The dispatch output (recv_x) must be at least max_recv_tokens_per_rank rows;
@@ -453,8 +646,9 @@ TEST_F(HtOverflowDropTest, EmDispatchCombineContinueOnOverflow) {
 // with 8 real rows; expert 1's zone is clamped away and all 8 of its assignments
 // (em slots 16..23) must be dropped -- pre-fix these were the OOB writes.
 TEST_F(HtOverflowDropTest, EmLocalPermuteAlignedDropNoOob) {
+    // Wrong world size is a launch error, not an environment limitation.
     if (g_nranks != 4) {
-        GTEST_SKIP() << "zone geometry below assumes 4 ranks (8 experts -> 2 per rank)";
+        GTEST_SKIP() << "requires exactly 4 ranks (8 experts -> 2 per rank), got " << g_nranks;
     }
     constexpr unsigned int kCap = 16;       // recv capacity; multiple of kAlign
     constexpr int kAlign = 16;              // per-expert zone alignment
@@ -684,8 +878,9 @@ TEST_F(HtOverflowDropTest, EmLocalPermuteAlignedDropNoOob) {
 // rows 4..7 are phantom and must read back zero. Expert 1's zone is clamped
 // away; ranks 2-3 are fully dropped and must combine back zeros.
 TEST_F(HtOverflowDropTest, EmLocalPermuteDeepFlatOverflowPhantomRowsZeroed) {
+    // Wrong world size is a launch error, not an environment limitation.
     if (g_nranks != 4) {
-        GTEST_SKIP() << "zone geometry below assumes 4 ranks (8 experts -> 2 per rank)";
+        GTEST_SKIP() << "requires exactly 4 ranks (8 experts -> 2 per rank), got " << g_nranks;
     }
     constexpr unsigned int kCap = 8;
     constexpr int kAlign = 4;
@@ -868,6 +1063,152 @@ TEST_F(HtOverflowDropTest, EmLocalPermuteDeepFlatOverflowPhantomRowsZeroed) {
     cudaFree(d_tok);
     ncclEpTensorDestroy(t_total);
     cudaFree(d_total);
+    ncclEpTensorDestroy(t_idx);
+    cudaFree(d_idx);
+    (void)ncclEpHandleDestroy(h);
+    NCCL_ASSERT(ncclEpGroupDestroy(grp));
+}
+
+// Same deep-FLAT-overflow geometry as EmLocalPermuteDeepFlatOverflowPhantomRowsZeroed,
+// but the backward dispatch pass writes into a FRESH buffer instead of reusing forward's
+// (the normal case for a real caller: backward's gradient buffer is a distinct allocation).
+// Backward never reruns publish_outputs, so its own pad warp depends entirely on
+// forward's in-place per_expert_counts_active[e] correction reaching it.
+TEST_F(HtOverflowDropTest, EmLocalPermuteDeepFlatOverflowBackwardPhantomRowsZeroed) {
+    if (g_nranks != 4) {
+        GTEST_SKIP() << "zone geometry below assumes 4 ranks (8 experts -> 2 per rank)";
+    }
+    constexpr unsigned int kCap = 8;
+    constexpr int kAlign = 4;
+    constexpr unsigned int kSlack = 64;
+
+    ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
+    gcfg.algorithm                    = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+    gcfg.num_experts                  = kNumExperts;
+    gcfg.max_dispatch_tokens_per_rank = kNumTokens;
+    gcfg.max_token_bytes              = kHidden * sizeof(nv_bfloat16);
+    gcfg.rdma_buffer_size             = NCCL_EP_AUTO;
+    gcfg.num_qp_per_rank              = NCCL_EP_AUTO;
+    gcfg.num_channels                 = NCCL_EP_AUTO;
+    gcfg.max_recv_tokens_per_rank     = kCap;
+    gcfg.overflow_policy              = NCCL_EP_OVERFLOW_DROP;
+    ncclEpGroup_t grp = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&grp, g_comm, &gcfg));
+
+    ncclEpHandleConfig_t hcfg = NCCL_EP_HANDLE_CONFIG_INIT;
+    hcfg.dispatch_output_per_expert_alignment = kAlign;
+    ncclEpHandle_t h = nullptr;
+    NCCL_ASSERT(ncclEpInitHandle(&h, grp, NCCL_EP_LAYOUT_EXPERT_MAJOR, &hcfg, kTopK,
+                                 /*handle_mem=*/nullptr));
+    ASSERT_NE(h, nullptr);
+
+    // tokens 0,1 -> expert 0; tokens 2,3 -> expert 1 (same as the forward-only test).
+    int64_t h_idx[kNumTokens * kTopK];
+    for (int i = 0; i < kNumTokens; ++i) h_idx[i] = (i < 2) ? 0 : 1;
+    int64_t* d_idx = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_idx, sizeof(h_idx)));
+    CUDA_ASSERT(cudaMemcpy(d_idx, h_idx, sizeof(h_idx), cudaMemcpyHostToDevice));
+    ncclEpTensor_t* t_idx = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_idx, 2, ncclInt64, d_idx, kNumTokens, kTopK));
+
+    NCCL_ASSERT(ncclEpUpdateHandle(h, t_idx, /*layout_info=*/nullptr, g_stream));
+    ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess)
+        << "Rank " << g_rank << ": UpdateHandle trapped on deep FLAT overflow";
+
+    std::vector<nv_bfloat16> h_tok(kNumTokens * kHidden);
+    std::vector<float> h_w(kNumTokens * kTopK);
+    for (int i = 0; i < kNumTokens; ++i) {
+        const float v = static_cast<float>(g_rank * kNumTokens + i + 1);
+        for (int hh = 0; hh < kHidden; ++hh) h_tok[i * kHidden + hh] = __float2bfloat16(v);
+        h_w[i] = static_cast<float>(g_rank * kNumTokens + i) + 0.5f;
+    }
+    const size_t recv_rows_alloc = kCap + kSlack;
+    nv_bfloat16 *d_tok = nullptr, *d_recv_fwd = nullptr, *d_recv_bwd = nullptr;
+    float *d_w = nullptr, *d_recv_w = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_tok, kNumTokens * kHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_fwd, recv_rows_alloc * kHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_bwd, recv_rows_alloc * kHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_w, kNumTokens * kTopK * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_w, recv_rows_alloc * sizeof(float)));
+    CUDA_ASSERT(cudaMemcpy(d_tok, h_tok.data(), kNumTokens * kHidden * sizeof(nv_bfloat16),
+                           cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_w, h_w.data(), kNumTokens * kTopK * sizeof(float),
+                           cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemset(d_recv_fwd, 0xAB, recv_rows_alloc * kHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMemset(d_recv_w, 0xAB, recv_rows_alloc * sizeof(float)));
+
+    ncclEpTensor_t *t_tok = nullptr, *t_recv_fwd = nullptr, *t_w = nullptr, *t_recv_w = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_tok, 2, ncclBfloat16, d_tok, kNumTokens, kHidden));
+    NCCL_ASSERT(epTensorCreate(&t_recv_fwd, 2, ncclBfloat16, d_recv_fwd, kCap, kHidden));
+    NCCL_ASSERT(epTensorCreate(&t_w, 2, ncclFloat32, d_w, kNumTokens, kTopK));
+    NCCL_ASSERT(epTensorCreate(&t_recv_w, 1, ncclFloat32, d_recv_w, kCap));
+
+    // Forward dispatch: establishes flat2em_slot_map and corrects
+    // per_expert_counts_active[e] in place for the phantom-row gap.
+    ncclEpDispatchInputs_t d_in = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t d_out = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    d_in.tokens = t_tok;
+    d_in.topk_weights = t_w;
+    d_out.tokens = t_recv_fwd;
+    d_out.topk_weights = t_recv_w;
+    ncclEpDispatchConfig_t dcfg = NCCL_EP_DISPATCH_CONFIG_INIT;
+    EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclSuccess);
+    EXPECT_EQ(ncclEpComplete(h, nullptr, g_stream), ncclSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess)
+        << "Rank " << g_rank << ": forward deep-FLAT-overflow dispatch must not fault";
+
+    // Backward dispatch: fresh, never-touched-by-forward buffer, canary-filled first.
+    // Drops topk_weights/topk_idx per the backward contract (token transport only).
+    CUDA_ASSERT(cudaMemset(d_recv_bwd, 0xAB, recv_rows_alloc * kHidden * sizeof(nv_bfloat16)));
+    ncclEpTensor_t* t_recv_bwd = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_recv_bwd, 2, ncclBfloat16, d_recv_bwd, kCap, kHidden));
+    d_in.topk_weights = nullptr;
+    d_out.topk_weights = nullptr;
+    d_out.tokens = t_recv_bwd;
+    dcfg.pass_direction = NCCL_EP_BWD_PASS;
+    EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclSuccess);
+    EXPECT_EQ(ncclEpComplete(h, nullptr, g_stream), ncclSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess)
+        << "Rank " << g_rank << ": backward deep-FLAT-overflow dispatch must not fault";
+
+    {
+        std::vector<nv_bfloat16> h_recv(recv_rows_alloc * kHidden);
+        CUDA_ASSERT(cudaMemcpy(h_recv.data(), d_recv_bwd,
+                               recv_rows_alloc * kHidden * sizeof(nv_bfloat16),
+                               cudaMemcpyDeviceToHost));
+        if (g_rank == 0) {
+            std::multiset<float> got_vals, want_vals;
+            for (int s = 0; s < 4; ++s) got_vals.insert(__bfloat162float(h_recv[s * kHidden]));
+            for (int r = 0; r < 2; ++r)
+                for (int i = 0; i < 2; ++i) want_vals.insert(static_cast<float>(r * kNumTokens + i + 1));
+            EXPECT_EQ(got_vals, want_vals)
+                << "backward's own buffer must hold the same retained expert-0 tokens";
+            // The regression check: without the in-place per_expert_counts_active fix,
+            // these rows would still hold the 0xAB canary in this fresh buffer.
+            for (unsigned int s = 4; s < kCap; ++s) {
+                EXPECT_EQ(__bfloat162float(h_recv[s * kHidden]), 0.0f)
+                    << "backward phantom row " << s << " must be zeroed, not canary";
+            }
+        }
+        const uint8_t* recv_bytes = reinterpret_cast<const uint8_t*>(h_recv.data());
+        size_t tok_bad = 0;
+        for (size_t b = kCap * kHidden * sizeof(nv_bfloat16);
+             b < recv_rows_alloc * kHidden * sizeof(nv_bfloat16); ++b) {
+            if (recv_bytes[b] != 0xAB) ++tok_bad;
+        }
+        EXPECT_EQ(tok_bad, 0u) << "Rank " << g_rank << ": OOB write past backward recv_tokens";
+    }
+
+    ncclEpTensorDestroy(t_recv_bwd);
+    cudaFree(d_recv_bwd);
+    ncclEpTensorDestroy(t_recv_w);
+    ncclEpTensorDestroy(t_w);
+    ncclEpTensorDestroy(t_recv_fwd);
+    ncclEpTensorDestroy(t_tok);
+    cudaFree(d_recv_w);
+    cudaFree(d_w);
+    cudaFree(d_recv_fwd);
+    cudaFree(d_tok);
     ncclEpTensorDestroy(t_idx);
     cudaFree(d_idx);
     (void)ncclEpHandleDestroy(h);

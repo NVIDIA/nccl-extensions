@@ -19,30 +19,99 @@
 #include <cuda_runtime.h>
 #include <nccl.h>
 #include <nccl_ep.h>
+#include "../nccl_ep_test_internal.h"
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <strings.h>  // strcasecmp
 #include <thread>
 #include <vector>
 
 #define NCCL_ASSERT(x) ASSERT_EQ((x), ncclSuccess)
 #define CUDA_ASSERT(x) ASSERT_EQ((x), cudaSuccess)
 
-// True when HT EM pull-dispatch/push-combine mode is active (NCCL_EP_HT_EM_PULL_PUSH).
-// The mode only supports the expert-major layout, so FLAT / rank-major cases skip.
-static inline bool ht_em_pull_push_active() {
-    const char* v = getenv("NCCL_EP_HT_EM_PULL_PUSH");
-    return v && v[0] != '\0' && v[0] != '0';
+// Mirrors nccl_ep_env.cc::parse_flag's truthy tokens (1/on/true, case-insensitive);
+// anything else, including unset, is inactive.
+static inline bool env_flag_active(const char* name) {
+    const char* v = getenv(name);
+    if (v == nullptr || v[0] == '\0') return false;
+    return strcasecmp(v, "1") == 0 || strcasecmp(v, "on") == 0 || strcasecmp(v, "true") == 0;
 }
 
-// Skip the current test under NCCL_EP_HT_EM_PULL_PUSH, which supports expert-major only.
-#define SKIP_IF_PULL_PUSH()                                                              \
-    do {                                                                                \
-        if (ht_em_pull_push_active())                                                   \
-            GTEST_SKIP() << "NCCL_EP_HT_EM_PULL_PUSH supports expert-major layout only"; \
-    } while (0)
+class ScopedEnvVar {
+public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        const char* previous = getenv(name_);
+        if (previous != nullptr) {
+            had_previous_ = true;
+            previous_ = previous;
+        }
+        if (value != nullptr) {
+            setenv(name_, value, 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (had_previous_) {
+            setenv(name_, previous_.c_str(), 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+private:
+    const char* name_;
+    bool had_previous_ = false;
+    std::string previous_;
+};
+
+// Reports only an explicit pull environment override, not the group's resolved flow.
+// AUTO-aware tests must inspect the group or handle instead.
+static inline bool ht_pull_push_active() {
+    return env_flag_active("NCCL_EP_HT_PULL_PUSH");
+}
+
+// True when the scan (routing-map AllGather) fallback is active (NCCL_EP_HT_AG_SCAN_MODE).
+static inline bool ht_ag_scan_mode_active() {
+    return env_flag_active("NCCL_EP_HT_AG_SCAN_MODE");
+}
+
+// True when count mode is forced unfused (NCCL_EP_HT_COUNT_UNFUSED); like scan mode,
+// it publishes the EM recv-count tables at UpdateHandle time.
+static inline bool ht_count_unfused_active() {
+    return env_flag_active("NCCL_EP_HT_COUNT_UNFUSED");
+}
+
+// True when HT EM nvlink-dup mode is active (NCCL_EP_HT_EM_NVLINK_DUP).
+static inline bool ht_em_nvlink_dup_active() {
+    return env_flag_active("NCCL_EP_HT_EM_NVLINK_DUP");
+}
+
+// True when HT EM local-dup mode is active (NCCL_EP_HT_EM_LOCAL_DUP).
+static inline bool ht_em_local_dup_active() {
+    return env_flag_active("NCCL_EP_HT_EM_LOCAL_DUP");
+}
+
+// True when count mode is active (fused or unfused) for EM local-permute and FLAT handles: the
+// recv map (s2d) is built inside dispatch, not at UpdateHandle. The EM duplication modes,
+// pull-push and NCCL_EP_HT_AG_SCAN_MODE keep the scan path. Env-only: assumes a single LSA
+// team, a non-eager group and zero_copy != ON (each of which also falls back to scan); prefer
+// the handle overload where a handle exists.
+static inline bool ht_count_mode_active() {
+    return !ht_ag_scan_mode_active() && !ht_em_nvlink_dup_active() &&
+           !ht_em_local_dup_active() && !ht_pull_push_active();
+}
+
+// True when count mode is fused: the recv count is produced inside dispatch, so
+// ncclEpHandle_test_getNumRecvTokens() is not valid until after the first dispatch. Unfused
+// count mode wires it at UpdateHandle time, like scan.
+static inline bool ht_count_fused_active() {
+    return ht_count_mode_active() && !ht_count_unfused_active();
+}
 
 // Allocate a tensor descriptor and bind it to a caller-owned device buffer.
 template <typename... Dims>
@@ -60,6 +129,15 @@ epTensorCreate(ncclEpTensor_t** t, unsigned int ndim, ncclDataType_t dtype, void
 static int g_rank = -1;
 static int g_nranks = -1;
 static std::string g_uid_file;
+
+// Query the resolved handle path, including explicit policy and early layout outputs.
+static inline bool ht_count_mode_active(ncclEpHandle_t handle) {
+    return ncclEpHandle_test_getMetadataMode(handle) != NCCL_EP_TEST_META_SCAN;
+}
+
+static inline bool ht_count_fused_active(ncclEpHandle_t handle) {
+    return ncclEpHandle_test_getMetadataMode(handle) == NCCL_EP_TEST_META_FUSED;
+}
 
 static ncclComm_t g_comm = nullptr;
 static ncclEpGroup_t g_ep_group = nullptr;  // rank-major (default)
@@ -181,7 +259,11 @@ static void ep_parse_args(int argc, char* argv[], const char* uid_suffix) {
     }
 }
 
-// Returns false if the test binary should exit (wrong device / too few ranks).
+// Returns false ONLY when the test should be skipped because this environment
+// cannot run it (e.g. pre-SM_90 hardware). Callers map a false return to
+// exit(0), so every genuine failure must exit non-zero here rather than return
+// -- otherwise a broken NCCL bootstrap reports as a passing suite. This matches
+// ep_parse_args above, which already exits directly on a bad command line.
 static bool ep_bootstrap(int argc, char* argv[], const char* uid_suffix) {
     ep_parse_args(argc, argv, uid_suffix);
     ::testing::InitGoogleTest(&argc, argv);
@@ -195,9 +277,13 @@ static bool ep_bootstrap(int argc, char* argv[], const char* uid_suffix) {
         if (g_rank == 0) printf("SKIP: SM_90+ required (this device is SM_%d0)\n", major);
         return false;
     }
+    // An insufficient world size is a launch error, not an environment
+    // limitation. Callers map a false return to exit(0), so returning false
+    // here would report a pass while running no distributed coverage at all.
+    // Exit non-zero instead; no NCCL resources exist yet to tear down.
     if (g_nranks < 2) {
-        if (g_rank == 0) printf("SKIP: at least 2 ranks required\n");
-        return false;
+        fprintf(stderr, "FATAL: at least 2 ranks required, got %d\n", g_nranks);
+        exit(EXIT_FAILURE);
     }
 
     ncclUniqueId uid{};
@@ -211,7 +297,7 @@ static bool ep_bootstrap(int argc, char* argv[], const char* uid_suffix) {
             "that the loopback interface is reachable.\n",
             g_rank,
             comm_ret);
-        return false;
+        exit(EXIT_FAILURE);
     }
     cudaStreamCreate(&g_stream);
 
@@ -227,7 +313,7 @@ static bool ep_bootstrap(int argc, char* argv[], const char* uid_suffix) {
     ncclResult_t grp_ret = ncclEpCreateGroup(&g_ep_group, g_comm, &gcfg);
     if (grp_ret != ncclSuccess) {
         fprintf(stderr, "Rank %d: ncclEpCreateGroup failed (err=%d).\n", g_rank, grp_ret);
-        return false;
+        exit(EXIT_FAILURE);
     }
 
     // Expert-major group (same config; layout is per-handle, not per-group)
@@ -235,7 +321,7 @@ static bool ep_bootstrap(int argc, char* argv[], const char* uid_suffix) {
     grp_ret = ncclEpCreateGroup(&g_ep_group_em, g_comm, &gcfg_em);
     if (grp_ret != ncclSuccess) {
         fprintf(stderr, "Rank %d: ncclEpCreateGroup (expert-major) failed (err=%d).\n", g_rank, grp_ret);
-        return false;
+        exit(EXIT_FAILURE);
     }
 
     cudaStreamSynchronize(g_stream);

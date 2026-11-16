@@ -53,7 +53,7 @@ inline std::string scan_flat_jit_source(
         << "      " << lsa_team_size << ",\n"
         << "      " << ::nccl_ep::jit::bool_literal(enable_per_expert_counts) << ",\n"
         << "      " << ::nccl_ep::jit::bool_literal(enable_em_permute) << ",\n"
-        << "      " << (enable_em_permute ? experts_per_rank : 0) << ",\n"
+        << "      " << ((enable_em_permute || use_topk_idx) ? experts_per_rank : 0) << ",\n"
         << "      " << em_out_type << ",\n"
         << "      " << ::nccl_ep::jit::bool_literal(use_topk_idx) << ">(\n"
         << "      p.input_routing_map, p.tmp, p.sparse_to_dense_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"
@@ -62,7 +62,7 @@ inline std::string scan_flat_jit_source(
         << "      p.lsa_team, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank,\n"
         << "      p.recv_total_counter, p.out_is_int64, p.max_recv_tokens_per_rank,\n"
         << "      p.allow_overflow_drop, p.token_to_recv_slot, smem_bytes";
-    if (enable_em_permute) {
+    if (enable_em_permute || use_topk_idx) {
         src << ",\n"
             << "      p.expert_scan_tmp, p.flat2em_slot_map, p.em_top_k, p.em_alignment, p.em_internal_offsets,\n"
             << "      reinterpret_cast<" << em_out_type << "*>(p.em_padded_out_counts),\n"
@@ -117,7 +117,9 @@ inline void launch_scan_flat(
              << "_LSATeams" << num_lsa_teams << "_lsa" << lsa_team_size << "_threads" << num_threads_per_block << "_blocks"
              << num_of_blocks << (enable_per_expert_counts ? "_pec" : "_nopec") << (enable_em_permute ? "_em" : "_noem");
         // EM out dtype is baked into the variant, so it's part of the cache key.
-        if (enable_em_permute) name << "_epr" << experts_per_rank << (out_is_int64 ? "_i64" : "_i32");
+        if (enable_em_permute || use_topk_idx) {
+            name << "_epr" << experts_per_rank << (out_is_int64 ? "_i64" : "_i32");
+        }
         if (use_topk_idx) name << "_tkidx";
         return name.str();
     }();
@@ -250,6 +252,78 @@ inline void launch_build_em_tables_jit(
         std::fprintf(
             stderr,
             "[nccl_ep jit] fatal build-em-tables JIT launch failure for %s: %s%s%s\n",
+            variant_name.c_str(),
+            ::nccl_ep::jit::jit_kernel_status_name(status),
+            error.empty() ? "" : ": ",
+            error.empty() ? "" : error.c_str());
+        std::abort();
+    }
+}
+
+constexpr const char* kBuildCountMetadataJitEntryName = "nccl_ep_jit_build_count_metadata_kernel";
+constexpr int kBuildCountMetadataBlockDim = 256;
+
+inline std::string build_count_metadata_jit_source(
+    int max_dst_ranks_bucket,
+    int experts_per_rank,
+    int lsa_team_size,
+    const char* topk_type_literal) {
+    std::ostringstream src;
+    src
+        << "#include \"device/ht_ep.cuh\"\n"
+        << "\n"
+        << "extern \"C\" __launch_bounds__(" << kBuildCountMetadataBlockDim << ", 1)\n"
+        << "__global__ void " << kBuildCountMetadataJitEntryName << "(\n"
+        << "    const __grid_constant__ ht_ep::build_count_metadata_param_t p) {\n"
+        << "  ht_ep::build_count_metadata_impl<" << topk_type_literal << ", "
+        << max_dst_ranks_bucket << ", "
+        << experts_per_rank << ", " << lsa_team_size
+        << ">(p);\n"
+        << "}\n";
+    return src.str();
+}
+
+inline void launch_build_count_metadata_jit(
+    int max_dst_ranks_bucket,
+    int experts_per_rank,
+    int lsa_team_size,
+    bool topk_is_int64,
+    ::ht_ep::build_count_metadata_param_t& param,
+    int num_blocks,
+    cudaStream_t stream) {
+    static const int variant_identity = 0;
+    const char* topk_type_literal = topk_is_int64 ? "int64_t" : "int32_t";
+    const std::string variant_name = [&] {
+        std::ostringstream name;
+        name << "build_count_metadata_cap" << max_dst_ranks_bucket
+             << "_epr" << experts_per_rank << "_lsa" << lsa_team_size
+             << "_topk" << topk_type_literal;
+        return name.str();
+    }();
+    const std::string source = build_count_metadata_jit_source(
+        max_dst_ranks_bucket, experts_per_rank, lsa_team_size, topk_type_literal);
+
+    ::nccl_ep::jit::JitKernelVariant variant;
+    variant.kernel_family = "ht_build_count_metadata";
+    variant.variant_name = variant_name;
+    variant.source = source;
+    variant.entry_name = kBuildCountMetadataJitEntryName;
+    variant.identity = &variant_identity;
+    // Distinct topology tuples must not alias in the fast cache; key on the variant name.
+    variant.runtime_key = static_cast<std::uint64_t>(std::hash<std::string>{}(variant_name));
+    variant.num_blocks = num_blocks;
+    variant.block_dim = kBuildCountMetadataBlockDim;
+    variant.dynamic_smem_bytes = 0;
+    variant.cooperative = false;
+
+    std::string error;
+    const ::nccl_ep::jit::JitKernelStatus status =
+        ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
+
+    if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
+        std::fprintf(
+            stderr,
+            "[nccl_ep jit] fatal build-count-metadata JIT launch failure for %s: %s%s%s\n",
             variant_name.c_str(),
             ::nccl_ep::jit::jit_kernel_status_name(status),
             error.empty() ? "" : ": ",

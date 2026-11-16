@@ -41,7 +41,7 @@ def _check_staged_libraries(package_dir: Path, library: str, package: str) -> No
 if not BUILDING_SDIST:
     from Cython.Build import cythonize
 
-    _check_staged_libraries(EP_PACKAGE, "libnccl_ep.so", "nccl.ep")
+    _check_staged_libraries(EP_PACKAGE, "libnccl_ep.so.0", "nccl.ep")
     _check_staged_libraries(M2N_PACKAGE, "libnccl_m2n.so", "nccl.m2n")
 
     CUDA_HOME = os.environ.get("CUDA_HOME")

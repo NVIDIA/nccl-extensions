@@ -56,29 +56,21 @@ static void debugPrintMeshGroupInfo(int worldRank, const char* meshName, const n
   RESHARD_TRACE(worldRank, "=== %s Mesh Analysis ===", meshName);
   RESHARD_TRACE(worldRank, "  Mesh: dims=[%d, %d], startRank=%d", mesh->dims[0], mesh->dims[1], mesh->startRank);
   RESHARD_TRACE(worldRank, "  Placement: [%s, %s]", p0, p1);
-  RESHARD_TRACE(worldRank, "  Derived: shardMeshDim=%d, repMeshDim=%d, shardTensorDim=%d", info->shardMeshDim,
-                info->repMeshDim, info->shardTensorDim);
   RESHARD_TRACE(worldRank, "  Counts: shardCount=%d, repCount=%d", info->shardCount, info->repCount);
-  RESHARD_TRACE(worldRank, "  My position: meshPos=[%d, %d], shardIdx=%d, repIdx=%d", info->meshPos[0],
-                info->meshPos[1], info->shardIdx, info->repIdx);
-
-  char shardBuf[512];
+  RESHARD_TRACE(worldRank, "  My position: shardIdx=%d, repIdx=%d", info->shardIdx, info->repIdx);
+  char shardBuf[512] = {}, repBuf[512] = {};
   int pos = 0;
   for (int i = 0; i < info->shardCount && pos < (int)sizeof(shardBuf) - 16; i++) {
-    pos += snprintf(shardBuf + pos, sizeof(shardBuf) - pos, "%s%d", (i != 0) ? ", " : "",
-                    info->shardGroupStart + i * info->shardGroupStride);
+    pos += snprintf(shardBuf + pos, sizeof(shardBuf) - pos, "%s%d", i ? ", " : "",
+                    getMeshRank(tensor, info, i, info->repIdx));
   }
-  RESHARD_TRACE(worldRank, "  Shard group: start=%d, stride=%d (members: %s)", info->shardGroupStart,
-                info->shardGroupStride, shardBuf);
-
-  char repBuf[512];
   pos = 0;
   for (int i = 0; i < info->repCount && pos < (int)sizeof(repBuf) - 16; i++) {
-    pos += snprintf(repBuf + pos, sizeof(repBuf) - pos, "%s%d", (i != 0) ? ", " : "",
-                    info->repGroupStart + i * info->repGroupStride);
+    pos += snprintf(repBuf + pos, sizeof(repBuf) - pos, "%s%d", i ? ", " : "",
+                    getMeshRank(tensor, info, info->shardIdx, i));
   }
-  RESHARD_TRACE(worldRank, "  Rep group: start=%d, stride=%d (members: %s)", info->repGroupStart, info->repGroupStride,
-                repBuf);
+  RESHARD_TRACE(worldRank, "  Shard group members: [%s]", shardBuf);
+  RESHARD_TRACE(worldRank, "  Replica group members: [%s]", repBuf);
 }
 
 static void debugPrintLoadBalancer(int worldRank, const ncclReshardRepLoadBalancer* lb) {
@@ -207,86 +199,30 @@ static void debugPrintTransferPlan(int worldRank, int srcShardIdx, int dstShardI
   fflush(stdout);
 }
 
-static int countOverlappingDstShards(const size_t srcDims[], const size_t srcStrides[], int srcShardDim,
+static int countOverlappingDstShards(const size_t srcDims[], const size_t srcStrides[], const ncclReshardShardLayout_t& srcShardLayout,
                                      int srcShardIdx, const size_t dstDims[], const size_t dstStrides[],
-                                     int dstShardDim, int dstShardCount, int ndims, size_t elementsPerChunk) {
+                                     const ncclReshardShardLayout_t& dstShardLayout, int dstShardCount, int ndims, size_t elementsPerChunk) {
   int count = 0;
   for (int dstShard = 0; dstShard < dstShardCount; dstShard++) {
     ncclReshardTransferPlan plan;
-    computeTransferPlan(srcDims, srcStrides, srcShardDim, srcShardIdx, dstDims, dstStrides, dstShardDim, dstShard,
+    computeTransferPlan(srcDims, srcStrides, srcShardLayout, srcShardIdx, dstDims, dstStrides, dstShardLayout, dstShard,
                         ndims, elementsPerChunk, &plan);
     if (plan.totalInnerTransfers > 0) count++;
   }
   return count;
 }
 
-static int countOverlappingSrcShards(const size_t srcDims[], const size_t srcStrides[], int srcShardDim,
+static int countOverlappingSrcShards(const size_t srcDims[], const size_t srcStrides[], const ncclReshardShardLayout_t& srcShardLayout,
                                      int srcShardCount, const size_t dstDims[], const size_t dstStrides[],
-                                     int dstShardDim, int dstShardIdx, int ndims, size_t elementsPerChunk) {
+                                     const ncclReshardShardLayout_t& dstShardLayout, int dstShardIdx, int ndims, size_t elementsPerChunk) {
   int count = 0;
   for (int srcShard = 0; srcShard < srcShardCount; srcShard++) {
     ncclReshardTransferPlan plan;
-    computeTransferPlan(srcDims, srcStrides, srcShardDim, srcShard, dstDims, dstStrides, dstShardDim, dstShardIdx,
+    computeTransferPlan(srcDims, srcStrides, srcShardLayout, srcShard, dstDims, dstStrides, dstShardLayout, dstShardIdx,
                         ndims, elementsPerChunk, &plan);
     if (plan.totalInnerTransfers > 0) count++;
   }
   return count;
-}
-
-static ncclResult_t computePlanLimitDims(int worldRank, const ncclDistTensor_t* src, const size_t srcTensorDims[],
-                                        const ncclReshardMeshGroupInfo* fullSrcInfo, const ncclDistTensor_t* dst,
-                                        const size_t dstTensorDims[], const ncclReshardMeshGroupInfo* fullDstInfo,
-                                        int ndims, size_t srcDims[], size_t dstDims[]) {
-  const ncclMesh_t* srcMesh = src->mesh;
-  const ncclMesh_t* dstMesh = dst->mesh;
-  const int srcMeshSize = srcMesh->dims[0] * srcMesh->dims[1];
-  const int dstMeshSize = dstMesh->dims[0] * dstMesh->dims[1];
-  const bool isSource = (worldRank >= srcMesh->startRank && worldRank < srcMesh->startRank + srcMeshSize);
-  const bool isDest = (worldRank >= dstMesh->startRank && worldRank < dstMesh->startRank + dstMeshSize);
-
-  size_t srcGlobalDims[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
-  size_t dstGlobalDims[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
-  for (int d = 0; d < ndims; d++) {
-    srcDims[d] = (isSource && srcTensorDims != nullptr) ? srcTensorDims[d] : 0;
-    dstDims[d] = (isDest && dstTensorDims != nullptr) ? dstTensorDims[d] : 0;
-
-    // Validate both descriptors on every rank before any role-specific
-    // reconstruction. A rank outside both meshes still participates in the
-    // collective call and must reject the same malformed global shape.
-    srcGlobalDims[d] = (srcTensorDims != nullptr) ? srcTensorDims[d] : 0;
-    dstGlobalDims[d] = (dstTensorDims != nullptr) ? dstTensorDims[d] : 0;
-    if (srcTensorDims != nullptr && d == fullSrcInfo->shardTensorDim) {
-      NCCL_M2N_CHECK_ARG(
-        m2nCheckedMulSize(srcTensorDims[d], static_cast<size_t>(fullSrcInfo->shardCount), &srcGlobalDims[d]),
-        worldRank, "validateReshardPlanLimits: source global shape overflow at dim %d (local=%zu, shardCount=%d)", d,
-        srcTensorDims[d], fullSrcInfo->shardCount);
-    }
-    if (dstTensorDims != nullptr && d == fullDstInfo->shardTensorDim) {
-      NCCL_M2N_CHECK_ARG(
-        m2nCheckedMulSize(dstTensorDims[d], static_cast<size_t>(fullDstInfo->shardCount), &dstGlobalDims[d]),
-        worldRank,
-        "validateReshardPlanLimits: destination global shape overflow at dim %d (local=%zu, shardCount=%d)", d,
-        dstTensorDims[d], fullDstInfo->shardCount);
-    }
-  }
-
-  if (isSource && !isDest) {
-    for (int d = 0; d < ndims; d++) {
-      const size_t globalSize = srcGlobalDims[d];
-      dstDims[d] = (d == fullDstInfo->shardTensorDim) ? globalSize / fullDstInfo->shardCount : globalSize;
-    }
-  } else if (isDest && !isSource) {
-    for (int d = 0; d < ndims; d++) {
-      const size_t globalSize = dstGlobalDims[d];
-      srcDims[d] = (d == fullSrcInfo->shardTensorDim) ? globalSize / fullSrcInfo->shardCount : globalSize;
-    }
-  } else if (!isSource && !isDest) {
-    for (int d = 0; d < ndims; d++) {
-      srcDims[d] = (srcTensorDims != nullptr) ? srcTensorDims[d] : 0;
-      dstDims[d] = (dstTensorDims != nullptr) ? dstTensorDims[d] : 0;
-    }
-  }
-  return ncclSuccess;
 }
 
 static ncclResult_t validateRingDomainFanout(int worldRank, const ncclDistTensor_t* dst,
@@ -323,8 +259,8 @@ ncclResult_t validateReshardPlanLimits(int worldRank, const ncclDistTensor_t* sr
   size_t dstDims[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
   size_t srcStrides[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
   size_t dstStrides[NCCL_RESHARD_MAX_TENSOR_DIMS] = {0};
-  NCCL_M2N_CHECK(computePlanLimitDims(worldRank, src, srcTensorDims, &fullSrcInfo, dst, dstTensorDims, &fullDstInfo,
-                                      ndims, srcDims, dstDims));
+  NCCL_M2N_CHECK(resolveReshardDims(worldRank, srcTensorDims, fullSrcInfo.shardLayout, dstTensorDims,
+                                    fullDstInfo.shardLayout, ndims, srcDims, dstDims));
   NCCL_M2N_CHECK(computeStridesChecked(srcDims, ndims, srcStrides));
   NCCL_M2N_CHECK(computeStridesChecked(dstDims, ndims, dstStrides));
 
@@ -338,8 +274,8 @@ ncclResult_t validateReshardPlanLimits(int worldRank, const ncclDistTensor_t* sr
   if (algo == RESHARD_ALGO_DIRECT) {
     for (int srcShard = 0; srcShard < fullSrcInfo.shardCount; srcShard++) {
       int overlapDstCount =
-        countOverlappingDstShards(srcDims, srcStrides, fullSrcInfo.shardTensorDim, srcShard, dstDims, dstStrides,
-                                  fullDstInfo.shardTensorDim, fullDstInfo.shardCount, ndims, elementsPerChunk);
+        countOverlappingDstShards(srcDims, srcStrides, fullSrcInfo.shardLayout, srcShard, dstDims, dstStrides,
+                                  fullDstInfo.shardLayout, fullDstInfo.shardCount, ndims, elementsPerChunk);
       for (int srcRep = 0; srcRep < fullSrcInfo.repCount; srcRep++) {
         int targetRepStart, targetRepEnd;
         getTargetRepRange(&lb, srcRep, &targetRepStart, &targetRepEnd);
@@ -360,8 +296,8 @@ ncclResult_t validateReshardPlanLimits(int worldRank, const ncclDistTensor_t* sr
     }
     for (int dstShard = 0; dstShard < fullDstInfo.shardCount; dstShard++) {
       int sourceCount =
-        countOverlappingSrcShards(srcDims, srcStrides, fullSrcInfo.shardTensorDim, fullSrcInfo.shardCount, dstDims,
-                                  dstStrides, fullDstInfo.shardTensorDim, dstShard, ndims, elementsPerChunk);
+        countOverlappingSrcShards(srcDims, srcStrides, fullSrcInfo.shardLayout, fullSrcInfo.shardCount, dstDims,
+                                  dstStrides, fullDstInfo.shardLayout, dstShard, ndims, elementsPerChunk);
       if (sourceCount > MAX_DIRECT_SOURCES) {
         NCCL_M2N_FAIL(ncclInvalidArgument, worldRank,
                       "validateReshardPlanLimits: direct source list would exceed capacity for dstShard %d "
@@ -374,8 +310,8 @@ ncclResult_t validateReshardPlanLimits(int worldRank, const ncclDistTensor_t* sr
 
   for (int srcShard = 0; srcShard < fullSrcInfo.shardCount; srcShard++) {
     int overlapDstCount =
-      countOverlappingDstShards(srcDims, srcStrides, fullSrcInfo.shardTensorDim, srcShard, dstDims, dstStrides,
-                                fullDstInfo.shardTensorDim, fullDstInfo.shardCount, ndims, elementsPerChunk);
+      countOverlappingDstShards(srcDims, srcStrides, fullSrcInfo.shardLayout, srcShard, dstDims, dstStrides,
+                                fullDstInfo.shardLayout, fullDstInfo.shardCount, ndims, elementsPerChunk);
     if (overlapDstCount > MAX_TARGETS) {
       NCCL_M2N_FAIL(ncclInvalidArgument, worldRank,
                     "validateReshardPlanLimits: target list would exceed capacity for srcShard %d "
@@ -385,8 +321,8 @@ ncclResult_t validateReshardPlanLimits(int worldRank, const ncclDistTensor_t* sr
   }
   for (int dstShard = 0; dstShard < fullDstInfo.shardCount; dstShard++) {
     int sourceCount =
-      countOverlappingSrcShards(srcDims, srcStrides, fullSrcInfo.shardTensorDim, fullSrcInfo.shardCount, dstDims,
-                                dstStrides, fullDstInfo.shardTensorDim, dstShard, ndims, elementsPerChunk);
+      countOverlappingSrcShards(srcDims, srcStrides, fullSrcInfo.shardLayout, fullSrcInfo.shardCount, dstDims,
+                                dstStrides, fullDstInfo.shardLayout, dstShard, ndims, elementsPerChunk);
     if (sourceCount > MAX_SOURCES) {
       NCCL_M2N_FAIL(ncclInvalidArgument, worldRank,
                     "validateReshardPlanLimits: source list would exceed capacity for dstShard %d "
@@ -617,113 +553,31 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
   computeMeshGroupInfo(src, srcMesh->startRank, &fullSrcInfo);
   computeMeshGroupInfo(dst, dstMesh->startRank, &fullDstInfo);
 
-  params.srcShardTensorDim = fullSrcInfo.shardTensorDim;
-  params.dstShardTensorDim = fullDstInfo.shardTensorDim;
+  params.srcShardLayout = fullSrcInfo.shardLayout;
+  params.dstShardLayout = fullDstInfo.shardLayout;
   params.srcShardCount = fullSrcInfo.shardCount;
   params.dstShardCount = fullDstInfo.shardCount;
-  params.sameShardDim = (params.srcShardTensorDim == params.dstShardTensorDim);
 
-  RESHARD_DEBUG(worldRank, "Sharding configuration:");
-  RESHARD_DEBUG(worldRank, "  srcShardTensorDim=%d, dstShardTensorDim=%d", params.srcShardTensorDim,
-                params.dstShardTensorDim);
-  RESHARD_DEBUG(worldRank, "  srcShardCount=%d, dstShardCount=%d", params.srcShardCount, params.dstShardCount);
-  RESHARD_DEBUG(worldRank, "  sameShardDim=%d (%s)", params.sameShardDim,
-                params.sameShardDim ? "SAME-DIM sharding" : "CROSS-DIM sharding");
-
+  params.mySrcShardIdx = -1;
+  params.mySrcRepIdx = -1;
+  params.myDstShardIdx = -1;
+  params.myDstRepIdx = -1;
   if (params.isSource) {
     computeMeshGroupInfo(src, worldRank, &srcInfo);
     debugPrintMeshGroupInfo(worldRank, "Source", src, &srcInfo);
-
     params.mySrcShardIdx = srcInfo.shardIdx;
     params.mySrcRepIdx = srcInfo.repIdx;
-    for (int d = 0; d < ndims; d++) params.srcDims[d] = srcTensorDims[d];
-    NCCL_M2N_CHECK(computeStridesChecked(params.srcDims, ndims, params.srcStrides));
-
-    {
-      char db[128], sb[128];
-      fmtSizes(db, sizeof(db), params.srcDims, ndims);
-      fmtSizes(sb, sizeof(sb), params.srcStrides, ndims);
-      RESHARD_DEBUG(worldRank, "Source local info:");
-      RESHARD_DEBUG(worldRank, "  mySrcShardIdx=%d, mySrcRepIdx=%d", params.mySrcShardIdx, params.mySrcRepIdx);
-      RESHARD_DEBUG(worldRank, "  srcDims=[%s], srcStrides=[%s]", db, sb);
-    }
-  } else {
-    params.mySrcShardIdx = -1;
-    params.mySrcRepIdx = -1;
   }
-
   if (params.isDest) {
     computeMeshGroupInfo(dst, worldRank, &dstInfo);
     debugPrintMeshGroupInfo(worldRank, "Dest", dst, &dstInfo);
-
     params.myDstShardIdx = dstInfo.shardIdx;
     params.myDstRepIdx = dstInfo.repIdx;
-    for (int d = 0; d < ndims; d++) params.dstDims[d] = dstTensorDims[d];
-    NCCL_M2N_CHECK(computeStridesChecked(params.dstDims, ndims, params.dstStrides));
-
-    {
-      char db[128], sb[128];
-      fmtSizes(db, sizeof(db), params.dstDims, ndims);
-      fmtSizes(sb, sizeof(sb), params.dstStrides, ndims);
-      RESHARD_DEBUG(worldRank, "Dest local info:");
-      RESHARD_DEBUG(worldRank, "  myDstShardIdx=%d, myDstRepIdx=%d", params.myDstShardIdx, params.myDstRepIdx);
-      RESHARD_DEBUG(worldRank, "  dstDims=[%s], dstStrides=[%s]", db, sb);
-    }
-  } else {
-    params.myDstShardIdx = -1;
-    params.myDstRepIdx = -1;
   }
-
-  // Infer missing dimensions
-  if (params.isSource && !params.isDest) {
-    for (int d = 0; d < ndims; d++) {
-      size_t globalSize;
-      if (d == params.srcShardTensorDim) {
-        NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(srcTensorDims[d], (size_t)params.srcShardCount, &globalSize), worldRank,
-                           "prepareReshardParams: source global dim overflow at dim %d: local=%zu shardCount=%d", d,
-                           srcTensorDims[d], params.srcShardCount);
-      } else {
-        globalSize = srcTensorDims[d];
-      }
-
-      if (d == params.dstShardTensorDim) params.dstDims[d] = globalSize / params.dstShardCount;
-      else params.dstDims[d] = globalSize;
-    }
-    NCCL_M2N_CHECK(computeStridesChecked(params.dstDims, ndims, params.dstStrides));
-
-    {
-      char db[128], sb[128];
-      fmtSizes(db, sizeof(db), params.dstDims, ndims);
-      fmtSizes(sb, sizeof(sb), params.dstStrides, ndims);
-      RESHARD_DEBUG(worldRank, "Inferred dstDims from src:");
-      RESHARD_DEBUG(worldRank, "  dstDims=[%s], dstStrides=[%s]", db, sb);
-    }
-  }
-
-  if (params.isDest && !params.isSource) {
-    for (int d = 0; d < ndims; d++) {
-      size_t globalSize;
-      if (d == params.dstShardTensorDim) {
-        NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(dstTensorDims[d], (size_t)params.dstShardCount, &globalSize), worldRank,
-                           "prepareReshardParams: destination global dim overflow at dim %d: local=%zu shardCount=%d",
-                           d, dstTensorDims[d], params.dstShardCount);
-      } else {
-        globalSize = dstTensorDims[d];
-      }
-
-      if (d == params.srcShardTensorDim) params.srcDims[d] = globalSize / params.srcShardCount;
-      else params.srcDims[d] = globalSize;
-    }
-    NCCL_M2N_CHECK(computeStridesChecked(params.srcDims, ndims, params.srcStrides));
-
-    {
-      char db[128], sb[128];
-      fmtSizes(db, sizeof(db), params.srcDims, ndims);
-      fmtSizes(sb, sizeof(sb), params.srcStrides, ndims);
-      RESHARD_DEBUG(worldRank, "Inferred srcDims from dst:");
-      RESHARD_DEBUG(worldRank, "  srcDims=[%s], srcStrides=[%s]", db, sb);
-    }
-  }
+  NCCL_M2N_CHECK(resolveReshardDims(worldRank, srcTensorDims, params.srcShardLayout, dstTensorDims,
+                                    params.dstShardLayout, ndims, params.srcDims, params.dstDims));
+  NCCL_M2N_CHECK(computeStridesChecked(params.srcDims, ndims, params.srcStrides));
+  NCCL_M2N_CHECK(computeStridesChecked(params.dstDims, ndims, params.dstStrides));
 
   ncclReshardRepLoadBalancer lb = {.srcRepCount = fullSrcInfo.repCount,
                                .dstRepCount = fullDstInfo.repCount,
@@ -758,9 +612,9 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
 
     for (int dstShard = 0; dstShard < params.dstShardCount; dstShard++) {
       ncclReshardTransferPlan plan;
-      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardTensorDim,
+      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardLayout,
                                                 params.mySrcShardIdx, params.dstDims, params.dstStrides,
-                                                params.dstShardTensorDim, dstShard, ndims, elementsPerChunk, &plan));
+                                                params.dstShardLayout, dstShard, ndims, elementsPerChunk, &plan));
 
       if (plan.totalInnerTransfers == 0) {
         RESHARD_TRACE(worldRank, "  dstShard %d: NO OVERLAP", dstShard);
@@ -780,9 +634,9 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
 
         for (int srcShard = 0; srcShard < params.srcShardCount; srcShard++) {
           ncclReshardTransferPlan checkPlan;
-          NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardTensorDim,
+          NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardLayout,
                                                     srcShard, params.dstDims, params.dstStrides,
-                                                    params.dstShardTensorDim, dstShard, ndims, elementsPerChunk,
+                                                    params.dstShardLayout, dstShard, ndims, elementsPerChunk,
                                                     &checkPlan));
 
           if (checkPlan.totalInnerTransfers > 0) {
@@ -943,8 +797,8 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
 
     for (int srcShard = 0; srcShard < params.srcShardCount; srcShard++) {
       ncclReshardTransferPlan plan;
-      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardTensorDim, srcShard,
-                                                params.dstDims, params.dstStrides, params.dstShardTensorDim,
+      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardLayout, srcShard,
+                                                params.dstDims, params.dstStrides, params.dstShardLayout,
                                                 params.myDstShardIdx, ndims, elementsPerChunk, &plan));
 
       if (plan.totalInnerTransfers > 0 && numAllSources < MAX_SOURCES) {
@@ -1039,8 +893,8 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
       int srcShard = allSourceShards[idx];
 
       ncclReshardTransferPlan plan;
-      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardTensorDim, srcShard,
-                                                params.dstDims, params.dstStrides, params.dstShardTensorDim,
+      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardLayout, srcShard,
+                                                params.dstDims, params.dstStrides, params.dstShardLayout,
                                                 params.myDstShardIdx, ndims, elementsPerChunk, &plan));
 
       if (params.numSources >= MAX_SOURCES) {
@@ -1223,8 +1077,6 @@ ncclResult_t prepareReshardParams(int worldRank, const ncclDistTensor_t* src, co
     RESHARD_DEBUG(worldRank, "  Final params summary:");
     RESHARD_DEBUG(worldRank, "    isSource=%d, isDest=%d", params.isSource, params.isDest);
     RESHARD_DEBUG(worldRank, "    srcDims=[%s], dstDims=[%s]", sd, dd);
-    RESHARD_DEBUG(worldRank, "    srcShardTensorDim=%d, dstShardTensorDim=%d (%s)", params.srcShardTensorDim,
-                  params.dstShardTensorDim, params.sameShardDim ? "SAME-DIM" : "CROSS-DIM");
     RESHARD_DEBUG(worldRank, "    srcShardCount=%d, dstShardCount=%d", params.srcShardCount, params.dstShardCount);
     RESHARD_DEBUG(worldRank, "    numTargets=%d, numSources=%d", params.numTargets, params.numSources);
     if (params.isDest) {
@@ -1277,7 +1129,7 @@ ncclResult_t prepareDirectReshardParams(int worldRank, const ncclDistTensor_t* s
   params.isSource = (worldRank >= srcMesh->startRank && worldRank < srcMesh->startRank + srcMeshSize);
   params.isDest = (worldRank >= dstMesh->startRank && worldRank < dstMesh->startRank + dstMeshSize);
 
-  /* Mesh-level views (shardTensorDim, shardCount, repCount, etc.)
+  /* Mesh-level views (shardLayout, shardCount, repCount, etc.)
    * are identical for every rank in a mesh — compute them once at
    * startRank.  Per-rank fields (meshPos, shardIdx, repIdx) only
    * matter for participating ranks; defer those until isSource /
@@ -1286,43 +1138,13 @@ ncclResult_t prepareDirectReshardParams(int worldRank, const ncclDistTensor_t* s
   computeMeshGroupInfo(src, srcMesh->startRank, &fullSrcInfo);
   computeMeshGroupInfo(dst, dstMesh->startRank, &fullDstInfo);
 
-  params.srcShardTensorDim = fullSrcInfo.shardTensorDim;
-  params.dstShardTensorDim = fullDstInfo.shardTensorDim;
+  params.srcShardLayout = fullSrcInfo.shardLayout;
+  params.dstShardLayout = fullDstInfo.shardLayout;
   params.srcShardCount = fullSrcInfo.shardCount;
   params.dstShardCount = fullDstInfo.shardCount;
 
-  size_t globalDims[NCCL_RESHARD_MAX_TENSOR_DIMS];
-  for (int d = 0; d < ndims; d++) {
-    if (params.isSource && srcTensorDims != nullptr) {
-      if (d == params.srcShardTensorDim) {
-        NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(srcTensorDims[d], (size_t)params.srcShardCount, &globalDims[d]),
-                           worldRank,
-                           "prepareDirectReshardParams: source global dim overflow at dim %d: local=%zu shardCount=%d",
-                           d, srcTensorDims[d], params.srcShardCount);
-      } else {
-        globalDims[d] = srcTensorDims[d];
-      }
-    } else if (params.isDest && dstTensorDims != nullptr) {
-      if (d == params.dstShardTensorDim) {
-        NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(dstTensorDims[d], (size_t)params.dstShardCount, &globalDims[d]),
-                           worldRank,
-                           "prepareDirectReshardParams: destination global dim overflow at dim %d: local=%zu "
-                           "shardCount=%d",
-                           d, dstTensorDims[d], params.dstShardCount);
-      } else {
-        globalDims[d] = dstTensorDims[d];
-      }
-    } else {
-      globalDims[d] = 1;
-    }
-  }
-
-  for (int d = 0; d < ndims; d++) {
-    if (d == params.srcShardTensorDim) params.srcDims[d] = globalDims[d] / params.srcShardCount;
-    else params.srcDims[d] = globalDims[d];
-    if (d == params.dstShardTensorDim) params.dstDims[d] = globalDims[d] / params.dstShardCount;
-    else params.dstDims[d] = globalDims[d];
-  }
+  NCCL_M2N_CHECK(resolveReshardDims(worldRank, srcTensorDims, params.srcShardLayout, dstTensorDims,
+                                    params.dstShardLayout, ndims, params.srcDims, params.dstDims));
 
   NCCL_M2N_CHECK(computeStridesChecked(params.srcDims, ndims, params.srcStrides));
   NCCL_M2N_CHECK(computeStridesChecked(params.dstDims, ndims, params.dstStrides));
@@ -1373,9 +1195,9 @@ ncclResult_t prepareDirectReshardParams(int worldRank, const ncclDistTensor_t* s
 
     for (int dstShard = 0; dstShard < params.dstShardCount; dstShard++) {
       ncclReshardTransferPlan plan;
-      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardTensorDim,
+      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardLayout,
                                                 params.mySrcShardIdx, params.dstDims, params.dstStrides,
-                                                params.dstShardTensorDim, dstShard, ndims, elementsPerChunk, &plan));
+                                                params.dstShardLayout, dstShard, ndims, elementsPerChunk, &plan));
 
       if (plan.totalInnerTransfers == 0) continue;
 
@@ -1426,8 +1248,8 @@ ncclResult_t prepareDirectReshardParams(int worldRank, const ncclDistTensor_t* s
 
     for (int srcShard = 0; srcShard < params.srcShardCount; srcShard++) {
       ncclReshardTransferPlan plan;
-      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardTensorDim, srcShard,
-                                                params.dstDims, params.dstStrides, params.dstShardTensorDim,
+      NCCL_M2N_CHECK(computeTransferPlanChecked(params.srcDims, params.srcStrides, params.srcShardLayout, srcShard,
+                                                params.dstDims, params.dstStrides, params.dstShardLayout,
                                                 params.myDstShardIdx, ndims, elementsPerChunk, &plan));
 
       if (plan.totalInnerTransfers == 0) continue;

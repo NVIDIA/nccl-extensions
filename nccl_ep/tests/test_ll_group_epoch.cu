@@ -153,11 +153,20 @@ BootstrapStatus ll_bootstrap(int argc, char* argv[]) {
         fprintf(stderr, "Invalid rank %d for %d ranks\n", g_rank, g_nranks);
         return BootstrapStatus::kError;
     }
+    // A wrong world size is a harness misconfiguration, not an environment
+    // limitation: this regression only reproduces the group-owned epoch race
+    // with two handles across exactly kRequiredRanks ranks. Skipping here would
+    // exit 0 and report a pass while testing nothing, which is how this suite
+    // stayed invisible in the first place. Fail loudly instead.
     if (g_nranks != kRequiredRanks) {
-        if (g_rank == 0) {
-            printf("SKIP: LL group epoch regression requires exactly %d ranks (got %d)\n", kRequiredRanks, g_nranks);
-        }
-        return BootstrapStatus::kSkip;
+        fprintf(
+            stderr,
+            "FATAL: LL group epoch regression requires exactly %d ranks (got %d). "
+            "Launch it with --nranks=%d; do not scale it to the GPU count.\n",
+            kRequiredRanks,
+            g_nranks,
+            kRequiredRanks);
+        return BootstrapStatus::kError;
     }
 
     int device_count = 0;

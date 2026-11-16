@@ -463,7 +463,9 @@ int main(int argc, char* argv[]) {
     }
     CUDACHECK(cudaMemset(bufs[i], 0xDE, maxAlloc));
     if (apiMode == ReshardApiMode::Window) {
-      NCCLCHECK(ncclCommWindowRegister(comms[i % numComms], bufs[i], maxAlloc, &windows[i], NCCL_WIN_COLL_SYMMETRIC));
+      NCCLCHECK(benchWaitCommReady(comms[i % numComms]));
+      NCCLCHECK(ncclCommWindowRegister(comms[i % numComms], bufs[i], maxAlloc, &windows[i],
+                                                   NCCL_WIN_COLL_SYMMETRIC));
     }
   }
 
@@ -486,6 +488,11 @@ int main(int argc, char* argv[]) {
     printf("%-24s %-12s %9s %9s %8s %7s %9s %9s\n", "------------------------", "------------", "---------",
            "---------", "--------", "-------", "---------", "---------");
     fflush(stdout);
+  }
+
+  // Finish registration before transfers read the window handles.
+  if (apiMode == ReshardApiMode::Window) {
+    for (auto& c : comms) NCCLCHECK(benchWaitCommReady(c));
   }
 
   int overallRc = 0;
@@ -685,8 +692,13 @@ int main(int argc, char* argv[]) {
   for (auto& s : streams) CUDACHECK(cudaStreamSynchronize(s));
   if (apiMode == ReshardApiMode::Window) {
     for (int i = 0; i < numTensors; i++) {
+      NCCLCHECK(benchWaitCommReady(comms[i % numComms]));
       NCCLCHECK(ncclCommWindowDeregister(comms[i % numComms], windows[i]));
     }
+  }
+  // Complete deregistration before releasing the buffers.
+  if (apiMode == ReshardApiMode::Window) {
+    for (auto& c : comms) NCCLCHECK(benchWaitCommReady(c));
   }
   NCCLCHECK(ncclM2nFinalize(m2nHandle));
   for (auto& b : bufs) {
@@ -698,7 +710,10 @@ int main(int argc, char* argv[]) {
   }
   for (auto& s : streams) CUDACHECK(cudaStreamDestroy(s));
   CUDACHECK(cudaStreamDestroy(seqStream));
-  for (auto& c : comms) ncclCommDestroy(c);
+  for (auto& c : comms) {
+    NCCLCHECK(benchWaitCommReady(c));
+    NCCLCHECK(ncclCommDestroy(c));
+  }
 
   MPICHECK(MPI_Finalize());
   return overallRc;

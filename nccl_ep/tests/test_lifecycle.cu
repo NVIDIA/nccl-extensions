@@ -9,6 +9,13 @@
  *   CallerOwnedHandleMem — caller allocates handle_mem (>= ncclEpHandleMemSize) and
  *                          passes a 1D ncclUint8 tensor to ncclEpInitHandle.
  *                          ncclEpHandleDestroy must not free the caller buffer.
+ *   ImportsRelocatedPreparedHandleMem -- ncclEpImportHandle from a handle_mem
+ *                          snapshot at a different address than the original,
+ *                          which keeps mutating; dispatch+combine on the
+ *                          imported handle must still work from the snapshot.
+ *   ImportedHandleSelectsDispatchChunkFromNumTokens -- ncclEpImportHandle recomputes
+ *                          dispatch_tokens_per_chunk from state.num_tokens (not the
+ *                          group default), covering the 32/64 chunk selection boundary.
  *   MultiIterReuse        — single ncclEpCreateHandle followed by 4 back-to-back
  *                          dispatch+combine pairs (buffer ping-pong / signal counter
  *                          correctness across iterations).
@@ -18,7 +25,24 @@
 
 #include "test_common.h"
 #include "../nccl_ep_test_internal.h"
+#include "../device/ht_ep.cuh"
 #include "../device/ll_ep_adapter.cuh"
+
+TEST(LlDispatchSmem, StagingRespectsCapacityAndHiddenLimit) {
+    using nccl_ep::ll::ll_dispatch_stage_quant;
+    constexpr int required = 7168 + 56 * sizeof(float) + 32;
+    EXPECT_TRUE(ll_dispatch_stage_quant(7168, required));
+    EXPECT_FALSE(ll_dispatch_stage_quant(7168, required - 1));
+    EXPECT_FALSE(ll_dispatch_stage_quant(7168, 0));
+    EXPECT_FALSE(ll_dispatch_stage_quant(7168, -1));
+    EXPECT_TRUE(ll_dispatch_stage_quant(512, 1024));
+    EXPECT_TRUE(ll_dispatch_stage_quant(8192, 48 * 1024));
+    constexpr int largest_required = 16384 + 128 * sizeof(float) + 32;
+    EXPECT_TRUE(ll_dispatch_stage_quant(16384, largest_required));
+    EXPECT_FALSE(ll_dispatch_stage_quant(16384, largest_required - 1));
+    EXPECT_FALSE(ll_dispatch_stage_quant(16640, 1024 * 1024));
+    EXPECT_FALSE(ll_dispatch_stage_quant(0, 48 * 1024));
+}
 
 TEST(LlCombineSmem, PreservesRequestedParallelismWhenItFits) {
     const auto config = nccl_ep::ll::choose_combine_smem_config(
@@ -63,6 +87,95 @@ TEST(LlCombineSmem, AcceptsExactSharedMemoryBoundary) {
     EXPECT_EQ(config.dynamic_smem_bytes, exact_limit);
 }
 
+TEST(LlCombineSmem, PadsGptOssHiddenForPartialDecodeWarp) {
+    constexpr int kHidden = 2880;
+    constexpr int kElemBytes = nccl_ep::ll::combine_smem::kTwoByteElementBytes;
+    constexpr int kPaddedHiddenInt4 = nccl_ep::ll::combine_smem::padded_hidden_int4(kHidden, kElemBytes);
+
+    EXPECT_EQ(kHidden * kElemBytes / sizeof(int4), 360);
+    EXPECT_EQ(kPaddedHiddenInt4, 384);
+    EXPECT_EQ(nccl_ep::ll::combine_smem::recv_decode_warps(kHidden, kElemBytes), 6);
+    const int send_warp_bytes = nccl_ep::ll::combine_smem::send_warp_smem_bytes(kHidden, kElemBytes);
+    EXPECT_EQ(send_warp_bytes, 3216);
+    EXPECT_EQ(send_warp_bytes % sizeof(int4), 0);
+    EXPECT_EQ((2 * send_warp_bytes) % sizeof(int4), 0);
+    const int recv_group_bytes =
+        nccl_ep::ll::combine_smem::recv_group_smem_bytes(kHidden, kElemBytes, /*nvfp4=*/false);
+    EXPECT_EQ(recv_group_bytes, 25472);
+    EXPECT_EQ(recv_group_bytes % sizeof(int4), 0);
+    EXPECT_EQ((2 * recv_group_bytes) % sizeof(int4), 0);
+
+    const auto config = nccl_ep::ll::choose_combine_smem_config(
+        kHidden,
+        ncclBfloat16,
+        NCCL_EP_COMB_QUANT_NONE,
+        /*num_warp_groups=*/1,
+        /*requested_warps_per_group=*/32,
+        /*max_dynamic_smem=*/1024 * 1024);
+    ASSERT_TRUE(config.feasible);
+    EXPECT_GT(config.num_recv_groups, 0);
+
+    const nccl_ep::LowLatencyLayout layout(
+        /*num_max_dispatch_tokens_per_rank=*/1,
+        /*max_token_bytes=*/kHidden * kElemBytes,
+        /*num_ranks=*/2,
+        /*num_experts=*/128,
+        /*num_topk=*/4,
+        NCCL_EP_LAYOUT_RANK_MAJOR);
+    EXPECT_EQ(layout.buffer.num_bytes_per_combine_msg, 5856);
+    EXPECT_EQ(layout.buffer.num_bytes_per_combine_msg % sizeof(int4), 0);
+}
+
+TEST(LlCombineSmem, RecvUnrollsGrowOnlyWhenAGroupCannotFitTheCta) {
+    using namespace nccl_ep::ll::combine_smem;
+    constexpr int kBf16 = kTwoByteElementBytes;
+    // Historical factor of 2 for every hidden size that fit before.
+    EXPECT_EQ(recv_unrolls(2880, kBf16), 2);
+    EXPECT_EQ(recv_unrolls(7168, kBf16), 2);
+    EXPECT_EQ(recv_unrolls(8192, kBf16), 2);
+    EXPECT_EQ(recv_decode_warps(8192, kBf16), 16);
+    EXPECT_EQ(recv_unrolls(15360, kBf16), 2);
+    EXPECT_EQ(recv_decode_warps(15360, kBf16), 30);
+    // 16384 bf16 needs 32 decode warps at 2 unrolls (+1 TMA warp > 32): move to 4.
+    EXPECT_EQ(recv_unrolls(16384, kBf16), 4);
+    EXPECT_EQ(recv_decode_warps(16384, kBf16), 16);
+    EXPECT_EQ(recv_padded_hidden_int4(16384, kBf16), 2048);
+    // fp32 doubles the int4 count: 16384 fp32 needs 32 decode warps even at 4 unrolls.
+    EXPECT_EQ(recv_unrolls(15360, 4), 4);
+    EXPECT_EQ(recv_unrolls(16384, 4), 0);
+    EXPECT_EQ(recv_decode_warps(16384, 4), kMaxCtaWarps);
+}
+
+TEST(LlCombineSmem, Hidden16384Bf16FitsWith1024ExpertsOn148Sms) {
+    // 1024 experts / 148 SMs -> 7 warp groups x 4 warps = 28 warps; before the
+    // hidden-dependent unroll this needed 33 warps and was infeasible.
+    constexpr int kOptinSmem = 232448;
+    const auto config = nccl_ep::ll::choose_combine_smem_config(
+        /*hidden=*/16384,
+        ncclBfloat16,
+        NCCL_EP_COMB_QUANT_NONE,
+        /*num_warp_groups=*/7,
+        /*requested_warps_per_group=*/4,
+        kOptinSmem - nccl_ep::ll::combine_smem::kLsaStaticSmemBytes);
+    ASSERT_TRUE(config.feasible);
+    EXPECT_EQ(config.num_warps_per_group, 4);
+    EXPECT_EQ(config.num_warps, 28);
+    EXPECT_EQ(config.num_recv_groups, 1);
+    EXPECT_LE(config.dynamic_smem_bytes, kOptinSmem);
+
+    const auto wide = nccl_ep::ll::choose_combine_smem_config(
+        /*hidden=*/16384, ncclBfloat16, NCCL_EP_COMB_QUANT_NONE,
+        /*num_warp_groups=*/1, /*requested_warps_per_group=*/32, kOptinSmem);
+    ASSERT_TRUE(wide.feasible);
+    EXPECT_EQ(wide.num_warps, 32);
+
+    // fp32 at 16384 still has no receive group that fits a CTA.
+    const auto fp32 = nccl_ep::ll::choose_combine_smem_config(
+        /*hidden=*/16384, ncclFloat32, NCCL_EP_COMB_QUANT_NONE,
+        /*num_warp_groups=*/1, /*requested_warps_per_group=*/32, 1024 * 1024);
+    EXPECT_FALSE(fp32.feasible);
+}
+
 TEST(LlCombineSmem, RejectsConfigurationsBelowMinimumFootprint) {
     const auto config = nccl_ep::ll::choose_combine_smem_config(
         /*hidden=*/7168,
@@ -89,6 +202,65 @@ TEST(LlCombineSmem, Nvfp4ReceiveBufferMatchesDevicePacketLayout) {
             kHidden, nccl_ep::ll::combine_smem::kTwoByteElementBytes, /*nvfp4=*/true),
         nccl_ep::ll::combine_smem::kRecvTmaBarrierBytes + kAlignedPacketBytes);
 }
+
+// Pure host-side sizing tests for combine_push's chunking (see
+// combine_push_chunk_size/combine_push_slots_per_block in device/ht_ep.cuh). smem_cap is passed
+// explicitly (never queried from the live device) so these stay deterministic and portable across
+// whatever GPU CI happens to run on. hidden_int4=896 (ntiles=7, tile_int4=128) is the shape
+// ep_bench -V exercises end to end; hidden_int4=2 covers the single-tile edge case.
+struct CombinePushChunkingCase {
+    std::string name;
+    int hidden_int4;
+    int chunk_size;          // requested chunk width in int4; <1 = whole row
+    int smem_cap;
+    int expected_chunks;     // combine_push_num_chunks's chunk count
+    int expected_buf_int4;   // combine_push_buf_int4's per-warp buffer width
+    int expected_slots;      // combine_push_slots_per_block's warp count
+};
+
+const std::vector<CombinePushChunkingCase> kCombinePushChunkingCases = {
+    // A single-tile row is one chunk regardless of the request.
+    {"SmallHiddenWholeRow", 2, 0, 232448, 1, 2, 24},
+    // Unset is the whole row.
+    {"UnsetIsWholeRow", 896, 0, 232448, 1, 7 * 128, 15},
+    // A request up to one tile is one tile per chunk.
+    {"OneTilePerChunk", 896, 128, 232448, 7, 128, 24},
+    {"BelowOneTileRoundsUp", 896, 1, 232448, 7, 128, 24},
+    // A request that is not a tile multiple rounds up; the last chunk is short.
+    {"TwoTilesPerChunk", 896, 200, 232448, 4, 2 * 128, 24},
+    // A request at or above the row clamps to the whole row.
+    {"ClampedToWholeRow", 896, 100000, 232448, 1, 7 * 128, 15},
+    // Whole row that is not a tile multiple: buffer is the exact row, not tile-rounded (769 pads to
+    // 896 and would give 15 slots).
+    {"NonAlignedWholeRow769", 769, 0, 232448, 1, 769, 18},
+    // 513 pads to 640; at this cap the exact width fits all 24 slots, the padded width only 19.
+    {"NonAlignedWholeRow513", 513, 0, 200800, 1, 513, 24},
+    // A request at or above a non-aligned row clamps to the exact row.
+    {"NonAlignedClampedToWholeRow", 769, 100000, 232448, 1, 769, 18},
+    // Multi-chunk on a non-aligned row keeps a tile-multiple reusable buffer.
+    {"NonAlignedOneTilePerChunk", 769, 128, 232448, 7, 128, 24},
+    // A tight smem cap forces slots down to the floor of 1, never below.
+    {"TinyCapClampsToOneSlot", 896, 128, 6000, 7, 128, 1},
+};
+
+class CombinePushChunkingTest : public ::testing::TestWithParam<CombinePushChunkingCase> {};
+
+TEST_P(CombinePushChunkingTest, ChunksBufWidthAndSlotsMatchExpected) {
+    const auto& c = GetParam();
+    EXPECT_EQ(ht_ep::combine_push_num_chunks(c.hidden_int4, c.chunk_size), c.expected_chunks);
+    EXPECT_EQ(ht_ep::combine_push_buf_int4(c.hidden_int4, c.chunk_size), c.expected_buf_int4);
+    EXPECT_EQ(ht_ep::combine_push_slots_per_block(c.hidden_int4, c.smem_cap, c.chunk_size),
+              c.expected_slots);
+    // dynamic_smem_bytes is the actual CUDA launch's dynamic-smem request; must stay in lockstep
+    // with the slots/buf_int4 it's built from.
+    EXPECT_EQ(ht_ep::combine_push_dynamic_smem_bytes(c.hidden_int4, c.expected_slots, c.chunk_size),
+              static_cast<size_t>(c.expected_slots) * c.expected_buf_int4 * 16);
+}
+
+INSTANTIATE_TEST_SUITE_P(Sizing, CombinePushChunkingTest, ::testing::ValuesIn(kCombinePushChunkingCases),
+                          [](const ::testing::TestParamInfo<CombinePushChunkingCase>& info) {
+                              return info.param.name;
+                          });
 
 static float bf16_val(nv_bfloat16 v) {
     return __bfloat162float(v);
@@ -175,6 +347,77 @@ protected:
     }
 };
 
+TEST_F(LifecycleTest, ResolvesIndependentSmBudgetsAndEnvironmentPrecedence) {
+    int device = 0;
+    int device_sms = 0;
+    CUDA_ASSERT(cudaGetDevice(&device));
+    CUDA_ASSERT(cudaDeviceGetAttribute(&device_sms, cudaDevAttrMultiProcessorCount, device));
+    ASSERT_GE(device_sms, 8);
+
+    const char* old_comm_ptr = getenv("NCCL_EP_COMM_SMS");
+    const char* old_dispatch_ptr = getenv("NCCL_EP_DISPATCH_SMS");
+    const char* old_combine_ptr = getenv("NCCL_EP_COMBINE_SMS");
+    const bool had_comm = old_comm_ptr != nullptr;
+    const bool had_dispatch = old_dispatch_ptr != nullptr;
+    const bool had_combine = old_combine_ptr != nullptr;
+    const std::string old_comm = had_comm ? old_comm_ptr : "";
+    const std::string old_dispatch = had_dispatch ? old_dispatch_ptr : "";
+    auto restore_env = [](const char* name, bool was_set, const std::string& old_value) {
+        if (was_set) setenv(name, old_value.c_str(), 1);
+        else unsetenv(name);
+    };
+    const std::string old_combine = had_combine ? old_combine_ptr : "";
+    unsetenv("NCCL_EP_COMM_SMS");
+    unsetenv("NCCL_EP_DISPATCH_SMS");
+    unsetenv("NCCL_EP_COMBINE_SMS");
+
+    const unsigned int shared = static_cast<unsigned int>(std::min(device_sms, 8));
+    const unsigned int dispatch = shared - 1;
+    auto make_group = [&](unsigned int dispatch_cfg, unsigned int combine_cfg) {
+        ncclEpGroupConfig_t cfg = NCCL_EP_GROUP_CONFIG_INIT;
+        cfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+        cfg.num_experts = kNumExperts;
+        cfg.max_dispatch_tokens_per_rank = kNumTokens;
+        cfg.max_recv_tokens_per_rank = kMaxRecvSlots;
+        cfg.max_token_bytes = kHidden * sizeof(nv_bfloat16);
+        cfg.rdma_buffer_size = NCCL_EP_AUTO;
+        cfg.num_qp_per_rank = NCCL_EP_AUTO;
+        cfg.num_channels = NCCL_EP_AUTO;
+        cfg.max_num_sms = shared;
+        cfg.dispatch_num_sms = dispatch_cfg;
+        cfg.combine_num_sms = combine_cfg;
+        ncclEpGroup_t group = nullptr;
+        EXPECT_EQ(ncclEpCreateGroup(&group, g_comm, &cfg), ncclSuccess);
+        return group;
+    };
+
+    // One operation-specific field does not change the other's shared fallback.
+    ncclEpGroup_t group = make_group(dispatch, NCCL_EP_AUTO);
+    unsigned int resolved_dispatch = 0, resolved_combine = 0;
+    ncclEpGroup_test_getSmBudgets(group, &resolved_dispatch, &resolved_combine);
+    EXPECT_EQ(resolved_dispatch, dispatch);
+    EXPECT_EQ(resolved_combine, shared);
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
+
+    const unsigned int env_shared = shared - 2;
+    const unsigned int env_dispatch = shared - 3;
+    const std::string env_shared_str = std::to_string(env_shared);
+    const std::string env_dispatch_str = std::to_string(env_dispatch);
+    const std::string invalid_str = std::to_string(device_sms + 1);
+    setenv("NCCL_EP_COMM_SMS", env_shared_str.c_str(), 1);
+    setenv("NCCL_EP_DISPATCH_SMS", env_dispatch_str.c_str(), 1);
+    setenv("NCCL_EP_COMBINE_SMS", invalid_str.c_str(), 1);
+    group = make_group(dispatch, shared - 1);
+    ncclEpGroup_test_getSmBudgets(group, &resolved_dispatch, &resolved_combine);
+    EXPECT_EQ(resolved_dispatch, env_dispatch);
+    EXPECT_EQ(resolved_combine, env_shared);
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
+
+    restore_env("NCCL_EP_COMM_SMS", had_comm, old_comm);
+    restore_env("NCCL_EP_DISPATCH_SMS", had_dispatch, old_dispatch);
+    restore_env("NCCL_EP_COMBINE_SMS", had_combine, old_combine);
+
+}
 TEST_F(LifecycleTest, LlCombineFitsMockedSmallSharedMemoryAndPreservesResults) {
     constexpr int kLargeHidden = 7168;
     constexpr int kMockDynamicSmem = 100000;
@@ -291,11 +534,17 @@ TEST_F(LifecycleTest, SeparatedInitUpdate) {
     NCCL_ASSERT(ncclEpUpdateHandle(h, topk_idx_, nullptr, g_stream));
     CUDA_ASSERT(cudaStreamSynchronize(g_stream));
 
+    // Fused count mode publishes the recv count inside dispatch, so it is only valid after the
+    // first dispatch; scan and unfused count wire it at UpdateHandle time.
     unsigned int num_recv = 0;
-    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
-    EXPECT_EQ(num_recv, 4u) << "FLAT recv count for top-k=1 fixed routing";
+    if (!ht_count_fused_active(h)) {
+        NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+        EXPECT_EQ(num_recv, 4u) << "FLAT recv count for top-k=1 fixed routing";
+    }
 
     auto combined = run_dispatch_combine_flat(h);
+    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+    EXPECT_EQ(num_recv, 4u) << "FLAT recv count after dispatch for top-k=1 fixed routing";
     for (int i = 0; i < kNumTokens; ++i) {
         float expected = static_cast<float>(g_rank * kNumTokens + i + 1);
         EXPECT_NEAR(combined[i], expected, 0.5f) << "rank " << g_rank << " token " << i;
@@ -330,6 +579,89 @@ TEST_F(LifecycleTest, SeparatedInitUpdateTwoUpdates) {
     NCCL_ASSERT(ncclEpHandleDestroy(h));
 }
 
+// Scan preprocessing is ordered at group scope (its routing-map AllGather is already
+// group-owned), so multiple handles share its update-only workspace. Updating h2 before
+// dispatching h1 verifies that prepared routing state remains private to each handle.
+TEST_F(LifecycleTest, ScanWorkspaceSharedAcrossHandles) {
+    // The shared scan workspace exists only on the scan metadata path. Count mode (the
+    // AUTO default for Flat and EM local-permute) builds its maps inside dispatch and never
+    // allocates it, so pin this group to FORCE_SCAN to test what the name says in every pass.
+    ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
+    gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+    gcfg.num_experts = kNumExperts;
+    gcfg.max_dispatch_tokens_per_rank = kNumTokens;
+    gcfg.max_token_bytes = kHidden * sizeof(nv_bfloat16);
+    gcfg.rdma_buffer_size = NCCL_EP_AUTO;
+    gcfg.num_qp_per_rank = NCCL_EP_AUTO;
+    gcfg.num_channels = NCCL_EP_AUTO;
+    gcfg.max_recv_tokens_per_rank = static_cast<unsigned int>(kMaxRecvSlots);
+    gcfg.meta_exchange_policy = NCCL_EP_META_EXCHANGE_FORCE_SCAN;
+    ncclEpGroup_t scan_group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&scan_group, g_comm, &gcfg));
+
+    ncclEpHandle_t h1 = nullptr;
+    ncclEpHandle_t h2 = nullptr;
+    NCCL_ASSERT(ncclEpInitHandle(&h1, scan_group, NCCL_EP_LAYOUT_FLAT, nullptr, kTopK, nullptr));
+    NCCL_ASSERT(ncclEpInitHandle(&h2, scan_group, NCCL_EP_LAYOUT_FLAT, nullptr, kTopK, nullptr));
+
+    const void *h1_rank_mask = nullptr, *h1_scan_tmp = nullptr;
+    const void *h2_rank_mask = nullptr, *h2_scan_tmp = nullptr;
+    const int32_t *h1_token_to_slot = nullptr, *h2_token_to_slot = nullptr;
+    ncclEpHandle_test_getScanScratch(h1, &h1_rank_mask, &h1_scan_tmp, &h1_token_to_slot);
+    ncclEpHandle_test_getScanScratch(h2, &h2_rank_mask, &h2_scan_tmp, &h2_token_to_slot);
+    ASSERT_NE(h1_rank_mask, nullptr);
+    ASSERT_NE(h1_scan_tmp, nullptr);
+    EXPECT_EQ(h1_rank_mask, h2_rank_mask);
+    EXPECT_EQ(h1_scan_tmp, h2_scan_tmp);
+    EXPECT_EQ(h1_token_to_slot, nullptr);  // FLAT does not need the EM remap bridge.
+    EXPECT_EQ(h2_token_to_slot, nullptr);
+
+    NCCL_ASSERT(ncclEpUpdateHandle(h1, topk_idx_, nullptr, g_stream));
+    NCCL_ASSERT(ncclEpUpdateHandle(h2, topk_idx_, nullptr, g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+
+    for (ncclEpHandle_t handle : {h1, h2}) {
+        auto combined = run_dispatch_combine_flat(handle);
+        for (int i = 0; i < kNumTokens; ++i) {
+            float expected = static_cast<float>(g_rank * kNumTokens + i + 1);
+            EXPECT_NEAR(combined[i], expected, 0.5f) << "rank " << g_rank << " token " << i;
+        }
+    }
+
+    NCCL_ASSERT(ncclEpHandleDestroy(h2));
+    NCCL_ASSERT(ncclEpHandleDestroy(h1));
+
+    // The scan-mode EM local-permute path additionally shares its token-to-slot bridge.
+    // This branch runs in the suite's NCCL_EP_HT_AG_SCAN_MODE rerun.
+    if (ht_ag_scan_mode_active()) {
+        ncclEpHandle_t em1 = nullptr;
+        ncclEpHandle_t em2 = nullptr;
+        NCCL_ASSERT(ncclEpInitHandle(
+            &em1, scan_group, NCCL_EP_LAYOUT_EXPERT_MAJOR, nullptr, kTopK, nullptr));
+        NCCL_ASSERT(ncclEpInitHandle(
+            &em2, scan_group, NCCL_EP_LAYOUT_EXPERT_MAJOR, nullptr, kTopK, nullptr));
+
+        const void *em1_rank_mask = nullptr, *em1_scan_tmp = nullptr;
+        const void *em2_rank_mask = nullptr, *em2_scan_tmp = nullptr;
+        const int32_t *em1_token_to_slot = nullptr, *em2_token_to_slot = nullptr;
+        ncclEpHandle_test_getScanScratch(em1, &em1_rank_mask, &em1_scan_tmp, &em1_token_to_slot);
+        ncclEpHandle_test_getScanScratch(em2, &em2_rank_mask, &em2_scan_tmp, &em2_token_to_slot);
+        ASSERT_NE(em1_token_to_slot, nullptr);
+        EXPECT_EQ(em1_rank_mask, h1_rank_mask);
+        EXPECT_EQ(em1_scan_tmp, h1_scan_tmp);
+        EXPECT_EQ(em1_rank_mask, em2_rank_mask);
+        EXPECT_EQ(em1_scan_tmp, em2_scan_tmp);
+        EXPECT_EQ(em1_token_to_slot, em2_token_to_slot);
+
+        NCCL_ASSERT(ncclEpUpdateHandle(em1, topk_idx_, nullptr, g_stream));
+        NCCL_ASSERT(ncclEpUpdateHandle(em2, topk_idx_, nullptr, g_stream));
+        CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+        NCCL_ASSERT(ncclEpHandleDestroy(em2));
+        NCCL_ASSERT(ncclEpHandleDestroy(em1));
+    }
+    NCCL_ASSERT(ncclEpGroupDestroy(scan_group));
+}
+
 // ── Test: CallerOwnedHandleMem — caller-owned handle_mem buffer ───────────────
 // Caller queries the required size, allocates, wraps as ncclUint8 1D tensor,
 // passes to ncclEpInitHandle. Verifies roundtrip correctness and that
@@ -362,6 +694,156 @@ TEST_F(LifecycleTest, CallerOwnedHandleMem) {
     // The caller still owns d_handle_mem; free it ourselves.
     ncclEpTensorDestroy(t_handle_mem);
     CUDA_ASSERT(cudaFree(d_handle_mem));
+}
+
+// -- Test: ImportsRelocatedPreparedHandleMem -- ncclEpImportHandle from a snapshot --
+// Snapshots a prepared handle_mem into a second buffer, then keeps mutating the
+// original so the two buffers diverge. Dispatch+combine on the imported handle
+// must still complete correctly from the snapshot alone (also covers ncclInt32
+// topk_idx_datatype recovery).
+
+TEST_F(LifecycleTest, ImportsRelocatedPreparedHandleMem) {
+
+    auto make_handle_mem = [&](size_t bytes, void** d_mem, ncclEpTensor_t** t) {
+        CUDA_ASSERT(cudaMalloc(d_mem, bytes));
+        NCCL_ASSERT(epTensorCreate(t, 1, ncclUint8, *d_mem, static_cast<unsigned int>(bytes)));
+    };
+
+    size_t handle_mem_bytes = 0;
+    NCCL_ASSERT(ncclEpHandleMemSize(g_ep_group, NCCL_EP_LAYOUT_FLAT, nullptr, &handle_mem_bytes, kTopK));
+
+    void* d_forward_mem = nullptr;
+    void* d_restored_mem = nullptr;
+    ncclEpTensor_t* t_forward_mem = nullptr;
+    ncclEpTensor_t* t_restored_mem = nullptr;
+    make_handle_mem(handle_mem_bytes, &d_forward_mem, &t_forward_mem);
+    make_handle_mem(handle_mem_bytes, &d_restored_mem, &t_restored_mem);
+
+    std::vector<int32_t> h_topk(kNumTokens * kTopK);
+    for (int i = 0; i < kNumTokens; ++i) h_topk[i] = expert_for_token(i);
+    int32_t* d_topk = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_topk, h_topk.size() * sizeof(int32_t)));
+    CUDA_ASSERT(cudaMemcpy(d_topk, h_topk.data(), h_topk.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    ncclEpTensor_t* t_topk = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_topk, 2, ncclInt32, d_topk, kNumTokens, kTopK));
+
+    ncclEpHandle_t forward_handle = nullptr;
+    NCCL_ASSERT(ncclEpInitHandle(
+        &forward_handle, g_ep_group, NCCL_EP_LAYOUT_FLAT, nullptr, kTopK, t_forward_mem));
+    NCCL_ASSERT(ncclEpUpdateHandle(forward_handle, t_topk, nullptr, g_stream));
+    CUDA_ASSERT(cudaMemcpyAsync(
+        d_restored_mem, d_forward_mem, handle_mem_bytes, cudaMemcpyDeviceToDevice, g_stream));
+
+    // Mutate the live handle after the snapshot: the import must not see this.
+    for (int i = 0; i < kNumTokens; ++i) h_topk[i] = (expert_for_token(i) + 1) % kNumExperts;
+    CUDA_ASSERT(cudaMemcpyAsync(
+        d_topk, h_topk.data(), h_topk.size() * sizeof(int32_t), cudaMemcpyHostToDevice, g_stream));
+    NCCL_ASSERT(ncclEpUpdateHandle(forward_handle, t_topk, nullptr, g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+
+    ncclEpHandleState_t state = NCCL_EP_HANDLE_STATE_INIT;
+    state.num_tokens = kNumTokens;
+    state.num_topk = kTopK;
+    state.topk_idx_datatype = ncclInt32;
+    ncclEpHandle_t restored_handle = nullptr;
+    NCCL_ASSERT(ncclEpImportHandle(
+        &restored_handle, g_ep_group, NCCL_EP_LAYOUT_FLAT, nullptr, &state, t_restored_mem));
+
+    NCCL_ASSERT(ncclEpHandleDestroy(forward_handle));
+    ncclEpTensorDestroy(t_forward_mem);
+    ncclEpTensorDestroy(t_topk);
+    CUDA_ASSERT(cudaFree(d_forward_mem));
+    CUDA_ASSERT(cudaFree(d_topk));
+
+    auto combined = run_dispatch_combine_flat(restored_handle);
+    for (int i = 0; i < kNumTokens; ++i) {
+        float expected = static_cast<float>(g_rank * kNumTokens + i + 1);
+        EXPECT_NEAR(combined[i], expected, 0.5f) << "rank " << g_rank << " token " << i;
+    }
+
+    NCCL_ASSERT(ncclEpHandleDestroy(restored_handle));
+    ncclEpTensorDestroy(t_restored_mem);
+    CUDA_ASSERT(cudaFree(d_restored_mem));
+}
+
+// -- Test: ImportedHandleSelectsDispatchChunkFromNumTokens -------------------
+// ncclEpImportHandle must recompute dispatch_tokens_per_chunk from
+// state.num_tokens exactly as ncclEpUpdateHandle does, not inherit the group
+// default installed by ncclEpInitHandle. A mismatch silently corrupts
+// own_chunk_rank in count-mode dispatch (EM+kLocalPermute).
+//
+// Uses 33+ tokens so the adaptive policy returns 32 on systems with
+// dispatch_num_sms in [16,64]; on narrower SM counts the function returns the
+// group default regardless, and the test still verifies UpdateHandle and Import
+// agree.
+TEST_F(LifecycleTest, ImportedHandleSelectsDispatchChunkFromNumTokens) {
+
+    constexpr int kLargeTokens = 48;
+    constexpr int kLargeRecvSlots = 4 * kLargeTokens;
+
+    ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
+    gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+    gcfg.num_experts = kNumExperts;
+    gcfg.max_dispatch_tokens_per_rank = kLargeTokens;
+    gcfg.max_token_bytes = kHidden * sizeof(nv_bfloat16);
+    gcfg.rdma_buffer_size = NCCL_EP_AUTO;
+    gcfg.num_qp_per_rank = NCCL_EP_AUTO;
+    gcfg.num_channels = NCCL_EP_AUTO;
+    gcfg.max_recv_tokens_per_rank = kLargeRecvSlots;
+
+    ncclEpGroup_t local_group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&local_group, g_comm, &gcfg));
+
+    size_t handle_mem_bytes = 0;
+    NCCL_ASSERT(ncclEpHandleMemSize(local_group, NCCL_EP_LAYOUT_FLAT, nullptr, &handle_mem_bytes, kTopK));
+
+    void* d_src_mem = nullptr;
+    void* d_snap_mem = nullptr;
+    ncclEpTensor_t* t_src_mem = nullptr;
+    ncclEpTensor_t* t_snap_mem = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_src_mem, handle_mem_bytes));
+    CUDA_ASSERT(cudaMalloc(&d_snap_mem, handle_mem_bytes));
+    NCCL_ASSERT(epTensorCreate(&t_src_mem, 1, ncclUint8, d_src_mem, (unsigned int)handle_mem_bytes));
+    NCCL_ASSERT(epTensorCreate(&t_snap_mem, 1, ncclUint8, d_snap_mem, (unsigned int)handle_mem_bytes));
+
+    std::vector<int32_t> h_topk(kLargeTokens * kTopK);
+    for (int i = 0; i < kLargeTokens; ++i) h_topk[i] = (g_rank * kLargeTokens + i) % kNumExperts;
+    int32_t* d_topk = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_topk, h_topk.size() * sizeof(int32_t)));
+    CUDA_ASSERT(cudaMemcpy(d_topk, h_topk.data(), h_topk.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    ncclEpTensor_t* t_topk = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_topk, 2, ncclInt32, d_topk, kLargeTokens, kTopK));
+
+    ncclEpHandle_t src_handle = nullptr;
+    NCCL_ASSERT(ncclEpInitHandle(&src_handle, local_group, NCCL_EP_LAYOUT_FLAT, nullptr, kTopK, t_src_mem));
+    NCCL_ASSERT(ncclEpUpdateHandle(src_handle, t_topk, nullptr, g_stream));
+
+    CUDA_ASSERT(cudaMemcpyAsync(
+        d_snap_mem, d_src_mem, handle_mem_bytes, cudaMemcpyDeviceToDevice, g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+
+    const int expected_chunk = ncclEpHandle_test_getDispatchTokensPerChunk(src_handle);
+
+    ncclEpHandleState_t state = NCCL_EP_HANDLE_STATE_INIT;
+    state.num_tokens = kLargeTokens;
+    state.num_topk = kTopK;
+    state.topk_idx_datatype = ncclInt32;
+    ncclEpHandle_t imported_handle = nullptr;
+    NCCL_ASSERT(ncclEpImportHandle(
+        &imported_handle, local_group, NCCL_EP_LAYOUT_FLAT, nullptr, &state, t_snap_mem));
+
+    EXPECT_EQ(ncclEpHandle_test_getDispatchTokensPerChunk(imported_handle), expected_chunk)
+        << "Import must recompute dispatch_tokens_per_chunk from num_tokens, not the group default";
+
+    NCCL_ASSERT(ncclEpHandleDestroy(imported_handle));
+    NCCL_ASSERT(ncclEpHandleDestroy(src_handle));
+    ncclEpTensorDestroy(t_snap_mem);
+    ncclEpTensorDestroy(t_src_mem);
+    ncclEpTensorDestroy(t_topk);
+    CUDA_ASSERT(cudaFree(d_snap_mem));
+    CUDA_ASSERT(cudaFree(d_src_mem));
+    CUDA_ASSERT(cudaFree(d_topk));
+    NCCL_ASSERT(ncclEpGroupDestroy(local_group));
 }
 
 // ── Test: MultiIterHandleReuse — 4 dispatch+combine pairs on one handle ───────

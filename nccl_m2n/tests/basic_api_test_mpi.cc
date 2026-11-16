@@ -134,9 +134,6 @@ static std::string gActiveAlgorithm;
 static int gActiveStreamPoolMode = -1;
 static bool gInitialUseInternalStreamsEnvSet = false;
 static std::string gInitialUseInternalStreamsEnv;
-#if !defined(GTEST_SKIP)
-static int gSkippedCases = 0;
-#endif
 
 static void CUDART_CB waitForStagingReuseRelease(void* data) {
   auto* release = static_cast<std::atomic<bool>*>(data);
@@ -320,12 +317,6 @@ static std::string gtestCaseName(const ::testing::TestParamInfo<MpiParam>& info)
   return basicApiGtestCaseName(info.param.tc.name, info.index, prefix.c_str());
 }
 
-#if !defined(GTEST_SKIP)
-static void recordFallbackSkip(const char* reason) {
-  basicApiRecordFallbackSkip(&gSkippedCases, reason, gWorldRank == 0);
-}
-#endif
-
 static void applyStreamPoolMode(int streamPoolMode) {
   if (streamPoolMode == 0) {
     testSetEnv("NCCL_RESHARD_USE_INTERNAL_STREAMS", "0");
@@ -404,20 +395,10 @@ static CaseResult runStreamOrdering(const TestCase& tc, TestEnv* env) {
 
 TEST(M2nGroupMpiTest, OverlappingCommunicatorsPreserveBucketOrder) {
   if (gCli.filter == nullptr || strcmp(gCli.filter, "group_mixed_context") != 0) {
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << "needs --filter group_mixed_context";
-#else
-    recordFallbackSkip("needs --filter group_mixed_context");
-    return;
-#endif
   }
   if (gWorldSize < 3) {
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << "needs at least 3 ranks";
-#else
-    recordFallbackSkip("needs at least 3 ranks");
-    return;
-#endif
   }
 
   ncclUniqueId ids[2];
@@ -536,20 +517,10 @@ TEST(M2nGroupMpiTest, OverlappingCommunicatorsPreserveBucketOrder) {
 
 TEST(PackMpiTest, ReducedBucketWaitsForDelayedRemoteConsumer) {
   if (gCli.filter == nullptr || strcmp(gCli.filter, "pack_reduced_bucket") != 0) {
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << "needs --filter pack_reduced_bucket";
-#else
-    recordFallbackSkip("needs --filter pack_reduced_bucket");
-    return;
-#endif
   }
   if (gWorldSize < 3) {
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << "needs at least 3 ranks";
-#else
-    recordFallbackSkip("needs at least 3 ranks");
-    return;
-#endif
   }
 
   /* Warm both communicators before contention so the first-use host-RMA ring
@@ -595,20 +566,10 @@ TEST(PackMpiTest, ReducedBucketWaitsForDelayedRemoteConsumer) {
 
 TEST(PackMpiTest, ReducedBucketWorksWithoutExternalPhaseBarriers) {
   if (gCli.filter == nullptr || strcmp(gCli.filter, "pack_reduced_bucket") != 0) {
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << "needs --filter pack_reduced_bucket";
-#else
-    recordFallbackSkip("needs --filter pack_reduced_bucket");
-    return;
-#endif
   }
   if (gWorldSize < 3) {
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << "needs at least 3 ranks";
-#else
-    recordFallbackSkip("needs at least 3 ranks");
-    return;
-#endif
   }
 
   /* Submit repeated warmed A/B waves without an MPI transfer-phase barrier or
@@ -714,13 +675,8 @@ TEST_P(BasicApiMpiTest, Reshard) {
 
   if (res.status == CASE_SKIP) {
     env.barrier(&env);
-#if defined(GTEST_SKIP)
     GTEST_SKIP() << ((res.skipReason != nullptr) ? res.skipReason : "skipped");
     return;
-#else
-    recordFallbackSkip(res.skipReason);
-    return;
-#endif
   }
 
   if (res.status == CASE_FAIL) ADD_FAILURE() << ((res.failReason != nullptr) ? res.failReason : "case failed");
@@ -732,7 +688,7 @@ TEST_P(BasicApiMpiTest, Reshard) {
 // an uninstantiated parameterized suite failure.
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(BasicApiMpiTest);
 
-INSTANTIATE_TEST_CASE_P(Matrix, BasicApiMpiTest, ::testing::ValuesIn(selectedParams()), gtestCaseName);
+INSTANTIATE_TEST_SUITE_P(Matrix, BasicApiMpiTest, ::testing::ValuesIn(selectedParams()), gtestCaseName);
 
 static int initMpiRuntime() {
   TEST_CUDACHECK(cudaGetDeviceCount(&gNumDevices));
@@ -847,9 +803,6 @@ int main(int argc, char** argv) {
   }
 
   int rc = RUN_ALL_TESTS();
-#if !defined(GTEST_SKIP)
-  basicApiPrintFallbackSkipSummary(gSkippedCases, gWorldRank == 0);
-#endif
   shutdownMpiRuntime();
   MPICHECK(MPI_Finalize());
   return rc;

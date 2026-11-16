@@ -73,7 +73,8 @@ ncclResult_t reshardGetOrCreateDevComm(ncclComm_t comm, int numCtas, int ginSign
 ncclResult_t reshardGetOrCreateDevCommWithRequirements(ncclComm_t comm, int barrierCount, int ginSignalCount,
                                                        int ginCounterCount, ReshardDevCommBarrierKind barrierKind,
                                                        int ginContextCount, int ginConnectionType, cudaStream_t stream,
-                                                       ncclDevComm* activeDevComm, ReshardDevCommUse* use);
+                                                       ncclDevComm* activeDevComm, ReshardDevCommUse* use,
+                                                       bool retainPersistentState = false);
 
 static inline ncclResult_t reshardRejectGraphCapture(const char* apiName, cudaStream_t stream) {
   cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;

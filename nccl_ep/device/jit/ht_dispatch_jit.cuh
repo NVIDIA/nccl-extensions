@@ -36,6 +36,8 @@ struct dispatch_warp_layout_t {
     int lsa_g2s_group_start;
     int lsa_s2g_group_warps;
     int lsa_s2g_group_start;
+    int map_group_warps;
+    int map_group_start;
     int pad_group_warps;
     int pad_group_start;
     int head_extra_group_warps;
@@ -50,7 +52,8 @@ struct dispatch_warp_layout_t {
 inline constexpr int kDispatchHeadWarps = 3;
 
 inline dispatch_warp_layout_t
-compute_dispatch_warp_layout(int num_lsa_teams, ncclEpLayout_t layout, int num_pipelines) {
+compute_dispatch_warp_layout(int num_lsa_teams, ncclEpLayout_t layout, int num_pipelines,
+                             bool count_map_warp) {
     const bool multi_lsa_layout = (num_lsa_teams != 1);
     dispatch_warp_layout_t L{};
     L.num_pipelines = num_pipelines;
@@ -60,11 +63,17 @@ compute_dispatch_warp_layout(int num_lsa_teams, ncclEpLayout_t layout, int num_p
     L.lsa_g2s_group_start = multi_lsa_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
     L.lsa_s2g_group_warps = L.num_pipelines;
     L.lsa_s2g_group_start = L.lsa_g2s_group_start + L.lsa_g2s_group_warps;
-    L.pad_group_warps = (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? 1 : 0;
-    L.pad_group_start = L.lsa_s2g_group_start + L.lsa_s2g_group_warps;
+    // Count mode dispatches FLAT (rank-major) with no EM padding, so it swaps the single EM PAD
+    // warp for a dedicated MAP group (the two are mutually exclusive). The MAP warps build the
+    // receiver EM tables on round-robin chunks; both warps also build the s2d rows that S2G gates
+    // on, so this is the s2d builder count and the floor is 2.
+    L.map_group_warps = count_map_warp ? 2 : 0;
+    L.map_group_start = L.lsa_s2g_group_start + L.lsa_s2g_group_warps;
+    L.pad_group_warps = count_map_warp ? 0 : ((layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? 1 : 0);
+    L.pad_group_start = L.map_group_start + L.map_group_warps;
     // Filler warps appended after PAD to guarantee the head always has 3 warps.
     const int comm_warps = L.cross_lsa_group_warps + L.lsa_g2s_group_warps +
-                           L.lsa_s2g_group_warps + L.pad_group_warps;
+                           L.lsa_s2g_group_warps + L.map_group_warps + L.pad_group_warps;
     L.head_extra_group_start = comm_warps;
     L.head_extra_group_warps = (comm_warps >= kDispatchHeadWarps) ? 0 : (kDispatchHeadWarps - comm_warps);
     L.block_dim = 32 * (comm_warps + L.head_extra_group_warps);
@@ -78,6 +87,8 @@ inline std::string dispatch_jit_source(
     int lsa_g2s_group_start,
     int lsa_s2g_group_warps,
     int lsa_s2g_group_start,
+    int map_group_warps,
+    int map_group_start,
     int pad_group_warps,
     int pad_group_start,
     int head_extra_group_warps,
@@ -94,6 +105,7 @@ inline std::string dispatch_jit_source(
     ncclEpLayout_t layout,
     int hidden_dim,
     int sf_bytes_per_token,
+    int experts_per_rank,
     const DispatchKernelSpec& kernel_spec) {
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
     std::ostringstream src;
@@ -108,12 +120,13 @@ inline std::string dispatch_jit_source(
         << lsa_g2s_group_start << ">;\n"
         << "using LSA_S2G_GROUP = ht_ep::warp_group<" << lsa_s2g_group_warps << ", "
         << lsa_s2g_group_start << ">;\n"
+        << "using MAP_GROUP            = ht_ep::warp_group<" << map_group_warps << ", " << map_group_start << ">;\n"
         << "using PAD_GROUP            = ht_ep::warp_group<" << pad_group_warps << ", " << pad_group_start << ">;\n"
         << "using HEAD_EXTRA_GROUP     = ht_ep::warp_group<" << head_extra_group_warps << ", "
         << head_extra_group_start << ">;\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(GIN_GROUP::size() + LSA_G2S_GROUP::size() + "
-           "LSA_S2G_GROUP::size() + PAD_GROUP::size() + HEAD_EXTRA_GROUP::size(), 1)\n"
+           "LSA_S2G_GROUP::size() + MAP_GROUP::size() + PAD_GROUP::size() + HEAD_EXTRA_GROUP::size(), 1)\n"
         << "__global__ void " << kDispatchJitEntryName << "(\n"
         << "    const __grid_constant__ ht_ep::dispatch_kernel_param_t<TOKEN_DATA_TYPE, " << lsa_team_size
         << "> param) {\n"
@@ -125,6 +138,7 @@ inline std::string dispatch_jit_source(
         << "      GIN_GROUP,\n"
         << "      LSA_G2S_GROUP,\n"
         << "      LSA_S2G_GROUP,\n"
+        << "      MAP_GROUP,\n"
         << "      PAD_GROUP,\n"
         << "      HEAD_EXTRA_GROUP,\n"
         << "      " << num_of_stages << ",\n"
@@ -138,7 +152,8 @@ inline std::string dispatch_jit_source(
         << "      " << lsa_team_size << ",\n"
         << "      " << layout_literal << ",\n"
         << "      " << hidden_dim << ",\n"
-        << "      kSfBytesPerToken>(param, smem_bytes);\n"
+        << "      kSfBytesPerToken,\n"
+        << "      " << experts_per_rank << ">(param, smem_bytes);\n"
         << "}\n";
     return src.str();
 }
@@ -151,14 +166,16 @@ inline ncclResult_t launch_dispatch(
     ncclEpLayout_t layout,
     int hidden_dim,
     int sf_bytes_per_token,
+    int experts_per_rank,
     const ncclEpEnvConfig* env,  // for rank-0-gated verbose param dump; may be null
     void* param,
     size_t param_size,
     int dynamic_smem_bytes,
     cudaStream_t stream,
-    const DispatchKernelSpec& kernel_spec) {
+    const DispatchKernelSpec& kernel_spec,
+    bool count_map_warp) {
     const dispatch_warp_layout_t L =
-        compute_dispatch_warp_layout(num_lsa_teams, layout, config.num_pipelines);
+        compute_dispatch_warp_layout(num_lsa_teams, layout, config.num_pipelines, count_map_warp);
 
     static const int fwd_variant_identity = 0;
     static const int bwd_variant_identity = 0;
@@ -175,7 +192,9 @@ inline ncclResult_t launch_dispatch(
              << "_recipe" << kernel_spec.recipe_cache_tag
              << "_payload" << kernel_spec.payload_cache_tag
              << "_scale" << kernel_spec.scale_cache_tag
-             << "_sf" << sf_bytes_per_token;
+             << "_sf" << sf_bytes_per_token
+             << "_epr" << experts_per_rank
+             << (count_map_warp ? "_countmap" : "");
         return name.str();
     }();
     const std::string source = dispatch_jit_source(
@@ -185,6 +204,8 @@ inline ncclResult_t launch_dispatch(
         L.lsa_g2s_group_start,
         L.lsa_s2g_group_warps,
         L.lsa_s2g_group_start,
+        L.map_group_warps,
+        L.map_group_start,
         L.pad_group_warps,
         L.pad_group_start,
         L.head_extra_group_warps,
@@ -201,6 +222,7 @@ inline ncclResult_t launch_dispatch(
         layout,
         hidden_dim,
         sf_bytes_per_token,
+        experts_per_rank,
         kernel_spec);
 
     ::nccl_ep::jit::JitKernelVariant variant;
@@ -213,6 +235,11 @@ inline ncclResult_t launch_dispatch(
     variant.num_blocks = config.num_of_blocks;
     variant.block_dim = L.block_dim;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
+    ::ht_ep::model_config_t static_smem_model{};
+    static_smem_model.num_of_experts_per_rank = experts_per_rank;
+    static_smem_model.ranks_per_lsa_team = lsa_team_size;
+    variant.expected_static_smem_bytes = static_cast<int>(::ht_ep::calc_disp_static_smem(static_smem_model));
+    variant.nucs = env != nullptr && nccl_ep_env_flag_on(env->nucs);
 
     // Dump the effective kernel parameters once per distinct variant, just before
     // the launch, when the env config asks for verbose output on this rank.
@@ -319,6 +346,7 @@ inline void dispatch_dump_warp_timing(
     _wt_print_group("INTER_N2N", L.cross_lsa_group_start, L.cross_lsa_group_warps);
     _wt_print_group("INTRA_G2S", L.lsa_g2s_group_start, L.lsa_g2s_group_warps);
     _wt_print_group("INTRA_S2G", L.lsa_s2g_group_start, L.lsa_s2g_group_warps);
+    _wt_print_group("MAP", L.map_group_start, L.map_group_warps);
     _wt_print_group("PAD", L.pad_group_start, L.pad_group_warps);
     _wt_print_block_span();
 }
@@ -430,7 +458,7 @@ inline int pick_pull_blocks_per_sm(int hidden_int4) {
 }
 
 inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec, int blocks_per_sm,
-                                                ncclEpDispQuant_t recipe) {
+                                                ncclEpDispQuant_t recipe, bool flat_expert_ids) {
     std::ostringstream src;
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
@@ -438,7 +466,8 @@ inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec,
         << "__global__ void " << kLocalPermuteDupJitEntryName << "(\n"
         << "    const __grid_constant__ ::ht_ep::local_permute_dup_param_t p) {\n"
         << "  ::ht_ep::local_permute_dup<" << hidden_int4 << ", " << hidden_vec
-        << ", " << ::nccl_ep::jit::dispatch_recipe_literal(recipe) << ">(\n"
+        << ", " << ::nccl_ep::jit::dispatch_recipe_literal(recipe)
+        << ", " << ::nccl_ep::jit::bool_literal(flat_expert_ids) << ">(\n"
         << "      reinterpret_cast<uint8_t*>(p.recv_x_em),\n"
         << "      p.recv_topk_weights_em,\n"
         << "      reinterpret_cast<const uint8_t*>(p.flat_staging),\n"
@@ -453,14 +482,19 @@ inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec,
         << "      p.caller_num_recv_tokens,\n"
         << "      reinterpret_cast<uint8_t*>(p.recv_scales_em),\n"
         << "      reinterpret_cast<const uint8_t*>(p.flat_scale_staging),\n"
-        << "      p.scale_row_bytes);\n"
+        << "      p.scale_row_bytes,\n"
+        << "      p.flat2em_out,\n"
+        << "      p.lerm_in,\n"
+        << "      p.lerm_out,\n"
+        << "      p.em_permute_cursors,\n"
+        << "      p.allow_overflow_drop);\n"
         << "}\n";
     return src.str();
 }
 
 inline void
 launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& param,
-                         ncclEpDispQuant_t recipe, cudaStream_t stream) {
+                         ncclEpDispQuant_t recipe, bool flat_expert_ids, cudaStream_t stream) {
     static const int variant_identity = 0;
     assert((param.row_bytes % 16) == 0);
     const int hidden_int4 = param.row_bytes / 16;
@@ -469,10 +503,11 @@ launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& par
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "local_permute_dup_h" << hidden_int4 << "_v" << hidden_vec << "_b" << blocks_per_sm
-             << (recipe != NCCL_EP_DISP_QUANT_NONE ? "_sf" : "");
+             << (recipe != NCCL_EP_DISP_QUANT_NONE ? "_sf" : "")
+             << (flat_expert_ids ? "_topk" : "_map");
         return name.str();
     }();
-    const std::string source = local_permute_dup_jit_source(hidden_int4, hidden_vec, blocks_per_sm, recipe);
+    const std::string source = local_permute_dup_jit_source(hidden_int4, hidden_vec, blocks_per_sm, recipe, flat_expert_ids);
 
     // Dynamic smem: zero-fill buffer for the pad warp's cp.async.bulk S2G.
     // Must cover both token rows and scale rows (scale_row_bytes may exceed row_bytes).
@@ -488,7 +523,8 @@ launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& par
     variant.identity = &variant_identity;
     variant.runtime_key = (static_cast<std::uint64_t>(hidden_int4) << 16) |
                           (static_cast<std::uint64_t>(hidden_vec) << 8) | static_cast<std::uint64_t>(blocks_per_sm) |
-                          (static_cast<std::uint64_t>(static_cast<uint32_t>(recipe)) << 32);
+                          (static_cast<std::uint64_t>(static_cast<uint32_t>(recipe)) << 32) |
+                          (static_cast<std::uint64_t>(flat_expert_ids) << 40);
     variant.num_blocks = num_blocks * blocks_per_sm;
     variant.block_dim = ::ht_ep::kLocalPermuteThreads;
     variant.dynamic_smem_bytes = zero_smem_bytes;
@@ -531,16 +567,39 @@ inline int pull_static_smem_bytes_per_warp() {
            static_cast<int>(sizeof(int));
 }
 
-// Largest pull-warp count whose smem fits the device cap. Each warp holds one remote
-// row in flight, so more warps is strictly better until the cap. blocks_per_sm CTAs
-// must be co-resident, so each gets 1/blocks_per_sm of the cap.
+// Static smem of the pull kernel: per-warp slot lists plus, for the fused pull-count variant,
+// the MAP counters (ready and done per MAP warp, the pull ticket counter, the ring read acks)
+// and the layout scan scratch.
+inline size_t pull_static_smem_bytes(int payload_warps, int map_only_warps, bool flat) {
+    const size_t counter_bytes = map_only_warps > 0
+        ? (2 * ::ht_ep::kPullDispatchMapWarps + 1 +
+           ::ht_ep::kPullDispatchChunkRing * ::ht_ep::kPullDispatchMapWarps) * sizeof(unsigned) +
+          ::ht_ep::kPullDispatchMapScanBytes : 0;
+    size_t static_bytes = payload_warps * pull_static_smem_bytes_per_warp() + counter_bytes;
+    if (flat) {
+        const int scratch_warps = map_only_warps > 0 ? map_only_warps : payload_warps;
+        static_bytes = (scratch_warps + 4) * sizeof(int);
+    }
+    return nccl_ep::align<size_t>(static_bytes, 16);
+}
+
+// Largest pull-warp count (payload + map_only_warps) whose smem fits the device cap. Each
+// payload warp holds one remote row in flight, so more warps is strictly better until the
+// cap. blocks_per_sm CTAs must be co-resident, so each gets 1/blocks_per_sm of the cap.
+// map_only_warps/map_smem_bytes (fused pull-count only) are the fixed MAP-warp-group
+// warp count and its smem (layout scratch + chunk ring), taken off the top.
 inline int pull_dispatch_warps(int hidden_int4, int scale_tma_row_bytes, size_t smem_optin,
-                               int blocks_per_sm) {
-    const int per_warp = pull_smem_bytes_per_warp(hidden_int4, scale_tma_row_bytes) +
-                         pull_static_smem_bytes_per_warp();
-    const size_t budget = smem_optin / static_cast<size_t>(std::max(1, blocks_per_sm));
-    const int fits = per_warp > 0 ? static_cast<int>(budget / static_cast<size_t>(per_warp)) : 0;
-    return std::max(1, std::min(::ht_ep::kPullDispatchMaxPullWarps, fits));
+                               int blocks_per_sm, size_t map_smem_bytes, int map_only_warps,
+                               bool flat) {
+    const size_t total_budget = smem_optin / static_cast<size_t>(std::max(1, blocks_per_sm));
+    for (int warps = ::ht_ep::kPullDispatchMaxPullWarps; warps > map_only_warps; --warps) {
+        const int payload_warps = warps - map_only_warps;
+        const size_t static_bytes = pull_static_smem_bytes(payload_warps, map_only_warps, flat);
+        const size_t dynamic_bytes = payload_warps * pull_smem_bytes_per_warp(hidden_int4, scale_tma_row_bytes) +
+                                      map_smem_bytes;
+        if (static_bytes + dynamic_bytes <= total_budget) return warps;
+    }
+    return 0;
 }
 
 inline int pull_dynamic_smem_bytes(int hidden_int4, int scale_tma_row_bytes, int pull_warps) {
@@ -582,67 +641,119 @@ inline int pull_scale_tma_row_bytes(int hidden_int4, ncclEpDispQuant_t recipe, i
 
 inline std::string dispatch_pull_jit_source(int hidden_int4, int blocks_per_sm, ncclEpDispQuant_t recipe,
                                                int scale_int4_per_lane, int scale_tma_row_bytes,
-                                               int pull_warps) {
+                                               int pull_warps, bool fused_map,
+                                               int top_k, int nRanks, int experts_per_rank, bool flat,
+                                               bool overlap_map, int test_stall_us) {
     std::ostringstream src;
+    if (test_stall_us > 0) {
+        src << "#define NCCL_EP_TEST_PULL_TICKET0_STALL_US " << test_stall_us << "\n";
+    }
+    const int threads = flat ? pull_warps * 32 : ::ht_ep::pull_dispatch_threads(pull_warps);
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
-        << "extern \"C\" __launch_bounds__(" << ::ht_ep::pull_dispatch_threads(pull_warps) << ", " << blocks_per_sm << ")\n"
+        << "extern \"C\" __launch_bounds__(" << threads << ", " << blocks_per_sm << ")\n"
         << "__global__ void " << kDispatchPullJitEntryName << "(\n"
-        << "    const __grid_constant__ ::ht_ep::dispatch_pull_param_t p) {\n"
-        << "  ::ht_ep::dispatch_pull<" << hidden_int4 << ", " << pull_stage_literal(hidden_int4)
+        << "    const __grid_constant__ ::ht_ep::dispatch_pull_param_t p) {\n";
+    if (flat) {
+        src << "  ::ht_ep::dispatch_pull_flat<" << hidden_int4 << ", "
+            << ::nccl_ep::jit::dispatch_recipe_literal(recipe) << ", " << scale_int4_per_lane
+            << ", " << scale_tma_row_bytes << ", " << pull_warps << ", "
+            << ::nccl_ep::jit::bool_literal(fused_map) << ", " << top_k << ", "
+            << kFlatMetadataChunkTokens << ", " << ::nccl_ep::jit::bool_literal(overlap_map) << ">(p);\n}\n";
+        return src.str();
+    }
+    src << "  ::ht_ep::dispatch_pull<" << hidden_int4 << ", " << pull_stage_literal(hidden_int4)
         << ", " << ::nccl_ep::jit::dispatch_recipe_literal(recipe) << ", " << scale_int4_per_lane
-        << ", " << scale_tma_row_bytes << ", " << pull_warps << ">(\n"
-        << "      reinterpret_cast<uint8_t*>(p.recv_x_em),\n"
-        << "      p.recv_topk_weights_em,\n"
-        << "      p.recv_x_scale_em,\n"
-        << "      p.flat2em_slot_map,\n"
-        << "      p.srcpos_map,\n"
-        << "      p.recv_slot_to_src,\n"
-        << "      p.peer_input_ptrs,\n"
-        << "      p.peer_weight_ptrs,\n"
-        << "      p.peer_scale_ptrs,\n"
-        << "      p.num_recv_tokens_dev,\n"
-        << "      p.expert_token_offsets,\n"
-        << "      p.per_expert_counts_active,\n"
-        << "      p.top_k,\n"
-        << "      p.experts_per_rank,\n"
-        << "      p.row_bytes,\n"
-        << "      p.scale_row_bytes,\n"
-        << "      p.caller_num_recv_tokens,\n"
-        << "      p.tokens_per_rank,\n"
-        << "      p.lsa_team_size,\n"
-        << "      p.dcomms,\n"
-        << "      p.head_sync_flag,\n"
-        << "      p.grid_barrier_counter,\n"
-        << "      p.unfused_sync);\n"
+        << ", " << scale_tma_row_bytes << ", " << pull_warps
+        << ", " << (fused_map ? "true" : "false") << ">(\n"
+        << "      p,\n"
+        << "      " << (fused_map ? std::to_string(top_k) : "p.top_k") << ",\n"
+        << "      " << (fused_map ? std::to_string(experts_per_rank) : "p.experts_per_rank") << ",\n"
+        << "      " << (fused_map ? std::to_string(nRanks) : "p.lsa_team_size") << ");\n"
         << "}\n";
     return src.str();
 }
 
 inline ncclResult_t
-launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, ncclEpDispQuant_t recipe,
-                        cudaStream_t stream) {
+launch_dispatch_pull_variant(int num_blocks, int blocks_per_sm, ::ht_ep::dispatch_pull_param_t& param,
+                             ncclEpDispQuant_t recipe, cudaStream_t stream, bool nucs, bool* retry_residency) {
     static const int variant_identity = 0;
     assert((param.row_bytes % 16) == 0);
     const int hidden_int4 = param.row_bytes / 16;
-    const int blocks_per_sm = pick_pull_blocks_per_sm(hidden_int4);
     // Per-lane int4 capacity for the FWD scale row, sized from the actual scale row so
     // any scale dtype / quantization block size fits (1 for NONE, where scale_row_bytes==0).
     const int scale_int4_per_lane = std::max(1, ((param.scale_row_bytes / 16) + 31) / 32);
     const size_t smem_optin = pull_device_smem_optin();
     const int scale_tma_row_bytes = pull_scale_tma_row_bytes(
         hidden_int4, recipe, param.scale_row_bytes, smem_optin, blocks_per_sm);
-    const int pull_warps = pull_dispatch_warps(hidden_int4, scale_tma_row_bytes, smem_optin, blocks_per_sm);
+    // layout_ready != nullptr is what selects the fused pull-count MAP-warp-group variant;
+    // the adapter (launch_dispatch_pull) sets every fused-count field together with it.
+    const bool fused_map = param.layout_ready != nullptr;
+    const size_t blocks = static_cast<size_t>(num_blocks) * blocks_per_sm;
+    const size_t flat_chunks = static_cast<size_t>(param.lsa_team_size) *
+        nccl_ep::ceil_div(param.tokens_per_rank, ::nccl_ep::ht::kFlatMetadataChunkTokens);
+    // A single wave of flat chunks favors cooperative mapping. With more work,
+    // dedicated producers hide map construction behind the payload transfers.
+    bool overlap_map = fused_map && param.flat && flat_chunks > blocks;
+    int map_warps = fused_map && (!param.flat || overlap_map) ? ::ht_ep::kPullDispatchMapWarps : 0;
+    size_t map_smem_bytes = fused_map && !param.flat
+        ? ::ht_ep::dispatch_pull_map_smem_ints(param.lsa_team_size, param.experts_per_rank) * sizeof(std::int32_t)
+        : 0;
+    if (overlap_map) {
+        const size_t tiles_per_chunk = ::nccl_ep::ht::kFlatMetadataChunkTokens / (map_warps * 32);
+        map_smem_bytes = nccl_ep::ceil_div(flat_chunks, blocks) * tiles_per_chunk * sizeof(int2);
+    } else if (fused_map && !param.flat) {
+        // The chunk_ranges ring (int2 per slot, fixed size) sits after the layout scratch.
+        // Folded into map_smem_bytes before the warp-count search below, or that search would
+        // pick a warp count sized only for the layout scratch and leave no room for this buffer.
+        const size_t chunk_ring_slots = static_cast<size_t>(::ht_ep::kPullDispatchChunkRing) * map_warps;
+        map_smem_bytes = ((map_smem_bytes + alignof(int2) - 1) & ~size_t(alignof(int2) - 1)) +
+            chunk_ring_slots * sizeof(int2);
+    }
+    // Test only: NCCL_EP_TEST_PULL_STALL_US stalls the first pull ticket of each block (see ht_ep.cuh).
+    const int test_stall_us = fused_map && !param.flat
+        ? std::atoi(::nccl_ep::jit::env_value("NCCL_EP_TEST_PULL_STALL_US").c_str()) : 0;
+    int pull_warps = pull_dispatch_warps(hidden_int4, scale_tma_row_bytes, smem_optin, blocks_per_sm,
+                                              map_smem_bytes, map_warps, param.flat);
+    if (pull_warps == 0 && overlap_map) {
+        overlap_map = false;
+        map_warps = 0;
+        map_smem_bytes = 0;
+        pull_warps = pull_dispatch_warps(hidden_int4, scale_tma_row_bytes, smem_optin, blocks_per_sm,
+                                         map_smem_bytes, map_warps, param.flat);
+    }
+    if (pull_warps == 0) {
+        std::fprintf(stderr, "[nccl_ep jit] dispatch-pull shared memory exceeds the device budget\n");
+        return ncclInvalidArgument;
+    }
 
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "dispatch_pull_h" << hidden_int4 << "_b" << blocks_per_sm
              << "_r" << static_cast<int>(recipe) << "_s" << scale_int4_per_lane
-             << "_st" << scale_tma_row_bytes << "_w" << pull_warps;
+             << "_st" << scale_tma_row_bytes << "_w" << pull_warps
+             << "_fm" << (fused_map ? 1 : 0) << (param.flat ? "_flat" : "");
+        if (fused_map || param.flat) {
+            name << "_k" << param.top_k;
+        }
+        if (fused_map && !param.flat) {
+            name << "_nr" << param.lsa_team_size << "_e" << param.experts_per_rank;
+        }
+        if (fused_map) {
+            name << "_cm" << map_smem_bytes;
+        }
+        if (test_stall_us > 0) {
+            name << "_ts" << test_stall_us;
+        }
+        if (param.flat) {
+            name << "_om" << overlap_map;
+        }
         return name.str();
     }();
     const std::string source = dispatch_pull_jit_source(hidden_int4, blocks_per_sm, recipe, scale_int4_per_lane,
-                                                        scale_tma_row_bytes, pull_warps);
+                                                        scale_tma_row_bytes, pull_warps, fused_map, param.top_k,
+                                                        param.lsa_team_size, param.experts_per_rank, param.flat,
+                                                        overlap_map, test_stall_us);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_dispatch_pull";
@@ -655,11 +766,23 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
     // bitfield would silently alias once a field (e.g. scale_tma_row_bytes) overflows.
     variant.runtime_key = static_cast<std::uint64_t>(std::hash<std::string>{}(variant_name));
     variant.num_blocks = num_blocks * blocks_per_sm;
-    variant.block_dim = ::ht_ep::pull_dispatch_threads(pull_warps);
-    variant.dynamic_smem_bytes = pull_dynamic_smem_bytes(hidden_int4, scale_tma_row_bytes, pull_warps);
+    variant.block_dim = param.flat ? pull_warps * 32 : ::ht_ep::pull_dispatch_threads(pull_warps);
+    const int payload_warps = pull_warps - map_warps;
+    variant.dynamic_smem_bytes = pull_dynamic_smem_bytes(hidden_int4, scale_tma_row_bytes, payload_warps) +
+        static_cast<int>(map_smem_bytes);
+    if (!param.flat) {
+        variant.expected_static_smem_bytes = static_cast<int>(pull_static_smem_bytes(payload_warps, map_warps, false));
+    }
+    variant.nucs = nucs;
+    variant.require_full_residency = fused_map && !param.unfused_sync;
+    variant.cooperative = variant.require_full_residency;
 
     std::string error;
     const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
+    if (status == ::nccl_ep::jit::JitKernelStatus::kInsufficientResidency && blocks_per_sm > 1) {
+        *retry_residency = true;
+        return ncclInvalidUsage;
+    }
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
         // The oversize-hidden smem case (kAttributeFailed) is pre-rejected in ncclEpDispatch
@@ -672,6 +795,20 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
         return ncclInternalError;
     }
     return ncclSuccess;
+}
+
+inline ncclResult_t launch_dispatch_pull(
+    int num_blocks, ::ht_ep::dispatch_pull_param_t& param, ncclEpDispQuant_t recipe,
+    cudaStream_t stream, bool nucs) {
+    const int blocks_per_sm = pick_pull_blocks_per_sm(param.row_bytes / 16);
+    bool retry_residency = false;
+    ncclResult_t result = launch_dispatch_pull_variant(
+        num_blocks, blocks_per_sm, param, recipe, stream, nucs, &retry_residency);
+    if (retry_residency) {
+        retry_residency = false;
+        result = launch_dispatch_pull_variant(num_blocks, 1, param, recipe, stream, nucs, &retry_residency);
+    }
+    return result;
 }
 
 } // namespace jit

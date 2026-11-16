@@ -7,4 +7,5 @@ build/
 # build_assets/generate_cython.py); the .cpp and .so they compile to are not.
 python/nccl/**/*.cpp
 python/nccl/**/*.so
+python/nccl/**/*.so.*
 python/nccl/**/include/

@@ -277,6 +277,7 @@ int main(int argc, char* argv[]) {
   // Retain the legacy caller-window setup for compatibility-mode coverage.
   ncclWindow_t window = nullptr;
   if (apiMode == ReshardApiMode::Window) {
+    NCCLCHECK(benchWaitCommReady(worldComm));
     NCCLCHECK(ncclCommWindowRegister(worldComm, buffer, allocSize, &window, NCCL_WIN_COLL_SYMMETRIC));
   }
 
@@ -353,6 +354,9 @@ int main(int argc, char* argv[]) {
       NCCLCHECK(ncclReshardWithWindow(m2nHandle, worldComm, window, &srcTensor, &dstTensor, reshardStream));
     }
   };
+
+  // Finish registration before the first iteration reads the window handle.
+  if (apiMode == ReshardApiMode::Window) NCCLCHECK(benchWaitCommReady(worldComm));
 
   // Warmup
   if (mpiRank == 0) {
@@ -598,8 +602,11 @@ int main(int argc, char* argv[]) {
   // Reshard is asynchronous. Complete the work before releasing its resources.
   CUDACHECK(cudaStreamSynchronize(reshardStream));
   if (window != nullptr) {
-    ncclCommWindowDeregister(worldComm, window);
+    NCCLCHECK(benchWaitCommReady(worldComm));
+    NCCLCHECK(ncclCommWindowDeregister(worldComm, window));
   }
+  // M2N finalization also releases windows on this communicator.
+  NCCLCHECK(benchWaitCommReady(worldComm));
   NCCLCHECK(ncclM2nFinalize(m2nHandle));
   if (apiMode == ReshardApiMode::Default) {
     CUDACHECK(cudaFree(buffer));
@@ -607,7 +614,8 @@ int main(int argc, char* argv[]) {
     NCCLCHECK(ncclMemFree(buffer));
   }
   CUDACHECK(cudaStreamDestroy(stream));
-  ncclCommDestroy(worldComm);
+  NCCLCHECK(benchWaitCommReady(worldComm));
+  NCCLCHECK(ncclCommDestroy(worldComm));
 
   MPICHECK(MPI_Finalize());
 

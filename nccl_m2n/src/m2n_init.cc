@@ -176,6 +176,7 @@ static ncclResult_t destroyExplicitHandle(ncclM2nHandle_t handle) {
 
 ncclM2nRuntime::~ncclM2nRuntime() {
   packStagingSynchronize();
+  reshardSplitSynchronizeCommBLanes();
   cacheFinalize();
   stagingPipeLaunchCompletionFinalize();
   reshardSplitCommFinalize();

@@ -3661,8 +3661,9 @@ static inline bool ht_pull_enabled(ncclEpGroup_t group, ncclEpHandle_t handle) {
  * Test whether pull-count metadata exchange can be fused with dispatch.
  *
  * Rebuilds receive-slot and EM maps inside dispatch from a pulled count/top-k
- * row. Requires pull-push expert-major in one LSA domain, non-eager sizing,
- * and a local expert count that fits the uint16 map. Group creation may pass
+ * row. Requires pull-push expert-major in one LSA domain and a local expert
+ * count that fits the uint16 map. Eager sizing (expert-major only) runs the
+ * unfused count exchange in ncclEpUpdateHandle. Group creation may pass
  * EXPERT_MAJOR as a hypothetical probe; handle setup uses the actual layout.
  *
  * @param group Group whose resolved HT mode and topology are being tested.
@@ -3675,7 +3676,7 @@ static inline bool dispatch_pull_count_capable(ncclEpGroup_t group, ncclEpLayout
     constexpr int kPullCountMaxLocalExperts = 65536 / MAX_NUM_TOPK;
     return !meta_exchange_force_scan(group) &&
            !is_internode_available(group) &&
-           !group->eager_mode &&
+           (!group->eager_mode || layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) &&
            (layout == NCCL_EP_LAYOUT_FLAT || group->num_local_experts <= kPullCountMaxLocalExperts) &&
            ht_pull_enabled(group, layout);
 }
@@ -4667,9 +4668,10 @@ static ncclResult_t ht_update_handle_pull_count_mode(
     // Layout outputs requested by the caller must be ready before dispatch: AllGather count
     // rows now and derive them immediately via the same reduction the unfused push-count path
     // uses (nccl_ep::ht::compute_layout_info), instead of waiting for dispatch to publish.
+    // Eager mode needs the recv count at UpdateHandle time, so it always runs the unfused exchange.
     const bool provide_layout_info =
         (padded_out_counts != nullptr) || (out_offsets != nullptr) || (recv_total_counter != nullptr);
-    if (provide_layout_info) {
+    if (provide_layout_info || ep_group->eager_mode) {
         NCCL_CHECK_RESULT(ncclAllGather(
             own_row,
             handle->ht.dispatch_push_count.cached_cnt_rows,

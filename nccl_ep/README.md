@@ -615,8 +615,8 @@ transport and scan metadata for flat pull/push. EM pull/push does not use
 this override; use `NCCL_EP_HT_AG_SCAN_MODE=1` to force its scan path.
 
 When eligible, fused metadata stages local routing information during
-`ncclEpUpdateHandle` and builds receive maps during dispatch. It is supported with pull/push within one LSA team. Eager sizing, explicit update-time layout outputs, and unsupported
-metadata configurations retain the scan path. Fused expert-major pull metadata
+`ncclEpUpdateHandle` and builds receive maps during dispatch. It is supported with pull/push within one LSA team. With expert-major pull/push, eager sizing and explicit update-time layout outputs
+all-gather the counts in `ncclEpUpdateHandle` (unfused count) and dispatch still builds the receive maps. Flat handles with eager sizing or early layout outputs, and unsupported metadata configurations, retain the scan path. Fused expert-major pull metadata
 supports at most 2048 local experts; larger configurations retain scan metadata.
 Enabling fused metadata alone does not select pull/push.
 

@@ -733,6 +733,11 @@ TEST_F(OutputLayoutTest, EagerRecvSize) {
         unsigned int num_recv = 0;
         NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
         ASSERT_GT(num_recv, 1u);
+        // Eager EM pull-push runs the unfused count exchange, not scan, unless scan is forced.
+        if (em && ht_pull_push_active()) {
+            EXPECT_EQ(ncclEpHandle_test_getMetadataMode(h),
+                      ht_ag_scan_mode_active() ? NCCL_EP_TEST_META_SCAN : NCCL_EP_TEST_META_UNFUSED);
+        }
 
         nv_bfloat16 *d_tok, *d_recv;
         float *d_weights, *d_recv_w;

@@ -1250,7 +1250,9 @@ TEST_F(OutputLayoutTest, EagerZeroRecv) {
 // combined[i] must equal its own source token. Under pull dispatch + push combine
 // (NCCL_EP_HT_PULL_PUSH) a zero-recv rank is still a source, so its input weights
 // must reach the receiver.
-static void run_eager_zero_recv_fwd_combine(int top_k) {
+static void run_eager_zero_recv_fwd_combine(
+    int top_k, ncclEpLayout_t layout = NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+    const bool flat = (layout == NCCL_EP_LAYOUT_FLAT);
     ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
     gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
     gcfg.num_experts = kNumExperts;
@@ -1294,7 +1296,7 @@ static void run_eager_zero_recv_fwd_combine(int top_k) {
 
     ncclEpHandle_t h = nullptr;
     NCCL_ASSERT(ncclEpCreateHandle(
-        &h, eager_group, NCCL_EP_LAYOUT_EXPERT_MAJOR, t_idx, nullptr, nullptr, g_stream));
+        &h, eager_group, layout, t_idx, nullptr, nullptr, g_stream));
     CUDA_ASSERT(cudaStreamSynchronize(g_stream));
     unsigned int num_recv = ~0u;
     NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
@@ -1306,15 +1308,23 @@ static void run_eager_zero_recv_fwd_combine(int top_k) {
     // on the zero-recv ranks.
     nv_bfloat16* d_recv = nullptr;
     float* d_recv_w = nullptr;
+    int64_t* d_recv_idx = nullptr;
+    const size_t recv_weight_count = static_cast<size_t>(num_recv) * (flat ? top_k : 1);
     if (!zero_recv) {
         CUDA_ASSERT(cudaMalloc(&d_recv, num_recv * kHidden * sizeof(nv_bfloat16)));
-        CUDA_ASSERT(cudaMalloc(&d_recv_w, num_recv * sizeof(float)));
+        CUDA_ASSERT(cudaMalloc(&d_recv_w, recv_weight_count * sizeof(float)));
+        if (flat) CUDA_ASSERT(cudaMalloc(&d_recv_idx, recv_weight_count * sizeof(int64_t)));
         CUDA_ASSERT(cudaMemset(d_recv, 0, num_recv * kHidden * sizeof(nv_bfloat16)));
-        CUDA_ASSERT(cudaMemset(d_recv_w, 0, num_recv * sizeof(float)));
+        CUDA_ASSERT(cudaMemset(d_recv_w, 0, recv_weight_count * sizeof(float)));
     }
-    ncclEpTensor_t *t_recv = nullptr, *t_recv_w = nullptr;
+    ncclEpTensor_t *t_recv = nullptr, *t_recv_w = nullptr, *t_recv_idx = nullptr;
     NCCL_ASSERT(epTensorCreate(&t_recv, 2, ncclBfloat16, d_recv, num_recv, kHidden));
-    NCCL_ASSERT(epTensorCreate(&t_recv_w, 1, ncclFloat32, d_recv_w, num_recv));
+    if (flat) {
+        NCCL_ASSERT(epTensorCreate(&t_recv_w, 2, ncclFloat32, d_recv_w, num_recv, top_k));
+        NCCL_ASSERT(epTensorCreate(&t_recv_idx, 2, ncclInt64, d_recv_idx, num_recv, top_k));
+    } else {
+        NCCL_ASSERT(epTensorCreate(&t_recv_w, 1, ncclFloat32, d_recv_w, num_recv));
+    }
 
     // FWD dispatch.
     {
@@ -1324,6 +1334,7 @@ static void run_eager_zero_recv_fwd_combine(int top_k) {
         d_in.topk_weights = t_w;
         d_out.tokens = t_recv;
         d_out.topk_weights = t_recv_w;
+        d_out.topk_idx = t_recv_idx;
         ncclEpDispatchConfig_t dcfg = NCCL_EP_DISPATCH_CONFIG_INIT;
         EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclSuccess);
         EXPECT_EQ(ncclEpComplete(h, nullptr, g_stream), ncclSuccess);
@@ -1334,13 +1345,17 @@ static void run_eager_zero_recv_fwd_combine(int top_k) {
     // mirroring the MoE combine input. Only rank 0 has recv rows here.
     if (!zero_recv) {
         std::vector<nv_bfloat16> h_recv(num_recv * kHidden);
-        std::vector<float> h_recv_w(num_recv);
+        std::vector<float> h_recv_w(recv_weight_count);
         CUDA_ASSERT(cudaMemcpy(h_recv.data(), d_recv, num_recv * kHidden * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
-        CUDA_ASSERT(cudaMemcpy(h_recv_w.data(), d_recv_w, num_recv * sizeof(float), cudaMemcpyDeviceToHost));
-        for (unsigned int s = 0; s < num_recv; ++s)
+        CUDA_ASSERT(cudaMemcpy(h_recv_w.data(), d_recv_w, recv_weight_count * sizeof(float), cudaMemcpyDeviceToHost));
+        for (unsigned int s = 0; s < num_recv; ++s) {
+            float weight = 0.0f;
+            for (int k = 0; k < (flat ? top_k : 1); ++k)
+                weight += h_recv_w[s * (flat ? top_k : 1) + k];
             for (int hh = 0; hh < kHidden; ++hh)
                 h_recv[s * kHidden + hh] =
-                    __float2bfloat16(__bfloat162float(h_recv[s * kHidden + hh]) * h_recv_w[s]);
+                    __float2bfloat16(__bfloat162float(h_recv[s * kHidden + hh]) * weight);
+        }
         CUDA_ASSERT(cudaMemcpy(d_recv, h_recv.data(), num_recv * kHidden * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
     }
 
@@ -1365,15 +1380,19 @@ static void run_eager_zero_recv_fwd_combine(int top_k) {
     CUDA_ASSERT(cudaMemcpy(h_out.data(), d_out_x, kNumTokens * kHidden * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
     for (int i = 0; i < kNumTokens; ++i) {
         const float expected = static_cast<float>(g_rank * kNumTokens + i + 1);
-        EXPECT_NEAR(bf16_val(h_out[i * kHidden]), expected, 1e-2f)
-            << "Rank " << g_rank << " token " << i << ": FWD combine must round-trip the source token";
+        for (int hh = 0; hh < kHidden; ++hh)
+            EXPECT_NEAR(bf16_val(h_out[i * kHidden + hh]), expected, 1e-2f)
+                << "Rank " << g_rank << " token " << i << " hidden " << hh
+                << ": FWD combine must round-trip the source token";
     }
 
     ncclEpTensorDestroy(t_out_x);
     cudaFree(d_out_x);
     ncclEpTensorDestroy(t_recv);
+    if (t_recv_idx) ncclEpTensorDestroy(t_recv_idx);
     ncclEpTensorDestroy(t_recv_w);
     if (d_recv) cudaFree(d_recv);
+    if (d_recv_idx) cudaFree(d_recv_idx);
     if (d_recv_w) cudaFree(d_recv_w);
     ncclEpTensorDestroy(t_tok);
     ncclEpTensorDestroy(t_w);
@@ -1391,6 +1410,19 @@ TEST_F(OutputLayoutTest, EagerZeroRecvForwardCombine) {
 
 TEST_F(OutputLayoutTest, EagerZeroRecvForwardCombineTopK2) {
     run_eager_zero_recv_fwd_combine(/*top_k=*/2);
+}
+
+// With multiple LSA teams, rank 1 has no expert input but relays rank 0's
+// RED results to remote attention owners. Empty inputs must not supply the
+// source window for those GIN writes.
+TEST_F(OutputLayoutTest, EagerZeroRecvForwardCombineFlat) {
+    SKIP_IF_PULL_PUSH();
+    run_eager_zero_recv_fwd_combine(/*top_k=*/1, NCCL_EP_LAYOUT_FLAT);
+}
+
+TEST_F(OutputLayoutTest, EagerZeroRecvForwardCombineFlatTopK2) {
+    SKIP_IF_PULL_PUSH();
+    run_eager_zero_recv_fwd_combine(/*top_k=*/2, NCCL_EP_LAYOUT_FLAT);
 }
 
 // ── TopK2MixedRoutingTest fixture ─────────────────────────────────────────────

@@ -624,7 +624,6 @@ struct dispatch_memory_region_info_t {
     size_t bytes_per_entry; // Size of packed entry (token + prob + sf)
     size_t max_tokens_per_dest; // Max tokens that can be staged per destination
     // Streaming RDMA signals
-    unsigned signals_tail_base; // Base signal ID for tail tracking (sender -> receiver)
     // Streaming buffer configuration
     int num_max_rdma_chunked_send_tokens; // Batch size per RDMA put (default: 6)
 };
@@ -720,6 +719,7 @@ struct DispatchParams {
     ncclWindow_t nccl_internal_window; // Internal destination window handle
     int num_ctx_per_comm; // Number of contexts per communicator
     void* gin_base_ptr; // Base pointer for offset calculations
+    unsigned dispatch_signal_base; // First dispatch signal id
     dispatch_memory_region_info_t mr_info;
 
     // Runtime config
@@ -811,8 +811,7 @@ struct CombineParams {
     ncclWindow_t nccl_internal_window; // Internal destination window handle
     int num_ctx_per_comm; // Number of contexts per communicator
     void* gin_base_ptr; // Base pointer for offset calculations
-    unsigned signals_base; // Base signal ID
-    unsigned combine_signal_offset; // Signal offset for combine operations
+    unsigned combine_signal_base; // First combine signal id
     combine_memory_region_info_t mr_info;
 
     // Runtime config

@@ -1571,6 +1571,7 @@ template <typename TOKEN_DATA_TYPE>
     kp.dest_window = params.nccl_internal_window;
     kp.num_ctx_per_comm = params.num_ctx_per_comm;
     kp.gin_base_ptr = params.gin_base_ptr;
+    kp.dispatch_signal_base = params.dispatch_signal_base;
     // Use offsets relative to gin_base_ptr
     kp.mr_info = {
         .attn_input_token_offset = params.mr_info.attn_input_token_offset,
@@ -1582,8 +1583,6 @@ template <typename TOKEN_DATA_TYPE>
         .guard_offset = params.mr_info.guard_offset,
         .bytes_per_entry = params.mr_info.bytes_per_entry,
         .max_tokens_per_dest = params.mr_info.max_tokens_per_dest,
-        // Streaming signal parameters
-        .signals_tail_base = params.mr_info.signals_tail_base,
         .num_max_rdma_chunked_send_tokens = params.mr_info.num_max_rdma_chunked_send_tokens
     };
 
@@ -1908,8 +1907,7 @@ ncclResult_t call_dispatch(
     kp.dest_window = params.nccl_internal_window;
     kp.num_ctx_per_comm = params.num_ctx_per_comm;
     kp.gin_base_ptr = params.gin_base_ptr;
-    kp.signals_base = params.signals_base;
-    kp.combine_signal_offset = params.combine_signal_offset;
+    kp.combine_signal_base = params.combine_signal_base;
     // Use offsets relative to gin_base_ptr
     kp.mr_info = {
         .combine_red_token_offset = params.mr_info.combine_red_token_offset,

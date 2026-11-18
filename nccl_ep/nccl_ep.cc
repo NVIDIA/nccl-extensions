@@ -1836,6 +1836,12 @@ static ncclResult_t devCommAllocAndCopyToDevice(ncclComm_t comm, ncclDevComm_t**
     return ncclInternalError;
 }
 
+// Plumbing preparation: once the unordered kernel is available, its flag replaces the false and this
+// flag takes effect.
+static bool ht_gin_weak_signal_reduction(ncclEpGroup_t group) {
+    return nccl_ep_env_flag_on(group->env.ht_gin_weak_signal_reduction) && false;
+}
+
 static int ht_n2n_channels(ncclEpGroup_t group) {
     const auto channels = [](unsigned int blocks, int warps) { return static_cast<int>(blocks) * warps; };
     return std::max({channels(group->dispatch_num_sms, NCCL_EP_HT_DISPATCH_N2N_WARPS),
@@ -2063,17 +2069,30 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
                   gin_signals_per_phase_for(ep_group->combine_num_sms, NCCL_EP_HT_COMBINE_N2N_WARPS),
                   gin_signals_per_phase_for(ep_group->flat_combine_num_sms, NCCL_EP_HT_COMBINE_N2N_WARPS)});
 
-    // Dispatch and combine can overlap across rail peers, so each gets its own range.
+    // Signal reduction shares one pool between dispatch and combine. It relies on the guard and is
+    // ignored with NCCL_EP_DISABLE_GUARD: without the guard the two phases can overlap across rail
+    // peers, and each would take the other's signals.
+    bool weak_signal_reduction = ht_gin_weak_signal_reduction(ep_group);
+    if (weak_signal_reduction && nccl_ep_env_flag_on(ep_group->env.disable_guard)) {
+        fprintf(stderr,
+                "[HT GIN] Warning: %s is ignored with %s: without the guard dispatch and combine can "
+                "overlap across rail peers and take each other's signals\n",
+                ep_group->env.ht_gin_weak_signal_reduction.name, ep_group->env.disable_guard.name);
+        weak_signal_reduction = false;
+    }
     ep_group->gin_config.dispatch_signal_base = 0u;
-    ep_group->gin_config.combine_signal_base = static_cast<unsigned>(gin_signals_per_phase);
-    ep_group->gin_config.num_total_signals = 2 * gin_signals_per_phase;
+    ep_group->gin_config.combine_signal_base =
+        weak_signal_reduction ? 0u : static_cast<unsigned>(gin_signals_per_phase);
+    ep_group->gin_config.num_total_signals =
+        weak_signal_reduction ? gin_signals_per_phase : 2 * gin_signals_per_phase;
 
     if (nccl_ep_env_verbose(ep_group->env)) {
         fprintf(stderr,
-                "[HT GIN] signal pool (dispatch|combine separate): %d[chunks/rank], %d[rail chunks] "
+                "[HT GIN] signal pool (dispatch+combine %s): %d[chunks/rank], %d[rail chunks] "
                 "over %d[data ctx]; channels dispatch %u/%u flat, combine %u/%u flat; "
                 "%d[ids/ctx], %d[total signals] over %d[ctx]\n",
-                max_chunks_per_rank, max_chunk_per_rails, num_data_ctx,
+                weak_signal_reduction ? "shared" : "separate", max_chunks_per_rank, max_chunk_per_rails,
+                num_data_ctx,
                 ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS,
                 ep_group->flat_dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS,
                 ep_group->combine_num_sms * NCCL_EP_HT_COMBINE_N2N_WARPS,

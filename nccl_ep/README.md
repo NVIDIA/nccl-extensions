@@ -445,6 +445,10 @@ no configuration. Advanced callers that can already guarantee consecutive EP
 operations will not race on these buffers may disable the guard to reclaim its
 overhead with `export NCCL_EP_DISABLE_GUARD=1`.
 
+`export NCCL_EP_HT_GIN_WEAK_SIGNAL_REDUCTION=1` is an option to reduce the
+GIN signal count further, available only on the unordered HT kernel path. It
+trades against the guard: with `NCCL_EP_DISABLE_GUARD=1` it has no effect.
+
 
 # Core Concepts
 

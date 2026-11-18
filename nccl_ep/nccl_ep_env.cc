@@ -99,6 +99,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_flag(cfg->ht_ag_scan_mode);
     parse_flag(cfg->ht_count_unfused);
     parse_flag(cfg->disable_guard);
+    parse_flag(cfg->ht_gin_weak_signal_reduction);
     parse_flag(cfg->ll_cft);
 
     parse_timeout_ms(cfg->timeout_ms);
@@ -142,6 +143,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.ht_recv_topk_order,
         &cfg.dispatch_copy_mode,
         &cfg.disable_guard,
+        &cfg.ht_gin_weak_signal_reduction,
         &cfg.ll_cft,
         &cfg.timeout_ms,
         &cfg.comm_num_sms,

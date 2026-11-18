@@ -77,6 +77,7 @@ struct ncclEpEnvConfig {
     static constexpr const char* dispatch_copy_modes[] = {"CE", "SIMT", "TMA", nullptr};
     ncclEpEnvVar dispatch_copy_mode{"NCCL_EP_DISPATCH_COPY_MODE", ncclEpEnvType::choice, dispatch_copy_modes};
     ncclEpEnvVar disable_guard{"NCCL_EP_DISABLE_GUARD", ncclEpEnvType::flag};
+    ncclEpEnvVar ht_gin_weak_signal_reduction{"NCCL_EP_HT_GIN_WEAK_SIGNAL_REDUCTION", ncclEpEnvType::flag};
     ncclEpEnvVar timeout_ms{"NCCL_EP_TIMEOUT_MS", ncclEpEnvType::ulong};
     ncclEpEnvVar comm_num_sms{"NCCL_EP_COMM_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar dispatch_num_sms{"NCCL_EP_DISPATCH_SMS", ncclEpEnvType::ulong};

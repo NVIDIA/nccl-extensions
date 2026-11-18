@@ -224,11 +224,12 @@ fold_topk_idx_local_hits(const uint16_t* row, int num_topk, int local_expert_glo
 // * Accumulate `rank_sums` for each local rank in LSA team (rank-scan prefix sum)
 // * When `smem` is provided (FLAT rank-scan path), perform warp-reduce of the
 //   per-thread rank_sums
-template <int LSA_TEAM_SIZE, int NUM_MASK_WORDS, bool USE_TOPK_IDX = false>
+template <int LSA_TEAM_SIZE, int NUM_MASK_WORDS, bool USE_TOPK_IDX = false, bool OVERFLOW_DROP>
 __device__ __forceinline__ void extract_lsa_ranks_meta(
     const uint8_t* input_routing_map,
     rank_mask_t<NUM_MASK_WORDS>* token_rank_mask,
     bool* rdma_to_attn_map,
+    bool* rdma_to_attn_map_wo_drop,
     const scan_geometry_t& g,
     int tokens_per_rank,
     int experts_per_rank,
@@ -270,7 +271,14 @@ __device__ __forceinline__ void extract_lsa_ranks_meta(
         token_rank_mask[token_id] = rank_mask;
 
         if (src_local_rank == local_rank) {
-            rdma_to_attn_map[rdma_map_id] = rank_mask.any();
+            const bool routed = rank_mask.any();
+            rdma_to_attn_map[rdma_map_id] = routed;
+            // Keep a copy: tokens past the allocated recv capacity are later dropped from
+            // rdma_to_attn_map. Combine needs both sets to tell a real token from a dropped
+            // one, which it still has to forward to the caller as zeros.
+            if constexpr (OVERFLOW_DROP) {
+                rdma_to_attn_map_wo_drop[rdma_map_id] = routed;
+            }
         }
     }
 
@@ -1042,12 +1050,14 @@ template <
     bool ENABLE_EM_PERMUTE = false,
     int EXPERTS_PER_RANK = 0,
     typename EM_OUT_T = int32_t,  // dtype of em_padded_out_counts / em_out_offsets
-    bool USE_TOPK_IDX = false>  // pull dispatch: metadata is the uint16 topk_idx list, not a bitmap
+    bool USE_TOPK_IDX = false,  // pull dispatch: metadata is the uint16 topk_idx list, not a bitmap
+    bool OVERFLOW_DROP>  // NCCL_EP_OVERFLOW_DROP: also emit the pristine rdma_to_attn_map_wo_drop
 __device__ __forceinline__ void scan_impl_flat(
     const uint8_t* input_routing_map,
     tmp_state_t* tmp,
     int32_t* sparse_to_dense_map,
     bool* rdma_to_attn_map,
+    bool* rdma_to_attn_map_wo_drop,
     bool* attn_to_rdma_map,
     rank_mask_t<(LSA_TEAM_SIZE + 63) / 64>* token_rank_mask,
     int32_t* num_of_tokens_for_experts,
@@ -1115,10 +1125,11 @@ __device__ __forceinline__ void scan_impl_flat(
 
     // Phase 1: rank tally (+ per-local-expert tally when EM-permute is enabled).
     // Passing &smem drives the warp-reduce of rank counts into smem.warp_rank_sums.
-    extract_lsa_ranks_meta<LSA_TEAM_SIZE, NUM_MASK_WORDS, USE_TOPK_IDX>(
+    extract_lsa_ranks_meta<LSA_TEAM_SIZE, NUM_MASK_WORDS, USE_TOPK_IDX, OVERFLOW_DROP>(
         input_routing_map,
         token_rank_mask,
         rdma_to_attn_map,
+        rdma_to_attn_map_wo_drop,
         g,
         num_of_tokens_per_rank,
         experts_per_rank,
@@ -1250,10 +1261,11 @@ __device__ __forceinline__ void scan_impl_flat(
 // the per-token rank mask, rdma_to_attn_map (filled by extract_lsa_ranks_meta), and
 // attn_to_rdma_map. The FLAT-only prefix scan / sparse_to_dense / per-expert
 // counts are skipped entirely.
-template <int NUM_THREADS_PER_BLOCK, int NUM_OF_BLOCKS, int NUM_LSA_TEAMS, int LSA_TEAM_SIZE>
+template <int NUM_THREADS_PER_BLOCK, int NUM_OF_BLOCKS, int NUM_LSA_TEAMS, int LSA_TEAM_SIZE, bool OVERFLOW_DROP>
 __device__ __forceinline__ void scan_impl_em(
     const uint8_t* input_routing_map,
     bool* rdma_to_attn_map,
+    bool* rdma_to_attn_map_wo_drop,
     bool* attn_to_rdma_map,
     rank_mask_t<(LSA_TEAM_SIZE + 63) / 64>* token_rank_mask,
     const int lsa_team,
@@ -1272,10 +1284,11 @@ __device__ __forceinline__ void scan_impl_em(
 
     // EM pre-pass: no smem argument -> rank sums are skipped; only token_rank_mask
     // and rdma_to_attn_map are produced.
-    extract_lsa_ranks_meta<LSA_TEAM_SIZE, NUM_MASK_WORDS>(
+    extract_lsa_ranks_meta<LSA_TEAM_SIZE, NUM_MASK_WORDS, /*USE_TOPK_IDX=*/false, OVERFLOW_DROP>(
         input_routing_map,
         token_rank_mask,
         rdma_to_attn_map,
+        rdma_to_attn_map_wo_drop,
         g,
         num_of_tokens_per_rank,
         experts_per_rank,
@@ -1307,6 +1320,7 @@ struct scan_flat_kernel_param_t {
     tmp_state_t* tmp;
     int32_t* sparse_to_dense_map;
     bool* rdma_to_attn_map;
+    bool* rdma_to_attn_map_wo_drop;
     bool* attn_to_rdma_map;
     void* token_rank_mask;
     int32_t* num_of_tokens_for_experts;
@@ -1343,6 +1357,7 @@ struct scan_flat_kernel_param_t {
 struct scan_em_kernel_param_t {
     const uint8_t* input_routing_map;
     bool* rdma_to_attn_map;
+    bool* rdma_to_attn_map_wo_drop;
     bool* attn_to_rdma_map;
     void* token_rank_mask;
     int lsa_team;

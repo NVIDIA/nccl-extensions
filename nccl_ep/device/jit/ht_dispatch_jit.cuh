@@ -106,32 +106,37 @@ inline std::string dispatch_jit_source(
     int hidden_dim,
     int sf_bytes_per_token,
     int experts_per_rank,
-    const DispatchKernelSpec& kernel_spec) {
+    const DispatchKernelSpec& kernel_spec,
+    HtKernelImpl impl) {
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
+    const char* const impl_header = ht_impl_header(impl);
+    const char* const ns = ht_impl_namespace(impl);
     std::ostringstream src;
-    src << "#include \"device/ht_ep.cuh\"\n"
+    src << "#include \"" << impl_header << "\"\n"
         << "\n"
         << "using TOKEN_DATA_TYPE = " << kernel_spec.payload_type_literal << ";\n"
         << "using SCALE_DATA_TYPE = " << kernel_spec.scale_type_literal << ";\n"
         << "static constexpr int kSfBytesPerToken = " << sf_bytes_per_token << ";\n"
-        << "using GIN_GROUP     = ht_ep::warp_group<" << cross_lsa_group_warps << ", "
+        << "using GIN_GROUP     = " << ns << "::warp_group<" << cross_lsa_group_warps << ", "
         << cross_lsa_group_start << ">;\n"
-        << "using LSA_G2S_GROUP = ht_ep::warp_group<" << lsa_g2s_group_warps << ", "
+        << "using LSA_G2S_GROUP = " << ns << "::warp_group<" << lsa_g2s_group_warps << ", "
         << lsa_g2s_group_start << ">;\n"
-        << "using LSA_S2G_GROUP = ht_ep::warp_group<" << lsa_s2g_group_warps << ", "
+        << "using LSA_S2G_GROUP = " << ns << "::warp_group<" << lsa_s2g_group_warps << ", "
         << lsa_s2g_group_start << ">;\n"
-        << "using MAP_GROUP            = ht_ep::warp_group<" << map_group_warps << ", " << map_group_start << ">;\n"
-        << "using PAD_GROUP            = ht_ep::warp_group<" << pad_group_warps << ", " << pad_group_start << ">;\n"
-        << "using HEAD_EXTRA_GROUP     = ht_ep::warp_group<" << head_extra_group_warps << ", "
+        << "using MAP_GROUP            = " << ns << "::warp_group<" << map_group_warps << ", " << map_group_start
+        << ">;\n"
+        << "using PAD_GROUP            = " << ns << "::warp_group<" << pad_group_warps << ", " << pad_group_start
+        << ">;\n"
+        << "using HEAD_EXTRA_GROUP     = " << ns << "::warp_group<" << head_extra_group_warps << ", "
         << head_extra_group_start << ">;\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(GIN_GROUP::size() + LSA_G2S_GROUP::size() + "
            "LSA_S2G_GROUP::size() + MAP_GROUP::size() + PAD_GROUP::size() + HEAD_EXTRA_GROUP::size(), 1)\n"
         << "__global__ void " << kDispatchJitEntryName << "(\n"
-        << "    const __grid_constant__ ht_ep::dispatch_kernel_param_t<TOKEN_DATA_TYPE, " << lsa_team_size
+        << "    const __grid_constant__ " << ns << "::dispatch_kernel_param_t<TOKEN_DATA_TYPE, " << lsa_team_size
         << "> param) {\n"
         << "  extern __shared__ uint8_t smem_bytes[];\n"
-        << "  ht_ep::dispatch_kernel_impl<\n"
+        << "  " << ns << "::dispatch_kernel_impl<\n"
         << "      TOKEN_DATA_TYPE,\n"
         << "      SCALE_DATA_TYPE,\n"
         << "      " << kernel_spec.recipe_source_literal << ",\n"
@@ -177,6 +182,9 @@ inline ncclResult_t launch_dispatch(
     const dispatch_warp_layout_t L =
         compute_dispatch_warp_layout(num_lsa_teams, layout, config.num_pipelines, count_map_warp);
 
+    const HtKernelImpl impl = ht_select_kernel_impl(env);
+    const bool unordered_impl = impl == HtKernelImpl::kUnordered;
+
     static const int fwd_variant_identity = 0;
     static const int bwd_variant_identity = 0;
     const int& variant_identity = config.forward_dispatch ? fwd_variant_identity : bwd_variant_identity;
@@ -194,7 +202,8 @@ inline ncclResult_t launch_dispatch(
              << "_scale" << kernel_spec.scale_cache_tag
              << "_sf" << sf_bytes_per_token
              << "_epr" << experts_per_rank
-             << (count_map_warp ? "_countmap" : "");
+             << (count_map_warp ? "_countmap" : "")
+             << (unordered_impl ? "_unordered" : "");
         return name.str();
     }();
     const std::string source = dispatch_jit_source(
@@ -223,10 +232,11 @@ inline ncclResult_t launch_dispatch(
         hidden_dim,
         sf_bytes_per_token,
         experts_per_rank,
-        kernel_spec);
+        kernel_spec,
+        impl);
 
     ::nccl_ep::jit::JitKernelVariant variant;
-    variant.kernel_family = "ht_dispatch";
+    variant.kernel_family = unordered_impl ? "ht_dispatch_unordered" : "ht_dispatch";
     variant.variant_name = variant_name;
     variant.source = source;
     variant.entry_name = kDispatchJitEntryName;

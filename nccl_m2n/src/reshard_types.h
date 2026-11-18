@@ -54,6 +54,11 @@ typedef enum {
   RESHARD_PIPE_NET_HOST_RMA = 1
 } ReshardPipeNetMode;
 
+typedef enum {
+  RESHARD_PACK_NET_RMA = 0,
+  RESHARD_PACK_NET_HOST_SENDRECV = 1
+} ReshardPackNetMode;
+
 /* ncclDevComm is defined in nccl_device.h; only TUs that need the
    DevCommCacheEntry (reshard_cache.cc) include that header directly. */
 

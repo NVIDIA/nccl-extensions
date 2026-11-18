@@ -79,3 +79,18 @@ if ! grep -Eq '^\[  PASSED  \] [1-9][0-9]* tests?\.' "${log}"; then
   echo "basic_api_test_local completed without any passing test cases." >&2
   exit 1
 fi
+
+packSendRecvLog="$(mktemp)"
+trap 'rm -f "${log}" "${pipeLog:-}" "${packSendRecvLog}"' EXIT
+if ! NCCL_RESHARD_PACK_NET_MODE=HOST_SENDRECV NCCL_RESHARD_LOG_LEVEL=INFO \
+  "${binary}" -N "${numGpus}" --api default --copy-algorithm pack \
+  --gtest_filter='Matrix/BasicApiLocalTest.*' >"${packSendRecvLog}" 2>&1; then
+  cat "${packSendRecvLog}"
+  exit 1
+fi
+if ! grep -Fq 'pack-host-sendrecv: ranks=' "${packSendRecvLog}" ||
+   ! grep -Eq '^\[  PASSED  \] [1-9][0-9]* tests?\.' "${packSendRecvLog}"; then
+  cat "${packSendRecvLog}"
+  echo "PACK host_sendrecv local run did not execute the HOST_SENDRECV path." >&2
+  exit 1
+fi

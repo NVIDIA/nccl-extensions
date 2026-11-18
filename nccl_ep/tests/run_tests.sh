@@ -29,7 +29,14 @@ HT_EM_RERUN=0
 # AUTO tests independently clear this override and declare their top-k.
 export NCCL_EP_HT_PULL_PUSH=0
 
-# Benchmark capacity arithmetic is host-only and needs no GPU ranks.
+# Dispatch policy and benchmark capacity arithmetic need no GPU ranks.
+if [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ll_dispatch_policy" ]]; then
+    "${NCCL_EP_BUILDDIR}/test/nccl_ep/test_ll_dispatch_policy" || OVERALL_FAIL=1
+fi
+if [[ "${TEST_SUITE}" == "test_ll_dispatch_policy" ]]; then
+    exit "${OVERALL_FAIL}"
+fi
+
 if [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ep_bench_recv_budget" ]]; then
     "${NCCL_EP_BUILDDIR}/test/nccl_ep/test_ep_bench_recv_budget" || OVERALL_FAIL=1
 fi

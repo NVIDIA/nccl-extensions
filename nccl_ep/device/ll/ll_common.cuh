@@ -15,10 +15,10 @@ namespace ll {
 // Selects the epoch (send-buffer bank) for this launch and, on the control
 // thread, advances/pairs the send/recv halves of a split-phase launch so a
 // send-only call's epoch is picked up by the matching recv-only call.
-__device__ __forceinline__ unsigned int selectLowLatencyEpoch(
+__device__ __forceinline__ uint64_t selectLowLatencyEpoch(
     LowLatencyEpochState* epochState, int phases, int smId, int threadId) {
     if (phases & LOW_LATENCY_SEND_PHASE) {
-        const unsigned int epoch = epochState->epoch;
+        const uint64_t epoch = epochState->epoch;
         if (smId == 0 && threadId == 0) {
             EP_DEVICE_ASSERT(epochState->send_in_flight == 0);
             if ((phases & LOW_LATENCY_RECV_PHASE) == 0) {
@@ -29,7 +29,7 @@ __device__ __forceinline__ unsigned int selectLowLatencyEpoch(
         return epoch;
     }
 
-    const unsigned int epoch = epochState->pending_epoch;
+    const uint64_t epoch = epochState->pending_epoch;
     if (smId == 0 && threadId == 0) {
         EP_DEVICE_ASSERT(epochState->send_in_flight == 1);
         EP_DEVICE_ASSERT(epoch == epochState->epoch);

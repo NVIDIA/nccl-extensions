@@ -272,7 +272,7 @@ protected:
         }
     }
 
-    void run_expert_major(ncclDataType_t weight_dtype) {
+    void run_expert_major(ncclDataType_t weight_dtype, bool send_only = false) {
         const auto& config = test_case();
         set_weight_dtype(weight_dtype);
         CUDA_ASSERT(cudaMemsetAsync(d_expert_counts_, 0, config.experts_per_rank * sizeof(int32_t), g_stream));
@@ -288,7 +288,10 @@ protected:
         combine_inputs.tokens = t_expert_recv_;
         combine_outputs.tokens = t_combined_;
         combine_outputs.topk_weights = t_weights_;
-        NCCL_ASSERT(ncclEpCombine(expert_handle_, &combine_inputs, &combine_outputs, nullptr, g_stream));
+        ncclEpCombineConfig_t combine_config = NCCL_EP_COMBINE_CONFIG_INIT;
+        combine_config.send_only = send_only;
+        NCCL_ASSERT(ncclEpCombine(expert_handle_, &combine_inputs, &combine_outputs, &combine_config, g_stream));
+        NCCL_ASSERT(ncclEpComplete(expert_handle_, nullptr, g_stream));
         CUDA_ASSERT(cudaStreamSynchronize(g_stream));
         std::vector<nv_bfloat16> result(config.num_tokens * kFlagHidden);
         if (!result.empty()) {
@@ -306,7 +309,7 @@ protected:
         }
     }
 
-    void run_case(bool expect_counters, ncclDataType_t weight_dtype) {
+    void run_case(bool expect_counters, ncclDataType_t weight_dtype, bool send_only = false) {
         const auto& config = test_case();
         set_weight_dtype(weight_dtype);
         CUDA_ASSERT(cudaMemset(d_recv_idx_, 0x5a, g_nranks * kFlagMaxTokens * config.topk * sizeof(int32_t)));
@@ -328,7 +331,9 @@ protected:
         outputs.topk_weights = t_recv_weights_;
         outputs.topk_idx = t_recv_idx_;
         layout_info.src_rank_counters = t_counters;
-        NCCL_ASSERT(ncclEpDispatch(handle_, &inputs, &outputs, &layout_info, nullptr, g_stream));
+        ncclEpDispatchConfig_t dispatch_config = NCCL_EP_DISPATCH_CONFIG_INIT;
+        dispatch_config.send_only = send_only;
+        NCCL_ASSERT(ncclEpDispatch(handle_, &inputs, &outputs, &layout_info, &dispatch_config, g_stream));
         NCCL_ASSERT(ncclEpComplete(handle_, nullptr, g_stream));
         CUDA_ASSERT(cudaStreamSynchronize(g_stream));
 
@@ -458,6 +463,25 @@ TEST_P(RecvTopkIdxSentinelTest, ExpertMajorWindowOnlyWeights) {
     ASSERT_NO_FATAL_FAILURE(bind_weight_window(t_weights_, d_weights_, weights_window_storage_, weights_window_));
     for (auto dtype : {ncclFloat32, ncclBfloat16}) {
         ASSERT_NO_FATAL_FAILURE(run_expert_major(dtype));
+        expect_window_bindings_unchanged();
+    }
+}
+
+TEST_P(RecvTopkIdxSentinelTest, SplitPhaseRankMajorWindowOnlyWeights) {
+    ASSERT_NO_FATAL_FAILURE(bind_weight_window(t_weights_, d_weights_, weights_window_storage_, weights_window_));
+    ASSERT_NO_FATAL_FAILURE(bind_weight_window(
+        t_recv_weights_, d_recv_weights_, recv_weights_window_storage_, recv_weights_window_));
+    for (auto dtype : {ncclFloat32, ncclBfloat16}) {
+        ASSERT_NO_FATAL_FAILURE(run_case(true, dtype, true));
+        expect_window_bindings_unchanged();
+    }
+}
+
+TEST_P(RecvTopkIdxSentinelTest, SplitPhaseExpertMajorWindowOnlyWeights) {
+    ASSERT_NO_FATAL_FAILURE(setup_expert_major());
+    ASSERT_NO_FATAL_FAILURE(bind_weight_window(t_weights_, d_weights_, weights_window_storage_, weights_window_));
+    for (auto dtype : {ncclFloat32, ncclBfloat16}) {
+        ASSERT_NO_FATAL_FAILURE(run_expert_major(dtype, true));
         expect_window_bindings_unchanged();
     }
 }

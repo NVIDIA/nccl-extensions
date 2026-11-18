@@ -9,7 +9,8 @@
 
 #include <limits>
 
-#include "include/common.hpp"
+#include "common.hpp"
+#include "device/ll/ll_hier_delivery.cuh"
 
 namespace {
 
@@ -20,26 +21,47 @@ struct EpochObservation {
     LowLatencyEpochState state;
 };
 
+// PR tier: one GPU, bounded CTA-local stress; no communicator or timing assertion.
+__global__ void reuseHierControl(unsigned int* failures) {
+  __shared__ uint64_t scratch;
+  for (unsigned int generation = 0; generation < 512; ++generation) {
+    if (threadIdx.x >= 32 && (generation & 1) == 0) {
+      __nanosleep(100);
+    }
+    const uint64_t expected = (uint64_t(generation) << 32) | (generation & 1);
+    const uint64_t observed = nccl_ep::ll::hierBroadcastControl(ncclCoopCta(), scratch, expected);
+    if (threadIdx.x >= 32 && (generation & 1) != 0) {
+      __nanosleep(100);
+    }
+    if (observed != expected) {
+      atomicAdd(failures, 1U);
+    }
+  }
+}
+
 __global__ void fullOperation(LowLatencyEpochState* state, EpochObservation* observation) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    observation->bank = state->epoch & 1u;
-    ++state->epoch;
+    if (threadIdx.x != 0 || blockIdx.x != 0) {
+        return;
+    }
+    constexpr int phases = LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE;
+    observation->bank = nccl_ep::ll::selectLowLatencyEpoch(state, phases, 0, 0) & 1U;
+    nccl_ep::ll::completeFullLowLatencyEpoch(state, phases, 0, 0);
     observation->state = *state;
 }
 
 __global__ void sendOnly(LowLatencyEpochState* state, EpochObservation* observation) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    observation->bank = state->epoch & 1u;
-    state->pending_epoch = state->epoch;
-    state->send_in_flight = 1;
+    if (threadIdx.x != 0 || blockIdx.x != 0) {
+        return;
+    }
+    observation->bank = nccl_ep::ll::selectLowLatencyEpoch(state, LOW_LATENCY_SEND_PHASE, 0, 0) & 1U;
     observation->state = *state;
 }
 
 __global__ void recvOnly(LowLatencyEpochState* state, EpochObservation* observation) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    observation->bank = state->pending_epoch & 1u;
-    ++state->epoch;
-    state->send_in_flight = 0;
+    if (threadIdx.x != 0 || blockIdx.x != 0) {
+        return;
+    }
+    observation->bank = nccl_ep::ll::selectLowLatencyEpoch(state, LOW_LATENCY_RECV_PHASE, 0, 0) & 1U;
     observation->state = *state;
 }
 
@@ -75,6 +97,36 @@ TEST_F(LlEpochProtocolTest, FullOperationAdvancesTheLiveEpoch) {
     EXPECT_EQ(result.state.send_in_flight, 0u);
 }
 
+TEST_F(LlEpochProtocolTest, SharedEpochCrossesThe32BitBoundary) {
+    const uint64_t last32BitEpoch = std::numeric_limits<uint32_t>::max();
+    const LowLatencyEpochState initial{last32BitEpoch, 0, 0};
+    ASSERT_EQ(cudaMemcpy(state_, &initial, sizeof(initial), cudaMemcpyHostToDevice), cudaSuccess);
+    fullOperation<<<1, 1>>>(state_, observation_);
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    EpochObservation result{};
+    ASSERT_EQ(cudaMemcpy(&result, observation_, sizeof(result), cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(result.bank, 1U);
+    EXPECT_EQ(result.state.epoch, last32BitEpoch + 1);
+    sendOnly<<<1, 1>>>(state_, observation_);
+    recvOnly<<<1, 1>>>(state_, observation_);
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&result, observation_, sizeof(result), cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(result.bank, 0U);
+    EXPECT_EQ(result.state.epoch, last32BitEpoch + 2);
+    EXPECT_EQ(result.state.pending_epoch, last32BitEpoch + 1);
+    EXPECT_EQ(result.state.send_in_flight, 0U);
+}
+
+TEST_F(LlEpochProtocolTest, HierControlReadersFinishBeforeReuse) {
+  auto* failures = reinterpret_cast<unsigned int*>(state_);
+  ASSERT_EQ(cudaMemset(failures, 0, sizeof(*failures)), cudaSuccess);
+  reuseHierControl<<<32, 128>>>(failures);
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  unsigned int observed = 0;
+  ASSERT_EQ(cudaMemcpy(&observed, failures, sizeof(observed), cudaMemcpyDeviceToHost), cudaSuccess);
+  EXPECT_EQ(observed, 0U);
+}
+
 TEST_F(LlEpochProtocolTest, SplitOperationKeepsOneBankUntilRecvCompletes) {
     const LowLatencyEpochState initial{10, 0, 0};
     ASSERT_EQ(cudaMemcpy(state_, &initial, sizeof(initial), cudaMemcpyHostToDevice), cudaSuccess);
@@ -98,7 +150,7 @@ TEST_F(LlEpochProtocolTest, SplitOperationKeepsOneBankUntilRecvCompletes) {
 }
 
 TEST_F(LlEpochProtocolTest, EpochRolloverPreservesDoubleBufferParity) {
-    const LowLatencyEpochState initial{std::numeric_limits<unsigned int>::max(), 0, 0};
+    const LowLatencyEpochState initial{std::numeric_limits<uint64_t>::max(), 0, 0};
     ASSERT_EQ(cudaMemcpy(state_, &initial, sizeof(initial), cudaMemcpyHostToDevice), cudaSuccess);
     fullOperation<<<1, 1>>>(state_, observation_);
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);

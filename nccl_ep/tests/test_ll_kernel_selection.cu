@@ -5,11 +5,105 @@
 
 #include <gtest/gtest.h>
 #include "nccl_ep.h"
+#include "device/ll/ll_hier_delivery.cuh"
+#include <cstddef>
+#include <initializer_list>
+#include <vector>
 #include "device/jit/ll_dispatch_jit.cuh"
 #include "device/jit/ll_combine_jit.cuh"
 
 using namespace nccl_ep::ll;
 using namespace nccl_ep::ll::jit;
+
+TEST(LlHierPolicy, CapacityGeometryHonorsSmBudget) {
+  EXPECT_EQ(hierLogicalCtas(148, 148), 384);
+  EXPECT_EQ(hierLogicalCtas(32, 148), 32);
+  EXPECT_EQ(hierLogicalCtas(80, 80), 240);
+  for (int tokens : {0, 1, 4, 5, 8, 9, 16, 17, 32, 33}) {
+    const bool direct = hierSelectDirect(hierDirectCutoff(384), tokens);
+    const auto geometry = selectHierGeometry(384, tokens);
+    EXPECT_EQ(direct, tokens <= 32);
+    if (direct) {
+      EXPECT_EQ(geometry.blocks, tokens == 0 || (tokens > 8 && tokens <= 16) ? 128 : 256);
+      EXPECT_EQ(geometry.threads, tokens > 4 && tokens <= 16 ? 256 : 128);
+    } else {
+      EXPECT_EQ(geometry.blocks, 384);
+      EXPECT_EQ(geometry.numRdmaRecvCtas, 256);
+    }
+  }
+  EXPECT_EQ(selectHierGeometry(32, 1).blocks, 32);
+}
+
+TEST(LlHierPolicy, DirectRequiresSparseSourceCount) {
+  EXPECT_EQ(hierDirectCutoff(32), 20);
+  EXPECT_EQ(hierDirectCutoff(384), 32);
+  for (int logicalCtas = 3; logicalCtas <= int(kHierMaxLogicalCtas); ++logicalCtas) {
+    SCOPED_TRACE(logicalCtas);
+    const int sendCtas = hierNumRdmaSendCtas(logicalCtas);
+    const int cutoff = hierDirectCutoff(logicalCtas);
+    EXPECT_LT(cutoff, sendCtas);
+    for (int tokens : {cutoff, cutoff + 1, sendCtas - 1, sendCtas}) {
+      SCOPED_TRACE(tokens);
+      const bool direct = hierSelectDirect(cutoff, tokens);
+      EXPECT_EQ(direct, tokens <= kHierDirectMaxTokens && tokens < sendCtas);
+      const auto geometry = selectHierGeometry(logicalCtas, tokens);
+      EXPECT_EQ(geometry.minCtasPerSm < kHierMinCtasPerSm, direct);
+      if (direct) {
+        EXPECT_LT(tokens, sendCtas);
+      } else {
+        EXPECT_EQ(geometry.blocks, logicalCtas);
+        EXPECT_EQ(geometry.numRdmaRecvCtas, sendCtas);
+      }
+    }
+  }
+}
+
+template <typename WeightT>
+class LlHierReceivePolicy : public ::testing::Test {};
+using LlHierWeightTypes = ::testing::Types<float, __nv_bfloat16>;
+TYPED_TEST_SUITE(LlHierReceivePolicy, LlHierWeightTypes);
+
+TYPED_TEST(LlHierReceivePolicy, ReceiveChoiceUsesCapacityAndTopologyOnly) {
+  DispatchParams<TypeParam> params{};
+  params.roundRobinReceiveSupported = true;
+  params.hidden = 7168;
+  params.numTopk = 8;
+  params.deviceSm = 100;
+  params.numRanks = 16;
+  params.hier.numLogicalCtas = 384;
+  params.maxTokensPerRank = 8192;
+  params.tokenDtype = ncclBfloat16;
+  params.layout = NCCL_EP_LAYOUT_RANK_MAJOR;
+  for (int tokens : {-1, 0, 1, 16, 32, 33, 63, 64, 256, 8192, 8193}) {
+    params.numTokens = tokens;
+    EXPECT_TRUE(hierSelectRoundRobinReceive(params));
+  }
+  params.numTokens = 256;
+  for (unsigned sm : {80u, 90u, 100u, 103u}) {
+    params.deviceSm = sm;
+    EXPECT_TRUE(hierSelectRoundRobinReceive(params));
+  }
+  for (int topk : {0, 1, 6, 7, 8, 32}) {
+    params.numTopk = topk;
+    EXPECT_EQ(hierSelectRoundRobinReceive(params), topk == 6 || topk == 8);
+  }
+  params.numTopk = 8;
+  params.numRanks = 32;
+  EXPECT_FALSE(hierSelectRoundRobinReceive(params));
+  params.numRanks = 16;
+  params.maxTokensPerRank = 8193;
+  EXPECT_FALSE(hierSelectRoundRobinReceive(params));
+  params.maxTokensPerRank = 63;
+  EXPECT_FALSE(hierSelectRoundRobinReceive(params));
+  params.maxTokensPerRank = 64;
+  EXPECT_TRUE(hierSelectRoundRobinReceive(params));
+  params.maxTokensPerRank = 512;
+  params.roundRobinReceiveSupported = false;
+  EXPECT_FALSE(hierSelectRoundRobinReceive(params));
+  params.roundRobinReceiveSupported = true;
+  params.hier.numLogicalCtas = 32;
+  EXPECT_FALSE(hierSelectRoundRobinReceive(params));
+}
 
 TEST(LlKernelSelection, PartialDispatchTilesUseUniversalInBothModes) {
     struct Case {
@@ -259,3 +353,125 @@ TEST(LlKernelSelection, CftJitSeparatesSenderModes) {
     EXPECT_NE(counted.find("device/ll/ll_dispatch_cft_lsa.cuh"), std::string::npos);
     EXPECT_NE(counted.find("dispatch_kernel_impl_cft_rm_lsa<"), std::string::npos);
 }
+
+namespace {
+using namespace nccl_ep::ll;
+
+TEST(LlHierProtocol, SenderSelectionIsLocal) {
+  EXPECT_TRUE(hierSelectDirect(1, 0));
+  EXPECT_TRUE(hierSelectDirect(1, 1));
+  EXPECT_FALSE(hierSelectDirect(1, 256));
+  EXPECT_FALSE(hierSelectDirect(0, 1));
+  // Peers may choose independently in the same dispatch generation.
+  const int tokens[] = {0, 1, 2, 256};
+  const bool expected[] = {true, true, false, false};
+  for (int rank = 0; rank < 4; ++rank) {
+    EXPECT_EQ(hierSelectDirect(1, tokens[rank]), expected[rank]);
+  }
+}
+
+TEST(LlHierProtocol, CompactHeaderWrapsWithoutChangingDeliveryMode) {
+  EXPECT_EQ(sizeof(HierDeliveryHeader), 8u);
+  EXPECT_EQ(offsetof(HierDeliveryHeader, control), 4u);
+  for (uint64_t epoch = 0; epoch < 256; ++epoch) {
+    for (bool direct : {false, true}) {
+      HierDeliveryHeader header{0xffU, hierPacketControl(epoch, direct)};
+      EXPECT_EQ(hierDeliveryIsDirect(&header), direct);
+      EXPECT_EQ(header.control & 15U, (epoch + 1) % 16);
+      EXPECT_EQ(header.control & ~31U, 0U);
+      EXPECT_EQ(header.control, hierPacketControl(epoch + 16, direct));
+      // A label match is not a match of the final slot's full ready tag.
+      EXPECT_NE(epoch + 1, epoch + 17);
+    }
+  }
+}
+
+TEST(LlHierProtocol, EntryMaskAddressesTwoNvl72Domains) {
+  for (int rank = 0; rank < 144; ++rank) {
+    // Entry one targets the second expert on any GPU, including GPU 143.
+    // Entry zero is a disabled duplicate, so it cannot suppress entry one.
+    const uint16_t experts[] = {uint16_t(rank * 2), uint16_t(rank * 2 + 1)};
+    const HierDeliveryHeader header{2U, hierPacketControl(0, false)};
+    EXPECT_FALSE(hierDeliveryEntryEnabled(&header, 0));
+    ASSERT_TRUE(hierDeliveryEntryEnabled(&header, 1));
+    EXPECT_EQ(experts[1] / 2, rank);
+    EXPECT_FALSE(hierDeliveryEntryEnabled(&header, -1));
+    EXPECT_FALSE(hierDeliveryEntryEnabled(&header, 32));
+  }
+  const HierDeliveryHeader last{uint32_t(1) << 31, 0};
+  EXPECT_TRUE(hierDeliveryEntryEnabled(&last, 31));
+}
+
+TEST(LlHierProtocol, SparseRelayTerminalIncludesZeroAndRequiresSendCtaZero) {
+  for (uint64_t epoch = 0; epoch < 64; ++epoch) {
+    EXPECT_FALSE(hierDeliveryRelayComplete(0, epoch, 0));
+    EXPECT_TRUE(hierDeliveryRelayComplete(epoch + 1, epoch, 17));
+    for (int count : {0, 1, 17, 255}) {
+      const auto relay = hierDeliveryCount(epoch, count, false);
+      EXPECT_EQ(hierDeliveryDecode(relay, epoch), count);
+      EXPECT_TRUE(hierDeliveryRelayComplete(relay, epoch, 0));
+      EXPECT_FALSE(hierDeliveryRelayComplete(relay, epoch, 1));
+      EXPECT_FALSE(hierDeliveryRelayComplete(relay, epoch + 2, 0));
+      // Direct completions additionally require the strong full-generation
+      // counter and cannot be consumed as ordinary relay terminals.
+      EXPECT_FALSE(hierDeliveryRelayComplete(hierDeliveryCount(epoch, count, true), epoch, 0));
+    }
+  }
+}
+
+TEST(LlHierProtocol, StrongCountersSurviveSkippedDirectEpochsAndPackedEpochWrap) {
+  uint64_t history[2] = {}, remote[2] = {};
+  for (uint64_t epoch : {uint64_t(0), uint64_t(1), uint64_t(16), uint64_t(17), uint64_t(1) << 30,
+                         (uint64_t(1) << 30) + 1, uint64_t(1) << 32, (uint64_t(1) << 32) + 1}) {
+    const int bank = epoch & 1;
+    const uint64_t tag = epoch + 1;
+    remote[bank] += tag - history[bank];
+    history[bank] = tag;
+    EXPECT_EQ(remote[bank], tag);
+  }
+  const uint64_t old = hierDeliveryCount(0, 1, true);
+  const uint64_t freshEpoch = uint64_t(1) << 30;
+  EXPECT_EQ(old, hierDeliveryCount(freshEpoch, 1, true));
+  EXPECT_EQ(hierDeliveryDecode(old, freshEpoch), 1);
+  EXPECT_NE(uint64_t(1), freshEpoch + 1);  // stale strong counter must fail
+}
+TEST(LlHierProtocol, StridedPeersPreserveDenseContextOrdinals) {
+  for (int domains : {2, 3, 4}) {
+    for (int localSize : {1, 4, 8, 72}) {
+      const int ranks = domains * localSize;
+      for (int stride : {1, domains}) {
+        for (int first = 0; first + (localSize - 1) * stride < ranks; ++first) {
+          std::vector<bool> local(ranks, false);
+          for (int i = 0; i < localSize; ++i) {
+            local[first + i * stride] = true;
+          }
+          int ordinal = 0;
+          for (int peer = 0; peer < ranks; ++peer) {
+            if (!local[peer]) {
+              EXPECT_EQ(hierRemotePeerOrdinal(peer, first, localSize, stride), ordinal);
+              ++ordinal;
+            }
+          }
+          EXPECT_EQ(ordinal, ranks - localSize);
+          for (int numWarps : {1, 4, 8}) {
+            std::vector<int> owners(ranks - localSize, 0);
+            for (int warp = 0; warp < numWarps; ++warp) {
+              for (int peer = warp; peer < ranks; peer += numWarps) {
+                if (!local[peer]) {
+                  const int index = hierRemotePeerOrdinal(peer, first, localSize, stride);
+                  ASSERT_GE(index, 0);
+                  ASSERT_LT(index, owners.size());
+                  ++owners[index];
+                }
+              }
+            }
+            for (int count : owners) {
+              EXPECT_EQ(count, 1);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+}  // namespace

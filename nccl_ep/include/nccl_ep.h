@@ -653,18 +653,21 @@ ncclResult_t ncclEpHandleMemSize(
 // Must be called before the first ncclEpDispatch/ncclEpCombine.
 //
 // NOTE: the impact of auto-sizing of internal buffers
-// (ncclEpGroupConfig_t::rdma_buffer_size == NCCL_EP_AUTO):
+// (ncclEpGroupConfig_t::rdma_buffer_size == NCCL_EP_AUTO) or hierarchical LL bank layout changes:
 // * collective behaviour: This function MAY be collective and must be called by all ranks
 //   in the group in the same order.
 // * memory allocation/re-allocation: This function may perform allocation/re-allocation
 //   if the new layout/topK requires more memory than the current allocation. All ranks
 //   must call this function in lockstep with the same (layout, num_topk).
 //   No active communication is allowed between the ranks during this operation.
+//   Complete all pending send_only operations on every handle with ncclEpComplete
+//   and synchronize their streams on all ranks before LL handle initialization.
 // * CUDA graph invalidation: This function must not be included in CUDA graph captures.
+//   Destroy and re-capture EP graphs after reallocation or shared bank layout changes.
 //
 // Use an explicit, sufficiently large rdma_buffer_size if you need to
-// avoid collective allocation/re-allocation, mid-stream reallocation, or graph
-// invalidation.
+// avoid reallocation. Hierarchical LL may still collectively change shared bank
+// offsets, requiring matching handle initialization across ranks and graph recapture.
 // Alternatively, to avoid CUDA graph invalidation, all Handles must be created
 // before the beginning of the CUDA graph capture.
 //
@@ -801,7 +804,7 @@ ncclResult_t ncclEpHandleMemSize(
     size_t* size_out,
     int num_topk);
 
-// Allocate handle buffers without performing any collective.
+// Allocate handle buffers; LL initialization may be collective (see above).
 // Call ncclEpUpdateHandle before the first ncclEpDispatch/ncclEpCombine.
 //
 // handle_mem == NULL:  NCCL EP allocates via alloc_fn; handle owns the memory.
@@ -913,6 +916,7 @@ typedef struct {
     unsigned int size; // = sizeof(this struct); first field, never moves
     unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
     unsigned int send_only; // if non-zero, only initiate transfers; requires ncclEpComplete() afterward
+                            // Must be the same on all ranks for a given call.
   //   supported for LL mode only; output tensors must still be preallocated
     unsigned int round_scales; // whether to round the scaling factors tensor into a power of 2
     ncclEpPassDir_t pass_direction; // forward (default) or backward pass; HT-only.
@@ -1033,6 +1037,7 @@ typedef struct {
     unsigned int size; // = sizeof(this struct); first field, never moves
     unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
     unsigned int send_only; // if non-zero, only initiate transfers; requires ncclEpComplete() afterward
+                            // Must be the same on all ranks for a given call.
     //   supported for LL mode only; output tensors must still be preallocated
     ncclEpPassDir_t pass_direction; // forward (default) or backward pass; HT-only.
     //   FWD forbids inputs->topk_weights; BWD requires inputs->topk_weights

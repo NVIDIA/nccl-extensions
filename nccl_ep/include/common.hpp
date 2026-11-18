@@ -118,6 +118,8 @@ static constexpr int kPullMaxLsaRanks = 128;
 
 namespace nccl_ep {
 
+constexpr int kBf16PerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
+
 inline constexpr std::string_view host_device_fp4_target_arch(unsigned int sm) {
     switch (sm) {
     case 100:
@@ -415,8 +417,8 @@ struct LowLatencyBuffer {
 };
 
 struct LowLatencyEpochState {
-    unsigned int epoch = 0;
-    unsigned int pending_epoch = 0;
+    uint64_t epoch = 0;
+    uint64_t pending_epoch = 0;
     unsigned int send_in_flight = 0;
 };
 

@@ -43,6 +43,7 @@ struct ncclEpEnvVar {
     ncclEpEnvType type;
     const char* const* choices = nullptr; // Null-terminated names for choice variables.
     bool is_set = false;
+    bool valid = true;
     union {
         unsigned long ul = 0;
         bool flag;
@@ -108,6 +109,9 @@ struct ncclEpEnvConfig {
     ncclEpEnvVar ll_cft{"NCCL_EP_LL_CFT", ncclEpEnvType::flag};
     // Debug-only driver API floor override for testing platform rejection.
     ncclEpEnvVar ll_cft_debug_min_driver{"NCCL_EP_LL_CFT_DEBUG_MIN_DRIVER", ncclEpEnvType::ulong};
+    // Unset: model-based AUTO. 0: baseline. 1: force Hierarchical (Direct/relay protocol).
+    ncclEpEnvVar ll_hier_dispatch{"NCCL_EP_LL_HIER_DISPATCH", ncclEpEnvType::flag};
+    ncclEpEnvVar ll_hier_full_gin{"NCCL_EP_LL_HIER_FULL_GIN", ncclEpEnvType::flag};
     // Selects which LL dispatch kernel family an otherwise LSA-eligible call (nvlinkOnly,
     // rank-major) uses: "simt" = dispatch_kernel_impl_2sided_rm_lsa, "tma" (default when unset) =
     // dispatch_kernel_impl_2sided_rm_lsa_tma, "universal" = the general dispatch_kernel_impl in

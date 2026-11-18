@@ -23,6 +23,11 @@ In this mode, the operation is split into the send and receive phases enabling c
   * This enables an application to utilize all avaialble GPU resources for computation while offloaded data transfers are performed.
   * To complete the operation, the `ncclEpComplete()` primitive is used.
 
+`send_only` is a collective property of the call: all ranks in the group must
+pass the same value for a given dispatch or combine. Mixing staged and
+synchronous calls across ranks for the same operation is unsupported and results
+in undefined behavior, typically a timeout.
+
 This mode is particularly beneficial for inference with multiple micro-batches.
 
 ```c

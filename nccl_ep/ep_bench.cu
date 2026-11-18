@@ -14,6 +14,7 @@
 #include <strings.h>
 #include <unistd.h>
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -5396,6 +5397,7 @@ void printUsage(const char* programName, int myRank) {
         printf("  --top-k <num>           Top-k experts per token (default: 8)\n");
         printf("  --experts <num>         Total number of experts (default: 256)\n");
         printf("  --weight-dtype <dtype>  Routing weights: fp32 (default) or bf16 (LL only)\n");
+        printf("  --num-qp-per-rank <auto|num>  API QP/context budget (default: auto; 0 = auto)\n");
         printf("  --warmup <num>          Warmup iterations (default: 10)\n");
         printf("  --iters <num>           Benchmark iterations (default: 50)\n");
         printf("  --cuda-graph            Replay one graph containing dispatch+combine during measurement\n");
@@ -5508,6 +5510,7 @@ int main(int argc, char* argv[]) {
     unsigned int max_num_sms = NCCL_EP_AUTO;  // Automatic SM assignment for different EP stages
     unsigned int dispatch_num_sms = NCCL_EP_AUTO;
     unsigned int combine_num_sms = NCCL_EP_AUTO;
+    unsigned int num_qp_per_rank = NCCL_EP_AUTO;
     bool ht_em_local_dup = false;
     bool ht_em_mode_explicit = false;
     bool ht_em_local_permute_explicit = false;
@@ -5580,6 +5583,7 @@ int main(int argc, char* argv[]) {
         {"overflow-drop", no_argument, 0, 1008},
         {"meta-exchange-policy", required_argument, 0, 1010},
         {"ht-flow", required_argument, 0, 1011},
+        {"num-qp-per-rank", required_argument, 0, 1016},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
@@ -5675,6 +5679,24 @@ int main(int argc, char* argv[]) {
         case 1007:
             combine_num_sms = static_cast<unsigned int>(atoi(optarg));
             break;
+        case 1016: {
+            if (strcasecmp(optarg, "auto") == 0) {
+                num_qp_per_rank = NCCL_EP_AUTO;
+                break;
+            }
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long value = strtoul(optarg, &end, 10);
+            if (optarg[0] == '-' || end == optarg || *end != '\0' || errno == ERANGE || value > UINT_MAX) {
+                if (myRank == 0) {
+                    fprintf(stderr, "Error: --num-qp-per-rank requires auto or an unsigned integer\n");
+                }
+                MPI_Finalize();
+                return 1;
+            }
+            num_qp_per_rank = static_cast<unsigned int>(value);
+            break;
+        }
         case 'm':
             ht_em_mode_explicit = true;
             ht_em_local_dup = false;
@@ -6159,6 +6181,11 @@ int main(int argc, char* argv[]) {
             layout == NCCL_EP_LAYOUT_RANK_MAJOR ? "rank-major" :
                                                   "expert-major");
         printf("  Ranks:           %d\n", nRanks);
+        if (num_qp_per_rank == NCCL_EP_AUTO) {
+            printf("  QP/context budget: auto\n");
+        } else {
+            printf("  QP/context budget: %u\n", num_qp_per_rank);
+        }
         if (max_num_sms != NCCL_EP_AUTO) {
             printf("  Shared SMs:      %u\n", max_num_sms);
         } else {
@@ -6308,8 +6335,7 @@ int main(int argc, char* argv[]) {
     // Use NCCL_EP_AUTO for buffer sizes (required for dynamic tokens with larger batches)
     // For LL mode with disable_nvlink: NCCL_P2P_DISABLE env var handles NCCL GIN P2P
     config.rdma_buffer_size = NCCL_EP_AUTO;
-    // num_qp_per_rank: LL mode requires >= num_local_experts, HT mode uses auto
-    config.num_qp_per_rank = (algorithm == NCCL_EP_ALGO_LOW_LATENCY) ? num_local_experts : NCCL_EP_AUTO;
+    config.num_qp_per_rank = num_qp_per_rank;
     config.num_channels = NCCL_EP_AUTO;
     if (overflow_drop) config.overflow_policy = NCCL_EP_OVERFLOW_DROP;
     // An explicit local-permute benchmark request must override the new AUTO flow.

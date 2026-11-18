@@ -28,6 +28,7 @@ void parse_flag(ncclEpEnvVar& var) {
         var.is_set = true;
         var.value.flag = false;
     } else {
+        var.valid = false;
         std::fprintf(stderr, "[nccl_ep] %s=%s ignored (expected 1/on/true or 0/off/false)\n", var.name, v);
     }
 }
@@ -100,6 +101,8 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_flag(cfg->ht_count_unfused);
     parse_flag(cfg->disable_guard);
     parse_flag(cfg->ll_cft);
+    parse_flag(cfg->ll_hier_dispatch);
+    parse_flag(cfg->ll_hier_full_gin);
 
     parse_timeout_ms(cfg->timeout_ms);
     parse_choice(cfg->ht_recv_topk_order);
@@ -145,6 +148,8 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.dispatch_copy_mode,
         &cfg.disable_guard,
         &cfg.ll_cft,
+        &cfg.ll_hier_dispatch,
+        &cfg.ll_hier_full_gin,
         &cfg.timeout_ms,
         &cfg.comm_num_sms,
         &cfg.dispatch_num_sms,

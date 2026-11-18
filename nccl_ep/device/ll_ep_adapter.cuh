@@ -209,8 +209,26 @@ struct cft_dispatch_args_t {
     int             countedPayload;      // LSA-CFT: 1 = this rank's payload puts are counted in this dispatch
 };
 
+// Shared buffer layout is independent of each rank's physical launch geometry.
+struct HierDispatchResources {
+    unsigned signalBase = 0;
+    ncclWindow_t window{};
+    uint8_t* buffer = nullptr;
+    size_t controlBankStride = 0;
+    size_t relayOffset = 0;
+    size_t finalOffset = 0;
+    size_t readyOffset = 0;
+    size_t doneOffset = 0;
+    size_t arrivalsOffset = 0;
+    size_t flatCompletionOffset = 0;
+    size_t slotBytes = 0;
+    int headerBytes = 0;
+    int numLogicalCtas = 0;
+};
+
 template <typename WeightT>
 struct dispatch_kernel_args_t {
+    HierDispatchResources hier;
     // INPUT
     const void* inData;
     const void* inScalesBuf;      // non-null for QUANT_FWD; runtime-typed storage
@@ -386,6 +404,8 @@ struct clean_low_latency_buffer_kernel_args_t {
 
 template <typename WeightT>
 struct DispatchParams {
+    HierDispatchResources hier;
+    bool roundRobinReceiveSupported = false; // Host-only topology/context capability, not a device argument.
     int maxDynamicSmem = 0; // Cached device capacity; also honors the test override.
     // User inputs
     const void* inData;

@@ -138,6 +138,7 @@ ncclResult_t call_dispatch(
     }
 
     dispatch_kernel_args_t<WeightT> args{};
+    args.hier = params.hier;
     args.inData = params.inData;
     args.inScalesBuf = params.inScalesBuf;
     args.inTopkIdx = params.inTopkIdx;
@@ -190,6 +191,10 @@ ncclResult_t call_dispatch(
     args.recvDataOffset = params.recvDataOffset;
     args.rcvScalesWin = params.rcvScalesWin;
     args.rcvScalesOffs = params.rcvScalesOffs;
+    // Group-selected Hierarchical precedes ordinary CFT/LSA kernel selection.
+    if (params.hier.buffer != nullptr) {
+        return jit::launch_ll_hier_dispatch(params, args, recipe, stream, nucs);
+    }
     args.cft.peerLeIds          = params.cftPeerLeIds;
     args.cft.recvBase           = params.cftRecvBase;
     args.cft.bytesCntrBaseOff   = params.cftBytesCntrBaseOff;

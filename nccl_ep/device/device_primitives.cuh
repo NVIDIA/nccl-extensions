@@ -50,7 +50,6 @@
 namespace nccl_ep {
 
 constexpr int kWarpSize = 32; // CUDA hardware warp width.
-constexpr int kBf16PerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
 
 // Compiler ordering only; does not emit a hardware fence.
 __device__ __forceinline__ void compiler_fence() {
@@ -435,9 +434,14 @@ __device__ __forceinline__ int ld_acquire_sys_global(const int* ptr) {
     return ret;
 }
 
+template <bool memory = false>
 __device__ __forceinline__ uint64_t ld_acquire_sys_global(const uint64_t* ptr) {
     uint64_t ret;
-    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr));
+    if constexpr (memory) {
+        asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr) : "memory");
+    } else {
+        asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr));
+    }
     return ret;
 }
 
@@ -565,6 +569,10 @@ __device__ __forceinline__ void st_release_cta(const int* ptr, int val) {
 
 __device__ __forceinline__ void st_relaxed_sys_global(const int* ptr, int val) {
     asm volatile("st.relaxed.sys.global.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
+}
+
+__device__ __forceinline__ void st_relaxed_sys_global(const uint64_t* ptr, uint64_t val) {
+    asm volatile("st.relaxed.sys.global.u64 [%0], %1;" :: "l"(ptr), "l"(val) : "memory");
 }
 
 __device__ __forceinline__ void st_relaxed_gpu_global(uint64_t* ptr, uint64_t val) {

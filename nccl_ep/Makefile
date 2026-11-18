@@ -85,6 +85,8 @@ NCCL_EP_JIT_HEADERS := \
     device/ll/ll_lsa_primitives.cuh \
     device/ll/ll_mask.cuh \
     device/ll/ll_logfmt.cuh \
+    device/ll/ll_dispatch_hier.cuh \
+    device/ll/ll_hier_delivery.cuh \
     device/ll/ll_dispatch_lsa.cuh \
     device/ll/ll_dispatch_cft_lsa.cuh \
     device/ll/ll_combine_lsa.cuh \

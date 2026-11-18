@@ -9,10 +9,13 @@
 #include "device/device_primitives.cuh"
 #include "device/ll/ll_ep_smem.cuh"
 #include "device/ll_ep_adapter.cuh"
+#include "device/ll/ll_hier_delivery.cuh"
 #include "device/jit/jit_runtime.hpp"
 #include "device/jit/jit_source_literals.hpp"
 #include "quantization_recipe.hpp"
 
+#include <algorithm>
+#include <limits>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -453,6 +456,83 @@ inline ncclResult_t launch_ll_dispatch(
         return ncclInternalError;
     }
     return ncclSuccess;
+}
+
+// Each specialization stages, sends, receives and compacts in one launch.
+// Launch specialization uses capacity; send mode is selected at execution.
+template <typename WeightT>
+inline ncclResult_t launch_ll_hier_dispatch(const DispatchParams<WeightT>& params, const dispatch_kernel_args_t<WeightT>& input,
+                                            ncclEpDispQuant_t recipe, cudaStream_t stream, bool nucs) {
+  if (params.layout != NCCL_EP_LAYOUT_RANK_MAJOR ||
+      recipe != NCCL_EP_DISP_QUANT_NONE ||
+      params.tokenDtype != ncclBfloat16 ||
+      params.hidden % ::nccl_ep::kBf16PerInt4 ||
+      params.nvlinkOnly ||
+      params.phases != (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE) ||
+      params.recvDataWindow != ncclWindow_t{} ||
+      params.rankMask ||
+      params.numAttnRanks) {
+    fprintf(stderr, "NCCL EP: fused dispatch requires full-phase unquantized BF16 rank-major "
+                    "dispatch with multiple LSA domains and staged outputs\n");
+    return ncclInvalidUsage;
+  }
+  static_assert(std::is_same_v<WeightT, float> || std::is_same_v<WeightT, __nv_bfloat16>);
+  constexpr ncclDataType_t weightDtype = std::is_same_v<WeightT, float> ? ncclFloat32 : ncclBfloat16;
+  *params.dstInfoDisqualifiedOut = true;
+  auto args = input;
+  const auto& resources = args.hier;
+  const int numRdmaSendCtas = hierNumRdmaSendCtas(resources.numLogicalCtas);
+  const bool roundRobinReceive = hierSelectRoundRobinReceive(params);
+  const auto geometry = selectHierGeometry(resources.numLogicalCtas, params.maxTokensPerRank);
+  static const int identities[2] = {};
+  ::nccl_ep::jit::JitKernelVariant variant;
+  variant.identity = &identities[int(roundRobinReceive)];
+  variant.kernel_family = "ll_dispatch_hierarchical";
+  variant.entry_name = "nccl_ep_jit_ll_dispatch_hierarchical";
+  variant.device_sm = params.deviceSm;
+  variant.num_blocks = geometry.blocks;
+  variant.block_dim = geometry.threads;
+  variant.cooperative = true;
+  variant.require_full_residency = true;
+  variant.cluster_dim_x = 1;
+  variant.nucs = nucs;
+  variant.propagate_cache_errors = true;
+  uint64_t key = ::nccl_ep::jit::kRuntimeKeySeed;
+  const int keyValues[] = {params.hidden, params.numTopk, int(params.topkIdxIsInt64), numRdmaSendCtas,
+                           geometry.numRdmaRecvCtas, geometry.minCtasPerSm, geometry.threads,
+                           int(roundRobinReceive), int(weightDtype)};
+  for (int value : keyValues) {
+    key = ::nccl_ep::jit::runtime_key_mix(key, value);
+  }
+  variant.runtime_key = key;
+  std::string error;
+  auto status = ::nccl_ep::jit::launch_jit_kernel_cached(variant, &args, 0, stream, &error);
+  if (status == ::nccl_ep::jit::JitKernelStatus::kDisabled) {
+    std::ostringstream name, source;
+    const int indexBits = params.topkIdxIsInt64 ? std::numeric_limits<uint64_t>::digits :
+                                                std::numeric_limits<uint32_t>::digits;
+    name << "fused_w" << int(weightDtype) << "_h" << params.hidden << "_k" << params.numTopk << "_idx" << indexBits << "_s"
+         << numRdmaSendCtas << "_r" << geometry.numRdmaRecvCtas << "_runtime_send"
+         << "_min" << geometry.minCtasPerSm << "_threads" << geometry.threads
+         << "_receive_" << (roundRobinReceive ? "round_robin" : "fixed");
+    source << "#include \"device/ll/ll_dispatch_hier.cuh\"\n"
+           << "extern \"C\" __global__ __launch_bounds__(" << geometry.threads << ", " << geometry.minCtasPerSm << ") void "
+           << variant.entry_name << "(const __grid_constant__ nccl_ep::ll::dispatch_kernel_args_t<"
+           << ::nccl_ep::jit::routing_weight_type_literal(weightDtype) << "> params) {\n"
+           << "nccl_ep::ll::dispatch_kernel_impl_hier<" << params.hidden << "," << params.numTopk << ","
+           << (params.topkIdxIsInt64 ? "int64_t" : "int32_t") << "," << numRdmaSendCtas << "," << geometry.numRdmaRecvCtas << ","
+           << (roundRobinReceive ? "true" : "false") << ">(params);\n}\n";
+    const std::string variantName = name.str();
+    const std::string code = source.str();
+    variant.variant_name = variantName;
+    variant.source = code;
+    status = ::nccl_ep::jit::launch_jit_kernel(variant, &args, stream, &error);
+  }
+  if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
+    fprintf(stderr, "fused dispatch JIT failed: %s\n", error.c_str());
+    return ncclInternalError;
+  }
+  return ncclSuccess;
 }
 
 } // namespace jit

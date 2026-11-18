@@ -6,6 +6,7 @@
 
 #include <unistd.h>
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cerrno>
 #include <cmath>
@@ -31,12 +32,13 @@
 #include "ht_compact_prob.h"
 #include "ht_chunk_config.hpp"
 #include "ht_sm_policy.hpp"
+#include "ll_dispatch_policy.h"
 #include "common.hpp"
 
 // HT (High Throughput) includes
 #include "device/ht_ep_adapter.cuh"
 #include "device/ht_ep_configs.cuh"
-#include "device/ll_ep_adapter.cuh"
+#include "device/ll/ll_hier_delivery.cuh"
 #include "device/jit/jit_runtime.hpp"
 
 namespace ll = nccl_ep::ll;
@@ -809,6 +811,7 @@ struct ncclEpGroup {
     //     to exactly that size. Handle init rejects (returns an error) any
     //     handle whose layout does not fit; no growth is performed.
     size_t rdma_buffer_size_alloc;
+    size_t ll_payload_slot_stride = 0;
     nccl_ep::LowLatencyEpochState* ll_epoch_state = nullptr;
     ncclEpGroupConfig_t config;         // Stored configuration
 
@@ -915,6 +918,8 @@ struct ncclEpGroup {
     size_t num_nccl_comms;
     std::vector<ncclComm_t> nccl_comms;
     ncclDevComm_t* nccl_dev_comm;
+    nccl_ep::ll::HierDispatchResources ll_hier;
+    bool ll_gin_contexts_restricted = false;
     ncclWindow_t* nccl_wins;
     int num_dispatch_signals;
     unsigned clean_barrier_signal_base;
@@ -1864,6 +1869,65 @@ static ncclResult_t devCommAllocAndCopyToDevice(ncclComm_t comm, ncclDevComm_t**
     return ncclInternalError;
 }
 
+static void init_ll_hier_layout(ncclEpGroup_t group) {
+    auto& resources = group->ll_hier;
+    constexpr size_t slotAlignment = ll::kHierSlotAlignment;
+    resources.headerBytes = nccl_ep::align(
+        nccl_ep::ll::get_dispatch_hdr_sz(MAX_NUM_TOPK, NCCL_EP_LAYOUT_RANK_MAJOR) + sizeof(int4), slotAlignment);
+    resources.slotBytes = nccl_ep::align(size_t(resources.headerBytes) + group->config.max_token_bytes, slotAlignment);
+}
+
+// Buffer strides and connection mode must agree; physical launches remain rank-local.
+static ncclResult_t configure_ll_hier(ncclEpGroup_t group, cudaStream_t stream) {
+    const auto& env = group->env;
+    const bool fullGin = !env.ll_hier_full_gin.is_set || env.ll_hier_full_gin.value.flag;
+    const int numLogicalCtas = ll::hierLogicalCtas(group->dispatch_num_sms, group->device_sm_count);
+    const bool supported = env.ll_hier_full_gin.valid && fullGin && numLogicalCtas >= 2 &&
+        ncclTeamRail(group->comm).nRanks > 1 && !group->num_attn_ranks &&
+        !group->config.enable_mask && !nccl_ep_env_flag_on(env.ll_cft) &&
+        group->config.zero_copy != NCCL_EP_ZERO_COPY_ON;
+    const bool automatic = !env.ll_hier_dispatch.is_set;
+    const bool enabled = automatic ?
+        supported && ll::llMayUseHierarchicalDispatch(ncclTeamRail(group->comm).nRanks,
+            ncclTeamLsa(group->comm).nRanks, group->config.max_dispatch_tokens_per_rank,
+            group->config.num_experts, group->config.num_topk, group->config.max_token_bytes,
+            group->ll_gin_contexts_restricted) :
+        nccl_ep_env_flag_on(env.ll_hier_dispatch);
+    const bool valid = env.ll_hier_dispatch.valid && (!enabled || supported);
+    using Vote = std::array<uint64_t, 13>;
+    const Vote local = {uint64_t(enabled), uint64_t(numLogicalCtas), group->config.max_dispatch_tokens_per_rank,
+        uint64_t(fullGin), uint64_t(valid), group->config.num_qp_per_rank, uint64_t(automatic),
+        uint64_t(ncclTeamRail(group->comm).nRanks), uint64_t(ncclTeamLsa(group->comm).nRanks),
+        group->config.num_experts, group->config.max_token_bytes, group->device_sm, group->config.num_topk};
+    std::vector<Vote> votes(group->nRanks);
+    votes[group->rank] = local;
+    ncclAllGatherHost(votes.data(), sizeof(Vote), group->rank, group->nRanks, group->comm, stream);
+    for (const auto& vote : votes) {
+        if (!vote[4]) {
+            fprintf(stderr, "NCCL EP: hierarchical dispatch requires FULL GIN and a supported topology/configuration\n");
+            return ncclInvalidUsage;
+        }
+        if (vote[0] != local[0] || (enabled && vote != local)) {
+            fprintf(stderr, "NCCL EP: hierarchical buffer layout and connection mode must agree on all ranks\n");
+            return ncclInvalidUsage;
+        }
+    }
+    if (!enabled) {
+        if (group->rank == 0 && automatic) {
+            fprintf(stderr, "[LL dispatch] Baseline family selected (automatic cost model)\n");
+        }
+        return ncclSuccess;
+    }
+    if (group->rank == 0) {
+        fprintf(stderr, "[LL dispatch] Hierarchical resources enabled (%s); handle model selects family\n",
+                automatic ? "automatic model" : "forced");
+    }
+    auto& resources = group->ll_hier;
+    resources.numLogicalCtas = numLogicalCtas;
+    init_ll_hier_layout(group);
+    return ncclSuccess;
+}
+
 static ncclResult_t
 init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, cudaStream_t stream) {
     // Initialize using public NCCL APIs
@@ -2685,11 +2749,14 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         ep_group->config.num_channels = 10;
     }
 
+    // Dispatch dedicates N2N warps per CTA; combine reuses this pool.
+    const unsigned autoGinContexts =
+        NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
     if (ep_group->config.num_qp_per_rank == NCCL_EP_AUTO) {
-        // Dispatch dedicates N2N warps per CTA; combine reuses this pool.
-        ep_group->config.num_qp_per_rank =
-            NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
+        ep_group->config.num_qp_per_rank = autoGinContexts;
     }
+    ep_group->ll_gin_contexts_restricted =
+        ll::llGinContextsRestricted(ep_group->config.num_qp_per_rank, autoGinContexts);
 
     // Resolve timeout_cycles: env var > config field > compile-time default
     {
@@ -2982,6 +3049,11 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             return ncclInvalidUsage;
         }
 
+        const ncclResult_t hier_result = configure_ll_hier(ep_group, stream);
+        if (hier_result != ncclSuccess) {
+          return reject_group(hier_result);
+        }
+
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
         if (props.nLsaTeams > 1) {
             reqs.ginContextCount = ep_group->config.num_qp_per_rank; // all contexts in single comm
@@ -2990,10 +3062,34 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             reqs.ginForceEnable = true;
             reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
             reqs.worldGinBarrierCount = 1;
+            if (ep_group->ll_hier.numLogicalCtas != 0) {
+                ep_group->ll_hier.signalBase = reqs.ginSignalCount;
+                reqs.ginSignalCount += 2 * ep_group->nRanks *
+                    ll::hierNumRdmaSendCtas(ep_group->ll_hier.numLogicalCtas);
+                reqs.ginStrongSignalsRequired = true;
+            }
         }
         ncclDevComm_t* nccl_dev_comm_host = nullptr;
         size_t dcomm_bytes = 0;
         NCCL_CHECK_RESULT(devCommCreate(ep_group->comm, &reqs, &nccl_dev_comm_host, &dcomm_bytes));
+        if (ep_group->ll_hier.numLogicalCtas != 0) {
+            const bool exceedsBudget = in_config->num_qp_per_rank != NCCL_EP_AUTO &&
+                nccl_dev_comm_host->ginContextCount > reqs.ginContextCount;
+            if (nccl_dev_comm_host->ginContextCount < MAX_NCCL_GIN_CTX_PER_COMM || exceedsBudget) {
+                fprintf(stderr, "NCCL EP: LL requires at least %d contexts within the configured budget; "
+                                "requested %u, received %d\n",
+                        MAX_NCCL_GIN_CTX_PER_COMM, unsigned(reqs.ginContextCount), nccl_dev_comm_host->ginContextCount);
+                ncclDevCommDestroy(ep_group->comm, nccl_dev_comm_host);
+                free(nccl_dev_comm_host);
+                return reject_group(ncclInvalidUsage);
+            }
+            if (ep_group->rank == 0) {
+                fprintf(stderr, "[hier routing] FULL target-first; shared LL device communicator\n");
+                fprintf(stderr, "[hier GIN] backend=%u context-stride=%d contexts=%d requested=%u signal-base=%u\n",
+                        unsigned(nccl_dev_comm_host->ginNetDeviceTypes[0]), nccl_dev_comm_host->ginContextStride,
+                        nccl_dev_comm_host->ginContextCount, unsigned(reqs.ginContextCount), ep_group->ll_hier.signalBase);
+            }
+        }
 
         NCCL_CHECK_RESULT(devCommAllocAndCopyToDevice(
             ep_group->comm,
@@ -3127,6 +3223,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             want_ll_cft = (vote[0].want_cft != 0);
         }
 
+
         if (ep_group->config.enable_mask) {
             // Allocate the cross-rank sync buffer used by clean_low_latency_buffer.
             // Its size depends only on nRanks (a group-level constant), so it is
@@ -3198,9 +3295,9 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
 }
 
 ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group) {
-    if (ep_group == nullptr) {
-        return ncclSuccess;
-    }
+  if (ep_group == nullptr) {
+    return ncclSuccess;
+  }
 
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -3306,15 +3403,17 @@ ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group) {
         }
 
         // Destroy single NCCL device communicator (copy back from device, destroy on ep_group->comm)
-        ncclDevComm_t* dc_host = nullptr;
-        size_t dcomm_bytes = 0;
-        NCCL_CHECK_RESULT(commAllocHost(ep_group->comm, &dc_host, &dcomm_bytes));
+        if (ep_group->nccl_dev_comm != nullptr) {
+            ncclDevComm_t* dc_host = nullptr;
+            size_t dcomm_bytes = 0;
+            NCCL_CHECK_RESULT(commAllocHost(ep_group->comm, &dc_host, &dcomm_bytes));
 
-        CUDA_CHECK(cudaMemcpy(dc_host, ep_group->nccl_dev_comm, dcomm_bytes, cudaMemcpyDeviceToHost));
-        NCCL_CHECK_RESULT(ncclDevCommDestroy(ep_group->comm, dc_host));
-        free(dc_host);
-        CUDA_CHECK(cudaFree(ep_group->nccl_dev_comm));
-        ep_group->nccl_dev_comm = nullptr;
+            CUDA_CHECK(cudaMemcpy(dc_host, ep_group->nccl_dev_comm, dcomm_bytes, cudaMemcpyDeviceToHost));
+            NCCL_CHECK_RESULT(ncclDevCommDestroy(ep_group->comm, dc_host));
+            free(dc_host);
+            CUDA_CHECK(cudaFree(ep_group->nccl_dev_comm));
+            ep_group->nccl_dev_comm = nullptr;
+        }
 
         // No split comms to destroy (using ep_group->comm directly)
     }
@@ -4030,6 +4129,16 @@ ncclResult_t ncclEpHandleMemSize(
     return ncclSuccess;
 }
 
+static ncclResult_t quiesce_ll_buffer(ncclEpGroup_t group) {
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    return ncclSuccess;
+}
+
 // Collectively (re-)size rdma_buffer to `new_size`. Two modes:
 //   - First allocation (rdma_buffer == nullptr): allocate, register, stash
 //     window handle in a newly-allocated device slot.
@@ -4053,12 +4162,7 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
         // window via RDMA. ncclMemFree/ncclCommWindowDeregister/
         // ncclMemAlloc/ncclCommWindowRegister are themselves collective,
         // so no further barrier is needed afterward.
-        CUDA_CHECK(cudaDeviceSynchronize());
-        cudaStream_t stream;
-        CUDA_CHECK(cudaStreamCreate(&stream));
-        NCCL_CHECK_RESULT(ncclBarrier(ep_group->comm, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaStreamDestroy(stream));
+        NCCLCHECK(quiesce_ll_buffer(ep_group));
 
         ncclWindow_t win_host;
         CUDA_CHECK(cudaMemcpy(&win_host, ep_group->nccl_wins, sizeof(ncclWindow_t), cudaMemcpyDeviceToHost));
@@ -4077,6 +4181,10 @@ static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_siz
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->nccl_wins), sizeof(ncclWindow_t)));
     }
     CUDA_CHECK(cudaMemcpy(ep_group->nccl_wins, &win_host, sizeof(ncclWindow_t), cudaMemcpyHostToDevice));
+    if (ep_group->ll_hier.numLogicalCtas != 0) {
+        ep_group->ll_hier.buffer = static_cast<uint8_t*>(ep_group->rdma_buffer);
+        ep_group->ll_hier.window = win_host;
+    }
 
     return ncclSuccess;
 }
@@ -4123,6 +4231,13 @@ ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
         handle->layout,
         ep_group->num_attn_ranks);
 
+    auto hier = ep_group->ll_hier;
+    if (hier.numLogicalCtas != 0) {
+        ll::hierOverlayLayout(layout, hier, ep_group->config.max_dispatch_tokens_per_rank,
+                               ep_group->nRanks, ep_group->ll_payload_slot_stride);
+    }
+    const bool resized = layout.total_bytes > ep_group->rdma_buffer_size_alloc;
+
     // Ensure rdma_buffer is large enough for this handle's actual layout.
     // - NCCL_EP_AUTO: lazily allocate (first handle) or grow (later handle
     //   needing more, e.g. different layout or larger num_topk). Stored
@@ -4146,6 +4261,24 @@ ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
         NCCLCHECK(ll_resize_rdma_buffer(ep_group, new_size));
     }
     assert(layout.total_bytes <= ep_group->rdma_buffer_size_alloc);
+
+    if (hier.numLogicalCtas != 0) {
+        if (!resized && ep_group->ll_payload_slot_stride != 0 &&
+            ep_group->ll_payload_slot_stride != layout.payload_slot_stride) {
+            NCCLCHECK(quiesce_ll_buffer(ep_group));
+            CUDA_CHECK(cudaMemset(static_cast<uint8_t*>(ep_group->rdma_buffer) + hier.readyOffset,
+                                 0, 2 * hier.controlBankStride));
+            NCCLCHECK(quiesce_ll_buffer(ep_group));
+        }
+        hier.buffer = ep_group->ll_hier.buffer;
+        hier.window = ep_group->ll_hier.window;
+        ep_group->ll_hier = hier;
+        ep_group->ll_payload_slot_stride = layout.payload_slot_stride;
+        if (ep_group->rank == 0) {
+            fprintf(stderr, "[hier dispatch] logical-CTAs=%d send-RDMA-CTAs=%d shared-buffer=%zu bytes\n",
+                    hier.numLogicalCtas, ll::hierNumRdmaSendCtas(hier.numLogicalCtas), layout.total_bytes);
+        }
+    }
 
     if (handle_mem != nullptr) {
         assert(handle_mem->ndim == 1 && handle_mem->datatype == ncclUint8);
@@ -5519,16 +5652,16 @@ static ncclResult_t validate_ht_backward_weights(
 
 template <typename Launch>
 static ncclResult_t launch_ll_with_weight_type(
-    ncclDataType_t dtype, const ncclEpTensor_t* input, const ncclEpTensor_t* output, Launch&& launch) {
+    ncclDataType_t dtype, const void* input, void* output, Launch&& launch) {
     switch (dtype) {
     case ncclFloat32:
         return launch(
-            static_cast<const float*>(input ? input->data : nullptr),
-            static_cast<float*>(output ? output->data : nullptr));
+            static_cast<const float*>(input),
+            static_cast<float*>(output));
     case ncclBfloat16:
         return launch(
-            static_cast<const __nv_bfloat16*>(input ? input->data : nullptr),
-            static_cast<__nv_bfloat16*>(output ? output->data : nullptr));
+            static_cast<const __nv_bfloat16*>(input),
+            static_cast<__nv_bfloat16*>(output));
     default:
         return ncclInvalidArgument;
     }
@@ -5849,6 +5982,8 @@ ncclResult_t ncclEpDispatch(
         // must retain their data pointers rather than the descriptors themselves.
         void* const recv_x_data = recv_x ? recv_x->data : nullptr;
         void* const scales_data = scales ? scales->data : nullptr;
+        const void* const topk_weights_in_data = topk_weights_in ? topk_weights_in->data : nullptr;
+        void* const recv_topk_weights_data = recv_topk_weights ? recv_topk_weights->data : nullptr;
         auto dispatch_fn = [=](int phases) -> ncclResult_t {
             void* const rdma_buf = group->rdma_buffer;
             // Prepare data pointers
@@ -5870,6 +6005,11 @@ ncclResult_t ncclEpDispatch(
                     (recipe == NCCL_EP_DISP_QUANT_FWD)
                     ? static_cast<const uint8_t*>(in_scales_outer->data) : nullptr;
                 nccl_ep::ll::DispatchParams<WeightT> params{};
+                params.hier = group->ll_hier;
+                params.roundRobinReceiveSupported =
+                    group->lsa_team_size == ll::hier_receive_policy::kLsaRanks &&
+                    group->nRanks == ll::hier_receive_policy::kRanks &&
+                    !group->ll_gin_contexts_restricted;
                 params.maxDynamicSmem = handle->group->max_dynamic_smem;
                 params.inData = x_data;
                 params.inScalesBuf = in_scales_data;
@@ -5909,7 +6049,8 @@ ncclResult_t ncclEpDispatch(
                 params.recvStats = nullptr;
                 params.waitStats = nullptr;
                 params.epochState = group->ll_epoch_state;
-                params.payloadSlotStride = handle->ll.layout.payload_slot_stride;
+                params.payloadSlotStride = handle->group->ll_hier.numLogicalCtas != 0 ?
+                    handle->group->ll_payload_slot_stride : handle->ll.layout.payload_slot_stride;
                 params.signalSlotStride = handle->ll.layout.signal_slot_stride;
                 params.numTokens = handle->num_tokens;
                 params.hidden = hidden;
@@ -5941,6 +6082,18 @@ ncclResult_t ncclEpDispatch(
                 params.recvTopkIdxKind = recv_topk_idx_kind;
                 params.phases = phases;
                 params.tokenDtype = x->datatype;
+                // These are collective call properties, never rank-local occupancy or window presence.
+                if (!group->env.ll_hier_dispatch.is_set &&
+                    (params.layout != NCCL_EP_LAYOUT_RANK_MAJOR ||
+                     recipe != NCCL_EP_DISP_QUANT_NONE ||
+                     params.tokenDtype != ncclBfloat16 ||
+                     params.hidden % nccl_ep::kBf16PerInt4 != 0 ||
+                     !ll::llUseHierarchicalDispatch(group->nRanks / group->lsa_team_size,
+                         group->lsa_team_size, params.maxTokensPerRank, params.numExperts, params.numTopk,
+                         uint64_t(params.hidden) * ncclTypeSize(ncclBfloat16), group->ll_gin_contexts_restricted) ||
+                     params.phases != (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE))) {
+                    params.hier = {};
+                }
                 // Pass the same parity to the sender offsets and receive pointers.
                 if (group->ll_cft_buffers.initialized) {
                     auto& lb = group->ll_cft_buffers;
@@ -5996,7 +6149,7 @@ ncclResult_t ncclEpDispatch(
                 }
             };
             return launch_ll_with_weight_type(
-                weight_dtype, topk_weights_in, recv_topk_weights,
+                weight_dtype, topk_weights_in_data, recv_topk_weights_data,
                 [&](auto* in_weights, auto* recv_weights) -> ncclResult_t {
                     switch (handle->topk_idx.datatype) {
                     case ncclInt32:
@@ -7501,6 +7654,8 @@ ncclResult_t ncclEpCombine(
 
         // Define combine lambda
         unsigned signal_base = 0;
+        // Window resolution can use a stack descriptor; retain only its device pointer.
+        const void* const topk_weights_data = topk_weights ? topk_weights->data : nullptr;
         auto combine_fn = [=](int phases) -> ncclResult_t {
             void* const rdma_buf = handle->group->rdma_buffer;
             // Prepare data pointers
@@ -7540,7 +7695,8 @@ ncclResult_t ncclEpCombine(
                 params.lsaSignalingCleanCount = buffer.lsa_signaling_clean_int_count;
                 params.waitStats = nullptr;
                 params.epochState = handle->group->ll_epoch_state;
-                params.payloadSlotStride = handle->ll.layout.payload_slot_stride;
+                params.payloadSlotStride = handle->group->ll_hier.numLogicalCtas != 0 ?
+                    handle->group->ll_payload_slot_stride : handle->ll.layout.payload_slot_stride;
                 params.signalSlotStride = handle->ll.layout.signal_slot_stride;
                 params.numCombinedTokens = num_combined_tokens;
                 params.hidden = hidden;
@@ -7580,7 +7736,7 @@ ncclResult_t ncclEpCombine(
                     params, stream, nccl_ep_env_flag_on(handle->group->env.nucs));
             };
             return launch_ll_with_weight_type(
-                weight_dtype, topk_weights, nullptr,
+                weight_dtype, topk_weights_data, nullptr,
                 [&](auto* weights, auto*) -> ncclResult_t {
                     switch (topk_idx->datatype) {
                     case ncclInt32:

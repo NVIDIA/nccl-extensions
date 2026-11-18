@@ -714,12 +714,12 @@ handle on a group that previously only hosted `RANK_MAJOR` handles, or a handle 
 **collectively reallocates** the buffer: deregister window → free → `ncclMemAlloc` → register.
 The recorded layout offsets on every live handle are pure offsets relative to the group's `rdma_buffer` and resolve correctly against the new base at use time, so existing handles remain valid.
 
-  Two constraints follow from a reallocation:
-  1. **All ranks must call `ncclEpInitHandle` in lockstep with the same `(layout, num_topk)`**. With AUTO sizing, `ncclEpInitHandle` is a conditionally collective call.
-  2. **Reallocation drops the contents of the old RDMA buffer.** Any operation issued with `send_only = 1` that has staged data but is still awaiting its receive half via `ncclEpComplete` will lose its in-flight data. Drain all such operations before triggering a reallocation.
-  3. **CUDA graph capture bakes the RDMA base pointer into the captured kernel parameters.** `ncclEpInitHandle` (in AUTO mode) must not be called between `cudaStreamBeginCapture` and `cudaStreamEndCapture`. Any previously captured graph containing EP kernels must be destroyed and re-captured after a reallocation.
+  Handle initialization has the following constraints:
+  1. **All ranks must call `ncclEpInitHandle` in lockstep with the same `(layout, num_topk)`**. With AUTO sizing or hierarchical shared bank layout changes, `ncclEpInitHandle` is a conditionally collective call.
+  2. **Reallocation drops the contents of the old RDMA buffer.** Any operation issued with `send_only = 1` that has staged data but is still awaiting its receive half via `ncclEpComplete` will lose its in-flight data. No communication may be in flight during LL handle initialization in either sizing mode: call `ncclEpComplete` for all pending staged operations on every handle, then synchronize their streams on all ranks.
+  3. **CUDA graph capture bakes the RDMA base pointer into the captured kernel parameters.** `ncclEpInitHandle` must not be called between `cudaStreamBeginCapture` and `cudaStreamEndCapture`. Any previously captured graph containing EP kernels must be destroyed and re-captured after a reallocation or shared bank layout change.
 
-- **Explicit `> 0`**: the buffer is allocated to exactly that size at `ncclEpCreateGroup` time. `ncclEpInitHandle` is purely local; it returns `ncclInvalidUsage` if the requested `(layout, num_topk)` does not fit. Use this mode if you need to avoid collective handle creation, mid-stream reallocation, or graph invalidation. There is currently no public API for computing the required size — one is planned for a future release. Until then, size conservatively: a buffer that is too small for the requested `(layout, num_topk)` is reported cleanly by `ncclEpInitHandle` rather than failing later.
+- **Explicit `> 0`**: the buffer is allocated to exactly that size at `ncclEpCreateGroup` time. `ncclEpInitHandle` may still collectively change shared bank offsets in hierarchical LL; it returns `ncclInvalidUsage` if the requested `(layout, num_topk)` does not fit. This mode avoids reallocation, but shared bank layout changes still require matching handle initialization across ranks and graph recapture as above. There is currently no public API for computing the required size — one is planned for a future release. Until then, size conservatively: a buffer that is too small for the requested `(layout, num_topk)` is reported cleanly by `ncclEpInitHandle` rather than failing later.
 
 ## Zero-copy
 

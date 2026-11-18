@@ -89,8 +89,9 @@ staging buffers are owned by the EP group.
 ### Multiple handles per group
 
 Both HT and LL support several handles being active on the same EP group, as a
-1F1B / pipeline-parallel schedule requires. Creating or updating one handle does
-not disturb another handle's pending dispatch or combine.
+1F1B / pipeline-parallel schedule requires. Updating one handle does not disturb
+another handle's pending dispatch or combine. LL handle creation requires no
+communication in flight on the group; see `ncclEpInitHandle` below.
 
 ### `ncclEpCreateHandle()`
 
@@ -154,7 +155,7 @@ routing happen at different points — for example to allocate all handles befor
 a CUDA graph capture begins.
 
 ```c
-// Allocate handle buffers without performing any collective.
+// Allocate handle buffers; LL initialization may be collective (see below).
 // Call ncclEpUpdateHandle before the first ncclEpDispatch/ncclEpCombine.
 //
 // handle_mem == NULL:  NCCL EP allocates via alloc_fn; handle owns the memory.
@@ -181,12 +182,16 @@ ncclResult_t ncclEpInitHandle(
     const ncclEpTensor_t* handle_mem);
 ```
 
-**Collective under `rdma_buffer_size = NCCL_EP_AUTO`.** With auto-sized RDMA
+**Collective under AUTO sizing or hierarchical LL bank layout changes.** With auto-sized RDMA
 buffers this call *may* be collective: if the requested `(layout, num_topk)`
-needs more memory than the current allocation, it reallocates. All ranks must
+needs more memory than the current allocation, it reallocates. Hierarchical LL
+can also collectively change shared bank offsets without reallocating. All ranks must
 then call it in lockstep with the same `(layout, num_topk)`, with no other
 communication in flight, and it must not appear inside a CUDA graph capture.
-An explicit `rdma_buffer_size` makes it purely local. See the
+Complete all pending staged operations with `ncclEpComplete` and synchronize
+their streams on all ranks before LL handle initialization. An explicit
+`rdma_buffer_size` prevents reallocation but not collective bank layout changes.
+Re-capture EP graphs after reallocation or shared bank layout changes. See the
 [`rdma_buffer_size` notes](../../README.md#algorithm-related-configurations).
 
 ### `ncclEpUpdateHandle()`

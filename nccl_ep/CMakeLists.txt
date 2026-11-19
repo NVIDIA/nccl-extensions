@@ -132,6 +132,7 @@ endif()
 set(NCCL_EP_JIT_CONFIG_HEADER "${NCCL_EP_JIT_SOURCE_DIR}/config.h")
 set(NCCL_EP_JIT_HEADERS
     device/ht_ep.cuh
+    device/ht/ht_gin_signal_layout.cuh
     device/ht_compact_prob.cuh
     ht_compact_prob.h
     device/mxfp8_quant.cuh

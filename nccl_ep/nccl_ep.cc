@@ -1993,6 +1993,19 @@ static ncclResult_t configure_ll_hier(ncclEpGroup_t group, cudaStream_t stream) 
     return ncclSuccess;
 }
 
+static int ht_n2n_channels(ncclEpGroup_t group) {
+    const auto channels = [](unsigned int blocks, int warps) { return static_cast<int>(blocks) * warps; };
+    int widest = 0;
+    for (const HtSmBudgets* sms : {&group->fwd_sms, &group->bwd_sms}) {
+        widest = std::max({widest,
+                           channels(sms->dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS),
+                           channels(sms->flat_dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS),
+                           channels(sms->combine, NCCL_EP_HT_COMBINE_N2N_WARPS),
+                           channels(sms->flat_combine, NCCL_EP_HT_COMBINE_N2N_WARPS)});
+    }
+    return widest;
+}
+
 static ncclResult_t
 init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, cudaStream_t stream) {
     // Initialize using public NCCL APIs
@@ -2181,33 +2194,108 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     }
 
     int qps_per_rank = ep_group->config.num_qp_per_rank;
-    // Only dispatch has dedicated cross-node warps per CTA. Combine selects
-    // channels from the resulting shared context pool, so its SM budget does
-    // not impose an additional per-CTA minimum here.
-    int min_required_ctx =
-        NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ht_dispatch_sms_capacity(ep_group) * NCCL_EP_HT_DISPATCH_N2N_WARPS);
-    if (qps_per_rank == 0) qps_per_rank = min_required_ctx;
-    if (qps_per_rank < min_required_ctx) {
+    const int n2n_channels = ht_n2n_channels(ep_group);
+    // Allocate for the worst case: every N2N warp must own its context exclusively in every
+    // configuration, so the budget follows the widest one. A smaller EP grid leaves the extra
+    // contexts unused.
+    int required_ctx = NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + n2n_channels;
+    if (qps_per_rank == 0) qps_per_rank = required_ctx;
+    if (qps_per_rank < required_ctx) {
         fprintf(stderr,
-                "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d for reserved + dedicated N2N warp contexts\n",
-                qps_per_rank, min_required_ctx);
+                "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d (%d reserved + %d N2N contexts)\n",
+                qps_per_rank, required_ctx, NCCL_EP_HT_RESERVED_GIN_GPU_CTXS, n2n_channels);
         return ncclInvalidUsage;
+    } else if (qps_per_rank > required_ctx) {
+        fprintf(stderr, "[HT GIN] Warning: num_qp_per_rank(%d) exceeds the %d contexts HT addresses; dropping %d\n",
+                qps_per_rank, required_ctx, qps_per_rank - required_ctx);
+        qps_per_rank = required_ctx;
     }
     ep_group->gin_config.qps_per_rank = qps_per_rank;
     // num_qp_per_rank is the total context budget; the data range is what's left after the reserved ones.
     ep_group->gin_config.num_ctx_per_comm = qps_per_rank - NCCL_EP_HT_RESERVED_GIN_GPU_CTXS;
 
-    // Only the combine and dispatch-tail regions have consumers.
-    int combine_signals = lsa_team_size * rdma_team_size * max_chunks_per_rank;
-    int streaming_tail_signals = rdma_team_size * rdma_team_size * lsa_team_size * max_chunks_per_rank;
-    ep_group->gin_config.num_total_signals = combine_signals + streaming_tail_signals;
+    const int num_data_ctx = ep_group->gin_config.num_ctx_per_comm;
+    const int max_chunk_per_rails = (rdma_team_size - 1) * max_chunks_per_rank;
+    const auto gin_signals_per_phase_for = [&](unsigned int blocks, int warps) {
+        const int channels = static_cast<int>(blocks) * warps;
+        if (channels <= 0) return 0;
+        return (rdma_team_size - 1) * ((max_chunks_per_rank + channels - 1) / channels);
+    };
+    // A smaller EP group spreads the same chunks over fewer GIN contexts, so each context
+    // carries more signals; each phase is sized by its narrowest configuration.
+    int gin_signals_per_phase = 0;
+    for (const HtSmBudgets* sms : {&ep_group->fwd_sms, &ep_group->bwd_sms}) {
+        gin_signals_per_phase =
+            std::max({gin_signals_per_phase,
+                      gin_signals_per_phase_for(sms->dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS),
+                      gin_signals_per_phase_for(sms->flat_dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS),
+                      gin_signals_per_phase_for(sms->combine, NCCL_EP_HT_COMBINE_N2N_WARPS),
+                      gin_signals_per_phase_for(sms->flat_combine, NCCL_EP_HT_COMBINE_N2N_WARPS)});
+    }
+
+    // Dispatch and combine can overlap across rail peers, so each gets its own range.
     ep_group->gin_config.signals_base = 0;
-    ep_group->gin_config.combine_signal_offset = 0;
-    ep_group->gin_config.signals_tail_base = combine_signals;
+    ep_group->gin_config.signals_tail_base = 0;
+    ep_group->gin_config.combine_signal_offset = static_cast<unsigned>(gin_signals_per_phase);
+    ep_group->gin_config.num_total_signals = 2 * gin_signals_per_phase;
     ep_group->gin_config.signals_tail_bwd_base = ep_group->gin_config.signals_tail_base;
     if (ht_dispatch_tail_signals_per_pass(ep_group)) {
         ep_group->gin_config.signals_tail_bwd_base = ep_group->gin_config.num_total_signals;
-        ep_group->gin_config.num_total_signals += streaming_tail_signals;
+        ep_group->gin_config.num_total_signals += gin_signals_per_phase;
+    }
+    // Per-signal shadows can protect signal waits when the per-pass budgets differ.
+
+    if (nccl_ep_env_verbose(ep_group->env)) {
+        fprintf(stderr,
+                "[HT GIN] signal pool (dispatch|combine separate): %d[chunks/rank], %d[rail chunks] "
+                "over %d[data ctx]; channels dispatch %u/%u flat, combine %u/%u flat; "
+                "%d[ids/ctx], %d[total signals] over %d[ctx]\n",
+                max_chunks_per_rank, max_chunk_per_rails, num_data_ctx,
+                ep_group->fwd_sms.dispatch * NCCL_EP_HT_DISPATCH_N2N_WARPS,
+                ep_group->fwd_sms.flat_dispatch * NCCL_EP_HT_DISPATCH_N2N_WARPS,
+                ep_group->fwd_sms.combine * NCCL_EP_HT_COMBINE_N2N_WARPS,
+                ep_group->fwd_sms.flat_combine * NCCL_EP_HT_COMBINE_N2N_WARPS,
+                ep_group->gin_config.num_total_signals,
+                ep_group->gin_config.num_total_signals * qps_per_rank, qps_per_rank);
+    }
+
+    if (nccl_ep_env_flag_on(ep_group->env.debug) && ep_group->env.rank == 0) {
+        // Chunk geometry first: the wire-chunk count is what the signal depth is derived from, and
+        // it grows with the LSA team count, so it is the root of how the pool scales with nodes.
+        fprintf(stderr,
+                "[HT GIN] chunks: %d[tokens/rank] / %d[tokens/chunk] = %d[chunks/rank] "
+                "x %d remote LSA teams = %d[rail chunks]\n",
+                ht_max_tokens, ht_combine_tokens_per_chunk, max_chunks_per_rank, rdma_team_size - 1,
+                max_chunk_per_rails);
+        fprintf(stderr,
+                "[HT GIN] %d ctx created (%d reserved + %d data); signals per ctx = %d; "
+                "total signals = %d\n",
+                qps_per_rank, NCCL_EP_HT_RESERVED_GIN_GPU_CTXS, num_data_ctx,
+                ep_group->gin_config.num_total_signals,
+                ep_group->gin_config.num_total_signals * qps_per_rank);
+        const struct {
+            const char* name;
+            unsigned int blocks;
+            int warps;
+        } cfgs[] = {
+            {"dispatch expert-major", ep_group->fwd_sms.dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS},
+            {"dispatch flat", ep_group->fwd_sms.flat_dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS},
+            {"combine  expert-major", ep_group->fwd_sms.combine, NCCL_EP_HT_COMBINE_N2N_WARPS},
+            {"combine  flat", ep_group->fwd_sms.flat_combine, NCCL_EP_HT_COMBINE_N2N_WARPS},
+            {"dispatch expert-major bwd", ep_group->bwd_sms.dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS},
+            {"dispatch flat bwd", ep_group->bwd_sms.flat_dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS},
+            {"combine  expert-major bwd", ep_group->bwd_sms.combine, NCCL_EP_HT_COMBINE_N2N_WARPS},
+            {"combine  flat bwd", ep_group->bwd_sms.flat_combine, NCCL_EP_HT_COMBINE_N2N_WARPS},
+        };
+        for (const auto& c : cfgs) {
+            const int channels = static_cast<int>(c.blocks) * c.warps;
+            const int needed = gin_signals_per_phase_for(c.blocks, c.warps);
+            fprintf(stderr,
+                    "[HT GIN]   %-26s channels = %3d (%u blocks x %d n2n warps), "
+                    "signals per ctx needed = %3d%s\n",
+                    c.name, channels, c.blocks, c.warps, needed,
+                    needed == gin_signals_per_phase ? "  <-- sets the pool" : "");
+        }
     }
 
     // =========================================================================
@@ -2899,10 +2987,9 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         ep_group->config.num_channels = 10;
     }
 
-    // HT dispatch dedicates N2N warps per CTA; combine reuses this pool.
+    // Each N2N warp dedicates a context; both phases draw from this pool.
     // LL eligibility is evaluated with this full budget before reducing it below.
-    const unsigned autoGinContexts =
-        NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ht_dispatch_sms_capacity(ep_group) * NCCL_EP_HT_DISPATCH_N2N_WARPS);
+    const unsigned autoGinContexts = NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + ht_n2n_channels(ep_group);
     if (ep_group->config.num_qp_per_rank == NCCL_EP_AUTO) {
         ep_group->config.num_qp_per_rank = autoGinContexts;
     }

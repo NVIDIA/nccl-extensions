@@ -22,7 +22,7 @@ extern "C" {
 // a libnccl_ep.so.MAJOR soname symlink).
 #define NCCL_EP_MAJOR 0
 #define NCCL_EP_MINOR 3
-#define NCCL_EP_PATCH 0
+#define NCCL_EP_PATCH 1
 
 // Packed version code: MAJOR*10000 + MINOR*100 + PATCH. Mirrors NCCL_VERSION_CODE.
 #define NCCL_EP_VERSION_CODE (NCCL_EP_MAJOR * 10000 + NCCL_EP_MINOR * 100 + NCCL_EP_PATCH)

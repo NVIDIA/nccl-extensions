@@ -1828,7 +1828,6 @@ static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
 // Constants for GIN configuration
 static constexpr int NCCL_EP_HT_GIN_MAX_CONTEXTS = 32;
 static constexpr int NCCL_EP_HT_GIN_CTXS_PER_COMM = 4;
-static constexpr int MAX_BARRIER_SESSIONS = 32;
 
 static ncclResult_t commAllocHost(ncclComm_t comm, ncclDevComm_t** outDevComm, size_t* outBytes) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
@@ -2155,15 +2154,13 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // num_qp_per_rank is the total context budget; the data range is what's left after the reserved ones.
     ep_group->gin_config.num_ctx_per_comm = qps_per_rank - NCCL_EP_HT_RESERVED_GIN_GPU_CTXS;
 
-    int dispatch_signals = lsa_team_size * rdma_team_size * max_chunks_per_rank;
+    // Only the combine and dispatch-tail regions have consumers.
     int combine_signals = lsa_team_size * rdma_team_size * max_chunks_per_rank;
     int streaming_tail_signals = rdma_team_size * rdma_team_size * lsa_team_size * max_chunks_per_rank;
-    int streaming_head_signals = rdma_team_size * rdma_team_size * lsa_team_size;
-    ep_group->gin_config.num_total_signals =
-        dispatch_signals + combine_signals + streaming_tail_signals + streaming_head_signals + MAX_BARRIER_SESSIONS;
+    ep_group->gin_config.num_total_signals = combine_signals + streaming_tail_signals;
     ep_group->gin_config.signals_base = 0;
-    ep_group->gin_config.combine_signal_offset = dispatch_signals;
-    ep_group->gin_config.signals_tail_base = dispatch_signals + combine_signals;
+    ep_group->gin_config.combine_signal_offset = 0;
+    ep_group->gin_config.signals_tail_base = combine_signals;
 
     // =========================================================================
     // Phase 3: comm setup (DevCommCreate + WindowRegister)

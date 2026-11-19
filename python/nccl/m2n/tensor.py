@@ -121,6 +121,8 @@ def _resolve_buffer(buffer: object) -> tuple[int, tuple[int, ...] | None, NcclDa
 
     data_ptr = getattr(buffer, "data_ptr", None)
     if callable(data_ptr):
+        if getattr(buffer, "is_cuda", None) is False:
+            raise ValueError(f"{type(buffer).__name__} must be a CUDA tensor")
         is_contiguous = getattr(buffer, "is_contiguous", None)
         if callable(is_contiguous) and not is_contiguous():
             raise ValueError(

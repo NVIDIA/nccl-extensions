@@ -50,6 +50,9 @@
 // Validation kernels (lifted from reshard_bench.cu — same byte pattern)
 // ============================================================================
 
+// Grid size cap for the grid-stride init/validate kernels below.
+static constexpr int kMaxGridBlocks = 65535;
+
 // guide §4.1.4 multi-param: bare `(` / `)` on own lines
 // clang-format off
 __global__ void
@@ -70,8 +73,8 @@ benchInitSourceDataKernel
 // clang-format on
 {
   size_t total = dim0 * dim1 * (nDims == 3 ? dim2 : 1);
-  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  size_t stride = blockDim.x * gridDim.x;
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t stride = (size_t)blockDim.x * gridDim.x;
   for (size_t i = idx; i < total; i += stride) {
     size_t d2 = (nDims == 3) ? (i % dim2) : 0;
     size_t rem = (nDims == 3) ? (i / dim2) : i;
@@ -106,8 +109,8 @@ benchValidateDestDataKernel
 // clang-format on
 {
   size_t total = dim0 * dim1 * (nDims == 3 ? dim2 : 1);
-  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  size_t stride = blockDim.x * gridDim.x;
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t stride = (size_t)blockDim.x * gridDim.x;
   for (size_t i = idx; i < total; i += stride) {
     size_t d2 = (nDims == 3) ? (i % dim2) : 0;
     size_t rem = (nDims == 3) ? (i / dim2) : i;
@@ -148,7 +151,8 @@ benchInitSourceData
 
   int blockSize = 256;
   size_t total = pLocalDims[0] * pLocalDims[1] * (nDims == 3 ? pLocalDims[2] : 1);
-  int numBlocks = (total + blockSize - 1) / blockSize;
+  size_t blocks = (total + blockSize - 1) / blockSize;
+  int numBlocks = blocks > kMaxGridBlocks ? kMaxGridBlocks : (int)blocks;
   benchInitSourceDataKernel<<<numBlocks, blockSize, 0, stream>>>(
     pBuffer, pLocalDims[0], pLocalDims[1], nDims == 3 ? pLocalDims[2] : 1, nDims, globalStart[0], globalStart[1],
     globalStart[2], globalDims[1], globalDims[2], salt);
@@ -185,7 +189,8 @@ benchValidateDestData
 
   int blockSize = 256;
   size_t total = pLocalDims[0] * pLocalDims[1] * (nDims == 3 ? pLocalDims[2] : 1);
-  int numBlocks = (total + blockSize - 1) / blockSize;
+  size_t blocks = (total + blockSize - 1) / blockSize;
+  int numBlocks = blocks > kMaxGridBlocks ? kMaxGridBlocks : (int)blocks;
   benchValidateDestDataKernel<<<numBlocks, blockSize, 0, stream>>>(
     pBuffer, pLocalDims[0], pLocalDims[1], nDims == 3 ? pLocalDims[2] : 1, nDims, globalStart[0], globalStart[1],
     globalStart[2], globalDims[1], globalDims[2], salt, pDevErr);

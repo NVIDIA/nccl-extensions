@@ -21,6 +21,19 @@ there; copy it device-to-host, synchronize, then allocate.
 The counter is readable in **any** mode. What eager mode adds is permission to
 *size the dispatch outputs to it* rather than to the worst case.
 
+For `NCCL_EP_LAYOUT_EXPERT_MAJOR` with `dispatch_output_per_expert_alignment`,
+the counter is the padded output-row extent: each local expert's token count
+rounded up to the alignment, summed. Two local experts that receive 3 and 5
+tokens at alignment 4 get zones at offsets 0 and 4 with padded counts 4 and 8,
+so the counter reports 12 rows for 8 routed tokens. The padded count can exceed
+the worst-case number of routed rows, `nRanks * max_dispatch_tokens_per_rank *
+num_topk`. Size the recv tensors from the counter, not from that product. In the
+local-permute and pull/push expert-major modes the eager bound adds
+`num_local_experts * (alignment - 1)` rows of worst-case padding, and
+`ncclEpCreateHandle`, `ncclEpInitHandle` and `ncclEpImportHandle` return
+`ncclInvalidArgument` if that bound does not fit a signed 32-bit row count. The
+remaining expert-major modes keep the unpadded bound and trap beyond it.
+
 A rank may legitimately receive **zero** tokens under eager routing. Recv outputs
 may then be empty (`data == nullptr`), but the token and weight outputs must agree
 on emptiness — they describe rows of the same recv set, so one cannot be empty

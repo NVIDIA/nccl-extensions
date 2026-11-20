@@ -14,7 +14,8 @@
  *   CombineExpertMajor       — dispatch + identity expert + combine recovers original values (expert-major)
  *   DispatchMeta             — expert_token_counts_padded and expert_token_offsets
  *   EagerRecvSizeFromLayoutInfo — query-then-allocate through the public recv_total_counter
- *                              readback only (FLAT and EM)
+ *                              readback only (FLAT and EM, EM also with alignment padding past the
+ *                              raw recv budget)
  *   FusedDispatchRecvTotalEM — fused count mode: recv_total_counter + per-expert counts/offsets
  *                              and dispatched slot content (count-mode only)
  *
@@ -73,6 +74,7 @@
 
 #include "test_common.h"
 #include "../nccl_ep_test_internal.h"
+#include <climits>
 #include <set>
 
 static float bf16_val(nv_bfloat16 v) {
@@ -90,7 +92,9 @@ protected:
         std::vector<nv_bfloat16> h_tok(kNumTokens * kHidden);
         for (int i = 0; i < kNumTokens; ++i) {
             float v = static_cast<float>(g_rank * kNumTokens + i + 1);
-            for (int hh = 0; hh < kHidden; ++hh) h_tok[i * kHidden + hh] = __float2bfloat16(v);
+            for (int hh = 0; hh < kHidden; ++hh) {
+                h_tok[i * kHidden + hh] = __float2bfloat16(v);
+            }
         }
 
         nv_bfloat16 *d_tok, *d_recv, *d_out;
@@ -177,7 +181,9 @@ protected:
         std::vector<nv_bfloat16> h_tok(kNumTokens * kHidden);
         for (int i = 0; i < kNumTokens; ++i) {
             float v = static_cast<float>(g_rank * kNumTokens + i + 1);
-            for (int hh = 0; hh < kHidden; ++hh) h_tok[i * kHidden + hh] = __float2bfloat16(v);
+            for (int hh = 0; hh < kHidden; ++hh) {
+                h_tok[i * kHidden + hh] = __float2bfloat16(v);
+            }
         }
 
         nv_bfloat16 *d_tok, *d_recv;
@@ -719,7 +725,7 @@ TEST_F(OutputLayoutTest, EagerRecvSize) {
     ncclEpGroup_t eager_group = nullptr;
     NCCL_ASSERT(ncclEpCreateGroup(&eager_group, g_comm, &gcfg));
 
-    auto run = [&](bool em, const ncclEpHandleConfig_t* hcfg = nullptr) {
+    auto run = [&](bool em, const ncclEpHandleConfig_t* hcfg) {
         ncclEpHandle_t h = nullptr;
         NCCL_ASSERT(ncclEpCreateHandle(
             &h,
@@ -797,8 +803,8 @@ TEST_F(OutputLayoutTest, EagerRecvSize) {
         NCCL_ASSERT(ncclEpHandleDestroy(h));
     };
 
-    run(/*em=*/false);
-    run(/*em=*/true);
+    run(/*em=*/false, nullptr);
+    run(/*em=*/true, nullptr);
 
     // EM zone padding: the queried recv total includes padding, so eager
     // sizing covers alignment (padded total fits the eager bound here).
@@ -828,7 +834,32 @@ TEST_F(OutputLayoutTest, EagerRecvSizeFromLayoutInfo) {
     ncclEpGroup_t eager_group = nullptr;
     NCCL_ASSERT(ncclEpCreateGroup(&eager_group, g_comm, &gcfg));
 
-    auto run = [&](bool em) {
+    // The group's raw recv budget: nRanks * max_dispatch_tokens_per_rank * num_topk.
+    const int raw_bound = g_nranks * kNumTokens * kTopK;
+    const int E_local = kNumExperts / g_nranks;
+
+    // Fixture routing: token i of rank r goes to expert (r * kNumTokens + i) % kNumExperts and carries payload
+    // r * kNumTokens + i + 1. Per-expert routed counts and this rank's local experts' payloads follow from it.
+    std::vector<size_t> routed(kNumExperts, 0);
+    std::vector<std::set<float>> payloads(E_local);
+    for (int r = 0; r < g_nranks; ++r) {
+        for (int i = 0; i < kNumTokens; ++i) {
+            const int e = (r * kNumTokens + i) % kNumExperts;
+            ++routed[e];
+            if (e / E_local == g_rank) {
+                payloads[e % E_local].insert(static_cast<float>(r * kNumTokens + i + 1));
+            }
+        }
+    }
+    size_t max_routed = 0;
+    for (const size_t n : routed) {
+        max_routed = n > max_routed ? n : max_routed;
+    }
+
+    // Aligned EM runs (hcfg alignment > 1) also read back the per-expert counts and offsets, and check the
+    // delivered zones: live rows then zero padding, every zone starting at its aligned offset.
+    auto run = [&](bool em, const ncclEpHandleConfig_t* hcfg) {
+        const size_t align = em && hcfg ? hcfg->dispatch_output_per_expert_alignment : 0;
         int32_t* d_total = nullptr;
         CUDA_ASSERT(cudaMalloc(&d_total, sizeof(int32_t)));
         CUDA_ASSERT(cudaMemset(d_total, 0, sizeof(int32_t)));
@@ -837,6 +868,17 @@ TEST_F(OutputLayoutTest, EagerRecvSizeFromLayoutInfo) {
 
         ncclEpLayoutInfo_t li = NCCL_EP_LAYOUT_INFO_INIT;
         li.recv_total_counter = t_total;
+        // Counts then offsets share one buffer, set to -1 so a missing write (offset 0 included) is caught.
+        int32_t* d_cnt_off = nullptr;
+        ncclEpTensor_t *t_cnt = nullptr, *t_off = nullptr;
+        if (align > 1) {
+            CUDA_ASSERT(cudaMalloc(&d_cnt_off, 2 * E_local * sizeof(int32_t)));
+            CUDA_ASSERT(cudaMemset(d_cnt_off, 0xff, 2 * E_local * sizeof(int32_t)));
+            NCCL_ASSERT(epTensorCreate(&t_cnt, 1, ncclInt32, d_cnt_off, E_local));
+            NCCL_ASSERT(epTensorCreate(&t_off, 1, ncclInt32, d_cnt_off + E_local, E_local));
+            li.expert_counters = t_cnt;
+            li.expert_offsets = t_off;
+        }
 
         ncclEpHandle_t h = nullptr;
         NCCL_ASSERT(ncclEpCreateHandle(
@@ -845,7 +887,7 @@ TEST_F(OutputLayoutTest, EagerRecvSizeFromLayoutInfo) {
             em ? NCCL_EP_LAYOUT_EXPERT_MAJOR : NCCL_EP_LAYOUT_FLAT,
             em ? topk_idx_em_ : topk_idx_,
             &li,
-            /*config=*/nullptr,
+            hcfg,
             g_stream));
         ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
 
@@ -872,6 +914,17 @@ TEST_F(OutputLayoutTest, EagerRecvSizeFromLayoutInfo) {
         if (!em) CUDA_ASSERT(cudaMalloc(&d_recv_idx, num_recv * kTopK * sizeof(int64_t)));
         std::vector<float> h_w(kNumTokens * kTopK, 1.0f);
         CUDA_ASSERT(cudaMemcpy(d_weights, h_w.data(), kNumTokens * kTopK * sizeof(float), cudaMemcpyHostToDevice));
+        // Distinct payloads (token i on this rank carries g_rank * kNumTokens + i + 1) and a nonzero fill of
+        // the recv rows, so only rows the dispatch writes can match the checks below.
+        std::vector<nv_bfloat16> h_tok(kNumTokens * kHidden);
+        for (int i = 0; i < kNumTokens; ++i) {
+            const float v = static_cast<float>(g_rank * kNumTokens + i + 1);
+            for (int hh = 0; hh < kHidden; ++hh) {
+                h_tok[i * kHidden + hh] = __float2bfloat16(v);
+            }
+        }
+        CUDA_ASSERT(cudaMemcpy(d_tok, h_tok.data(), h_tok.size() * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+        CUDA_ASSERT(cudaMemset(d_recv, 0x7f, num_recv * kHidden * sizeof(nv_bfloat16)));
 
         ncclEpTensor_t *t_tok = nullptr, *t_recv = nullptr, *t_w = nullptr, *t_recv_w = nullptr,
                        *t_recv_idx = nullptr;
@@ -899,6 +952,45 @@ TEST_F(OutputLayoutTest, EagerRecvSizeFromLayoutInfo) {
         EXPECT_EQ(ncclEpComplete(h, nullptr, g_stream), ncclSuccess);
         EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
 
+        if (align > 1) {
+            // Each local expert's zone holds its live rows, then padding up to the alignment.
+            std::vector<size_t> zone_start(E_local + 1, 0);
+            for (int z = 0; z < E_local; ++z) {
+                zone_start[z + 1] = zone_start[z] + (payloads[z].size() + align - 1) / align * align;
+            }
+            // Fatal: the row checks below index every zone row.
+            ASSERT_EQ(num_recv, zone_start[E_local]) << "Rank " << g_rank << ": padded total";
+            EXPECT_GT(h_total, raw_bound) << "Rank " << g_rank << ": the padded count must exceed the raw recv budget";
+            std::vector<int32_t> h_cnt_off(2 * E_local);
+            CUDA_ASSERT(cudaMemcpy(
+                h_cnt_off.data(), d_cnt_off, h_cnt_off.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+            std::vector<nv_bfloat16> h_recv(num_recv * kHidden);
+            CUDA_ASSERT(cudaMemcpy(h_recv.data(), d_recv, h_recv.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+            for (int z = 0; z < E_local; ++z) {
+                const size_t live_end = zone_start[z] + payloads[z].size();
+                EXPECT_EQ(h_cnt_off[z], static_cast<int32_t>(zone_start[z + 1] - zone_start[z]))
+                    << "Rank " << g_rank << ": expert " << z << " padded count";
+                EXPECT_EQ(h_cnt_off[E_local + z], static_cast<int32_t>(zone_start[z]))
+                    << "Rank " << g_rank << ": expert " << z << " offset";
+                std::set<float> live;
+                for (size_t r = zone_start[z]; r < live_end; ++r) {
+                    const float v = bf16_val(h_recv[r * kHidden]);
+                    live.insert(v);
+                    for (int hh = 0; hh < kHidden; ++hh) {
+                        EXPECT_EQ(bf16_val(h_recv[r * kHidden + hh]), v)
+                            << "Rank " << g_rank << ": row " << r << " col " << hh;
+                    }
+                }
+                EXPECT_EQ(live, payloads[z]) << "Rank " << g_rank << ": expert " << z << " live rows";
+                for (size_t r = live_end; r < zone_start[z + 1]; ++r) {
+                    for (int hh = 0; hh < kHidden; ++hh) {
+                        EXPECT_EQ(bf16_val(h_recv[r * kHidden + hh]), 0.f)
+                            << "Rank " << g_rank << ": pad row " << r << " col " << hh;
+                    }
+                }
+            }
+        }
+
         // One row short of the published count must be rejected on the host (FLAT only; the EM
         // path is sync-free, so it does not host-reject undersize).
         if (!em) {
@@ -923,10 +1015,42 @@ TEST_F(OutputLayoutTest, EagerRecvSizeFromLayoutInfo) {
         NCCL_ASSERT(ncclEpHandleDestroy(h));
         ncclEpTensorDestroy(t_total);
         cudaFree(d_total);
+        if (t_cnt) {
+            ncclEpTensorDestroy(t_cnt);
+        }
+        if (t_off) {
+            ncclEpTensorDestroy(t_off);
+        }
+        cudaFree(d_cnt_off);
     };
 
-    run(/*em=*/false);
-    run(/*em=*/true);
+    run(/*em=*/false, nullptr);
+    run(/*em=*/true, nullptr);
+
+    // The dup modes stage padded rows internally, inside the raw budget.
+    if (!ht_em_nvlink_dup_active() && !ht_em_local_dup_active()) {
+        // Padded zones past the raw budget: the smallest power-of-two alignment that holds every expert's rows and
+        // puts the padded total above the budget, so only the padded eager bound covers the layout.
+        size_t wide_align = 1;
+        while (wide_align < max_routed || E_local * wide_align <= static_cast<size_t>(raw_bound)) {
+            wide_align <<= 1;
+        }
+        ncclEpHandleConfig_t hcfg = NCCL_EP_HANDLE_CONFIG_INIT;
+        hcfg.dispatch_output_per_expert_alignment = wide_align;
+        run(/*em=*/true, &hcfg);
+
+        // A padded eager bound beyond a signed 32-bit row count is rejected at handle creation.
+        size_t huge_align = 1;
+        while (raw_bound + E_local * static_cast<int64_t>(huge_align - 1) <= INT_MAX) {
+            huge_align <<= 1;
+        }
+        hcfg.dispatch_output_per_expert_alignment = huge_align;
+        ncclEpHandle_t h = nullptr;
+        EXPECT_EQ(
+            ncclEpCreateHandle(&h, eager_group, NCCL_EP_LAYOUT_EXPERT_MAJOR, topk_idx_em_, nullptr, &hcfg, g_stream),
+            ncclInvalidArgument);
+        EXPECT_EQ(h, nullptr);
+    }
 
     NCCL_ASSERT(ncclEpGroupDestroy(eager_group));
 }
@@ -1470,7 +1594,9 @@ protected:
         std::vector<nv_bfloat16> h_tok(kNumTokens * kHidden);
         for (int i = 0; i < kNumTokens; ++i) {
             float v = static_cast<float>(g_rank * kNumTokens + i + 1);
-            for (int hh = 0; hh < kHidden; ++hh) h_tok[i * kHidden + hh] = __float2bfloat16(v);
+            for (int hh = 0; hh < kHidden; ++hh) {
+                h_tok[i * kHidden + hh] = __float2bfloat16(v);
+            }
         }
 
         nv_bfloat16 *d_tok, *d_recv;

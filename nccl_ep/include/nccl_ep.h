@@ -590,7 +590,8 @@ typedef struct {
     unsigned int size; // = sizeof(this struct); first field, never moves
     unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
   // HT expert-major only: per-expert zone alignment in tokens (pow2; 0/1 = no padding).
-  // Padded slots are zero-filled by dispatch.
+  // Padded slots are zero-filled by dispatch. In eager mode, handle creation returns
+  // ncclInvalidArgument if the padded recv bound exceeds INT32_MAX rows.
     size_t dispatch_output_per_expert_alignment;
 } ncclEpHandleConfig_t;
 

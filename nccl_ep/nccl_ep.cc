@@ -3612,6 +3612,9 @@ struct ncclEpHandle {
 
             // Expert-major fields (alignment set in InitHandle; offsets/counts set in UpdateHandle)
             size_t dispatch_output_per_expert_alignment;
+            // Per-rank recv row bound: the recv slot budget, plus the worst-case alignment padding
+            // in eager expert-major mode (padded zones live in the caller's buffer). Set in InitHandle.
+            int recv_row_limit;
             int64_t* expert_token_offsets; // [experts_per_rank] written by remap kernel
             int32_t* per_expert_counts_active; // alias to authoritative counts buffer
 
@@ -4611,6 +4614,30 @@ ncclResult_t ncclEpInitHandle(
                                 1;
     assert((em_align & (em_align - 1)) == 0 && "dispatch_output_per_expert_alignment must be a power of two");
 
+    int recv_row_limit = ep_group->max_recv_tokens;
+    if (ep_group->eager_mode && em_local_permute_enabled(ep_group, layout)) {
+        // Eager local-permute: padded zones live in the caller buffer, so the budget grows by the
+        // worst-case padding of every local expert. Row counts are signed 32-bit in the kernels.
+        const size_t padding_per_expert = em_align - 1;
+        const int64_t max_padding = (INT_MAX - static_cast<int64_t>(recv_row_limit)) / ep_group->num_local_experts;
+        if (padding_per_expert > static_cast<size_t>(max_padding)) {
+            size_t max_align = 1;
+            while (max_align * 2 - 1 <= static_cast<size_t>(max_padding)) {
+                max_align *= 2;
+            }
+            fprintf(
+                stderr,
+                "NCCL EP: dispatch_output_per_expert_alignment=%zu overflows the signed 32-bit eager "
+                "expert-major recv bound (base bound %d rows, %d local experts, largest valid alignment %zu)\n",
+                em_align,
+                recv_row_limit,
+                ep_group->num_local_experts,
+                max_align);
+            return ncclInvalidArgument;
+        }
+        recv_row_limit += ep_group->num_local_experts * static_cast<int>(padding_per_expert);
+    }
+
     *out_handle = new ncclEpHandle();
     ncclEpHandle_t handle = *out_handle;
     handle->group = ep_group;
@@ -4625,6 +4652,7 @@ ncclResult_t ncclEpInitHandle(
         if (res == ncclSuccess && is_ht_em) {
             handle->ht.dispatch_output_per_expert_alignment = em_align;
         }
+        handle->ht.recv_row_limit = recv_row_limit;
     }
 
     return res;
@@ -5324,13 +5352,7 @@ ncclResult_t ncclEpUpdateHandle(
         per_expert_counts_device != nullptr) {
         CUDA_CHECK(cudaMemsetAsync(per_expert_counts_device, 0, experts_per_rank * sizeof(int32_t), stream));
     }
-    int max_recv_tpr = static_cast<int>(ep_group->config.max_recv_tokens_per_rank);
-    const int alignment = static_cast<int>(handle->ht.dispatch_output_per_expert_alignment);
-    if (ep_group->eager_mode && em_permute_active && (alignment > 0)) {
-        // Eager local-permute: padded zones live in the caller buffer
-        // Extend the zone-overflow budget by the worst-case padding.
-        max_recv_tpr += experts_per_rank * (alignment - 1);
-    }
+    const int max_recv_tpr = handle->ht.recv_row_limit;
 
     if (count_mode) {
         return ht_update_handle_count_mode(
@@ -6634,15 +6656,9 @@ ncclResult_t ncclEpDispatch(
         params.pad_expert_token_offsets = fused_em_pad ? handle->ht.expert_token_offsets : nullptr;
         params.pad_alignment =
             fused_em_pad ? static_cast<int>(handle->ht.dispatch_output_per_expert_alignment) : 0;
-        // Padded eager EM recv budget, matching ncclEpUpdateHandle's compute_layout_info
-        // (max_recv_tpr). Used below both as count mode's recv_max_slots and as the S2G
-        // backstop bound (params.max_recv_tokens_per_rank), so legitimately-padded slots
-        // don't trip S2G's assert.
-        int max_recv_tokens_per_rank = group->max_recv_tokens;
-        if (group->eager_mode && em_permute_active && handle->ht.dispatch_output_per_expert_alignment > 0) {
-            max_recv_tokens_per_rank += group->num_local_experts *
-                (static_cast<int>(handle->ht.dispatch_output_per_expert_alignment) - 1);
-        }
+        // Per-handle recv bound (padded in eager expert-major): count mode's recv_max_slots, the S2G
+        // backstop bound and the pull dispatch's EM budget.
+        const int recv_row_limit = handle->ht.recv_row_limit;
         // Fused-meta-dispatch path: build the rank-major s2d inside the dispatch kernel from the
         // histogram-published per-rank count rows (FWD only; BWD reuses the FWD-populated s2d).
         // No host collective or kernel runs between the histogram and dispatch.
@@ -6672,7 +6688,7 @@ ncclResult_t ncclEpDispatch(
             params.dispatch_push_count.token_dst_rank_bitmap = handle->ht.dispatch_push_count.token_dst_rank_bitmap;
             params.dispatch_push_count.recv_tables_ptrs =
                 reinterpret_cast<uint8_t* const*>(group->ht_buffers.dispatch_push_count_meta_table_ptrs);
-            params.dispatch_push_count.recv_max_slots = max_recv_tokens_per_rank;
+            params.dispatch_push_count.recv_max_slots = recv_row_limit;
             // Only NCCL_EP_OVERFLOW_DROP sets this; TRAP still traps on overflow (see the
             // DROP-contract doc). When set, the fused meta build clamps published per-expert
             // offsets/counts to the recv budget so over-budget tokens drop instead of trapping.
@@ -6827,7 +6843,7 @@ ncclResult_t ncclEpDispatch(
         // Device-side backstop bound for recv slot indices: the fixed budget or the derived
         // eager bound (computed above). The scan/count build produces slots below it (DROP
         // masks the rest), so the S2G assert only fires on corrupted or stale routing maps.
-        params.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
+        params.max_recv_tokens_per_rank = recv_row_limit;
 
         // Call dispatch kernel
         int sf_bytes_per_token = 0;
@@ -7223,7 +7239,7 @@ ncclResult_t ncclEpDispatch(
                 // Pull-count builds recv_slot_to_src/srcpos_map in-kernel (the scan never runs),
                 // so their FLAT-slot capacity must be recomputed here to match HtBlockLayout's
                 // sizing of those handle buffers exactly (single-LSA-team only: rdma_team_size == 1).
-                const int pull_flat_recv_capacity = pull_count_dispatch
+                const int flat_slot_capacity = pull_count_dispatch
                     ? static_cast<int>(std::min<size_t>(
                           static_cast<size_t>(group->max_recv_tokens),
                           static_cast<size_t>(group->config.max_dispatch_tokens_per_rank) *
@@ -7331,8 +7347,8 @@ ncclResult_t ncclEpDispatch(
                     pull_expert_cursor,
                     pull_layout_ready,
                     group->lsa_rank,
-                    group->max_recv_tokens,
-                    pull_flat_recv_capacity,
+                    recv_row_limit,
+                    flat_slot_capacity,
                     static_cast<int>(handle->ht.dispatch_output_per_expert_alignment),
                     group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP,
                     pull_count_rebuild ? handle->ht.dispatch_push_count.own_row : nullptr,

@@ -40,6 +40,7 @@
 #include <cuda/ptx>
 #include "nccl_device.h"
 #include "cuda_compat_shims.cuh" // Compatibility shims for CUDA 12.x
+#include "ht/ht_common.cuh"
 
 // Per-warp transfer stage for pull dispatch: read one remote row once, store it to
 // each of the K local EM slots (read-once-scatter-many). The row is TMA'd
@@ -371,45 +372,22 @@ struct combine_block_timing_entry_t {
 };
 #endif
 
-// Expert-major S2D entry: int32 packed as [31:22]=rank_id (10b, <= 1024), [21:0]=slot (22b).
-// -1 = no entry.  Only used when expert-major layout is active.
-constexpr int EM_S2D_RANK_BITS = 10;
-constexpr int EM_S2D_SLOT_BITS = 32 - EM_S2D_RANK_BITS;
-constexpr int EM_S2D_MAX_RANKS = 1 << EM_S2D_RANK_BITS; // 1024
-constexpr uint32_t EM_S2D_SLOT_MASK = (1u << EM_S2D_SLOT_BITS) - 1u;
-// Slot field must hold values up to MAX_SUPPORTED_TOKENS_PER_RANK; -1 sentinel must not collide.
-static_assert(
-    MAX_SUPPORTED_TOKENS_PER_RANK < (1 << EM_S2D_SLOT_BITS),
-    "MAX_SUPPORTED_TOKENS_PER_RANK exceeds em_s2d slot field width");
-
 // s2d-map double-buffer depth: consume one stage while prefetching the next (chunk, LSA team) row.
 constexpr int S2D_MAP_RING_STAGES = 2;
 
-__host__ __device__ __forceinline__ int32_t em_s2d_pack(int rank_id, int slot) {
-    return static_cast<int32_t>(
-        (static_cast<uint32_t>(rank_id) << EM_S2D_SLOT_BITS) | (static_cast<uint32_t>(slot) & EM_S2D_SLOT_MASK));
-}
-__host__ __device__ __forceinline__ int em_s2d_unpack_rank(int32_t v) {
-    return static_cast<int>(static_cast<uint32_t>(v) >> EM_S2D_SLOT_BITS);
-}
-__host__ __device__ __forceinline__ int em_s2d_unpack_slot(int32_t v) {
-    return static_cast<int>(static_cast<uint32_t>(v) & EM_S2D_SLOT_MASK);
-}
-
-// NCCL_EP_OVERFLOW_DROP helpers: a recv slot at/above capacity would index past
-// the recv buffer, so the drop policy remaps it to the sentinel -1.
-__host__ __device__ __forceinline__ bool slot_overflows(int32_t slot, int capacity) {
-    return slot >= capacity;
-}
-__host__ __device__ __forceinline__ int32_t drop_overflow_slot(int32_t slot, bool drop, int capacity) {
-    return (drop && slot_overflows(slot, capacity)) ? -1 : slot;
-}
-
-// Combine kernels pad each LSA team's rdma_to_attn_map row to a multiple of 16 bools;
-// producers of the map must use the same stride.
-__host__ __device__ __forceinline__ int rdma_to_attn_row_stride(int tokens_per_rank) {
-    return (((tokens_per_rank - 1) / 16) + 1) * 16;
-}
+using ht_common::EM_S2D_RANK_BITS;
+using ht_common::EM_S2D_SLOT_BITS;
+using ht_common::EM_S2D_MAX_RANKS;
+using ht_common::EM_S2D_SLOT_MASK;
+using ht_common::em_s2d_pack;
+using ht_common::em_s2d_unpack_rank;
+using ht_common::em_s2d_unpack_slot;
+using ht_common::slot_overflows;
+using ht_common::drop_overflow_slot;
+using ht_common::rdma_to_attn_row_stride;
+using ht_common::flat_route_pack;
+using ht_common::flat_route_expert;
+using ht_common::flat_route_source_pos;
 
 // EM unfused-combine path: s2d entries are lex-sorted (dest_rank, k), so duplicates
 // within a row are adjacent. Returns true when this lane's entry has the same
@@ -9219,19 +9197,6 @@ __device__ __forceinline__ void combine_reduce(
             }
         }
     }
-}
-
-// Flat receive rows contain local experts in ascending order. One 32-bit entry
-// records both the expert and its original top-k position; -1 marks the tail.
-// Kept with the handle so backward combine never consults another handle's routing.
-__host__ __device__ constexpr int32_t flat_route_pack(int expert, int source_pos) {
-    return expert * MAX_NUM_TOPK + source_pos;
-}
-__host__ __device__ constexpr int flat_route_expert(int32_t route) {
-    return route / MAX_NUM_TOPK;
-}
-__host__ __device__ constexpr int flat_route_source_pos(int32_t route) {
-    return route % MAX_NUM_TOPK;
 }
 
 // Counts occupy the prefix of each published row, followed by packed top-k.

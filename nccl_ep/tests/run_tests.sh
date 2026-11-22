@@ -52,6 +52,14 @@ if [[ "${TEST_SUITE}" == "test_ht_chunk_config" ]]; then
     exit "${OVERALL_FAIL}"
 fi
 
+# The chunk -> channel -> GIN context mapping is host-checkable and needs no GPU ranks.
+if [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ht_gin_signal_layout" ]]; then
+    "${NCCL_EP_BUILDDIR}/test/nccl_ep/test_ht_gin_signal_layout" ${GTEST_ARGS[@]+"${GTEST_ARGS[@]}"} || OVERALL_FAIL=1
+fi
+if [[ "${TEST_SUITE}" == "test_ht_gin_signal_layout" ]]; then
+    exit "${OVERALL_FAIL}"
+fi
+
 # Driver compatibility checks use mocked CUDA queries and need no GPU ranks.
 if [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_cft_driver_api" ]]; then
     if ! CFT_UNDEFINED_SYMBOLS=$(nm -D --undefined-only "${NCCL_EP_BUILDDIR}/lib/libnccl_ep.so"); then

@@ -1837,8 +1837,8 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                   "dispatch channel count must match the host's, which sizes the GIN context pool");
 
     // GIN device side setup. Single communicator; ctx_idx spreads QP traffic.
-    int global_channel = blockIdx.x * N2N_WARPS + n2n_warp_id;
-    int ctx_idx = ht_gin_signals::get_data_ctx(global_channel, GLOBAL_CHANNELS);
+    int global_channel = ht_gin_signals::gin_warp_channel(blockIdx.x, n2n_warp_id, N2N_WARPS);
+    int ctx_idx = ht_gin_signals::gin_channel_ctx(global_channel, GLOBAL_CHANNELS);
 
     ncclGin net(dcomm, ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
     ncclTeam rail = ncclTeamRail(dcomm);
@@ -1847,11 +1847,11 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     // presence of wait/flushAsync in this loop slows posting.
     constexpr int GIN_WINDOW = NCCL_EP_HT_DISPATCH_GIN_WINDOW;
     constexpr bool USE_WINDOW = MAX_CHUNKS_PER_RANK > GIN_WINDOW * CHUNK_STRIDE;
-    const int n_mine = nccl_ep::ceil_div(MAX_CHUNKS_PER_RANK - global_channel, CHUNK_STRIDE);
+    const int n_mine = ht_gin_signals::gin_channel_num_chunks(global_channel, GLOBAL_CHANNELS, MAX_CHUNKS_PER_RANK);
     ncclGinRequest_t chunk_done[GIN_WINDOW][NUM_REMOTE_LSA];
-    int n_posted = 0;
 
-    for (int cidx = global_channel; cidx < MAX_CHUNKS_PER_RANK; cidx += CHUNK_STRIDE, ++n_posted) {
+    for (int n_posted = 0; n_posted < n_mine; ++n_posted) {
+        const int cidx = ht_gin_signals::gin_chunk_at(global_channel, n_posted, GLOBAL_CHANNELS);
         if constexpr (USE_WINDOW) {
             if (n_posted >= GIN_WINDOW) {
                 for (int j = 0; j < NUM_REMOTE_LSA; ++j) {
@@ -1924,11 +1924,14 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                 dense_dst_offset += __popc(need_write_bitmask[word]) * entry_bytes;
             }
 
-            // Signal on the SAME put comm, into this team's own band at the destination. Routed
-            // through the same entry point the waiter uses, so the two cannot drift.
+            // Signal on the SAME put comm, into this team's own band at the destination. The
+            // context comes from gin_channel_ctx and the id from gin_dispatch_chunk_signal, the
+            // helpers the waiter uses; a warp sends only its own channel's chunks
+            // (gin_chunk_channel(gin_chunk_at(c, k)) == c).
             unsigned tail_signal_id =
                 ht_gin_signals::gin_dispatch_chunk_signal(
-                    my_lteam, remote_lteam_id, cidx, MAX_CHUNKS_PER_RANK, CHUNK_STRIDE, smem_mr_info_ptr->signals_tail_base)
+                    my_lteam, remote_lteam_id, cidx, MAX_CHUNKS_PER_RANK, GLOBAL_CHANNELS,
+                    smem_mr_info_ptr->signals_tail_base)
                     .sig_id;
             net.signal(
                 rail,
@@ -3332,11 +3335,11 @@ __forceinline__ __device__ void combine_n2n_signal_remote(
     ncclGin& net,
     ncclTeam rail,
     int lteam_id,
-    int cidx,
+    int g,
     unsigned signals_base,
     unsigned combine_signal_offset) {
     unsigned signal_id =
-        ht_gin_signals::gin_combine_chunk_signal(cidx, NBLOCKS, signals_base + combine_signal_offset).sig_id;
+        ht_gin_signals::gin_combine_chunk_signal(g, NBLOCKS, signals_base + combine_signal_offset).sig_id;
     net.signal(
         rail,
         lteam_id,
@@ -3417,12 +3420,16 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     uint32_t token_consumer_parity = 0;
     uint32_t cumulative_sent = 0; // Cumulative active tokens RDMA-put across all chunks (never reset).
 
-    const int ctx_idx = ht_gin_signals::get_data_ctx(blockIdx.x, NBLOCKS);
+    // One channel per CTA.
+    const int channel = ht_gin_signals::gin_warp_channel(blockIdx.x, 0, 1);
+    const int ctx_idx = ht_gin_signals::gin_channel_ctx(channel, NBLOCKS);
     ncclGin net(*dcomm, ctx_idx);
 
-    for (int cidx = blockIdx.x; cidx < total_chunks; cidx += NBLOCKS) {
+    const int n_mine = ht_gin_signals::gin_channel_num_chunks(channel, NBLOCKS, total_chunks);
+    for (int k = 0; k < n_mine; ++k) {
+        const int g = ht_gin_signals::gin_chunk_at(channel, k, NBLOCKS);
         // LSA-team/chunk mapping shared with the G2S receiver so signals match.
-        const auto meta = combine_chunk_meta<LSA_TEAMS, TOKENS_PER_CHUNK>(cidx, my_lteam, cpr, rem_chunk_sz);
+        const auto meta = combine_chunk_meta<LSA_TEAMS, TOKENS_PER_CHUNK>(g, my_lteam, cpr, rem_chunk_sz);
         const int lteam_id = meta.lteam_id;
         const int chunk_id = meta.chunk_id;
         // With rail-scoped GIN comms, LSA-team index maps to rail-team rank.
@@ -3467,7 +3474,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
             // Signal remote
             __syncwarp();
             if (GIN_GROUP::thread_rank() == 0) {
-                combine_n2n_signal_remote<NBLOCKS>(net, rail, lteam_id, cidx, signals_base, combine_signal_offset);
+                combine_n2n_signal_remote<NBLOCKS>(net, rail, lteam_id, g, signals_base, combine_signal_offset);
             }
             __syncwarp();
 
@@ -3496,7 +3503,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
             // Signal remote
             __syncwarp();
             if (GIN_GROUP::thread_rank() == 0) {
-                combine_n2n_signal_remote<NBLOCKS>(net, rail, lteam_id, cidx, signals_base, combine_signal_offset);
+                combine_n2n_signal_remote<NBLOCKS>(net, rail, lteam_id, g, signals_base, combine_signal_offset);
             }
             __syncwarp();
         }

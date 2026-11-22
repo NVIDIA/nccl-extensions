@@ -39,6 +39,7 @@
 // HT (High Throughput) includes
 #include "device/ht_ep_adapter.cuh"
 #include "device/ht_ep_configs.cuh"
+#include "device/ht/ht_gin_signal_layout.cuh"
 #include "device/ll/ll_hier_delivery.cuh"
 #include "device/lamport.cuh"
 #include "device/jit/jit_runtime.hpp"
@@ -2217,9 +2218,8 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     const int num_data_ctx = ep_group->gin_config.num_ctx_per_comm;
     const int max_chunk_per_rails = (rdma_team_size - 1) * max_chunks_per_rank;
     const auto gin_signals_per_phase_for = [&](unsigned int blocks, int warps) {
-        const int channels = static_cast<int>(blocks) * warps;
-        if (channels <= 0) return 0;
-        return (rdma_team_size - 1) * ((max_chunks_per_rank + channels - 1) / channels);
+        return ht_gin_signals::gin_signals_per_phase(rdma_team_size, max_chunks_per_rank,
+                                                     static_cast<int>(blocks) * warps);
     };
     // A smaller EP group spreads the same chunks over fewer GIN contexts, so each context
     // carries more signals; each phase is sized by its narrowest configuration.

@@ -18,9 +18,31 @@
 
 namespace ht_gin_signals {
 
-// Map a data channel onto its GIN context, skipping the reserved contexts.
-__forceinline__ __device__ int get_data_ctx(int channel, int num_channels) {
-    return NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (channel % num_channels);
+// The GIN context a channel's puts and signals ride on.
+__forceinline__ __host__ __device__ int gin_channel_ctx(int channel, int channels) {
+    return NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (channel % channels);
+}
+
+// Chunk ownership, shared by senders and receivers: chunk cidx is sent by channel
+// cidx % channels, as that channel's (cidx / channels)-th chunk.
+__forceinline__ __host__ __device__ int gin_warp_channel(int block, int warp, int warps_per_block) {
+    return block * warps_per_block + warp;
+}
+
+__forceinline__ __host__ __device__ int gin_chunk_at(int channel, int ordinal, int channels) {
+    return channel + ordinal * channels;
+}
+
+__forceinline__ __host__ __device__ int gin_channel_num_chunks(int channel, int channels, int num_chunks) {
+    return channel < num_chunks ? nccl_ep::ceil_div(num_chunks - channel, channels) : 0;
+}
+
+__forceinline__ __host__ __device__ int gin_chunk_channel(int cidx, int channels) {
+    return cidx % channels;
+}
+
+__forceinline__ __host__ __device__ int gin_chunk_ordinal(int cidx, int channels) {
+    return cidx / channels;
 }
 
 struct gin_chunk_signal_t {
@@ -28,15 +50,20 @@ struct gin_chunk_signal_t {
     unsigned sig_id;  // signal id within that context
 };
 
-__forceinline__ __device__ int gin_ids_per_channel(int num_chunks, int channels) {
+__forceinline__ __host__ __device__ int gin_ids_per_channel(int num_chunks, int channels) {
     return nccl_ep::ceil_div(num_chunks, channels);
 }
 
-__forceinline__ __device__ gin_chunk_signal_t
+// Signals one phase needs per context: one id per (source team, chunk ordinal).
+__forceinline__ __host__ __device__ int gin_signals_per_phase(int lsa_teams, int max_chunks_per_rank, int channels) {
+    return channels > 0 ? (lsa_teams - 1) * gin_ids_per_channel(max_chunks_per_rank, channels) : 0;
+}
+
+__forceinline__ __host__ __device__ gin_chunk_signal_t
 gin_split_chunk(int cidx, int channels, unsigned id_base) {
     gin_chunk_signal_t s;
-    s.ctx_idx = get_data_ctx(cidx, channels);
-    s.sig_id = id_base + static_cast<unsigned>(cidx / channels);
+    s.ctx_idx = gin_channel_ctx(gin_chunk_channel(cidx, channels), channels);
+    s.sig_id = id_base + static_cast<unsigned>(gin_chunk_ordinal(cidx, channels));
     return s;
 }
 
@@ -53,7 +80,7 @@ gin_split_chunk(int cidx, int channels, unsigned id_base) {
 //      2       2           2            5       2           2            8       2           2           11       2           2
 //
 // Each warp takes a contiguous run of 3: one chunk's worth of teams.
-__forceinline__ __device__ gin_chunk_signal_t gin_dispatch_chunk_signal(
+__forceinline__ __host__ __device__ gin_chunk_signal_t gin_dispatch_chunk_signal(
     int src_lteam, int dst_lteam, int cidx, int max_chunks_per_rank, int channels, unsigned signals_tail_base) {
     const int src_slot = src_lteam > dst_lteam ? src_lteam - 1 : src_lteam;
     const unsigned id_base =
@@ -72,9 +99,7 @@ __forceinline__ __device__ gin_chunk_signal_t gin_dispatch_chunk_signal(
 //      6       0           3            7       1           3
 //      8       2           4            9       0           4
 //     10       1           5           11       2           5
-//
-// Each warp takes every other index, so half the warps carry twice the ids.
-__forceinline__ __device__ gin_chunk_signal_t
+__forceinline__ __host__ __device__ gin_chunk_signal_t
 gin_combine_chunk_signal(int cidx, int channels, unsigned combine_signal_offset) {
     return gin_split_chunk(cidx, channels, combine_signal_offset);
 }

@@ -76,6 +76,14 @@ if [[ "${TEST_SUITE}" == "test_cft_driver_api" ]]; then
     exit "${OVERALL_FAIL}"
 fi
 
+# Host-pass compile of the generated HT JIT sources; needs nvcc, no GPU ranks.
+if [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ht_jit_compile" ]]; then
+    "${NCCL_EP_BUILDDIR}/test/nccl_ep/test_ht_jit_compile" "${GTEST_ARGS[@]}" || OVERALL_FAIL=1
+fi
+if [[ "${TEST_SUITE}" == "test_ht_jit_compile" ]]; then
+    exit "${OVERALL_FAIL}"
+fi
+
 NUM_GPUS="${1:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
 
 run_suite() {

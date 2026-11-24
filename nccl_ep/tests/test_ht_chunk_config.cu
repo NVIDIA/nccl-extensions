@@ -4,6 +4,7 @@
  */
 #include <gtest/gtest.h>
 #include <limits>
+#include <string>
 #include "ht_chunk_config.hpp"
 #include "ht_sm_policy.hpp"
 
@@ -251,4 +252,55 @@ TEST(HtSmPolicy, ArchitectureAndLayoutDefaults) {
     EXPECT_EQ(nccl_ep::ht_default_comm_sms(107, true), 32u);
     EXPECT_EQ(nccl_ep::ht_flat_combine_default_sms(8191), 16u);
     EXPECT_EQ(nccl_ep::ht_flat_combine_default_sms(8192), 32u);
+}
+
+// resolve_combine_push_chunk returns the pre-tile-rounding width (int4) fed to
+// combine_push_chunk_size: 0 is the whole row, 1 (one tile) is the automatic default. SM107
+// keeps one tile at every EP size; other architectures switch to the whole row from EP16.
+// A malformed override keeps the automatic default and reports kInvalid.
+TEST(HtChunkConfig, CombinePushResolveDefaultAndInvalid) {
+    for (int ep_size : {4, 15, 16, 32, 64}) {
+        const auto rubin = nccl_ep::resolve_combine_push_chunk(107, ep_size, 2, "");
+        EXPECT_EQ(rubin.requested_int4, 1);
+        EXPECT_EQ(rubin.message, nccl_ep::CombinePushChunkMessage::kNone);
+        for (unsigned int sm : {90u, 100u, 103u, 120u}) {
+            const auto r = nccl_ep::resolve_combine_push_chunk(sm, ep_size, 2, "");
+            EXPECT_EQ(r.requested_int4, ep_size >= 16 ? 0 : 1);
+            EXPECT_EQ(r.message, nccl_ep::CombinePushChunkMessage::kNone);
+        }
+    }
+    for (const char* bad : {"abc", "12x", "-1", "600000000", "99999999999"}) {
+        const auto rubin = nccl_ep::resolve_combine_push_chunk(107, 16, 2, bad);
+        EXPECT_EQ(rubin.requested_int4, 1);
+        EXPECT_EQ(rubin.message, nccl_ep::CombinePushChunkMessage::kInvalid);
+        const auto other = nccl_ep::resolve_combine_push_chunk(100, 16, 2, bad);
+        EXPECT_EQ(other.requested_int4, 0);
+        EXPECT_EQ(other.message, nccl_ep::CombinePushChunkMessage::kInvalid);
+    }
+}
+
+TEST(HtChunkConfig, CombinePushResolveOverride) {
+    // 0 forces the whole row; a positive value rounds up to int4 by elem_bytes. Both
+    // override the arch/EP default, so SM107 and others resolve identically.
+    for (unsigned int sm : {90u, 107u}) {
+        for (int ep_size : {15, 16}) {
+            const auto zero = nccl_ep::resolve_combine_push_chunk(sm, ep_size, 2, "0");
+            EXPECT_EQ(zero.requested_int4, 0);
+            EXPECT_EQ(zero.message, nccl_ep::CombinePushChunkMessage::kNone);
+        }
+    }
+    struct Case {
+        int elems;
+        int elem_bytes;
+        int int4s;
+    };
+    for (const Case c : {Case{1, 2, 1}, Case{16, 2, 2}, Case{17, 2, 3},
+                         Case{17, 1, 2}, Case{8, 4, 2}}) {
+        for (unsigned int sm : {100u, 107u}) {
+            const auto r = nccl_ep::resolve_combine_push_chunk(sm, 15, c.elem_bytes,
+                                                               std::to_string(c.elems));
+            EXPECT_EQ(r.requested_int4, c.int4s);
+            EXPECT_EQ(r.message, nccl_ep::CombinePushChunkMessage::kExplicitWidth);
+        }
+    }
 }

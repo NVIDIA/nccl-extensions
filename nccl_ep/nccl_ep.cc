@@ -879,6 +879,7 @@ struct ncclEpGroup {
     unsigned int device_sm_count;   // Number of SMs on the device
     int max_dynamic_smem;           // Opt-in dynamic shared-memory limit per block
     int last_ll_combine_warps_per_group; // Test/diagnostic record of the resolved LL launch shape
+    nccl_ep::CombinePushLaunch last_combine_push_launch{}; // Test/diagnostic record of the HT push combine launch
     // Hardware opt-in dynamic shared memory cap per block (sharedMemPerBlockOptin), cached
     // once so the dispatch path can reject a pull kernel whose per-warp staging would exceed
     // it (see ncclEpDispatch) without re-querying the device on every call.
@@ -8027,6 +8028,7 @@ ncclResult_t ncclEpCombine(
                 static_cast<int>(group->config.max_dispatch_tokens_per_rank),
                 team_size,
                 group->nRanks,
+                group->device_sm,
                 // Push combine is a comm kernel (NVLink push), so it uses the combine SM budget.
                 static_cast<int>(ht_combine_num_sms(group, handle->layout)),
                 0u,
@@ -8045,7 +8047,8 @@ ncclResult_t ncclEpCombine(
                 nccl_ep_env_flag_on(group->env.nucs),
                 handle->layout == NCCL_EP_LAYOUT_FLAT,
                 em_drop ? group->ht_buffers.ipc_combine_prob_offset - group->ht_buffers.ipc_combine_token_offset
-                        : 0));
+                        : 0,
+                &group->last_combine_push_launch));
             NCCLCHECK(nccl_ep::ht::launch_combine_reduce_stage(
                 combined_x->data,
                 staging,
@@ -8605,6 +8608,13 @@ ncclResult_t ncclEpGroup_test_setMaxDynamicSmem(ncclEpGroup_t group, int max_dyn
 
 int ncclEpGroup_test_getLastLlCombineWarpsPerGroup(ncclEpGroup_t group) {
     return group == nullptr ? 0 : group->last_ll_combine_warps_per_group;
+}
+
+void ncclEpGroup_test_getLastCombinePushLaunch(
+    ncclEpGroup_t group, int* chunk_int4, unsigned int* device_sm) {
+    if (group == nullptr) return;
+    if (chunk_int4 != nullptr) *chunk_int4 = group->last_combine_push_launch.chunk_int4;
+    if (device_sm != nullptr) *device_sm = group->last_combine_push_launch.device_sm;
 }
 
 void ncclEpGroup_test_getSmBudgets(

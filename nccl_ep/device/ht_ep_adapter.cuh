@@ -22,6 +22,7 @@
 #include "nccl_ep_env.h"
 
 namespace nccl_ep {
+struct CombinePushLaunch;  // ht_chunk_config.hpp
 namespace ht {
 
 // Source-token granularity of flat fused metadata. Each chunk carries one
@@ -554,6 +555,7 @@ ncclResult_t launch_combine_push(
     int tokens_per_rank,
     int lsa_team_size,
     int ep_size,
+    unsigned int device_sm,
     int sm_count,
     unsigned int shuffle_sms,
     cudaStream_t stream,
@@ -571,7 +573,9 @@ ncclResult_t launch_combine_push(
     bool nucs,
     bool flat,
     // Overflow-drop expert-major: byte offset from a peer staging base to its row flags (0 = off).
-    size_t row_flag_offset);
+    size_t row_flag_offset,
+    // Optional: receives the resolved chunk width and architecture of the launch (tests).
+    ::nccl_ep::CombinePushLaunch* launch_record);
 
 ncclResult_t launch_combine_reduce_stage(
     void* attn_output,

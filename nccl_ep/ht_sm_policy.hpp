@@ -11,13 +11,23 @@ inline constexpr unsigned int kHtExpertMajorDefaultSms = 24;
 inline constexpr unsigned int kHtRubinExpertMajorSms = 32;
 inline constexpr unsigned int kHtFlatCombineLargeBatchSms = 32;
 inline constexpr unsigned int kHtLargeBatchTokens = 8192;
+inline constexpr int kHtCombinePushWholeRowEpSize = 16;
+inline constexpr unsigned int kHtRubinSm = 107;
 
 // Rubin is SM107. A numeric >= comparison also matches Blackwell SM110/120/121.
 constexpr unsigned int ht_default_comm_sms(unsigned int device_sm, bool expert_major) {
-    if (expert_major && device_sm == 107) {
+    if (expert_major && device_sm == kHtRubinSm) {
         return kHtRubinExpertMajorSms;
     }
     return expert_major ? kHtExpertMajorDefaultSms : kHtFlatDefaultSms;
+}
+
+// Whole-row push-combine default: never on Rubin (SM107), else from EP16.
+constexpr bool ht_combine_push_default_whole_row(unsigned int device_sm, int ep_size) {
+    if (device_sm == kHtRubinSm) {
+        return false;
+    }
+    return ep_size >= kHtCombinePushWholeRowEpSize;
 }
 
 constexpr unsigned int ht_flat_combine_default_sms(unsigned int max_dispatch_tokens_per_rank) {

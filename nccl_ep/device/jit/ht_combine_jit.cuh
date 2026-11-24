@@ -10,6 +10,8 @@
 #include "device/jit/jit_runtime.hpp"
 #include "device/jit/jit_utils.hpp"
 #include "device/jit/jit_source_literals.hpp"
+#include "ht_chunk_config.hpp"
+#include "ht_sm_policy.hpp"
 #include "nccl_ep_env.h"
 
 #include <cassert>
@@ -524,12 +526,14 @@ inline ncclResult_t launch_combine_push(
     int row_bytes,
     int num_blocks,
     int ep_size,
+    unsigned int device_sm,
     ::ht_ep::combine_push_param_t& param,
     cudaStream_t stream,
     ncclEpCombQuant_t recipe,
-    ncclDataType_t token_dtype = ncclBfloat16,
-    bool backward = false,
-    bool nucs = false) {
+    ncclDataType_t token_dtype,
+    bool backward,
+    bool nucs,
+    ::nccl_ep::CombinePushLaunch* launch_record) {
     static const int variant_identity = 0;
     assert((row_bytes % 16) == 0);
     const int hidden_int4 = row_bytes / 16;
@@ -549,47 +553,29 @@ inline ncclResult_t launch_combine_push(
     int smem_cap = 0, dev = 0;
     (void)cudaGetDevice(&dev);
     (void)cudaDeviceGetAttribute(&smem_cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-    // NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE is the chunk width in hidden elements. Unset auto-selects
-    // the default by EP size: one tile for EP < 16, the whole row for EP >= 16 (chunking wins at
-    // small EP but not large). 0 forces the whole row; other values round up to whole tiles,
-    // clamped to the row.
-    const int requested_int4 = [&] {
-        // Flat relays the row without EM gather/reduction accumulators. Use a
-        // full-row TMA stage and size the warp count to its shared-memory cost.
-        if (param.flat || mxfp8) {
-            return 0;
-        }
-        constexpr int kOneTile = 1;  // rounds up to one tile in combine_push_chunk_size
-        constexpr int kAutoNoChunkEpSize = 16;  // EP >= this uses the whole row by default
-        const int auto_default = ep_size >= kAutoNoChunkEpSize ? 0 : kOneTile;
-        const std::string raw_value = ::nccl_ep::jit::env_value("NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE");
-        if (raw_value.empty()) return auto_default;
-        char* end = nullptr;
-        const long elems = std::strtol(raw_value.c_str(), &end, 10);
-        if (end == raw_value.c_str() || *end != '\0' || elems < 0 || elems > INT_MAX / 4) {
-            if (::nccl_ep::jit::announce_once("combine_push_chunk_size_bad_h" + std::to_string(hidden_int4))) {
-                std::fprintf(stderr,
-                             "[nccl_ep][env] NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE=\"%s\" is not a non-negative "
-                             "integer; using the default chunk\n",
-                             raw_value.c_str());
-            }
-            return auto_default;
-        }
-        if (elems == 0) return 0;
-        const int elem_bytes = token_dtype == ncclFloat32 ? 4
-                               : (token_dtype == ncclFloat8e4m3 || token_dtype == ncclFloat8e5m2 ||
-                                  token_dtype == ncclFloat4x2)
-                                   ? 1
-                                   : 2;
-        const int int4s = static_cast<int>((elems * elem_bytes + 15) / 16);
-        if (::nccl_ep::jit::announce_once("combine_push_chunk_size_h" + std::to_string(hidden_int4))) {
+    // Flat and MXFP8 relay the whole row. Otherwise NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE is the chunk
+    // width in hidden elements; unset: see ht_combine_push_default_whole_row. 0 forces the whole
+    // row; other values round up to whole tiles, clamped.
+    int requested_int4 = 0;
+    if (!param.flat && !mxfp8) {
+        const std::string chunk_env = ::nccl_ep::jit::env_value("NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE");
+        const ::nccl_ep::CombinePushChunkResolution chunk_req = ::nccl_ep::resolve_combine_push_chunk(
+            device_sm, ep_size, static_cast<int>(::nccl_ep::ncclTypeSize(token_dtype)), chunk_env);
+        if (chunk_req.message == ::nccl_ep::CombinePushChunkMessage::kInvalid &&
+            ::nccl_ep::jit::announce_once("combine_push_chunk_size_bad_h" + std::to_string(hidden_int4))) {
             std::fprintf(stderr,
-                         "[nccl_ep][env] NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE: combine push h%d chunk=%d elems "
+                         "[nccl_ep][env] NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE=\"%s\" is not a non-negative "
+                         "integer; using the default chunk\n",
+                         chunk_env.c_str());
+        } else if (chunk_req.message == ::nccl_ep::CombinePushChunkMessage::kExplicitWidth &&
+                   ::nccl_ep::jit::announce_once("combine_push_chunk_size_h" + std::to_string(hidden_int4))) {
+            std::fprintf(stderr,
+                         "[nccl_ep][env] NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE: combine push h%d chunk=%s elems "
                          "(%d int4 before rounding to tiles)\n",
-                         hidden_int4, elems, int4s);
+                         hidden_int4, chunk_env.c_str(), chunk_req.requested_int4);
         }
-        return int4s;
-    }();
+        requested_int4 = chunk_req.requested_int4;
+    }
     const int chunk_size = ::ht_ep::combine_push_chunk_size(row_int4, requested_int4);
     const int kernel_chunk_size = mxfp8 ? 0 : chunk_size;
     const int slots = param.flat
@@ -685,6 +671,7 @@ inline ncclResult_t launch_combine_push(
                      error.empty() ? "" : ": ", error.empty() ? "" : error.c_str());
         return ncclInternalError;
     }
+    if (launch_record != nullptr) *launch_record = {chunk_size, device_sm};
     return ncclSuccess;
 }
 

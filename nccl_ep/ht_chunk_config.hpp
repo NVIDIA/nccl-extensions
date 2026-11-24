@@ -6,12 +6,15 @@
 #pragma once
 
 #include "nccl_ep_env.h"
+#include "ht_sm_policy.hpp"
 #include "device/ht_ep_configs.cuh"
 
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
+#include <string>
 
 inline int nccl_ep_resolve_combine_chunk(const ncclEpEnvConfig& cfg, int dispatch_num_sms, int num_lsa_teams) {
     // RDMA (multi-LSA-team) configs use the 64-token default; single-LSA configs
@@ -103,5 +106,47 @@ private:
     int default_chunk_;
     int dispatch_num_sms_;
 };
+
+// Message the combine-push launcher logs once per hidden size for the
+// NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE override: kInvalid warns about a malformed
+// value, kExplicitWidth reports an accepted nonzero one, kNone logs nothing (unset or 0).
+enum class CombinePushChunkMessage { kNone, kInvalid, kExplicitWidth };
+
+struct CombinePushChunkResolution {
+    int requested_int4;             // chunk width (int4) before tile rounding; 0 is the whole row
+    CombinePushChunkMessage message;
+};
+
+// Chunk width of the last combine-push launch, for tests: int4 after tile rounding and the
+// architecture it was resolved for.
+struct CombinePushLaunch {
+    int chunk_int4;
+    unsigned int device_sm;
+};
+
+// Resolve the expert-major combine-push chunk width (int4) before tile rounding.
+// NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE (in hidden elements, scaled by elem_bytes) wins:
+// 0 forces the whole row, a positive value rounds up to whole tiles, and an empty or
+// malformed value falls back to the arch/EP default (one tile on Rubin, whole row from
+// EP16 elsewhere).
+inline CombinePushChunkResolution resolve_combine_push_chunk(
+    unsigned int device_sm, int ep_size, int elem_bytes, const std::string& env_value) {
+    constexpr int kOneTile = 1;  // rounds up to one tile in combine_push_chunk_size
+    const int auto_default = ht_combine_push_default_whole_row(device_sm, ep_size) ? 0 : kOneTile;
+    if (env_value.empty()) {
+        return {auto_default, CombinePushChunkMessage::kNone};
+    }
+    char* end = nullptr;
+    const long elems = std::strtol(env_value.c_str(), &end, 10);
+    if (end == env_value.c_str() || *end != '\0' || elems < 0 ||
+        elems > std::numeric_limits<int>::max() / 4) {
+        return {auto_default, CombinePushChunkMessage::kInvalid};
+    }
+    if (elems == 0) {
+        return {0, CombinePushChunkMessage::kNone};
+    }
+    const int int4s = static_cast<int>((elems * elem_bytes + 15) / 16);
+    return {int4s, CombinePushChunkMessage::kExplicitWidth};
+}
 
 } // namespace nccl_ep

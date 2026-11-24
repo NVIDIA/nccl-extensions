@@ -1,0 +1,16 @@
+# Machine / editor cruft
+.DS_Store
+
+# Presentations, docs binaries
+*.pptx
+*.docx
+
+# Python build/venv artifacts
+__pycache__/
+*.egg-info/
+*.pyc
+
+# Benchmark output / plots (regenerated locally, not upstreamed)
+ft_handle/python/data/
+*.png
+*.csv

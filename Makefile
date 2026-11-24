@@ -7,7 +7,7 @@
 
 .DEFAULT_GOAL := all
 
-EXTENSIONS := nccl_ep nccl_m2n
+EXTENSIONS := nccl_ep nccl_m2n nccl_ft
 
 .PHONY: all clean nccl-submodule
 
@@ -43,6 +43,11 @@ nccl_m2n.%:
 	$(MAKE) -C $(REPO_ROOT)/nccl_m2n $* \
 		NCCL_HOME=$(ABS_NCCL_HOME) \
 		BUILDDIR=$(ABS_NCCL_M2N_BUILDDIR)
+
+# nccl_ft keeps its artifacts in-tree (ft_handle/libft_collective.{so,a}).
+nccl_ft.%:
+	$(MAKE) -C $(REPO_ROOT)/nccl_ft $* \
+		NCCL_HOME=$(ABS_NCCL_HOME)
 
 nccl-submodule:
 	@if [ ! -e "$(NCCL_SUBMODULE_HOME)/.git" ]; then \

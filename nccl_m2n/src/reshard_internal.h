@@ -131,6 +131,10 @@ inline ReshardCopyAlgorithm gReshardCopyAlgorithm = RESHARD_COPY_ALGO_PACK;
  * host-initiated NCCL one-sided PutSignal/Signal/WaitSignal. */
 inline ReshardPipeNetMode gReshardPipeNetMode = RESHARD_PIPE_NET_DEVICE;
 
+/* PACK transport mode. RMA uses symmetric-window GIN or single-domain host RMA;
+ * HOST_SENDRECV uses grouped host ncclSend/ncclRecv without window registration. */
+inline ReshardPackNetMode gReshardPackNetMode = RESHARD_PACK_NET_RMA;
+
 /* Resolved once with the rest of the process runtime configuration at the
  * first ncclM2nInit. Host-RMA uses its default channel count as a pool
  * capacity; its active lanes are resolved from the peer graph unless the
@@ -311,6 +315,9 @@ inline ReshardCopyAlgorithm reshardGetCopyAlgorithm() {
 }
 inline ReshardPipeNetMode reshardGetPipeNetMode() {
   return gReshardPipeNetMode;
+}
+inline ReshardPackNetMode reshardGetPackNetMode() {
+  return gReshardPackNetMode;
 }
 inline const ReshardStagingRuntimeConfig& reshardGetStagingRuntimeConfig() {
   return gReshardStagingRuntimeConfig;
@@ -809,9 +816,9 @@ ncclResult_t reshardTestBroadcastMaxInt(ncclComm_t comm, cudaStream_t stream, in
  * reshard_user_window.cu — PACK copy mode entry.
  *
  * Pack each destination's bytes contiguously into the reused transfer buffer
- * via CE cudaMemcpy3D, transfer with host RMA for an eligible forward-ordered
- * single-LSA communicator (otherwise use the existing user-window kernel),
- * then unpack.
+ * via CE cudaMemcpy3D, transfer with host RMA (eligible forward-ordered
+ * single-LSA communicator), host Send/Recv (HOST_SENDRECV), or the user-window
+ * kernel, then unpack.
  * Used by ncclReshard when copyAlgo == RESHARD_COPY_ALGO_PACK.
  * Both src/dst descriptors must be the normalized, privately owned copies in a
  * live ReshardTensorSetup prepared by reshardPrepareTensorSetup. This function

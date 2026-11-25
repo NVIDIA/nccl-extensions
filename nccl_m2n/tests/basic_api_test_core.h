@@ -1675,8 +1675,11 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
   const char* instrumentationFailure = nullptr;
 #ifdef NCCL_M2N_TESTING
   if (testPackFusion) {
-    if (reshardGetFusedSubmissionCountForTest() != 1) {
-      instrumentationFailure = "compatible grouped tensors did not produce exactly one fused PACK submission";
+    const size_t expectedFused = (reshardGetPackNetMode() == RESHARD_PACK_NET_RMA) ? 1 : 0;
+    if (reshardGetFusedSubmissionCountForTest() != expectedFused) {
+      instrumentationFailure = (expectedFused == 1)
+                                 ? "compatible grouped tensors did not produce exactly one fused PACK submission"
+                                 : "PACK host_sendrecv unexpectedly executed fused window submission";
     }
   } else if (!asyncOrdering && env->expectPack &&
              reshardGetLastCompletedCopyAlgorithmForTest() != RESHARD_COPY_ALGO_PACK) {

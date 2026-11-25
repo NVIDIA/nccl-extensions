@@ -465,6 +465,7 @@ Apply regardless of the selected copy algorithm.
 | Variable | Algorithm | Effect |
 |---|---|---|
 | `NCCL_RESHARD_PACK_BUFFSIZES` | PACK | Bounded staging pool as comma-separated `size[:slots]` buckets (default `2147483648:4`). Sizes accept bytes or binary `k`/`m` suffixes; omitted slots default to one. Invalid profiles retain the built-in default. Multiple size buckets disable split comm and use the parent DevComm path; one bucket with multiple slots retains split support. |
+| `NCCL_RESHARD_PACK_NET_MODE` | PACK | `RMA` (default, symmetric-window GIN or single-domain host-RMA) or `HOST_SENDRECV` (grouped host `ncclSend`/`ncclRecv` without window registration or one-sided RMA; read at runtime initialization). `HOST_SENDRECV` uses direct source-to-replica delivery without ring/LSA fan-out (bounded by `MAX_DIRECT_TARGETS=64` and `MAX_DIRECT_SOURCES=64`) and runs `ncclM2nGroupStart`/`End` entries serially without window fusion. |
 | `NCCL_RESHARD_STAGING_NUM_CHANNELS` | DIRECT, PIPE | Channel count for the channelized staging pool (separate from PACK's pool above); default 4, or 8 for PIPE host-RMA. |
 | `NCCL_RESHARD_STAGING_CHANNEL_SIZE` | DIRECT, PIPE | Per-channel data capacity for that pool; default 8 MiB, or 128 MiB for PIPE host-RMA. |
 | `NCCL_RESHARD_STAGING_CHUNK_SIZE` | DIRECT, PIPE | Chunk size within a staging channel; default 1 MiB, or 32 MiB for PIPE host-RMA. |

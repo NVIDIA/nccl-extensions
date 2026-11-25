@@ -191,6 +191,26 @@ runPackSplitCase() {
   rm -f "${log}"
 }
 
+runPackHostSendRecvCase() {
+  local log
+  log="$(mktemp)"
+
+  echo "=== basic_api_test_mpi: PACK host_sendrecv ==="
+  if ! NCCL_RESHARD_PACK_NET_MODE=HOST_SENDRECV NCCL_RESHARD_LOG_LEVEL=INFO \
+     runMpiProgram "${binary}" "${log}" \
+       --filter tiny_contribution --algorithm ring --api default --copy-algorithm pack --lb-mode node \
+       --gtest_filter='Matrix/BasicApiMpiTest.*' ||
+     ! grep -Eq "^worldSize=${expectedRanks}, devices=[1-9][0-9]*," "${log}" ||
+     ! grep -Eq '^\[  PASSED  \] [1-9][0-9]* tests?\.' "${log}" ||
+     ! grep -Fq 'pack-host-sendrecv: ranks=' "${log}" ||
+     grep -Fq '[  SKIPPED ]' "${log}"; then
+    echo "basic_api_test_mpi [PACK host_sendrecv] did not execute a passing HOST_SENDRECV case." >&2
+    rm -f "${log}"
+    return 1
+  fi
+  rm -f "${log}"
+}
+
 runNonBlockingCase() {
   NCCL_COMM_BLOCKING=0 runCase "$@"
 }
@@ -203,6 +223,8 @@ runNonBlockingCoverage() {
     --filter tiny_contribution --algorithm ring --api default --copy-algorithm pack --lb-mode uniform
   runNonBlockingCase "nonblocking PACK/window API" \
     --filter tiny_contribution --algorithm ring --api window --copy-algorithm pack --lb-mode uniform
+  NCCL_RESHARD_PACK_NET_MODE=HOST_SENDRECV runNonBlockingCase "nonblocking PACK host-sendrecv/default API" \
+    --filter tiny_contribution --algorithm ring --api default --copy-algorithm pack --lb-mode uniform
   NCCL_RESHARD_PIPE_NET_MODE=HOST_RMA runNonBlockingCase "nonblocking PIPE host-RMA/default API" \
     --filter tiny_contribution --algorithm ring --api default --copy-algorithm pipe --lb-mode uniform
   if [[ "${NCCL_M2N_MPI_TEST_PROFILE}" == eight_rank ]]; then
@@ -387,6 +409,7 @@ case "${NCCL_M2N_MPI_TEST_PROFILE}" in
       --algorithm ring --api default --lb-mode uniform
     runPackSplitCase split_tiny_contribution
     runPackSplitCase split_reverse_mesh
+    runPackHostSendRecvCase
     ;;
   eight_rank)
     runCase "all algorithms, source parity" --algorithm all --lb-mode uniform
@@ -395,6 +418,7 @@ case "${NCCL_M2N_MPI_TEST_PROFILE}" in
       --algorithm all --api all --lb-mode uniform
     runPackSplitCase split_tiny_contribution
     runPackSplitCase split_reverse_mesh
+    runPackHostSendRecvCase
     runPackGroupCase
     for algorithm in ring direct; do
       for dstShardDim in 0 1; do

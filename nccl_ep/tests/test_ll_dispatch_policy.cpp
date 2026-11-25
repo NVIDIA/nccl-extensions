@@ -24,6 +24,21 @@ int main() {
     check(!llUseHierarchicalDispatch(4, 8, 256, 512, 8, referenceBytes, false));
     check(llUseHierarchicalDispatch(4, 8, 512, 512, 8, referenceBytes, false));
     check(llUseHierarchicalDispatch(4, 8, 8192, 256, 8, referenceBytes, false));
+    check(!llMayUseHierarchicalDispatch(16, 4, 128, 256, 8, referenceBytes, false));
+
+    // AUTO must not promote outside the provisioning limit, even where the
+    // unconstrained fit predicts a win at high top-k or token capacity.
+    check(llHierarchicalDispatchScore(5, 4, 128, 80, 15, referenceBytes, false) < 0);
+    check(llHierarchicalDispatchScore(8, 4, 128, 128, 23, referenceBytes, false) < 0);
+    check(llHierarchicalDispatchScore(16, 4, 8192, 256, 32, referenceBytes, false) < 0);
+    for (int domains : {5, 8, 16, 32}) {
+        const int experts = domains * 4 * 4;
+        for (int topk = 1; topk <= 32; ++topk) {
+            check(!llUseHierarchicalDispatch(domains, 4, 8192, experts, topk, referenceBytes, false));
+            check(!llMayUseHierarchicalDispatch(domains, 4, 8192, experts, topk, referenceBytes, false));
+        }
+        check(!llMayUseHierarchicalDispatch(domains, 4, 8192, experts, 0, referenceBytes, false));
+    }
 
     for (int domains = 2; domains <= 4; ++domains) {
         for (int ranks = 4; ranks <= 8; ++ranks) {
@@ -69,15 +84,18 @@ int main() {
         }
     }
 
-    // Every permitted handle choice is covered by the group reservation.
-    for (unsigned bound : {0u, 1u, 6u, 8u, 32u, std::numeric_limits<unsigned>::max()}) {
-        const bool reserved = llMayUseHierarchicalDispatch(2, 8, 512, 256, bound, referenceBytes, false);
-        const unsigned limit = bound == 0 ? 32u : std::min(bound, 32u);
-        bool any = false;
-        for (unsigned topk = 1; topk <= limit; ++topk) {
-            any |= llUseHierarchicalDispatch(2, 8, 512, 256, int(topk), referenceBytes, false);
+    // Group reservation and dispatch agree at and beyond the domain boundary.
+    for (int domains : {1, 2, 3, 4, 5, 8, 16}) {
+        for (unsigned bound : {0u, 1u, 6u, 8u, 32u, std::numeric_limits<unsigned>::max()}) {
+            const int experts = domains * 8 * 16;
+            const bool reserved = llMayUseHierarchicalDispatch(domains, 8, 512, experts, bound, referenceBytes, false);
+            const unsigned limit = bound == 0 ? 32u : std::min(bound, 32u);
+            bool any = false;
+            for (unsigned topk = 1; topk <= limit; ++topk) {
+                any |= llUseHierarchicalDispatch(domains, 8, 512, experts, int(topk), referenceBytes, false);
+            }
+            check(reserved == any);
         }
-        check(reserved == any);
     }
     check(!llUseHierarchicalDispatch(2, 8, std::numeric_limits<int>::max(), 256, 1, referenceBytes, false));
     check(llUseHierarchicalDispatch(2, 8, 512, 256, 6, referenceBytes, false));

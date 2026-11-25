@@ -26,8 +26,11 @@ constexpr double kBaselineSparseTokenScale = 32;
 constexpr double kReferenceTokenBytes = 7168 * sizeof(uint16_t);
 } // namespace hierarchical_dispatch_fit
 
-// Promotion margins are independent of the fit.
+// AUTO eligibility and promotion margins are independent of the fit.
 namespace hierarchical_dispatch_auto_policy {
+// Larger-domain wins are unvalidated extrapolations; cap AUTO to avoid
+// reserving an expensive GIN pool. Forced hierarchy remains available.
+constexpr int kMaxDomains = 4;
 constexpr double kMinSavingUs = 5;
 constexpr double kMinSavingFraction = .02;
 } // namespace hierarchical_dispatch_auto_policy
@@ -95,8 +98,9 @@ inline double llHierarchicalDispatchScore(int domains, int ranksPerDomain, uint6
 
 inline bool llUseHierarchicalDispatch(int domains, int ranksPerDomain, uint64_t capacity,
                                        int experts, int topk, uint64_t tokenBytes, bool contextsRestricted) {
-    return llHierarchicalDispatchScore(domains, ranksPerDomain, capacity, experts, topk,
-                                      tokenBytes, contextsRestricted) < 0;
+    return domains <= hierarchical_dispatch_auto_policy::kMaxDomains &&
+        llHierarchicalDispatchScore(domains, ranksPerDomain, capacity, experts, topk,
+                                   tokenBytes, contextsRestricted) < 0;
 }
 
 // Group resources cover any handle allowed by its top-k bound; dispatch uses the actual top-k.

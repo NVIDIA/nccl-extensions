@@ -2898,7 +2898,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         ep_group->config.num_channels = 10;
     }
 
-    // Dispatch dedicates N2N warps per CTA; combine reuses this pool.
+    // HT dispatch dedicates N2N warps per CTA; combine reuses this pool.
+    // LL eligibility is evaluated with this full budget before reducing it below.
     const unsigned autoGinContexts =
         NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ht_dispatch_sms_capacity(ep_group) * NCCL_EP_HT_DISPATCH_N2N_WARPS);
     if (ep_group->config.num_qp_per_rank == NCCL_EP_AUTO) {
@@ -3201,6 +3202,13 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         const ncclResult_t hier_result = configure_ll_hier(ep_group, stream);
         if (hier_result != ncclSuccess) {
           return reject_group(hier_result);
+        }
+
+        // Without hierarchy (zero CTAs), baseline LL needs only four contexts.
+        if (in_config->num_qp_per_rank == NCCL_EP_AUTO && ep_group->ll_hier.numLogicalCtas == 0) {
+            ep_group->config.num_qp_per_rank = MAX_NCCL_GIN_CTX_PER_COMM;
+            ep_group->ll_gin_contexts_restricted =
+                ll::llGinContextsRestricted(ep_group->config.num_qp_per_rank, autoGinContexts);
         }
 
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;

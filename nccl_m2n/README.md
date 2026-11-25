@@ -20,6 +20,7 @@ is installed as `libnccl_m2n.so`; the public header is `nccl_m2n.h`.
 | @spotluri | Design, kernels, performance |
 | @kingchc | APIs, integration |
 | @kwen2501 | APIs, integration |
+| @pkousha | APIs, integration |
 
 ---
 

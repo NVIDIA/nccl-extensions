@@ -93,14 +93,14 @@ std::string dispatch_source(const Shape& s, HtKernelImpl impl, nccl_ep::HtDispat
         /*sf_bytes_per_token=*/0, kExpertsPerRank, schedule, spec, impl);
 }
 
-std::string combine_source(const Shape& s, HtKernelImpl impl) {
+std::string combine_source(const Shape& s, HtKernelImpl impl, bool overflow_drop) {
     using namespace nccl_ep::ht::jit;
     const combine_warp_layout_t L = compute_combine_warp_layout(kLsaTeams, NCCL_EP_HT_COMBINE_CROSS_LSA_PIPELINES);
     return combine_jit_source(
         L, NCCL_EP_HT_COMBINE_CROSS_LSA_STAGES_G2S, NCCL_EP_HT_COMBINE_CROSS_LSA_STAGES_S2G,
         NCCL_EP_HT_COMBINE_TOK_PER_GROUP, kChunk,
         kMaxTokens, kLsaTeams, kBlocks, /*backward_combine=*/s.backward, kLsaTeamSize, s.layout, kHidden,
-        ncclBfloat16, NCCL_EP_COMB_QUANT_NONE, impl);
+        ncclBfloat16, NCCL_EP_COMB_QUANT_NONE, impl, overflow_drop);
 }
 
 class HtJitCompile : public ::testing::TestWithParam<HtKernelImpl> {};
@@ -122,11 +122,17 @@ TEST_P(HtJitCompile, Dispatch) {
 }
 
 TEST_P(HtJitCompile, Combine) {
+    // Only the unordered combine has an NCCL_EP_OVERFLOW_DROP variant.
+    const bool unordered = GetParam() == HtKernelImpl::kUnordered;
     for (const Shape& s : kShapes) {
-        std::string log;
-        const std::string tag = std::string("combine_") + impl_name(GetParam()) + "_" + s.name;
-        const std::string failed = compile_host_pass(combine_source(s, GetParam()), tag, &log);
-        EXPECT_TRUE(failed.empty()) << tag << "\n" << failed << "\n" << log;
+        for (const bool drop : {false, true}) {
+            if (drop && !unordered) continue;
+            std::string log;
+            const std::string tag =
+                std::string("combine_") + impl_name(GetParam()) + "_" + s.name + (drop ? "_drop" : "");
+            const std::string failed = compile_host_pass(combine_source(s, GetParam(), drop), tag, &log);
+            EXPECT_TRUE(failed.empty()) << tag << "\n" << failed << "\n" << log;
+        }
     }
 }
 

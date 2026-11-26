@@ -7,7 +7,7 @@
 #pragma once
 #include "common.hpp"
 
-namespace ht_ep {
+namespace ht_common {
 
 // Count-exchange path: per-destination-rank send-count histogram. Topology
 // constants (experts_per_rank, lsa_team_size) are baked as template params so the
@@ -93,4 +93,4 @@ __device__ void build_count_metadata_impl(const build_count_metadata_param_t& p)
     }
 }
 
-} // namespace ht_ep
+} // namespace ht_common

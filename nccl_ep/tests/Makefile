@@ -49,6 +49,7 @@ TEST_BINARIES := \
         $(DST_DIR)/test_ht_dispatch_async \
         $(DST_DIR)/test_ht_dispatch_pp_interleave \
         $(DST_DIR)/test_ht_gin_signal_layout \
+        $(DST_DIR)/test_ht_jit_compile \
         $(DST_DIR)/test_ht_overflow_drop \
         $(DST_DIR)/test_ht_pull_chunk_ring \
         $(DST_DIR)/test_ht_stale_routing_map \
@@ -96,6 +97,10 @@ $(DST_DIR)/test_ht_chunk_config: $(DST_DIR)/test_ht_chunk_config.o $(GTEST_LIBS)
 
 $(DST_DIR)/test_ht_chunk_config.o: test_ht_chunk_config.cu $(NCCL_EP_SRCDIR)/ht_chunk_config.hpp $(NCCL_EP_SRCDIR)/ht_sm_policy.hpp $(NCCL_EP_SRCDIR)/nccl_ep_env.h $(NCCL_EP_SRCDIR)/device/ht_ep_configs.cuh | $(DST_DIR)
 	$(CXX) $(CXXSTD) -x c++ -pthread -I$(NCCL_EP_SRCDIR) -I$(GTEST_DIR)/include -c $< -o $@
+
+# Host-pass compile of the generated HT JIT sources against the staged kernel headers.
+$(DST_DIR)/test_ht_jit_compile.o: NVCUFLAGS += -DNCCL_EP_TEST_JIT_SOURCE_DIR='"$(NCCL_EP_INCDIR)/nccl_ep"' \
+                                              -DNCCL_EP_TEST_NCCL_INCDIR='"$(NCCL_INCDIR)"'
 
 # Exercise optional driver API lookup without a GPU or production test hooks.
 CFT_DRIVER_WRAPS := cudaGetDriverEntryPointByVersion cudaGetLastError cudaRuntimeGetVersion \

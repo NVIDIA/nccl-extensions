@@ -44,9 +44,9 @@ inline std::string scan_flat_jit_source(
         << "\n"
         << "extern \"C\" __launch_bounds__(" << num_threads_per_block << ", 1)\n"
         << "__global__ void " << kScanFlatJitEntryName << "(\n"
-        << "    const __grid_constant__ ht_ep::scan_flat_kernel_param_t p) {\n"
+        << "    const __grid_constant__ ht_common::scan_flat_kernel_param_t p) {\n"
         << "  extern __shared__ uint8_t smem_bytes[];\n"
-        << "  ht_ep::scan_impl_flat<\n"
+        << "  ht_common::scan_impl_flat<\n"
         << "      " << num_threads_per_block << ",\n"
         << "      " << num_of_blocks << ",\n"
         << "      " << num_lsa_teams << ",\n"
@@ -57,7 +57,7 @@ inline std::string scan_flat_jit_source(
         << "      " << em_out_type << ",\n"
         << "      " << ::nccl_ep::jit::bool_literal(use_topk_idx) << ">(\n"
         << "      p.input_routing_map, p.tmp, p.sparse_to_dense_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"
-        << "      reinterpret_cast<ht_ep::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
+        << "      reinterpret_cast<ht_common::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
         << "      p.num_of_tokens_for_experts, p.local_expert_routing_map, p.per_expert_token_counts,\n"
         << "      p.lsa_team, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank,\n"
         << "      p.recv_total_counter, p.out_is_int64, p.max_recv_tokens_per_rank,\n"
@@ -84,14 +84,14 @@ scan_em_jit_source(int num_threads_per_block, int num_of_blocks, int num_lsa_tea
         << "\n"
         << "extern \"C\" __launch_bounds__(" << num_threads_per_block << ", 1)\n"
         << "__global__ void " << kScanEmJitEntryName << "(\n"
-        << "    const __grid_constant__ ht_ep::scan_em_kernel_param_t p) {\n"
-        << "  ht_ep::scan_impl_em<\n"
+        << "    const __grid_constant__ ht_common::scan_em_kernel_param_t p) {\n"
+        << "  ht_common::scan_impl_em<\n"
         << "      " << num_threads_per_block << ",\n"
         << "      " << num_of_blocks << ",\n"
         << "      " << num_lsa_teams << ",\n"
         << "      " << lsa_team_size << ">(\n"
         << "      p.input_routing_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"
-        << "      reinterpret_cast<ht_ep::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
+        << "      reinterpret_cast<ht_common::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
         << "      p.lsa_team, p.local_rank, p.num_of_tokens_per_rank, p.experts_per_rank);\n"
         << "}\n";
     return src.str();
@@ -107,7 +107,7 @@ inline void launch_scan_flat(
     bool enable_em_permute,
     bool out_is_int64,
     bool use_topk_idx,
-    ::ht_ep::scan_flat_kernel_param_t& param,
+    ::ht_common::scan_flat_kernel_param_t& param,
     int dynamic_smem_bytes,
     cudaStream_t stream) {
     static const int variant_identity = 0;
@@ -164,7 +164,7 @@ inline void launch_scan_em(
     int num_of_blocks,
     int num_lsa_teams,
     int lsa_team_size,
-    ::ht_ep::scan_em_kernel_param_t& param,
+    ::ht_common::scan_em_kernel_param_t& param,
     cudaStream_t stream) {
     static const int variant_identity = 0;
     const std::string variant_name = [&] {
@@ -209,8 +209,8 @@ inline std::string build_em_tables_jit_source(int experts_per_rank, int lsa_team
         << "\n"
         << "extern \"C\" __launch_bounds__(" << kBuildEmTablesBlockDim << ", 1)\n"
         << "__global__ void " << kBuildEmTablesJitEntryName << "(\n"
-        << "    const __grid_constant__ ht_ep::build_em_tables_param_t p) {\n"
-        << "  ht_ep::build_em_tables_impl<" << experts_per_rank << ", " << lsa_team_size << ">(p);\n"
+        << "    const __grid_constant__ ht_common::build_em_tables_param_t p) {\n"
+        << "  ht_common::build_em_tables_impl<" << experts_per_rank << ", " << lsa_team_size << ">(p);\n"
         << "}\n";
     return src.str();
 }
@@ -218,7 +218,7 @@ inline std::string build_em_tables_jit_source(int experts_per_rank, int lsa_team
 inline void launch_build_em_tables_jit(
     int experts_per_rank,
     int lsa_team_size,
-    ::ht_ep::build_em_tables_param_t& param,
+    ::ht_common::build_em_tables_param_t& param,
     int dynamic_smem_bytes,
     int num_blocks,
     cudaStream_t stream) {
@@ -274,8 +274,8 @@ inline std::string build_count_metadata_jit_source(
         << "\n"
         << "extern \"C\" __launch_bounds__(" << kBuildCountMetadataBlockDim << ", 1)\n"
         << "__global__ void " << kBuildCountMetadataJitEntryName << "(\n"
-        << "    const __grid_constant__ ht_ep::build_count_metadata_param_t p) {\n"
-        << "  ht_ep::build_count_metadata_impl<" << topk_type_literal << ", "
+        << "    const __grid_constant__ ht_common::build_count_metadata_param_t p) {\n"
+        << "  ht_common::build_count_metadata_impl<" << topk_type_literal << ", "
         << max_dst_ranks_bucket << ", "
         << experts_per_rank << ", " << lsa_team_size
         << ">(p);\n"
@@ -288,7 +288,7 @@ inline void launch_build_count_metadata_jit(
     int experts_per_rank,
     int lsa_team_size,
     bool topk_is_int64,
-    ::ht_ep::build_count_metadata_param_t& param,
+    ::ht_common::build_count_metadata_param_t& param,
     int num_blocks,
     cudaStream_t stream) {
     static const int variant_identity = 0;

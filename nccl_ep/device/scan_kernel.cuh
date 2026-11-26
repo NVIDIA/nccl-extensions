@@ -7,9 +7,10 @@
 #pragma once
 #include "common.hpp"
 #include "device_primitives.cuh"
+#include "ht/ht_common.cuh"
 #include <cooperative_groups.h>
 
-namespace ht_ep {
+namespace ht_common {
 
 enum scan_state {
     EMPTY = 0,
@@ -1679,4 +1680,4 @@ __device__ void build_em_tables_impl(const build_em_tables_param_t& p) {
     }
 }
 
-} // namespace ht_ep
+} // namespace ht_common

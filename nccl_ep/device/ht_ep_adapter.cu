@@ -156,7 +156,7 @@ void build_count_metadata(
     const int cap = nccl_ep::align(num_world_dst_ranks, 64);   // 64,128,...,1024
     EP_HOST_ASSERT(cap >= 64 && cap <= 1024 && "num_world_dst_ranks exceeds 1024");
 
-    ::ht_ep::build_count_metadata_param_t param{};
+    ::ht_common::build_count_metadata_param_t param{};
     param.topk_idx                          = topk_idx;
     param.cached_topk_idx                   = cached_topk_idx;
     param.cnt_rank                          = cnt_rank;
@@ -288,7 +288,7 @@ __global__ void compute_layout_info_kernel(
     int32_t* num_tokens_for_experts,    // handle FLAT recv count (unpadded); nullable
     bool is_flat) {                     // Flat layout: no EM zones, budget/total use the rank-level count
     extern __shared__ int32_t s_raw[]; // [2 * experts_per_rank + 1]: expert_total | expert_base | overflow_flag
-    ::ht_ep::scan_flat_smem_t smem{};
+    ::ht_common::scan_flat_smem_t smem{};
     smem.expert_total = s_raw;
     smem.expert_base = s_raw + experts_per_rank;
     smem.overflow_flag = s_raw + 2 * experts_per_rank;
@@ -320,7 +320,7 @@ __global__ void compute_layout_info_kernel(
         smem.expert_total[e] = c;
     }
     __syncthreads();
-    ::ht_ep::em_populate_cnt_tensors<EM_OUT_T>(
+    ::ht_common::em_populate_cnt_tensors<EM_OUT_T>(
         smem, experts_per_rank, em_alignment, em_internal_offsets,
         em_padded_out_counts, em_out_offsets, em_actual_counts_out,
         recv_total_counter, out_is_int64, max_recv_tokens_per_rank, allow_overflow_drop,
@@ -1057,24 +1057,24 @@ ncclResult_t call_metadata_preprocessing(
         }
 
         if (em_permute) {
-            const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * lsa_team_size * sizeof(::ht_ep::tmp_state_t);
+            const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * lsa_team_size * sizeof(::ht_common::tmp_state_t);
             CUDA_CHECK(cudaMemsetAsync(ranks_scan_tmp, 0, preprocessing_tmp_sz, stream));
 
             // The shared gscratch (ep_workspace, fit-checked above) doubles as the
             // fused scan's per-expert decoupled-scan state; gscratch_needed is its
             // exact byte size on the local-permute path.
-            auto* expert_scan_tmp = reinterpret_cast<::ht_ep::tmp_state_t*>(scan_gscratch);
+            auto* expert_scan_tmp = reinterpret_cast<::ht_common::tmp_state_t*>(scan_gscratch);
             CUDA_CHECK(cudaMemsetAsync(expert_scan_tmp, 0, gscratch_needed, stream));
 
             // Rank region + EM-permute region; sized by the single scan_flat_smem_t layout.
-            const int dynamic_smem_bytes = static_cast<int>(::ht_ep::scan_flat_smem_t::byte_size(
+            const int dynamic_smem_bytes = static_cast<int>(::ht_common::scan_flat_smem_t::byte_size(
                 NUM_OF_WARPS_PER_BLOCK_SCAN, lsa_team_size, experts_per_rank,
                 /*has_expert_counts=*/false, /*has_em_permute=*/true));
 
-            ::ht_ep::scan_flat_kernel_param_t sp{};
+            ::ht_common::scan_flat_kernel_param_t sp{};
             sp.input_routing_map =
                 use_topk_idx ? reinterpret_cast<const uint8_t*>(global_topk_idx) : global_routing_map;
-            sp.tmp = reinterpret_cast<::ht_ep::tmp_state_t*>(ranks_scan_tmp);
+            sp.tmp = reinterpret_cast<::ht_common::tmp_state_t*>(ranks_scan_tmp);
             sp.sparse_to_dense_map = sparse_to_dense_map;
             sp.rdma_to_attn_map = rdma_to_attn_map;
             sp.attn_to_rdma_map = attn_to_rdma_map;
@@ -1129,7 +1129,7 @@ ncclResult_t call_metadata_preprocessing(
         } else {
             // nvlink_dup / local_dup EM path: produce only the per-token rank mask + RDMA/attn
             // maps in the scan, then let em_scan_kernel build S2D / LERM / em offsets.
-            ::ht_ep::scan_em_kernel_param_t sp;
+            ::ht_common::scan_em_kernel_param_t sp;
             sp.input_routing_map = global_routing_map;
             sp.rdma_to_attn_map = rdma_to_attn_map;
             sp.attn_to_rdma_map = attn_to_rdma_map;
@@ -1195,17 +1195,17 @@ ncclResult_t call_metadata_preprocessing(
         CUDA_CHECK(cudaMemsetAsync(per_expert_token_counts, 0, experts_per_rank * sizeof(int32_t), stream));
     }
 
-    const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * lsa_team_size * sizeof(::ht_ep::tmp_state_t);
+    const size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * lsa_team_size * sizeof(::ht_common::tmp_state_t);
     CUDA_CHECK(cudaMemsetAsync(ranks_scan_tmp, 0, preprocessing_tmp_sz, stream));
 
     // Rank region (+ optional per-expert counts); sized by the single scan_flat_smem_t layout.
-    const int dynamic_smem_bytes = static_cast<int>(::ht_ep::scan_flat_smem_t::byte_size(
+    const int dynamic_smem_bytes = static_cast<int>(::ht_common::scan_flat_smem_t::byte_size(
         NUM_OF_WARPS_PER_BLOCK_SCAN, lsa_team_size, experts_per_rank,
         /*has_expert_counts=*/per_expert_token_counts != nullptr, /*has_em_permute=*/false));
 
-    ::ht_ep::scan_flat_kernel_param_t sp{};
+    ::ht_common::scan_flat_kernel_param_t sp{};
     sp.input_routing_map = use_topk_idx ? reinterpret_cast<const uint8_t*>(global_topk_idx) : global_routing_map;
-    sp.tmp = reinterpret_cast<::ht_ep::tmp_state_t*>(ranks_scan_tmp);
+    sp.tmp = reinterpret_cast<::ht_common::tmp_state_t*>(ranks_scan_tmp);
     sp.sparse_to_dense_map = sparse_to_dense_map;
     sp.rdma_to_attn_map = rdma_to_attn_map;
     sp.attn_to_rdma_map = attn_to_rdma_map;
@@ -1252,7 +1252,7 @@ ncclResult_t call_metadata_preprocessing(
 }
 
 size_t get_preprocessing_scan_tmp_size(int num_blocks, int lsa_team_size) {
-    return static_cast<size_t>(num_blocks) * lsa_team_size * sizeof(::ht_ep::tmp_state_t);
+    return static_cast<size_t>(num_blocks) * lsa_team_size * sizeof(::ht_common::tmp_state_t);
 }
 
 size_t get_rank_mask_elem_size(int lsa_team_size) {
@@ -1304,7 +1304,7 @@ void launch_build_em_tables(
     constexpr int kNumWarps = jit::kBuildEmTablesBlockDim / 32;
     const size_t smem_bytes = static_cast<size_t>(kNumWarps + 1) * n_dle * sizeof(int32_t);
 
-    ::ht_ep::build_em_tables_param_t p{};
+    ::ht_common::build_em_tables_param_t p{};
     p.input_routing_map        = input_routing_map;
     p.token_rank_mask_words    = static_cast<const uint64_t*>(token_rank_mask);
     p.num_mask_words           = num_mask_words;
@@ -1352,7 +1352,7 @@ size_t get_em_scan_gscratch_size(int lsa_team_size, int experts_per_rank, int nu
         // reduction (expert_scan_tmp), [num_sms * experts_per_rank] tmp_state_t
         // (independent of nrpn). The drop-mode post-drop delivered count is tallied
         // straight into em_actual_counts_out (atomicAdd), so it needs no scratch.
-        return static_cast<size_t>(num_sms) * experts_per_rank * sizeof(::ht_ep::tmp_state_t);
+        return static_cast<size_t>(num_sms) * experts_per_rank * sizeof(::ht_common::tmp_state_t);
     }
     // em_scan_kernel (kLocalDup / nvlink_dup path): block_count[num_sms][nrpn*epr] int32.
     return static_cast<size_t>(num_sms) * lsa_team_size * experts_per_rank * sizeof(int32_t);

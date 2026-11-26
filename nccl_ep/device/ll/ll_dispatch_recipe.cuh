@@ -13,6 +13,7 @@
 
 #include <type_traits>
 #include "../device_primitives.cuh"
+#include "nccl_ep.h"
 
 namespace nccl_ep {
 namespace ll {

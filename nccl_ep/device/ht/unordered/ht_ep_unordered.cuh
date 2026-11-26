@@ -34,6 +34,7 @@
 #include "mxfp8_quant.cuh"
 #include "quant_recipe.cuh"
 #include "ht/ht_combine_packed.cuh"
+#include "ht/warp_group.cuh"
 #include <assert.h>
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -41,7 +42,7 @@
 #include <cuda/ptx>
 #include "nccl_device.h"
 #include "cuda_compat_shims.cuh" // Compatibility shims for CUDA 12.x
-#include "ht_common.cuh"
+#include "ht/ht_common.cuh"
 
 namespace ht_gin_unordered {
 
@@ -136,24 +137,6 @@ struct acc_prob_storage_t {};
 template <int N>
 struct acc_prob_storage_t<true, N> {
     float data[N];
-};
-
-// Generic warp group for warp-specializaion.
-template <int NUM_WARPS, int STARTING_WARPS>
-struct warp_group {
-    __host__ __device__ static constexpr int size() {
-        return 32 * NUM_WARPS;
-    }
-    __host__ __device__ static constexpr int warp_size() {
-        return NUM_WARPS;
-    }
-
-    __host__ __device__ static int thread_rank() {
-        return threadIdx.x - (32 * STARTING_WARPS);
-    }
-    __host__ __device__ static int warp_rank() {
-        return thread_rank() / 32;
-    }
 };
 
 // Memory region info structs for GIN (gin-deepep style)
@@ -486,7 +469,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     const int wire_prob_row_floats = prob_row_floats(config, model);
     if (config.forward_dispatch) {
         layout.prob_buffer_stage_stride = wire_prob_row_floats * sizeof(float);
-        layout.prob_buffer_stage_stride = (layout.prob_buffer_stage_stride + 15) & ~15;
+        layout.prob_buffer_stage_stride = nccl_ep::align(layout.prob_buffer_stage_stride, NCCL_EP_HT_TMA_ALIGN);
         layout.lsa_prob_buffer = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
         offset += config.num_of_stages * layout.prob_buffer_stage_stride;
     } else {
@@ -497,7 +480,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     // Scaling factor buffer (only if quantized, 16B aligned) -- total stages unchanged
     if (config.sf_bytes_per_token > 0) {
         layout.sf_buffer_stage_stride = config.sf_bytes_per_token;
-        layout.sf_buffer_stage_stride = (layout.sf_buffer_stage_stride + 15) & ~15;
+        layout.sf_buffer_stage_stride = nccl_ep::align(layout.sf_buffer_stage_stride, NCCL_EP_HT_TMA_ALIGN);
         layout.lsa_scaling_factor_buffer = reinterpret_cast<uint8_t*>(smem_base) + offset;
         offset += config.num_of_stages * layout.sf_buffer_stage_stride;
     } else {
@@ -507,7 +490,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
 
     // attn_to_rdma_map buffer (16B aligned, only if multi_lsa, shared across pipelines)
     if (model.num_lsa_teams > 1) {
-        offset = (offset + 15) & ~15;
+        offset = nccl_ep::align(offset, static_cast<size_t>(NCCL_EP_HT_TMA_ALIGN));
         layout.attn_to_rdma_map_buffer = reinterpret_cast<bool*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
         offset += config.num_of_tokens_per_chunk * (model.num_lsa_teams - 1) * sizeof(bool);
     } else {
@@ -1264,7 +1247,7 @@ __forceinline__ __device__ void dispatch_s2g_prefetch_s2d_map(
     // cp.async.bulk needs a 16B-multiple size: round up. Safe because the source S2D buffer
     // is over-allocated for max_tokens_per_rank and the smem dest stage is padded to 128B.
     uint32_t copy_bytes = (uint32_t)(chunk_size * s2d_inner_dim * sizeof(int32_t));
-    copy_bytes = (copy_bytes + 15u) & ~15u;
+    copy_bytes = nccl_ep::align(copy_bytes, static_cast<uint32_t>(NCCL_EP_HT_TMA_ALIGN));
     cuda::ptx::cp_async_bulk(
         cuda::ptx::space_shared,
         cuda::ptx::space_global,

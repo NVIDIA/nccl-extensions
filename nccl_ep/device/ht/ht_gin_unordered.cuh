@@ -1070,7 +1070,9 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
                 lteam_id, my_lteam, cidx, MAX_CHUNKS_PER_RANK, CHUNK_STRIDE, mr_info->signals_tail_base);
         const unsigned tail_signal_id = tail_signal.sig_id;
         ncclGin net(dcomm, tail_signal.ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
-        net.waitSignal(ncclCoopThread(), tail_signal_id, expected_flag_value);
+        // Already a single lane here.
+        net.increaseSignalShadow(tail_signal_id, 1ull);
+        net.waitSignalMeetShadow(ncclCoopThread(), tail_signal_id);
 
         const int remote_slot = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
         const int chunk_first_token = cidx * TOKENS_PER_CHUNK;
@@ -1509,20 +1511,24 @@ __forceinline__ __device__ void dispatch_N2N_warp(
             // context comes from gin_channel_ctx and the id from gin_dispatch_chunk_signal, the
             // helpers the waiter uses; a warp sends only its own channel's chunks
             // (gin_chunk_channel(gin_chunk_at(c, k)) == c).
-            unsigned tail_signal_id =
-                ht_gin_signals::gin_dispatch_chunk_signal(
-                    my_lteam, remote_lteam_id, cidx, MAX_CHUNKS_PER_RANK, GLOBAL_CHANNELS,
-                    smem_mr_info_ptr->signals_tail_base)
-                    .sig_id;
-            net.signal(
-                rail,
-                remote_lteam_id,
-                ncclGin_SignalAdd{tail_signal_id, 1},
-                ncclCoopWarp(),
-                ncclGin_None{},
-                cuda::thread_scope_thread,
-                cuda::thread_scope_thread,
-                ncclGinOptFlagsDefault);
+            // Only chunks the receiver waits on (cidx < num_of_chunks_per_rank) are signalled, so
+            // every signal meets exactly one shadow raise.
+            if (cidx < num_of_chunks_per_rank) {
+                unsigned tail_signal_id =
+                    ht_gin_signals::gin_dispatch_chunk_signal(
+                        my_lteam, remote_lteam_id, cidx, MAX_CHUNKS_PER_RANK, GLOBAL_CHANNELS,
+                        smem_mr_info_ptr->signals_tail_base)
+                        .sig_id;
+                net.signal(
+                    rail,
+                    remote_lteam_id,
+                    ncclGin_SignalAdd{tail_signal_id, 1},
+                    ncclCoopWarp(),
+                    ncclGin_None{},
+                    cuda::thread_scope_thread,
+                    cuda::thread_scope_thread,
+                    ncclGinOptFlagsDefault);
+            }
             if constexpr (USE_WINDOW) {
                 if (n_posted + GIN_WINDOW < n_mine) {
                     net.flushAsync(rail, remote_lteam_id, &chunk_done[n_posted % GIN_WINDOW][j], ncclCoopWarp());
@@ -3341,7 +3347,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
                             global_cidx, NBLOCKS, signals_base + combine_signal_offset);
                     unsigned signal_id = signal.sig_id;
                     ncclGin net(*dcomm, signal.ctx_idx);
-                    net.waitSignal(ncclCoopThread(), signal_id, expected_flag_value);
+                    net.waitSignalMeetShadow(ncclCoopThread(), signal_id);
                 }
             }
             __syncwarp(0xffffffff);
@@ -5254,6 +5260,20 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     using head_rdma_warp = warp_group<1, 1>; // warp 1
     const int head_tid = (int)threadIdx.x;
     if (head_tid < head_init_warp::size()) {
+        // Every chunk will wait for a signal, so prepare the expectation here.
+        if constexpr (LSA_TEAMS != 1) {
+            if (head_leader) {
+                const int total_wire = (LSA_TEAMS - 1) * MAX_CHUNKS_PER_RANK;
+                for (int g = head_tid; g < total_wire; g += head_init_warp::size()) {
+                    const ht_gin_signals::gin_chunk_signal_t signal =
+                        ht_gin_signals::gin_combine_chunk_signal(
+                            g, NBLOCKS, param.signals_base + param.combine_signal_offset);
+                    ncclGin net(*param.dcomm, signal.ctx_idx);
+                    net.increaseSignalShadow(signal.sig_id, 1ull);
+                }
+            }
+        }
+        __syncwarp();
         if (head_tid == 0) {
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
             _wt_head_start = clock64();

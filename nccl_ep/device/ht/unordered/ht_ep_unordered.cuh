@@ -1513,10 +1513,9 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     net.flush(ncclCoopWarp(), cuda::memory_order_acquire);
 }
 
-// Count-mode: wait for MAP warp (unit % NUM_MAP_WARPS)'s (unit / NUM_MAP_WARPS)-th
-// publish (must match dispatch_push_map_warp's split). Shared by S2G (s2d prefetch) and
-// G2S (rdma_to_attn_map read, which build_s2d drop-clears while building the same unit) --
-// both must wait on the same counter or one can read a value the other already sees cleared.
+// Count-mode: wait for this block's chunk unit u, built by MAP warp u % NUM_MAP_WARPS.
+// Each MAP warp publishes its completed-chunk count; S2G waits before reading that chunk's
+// s2d rows. The unit numbering must match dispatch_push_map_warp's split.
 template <int NUM_MAP_WARPS>
 __forceinline__ __device__ void s2d_unit_wait(const int* s2d_chunks_ready, int u) {
     // Relaxed spin, then one CTA-acquire fence once the count passes, pairing with the
@@ -1795,8 +1794,7 @@ template <
     int NBLOCKS,
     int NUM_PIPELINES,
     bool FORWARD_DISPATCH,
-    bool HAS_SF,
-    int NUM_MAP_WARPS = 1>
+    bool HAS_SF>
 __forceinline__ __device__ void dispatch_G2S_warp(
     // INPUT
     const bool* rdma_to_attn_map,
@@ -1819,12 +1817,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
     int num_ctx_per_comm,
     void* gin_base_ptr,
     const struct dispatch_memory_region_info_t* mr_info,
-    SMEM_TYPE* smem_buffer_ptr,
-    // Count-mode: gates the rdma_to_attn_map read via s2d_unit_wait (see its doc comment
-    // above). Without this, G2S can decide a token is "needed" from a stale pre-clear read
-    // that disagrees with S2G's paired consumer, desyncing the smem FIFO producer/consumer
-    // counts and deadlocking the pipeline.
-    const int* s2d_chunks_ready = nullptr) {
+    SMEM_TYPE* smem_buffer_ptr) {
     using routing_loads_t = uint4;
 
     static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
@@ -1865,11 +1858,6 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                 // Walk LSA teams backward from self around the ring (j=0 -> self, j>=1 -> remote)
                 int lteam_id = (my_lteam + LSA_TEAMS - j) % LSA_TEAMS;
 
-                // Count mode: the map rows are final only after s2d_unit_wait. Every lane reads the
-                // map below, so every lane takes the acquire.
-                if (s2d_chunks_ready) {
-                    s2d_unit_wait<NUM_MAP_WARPS>(s2d_chunks_ready, (chunk_iter - 1) * LSA_TEAMS + j);
-                }
                 const bool* routing_row =
                     rdma_to_attn_map + (lteam_id * routing_map_lsa_stride) + work.first(cidx);
                 int tokens_needed = 0;
@@ -5010,7 +4998,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
 #define DISPATCH_G2S_TEMPLATE \
         dispatch_G2S_warp<Schedule, LSA_G2S_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_STAGES, TOKENS_PER_CHUNK, \
                             MAX_TOKENS_PER_RANK, LSA_TEAMS, LSA_TEAM_SZ, NBLOCKS, NUM_PIPELINES, \
-                            FORWARD_DISPATCH, HAS_SF, kMapWarps>
+                            FORWARD_DISPATCH, HAS_SF>
         DISPATCH_G2S_TEMPLATE(
             param.rdma_to_attn_map,
             param.attn_input_token,
@@ -5030,8 +5018,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             param.num_ctx_per_comm,
             param.gin_base_ptr,
             &param.mr_info,
-            smem_buffer_ptr,
-            param.dispatch_push_count.active ? s_s2d_chunks_ready : nullptr);
+            smem_buffer_ptr);
 #undef DISPATCH_G2S_TEMPLATE
     } else if (
         threadIdx_x_int < GIN_GROUP::size() + LSA_G2S_GROUP::size() + LSA_S2G_GROUP::size()) {

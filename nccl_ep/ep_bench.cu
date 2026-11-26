@@ -5085,6 +5085,7 @@ void printHighThroughputResults(
     // Obtain kernel times from CUPTI if available
     double global_kernel_dk_us = 0.0, global_kernel_ck_us = 0.0;
     double global_kernel_pk_us = 0.0, global_kernel_lr_us = 0.0;
+    double global_dispatch_pro_us = 0.0;
     double global_dispatch_epi_us = 0.0;
     double global_combine_pro_us = 0.0;
     double global_combine_epi_us = 0.0;
@@ -5093,6 +5094,7 @@ void printHighThroughputResults(
     double local_combine_kernel_us = 0.0;
     double local_dup_kernel_us = 0.0;
     double local_reduce_kernel_us = 0.0;
+    double local_dispatch_pro_us = 0.0;
     double local_dispatch_epi_us = 0.0;
     double local_combine_pro_us = 0.0;
     // Unfused EM pull/push sync (NCCL_EP_HT_UNFUSED_SYNC): head/tail sync run as
@@ -5108,6 +5110,8 @@ void printHighThroughputResults(
             ktimer.get_avg_us("ht_combine_kernel") + ktimer.get_avg_us("ht_combine_push_kernel");
         local_dup_kernel_us = ktimer.get_avg_us("local_dup_kernel");
         local_reduce_kernel_us = ktimer.get_avg_us("local_reduce_kernel");
+        // Unordered multi-node pack prologue; 0.0 when inactive.
+        local_dispatch_pro_us = ktimer.get_avg_us("local_dispatch_pack_kernel");
         // Local EM permute copy kernels (HT + EM + zero_copy != ON path); 0.0 when inactive.
         local_dispatch_epi_us = ktimer.get_avg_us("local_permute_dup");
         local_combine_pro_us = ktimer.get_avg_us("local_permute_reduce");
@@ -5122,6 +5126,7 @@ void printHighThroughputResults(
         MPI_Reduce(&local_combine_kernel_us, &global_kernel_ck_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&local_dup_kernel_us, &global_kernel_pk_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&local_reduce_kernel_us, &global_kernel_lr_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_dispatch_pro_us, &global_dispatch_pro_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&local_dispatch_epi_us, &global_dispatch_epi_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&local_combine_pro_us, &global_combine_pro_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&local_combine_epi_us, &global_combine_epi_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
@@ -5176,6 +5181,7 @@ void printHighThroughputResults(
         if (ktimer.is_valid()) {
             double avg_kernel_dk_us = global_kernel_dk_us / nRanks;
             double avg_kernel_ck_us = global_kernel_ck_us / nRanks;
+            double avg_dispatch_pro_us = global_dispatch_pro_us / nRanks;
             double avg_dispatch_epi_us = (global_kernel_pk_us + global_dispatch_epi_us) / nRanks;
             double avg_combine_pro_us = (global_kernel_lr_us + global_combine_pro_us) / nRanks;
             double avg_combine_epi_us = global_combine_epi_us / nRanks;
@@ -5187,6 +5193,9 @@ void printHighThroughputResults(
                                      dispatch_totals.scale_out_recv, nRanks, dk_s);
                 printHtBandwidthLine("send", dispatch_totals.total_send, dispatch_totals.nvl_send,
                                      dispatch_totals.scale_out_send, nRanks, dk_s);
+            }
+            if (avg_dispatch_pro_us > 0.0) {
+                printf("DispatchPrologue: kernel=%.2f us\n", avg_dispatch_pro_us);
             }
             if (avg_dispatch_epi_us > 0.0) {
                 printf("DispatchEpilogue: kernel=%.2f us\n", avg_dispatch_epi_us);

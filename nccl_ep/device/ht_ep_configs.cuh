@@ -71,6 +71,9 @@ inline constexpr int kHtDispatchTailChunkTokens = 16;
 // Context 0 is reserved for NCCL_GIN_RESOURCE_SHARING_GPU use
 #define NCCL_EP_HT_RESERVED_GIN_GPU_CTXS 1
 
+// cp.async.bulk (TMA) address and size granularity, in bytes.
+#define NCCL_EP_HT_TMA_ALIGN 16
+
 // ============================================================================
 // Preprocessing kernel configuration
 // ============================================================================

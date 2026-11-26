@@ -27,7 +27,7 @@ namespace ht {
 
 // Selects which HT kernel implementation gets JIT-compiled.
 //   kOrdered:   device/ht_ep.cuh, namespace ht_ep. The default.
-//   kUnordered: device/ht/ht_gin_unordered.cuh, namespace ht_gin_unordered.
+//   kUnordered: device/ht/unordered/ht_ep_unordered.cuh, namespace ht_gin_unordered.
 // Honoured by the dispatch and combine entry points only; see the
 // NCCL_EP_HT_GIN_PROTOCOL section of README.md for the scope.
 enum class HtKernelImpl { kOrdered, kUnordered };
@@ -40,7 +40,7 @@ inline HtKernelImpl ht_select_kernel_impl(const ncclEpEnvConfig* env) {
 
 // Path of the implementation header, as the JIT -I roots resolve it.
 inline const char* ht_impl_header(HtKernelImpl impl) {
-    return impl == HtKernelImpl::kUnordered ? "device/ht/ht_gin_unordered.cuh" : "device/ht_ep.cuh";
+    return impl == HtKernelImpl::kUnordered ? "device/ht/unordered/ht_ep_unordered.cuh" : "device/ht_ep.cuh";
 }
 
 // Namespace enclosing the kernel templates in that header.

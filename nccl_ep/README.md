@@ -364,7 +364,15 @@ and run with a CUDA 13.3 or newer driver.
 #   - RDMA / multi-node configs:  64
 #   - LSA-only / single-node:     NUM_OF_TOKENS_PER_GROUP (4) * resolved SM count,
 #                                 rounded up to a multiple of 32
+# Not used by dispatch with NCCL_EP_HT_GIN_PROTOCOL=UNORDERED on multi-node configs.
 export NCCL_EP_TOKENS_PER_CHUNK=128
+
+# NCCL_EP_HT_GIN_PROTOCOL=UNORDERED only: dispatch token batching granularity.
+# One network transfer carries this many tokens (64 = 64 tokens in one go), and
+# the receiver waits for the whole batch to land before processing it. Smaller
+# batches cost more network resources (transfers and GIN signals) but flow
+# faster than large ones, so performance peaks in between. Default 64.
+export NCCL_EP_UNORDERED_DISPATCH_TOKENS_PER_BATCH=64
 
 # Dump every resolved NCCL EP environment variable (name + value, or "unset")
 # at group creation, including NCCL_EP_TOKENS_PER_CHUNK.
@@ -720,7 +728,7 @@ documentation for more details.
 
 `NCCL_EP_HT_GIN_PROTOCOL` selects which kernel HT dispatch and combine run:
 
-- `UNORDERED`: the kernel for unordered networks. Work in progress: it still
+- `UNORDERED`: the kernel for unordered networks. Work in progress: combine still
   relies on the network delivering in order.
 - `ORDERED` or unset: the ordered network (GIN strong signals) kernel. This is the default.
 

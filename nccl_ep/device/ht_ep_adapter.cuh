@@ -421,6 +421,10 @@ constexpr unsigned int dispatch_copy_tma_sms(unsigned int device_sm, unsigned in
     return device_sm_count < sms ? device_sm_count : sms;
 }
 ncclResult_t configure_dispatch_copy_tma();
+
+// The env variable's value when set, else default_value.
+int env_or_default(const ncclEpEnvVar* var, int default_value);
+
 void launch_dispatch_copy_epilogue(
     const int32_t* flat_count, const int64_t* em_count,
     size_t capacity, size_t staging_capacity,
@@ -762,6 +766,7 @@ struct DispatchParams {
     ncclWindow_t nccl_internal_window; // Internal destination window handle
     int num_ctx_per_comm; // Number of contexts per communicator
     void* gin_base_ptr; // Base pointer for offset calculations
+    const bool* rdma_to_attn_map_wo_drop; // pre-drop copy; null unless DROP (unordered only)
     dispatch_memory_region_info_t mr_info;
 
     // Runtime config
@@ -772,6 +777,8 @@ struct DispatchParams {
 
     // EM local-fanout: > 0 enables sender S2G dedup + a receiver local_dup kernel.
     int local_dup_num_sms = 0;
+    // Unordered multi-LSA pack prologue grid cap (preprocessing SM count).
+    int local_dispatch_pack_num_sms = 0;
 
     bool guard_enabled = false; // RDMA + LSA buffer guard on/off
 
@@ -794,6 +801,7 @@ ncclResult_t call_dispatch(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank, // Max tokens for buffer sizing (chunk-aligned)
     int num_tokens_per_chunk, // Dispatch/combine tokens per chunk (resolved per group)
+    int unordered_dispatch_tokens_per_batch, // tokens per gin.put, resolved per group
     int num_lsa_teams, // Number of LSA teams (RDMA domain size)
     ncclEpDispQuant_t recipe,
     ncclEpPassDir_t pass_direction,

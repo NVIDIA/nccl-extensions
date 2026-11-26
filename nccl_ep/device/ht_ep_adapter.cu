@@ -5,6 +5,7 @@
  */
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  * See LICENSE.txt for more license information.
  */
@@ -12,6 +13,7 @@
 #include "nccl_device.h"
 #include "device/ht_ep_adapter.cuh"
 #include "device/ht_ep_configs.cuh"
+#include "device/ht/unordered/ep_dispatch_channel.cuh"
 #include "common.hpp"
 #include "jit/ht_combine_jit.cuh"
 #include "jit/ht_dispatch_jit.cuh"
@@ -1367,7 +1369,7 @@ size_t get_em_scan_gscratch_size(int lsa_team_size, int experts_per_rank, int nu
     return static_cast<size_t>(num_sms) * lsa_team_size * experts_per_rank * sizeof(int32_t);
 }
 
-static int env_or_default(const ncclEpEnvVar* var, int default_value) {
+int env_or_default(const ncclEpEnvVar* var, int default_value) {
     if (var == nullptr || !var->is_set) return default_value;
     return var->value.ul <= static_cast<unsigned long>(INT_MAX) ? static_cast<int>(var->value.ul) : 0;
 }
@@ -1604,7 +1606,8 @@ template <typename TOKEN_DATA_TYPE>
 template <typename TOKEN_DATA_TYPE>
 std::vector<uint8_t> build_dispatch_arg_buffer(
     const ::ht_ep::dispatch_kernel_param_base_t<TOKEN_DATA_TYPE>& kp,
-    const DispatchParams& params) {
+    const DispatchParams& params,
+    bool unordered) {
     using ParamBase = ::ht_ep::dispatch_kernel_param_base_t<TOKEN_DATA_TYPE>;
     static_assert(sizeof(ParamBase) % alignof(void*) == 0);
 
@@ -1612,7 +1615,12 @@ std::vector<uint8_t> build_dispatch_arg_buffer(
     const size_t token_offset = base_size;
     const size_t prob_offset = token_offset + params.lsa_team_size * sizeof(TOKEN_DATA_TYPE*);
     const size_t sf_offset = prob_offset + params.lsa_team_size * sizeof(float*);
-    const size_t total_size = sf_offset + params.lsa_team_size * sizeof(float*);
+    size_t total_size = sf_offset + params.lsa_team_size * sizeof(float*);
+    // The unordered kernel takes rdma_to_attn_map_wo_drop as its second argument.
+    const size_t wo_drop_offset = total_size;
+    if (unordered) {
+        total_size += sizeof(const bool*);
+    }
 
     std::vector<uint8_t> arg(total_size);
     std::memcpy(arg.data(), &kp, sizeof(kp));
@@ -1628,6 +1636,9 @@ std::vector<uint8_t> build_dispatch_arg_buffer(
             sf_ptrs[i] = static_cast<uint8_t*>(params.expert_output_scaling_factor_ptrs[i]);
         }
     }
+    if (unordered) {
+        std::memcpy(arg.data() + wo_drop_offset, &params.rdma_to_attn_map_wo_drop, sizeof(const bool*));
+    }
 
     return arg;
 }
@@ -1638,6 +1649,7 @@ ncclResult_t dispatch_impl(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank,
     int num_tokens_per_chunk,
+    int unordered_dispatch_tokens_per_batch,
     int num_lsa_teams,
     ncclEpPassDir_t pass_direction,
     int num_blocks,
@@ -1722,19 +1734,43 @@ ncclResult_t dispatch_impl(
         // Warp budget caps the pipeline count (2 warps per pipeline). Count mode swaps the
         // EM PAD warp for a 2-warp MAP group (see compute_dispatch_warp_layout), so it must
         // be reserved here too.
+        // Unordered multi-node: each pipeline is a whole channel, N2N + G2S + S2G = 3 warps per pipeline.
+        const bool unordered_multi_node = ht_select_kernel_impl(env) == HtKernelImpl::kUnordered && num_lsa_teams > 1;
+        // The pipeline count stays fixed (never reduced by the fit) when set from env, and always for
+        // unordered multi-node. There each pipeline is one balanced channel end to end, N2N -> G2S -> S2G:
+        // one producer per consumer, so every channel carries an even share of the traffic and none
+        // waits on another. The group sizes its per-channel GIN resources for this count. Ordered N2N
+        // warps are a shared pool, so only an env value fixes the count there.
+        const bool pipelines_fixed = pipelines_from_env || unordered_multi_node;
         const int fixed_warps =
-            (num_lsa_teams != 1 ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0) +
+            (num_lsa_teams != 1 && !unordered_multi_node ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0) +
             (params.dispatch_push_count.active ? 2 : (params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? 1 : 0));
-        const int max_pipelines = (32 - fixed_warps) / 2;
-        if (pipelines_from_env && requested_pipelines > max_pipelines) {
+        const int max_pipelines = (32 - fixed_warps) / (unordered_multi_node ? 3 : 2);
+        if (pipelines_fixed && requested_pipelines > max_pipelines) {
             std::fprintf(stderr, "[nccl_ep] dispatch pipelines=%d exceeds block limit; maximum=%d.\n",
                          requested_pipelines, max_pipelines);
             return ncclInvalidArgument;
         }
+        // The fit only lowers stages, so the requested count must already give 3 per pipeline.
+        if (unordered_multi_node && ((stages_from_env && requested_stages % requested_pipelines != 0) ||
+                                     requested_stages / requested_pipelines < kMinStagesPerPipeline)) {
+            std::fprintf(stderr,
+                         "[nccl_ep] unordered dispatch: stages=%d for %d pipelines needs at least %d stages per "
+                         "pipeline (and a multiple when set); set NCCL_EP_DISPATCH_NUM_STAGES.\n",
+                         requested_stages, requested_pipelines, kMinStagesPerPipeline);
+            return ncclInvalidArgument;
+        }
 
         // Bilinear SMEM coefficients: size = fixed + P*per_pipeline + S*per_stage.
+        // Unordered: the cost follows the channel the kernel walks (the kernel derives the same value
+        // from the same helper); the group chunk itself reaches the kernel unchanged.
+        ::ht_ep::dispatch_config_t cost_config = d_config;
+        if (unordered_multi_node) {
+            cost_config.num_of_tokens_per_chunk = ::nccl_ep::ht_dense::dispatch_tokens_per_channel(
+                max_dispatch_tokens_per_rank, num_blocks * requested_pipelines);
+        }
         const ::ht_ep::disp_smem_cost_t terms = ::ht_ep::calc_disp_smem_cost(
-            params.layout, kernel_spec.payload_bytes, d_config, d_model);
+            params.layout, kernel_spec.payload_bytes, cost_config, d_model);
         if (terms.per_stage == 0) {
             std::fprintf(stderr, "NCCL EP warning: unsupported HT dispatch token size %u\n",
                          kernel_spec.payload_bytes);
@@ -1756,7 +1792,7 @@ ncclResult_t dispatch_impl(
             fit = choose_dispatch_smem_config(
                 terms, static_cast<size_t>(max_smem),
                 requested_stages, stages_from_env,
-                requested_pipelines, pipelines_from_env,
+                requested_pipelines, pipelines_fixed,
                 min_stages_per_pipeline, max_pipelines);
             if (fit.feasible) {
                 chosen_in_flight = in_flight;
@@ -1807,7 +1843,8 @@ ncclResult_t dispatch_impl(
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
         const jit::dispatch_warp_layout_t dispatch_layout =
             jit::compute_dispatch_warp_layout(num_lsa_teams, params.layout, d_config.num_pipelines,
-                                              params.dispatch_push_count.active);
+                                              params.dispatch_push_count.active,
+                                              ht_select_kernel_impl(env) == HtKernelImpl::kUnordered);
         const int dispatch_wt_total = num_blocks * (dispatch_layout.block_dim / 32);
         ::ht_ep::dispatch_warp_timing_entry_t* d_wt = nullptr;
         CUDA_CHECK(cudaMalloc(&d_wt, dispatch_wt_total * sizeof(::ht_ep::dispatch_warp_timing_entry_t)));
@@ -1816,7 +1853,43 @@ ncclResult_t dispatch_impl(
         kp.warp_timing = d_wt;
 #endif
 
-        std::vector<uint8_t> kernel_arg = build_dispatch_arg_buffer(kp, params);
+        // Unordered only: pack the entries into send staging before the dispatch kernel.
+        if (ht_select_kernel_impl(env) == HtKernelImpl::kUnordered && num_lsa_teams > 1) {
+            ::nccl_ep::ht_dense::pack_args_t pa{};
+            pa.send_staging =
+                reinterpret_cast<uint8_t*>(params.gin_base_ptr) + params.mr_info.gin_send_staging_offset;
+            pa.attn_input_token = reinterpret_cast<const uint8_t*>(params.attn_input_token);
+            pa.attn_input_prob = forward_dispatch
+                                     ? reinterpret_cast<const uint8_t*>(params.attn_input_prob)
+                                     : nullptr;
+            pa.attn_input_sf = sf_bytes_per_token > 0
+                                   ? reinterpret_cast<const uint8_t*>(params.attn_input_scaling_factor)
+                                   : nullptr;
+            pa.attn_to_rdma_map = params.attn_to_rdma_map;
+            pa.guard_flags = reinterpret_cast<const uint64_t*>(
+                reinterpret_cast<const uint8_t*>(params.gin_base_ptr) + params.mr_info.guard_offset);
+            pa.expected_gin_flag_val = params.expected_gin_flag_val;
+            pa.bytes_per_entry = params.mr_info.bytes_per_entry;
+            pa.token_bytes = static_cast<size_t>(kp.hidden_dim) * kernel_spec.payload_bytes;
+            // Zero without prob: it is also the scales' offset, read at token_bytes + (fwd ? prob : 0).
+            pa.prob_bytes = pa.attn_input_prob == nullptr
+                                ? 0
+                                : static_cast<size_t>(::ht_ep::prob_row_floats(d_config, d_model)) *
+                                      sizeof(float);
+            pa.compact_prob = d_config.compact_prob;
+            pa.sf_bytes = static_cast<size_t>(sf_bytes_per_token);
+            pa.max_tokens_per_dest = static_cast<int>(params.mr_info.max_tokens_per_dest);
+            pa.num_of_tokens_per_rank = kp.num_of_tokens_per_rank;
+            pa.max_tokens_per_rank = max_dispatch_tokens_per_rank;
+            pa.num_channels = num_blocks * d_config.num_pipelines;
+            pa.lsa_teams = num_lsa_teams;
+            pa.my_lteam = kp.lsa_team;
+            jit::launch_local_dispatch_pack(forward_dispatch, sf_bytes_per_token > 0, params.guard_enabled,
+                                           params.local_dispatch_pack_num_sms, pa, stream);
+        }
+
+        std::vector<uint8_t> kernel_arg =
+            build_dispatch_arg_buffer(kp, params, ht_select_kernel_impl(env) == HtKernelImpl::kUnordered);
         if (ncclResult_t r = jit::launch_dispatch(
             d_config,
             max_dispatch_tokens_per_rank,
@@ -1833,7 +1906,8 @@ ncclResult_t dispatch_impl(
             static_cast<int>(smem_size),
             stream,
             kernel_spec,
-            params.dispatch_push_count.active); r != ncclSuccess)
+            params.dispatch_push_count.active,
+            unordered_dispatch_tokens_per_batch); r != ncclSuccess)
             return r;
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
@@ -1848,6 +1922,7 @@ ncclResult_t call_dispatch(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank,
     int num_tokens_per_chunk,
+    int unordered_dispatch_tokens_per_batch,
     int num_lsa_teams,
     ncclEpDispQuant_t recipe,
     ncclEpPassDir_t pass_direction,
@@ -1863,7 +1938,7 @@ ncclResult_t call_dispatch(
         return r;
     }
     return dispatch_impl(
-        params, max_dispatch_tokens_per_rank, num_tokens_per_chunk, num_lsa_teams,
+        params, max_dispatch_tokens_per_rank, num_tokens_per_chunk, unordered_dispatch_tokens_per_batch, num_lsa_teams,
         pass_direction, num_blocks, max_dynamic_smem, sf_bytes_per_token, env, stream, kernel_spec);
 }
 

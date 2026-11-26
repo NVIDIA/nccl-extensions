@@ -83,14 +83,16 @@ std::string dispatch_source(const Shape& s, HtKernelImpl impl, nccl_ep::HtDispat
     nccl_ep::DispatchKernelSpec spec{};
     EXPECT_EQ(nccl_ep::resolveDispatchKernelSpec(NCCL_EP_DISP_QUANT_NONE, ncclBfloat16, ncclFloat32, &spec),
               ncclSuccess);
-    const dispatch_warp_layout_t L = compute_dispatch_warp_layout(kLsaTeams, s.layout, NCCL_EP_HT_DISPATCH_PIPELINES, false);
+    const dispatch_warp_layout_t L = compute_dispatch_warp_layout(
+        kLsaTeams, s.layout, NCCL_EP_HT_DISPATCH_PIPELINES, false, impl == HtKernelImpl::kUnordered);
     return dispatch_jit_source(
         L.cross_lsa_group_warps, L.cross_lsa_group_start, L.lsa_g2s_group_warps, L.lsa_g2s_group_start,
         L.lsa_s2g_group_warps, L.lsa_s2g_group_start, L.map_group_warps, L.map_group_start,
         L.pad_group_warps, L.pad_group_start, L.head_extra_group_warps, L.head_extra_group_start,
         NCCL_EP_HT_DISPATCH_STAGES, NCCL_EP_HT_DISPATCH_IN_FLIGHT_S2G, kChunk, kMaxTokens, kLsaTeams, kBlocks,
         /*forward_dispatch=*/!s.backward, L.num_pipelines, kLsaTeamSize, s.layout, kHidden,
-        /*sf_bytes_per_token=*/0, kExpertsPerRank, schedule, spec, impl);
+        /*sf_bytes_per_token=*/0, kExpertsPerRank, schedule, spec, impl,
+        /*unordered_dispatch_tokens_per_batch=*/kChunk);
 }
 
 std::string combine_source(const Shape& s, HtKernelImpl impl, bool overflow_drop) {

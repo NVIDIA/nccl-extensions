@@ -1,5 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  * See LICENSE.txt for more license information.
  */
@@ -32,6 +33,8 @@
 #include "nccl_ep_env.h"
 #include "ht_compact_prob.h"
 #include "ht_chunk_config.hpp"
+#include "device/ht/unordered/ht_gin_dispatch_batch.cuh"
+#include "device/ht/unordered/ep_dispatch_channel.cuh"
 #include "ht_sm_policy.hpp"
 #include "ll_dispatch_policy.h"
 #include "common.hpp"
@@ -860,6 +863,8 @@ struct ncclEpGroup {
     int ht_dispatch_tokens_per_chunk = 0;
     int ht_flat_combine_tokens_per_chunk = 0;
     int ht_flat_dispatch_tokens_per_chunk = 0;
+    // Unordered dispatch: tokens per gin.put.
+    int ht_unordered_dispatch_tokens_per_batch = 0;
 
     struct {
         // Device communicator (single comm, multiple contexts)
@@ -1994,13 +1999,22 @@ static ncclResult_t configure_ll_hier(ncclEpGroup_t group, cudaStream_t stream) 
     return ncclSuccess;
 }
 
+// Unordered dispatch runs one N2N warp per pipeline, as it runs one G2S/S2G pair per pipeline.
+static int ht_dispatch_n2n_warps(ncclEpGroup_t group, bool unordered) {
+    if (!unordered) return NCCL_EP_HT_DISPATCH_N2N_WARPS;
+    return std::max(1, nccl_ep::ht::env_or_default(&group->env.dispatch_num_pipelines, NCCL_EP_HT_DISPATCH_PIPELINES));
+}
+
 static int ht_n2n_channels(ncclEpGroup_t group) {
     const auto channels = [](unsigned int blocks, int warps) { return static_cast<int>(blocks) * warps; };
+    const bool unordered =
+        nccl_ep::ht::ht_select_kernel_impl(&group->env) == nccl_ep::ht::HtKernelImpl::kUnordered;
+    const int dispatch_warps = ht_dispatch_n2n_warps(group, unordered);
     int widest = 0;
     for (const HtSmBudgets* sms : {&group->fwd_sms, &group->bwd_sms}) {
         widest = std::max({widest,
-                           channels(sms->dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS),
-                           channels(sms->flat_dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS),
+                           channels(sms->dispatch, dispatch_warps),
+                           channels(sms->flat_dispatch, dispatch_warps),
                            channels(sms->combine, NCCL_EP_HT_COMBINE_N2N_WARPS),
                            channels(sms->flat_combine, NCCL_EP_HT_COMBINE_N2N_WARPS)});
     }
@@ -2226,14 +2240,35 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         return ht_gin_signals::gin_signals_per_phase(rdma_team_size, max_chunks_per_rank,
                                                      static_cast<int>(blocks) * warps);
     };
+    // Dispatch sizing follows the kernel: ordered per chunk, unordered per batch per
+    // source at its fixed pipeline count.
+    const bool gin_unordered =
+        nccl_ep::ht::ht_select_kernel_impl(&ep_group->env) == nccl_ep::ht::HtKernelImpl::kUnordered;
+    const int unordered_dispatch_tokens_per_batch = ep_group->ht_unordered_dispatch_tokens_per_batch;
+    const int dispatch_n2n_warps = ht_dispatch_n2n_warps(ep_group, gin_unordered);
+    const auto gin_unordered_signals_per_phase_for = [&](unsigned int blocks, int warps) {
+        const int channels = static_cast<int>(blocks) * warps;
+        if (channels <= 0) return 0;
+        return nccl_ep::ht::dispatch_signals_per_ctx(ht_max_tokens, channels, unordered_dispatch_tokens_per_batch,
+                                                   rdma_team_size - 1);
+    };
+    const auto gin_dispatch_signals_for = [&](unsigned int blocks) {
+        return gin_unordered ? gin_unordered_signals_per_phase_for(blocks, dispatch_n2n_warps)
+                             : gin_signals_per_phase_for(blocks, dispatch_n2n_warps);
+    };
+    int gin_dispatch_signals = 0;
+    for (const HtSmBudgets* sms : {&ep_group->fwd_sms, &ep_group->bwd_sms}) {
+        gin_dispatch_signals = std::max({gin_dispatch_signals, gin_dispatch_signals_for(sms->dispatch),
+                                         gin_dispatch_signals_for(sms->flat_dispatch)});
+    }
     // A smaller EP group spreads the same chunks over fewer GIN contexts, so each context
     // carries more signals; each phase is sized by its narrowest configuration.
     int gin_signals_per_phase = 0;
     for (const HtSmBudgets* sms : {&ep_group->fwd_sms, &ep_group->bwd_sms}) {
         gin_signals_per_phase =
             std::max({gin_signals_per_phase,
-                      gin_signals_per_phase_for(sms->dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS),
-                      gin_signals_per_phase_for(sms->flat_dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS),
+                      gin_dispatch_signals_for(sms->dispatch),
+                      gin_dispatch_signals_for(sms->flat_dispatch),
                       gin_signals_per_phase_for(sms->combine, NCCL_EP_HT_COMBINE_N2N_WARPS),
                       gin_signals_per_phase_for(sms->flat_combine, NCCL_EP_HT_COMBINE_N2N_WARPS)});
     }
@@ -2256,8 +2291,8 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
                 "over %d[data ctx]; channels dispatch %u/%u flat, combine %u/%u flat; "
                 "%d[ids/ctx], %d[total signals] over %d[ctx]\n",
                 max_chunks_per_rank, max_chunk_per_rails, num_data_ctx,
-                ep_group->fwd_sms.dispatch * NCCL_EP_HT_DISPATCH_N2N_WARPS,
-                ep_group->fwd_sms.flat_dispatch * NCCL_EP_HT_DISPATCH_N2N_WARPS,
+                ep_group->fwd_sms.dispatch * dispatch_n2n_warps,
+                ep_group->fwd_sms.flat_dispatch * dispatch_n2n_warps,
                 ep_group->fwd_sms.combine * NCCL_EP_HT_COMBINE_N2N_WARPS,
                 ep_group->fwd_sms.flat_combine * NCCL_EP_HT_COMBINE_N2N_WARPS,
                 ep_group->gin_config.num_total_signals,
@@ -2282,24 +2317,39 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
             const char* name;
             unsigned int blocks;
             int warps;
+            bool dispatch;
         } cfgs[] = {
-            {"dispatch expert-major", ep_group->fwd_sms.dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS},
-            {"dispatch flat", ep_group->fwd_sms.flat_dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS},
-            {"combine  expert-major", ep_group->fwd_sms.combine, NCCL_EP_HT_COMBINE_N2N_WARPS},
-            {"combine  flat", ep_group->fwd_sms.flat_combine, NCCL_EP_HT_COMBINE_N2N_WARPS},
-            {"dispatch expert-major bwd", ep_group->bwd_sms.dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS},
-            {"dispatch flat bwd", ep_group->bwd_sms.flat_dispatch, NCCL_EP_HT_DISPATCH_N2N_WARPS},
-            {"combine  expert-major bwd", ep_group->bwd_sms.combine, NCCL_EP_HT_COMBINE_N2N_WARPS},
-            {"combine  flat bwd", ep_group->bwd_sms.flat_combine, NCCL_EP_HT_COMBINE_N2N_WARPS},
+            {"dispatch expert-major", ep_group->fwd_sms.dispatch, dispatch_n2n_warps, true},
+            {"dispatch flat", ep_group->fwd_sms.flat_dispatch, dispatch_n2n_warps, true},
+            {"combine  expert-major", ep_group->fwd_sms.combine, NCCL_EP_HT_COMBINE_N2N_WARPS, false},
+            {"combine  flat", ep_group->fwd_sms.flat_combine, NCCL_EP_HT_COMBINE_N2N_WARPS, false},
+            {"dispatch expert-major bwd", ep_group->bwd_sms.dispatch, dispatch_n2n_warps, true},
+            {"dispatch flat bwd", ep_group->bwd_sms.flat_dispatch, dispatch_n2n_warps, true},
+            {"combine  expert-major bwd", ep_group->bwd_sms.combine, NCCL_EP_HT_COMBINE_N2N_WARPS, false},
+            {"combine  flat bwd", ep_group->bwd_sms.flat_combine, NCCL_EP_HT_COMBINE_N2N_WARPS, false},
         };
         for (const auto& c : cfgs) {
             const int channels = static_cast<int>(c.blocks) * c.warps;
-            const int needed = gin_signals_per_phase_for(c.blocks, c.warps);
-            fprintf(stderr,
-                    "[HT GIN]   %-26s channels = %3d (%u blocks x %d n2n warps), "
-                    "signals per ctx needed = %3d%s\n",
-                    c.name, channels, c.blocks, c.warps, needed,
-                    needed == gin_signals_per_phase ? "  <-- sets the pool" : "");
+            if (c.dispatch && gin_unordered) {
+                if (channels > 0) {
+                    const int chunk = nccl_ep::ht_dense::dispatch_tokens_per_channel(ht_max_tokens, channels);
+                    const int needed = gin_unordered_signals_per_phase_for(c.blocks, c.warps);
+                    fprintf(stderr,
+                            "[HT GIN]   %-26s channels = %3d (%u blocks x %d pipelines), chunk = %4d "
+                            "tokens / %d per put = %3d batches x %d sources, signals per ctx needed = %3d%s\n",
+                            c.name, channels, c.blocks, c.warps, chunk, unordered_dispatch_tokens_per_batch,
+                            nccl_ep::ht_dense::dispatch_batches_per_channel(chunk, unordered_dispatch_tokens_per_batch),
+                            rdma_team_size - 1, needed,
+                            needed == gin_signals_per_phase ? "  <-- sets the pool" : "");
+                }
+            } else {
+                const int needed = gin_signals_per_phase_for(c.blocks, c.warps);
+                fprintf(stderr,
+                        "[HT GIN]   %-26s channels = %3d (%u blocks x %d n2n warps), "
+                        "signals per ctx needed = %3d%s\n",
+                        c.name, channels, c.blocks, c.warps, needed,
+                        needed == gin_signals_per_phase ? "  <-- sets the pool" : "");
+            }
         }
     }
 
@@ -2330,11 +2380,13 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
             nccl_ep::ceil_div<int>(max_chunks_per_rank, min_dispatch_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
         reqs.ginQueueDepth =
             std::min(chunks_per_channel, NCCL_EP_HT_DISPATCH_GIN_WINDOW) * (3 * ht_combine_tokens_per_chunk + 1);
+        // Unordered dispatch posts a channel's whole run with no in-flight window. The 2x is the worst case:
+        // every chunk is transmitted and each carries its own signal.
+        reqs.ginQueueDepth = std::max(reqs.ginQueueDepth,
+                                      gin_unordered ? 2 * gin_dispatch_signals + 1 : 0);
+        reqs.ginStrongSignalsRequired = !gin_unordered;
         // NCCL EP uses GIN indexed signals; VA signals are not needed.
         reqs.ginVaSignalsRequired = false;
-        // The unordered kernel does not rely on strong signals; the ordered kernel does.
-        reqs.ginStrongSignalsRequired =
-            nccl_ep::ht::ht_select_kernel_impl(&ep_group->env) != nccl_ep::ht::HtKernelImpl::kUnordered;
         // Dispatch and the pull gate use sessions 0-1; combine uses one more at a pass-independent index.
         reqs.lsaBarrierCount =
             std::max<int>(ht_dispatch_sms_capacity(ep_group), NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
@@ -2594,10 +2646,17 @@ static void init_ht_chunks(ncclEpGroup_t ep_group) {
     ep_group->ht_flat_dispatch_tokens_per_chunk = flat_chunk == chunk
         ? ep_group->ht_dispatch_tokens_per_chunk
         : nccl_ep_resolve_dispatch_chunk(ep_group->env, flat_chunk, ep_group->rdma_team_size);
+    ep_group->ht_unordered_dispatch_tokens_per_batch =
+        nccl_ep_resolve_unordered_dispatch_tokens_per_batch(ep_group->env);
     if (nccl_ep_env_verbose(ep_group->env)) {
         fprintf(stderr, "[nccl_ep] HT chunks: expert-major dispatch=%d combine=%d; flat dispatch=%d combine=%d\n",
                 ep_group->ht_dispatch_tokens_per_chunk, chunk,
                 ep_group->ht_flat_dispatch_tokens_per_chunk, flat_chunk);
+        if (nccl_ep::ht::ht_select_kernel_impl(&ep_group->env) == nccl_ep::ht::HtKernelImpl::kUnordered) {
+            fprintf(stderr,
+                    "[nccl_ep] HT unordered dispatch: chunk = max tokens per rank / channels, %d tokens per put\n",
+                    ep_group->ht_unordered_dispatch_tokens_per_batch);
+        }
     }
     // The shared stride must be divisible by both layouts' chunk sizes.
     ep_group->ht_aligned_max_tokens = nccl_ep::align<unsigned int>(
@@ -4235,7 +4294,7 @@ struct HtBlockLayout {
 
         HtBlockLayout L = {};
         L.sz_r2a = align256(static_cast<size_t>(rdma_team_size) * padded_max_tokens * sizeof(bool));
-        // Pristine pre-drop copy of r2a; only the unordered internode combine reads it under DROP.
+        // Pristine pre-drop copy of r2a; unordered internode dispatch and combine read it under DROP.
         L.sz_r2a_wo_drop =
             (ep_group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP && is_internode_available(ep_group) &&
              nccl_ep::ht::ht_select_kernel_impl(&ep_group->env) == nccl_ep::ht::HtKernelImpl::kUnordered)
@@ -7088,6 +7147,7 @@ ncclResult_t ncclEpDispatch(
         // reuses the FWD-populated handle maps; only the FWD-only weight scatter
         // is skipped (recv_topk_weights is null for BWD).
         params.rdma_to_attn_map = handle->ht.rdma_to_attn_map;
+        params.rdma_to_attn_map_wo_drop = handle->ht.rdma_to_attn_map_wo_drop;
         params.attn_to_rdma_map = handle->ht.attn_to_rdma_map;
         params.sparse_to_dense_map = handle->ht.sparse_to_dense_map;
         params.s2d_inner_dim = (expert_major && !em_permute_active) ? handle->num_topk : group->lsa_team_size;
@@ -7254,7 +7314,9 @@ ncclResult_t ncclEpDispatch(
         // Use offsets relative to gin_base_ptr
         // All buffers are part of one large registered window
         // Calculate bytes_per_entry for batched staging
-        size_t bytes_per_token_entry = group->config.max_token_bytes; // token data
+        // The real token + scale width: max_token_bytes also sizes the combine output, so it is wider
+        // than a quantized row. The API already bounds this by max_token_bytes, 16B aligned.
+        size_t bytes_per_token_entry = token_bytes + forwarded_scale_bytes_per_token;
         // Compact shrinks only the FWD wire entry; BWD dispatch keeps the
         // dense-sized stride (its prob hole is never filled). Allocation-side
         // sizing (group create) stays conservative at the dense size, which is
@@ -7291,6 +7353,7 @@ ncclResult_t ncclEpDispatch(
         // EM local-fanout: dispatch dedups S2G; receiver local_dup fills secondaries.
         const bool em_unfused_active = em_local_dup_active(group, handle->layout);
         params.local_dup_num_sms = em_unfused_active ? static_cast<int>(group->shuffle_sms) : 0;
+        params.local_dispatch_pack_num_sms = static_cast<int>(group->preprocess_num_sms);
         // Device-side backstop bound for recv slot indices: the fixed budget or the derived
         // eager bound (computed above). The scan/count build produces slots below it (DROP
         // masks the rest), so the S2G assert only fires on corrupted or stale routing maps.
@@ -7310,6 +7373,7 @@ ncclResult_t ncclEpDispatch(
                     params,
                     group->ht_aligned_max_tokens,
                     handle->ht.dispatch_tokens_per_chunk,
+                    group->ht_unordered_dispatch_tokens_per_batch,
                     group->rdma_team_size,
                     recipe,
                     pass_direction,

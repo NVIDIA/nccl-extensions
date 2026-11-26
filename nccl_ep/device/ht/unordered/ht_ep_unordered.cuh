@@ -5,6 +5,7 @@
  */
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  * See LICENSE.txt for more license information.
  */
@@ -30,10 +31,11 @@
 #include "common.hpp"
 #include "device_primitives.cuh"
 #include "ht_ep_configs.cuh"
-#include "ht/ht_gin_signal_layout.cuh"
 #include "mxfp8_quant.cuh"
 #include "quant_recipe.cuh"
 #include "ht/ht_combine_packed.cuh"
+#include "ht/ht_gin_signal_layout.cuh"
+#include "ep_dispatch_channel.cuh"
 #include "ht/warp_group.cuh"
 #include <assert.h>
 #include <cooperative_groups.h>
@@ -46,89 +48,6 @@
 
 namespace ht_gin_unordered {
 
-// Compile-time scheduling avoids tail-indexing overhead that can regress coarse-kernel performance.
-// Preserve complete coarse waves, subdivide only an additional partial wave.
-template <nccl_ep::HtDispatchSchedule Schedule, int Chunk, int Teams>
-class dispatch_work_t {
-public:
-    static constexpr bool kRedistributed = Schedule == nccl_ep::HtDispatchSchedule::Redistributed && Teams == 1;
-    static constexpr int kMapStride = (kRedistributed) ? 1 : Chunk;
-
-    __device__ dispatch_work_t(int n, int blocks) {
-        count_ = nccl_ep::ceil_div(n, Chunk);
-        bulk_chunks_ = count_;
-        tail_start_ = 0;
-        const int remainder = n % Chunk;
-        last_size_ = (remainder != 0) ? remainder : Chunk;
-        if constexpr (kRedistributed) {
-            const int complete_chunks = nccl_ep::align_down(n / Chunk, blocks);
-            const int complete_tokens = complete_chunks * Chunk;
-            if (complete_chunks > 0 && n != complete_tokens) {
-                bulk_chunks_ = complete_chunks;
-                tail_start_ = complete_tokens;
-                const int tail_tokens = n - complete_tokens;
-                count_ = complete_chunks + nccl_ep::ceil_div(tail_tokens, nccl_ep::kHtDispatchTailChunkTokens);
-                const int tail_remainder = tail_tokens % nccl_ep::kHtDispatchTailChunkTokens;
-                last_size_ = (tail_remainder != 0) ? tail_remainder : nccl_ep::kHtDispatchTailChunkTokens;
-            }
-        }
-        last_routing_loads_ = nccl_ep::ceil_div(last_size_, kTokensPerRoutingLoad);
-    }
-    __device__ __forceinline__ int count() const {
-        return count_;
-    }
-    __device__ __forceinline__ int first(int unit) const {
-        if constexpr (kRedistributed) {
-            if (unit >= bulk_chunks_) {
-                return tail_start_ + (unit - bulk_chunks_) * nccl_ep::kHtDispatchTailChunkTokens;
-            }
-        }
-        return unit * Chunk;
-    }
-    __device__ __forceinline__ int size(int unit) const {
-        if (unit == count_ - 1) {
-            return last_size_;
-        }
-        if constexpr (kRedistributed) {
-            if (unit >= bulk_chunks_) {
-                return nccl_ep::kHtDispatchTailChunkTokens;
-            }
-        }
-        return Chunk;
-    }
-    __device__ __forceinline__ int map_index(int unit) const {
-        if constexpr (kRedistributed) {
-            return first(unit);
-        } else {
-            return unit;
-        }
-    }
-    __device__ __forceinline__ int metadata_chunk(int unit) const {
-        if constexpr (kRedistributed) {
-            return first(unit) / Chunk;
-        } else {
-            return unit;
-        }
-    }
-    __device__ __forceinline__ int map_size(int unit) const {
-        if constexpr (kRedistributed) {
-            return size(unit);
-        } else {
-            return Chunk;
-        }
-    }
-    __device__ __forceinline__ int routing_loads(int unit) const {
-        return (unit == count_ - 1) ? last_routing_loads_ : (size(unit) / kTokensPerRoutingLoad);
-    }
-
-private:
-    static constexpr int kTokensPerRoutingLoad = sizeof(uint4) / sizeof(bool);
-    int bulk_chunks_;
-    int count_;
-    int tail_start_;
-    int last_size_;
-    int last_routing_loads_;
-};
 
 // Conditionally allocate compile-time arrays only when enabled.
 template <bool ENABLE, int N>
@@ -158,13 +77,23 @@ struct dispatch_memory_region_info_t {
     int num_max_rdma_chunked_send_tokens; // Batch size per RDMA put (default: 6)
 } __attribute__((__aligned__(8)));
 
-// Byte offset (from the packed inter-lsa-team receive region start) of one source slot's chunk.
+// Byte offset (from the packed inter-lsa-team receive region start) of entry token_idx of one source slot.
 // Packed layout is [remote_slot][token-in-slot], each entry bytes_per_entry (token + prob + sf).
 __forceinline__ __device__ size_t
-dispatch_packed_entry_offset(const dispatch_memory_region_info_t* mr, int remote_slot, int chunk_first_token) {
+dispatch_packed_dst_offset(const dispatch_memory_region_info_t* mr, int remote_slot, int token_idx) {
     return mr->gin_recv_staging_offset +
            (static_cast<size_t>(remote_slot) * mr->max_tokens_per_dest +
-            static_cast<size_t>(chunk_first_token)) *
+            static_cast<size_t>(token_idx)) *
+               mr->bytes_per_entry;
+}
+
+// Byte offset (from the GIN base) of entry token_idx of one destination in the send staging the prologue packed.
+// Same [slot][token-in-slot] layout, indexed by the destination at this sender (remote_idx).
+__forceinline__ __device__ size_t
+dispatch_packed_src_offset(const dispatch_memory_region_info_t* mr, int remote_idx, int token_idx) {
+    return mr->gin_send_staging_offset +
+           (static_cast<size_t>(remote_idx) * mr->max_tokens_per_dest +
+            static_cast<size_t>(token_idx)) *
                mr->bytes_per_entry;
 }
 
@@ -179,7 +108,7 @@ struct combine_memory_region_info_t {
 struct dispatch_config_t {
     int num_of_stages;
     int num_of_in_flight_s2g;
-    int num_of_tokens_per_chunk;
+    int num_of_tokens_per_channel;
     int num_of_blocks;
     bool forward_dispatch;
     bool device_side_sync;
@@ -459,7 +388,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     // Sparse to dense map buffer: S2D_MAP_RING_STAGES ping-pong stages PER PIPELINE (128B aligned)
     // Inner dim is mode-dependent: flat = lsa_team_size, expert-major = num_topk.
     layout.s2d_inner_dim = config.s2d_inner_dim;
-    layout.s2d_map_stage_stride = config.num_of_tokens_per_chunk * config.s2d_inner_dim * sizeof(int32_t);
+    layout.s2d_map_stage_stride = config.num_of_tokens_per_channel * config.s2d_inner_dim * sizeof(int32_t);
     layout.s2d_map_stage_stride = (layout.s2d_map_stage_stride + 127) & ~127;
     layout.sparse_to_dense_map_buffer = reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += S2D_MAP_RING_STAGES * num_pipelines * layout.s2d_map_stage_stride;
@@ -492,7 +421,7 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     if (model.num_lsa_teams > 1) {
         offset = nccl_ep::align(offset, static_cast<size_t>(NCCL_EP_HT_TMA_ALIGN));
         layout.attn_to_rdma_map_buffer = reinterpret_cast<bool*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-        offset += config.num_of_tokens_per_chunk * (model.num_lsa_teams - 1) * sizeof(bool);
+        offset += config.num_of_tokens_per_channel * (model.num_lsa_teams - 1) * sizeof(bool);
     } else {
         layout.attn_to_rdma_map_buffer = nullptr;
     }
@@ -536,7 +465,6 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
 
     return layout;
 }
-
 // kTokenSize drives the per-stage token-buffer stride; everything else
 // (probabilities, mbarriers, scales) is element-width-invariant.
 template <ncclDataType_t kTokenDtype,
@@ -925,84 +853,6 @@ __forceinline__ __device__ void ring_advance(SlotT& slot, uint32_t& parity, int 
     }
 }
 
-// Put one token's bundle (token, +prob if FWD, +sf if quantized) to a remote LSA team, packed from dst_offset.
-// Every put carries its own weak signal and rings its own doorbell (ncclGinOptFlagsDefault).
-template <typename TOKEN_DATA_TYPE, bool FORWARD_DISPATCH, bool HAS_SF, int LSA_TEAMS>
-__forceinline__ __device__ void dispatch_n2n_put_token(
-    ncclGin& net,
-    const ncclTeam& rail,
-    int remote_lteam_id,
-    ncclWindow_t internal_window,
-    size_t dst_offset,
-    const struct dispatch_memory_region_info_t* mr_info,
-    ncclWindow_t token_window,
-    ncclWindow_t prob_window,
-    ncclWindow_t sf_window,
-    int token_idx,
-    size_t token_bytes,
-    size_t prob_bytes,
-    int sf_bytes_per_token,
-    bool compact_prob, // compact top-k wire format
-    unsigned sig_id) {
-    size_t token_src = mr_info->attn_input_token_offset + token_idx * token_bytes;
-    net.put(
-        rail,
-        remote_lteam_id,
-        internal_window,
-        dst_offset,
-        token_window,
-        token_src,
-        token_bytes,
-        ncclGin_WeakSignalAdd{sig_id, 1},
-        ncclGin_None{},
-        ncclCoopThread(),
-        ncclGin_None{},
-        cuda::thread_scope_thread,
-        cuda::thread_scope_device,
-        ncclGinOptFlagsDefault);
-    if constexpr (FORWARD_DISPATCH) {
-        // Dense rows are laid out [token][lsa_team][experts_per_lsa_team] and
-        // sliced per destination; the compact row is token-scoped (same
-        // original-order weights + IDs for every destination).
-        size_t prob_src = compact_prob
-            ? mr_info->attn_input_prob_offset + token_idx * prob_bytes
-            : mr_info->attn_input_prob_offset + (token_idx * LSA_TEAMS + remote_lteam_id) * prob_bytes;
-        net.put(
-            rail,
-            remote_lteam_id,
-            internal_window,
-            dst_offset + token_bytes,
-            prob_window,
-            prob_src,
-            prob_bytes,
-            ncclGin_WeakSignalAdd{sig_id, 1},
-            ncclGin_None{},
-            ncclCoopThread(),
-            ncclGin_None{},
-            cuda::thread_scope_thread,
-            cuda::thread_scope_device,
-            ncclGinOptFlagsDefault);
-    }
-    if constexpr (HAS_SF) {
-        size_t sf_src = mr_info->attn_input_scaling_factor_offset + token_idx * sf_bytes_per_token;
-        net.put(
-            rail,
-            remote_lteam_id,
-            internal_window,
-            dst_offset + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0),
-            sf_window,
-            sf_src,
-            sf_bytes_per_token,
-            ncclGin_WeakSignalAdd{sig_id, 1},
-            ncclGin_None{},
-            ncclCoopThread(),
-            ncclGin_None{},
-            cuda::thread_scope_thread,
-            cuda::thread_scope_device,
-            ncclGinOptFlagsDefault);
-    }
-}
-
 // Resolved G2S source for one (LSA team, chunk): packed-remote entry base, or strided-local base pointers.
 template <typename TOKEN_DATA_TYPE>
 struct g2s_source_t {
@@ -1017,10 +867,7 @@ struct g2s_source_t {
 template <
     typename TOKEN_DATA_TYPE,
     int LSA_TEAMS,
-    int LSA_TEAM_SZ,
-    int MAX_TOKENS_PER_RANK,
-    int TOKENS_PER_CHUNK,
-    int NBLOCKS,
+    int TOKENS_PER_CHANNEL,
     bool FORWARD_DISPATCH,
     bool HAS_SF>
 __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_source(
@@ -1029,17 +876,13 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     const uint8_t* attn_input_token_scaling_factor,
     const int lteam_id,
     const int my_lteam,
-    const int cidx,
-    const uint64_t expected_flag_value,
+    const int channel_idx,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
     const bool compact_prob,
     const uint32_t prob_bytes,
-    const ncclDevComm& dcomm,
-    int num_ctx_per_comm,
     void* gin_base_ptr,
-    const struct dispatch_memory_region_info_t* mr_info,
-    int first_token) {
+    const struct dispatch_memory_region_info_t* mr_info) {
     g2s_source_t<TOKEN_DATA_TYPE> src;
     src.use_packed = false;
     src.packed_base = nullptr;
@@ -1048,36 +891,26 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     src.sf_base = nullptr;
 
     if (lteam_id != my_lteam) {
-        // Remote: wait for the RDMA arrival signal, then point at this tile+chunk in the packed buffer.
-        constexpr int MAX_CHUNKS_PER_RANK = MAX_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
-        constexpr int CHUNK_STRIDE = NBLOCKS * NCCL_EP_HT_DISPATCH_N2N_WARPS;
-        const ht_gin_signals::gin_chunk_signal_t tail_signal =
-            ht_gin_signals::gin_dispatch_chunk_signal(
-                lteam_id, my_lteam, cidx, MAX_CHUNKS_PER_RANK, CHUNK_STRIDE, mr_info->signals_tail_base);
-        const unsigned tail_signal_id = tail_signal.sig_id;
-        ncclGin net(dcomm, tail_signal.ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
-        // Already a single lane here.
-        // The G2S warp already raised the shadow by the number of puts this chunk carries.
-        net.waitSignalMeetShadow(ncclCoopThread(), tail_signal_id);
-
+        // Remote: point at this chunk in the packed buffer; the caller waits each batch.
         const int remote_slot = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
-        const int chunk_first_token = cidx * TOKENS_PER_CHUNK;
+        const int channel_first_token_idx = channel_idx * TOKENS_PER_CHANNEL;
 
         src.use_packed = true;
+        // The receiver's G2S source is the sender N2N's put destination: the same dispatch_packed_dst_offset.
         src.packed_base = reinterpret_cast<const uint8_t*>(gin_base_ptr) +
-                          dispatch_packed_entry_offset(mr_info, remote_slot, chunk_first_token);
+                          dispatch_packed_dst_offset(mr_info, remote_slot, channel_first_token_idx);
     } else {
         // Local: strided bases into this rank's own global mem arrays for this chunk.
-        int chunk_first_token = first_token;
-        src.token_base = attn_input_token + chunk_first_token * HIDDEN_DIM;
+        int channel_first_token_idx = channel_idx * TOKENS_PER_CHANNEL;
+        src.token_base = attn_input_token + channel_first_token_idx * HIDDEN_DIM;
         if constexpr (FORWARD_DISPATCH) {
             // Compact has one wire row per token; dense has one per LSA team.
             const size_t prob_row_floats = prob_bytes / sizeof(float);
             const size_t prob_row_stride = prob_row_floats * (compact_prob ? 1 : LSA_TEAMS);
-            src.prob_base = attn_input_prob + chunk_first_token * prob_row_stride;
+            src.prob_base = attn_input_prob + channel_first_token_idx * prob_row_stride;
         }
         if constexpr (HAS_SF) {
-            src.sf_base = attn_input_token_scaling_factor + chunk_first_token * sf_bytes_per_token;
+            src.sf_base = attn_input_token_scaling_factor + channel_first_token_idx * sf_bytes_per_token;
         }
     }
     return src;
@@ -1152,7 +985,7 @@ template <
 __forceinline__ __device__ void dispatch_g2s_issue_token(
     const g2s_source_t<TOKEN_DATA_TYPE>& src,
     const int cur_tokid,
-    const int packed_dense_idx,
+    const int packed_idx,
     SMEM_TYPE* smem_buffer_ptr,
     const int pipeline_rank,
     const int stage,
@@ -1169,7 +1002,7 @@ __forceinline__ __device__ void dispatch_g2s_issue_token(
 
     if (src.use_packed) {
         // Packed entry is contiguous [token | prob | sf].
-        const uint8_t* packed_src_base = src.packed_base + packed_dense_idx * mr_info->bytes_per_entry;
+        const uint8_t* packed_src_base = src.packed_base + packed_idx * mr_info->bytes_per_entry;
         const void* token_src = packed_src_base;
         const void* prob_src = packed_src_base + token_bytes;
         const void* sf_src = packed_src_base + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
@@ -1229,24 +1062,25 @@ struct s2g_dest_t {
 };
 
 // TMA-load one (LSA team, chunk)'s s2d-map slice into the SMEM stage and publish. Caller elects one lane.
-template <typename SMEM_TYPE, int NUM_OF_TOKENS_PER_CHUNK>
+template <typename SMEM_TYPE, int NUM_OF_TOKENS_PER_CHANNEL>
 __forceinline__ __device__ void dispatch_s2g_prefetch_s2d_map(
     const int32_t* sparse_to_dense_map,
     SMEM_TYPE* smem_buffer_ptr,
     const int pipeline_rank,
     const uint32_t s2d_map_stage,
     const int lsa_team_id,
-    const int chunk_id,
-    const int chunk_size,
+    const int channel_idx,
+    const int channel_size,
     const int num_of_tokens_per_rank,
     const int s2d_inner_dim) {
     const int32_t* s2d_base =
-        sparse_to_dense_map + (lsa_team_id * num_of_tokens_per_rank + chunk_id * NUM_OF_TOKENS_PER_CHUNK) * s2d_inner_dim;
+        sparse_to_dense_map +
+        (lsa_team_id * num_of_tokens_per_rank + channel_idx * NUM_OF_TOKENS_PER_CHANNEL) * s2d_inner_dim;
     void* smem_dst = reinterpret_cast<void*>(smem_buffer_ptr->get_s2d_map_buffer_base(pipeline_rank, s2d_map_stage));
     uint64_t* mbar = smem_buffer_ptr->get_s2d_map_mbar(pipeline_rank, s2d_map_stage);
     // cp.async.bulk needs a 16B-multiple size: round up. Safe because the source S2D buffer
     // is over-allocated for max_tokens_per_rank and the smem dest stage is padded to 128B.
-    uint32_t copy_bytes = (uint32_t)(chunk_size * s2d_inner_dim * sizeof(int32_t));
+    uint32_t copy_bytes = (uint32_t)(channel_size * s2d_inner_dim * sizeof(int32_t));
     copy_bytes = nccl_ep::align(copy_bytes, static_cast<uint32_t>(NCCL_EP_HT_TMA_ALIGN));
     cuda::ptx::cp_async_bulk(
         cuda::ptx::space_shared,
@@ -1347,170 +1181,107 @@ __forceinline__ __device__ void dispatch_s2g_issue_token(
 // Device function for cross-LSA-team node2node(RDMA) warp for dispatch kernel.
 template <
     typename GIN_GROUP,
-    typename TOKEN_DATA_TYPE,
     typename SMEM_TYPE,
-    int NUM_STAGES,
-    int TOKENS_PER_CHUNK,
+    int TOKENS_PER_BATCH,
     int MAX_TOKENS_PER_RANK,
     int LSA_TEAMS,
-    int LSA_TEAM_SZ,
-    int NBLOCKS,
-    bool FORWARD_DISPATCH,
-    bool HAS_SF>
+    int NBLOCKS>
 __forceinline__ __device__ void dispatch_N2N_warp(
     // INPUT
     const bool* attn_to_rdma_map,
     // CONFIG
     const int my_lteam,
     const int num_of_tokens_per_rank,
-    const int HIDDEN_DIM,
-    const int sf_bytes_per_token,
-    const bool compact_prob,
-    const uint32_t prob_bytes,
     const ncclDevComm& dcomm,
-    int num_ctx_per_comm,
-    ncclWindow_t nccl_token_window,
-    ncclWindow_t nccl_prob_window,
-    ncclWindow_t nccl_sf_window,
     ncclWindow_t nccl_internal_window,
     const struct dispatch_memory_region_info_t* mr_info,
     SMEM_TYPE* smem_buffer_ptr) {
-    const int num_of_chunks_per_rank = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHUNK);
-
-    static_assert(GIN_GROUP::size() >= LSA_TEAMS - 1, "mr_info should be loaded at once.");
-    static_assert(TOKENS_PER_CHUNK % 32 == 0, "TOKENS_PER_CHUNK must be multiple of 32.");
-    static_assert(
-        MAX_TOKENS_PER_RANK % TOKENS_PER_CHUNK == 0,
-        "MAX_TOKENS_PER_RANK must be multiple of TOKENS_PER_CHUNK.");
-
     // Load mr_info into shared memory for faster access in Put calls.
-    int lane_id = GIN_GROUP::thread_rank() % 32;
-    struct dispatch_memory_region_info_t* smem_mr_info_ptr = nullptr;
-    if constexpr (LSA_TEAMS != 1) {
-        smem_mr_info_ptr = smem_buffer_ptr->dispatch_memory_region_info;
-        if (lane_id == 0) {
-            smem_mr_info_ptr[0] = mr_info[0];
-        }
-        __syncwarp();
+    struct dispatch_memory_region_info_t* smem_mr_info_ptr = smem_buffer_ptr->dispatch_memory_region_info;
+    if (GIN_GROUP::thread_rank() % 32 == 0) {
+        smem_mr_info_ptr[0] = mr_info[0];
     }
+    __syncwarp();
 
     constexpr int N2N_WARPS = GIN_GROUP::size() / 32;
     int n2n_warp_id = GIN_GROUP::thread_rank() / 32;
-    size_t token_bytes = HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE);
-    constexpr int MAX_CHUNKS_PER_RANK = MAX_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
+    constexpr int CHANNEL_CNT = NBLOCKS * N2N_WARPS;
+    constexpr int TOKENS_PER_CHANNEL =
+        ::nccl_ep::ht_dense::dispatch_tokens_per_channel(MAX_TOKENS_PER_RANK, CHANNEL_CNT);
     constexpr int NUM_REMOTE_LSA = LSA_TEAMS - 1;
-
-    constexpr int CHUNK_STRIDE = NBLOCKS * N2N_WARPS;
-    constexpr int GLOBAL_CHANNELS = CHUNK_STRIDE;
-    static_assert(N2N_WARPS == NCCL_EP_HT_DISPATCH_N2N_WARPS,
-                  "dispatch channel count must match the host's, which sizes the GIN context pool");
+    constexpr int MAX_BATCHES_PER_CHANNEL =
+        ::nccl_ep::ht_dense::dispatch_batches_per_channel(TOKENS_PER_CHANNEL, TOKENS_PER_BATCH);
 
     // GIN device side setup. Single communicator; ctx_idx spreads QP traffic.
-    int global_channel = ht_gin_signals::gin_warp_channel(blockIdx.x, n2n_warp_id, N2N_WARPS);
-    int ctx_idx = ht_gin_signals::gin_channel_ctx(global_channel, GLOBAL_CHANNELS);
+    int global_channel = blockIdx.x * N2N_WARPS + n2n_warp_id;
+    int ctx_idx = ht_gin_signals::gin_channel_ctx(global_channel, CHANNEL_CNT);
 
-    ncclGin net(dcomm, ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
+    ncclGin net(dcomm, ctx_idx, NCCL_GIN_RESOURCE_SHARING_THREAD);
     ncclTeam rail = ncclTeamRail(dcomm);
 
-    // At most GIN_WINDOW chunks per rail peer in flight. Compiled in only when it can engage: the mere
-    // presence of wait/flushAsync in this loop slows posting.
-    constexpr int GIN_WINDOW = NCCL_EP_HT_DISPATCH_GIN_WINDOW;
-    constexpr bool USE_WINDOW = MAX_CHUNKS_PER_RANK > GIN_WINDOW * CHUNK_STRIDE;
-    const int n_mine = ht_gin_signals::gin_channel_num_chunks(global_channel, GLOBAL_CHANNELS, MAX_CHUNKS_PER_RANK);
-    ncclGinRequest_t chunk_done[GIN_WINDOW][NUM_REMOTE_LSA];
+    int channel_first_token_idx = global_channel * TOKENS_PER_CHANNEL;
+    const int tokens_per_channel =
+        ::nccl_ep::ht_dense::dispatch_channel_size(global_channel, TOKENS_PER_CHANNEL, num_of_tokens_per_rank);
 
-    for (int n_posted = 0; n_posted < n_mine; ++n_posted) {
-        const int cidx = ht_gin_signals::gin_chunk_at(global_channel, n_posted, GLOBAL_CHANNELS);
-        if constexpr (USE_WINDOW) {
-            if (n_posted >= GIN_WINDOW) {
-                for (int j = 0; j < NUM_REMOTE_LSA; ++j) {
-                    net.wait(chunk_done[n_posted % GIN_WINDOW][j], ncclCoopWarp());
-                }
+    // Ring order: LSA team i sends to i+1 first, then i+2, ..., so at each step every team targets a
+    // different peer and no receiver is hit by all senders at once.
+    for (int j = 0; j < NUM_REMOTE_LSA; ++j) {
+        // Skip-self ring over the other LSA teams, load-balanced start at my_lteam.
+        int remote_idx = (j + my_lteam) % NUM_REMOTE_LSA;
+        int remote_lteam_id = remote_idx < my_lteam ? remote_idx : remote_idx + 1;
+        int remote_slot = remote_idx < my_lteam ? my_lteam - 1 : my_lteam;
+
+        size_t packed_src_offset =
+            dispatch_packed_src_offset(smem_mr_info_ptr, remote_idx, channel_first_token_idx);
+        size_t packed_dst_offset =
+            dispatch_packed_dst_offset(smem_mr_info_ptr, remote_slot, channel_first_token_idx);
+        const size_t entry_bytes = smem_mr_info_ptr->bytes_per_entry;
+
+        // Create a bitmask of tokens that need to be written. One word per 32 tokens.
+        int32_t need_write_bitmask[nccl_ep::ceil_div(TOKENS_PER_CHANNEL, 32)];
+        for (int i = 0; i < nccl_ep::ceil_div(TOKENS_PER_CHANNEL, 32); i++) {
+            int token_idx_in_channel = i * 32 + ncclCoopWarp().thread_rank();
+            bool need_write =
+                token_idx_in_channel < tokens_per_channel &&
+                attn_to_rdma_map[((token_idx_in_channel + channel_first_token_idx) * NUM_REMOTE_LSA) + remote_idx];
+            need_write_bitmask[i] = __ballot_sync(~0u, need_write);
+        }
+        int routed_tokens_per_channel = 0;
+        for (int i = 0; i < nccl_ep::ceil_div(TOKENS_PER_CHANNEL, 32); i++) {
+            routed_tokens_per_channel += __popc(need_write_bitmask[i]);
+        }
+
+        // A single thread issues the gin.puts: the tokens are already packed, so each batch is one put.
+        if (cuda::ptx::elect_sync(~0)) {
+            for (int batch_idx = 0; batch_idx * TOKENS_PER_BATCH < routed_tokens_per_channel; ++batch_idx) {
+                const int first = batch_idx * TOKENS_PER_BATCH;
+                const int n = min(routed_tokens_per_channel - first, TOKENS_PER_BATCH);
+                const size_t src_offset = packed_src_offset + static_cast<size_t>(first) * entry_bytes;
+                const size_t dst_offset = packed_dst_offset + static_cast<size_t>(first) * entry_bytes;
+                const unsigned sig_id =
+                    ht_gin_signals::gin_dispatch_chunk_signal(
+                        my_lteam, remote_lteam_id, batch_idx * CHANNEL_CNT + global_channel,
+                        MAX_BATCHES_PER_CHANNEL * CHANNEL_CNT, CHANNEL_CNT, smem_mr_info_ptr->signals_tail_base)
+                        .sig_id;
+                net.put(
+                    rail,
+                    remote_lteam_id,
+                    nccl_internal_window,
+                    dst_offset,
+                    nccl_internal_window,
+                    src_offset,
+                    static_cast<size_t>(n) * entry_bytes,
+                    ncclGin_WeakSignalAdd{sig_id, 1},
+                    ncclGin_None{},
+                    ncclCoopThread(),
+                    ncclGin_None{},
+                    cuda::thread_scope_thread,
+                    cuda::thread_scope_device,
+                    ncclGinOptFlagsDefault);
             }
         }
-        int chunk_first_token_idx = cidx * TOKENS_PER_CHUNK;
-        int csize = 0;
-        if (cidx < num_of_chunks_per_rank) {
-            csize = TOKENS_PER_CHUNK;
-            if (chunk_first_token_idx + csize > num_of_tokens_per_rank) {
-                csize = num_of_tokens_per_rank - chunk_first_token_idx;
-            }
-        }
-
-        for (int j = 0; j < NUM_REMOTE_LSA; ++j) {
-            // Skip-self ring over the other LSA teams, load-balanced start at my_lteam.
-            int remote_idx = (j + my_lteam) % NUM_REMOTE_LSA;
-            int remote_lteam_id = remote_idx < my_lteam ? remote_idx : remote_idx + 1;
-            int remote_slot = remote_idx < my_lteam ? my_lteam - 1 : my_lteam;
-
-            size_t dense_dst_offset =
-                dispatch_packed_entry_offset(smem_mr_info_ptr, remote_slot, chunk_first_token_idx);
-            const size_t entry_bytes = smem_mr_info_ptr->bytes_per_entry;
-
-            // Signal id of this (chunk, destination) band; the waiter derives it through the same entry point.
-            // A chunk past num_of_chunks_per_rank has csize 0, so it sends nothing and signals nothing.
-            const unsigned sig_id =
-                ht_gin_signals::gin_dispatch_chunk_signal(
-                    my_lteam, remote_lteam_id, cidx, MAX_CHUNKS_PER_RANK, CHUNK_STRIDE,
-                    smem_mr_info_ptr->signals_tail_base)
-                    .sig_id;
-
-            // Create a bitmask of tokens that need to be written. One word per 32 tokens.
-            int32_t need_write_bitmask[TOKENS_PER_CHUNK / 32];
-            for (int i = 0; i < TOKENS_PER_CHUNK / 32; i++) {
-                int token_idx_in_chunk = i * 32 + ncclCoopWarp().thread_rank();
-                bool need_write =
-                    token_idx_in_chunk < csize &&
-                    attn_to_rdma_map[((token_idx_in_chunk + chunk_first_token_idx) * NUM_REMOTE_LSA) + remote_idx];
-                need_write_bitmask[i] = __ballot_sync(~0u, need_write);
-            }
-
-            for (int token_idx_in_chunk = ncclCoopWarp().thread_rank(); token_idx_in_chunk < csize;
-                 token_idx_in_chunk += ncclCoopWarp().size()) {
-                const int word = token_idx_in_chunk / 32;
-                const int lane_in_word = token_idx_in_chunk % 32;
-                size_t dst_offset = dense_dst_offset;
-
-                // Compact: skip space for earlier tokens in this word that aren't written.
-                if (lane_in_word > 0) {
-                    uint32_t writes_before = need_write_bitmask[word] & ((1u << lane_in_word) - 1);
-                    dst_offset += __popc(writes_before) * entry_bytes;
-                }
-
-                bool need_write =
-                    attn_to_rdma_map[((chunk_first_token_idx + token_idx_in_chunk) * NUM_REMOTE_LSA) + remote_idx];
-                if (need_write) {
-                    int token_idx = chunk_first_token_idx + token_idx_in_chunk;
-                    dispatch_n2n_put_token<TOKEN_DATA_TYPE, FORWARD_DISPATCH, HAS_SF, LSA_TEAMS>(
-                        net,
-                        rail,
-                        remote_lteam_id,
-                        nccl_internal_window,
-                        dst_offset,
-                        smem_mr_info_ptr,
-                        nccl_token_window,
-                        nccl_prob_window,
-                        nccl_sf_window,
-                        token_idx,
-                        token_bytes,
-                        prob_bytes,
-                        sf_bytes_per_token,
-                        compact_prob,
-                        sig_id);
-                }
-                // Advance the compacted base past all written tokens in this word.
-                dense_dst_offset += __popc(need_write_bitmask[word]) * entry_bytes;
-            }
-
-            if constexpr (USE_WINDOW) {
-                if (n_posted + GIN_WINDOW < n_mine) {
-                    net.flushAsync(rail, remote_lteam_id, &chunk_done[n_posted % GIN_WINDOW][j], ncclCoopWarp());
-                }
-            }
-        }
+        __syncwarp();
     }
-    // GIN flush with coopWarp includes syncwarp at the end
-    net.flush(ncclCoopWarp(), cuda::memory_order_acquire);
 }
 
 // Count-mode: wait for this block's chunk unit u, built by MAP warp u % NUM_MAP_WARPS.
@@ -1529,15 +1300,13 @@ __forceinline__ __device__ void s2d_unit_wait(const int* s2d_chunks_ready, int u
 // Dispatch intra-LSA S2G warp group. With NUM_PIPELINES > 1, each warp is an
 // independent pipeline consumer paired with the G2S warp of the same pipeline_rank.
 template <
-    nccl_ep::HtDispatchSchedule Schedule,
     typename LSA_S2G_GROUP,
     typename TOKEN_DATA_TYPE,
     typename SMEM_TYPE,
     int NUM_STAGES,
     int IN_FLIGHT_S2G,
-    int TOKENS_PER_CHUNK,
+    int TOKENS_PER_CHANNEL,
     int LSA_TEAMS,
-    int LSA_TEAM_SZ,
     int NBLOCKS,
     int NUM_PIPELINES,
     bool FORWARD_DISPATCH,
@@ -1556,7 +1325,6 @@ __forceinline__ __device__ void dispatch_S2G_warp(
     // CONFIG
     const int my_lteam,
     const int num_of_tokens_per_rank,
-    const int work_tokens_per_rank,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
     const uint32_t prob_bytes,
@@ -1564,7 +1332,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
     const int max_recv_tokens_per_rank,
     SMEM_TYPE* smem_buffer_ptr,
     // Count-mode: MAP-warp unit-completion counters (smem, one per MAP warp); gate each
-    // chunk's s2d prefetch. Unit ordinal u is built by warp u % NUM_MAP_WARPS as its
+    // chunk's s2d reads. Unit ordinal u is built by warp u % NUM_MAP_WARPS as its
     // (u / NUM_MAP_WARPS)-th publish (must match dispatch_push_map_warp's split).
     const int* s2d_chunks_ready = nullptr) {
     constexpr int STAGES_PER_PIPELINE = NUM_STAGES / NUM_PIPELINES;
@@ -1574,17 +1342,17 @@ __forceinline__ __device__ void dispatch_S2G_warp(
     using routing_loads_t = uint4;
     static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
     static_assert(
-        TOKENS_PER_CHUNK % sizeof(routing_loads_t) == 0,
-        "TOKENS_PER_CHUNK must be multiple of routing_loads_t.");
+        TOKENS_PER_CHANNEL % sizeof(routing_loads_t) == 0,
+        "TOKENS_PER_CHANNEL must be multiple of routing_loads_t.");
     constexpr int TOKENS_PER_ROUTING_LOAD = sizeof(routing_loads_t) / sizeof(bool);
+    constexpr int ROUTING_LOADS_PER_CHUNK = TOKENS_PER_CHANNEL / TOKENS_PER_ROUTING_LOAD;
 
     // S2D inner dim: mode-dependent, carried by SMEM layout struct.
     const int s2d_inner_dim = smem_buffer_ptr->s2d_inner_dim;
 
     const int pipeline_rank = LSA_S2G_GROUP::warp_rank();
-    using work_t = dispatch_work_t<Schedule, TOKENS_PER_CHUNK, LSA_TEAMS>;
-    const work_t work(work_tokens_per_rank, NBLOCKS);
-    const int num_of_chunks_per_rank = work.count();
+    const int rem_channel_sz = num_of_tokens_per_rank % TOKENS_PER_CHANNEL;
+    const int channels_per_rank = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHANNEL);
     // TOKENS_PER_ROUTING_LOAD must match the producer's pad in scan_kernel.cuh
     const int routing_map_lsa_stride = nccl_ep::align(num_of_tokens_per_rank, TOKENS_PER_ROUTING_LOAD);
     int in_flight_s2g = 0;
@@ -1600,18 +1368,23 @@ __forceinline__ __device__ void dispatch_S2G_warp(
     // Count mode reads the MAP-warp-built s2d rows directly from GMEM (gated on s2d_chunks_ready),
     // so it skips the TMA staging entirely.
     if constexpr (!COUNT_MODE) if (s2g_lane == 0) {
-        int chunk_iter = 0;
-        for (int chunk_idx = blockIdx.x; chunk_idx < num_of_chunks_per_rank; chunk_idx += NBLOCKS) {
-            if ((chunk_iter++ % NUM_PIPELINES) == pipeline_rank) {
-                int current_chunk_size = work.size(chunk_idx);
-                dispatch_s2g_prefetch_s2d_map<SMEM_TYPE, work_t::kMapStride>(
+        int channel_iter = 0;
+        for (int channel_idx = blockIdx.x; channel_idx < channels_per_rank; channel_idx += NBLOCKS) {
+            if ((channel_iter++ % NUM_PIPELINES) == pipeline_rank) {
+                int current_channel_size;
+                if (rem_channel_sz != 0 && channel_idx == channels_per_rank - 1) {
+                    current_channel_size = rem_channel_sz;
+                } else {
+                    current_channel_size = TOKENS_PER_CHANNEL;
+                }
+                dispatch_s2g_prefetch_s2d_map<SMEM_TYPE, TOKENS_PER_CHANNEL>(
                     sparse_to_dense_map,
                     smem_buffer_ptr,
                     pipeline_rank,
                     s2d_stage,
                     my_lteam,
-                    work.map_index(chunk_idx),
-                    current_chunk_size,
+                    channel_idx,
+                    current_channel_size,
                     num_of_tokens_per_rank,
                     s2d_inner_dim);
                 break;
@@ -1621,14 +1394,26 @@ __forceinline__ __device__ void dispatch_S2G_warp(
     __syncwarp();
 
     {
-        int chunk_iter = 0;
-        for (int cidx = blockIdx.x; cidx < num_of_chunks_per_rank; cidx += NBLOCKS) {
-            if ((chunk_iter++ % NUM_PIPELINES) != pipeline_rank) {
-                continue;
+        int channel_iter = 0;
+        // Pipeline to channel is 1:1 on multi-node (a single pass) and 1:many on a single node.
+        for (int channel_idx = blockIdx.x; channel_idx < channels_per_rank; channel_idx += NBLOCKS) {
+            if ((channel_iter++ % NUM_PIPELINES) != pipeline_rank) continue;
+
+            int routing_loads_in_channel;
+            int tokens_per_channel;
+            if (rem_channel_sz != 0 && channel_idx == channels_per_rank - 1) {
+                routing_loads_in_channel = nccl_ep::ceil_div(rem_channel_sz, (int)sizeof(routing_loads_t));
+                tokens_per_channel = rem_channel_sz;
+            } else {
+                routing_loads_in_channel = ROUTING_LOADS_PER_CHUNK;
+                tokens_per_channel = TOKENS_PER_CHANNEL;
             }
 
-            const int csize = work.size(cidx);
-            const int routing_loads_in_chunk = work.routing_loads(cidx);
+            // MAP publishes once per channel, using this block's channel iteration as the unit.
+            if constexpr (COUNT_MODE) {
+                s2d_unit_wait<NUM_MAP_WARPS>(s2d_chunks_ready, channel_iter - 1);
+            }
+
             for (int j = 0; j < LSA_TEAMS; j++) {
                 // Per-pipeline self-sync (arrival count = 1, trivially satisfied); lane 0 only.
                 if (s2g_lane == 0) {
@@ -1641,53 +1426,52 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                 }
                 __syncwarp();
 
-                // Prefetch next (chunk, LSA team) s2d map for THIS pipeline (single TMA load, lane 0 only).
+                // Prefetch next (channel, LSA team) s2d map for THIS pipeline (single TMA load, lane 0 only).
                 // Scan mode only; count mode reads GMEM and gates on s2d_chunks_ready below.
                 if constexpr (!COUNT_MODE) if (s2g_lane == 0) {
-                    int next_chunk_id;
+                    int next_channel_idx;
                     int next_lsa_id;
                     int next_lsa_iter = j + 1;
                     if (next_lsa_iter < LSA_TEAMS) {
-                        next_chunk_id = cidx;
+                        next_channel_idx = channel_idx;
                         next_lsa_id = (my_lteam + LSA_TEAMS - next_lsa_iter) % LSA_TEAMS;
                     } else {
-                        // Find the next chunk this pipeline will process
-                        int future_chunk_iter = chunk_iter; // chunk_iter was already incremented for current chunk
-                        next_chunk_id = -1;
-                        for (int fi = cidx + NBLOCKS; fi < num_of_chunks_per_rank; fi += NBLOCKS) {
-                            if ((future_chunk_iter++ % NUM_PIPELINES) == pipeline_rank) {
-                                next_chunk_id = fi;
+                        // Find the next channel this pipeline will process
+                        int future_channel_iter = channel_iter; // already incremented for the current channel
+                        next_channel_idx = -1;
+                        for (int fi = channel_idx + NBLOCKS; fi < channels_per_rank; fi += NBLOCKS) {
+                            if ((future_channel_iter++ % NUM_PIPELINES) == pipeline_rank) {
+                                next_channel_idx = fi;
                                 break;
                             }
                         }
                         next_lsa_id = my_lteam;
                     }
 
-                    if (next_chunk_id >= 0 && next_chunk_id < num_of_chunks_per_rank) {
-                        int next_chunk_size = work.size(next_chunk_id);
-                        dispatch_s2g_prefetch_s2d_map<SMEM_TYPE, work_t::kMapStride>(
+                    if (next_channel_idx >= 0 && next_channel_idx < channels_per_rank) {
+                        int next_channel_size;
+                        if (rem_channel_sz != 0 && next_channel_idx == channels_per_rank - 1) {
+                            next_channel_size = rem_channel_sz;
+                        } else {
+                            next_channel_size = TOKENS_PER_CHANNEL;
+                        }
+                        dispatch_s2g_prefetch_s2d_map<SMEM_TYPE, TOKENS_PER_CHANNEL>(
                             sparse_to_dense_map,
                             smem_buffer_ptr,
                             pipeline_rank,
                             s2d_stage ^ 1,
                             next_lsa_id,
-                            work.map_index(next_chunk_id),
-                            next_chunk_size,
+                            next_channel_idx,
+                            next_channel_size,
                             num_of_tokens_per_rank,
                             s2d_inner_dim);
                     }
                 }
 
-                // Count mode: wait for the in-kernel MAP warp to build this (chunk, LSA team)
-                // unit's s2d slice in GMEM before the fan-out reads it. The proxy fence in
-                // s2d_unit_wait orders the acquire ahead of the reads.
-                if constexpr (COUNT_MODE) {
-                    s2d_unit_wait<NUM_MAP_WARPS>(s2d_chunks_ready, (chunk_iter - 1) * LSA_TEAMS + j);
-                }
                 // Walk LSA teams backward from self around the ring (j=0 -> self, j>=1 -> remote)
                 int lteam_id = (my_lteam + LSA_TEAMS - j) % LSA_TEAMS;
                 const routing_loads_t* routing_map_ptr = reinterpret_cast<const routing_loads_t*>(
-                    rdma_to_attn_map + (lteam_id * routing_map_lsa_stride + work.first(cidx)));
+                    rdma_to_attn_map + (lteam_id * routing_map_lsa_stride + channel_idx * TOKENS_PER_CHANNEL));
 
                 // Scan mode waits for the TMA-staged s2d row; count mode reads GMEM (no staging).
                 if constexpr (!COUNT_MODE) {
@@ -1695,12 +1479,12 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                     nccl_ep::mbarrier_wait_parity(wait_mbar, s2d_parity);
                 }
 
-                for (int load_idx = 0; load_idx < routing_loads_in_chunk; load_idx++) {
+                for (int load_idx = 0; load_idx < routing_loads_in_channel; load_idx++) {
                     routing_loads_t routing_flags = routing_map_ptr[load_idx];
 #pragma unroll
                     for (int token_in_load = 0; token_in_load < TOKENS_PER_ROUTING_LOAD; token_in_load++) {
                         int cur_tokid = load_idx * TOKENS_PER_ROUTING_LOAD + token_in_load;
-                        if (cur_tokid >= csize) {
+                        if (cur_tokid >= tokens_per_channel) {
                             break;
                         }
                         bool token_needed = *(reinterpret_cast<bool*>(&routing_flags) + token_in_load);
@@ -1711,7 +1495,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                             if constexpr (COUNT_MODE) {
                                 s2d_smem_row =
                                     sparse_to_dense_map +
-                                    ((size_t)lteam_id * num_of_tokens_per_rank + work.first(cidx) +
+                                    ((size_t)lteam_id * num_of_tokens_per_rank + channel_idx * TOKENS_PER_CHANNEL +
                                      cur_tokid) *
                                         s2d_inner_dim;
                             } else {
@@ -1780,17 +1564,15 @@ __forceinline__ __device__ void dispatch_S2G_warp(
 }
 
 // Dispatch intra-LSA G2S warp group. With NUM_PIPELINES > 1, each warp is an independent
-// pipeline processing disjoint chunks through its own partition of the shared-memory FIFO.
+// pipeline processing disjoint channels through its own partition of the shared-memory FIFO.
 template <
-    nccl_ep::HtDispatchSchedule Schedule,
     typename LSA_G2S_GROUP,
     typename TOKEN_DATA_TYPE,
     typename SMEM_TYPE,
     int NUM_STAGES,
-    int TOKENS_PER_CHUNK,
-    int MAX_TOKENS_PER_RANK,
+    int TOKENS_PER_CHANNEL,
+    int TOKENS_PER_BATCH,
     int LSA_TEAMS,
-    int LSA_TEAM_SZ,
     int NBLOCKS,
     int NUM_PIPELINES,
     bool FORWARD_DISPATCH,
@@ -1798,177 +1580,152 @@ template <
 __forceinline__ __device__ void dispatch_G2S_warp(
     // INPUT
     const bool* rdma_to_attn_map,
+    const bool* rdma_to_attn_map_wo_drop,
     const TOKEN_DATA_TYPE* attn_input_token,
     const float* attn_input_prob,
     const uint8_t* attn_input_token_scaling_factor,
-    // OUTPUT
-    uint64_t* gin_G2S_flags,
     // CONFIG
-    const int local_rank,
     const int my_lteam,
     const int num_of_tokens_per_rank,
-    const int work_tokens_per_rank,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
     const bool compact_prob,
     const uint32_t prob_bytes,
-    const uint64_t expected_flag_value,
     const ncclDevComm& dcomm,
-    int num_ctx_per_comm,
     void* gin_base_ptr,
     const struct dispatch_memory_region_info_t* mr_info,
     SMEM_TYPE* smem_buffer_ptr) {
     using routing_loads_t = uint4;
+    constexpr int CHANNEL_CNT = NBLOCKS * NUM_PIPELINES;
 
     static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
     static_assert(
-        TOKENS_PER_CHUNK % sizeof(routing_loads_t) == 0,
-        "TOKENS_PER_CHUNK must be multiple of routing_loads_t.");
-    static_assert(
-        MAX_TOKENS_PER_RANK % TOKENS_PER_CHUNK == 0,
-        "MAX_TOKENS_PER_RANK must be multiple of TOKENS_PER_CHUNK.");
+        TOKENS_PER_CHANNEL % sizeof(routing_loads_t) == 0,
+        "TOKENS_PER_CHANNEL must be multiple of routing_loads_t.");
 
     constexpr int TOKENS_PER_ROUTING_LOAD = sizeof(routing_loads_t) / sizeof(bool);
+    constexpr int ROUTING_LOADS_PER_CHUNK = TOKENS_PER_CHANNEL / TOKENS_PER_ROUTING_LOAD;
     constexpr int STAGES_PER_PIPELINE = NUM_STAGES / NUM_PIPELINES;
+    constexpr int MAX_BATCHES_PER_CHANNEL =
+        ::nccl_ep::ht_dense::dispatch_batches_per_channel(TOKENS_PER_CHANNEL, TOKENS_PER_BATCH);
 
     const int pipeline_rank = LSA_G2S_GROUP::warp_rank();
-    const dispatch_work_t<Schedule, TOKENS_PER_CHUNK, LSA_TEAMS> work(work_tokens_per_rank, NBLOCKS);
-    const int num_of_chunks_per_rank = work.count();
-    const int max_num_of_chunks_per_rank = nccl_ep::ceil_div(MAX_TOKENS_PER_RANK, TOKENS_PER_CHUNK);
+    const int rem_channel_sz = num_of_tokens_per_rank % TOKENS_PER_CHANNEL;
+    const int channels_per_rank = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHANNEL);
     // TOKENS_PER_ROUTING_LOAD must match the producer's pad in scan_kernel.cuh
     const int routing_map_lsa_stride = nccl_ep::align(num_of_tokens_per_rank, TOKENS_PER_ROUTING_LOAD);
     int stage = 0;
     uint32_t consumer_parity = 1;
     int tokens_produced = 0;
 
-    // All lanes walk the chunks and count the routing map together; lane 0 owns the pipeline state
-    // (stage, consumer_parity, tokens_produced) and does the shadow raise, the wait and the copies.
-    const int lane = LSA_G2S_GROUP::thread_rank() % 32;
-    {
-        int chunk_iter = 0;
-        for (int cidx = blockIdx.x; cidx < num_of_chunks_per_rank; cidx += NBLOCKS) {
-            if ((chunk_iter++ % NUM_PIPELINES) != pipeline_rank) {
-                continue;
-            }
+    if (cuda::ptx::elect_sync(~0)) {
+        int channel_iter = 0;
+        // Pipeline to channel is 1:1 on multi-node (a single pass) and 1:many on a single node.
+        for (int channel_idx = blockIdx.x; channel_idx < channels_per_rank; channel_idx += NBLOCKS) {
+            if ((channel_iter++ % NUM_PIPELINES) != pipeline_rank) continue;
 
-            const int csize = work.size(cidx);
-            const int routing_loads_in_chunk = work.routing_loads(cidx);
+            int routing_loads_in_channel;
+            int tokens_per_channel;
+            if (rem_channel_sz != 0 && channel_idx == channels_per_rank - 1) {
+                routing_loads_in_channel = nccl_ep::ceil_div(rem_channel_sz, (int)sizeof(routing_loads_t));
+                tokens_per_channel = rem_channel_sz;
+            } else {
+                routing_loads_in_channel = ROUTING_LOADS_PER_CHUNK;
+                tokens_per_channel = TOKENS_PER_CHANNEL;
+            }
 
             for (int j = 0; j < LSA_TEAMS; j++) {
                 // Walk LSA teams backward from self around the ring (j=0 -> self, j>=1 -> remote)
                 int lteam_id = (my_lteam + LSA_TEAMS - j) % LSA_TEAMS;
+                const bool remote = lteam_id != my_lteam;
 
-                const bool* routing_row =
-                    rdma_to_attn_map + (lteam_id * routing_map_lsa_stride) + work.first(cidx);
-                int tokens_needed = 0;
-                if (lteam_id != my_lteam) {
-                    // Number of tokens this team sends us in the chunk, 32 tokens per ballot.
-                    for (int t0 = 0; t0 < csize; t0 += 32) {
-                        const int t = t0 + lane;
-                        tokens_needed += __popc(__ballot_sync(~0u, t < csize && routing_row[t]));
-                    }
-                }
+                g2s_source_t<TOKEN_DATA_TYPE> src = dispatch_g2s_resolve_source<
+                    TOKEN_DATA_TYPE,
+                    LSA_TEAMS,
+                    TOKENS_PER_CHANNEL,
+                    FORWARD_DISPATCH,
+                    HAS_SF>(
+                    attn_input_token,
+                    attn_input_prob,
+                    attn_input_token_scaling_factor,
+                    lteam_id,
+                    my_lteam,
+                    channel_idx,
+                    HIDDEN_DIM,
+                    sf_bytes_per_token,
+                    compact_prob,
+                    prob_bytes,
+                    gin_base_ptr,
+                    mr_info);
 
-                if (lane == 0) {
-                    if (lteam_id != my_lteam) {
-                        // Every gin.put of this chunk carries one weak signal.
-                        constexpr uint64_t GIN_PUTS_PER_TOKEN = 1 + (FORWARD_DISPATCH ? 1 : 0) + (HAS_SF ? 1 : 0);
-                        const ht_gin_signals::gin_chunk_signal_t sig = ht_gin_signals::gin_dispatch_chunk_signal(
-                            lteam_id, my_lteam, cidx, MAX_TOKENS_PER_RANK / TOKENS_PER_CHUNK,
-                            NBLOCKS * NCCL_EP_HT_DISPATCH_N2N_WARPS, mr_info->signals_tail_base);
-                        ncclGin net(dcomm, sig.ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
-                        net.increaseSignalShadow(sig.sig_id, GIN_PUTS_PER_TOKEN * static_cast<uint64_t>(tokens_needed));
-                    }
+                const size_t map_offset = (lteam_id * routing_map_lsa_stride) + (channel_idx * TOKENS_PER_CHANNEL);
+                const routing_loads_t* routing_map_ptr =
+                    reinterpret_cast<const routing_loads_t*>(rdma_to_attn_map + map_offset);
+                const routing_loads_t* routing_map_wo_drop_ptr =
+                    reinterpret_cast<const routing_loads_t*>(rdma_to_attn_map_wo_drop + map_offset);
 
-                    g2s_source_t<TOKEN_DATA_TYPE> src = dispatch_g2s_resolve_source<
-                        TOKEN_DATA_TYPE,
-                        LSA_TEAMS,
-                        LSA_TEAM_SZ,
-                        MAX_TOKENS_PER_RANK,
-                        TOKENS_PER_CHUNK,
-                        NBLOCKS,
-                        FORWARD_DISPATCH,
-                        HAS_SF>(
-                        attn_input_token,
-                        attn_input_prob,
-                        attn_input_token_scaling_factor,
-                        lteam_id,
-                        my_lteam,
-                        cidx,
-                        expected_flag_value,
-                        HIDDEN_DIM,
-                        sf_bytes_per_token,
-                        compact_prob,
-                        prob_bytes,
-                        dcomm,
-                        num_ctx_per_comm,
-                        gin_base_ptr,
-                        mr_info,
-                        work.first(cidx));
-
-                    const routing_loads_t* routing_map_ptr = reinterpret_cast<const routing_loads_t*>(routing_row);
-
-                    int packed_dense_idx = 0;
-                    for (int load_idx = 0; load_idx < routing_loads_in_chunk; load_idx++) {
-                        routing_loads_t routing_flags = routing_map_ptr[load_idx];
+                int packed_idx = 0;
+                int batches_waited = 0;
+                for (int load_idx = 0; load_idx < routing_loads_in_channel; load_idx++) {
+                    routing_loads_t routing_flags = routing_map_ptr[load_idx];
+                    routing_loads_t routing_flags_wo_drop = remote ? routing_map_wo_drop_ptr[load_idx] : routing_flags;
 
 #pragma unroll
-                        for (int token_in_load = 0; token_in_load < TOKENS_PER_ROUTING_LOAD; token_in_load++) {
-                            int cur_tokid = load_idx * TOKENS_PER_ROUTING_LOAD + token_in_load;
-                            if (cur_tokid >= csize) {
-                                break;
-                            }
+                    for (int token_in_load = 0; token_in_load < TOKENS_PER_ROUTING_LOAD; token_in_load++) {
+                        int cur_tokid = load_idx * TOKENS_PER_ROUTING_LOAD + token_in_load;
+                        if (cur_tokid >= tokens_per_channel) {
+                            break;
+                        }
 
-                            bool token_needed = *(reinterpret_cast<bool*>(&routing_flags) + token_in_load);
-                            if (token_needed) {
-                                if (tokens_produced >= STAGES_PER_PIPELINE) {
-                                    uint64_t* mbar =
-                                        smem_buffer_ptr->get_lsa_mbarrier_consumer(pipeline_rank, stage);
-                                    nccl_ep::mbarrier_wait_parity(mbar, consumer_parity);
-                                }
-
-                                dispatch_g2s_issue_token<
-                                    TOKEN_DATA_TYPE,
-                                    SMEM_TYPE,
-                                    LSA_TEAMS,
-                                    FORWARD_DISPATCH,
-                                    HAS_SF>(
-                                    src,
-                                    cur_tokid,
-                                    packed_dense_idx,
-                                    smem_buffer_ptr,
-                                    pipeline_rank,
-                                    stage,
-                                    HIDDEN_DIM,
-                                    sf_bytes_per_token,
-                                    compact_prob,
-                                    prob_bytes,
-                                    my_lteam,
-                                    mr_info);
-
-                                if (src.use_packed) {
-                                    packed_dense_idx++;
-                                }
-
-                                tokens_produced += 1;
-                                ring_advance(stage, consumer_parity, STAGES_PER_PIPELINE);
+                        bool token_needed = *(reinterpret_cast<bool*>(&routing_flags) + token_in_load);
+                        if (remote) {
+                            // A dropped token keeps its slot and its batch is still waited,
+                            // else that batch's +1 is left for the next phase to consume.
+                            if (!*(reinterpret_cast<bool*>(&routing_flags_wo_drop) + token_in_load)) continue;
+                            const int d = packed_idx / TOKENS_PER_BATCH;
+                            if (d >= batches_waited) {
+                                const ht_gin_signals::gin_chunk_signal_t sig = ht_gin_signals::gin_dispatch_chunk_signal(
+                                    lteam_id, my_lteam, d * CHANNEL_CNT + channel_idx,
+                                    MAX_BATCHES_PER_CHANNEL * CHANNEL_CNT, CHANNEL_CNT,
+                                    mr_info->signals_tail_base);
+                                ncclGin net(dcomm, sig.ctx_idx);
+                                net.increaseSignalShadow(sig.sig_id, 1ull);
+                                net.waitSignalMeetShadow(ncclCoopThread(), sig.sig_id);
+                                batches_waited = d + 1;
                             }
                         }
+                        if (token_needed) {
+                            if (tokens_produced >= STAGES_PER_PIPELINE) {
+                                uint64_t* mbar =
+                                    smem_buffer_ptr->get_lsa_mbarrier_consumer(pipeline_rank, stage);
+                                nccl_ep::mbarrier_wait_parity(mbar, consumer_parity);
+                            }
+
+                            dispatch_g2s_issue_token<
+                                TOKEN_DATA_TYPE,
+                                SMEM_TYPE,
+                                LSA_TEAMS,
+                                FORWARD_DISPATCH,
+                                HAS_SF>(
+                                src,
+                                cur_tokid,
+                                packed_idx,
+                                smem_buffer_ptr,
+                                pipeline_rank,
+                                stage,
+                                HIDDEN_DIM,
+                                sf_bytes_per_token,
+                                compact_prob,
+                                prob_bytes,
+                                my_lteam,
+                                mr_info);
+
+                            tokens_produced += 1;
+                            ring_advance(stage, consumer_parity, STAGES_PER_PIPELINE);
+                        }
+                        if (remote) packed_idx++;
                     }
                 }
-                __syncwarp();
-            }
-        }
-    }
-    // Update residue flags (only pipeline 0 does this to avoid duplicate writes).
-    if (LSA_G2S_GROUP::warp_rank() == 0) {
-        int residue_flag_count = max_num_of_chunks_per_rank - num_of_chunks_per_rank;
-
-        for (int lteam_id = blockIdx.x; lteam_id < LSA_TEAMS - 1; lteam_id += gridDim.x) {
-            uint64_t* residue_flag_base_ptr =
-                gin_G2S_flags + (lteam_id * max_num_of_chunks_per_rank) + num_of_chunks_per_rank;
-            if (LSA_G2S_GROUP::thread_rank() < residue_flag_count) {
-                residue_flag_base_ptr[LSA_G2S_GROUP::thread_rank()] = expected_flag_value;
             }
         }
     }
@@ -4180,6 +3937,7 @@ struct dispatch_push_map_ctx_t {
     int experts_per_lsa_team;
     int dst_off;
     int expert_off;
+    int num_chunks;
     size_t count_row_ints;
     const int32_t* count_rows;
     int hit_word_offset;
@@ -4306,19 +4064,18 @@ struct rank_slice_t {
 };
 
 // Build the rank-major s2d (FLAT slot per (stream, token, dest rank), -1 = not
-// routed) that S2G gates on. All MAP warps walk S2G's (chunk x stream) domain
-// splitting units round-robin (unit % NUM_MAP_WARPS), publishing each via
-// s2d_chunks_ready; units past a stream's token count publish empty.
-template <nccl_ep::HtDispatchSchedule Schedule, int NUM_OF_TOKENS_PER_CHUNK, int MAX_DST_RANKS, int NUM_MAP_WARPS>
+// routed) that S2G gates on. MAP warps split this block's chunks round-robin
+// (unit % NUM_MAP_WARPS), publishing each via s2d_chunks_ready; chunks past the
+// stream's token count publish empty.
+template <int NUM_OF_TOKENS_PER_CHUNK, int MAX_DST_RANKS, int NUM_MAP_WARPS>
 __device__ __forceinline__ void dispatch_push_map_build_s2d(
     const dispatch_push_map_ctx_t& ctx, int map_warp,
-    int32_t (*s_rank_base)[MAX_DST_RANKS],
-    const dispatch_work_t<Schedule, NUM_OF_TOKENS_PER_CHUNK, 1>& work) {
-    using work_t = dispatch_work_t<Schedule, NUM_OF_TOKENS_PER_CHUNK, 1>;
+    int32_t (*s_rank_base)[MAX_DST_RANKS]) {
     const int lane = (int)(threadIdx.x & 31);
     using RankSlice = rank_slice_t<MAX_DST_RANKS>;
     const RankSlice rank_slice{ctx.hit_word_offset, ctx.hit_bit_shift};
     constexpr int WAVES = nccl_ep::ceil_div(NUM_OF_TOKENS_PER_CHUNK, 32);
+    const int num_chunks = ctx.num_chunks;
     const int num_blocks = ctx.num_blocks;
     const int lsa_team_size = ctx.lsa_team_size;
     const int* per_src_lteam_num_tokens = ctx.per_src_lteam_num_tokens;
@@ -4335,12 +4092,9 @@ __device__ __forceinline__ void dispatch_push_map_build_s2d(
     // stripes across its MAP warps (unit % NUM_MAP_WARPS), so every (block, warp) owns a
     // disjoint, evenly-spaced slice of the chunks.
     int built = 0, unit = 0;
-    for (int c = blockIdx.x; c < work.count(); c += num_blocks, unit++) {
-        if (unit % NUM_MAP_WARPS != map_warp) {
-            continue;
-        }
-        const int t0 = work.first(c);
-        const int work_size = work.map_size(c);
+    for (int c = blockIdx.x; c < num_chunks; c += num_blocks, unit++) {
+        if (unit % NUM_MAP_WARPS != map_warp) continue;
+        const int t0 = c * NUM_OF_TOKENS_PER_CHUNK;
         if (t0 >= stream_tokens) {
             built++;
             if (lane == 0) nccl_ep::st_release_cta(s2d_chunks_ready + map_warp, built);
@@ -4349,30 +4103,7 @@ __device__ __forceinline__ void dispatch_push_map_build_s2d(
         const uint64_t* stream_hits = token_dst_rank_bitmap;
         int32_t* stream_s2d = s2d;
         int32_t run[MAX_DST_RANKS];
-        const int metadata_chunk = work.metadata_chunk(c);
-        chunk_slot_base(s_rank_base[map_warp], per_src_lteam_chunk_rank, metadata_chunk, run);
-        // MAP cursor run[r] starts after earlier source ranks and metadata chunks.
-        // Split tail units also skip hits before t0 within the same metadata chunk,
-        // preserving receive slots independently of the other CTAs' progress.
-        if constexpr (work_t::kRedistributed) {
-            for (int first = metadata_chunk * NUM_OF_TOKENS_PER_CHUNK; first < t0; first += nccl_ep::kWarpSize) {
-                const int t = first + lane;
-                uint64_t hits[RankSlice::PREFETCH_WORDS] = {};
-                if (t < t0 && t < stream_tokens) {
-                    const uint64_t* slice = stream_hits + (size_t)t * RankSlice::HIT_WORDS + rank_slice.word_offset;
-#pragma unroll
-                    for (int word = 0; word < RankSlice::PREFETCH_WORDS; word++) {
-                        if (rank_slice.word_offset + word < RankSlice::HIT_WORDS) {
-                            hits[word] = slice[word];
-                        }
-                    }
-                }
-                for (int r = 0; r < lsa_team_size; r++) {
-                    const uint32_t rank_hit_mask = __ballot_sync(0xffffffffu, rank_slice.hit(hits, r));
-                    run[r] += __popc(rank_hit_mask);
-                }
-            }
-        }
+        chunk_slot_base(s_rank_base[map_warp], per_src_lteam_chunk_rank, c, run);
         // Waves tiled so the hit-bitmap loads issue in parallel ahead of the serial
         // ballot chain (run[] carries across waves).
         constexpr int PF_WAVES = WAVES < 4 ? WAVES : 4;
@@ -4388,7 +4119,7 @@ __device__ __forceinline__ void dispatch_push_map_build_s2d(
                 const int tc = (wave_base + pi) * 32 + lane; // offset within the chunk
                 const int t = t0 + tc;
                 // tc/t only grow with pi, so once out of range every later wave is too.
-                if (tc >= work_size || t >= stream_tokens) break;
+                if (tc >= NUM_OF_TOKENS_PER_CHUNK || t >= stream_tokens) break;
                 const uint64_t* slice_hits = stream_hits + (size_t)t * RankSlice::HIT_WORDS + rank_slice.word_offset;
                 if constexpr (RankSlice::ONE_WORD) {
                     hits_pf[pi][0] = slice_hits[0];
@@ -4446,14 +4177,14 @@ __device__ __forceinline__ void dispatch_push_map_build_s2d(
 // tables, off the S2G critical path. All MAP warps split chunks round-robin.
 // Weights are receiver-local (from the landed prob) and flat2em is assigned by the
 // permute, so only LERM is written here.
-template <nccl_ep::HtDispatchSchedule Schedule, int NUM_OF_TOKENS_PER_CHUNK, int MAX_DST_RANKS, int NUM_MAP_WARPS,
+template <int NUM_OF_TOKENS_PER_CHUNK, int MAX_DST_RANKS, int NUM_MAP_WARPS,
           int EXPERTS_PER_RANK>
 __device__ __forceinline__ void dispatch_push_map_build_lerm(
-    const dispatch_push_map_ctx_t& ctx, int map_warp,
-    const dispatch_work_t<Schedule, NUM_OF_TOKENS_PER_CHUNK, 1>& work) {
+    const dispatch_push_map_ctx_t& ctx, int map_warp) {
     const int lane = (int)(threadIdx.x & 31);
     constexpr int MASK_WORDS = nccl_ep::bit_words(EXPERTS_PER_RANK);
     constexpr int WAVES = nccl_ep::ceil_div(NUM_OF_TOKENS_PER_CHUNK, 32);
+    const int num_chunks = ctx.num_chunks;
     const int num_blocks = ctx.num_blocks;
     const int lsa_team_size = ctx.lsa_team_size;
     const int experts_per_rank = ctx.experts_per_rank;
@@ -4475,12 +4206,9 @@ __device__ __forceinline__ void dispatch_push_map_build_lerm(
     // LERM rows sit at the base of the receiver table region (weights are receiver-local now).
     const size_t lerm_base = 0;
     int unit = 0;
-    for (int c = blockIdx.x; c < work.count(); c += num_blocks, unit++) {
-        const int t0 = work.first(c);
-        const int unit_size = work.map_size(c);
-        if (t0 >= stream_tokens) {
-            break;
-        }
+    for (int c = blockIdx.x; c < num_chunks; c += num_blocks, unit++) {
+        const int t0 = c * NUM_OF_TOKENS_PER_CHUNK;
+        if (t0 >= stream_tokens) break;
         // The chunk's s2d (same unit numbering as build_s2d) supplies the FLAT slots.
         if (lane == 0)
             while (nccl_ep::ld_acquire_cta(s2d_chunks_ready + unit % NUM_MAP_WARPS) <=
@@ -4491,9 +4219,7 @@ __device__ __forceinline__ void dispatch_push_map_build_lerm(
             if ((NUM_MAP_WARPS - 1 - (unit * WAVES + w) % NUM_MAP_WARPS) != map_warp) continue;
             const int tc = w * 32 + lane;
             const int t = t0 + tc;
-            if (tc >= unit_size || t >= stream_tokens) {
-                continue;
-            }
+            if (tc >= NUM_OF_TOKENS_PER_CHUNK || t >= stream_tokens) continue;
             // Collect this token's routed dest ranks and packed expert masks in a
             // small list, then write only those rows -- avoids walking every dest
             // rank on wide NVLink domains where lsa_team_size >> num_topk.
@@ -4685,7 +4411,7 @@ __device__ __forceinline__ void dispatch_push_map_publish_outputs(
 // writes the receiver LERM rows; block 0 / warp 0 publishes the recv count and EM
 // zone offsets. Single-LSA-team only, so there is no cross-team metadata exchange.
 // Phase helpers (_build_s2d / _build_lerm / _publish_outputs) share dispatch_push_map_ctx_t.
-template <nccl_ep::HtDispatchSchedule Schedule, int NUM_OF_TOKENS_PER_CHUNK, int MAX_DST_RANKS, int NUM_MAP_WARPS,
+template <int NUM_OF_TOKENS_PER_CHUNK, int MAX_DST_RANKS, int NUM_MAP_WARPS,
           int EXPERTS_PER_RANK>
 __device__ __forceinline__ void dispatch_push_map_warp(
     const dispatch_push_count_kparams_t& p,
@@ -4693,7 +4419,7 @@ __device__ __forceinline__ void dispatch_push_map_warp(
     int my_rank,             // local (LSA) rank
     int my_lteam,
     int num_blocks,
-    int work_tokens_per_rank, // Same local work domain as G2S/S2G.
+    int num_tokens_per_rank, // S2G's chunk domain (max tokens); >= any stream's token count
     int map_warp,            // this warp's index in [0, NUM_MAP_WARPS); stripes s2d + LERM
     int* s2d_chunks_ready) {
     const int lane = (int)(threadIdx.x & 31);
@@ -4706,7 +4432,7 @@ __device__ __forceinline__ void dispatch_push_map_warp(
     // covering its own LSA team's rank slice (see rank_slice_t above).
     const rank_slice_t<MAX_DST_RANKS> rank_slice{nccl_ep::bit_word(dst_off), dst_off & 63};
     const int expert_off = my_lteam * experts_per_lsa_team;                       // my LSA team's global expert base
-    const dispatch_work_t<Schedule, NUM_OF_TOKENS_PER_CHUNK, 1> work(work_tokens_per_rank, num_blocks);
+    const int num_chunks = nccl_ep::ceil_div(num_tokens_per_rank, NUM_OF_TOKENS_PER_CHUNK);
     // Count landing rows, one per global sender: own-LSA-team senders' rows are fanned out into this
     // rank's own table region at the dispatch head (the head LSA barrier orders them before any read
     // here). All reads are local.
@@ -4736,6 +4462,7 @@ __device__ __forceinline__ void dispatch_push_map_warp(
     ctx.experts_per_lsa_team = experts_per_lsa_team;
     ctx.dst_off = dst_off;
     ctx.expert_off = expert_off;
+    ctx.num_chunks = num_chunks;
     ctx.count_row_ints = count_row_ints;
     ctx.count_rows = count_rows;
     ctx.hit_word_offset = rank_slice.word_offset;
@@ -4748,12 +4475,11 @@ __device__ __forceinline__ void dispatch_push_map_warp(
     dispatch_push_map_build_rank_base(ctx, s_rank_base[map_warp], lane);
 
     // Phase 1: build s2d (S2G-critical).
-    dispatch_push_map_build_s2d<Schedule, NUM_OF_TOKENS_PER_CHUNK, MAX_DST_RANKS, NUM_MAP_WARPS>(
-        ctx, map_warp, s_rank_base, work);
+    dispatch_push_map_build_s2d<NUM_OF_TOKENS_PER_CHUNK, MAX_DST_RANKS, NUM_MAP_WARPS>(ctx, map_warp, s_rank_base);
 
     // Phase 2: build receiver LERM tables.
-    dispatch_push_map_build_lerm<Schedule, NUM_OF_TOKENS_PER_CHUNK, MAX_DST_RANKS, NUM_MAP_WARPS,
-                            EXPERTS_PER_RANK>(ctx, map_warp, work);
+    dispatch_push_map_build_lerm<NUM_OF_TOKENS_PER_CHUNK, MAX_DST_RANKS, NUM_MAP_WARPS,
+                            EXPERTS_PER_RANK>(ctx, map_warp);
 
     // Peer-visible table writes must be ordered before this rank's completion-barrier flag.
     __threadfence_system();
@@ -4797,7 +4523,6 @@ __device__ __forceinline__ bool elect_last_block(const int* counter, int num_blo
 }
 
 template <
-    nccl_ep::HtDispatchSchedule Schedule,
     typename TOKEN_DATA_TYPE,
     typename SCALE_DATA_TYPE,
     ncclEpDispQuant_t kRecipe,
@@ -4810,6 +4535,7 @@ template <
     int NUM_STAGES,
     int IN_FLIGHT_S2G,
     int TOKENS_PER_CHUNK,
+    int TOKENS_PER_BATCH,
     int MAX_TOKENS_PER_RANK,
     int LSA_TEAMS,
     int NBLOCKS,
@@ -4822,7 +4548,8 @@ template <
     int EXPERTS_PER_RANK>
 __device__ __forceinline__ void dispatch_kernel_impl(
     const dispatch_kernel_param_t<TOKEN_DATA_TYPE, LSA_TEAM_SZ>& param,
-    uint8_t* smem_bytes) {
+    uint8_t* smem_bytes,
+    const bool* rdma_to_attn_map_wo_drop) {
     static_assert(kRecipe == NCCL_EP_DISP_QUANT_NONE || kRecipe == NCCL_EP_DISP_QUANT_FWD,
                   "unsupported dispatch quantization recipe");
     // The JIT-selected ScaleT validates the caller's scale element packing.
@@ -4830,12 +4557,35 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                   "scale payload must contain a whole number of ScaleT elements");
     const int my_lteam = param.lsa_team;
     if constexpr (LSA_TEAMS != 1) {
-        static_assert(
-            GIN_GROUP::size() % 32 == 0 && GIN_GROUP::size() <= 64,
-            "Dispatch kernel supports 1 or 2 N2N warps.");
+        // One channel end to end: N2N warp (sender) -> G2S -> S2G (receiver), a symmetric producer/consumer
+        // chain, so there is one N2N warp per pipeline.
+        static_assert(GIN_GROUP::size() == 32 * NUM_PIPELINES, "Unordered dispatch runs one N2N warp per pipeline.");
     }
     static_assert(NUM_STAGES % NUM_PIPELINES == 0, "NUM_STAGES must be divisible by NUM_PIPELINES.");
     constexpr int STAGES_PER_PIPELINE = NUM_STAGES / NUM_PIPELINES;
+    // Multi-node divides the work by tokens per channel, and each channel's range is packed
+    // compactly: the network ships whole batches, each one gin.put carrying its own weak signal,
+    // and every entry lands at an offset both sides derive the same way. A single LSA team needs
+    // none of that, being pure NVLink, so its channel is the group chunk, one batch each.
+    //
+    //   e.g. 3 blocks x 2 pipelines, warps named b<block>.p<pipeline>
+    //
+    //   multi-node: channel == warp, one per (block, pipeline), batches live inside a channel
+    //
+    //     channel 0 = b0.p0      channel 1 = b1.p0      channel 5 = b2.p1
+    //     [############____]     [#######_________]     [##############__]
+    //     | batch | batch |      | batch |              | batch | batch |   batch = (one gin.put + weak signal)
+    //
+    //   single node: many channels, one batch each; every warp iterates over its channels round-robin
+    //
+    //     channel 0   channel 1   channel 2   channel 3   channel 4   channel 5   ...  channel M-1
+    //     [##_#__#]   [#___##_]   [#_###__]   [__##_#_]   [###__#_]   [#_#__##]
+    //      b0.p0       b1.p0       b2.p0       b0.p1       b1.p1       b2.p1   ...  b0.p0 again
+    //      no packing, no network: G2S reads its own input, S2G scatters over NVLink
+    constexpr int TOKENS_PER_CHANNEL =
+        LSA_TEAMS > 1 ? ::nccl_ep::ht_dense::dispatch_tokens_per_channel(MAX_TOKENS_PER_RANK,
+                                                                        NBLOCKS * NUM_PIPELINES)
+                      : TOKENS_PER_CHUNK;
 
     using cur_smem_t = dispatch_smem_layout_t;
 
@@ -4844,7 +4594,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     model_config_t d_model;
     d_config.num_of_stages = NUM_STAGES;
     d_config.num_of_in_flight_s2g = IN_FLIGHT_S2G;
-    d_config.num_of_tokens_per_chunk = TOKENS_PER_CHUNK;
+    d_config.num_of_tokens_per_channel = TOKENS_PER_CHANNEL;
     d_config.num_of_blocks = NBLOCKS;
     d_config.forward_dispatch = FORWARD_DISPATCH;
     d_config.sf_bytes_per_token = SF_BYTES_PER_TOKEN;
@@ -4974,21 +4724,13 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     if (threadIdx_x_int < GIN_GROUP::size()) {
         if constexpr (LSA_TEAMS != 1) {
 #define DISPATCH_N2N_TEMPLATE \
-            dispatch_N2N_warp<GIN_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_STAGES, TOKENS_PER_CHUNK, \
-                              MAX_TOKENS_PER_RANK, LSA_TEAMS, LSA_TEAM_SZ, NBLOCKS, FORWARD_DISPATCH, HAS_SF>
+            dispatch_N2N_warp<GIN_GROUP, cur_smem_t, TOKENS_PER_BATCH, MAX_TOKENS_PER_RANK, LSA_TEAMS, \
+                              NBLOCKS>
             DISPATCH_N2N_TEMPLATE(
                 param.attn_to_rdma_map,
                 my_lteam,
                 param.num_of_tokens_per_rank,
-                HIDDEN_DIM,
-                SF_BYTES_PER_TOKEN,
-                param.compact_prob,
-                prob_bytes,
                 *param.dcomm,
-                param.num_ctx_per_comm,
-                param.token_window,
-                param.prob_window,
-                param.sf_window,
                 param.dest_window,
                 &param.mr_info,
                 smem_buffer_ptr);
@@ -4996,26 +4738,21 @@ __device__ __forceinline__ void dispatch_kernel_impl(
         }
     } else if (threadIdx_x_int < GIN_GROUP::size() + LSA_G2S_GROUP::size()) {
 #define DISPATCH_G2S_TEMPLATE \
-        dispatch_G2S_warp<Schedule, LSA_G2S_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_STAGES, TOKENS_PER_CHUNK, \
-                            MAX_TOKENS_PER_RANK, LSA_TEAMS, LSA_TEAM_SZ, NBLOCKS, NUM_PIPELINES, \
-                            FORWARD_DISPATCH, HAS_SF>
+        dispatch_G2S_warp<LSA_G2S_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_STAGES, TOKENS_PER_CHANNEL, \
+                            TOKENS_PER_BATCH, LSA_TEAMS, NBLOCKS, NUM_PIPELINES, FORWARD_DISPATCH, HAS_SF>
         DISPATCH_G2S_TEMPLATE(
             param.rdma_to_attn_map,
+            rdma_to_attn_map_wo_drop != nullptr ? rdma_to_attn_map_wo_drop : param.rdma_to_attn_map,
             param.attn_input_token,
             param.attn_input_prob,
             param.attn_input_token_scaling_factor,
-            param.gin_G2S_flags,
-            param.local_rank,
             my_lteam,
             param.num_of_tokens_per_rank,
-            param.work_tokens_per_rank,
             HIDDEN_DIM,
             SF_BYTES_PER_TOKEN,
             param.compact_prob,
             prob_bytes,
-            *param.expected_tail_signal_val,
             *param.dcomm,
-            param.num_ctx_per_comm,
             param.gin_base_ptr,
             &param.mr_info,
             smem_buffer_ptr);
@@ -5023,8 +4760,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     } else if (
         threadIdx_x_int < GIN_GROUP::size() + LSA_G2S_GROUP::size() + LSA_S2G_GROUP::size()) {
 #define DISPATCH_S2G_TEMPLATE(COUNT_MODE) \
-        dispatch_S2G_warp<Schedule, LSA_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_STAGES, \
-                            IN_FLIGHT_S2G, TOKENS_PER_CHUNK, LSA_TEAMS, LSA_TEAM_SZ, NBLOCKS, NUM_PIPELINES, \
+        dispatch_S2G_warp<LSA_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_STAGES, \
+                            IN_FLIGHT_S2G, TOKENS_PER_CHANNEL, LSA_TEAMS, NBLOCKS, NUM_PIPELINES, \
                             FORWARD_DISPATCH, HAS_SF, kLayout, kMapWarps, COUNT_MODE>( \
             param.rdma_to_attn_map, \
             param.sparse_to_dense_map, \
@@ -5033,7 +4770,6 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             param.expert_output_scaling_factor, \
             my_lteam, \
             param.num_of_tokens_per_rank, \
-            param.work_tokens_per_rank, \
             HIDDEN_DIM, \
             SF_BYTES_PER_TOKEN, \
             prob_bytes, \
@@ -5057,13 +4793,13 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             (threadIdx_x_int -
              (GIN_GROUP::size() + LSA_G2S_GROUP::size() + LSA_S2G_GROUP::size())) /
             32;
-        dispatch_push_map_warp<Schedule, TOKENS_PER_CHUNK, LSA_TEAM_SZ, kMapWarps, EXPERTS_PER_RANK>(
+        dispatch_push_map_warp<TOKENS_PER_CHANNEL, LSA_TEAM_SZ, kMapWarps, EXPERTS_PER_RANK>(
             param.dispatch_push_count,
             param.experts_per_rank,
             param.local_rank,
             my_lteam,
             NBLOCKS,
-            param.work_tokens_per_rank,
+            param.num_of_tokens_per_rank,
             map_warp,
             s_s2d_chunks_ready);
     } else if (
@@ -5108,16 +4844,15 @@ __device__ __forceinline__ void dispatch_kernel_impl(
         if (MAP_GROUP::size() > 0 && threadIdx_x_int >= kMapBase &&
             threadIdx_x_int < kMapBase + (int)MAP_GROUP::size()) {
             const int s2d_inner = smem_buffer_ptr->s2d_inner_dim;
-            const int ntok = param.work_tokens_per_rank;
-            const dispatch_work_t<Schedule, TOKENS_PER_CHUNK, 1> work(ntok, NBLOCKS);
+            const int ntok = param.num_of_tokens_per_rank;
+            const int num_chunks = nccl_ep::ceil_div(ntok, TOKENS_PER_CHANNEL);
             bool* r2a = const_cast<bool*>(param.rdma_to_attn_map);
             const int32_t* s2d = param.sparse_to_dense_map;
             const int map_tid = threadIdx_x_int - kMapBase;
             // Own this block's chunks only (same split as build_s2d), so we read s2d this block built.
-            for (int c = blockIdx.x; c < work.count(); c += NBLOCKS) {
-                const int unit_size = work.map_size(c);
-                for (int ti = map_tid; ti < unit_size; ti += (int)MAP_GROUP::size()) {
-                    const int t = work.first(c) + ti;
+            for (int c = blockIdx.x; c < num_chunks; c += NBLOCKS) {
+                for (int ti = map_tid; ti < TOKENS_PER_CHANNEL; ti += (int)MAP_GROUP::size()) {
+                    const int t = c * TOKENS_PER_CHANNEL + ti;
                     if (t >= ntok || !r2a[t]) continue;
                     bool kept = false;
                     for (int r = 0; r < s2d_inner; ++r) {

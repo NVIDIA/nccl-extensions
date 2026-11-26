@@ -1,5 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  * See LICENSE.txt for more license information.
  */
@@ -8,6 +9,7 @@
 
 #include "device/ht_ep.cuh"
 #include "device/ht_ep_adapter.cuh"
+#include "device/ht/unordered/local_dispatch_pack.cuh"
 #include "device/jit/jit_runtime.hpp"
 #include "device/jit/jit_utils.hpp"
 #include "device/jit/jit_source_literals.hpp"
@@ -54,14 +56,16 @@ inline constexpr int kDispatchHeadWarps = 3;
 
 inline dispatch_warp_layout_t
 compute_dispatch_warp_layout(int num_lsa_teams, ncclEpLayout_t layout, int num_pipelines,
-                             bool count_map_warp) {
+                             bool count_map_warp, bool unordered = false) {
     const bool multi_lsa_layout = (num_lsa_teams != 1);
     dispatch_warp_layout_t L{};
     L.num_pipelines = num_pipelines;
-    L.cross_lsa_group_warps = multi_lsa_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
+    // Unordered: one N2N warp per pipeline, so each channel sends and drains one chunk.
+    const int n2n_warps = unordered ? num_pipelines : NCCL_EP_HT_DISPATCH_N2N_WARPS;
+    L.cross_lsa_group_warps = multi_lsa_layout ? n2n_warps : 0;
     L.cross_lsa_group_start = 0;
     L.lsa_g2s_group_warps = L.num_pipelines;
-    L.lsa_g2s_group_start = multi_lsa_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
+    L.lsa_g2s_group_start = multi_lsa_layout ? n2n_warps : 0;
     L.lsa_s2g_group_warps = L.num_pipelines;
     L.lsa_s2g_group_start = L.lsa_g2s_group_start + L.lsa_g2s_group_warps;
     // Count mode dispatches FLAT (rank-major) with no EM padding, so it swaps the single EM PAD
@@ -109,8 +113,10 @@ inline std::string dispatch_jit_source(
     int experts_per_rank,
     HtDispatchSchedule schedule,
     const DispatchKernelSpec& kernel_spec,
-    HtKernelImpl impl) {
+    HtKernelImpl impl,
+    int unordered_dispatch_tokens_per_batch) {
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
+    const bool unordered = impl == HtKernelImpl::kUnordered;
     const char* const impl_header = ht_impl_header(impl);
     const char* const ns = ht_impl_namespace(impl);
     std::ostringstream src;
@@ -136,11 +142,12 @@ inline std::string dispatch_jit_source(
            "LSA_S2G_GROUP::size() + MAP_GROUP::size() + PAD_GROUP::size() + HEAD_EXTRA_GROUP::size(), 1)\n"
         << "__global__ void " << kDispatchJitEntryName << "(\n"
         << "    const __grid_constant__ " << ns << "::dispatch_kernel_param_t<TOKEN_DATA_TYPE, " << lsa_team_size
-        << "> param) {\n"
+        << "> param" << (unordered ? ",\n    const bool* rdma_to_attn_map_wo_drop" : "") << ") {\n"
         << "  extern __shared__ uint8_t smem_bytes[];\n"
         << "  " << ns << "::dispatch_kernel_impl<\n"
-        << "      nccl_ep::HtDispatchSchedule::"
-        << ((schedule == HtDispatchSchedule::Redistributed) ? "Redistributed" : "Coarse") << ",\n"
+        << (unordered ? std::string()
+                      : std::string("      nccl_ep::HtDispatchSchedule::") +
+                            ((schedule == HtDispatchSchedule::Redistributed) ? "Redistributed" : "Coarse") + ",\n")
         << "      TOKEN_DATA_TYPE,\n"
         << "      SCALE_DATA_TYPE,\n"
         << "      " << kernel_spec.recipe_source_literal << ",\n"
@@ -153,6 +160,7 @@ inline std::string dispatch_jit_source(
         << "      " << num_of_stages << ",\n"
         << "      " << num_of_in_flight_s2g << ",\n"
         << "      " << num_of_tokens_per_chunk << ",\n"
+        << (unordered ? "      " + std::to_string(unordered_dispatch_tokens_per_batch) + ",\n" : std::string())
         << "      " << max_tokens_per_rank << ",\n"
         << "      " << num_lsa_teams << ",\n"
         << "      " << num_of_blocks << ",\n"
@@ -162,7 +170,8 @@ inline std::string dispatch_jit_source(
         << "      " << layout_literal << ",\n"
         << "      " << hidden_dim << ",\n"
         << "      kSfBytesPerToken,\n"
-        << "      " << experts_per_rank << ">(param, smem_bytes);\n"
+        << "      " << experts_per_rank << ">(param, smem_bytes"
+        << (unordered ? ", rdma_to_attn_map_wo_drop" : "") << ");\n"
         << "}\n";
     return src.str();
 }
@@ -183,14 +192,17 @@ inline ncclResult_t launch_dispatch(
     int dynamic_smem_bytes,
     cudaStream_t stream,
     const DispatchKernelSpec& kernel_spec,
-    bool count_map_warp) {
-    const dispatch_warp_layout_t L =
-        compute_dispatch_warp_layout(num_lsa_teams, layout, config.num_pipelines, count_map_warp);
-    const HtDispatchSchedule schedule = ht_dispatch_schedule(
-        work_tokens_per_rank, config.num_of_tokens_per_chunk, config.num_of_blocks, num_lsa_teams);
-
+    bool count_map_warp,
+    int unordered_dispatch_tokens_per_batch) {
     const HtKernelImpl impl = ht_select_kernel_impl(env);
     const bool unordered_impl = impl == HtKernelImpl::kUnordered;
+    const dispatch_warp_layout_t L = compute_dispatch_warp_layout(
+        num_lsa_teams, layout, config.num_pipelines, count_map_warp, unordered_impl);
+    // The unordered kernel walks channels, not the schedule's chunk units.
+    const HtDispatchSchedule schedule = unordered_impl
+        ? HtDispatchSchedule::Coarse
+        : ht_dispatch_schedule(work_tokens_per_rank, config.num_of_tokens_per_chunk, config.num_of_blocks,
+                               num_lsa_teams);
 
     static const int fwd_variant_identity = 0;
     static const int bwd_variant_identity = 0;
@@ -211,7 +223,8 @@ inline ncclResult_t launch_dispatch(
              << "_epr" << experts_per_rank
              << ((count_map_warp) ? "_countmap" : "")
              << ((schedule == HtDispatchSchedule::Redistributed) ? "_tail" : "_coarse")
-             << (unordered_impl ? "_unordered" : "");
+             << (unordered_impl ? "_unordered" : "")
+             << (unordered_impl ? "_tpb" + std::to_string(unordered_dispatch_tokens_per_batch) : std::string());
         return name.str();
     }();
     const std::string source = dispatch_jit_source(
@@ -242,7 +255,8 @@ inline ncclResult_t launch_dispatch(
         experts_per_rank,
         schedule,
         kernel_spec,
-        impl);
+        impl,
+        unordered_dispatch_tokens_per_batch);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = unordered_impl ? "ht_dispatch_unordered" : "ht_dispatch";
@@ -370,6 +384,86 @@ inline void dispatch_dump_warp_timing(
     _wt_print_block_span();
 }
 #endif
+
+// ============================================================================
+// Local dispatch pack JIT (unordered, multi-LSA): pack send staging before dispatch.
+// ============================================================================
+constexpr const char* kLocalDispatchPackJitEntryName = "nccl_ep_jit_ht_local_dispatch_pack_kernel";
+// Pack blocks per SM: the device's resident maximum for the pack's block size (8 at 256 threads on
+// H100/H200/B200). A block stages one token at a time and its warps idle on that TMA load, so filling
+// each SM with resident blocks keeps the most loads in flight. The blocks are independent (no
+// grid-wide sync), so a larger grid would only queue.
+inline int local_dispatch_pack_blocks_per_sm() {
+    static const int blocks = [] {
+        int dev = 0;
+        int max_threads = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&max_threads, cudaDevAttrMaxThreadsPerMultiProcessor, dev) != cudaSuccess) {
+            return 1;
+        }
+        return std::max(1, max_threads / ::nccl_ep::ht_dense::pack_group::size());
+    }();
+    return blocks;
+}
+
+inline std::string local_dispatch_pack_jit_source(bool forward_dispatch, bool has_sf, bool guard_enabled) {
+    std::ostringstream src;
+    src << "#include \"device/ht/unordered/local_dispatch_pack.cuh\"\n"
+        << "\n"
+        << "extern \"C\" __launch_bounds__(" << ::nccl_ep::ht_dense::pack_group::size() << ")\n"
+        << "__global__ void " << kLocalDispatchPackJitEntryName << "(\n"
+        << "    const __grid_constant__ ::nccl_ep::ht_dense::pack_args_t p) {\n"
+        << "  ::nccl_ep::ht_dense::local_dispatch_pack<\n"
+        << "      " << ::nccl_ep::jit::bool_literal(forward_dispatch) << ",\n"
+        << "      " << ::nccl_ep::jit::bool_literal(has_sf) << ",\n"
+        << "      " << ::nccl_ep::jit::bool_literal(guard_enabled) << ">(p);\n"
+        << "}\n";
+    return src.str();
+}
+
+// Launch on the dispatch stream, right before the dispatch kernel.
+inline void launch_local_dispatch_pack(
+    bool forward_dispatch,
+    bool has_sf,
+    bool guard_enabled,
+    int num_sms,
+    ::nccl_ep::ht_dense::pack_args_t& param,
+    cudaStream_t stream) {
+    if (param.lsa_teams <= 1 || param.num_of_tokens_per_rank <= 0) return;
+    static const int variant_identity = 0;
+    const std::string variant_name =
+        std::string("local_dispatch_pack") + (forward_dispatch ? "_fwd" : "_bwd") + (has_sf ? "_sf" : "") +
+        (guard_enabled ? "_guard" : "");
+    const std::string source = local_dispatch_pack_jit_source(forward_dispatch, has_sf, guard_enabled);
+
+    ::nccl_ep::jit::JitKernelVariant variant;
+    variant.kernel_family = "ht_local_dispatch_pack";
+    variant.variant_name = variant_name;
+    variant.source = source;
+    variant.entry_name = kLocalDispatchPackJitEntryName;
+    variant.identity = &variant_identity;
+    variant.runtime_key =
+        (static_cast<std::uint64_t>(forward_dispatch ? 1u : 0u)) | (static_cast<std::uint64_t>(has_sf ? 1u : 0u) << 1) |
+        (static_cast<std::uint64_t>(guard_enabled ? 1u : 0u) << 2);
+    // Fill the preprocessing SMs with resident blocks; the kernel grid-strides over the rest.
+    variant.num_blocks = num_sms > 0
+                             ? std::min(param.num_of_tokens_per_rank, num_sms * local_dispatch_pack_blocks_per_sm())
+                             : param.num_of_tokens_per_rank;
+    variant.block_dim = ::nccl_ep::ht_dense::pack_group::size();
+    // mbarrier (padded to keep the stage aligned), then the token and scale row.
+    variant.dynamic_smem_bytes =
+        static_cast<int>(NCCL_EP_HT_TMA_ALIGN + param.token_bytes + (has_sf ? param.sf_bytes : 0));
+
+    std::string error;
+    const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
+
+    if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
+        std::fprintf(stderr, "[nccl_ep jit] fatal dispatch pack JIT launch failure for %s: %s%s%s\n",
+                     variant_name.c_str(), ::nccl_ep::jit::jit_kernel_status_name(status),
+                     error.empty() ? "" : ": ", error.empty() ? "" : error.c_str());
+        std::abort();
+    }
+}
 
 // ============================================================================
 // Local dup JIT (NVLink-dedup mode): fan secondaries from primary EM slots.

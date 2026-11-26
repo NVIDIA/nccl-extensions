@@ -59,6 +59,21 @@ inline int nccl_ep_resolve_dispatch_chunk(const ncclEpEnvConfig& cfg, int combin
     return static_cast<int>(chunk);
 }
 
+// Unordered HT dispatch: tokens per gin.put. Resolved once at group creation.
+inline int nccl_ep_resolve_unordered_dispatch_tokens_per_batch(const ncclEpEnvConfig& cfg) {
+    constexpr int kDefault = 64;
+    const auto& var = cfg.unordered_dispatch_tokens_per_batch;
+    if (!var.is_set) return kDefault;
+    if (var.value.ul == 0 || var.value.ul > 4096) {
+        if (cfg.rank == 0) {
+            std::fprintf(stderr, "[nccl_ep] %s=%lu ignored (must be 1..4096); using %d\n",
+                         var.name, var.value.ul, kDefault);
+        }
+        return kDefault;
+    }
+    return static_cast<int>(var.value.ul);
+}
+
 namespace nccl_ep {
 
 inline HtDispatchSchedule ht_dispatch_schedule(int work_tokens, int chunk, int blocks, int lsa_teams) {

@@ -71,6 +71,9 @@ NCCL_EP_JIT_HEADERS := \
     ht_compact_prob.h \
     device/ht/ht_combine_packed.cuh \
     device/ht/unordered/ht_ep_unordered.cuh \
+    device/ht/unordered/ht_gin_dispatch_batch.cuh \
+    device/ht/unordered/local_dispatch_pack.cuh \
+    device/ht/unordered/ep_dispatch_channel.cuh \
     device/ht/warp_group.cuh \
     device/ht/ht_common.cuh \
     device/ht/ht_ep_shared.cuh \

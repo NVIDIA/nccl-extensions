@@ -102,6 +102,7 @@ struct ncclEpEnvConfig {
     ncclEpEnvVar preprocess_num_sms{"NCCL_EP_PREPROCESS_NUM_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar tokens_per_chunk{"NCCL_EP_TOKENS_PER_CHUNK", ncclEpEnvType::ulong};
     ncclEpEnvVar dispatch_tokens_per_chunk{"NCCL_EP_DISPATCH_TOKENS_PER_CHUNK", ncclEpEnvType::ulong};
+    ncclEpEnvVar unordered_dispatch_tokens_per_batch{"NCCL_EP_UNORDERED_DISPATCH_TOKENS_PER_BATCH", ncclEpEnvType::ulong};
     ncclEpEnvVar dispatch_num_stages{"NCCL_EP_DISPATCH_NUM_STAGES", ncclEpEnvType::ulong};
     ncclEpEnvVar dispatch_num_pipelines{"NCCL_EP_DISPATCH_NUM_PIPELINES", ncclEpEnvType::ulong};
     ncclEpEnvVar combine_num_stages_g2s{"NCCL_EP_COMBINE_NUM_STAGES_G2S", ncclEpEnvType::ulong};

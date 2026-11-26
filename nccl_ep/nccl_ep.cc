@@ -908,6 +908,7 @@ struct ncclEpGroup {
     int max_dynamic_smem;           // Opt-in dynamic shared-memory limit per block
     int last_ll_combine_warps_per_group; // Test/diagnostic record of the resolved LL launch shape
     nccl_ep::CombinePushLaunch last_combine_push_launch{}; // Test/diagnostic record of the HT push combine launch
+    bool force_combine_push_ring = false; // Test-only: see ncclEpGroup_test_forceCombinePushRing
     // Hardware opt-in dynamic shared memory cap per block (sharedMemPerBlockOptin), cached
     // once so the dispatch path can reject a pull kernel whose per-warp staging would exceed
     // it (see ncclEpDispatch) without re-querying the device on every call.
@@ -8391,6 +8392,7 @@ ncclResult_t ncclEpCombine(
                 handle->layout == NCCL_EP_LAYOUT_FLAT,
                 em_drop ? group->ht_buffers.ipc_combine_prob_offset - group->ht_buffers.ipc_combine_token_offset
                         : 0,
+                group->force_combine_push_ring,
                 &group->last_combine_push_launch));
             NCCLCHECK(nccl_ep::ht::launch_combine_reduce_stage(
                 combined_x->data,
@@ -8992,11 +8994,22 @@ int ncclEpGroup_test_getLastLlCombineWarpsPerGroup(ncclEpGroup_t group) {
     return group == nullptr ? 0 : group->last_ll_combine_warps_per_group;
 }
 
+ncclResult_t ncclEpGroup_test_forceCombinePushRing(ncclEpGroup_t group, bool force) {
+    if (group == nullptr) {
+        return ncclInvalidArgument;
+    }
+    group->force_combine_push_ring = force;
+    return ncclSuccess;
+}
+
 void ncclEpGroup_test_getLastCombinePushLaunch(
-    ncclEpGroup_t group, int* chunk_int4, unsigned int* device_sm) {
+    ncclEpGroup_t group, int* chunk_int4, unsigned int* device_sm, int* ring) {
     if (group == nullptr) return;
     if (chunk_int4 != nullptr) *chunk_int4 = group->last_combine_push_launch.chunk_int4;
     if (device_sm != nullptr) *device_sm = group->last_combine_push_launch.device_sm;
+    if (ring != nullptr) {
+        *ring = group->last_combine_push_launch.ring;
+    }
 }
 
 void ncclEpGroup_test_getSmBudgets(

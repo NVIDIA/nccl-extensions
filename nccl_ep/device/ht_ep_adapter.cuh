@@ -574,6 +574,8 @@ ncclResult_t launch_combine_push(
     bool flat,
     // Overflow-drop expert-major: byte offset from a peer staging base to its row flags (0 = off).
     size_t row_flag_offset,
+    // Tests: use the load ring on any device where it fits (false: ht_combine_push_ring_enabled).
+    bool force_ring,
     // Optional: receives the resolved chunk width and architecture of the launch (tests).
     ::nccl_ep::CombinePushLaunch* launch_record);
 

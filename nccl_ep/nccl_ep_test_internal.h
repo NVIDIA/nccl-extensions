@@ -67,10 +67,14 @@ ncclResult_t ncclEpGroup_test_setMaxDynamicSmem(ncclEpGroup_t group, int max_dyn
 // Returns the last LL combine launch's resolved warps-per-group, or zero when
 // that group has not launched LL combine.
 int ncclEpGroup_test_getLastLlCombineWarpsPerGroup(ncclEpGroup_t group);
-// Returns the last HT push combine launch's chunk width (int4, after tile rounding) and the device
-// architecture it was resolved for, or zeros when the group has not launched one.
+// Returns the last HT push combine launch's chunk width (int4, after tile rounding), the device
+// architecture it was resolved for and its load-ring depth, or zeros when the group has not
+// launched one.
 void ncclEpGroup_test_getLastCombinePushLaunch(
-    ncclEpGroup_t group, int* chunk_int4, unsigned int* device_sm);
+    ncclEpGroup_t group, int* chunk_int4, unsigned int* device_sm, int* ring);
+// Use the HT push combine load ring on any device where it fits, not only where
+// ht_combine_push_ring_enabled selects it, so tests can run the ring off Rubin.
+ncclResult_t ncclEpGroup_test_forceCombinePushRing(ncclEpGroup_t group, bool force);
 
 // The nccl_ep::ll::LlCombineKernel (device/ll_ep_adapter.cuh) that the last LL combine of the group resolved to, or -1
 // when none ran. Recorded on the host at call time, so it is valid right after ncclEpCombine returns.

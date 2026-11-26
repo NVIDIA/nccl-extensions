@@ -253,8 +253,66 @@ TEST_P(CombinePushChunkingTest, ChunksBufWidthAndSlotsMatchExpected) {
               c.expected_slots);
     // dynamic_smem_bytes is the actual CUDA launch's dynamic-smem request; must stay in lockstep
     // with the slots/buf_int4 it's built from.
-    EXPECT_EQ(ht_ep::combine_push_dynamic_smem_bytes(c.hidden_int4, c.expected_slots, c.chunk_size),
+    EXPECT_EQ(ht_ep::combine_push_dynamic_smem_bytes(c.hidden_int4, c.expected_slots, c.chunk_size, 0),
               static_cast<size_t>(c.expected_slots) * c.expected_buf_int4 * 16);
+}
+
+// Load-ring depth: 0 for a whole-row or multi-tile chunk, else the smem-bound depth (capped), and 0
+// unless the mean copies per row (top_k / team) are in [1, depth].
+TEST(CombinePushRing, Depth) {
+    constexpr int kCap = 232448;  // smem allows depth 3 at 24 slots
+    constexpr int kDepth = std::min(3, ht_ep::kCombinePushMaxRing);
+    constexpr int kDepth2Cap = 166912;  // smem allows depth 2
+    constexpr int kDepth2 = std::min(2, ht_ep::kCombinePushMaxRing);
+    struct Case {
+        int cap, chunk, top_k, team, want;
+    };
+    const Case cases[] = {
+        {kCap, 0, 8, 4, 0},                             // whole row
+        {kCap, 256, 8, 4, 0},                           // two-tile chunk
+        {kCap, 128, 4, 4, kDepth},                      // one copy per row
+        {kCap, 128, 8, 16, 0},                          // half a copy
+        {kCap, 128, 2 * kDepth, 2, kDepth},             // depth copies
+        {kCap, 128, 2 * (kDepth + 1), 2, 0},            // one copy over the depth
+        {kDepth2Cap, 128, 4 * kDepth2, 4, kDepth2},     // a smem-bound depth bounds the copies too
+        {kDepth2Cap, 128, 4 * (kDepth2 + 1), 4, 0},
+    };
+    for (const Case& c : cases) {
+        EXPECT_EQ(ht_ep::combine_push_ring_depth(896, c.cap, c.chunk, 24, c.top_k, c.team), c.want)
+            << "cap " << c.cap << " chunk " << c.chunk << " top_k " << c.top_k << " team " << c.team;
+    }
+    EXPECT_EQ(ht_ep::combine_push_dynamic_smem_bytes(896, 24, 128, 3), static_cast<size_t>(24) * 4 * 128 * 16);
+}
+
+// Push buffers, ring stages and metadata fit the cap; the depth drops by one at each cap where
+// one more stage per slot no longer fits, and stays at kCombinePushMaxRing above it.
+TEST(CombinePushRing, DepthStaysUnderSmemCap) {
+    constexpr int kChunk = 128;
+    constexpr int kSlots = 24;
+    constexpr int kStageBytes = kSlots * kChunk * 16;
+    constexpr int kMetaBytes =
+        ht_ep::combine_push_meta_reserve_bytes() + ht_ep::combine_push_ring_bar_bytes(ht_ep::kCombinePushMaxRing);
+    auto fits = [&](int hidden_int4, int cap) {
+        const int slots = ht_ep::combine_push_slots_per_block(hidden_int4, cap, kChunk);
+        const int ring = ht_ep::combine_push_ring_depth(hidden_int4, cap, kChunk, slots, 4, 4);
+        return ht_ep::combine_push_dynamic_smem_bytes(hidden_int4, slots, kChunk, ring) + kMetaBytes <=
+               static_cast<size_t>(cap);
+    };
+    for (int depth = 1; depth <= ht_ep::kCombinePushMaxRing + 1; depth++) {
+        const int cap = kMetaBytes + (depth + 1) * kStageBytes;
+        const int want = depth < ht_ep::kCombinePushMaxRing ? depth : ht_ep::kCombinePushMaxRing;
+        ASSERT_EQ(ht_ep::combine_push_slots_per_block(896, cap, kChunk), kSlots);
+        EXPECT_EQ(ht_ep::combine_push_ring_depth(896, cap, kChunk, kSlots, 4, 4), want);
+        EXPECT_EQ(ht_ep::combine_push_ring_depth(896, cap - 1, kChunk, kSlots, 4, 4), depth - 1);
+        EXPECT_TRUE(fits(896, cap));
+        EXPECT_TRUE(fits(896, cap - 1));
+    }
+    // Opt-in caps of current GPUs, over rows with a full and a partial last chunk.
+    for (int cap : {101376, 166912, 232448}) {
+        for (int hidden_int4 : {360, 512, 896}) {
+            EXPECT_TRUE(fits(hidden_int4, cap)) << "hidden_int4=" << hidden_int4 << " cap=" << cap;
+        }
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(Sizing, CombinePushChunkingTest, ::testing::ValuesIn(kCombinePushChunkingCases),

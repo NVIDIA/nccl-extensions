@@ -533,6 +533,7 @@ inline ncclResult_t launch_combine_push(
     ncclDataType_t token_dtype,
     bool backward,
     bool nucs,
+    bool force_ring,
     ::nccl_ep::CombinePushLaunch* launch_record) {
     static const int variant_identity = 0;
     assert((row_bytes % 16) == 0);
@@ -596,6 +597,11 @@ inline ncclResult_t launch_combine_push(
         return ncclInvalidArgument;
     }
 
+    int ring = 0;
+    if (!param.flat && !mxfp8 && (force_ring || ::nccl_ep::ht_combine_push_ring_enabled(device_sm))) {
+        ring = ::ht_ep::combine_push_ring_depth(row_int4, smem_cap, chunk_size, slots, top_k, param.lsa_team_size);
+    }
+
     // chunk_size is baked into the source and variant name: it sets the per-warp buffer width and
     // the reduce strategy at compile time, so each distinct value is its own JIT compile.
     const std::string variant_name = [&] {
@@ -605,6 +611,9 @@ inline ncclResult_t launch_combine_push(
              << (backward ? "_bwd" : "")
              << "_c" << chunk_size << (param.claim_dynamic ? "_dyn" : "") << (param.flat ? "_flat" : "")
              << "_w" << slots;
+        if (ring > 0) {
+            name << "_r" << ring;
+        }
         return name.str();
     }();
     const std::string source = [&] {
@@ -622,7 +631,7 @@ inline ncclResult_t launch_combine_push(
         src << "  extern __shared__ uint8_t smem_bytes[];\n"
             << "  ::ht_ep::combine_push<" << top_k << ", " << hidden_int4 << ", " << token_dtype_literal
             << ", " << recipe_literal << ", " << backward_literal << ", " << kernel_chunk_size << ", "
-            << (param.claim_dynamic ? "true" : "false") << ">(\n"
+            << (param.claim_dynamic ? "true" : "false") << ", " << ring << ">(\n"
             << "      p.peer_staging_ptrs,\n"
             << "      reinterpret_cast<const uint8_t*>(p.recv_x_em),\n"
             << "      p.flat2em_slot_map,\n"
@@ -659,7 +668,7 @@ inline ncclResult_t launch_combine_push(
     variant.num_blocks = num_blocks;
     variant.block_dim = block_dim;
     variant.dynamic_smem_bytes = param.flat ? slots * (row_bytes + 16) : static_cast<int>(
-        ::ht_ep::combine_push_dynamic_smem_bytes(row_int4, slots, chunk_size));
+        ::ht_ep::combine_push_dynamic_smem_bytes(row_int4, slots, chunk_size, ring));
     variant.nucs = nucs;
 
     std::string error;
@@ -671,7 +680,9 @@ inline ncclResult_t launch_combine_push(
                      error.empty() ? "" : ": ", error.empty() ? "" : error.c_str());
         return ncclInternalError;
     }
-    if (launch_record != nullptr) *launch_record = {chunk_size, device_sm};
+    if (launch_record != nullptr) {
+        *launch_record = {chunk_size, device_sm, ring};
+    }
     return ncclSuccess;
 }
 

@@ -30,6 +30,11 @@ constexpr bool ht_combine_push_default_whole_row(unsigned int device_sm, int ep_
     return ep_size >= kHtCombinePushWholeRowEpSize;
 }
 
+// Combine-push load ring: measured faster on Rubin (SM107) only.
+constexpr bool ht_combine_push_ring_enabled(unsigned int device_sm) {
+    return device_sm == kHtRubinSm;
+}
+
 constexpr unsigned int ht_flat_combine_default_sms(unsigned int max_dispatch_tokens_per_rank) {
     if (max_dispatch_tokens_per_rank >= kHtLargeBatchTokens) {
         return kHtFlatCombineLargeBatchSms;

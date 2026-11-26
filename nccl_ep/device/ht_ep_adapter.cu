@@ -2777,6 +2777,7 @@ ncclResult_t launch_combine_push(
     bool nucs,
     bool flat,
     size_t row_flag_offset,
+    bool force_ring,
     ::nccl_ep::CombinePushLaunch* launch_record) {
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
@@ -2827,7 +2828,7 @@ ncclResult_t launch_combine_push(
     if (unfused_sync) NCCLCHECK(jit::launch_lsa_head_sync(dcomm, head_sync_flag, stream));
     const ncclResult_t status = ::nccl_ep::ht::jit::launch_combine_push(
         top_k, row_bytes, static_cast<int>(grid), ep_size, device_sm, p, stream, combine_recipe,
-        token_dtype, backward, nucs, launch_record);
+        token_dtype, backward, nucs, force_ring, launch_record);
     if (status != ncclSuccess) return status; // skip the tail sync: the kernel never launched
     if (unfused_sync) {
         NCCLCHECK(jit::launch_lsa_tail_sync(dcomm, grid_barrier_counter, head_sync_flag, stream));

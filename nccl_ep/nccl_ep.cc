@@ -2330,6 +2330,11 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
             nccl_ep::ceil_div<int>(max_chunks_per_rank, min_dispatch_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
         reqs.ginQueueDepth =
             std::min(chunks_per_channel, NCCL_EP_HT_DISPATCH_GIN_WINDOW) * (3 * ht_combine_tokens_per_chunk + 1);
+        // NCCL EP uses GIN indexed signals; VA signals are not needed.
+        reqs.ginVaSignalsRequired = false;
+        // The unordered kernel does not rely on strong signals; the ordered kernel does.
+        reqs.ginStrongSignalsRequired =
+            nccl_ep::ht::ht_select_kernel_impl(&ep_group->env) != nccl_ep::ht::HtKernelImpl::kUnordered;
         // Dispatch and the pull gate use sessions 0-1; combine uses one more at a pass-independent index.
         reqs.lsaBarrierCount =
             std::max<int>(ht_dispatch_sms_capacity(ep_group), NCCL_EP_HT_DISPATCH_BLOCKS) + 1;

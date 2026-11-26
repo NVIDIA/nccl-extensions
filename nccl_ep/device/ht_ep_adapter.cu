@@ -1853,7 +1853,8 @@ ncclResult_t dispatch_impl(
         kp.warp_timing = d_wt;
 #endif
 
-        // Unordered only: pack the entries into send staging before the dispatch kernel.
+        // Unordered only: pack the entries into send staging before the dispatch kernel. The inputs
+        // are 16B aligned here; ncclEpDispatch stages them first when they are not.
         if (ht_select_kernel_impl(env) == HtKernelImpl::kUnordered && num_lsa_teams > 1) {
             ::nccl_ep::ht_dense::pack_args_t pa{};
             pa.send_staging =

@@ -63,7 +63,9 @@ Both directions are supported:
 
 Under `NCCL_EP_DISP_QUANT_FWD` the scale tensors participate in the same pairing.
 Dispatch **inputs** may also be windowed; that is an independent per-tensor
-choice, not something the group flag governs.
+choice, not something the group flag governs. Input zero-copy is not supported for
+unordered (`NCCL_EP_HT_GIN_PROTOCOL=UNORDERED`) multi-node dispatch: the inputs are
+always copied into library buffers.
 
 Expert-major dispatch on the permute path — what you get under `AUTO`/`OFF` —
 stages into the recv buffer even when the tensor is windowed, because the permute

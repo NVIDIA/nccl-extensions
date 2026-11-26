@@ -765,6 +765,10 @@ attaching a NCCL window (`ncclCommWindowRegister`) to the respective tensor.
 Refer to the [Zero-Copy](docs/documentation/zero_copy.md) documentation for more
 details.
 
+With `NCCL_EP_HT_GIN_PROTOCOL=UNORDERED` on multi-node runs, input zero-copy is
+**not supported for dispatch**: it always copies its inputs into library buffers
+before sending. Output windows are used as usual.
+
 ## Custom Allocators
 
 EP allocates its internal device buffers with `cudaMalloc`/`cudaFree` by default.

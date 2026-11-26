@@ -926,6 +926,7 @@ struct ncclEpGroup {
     unsigned int shuffle_sms; // Resolved SM count for the shuffle kernels (local_dup, local_reduce, push-combine reduce).
     unsigned int
         preprocess_num_sms; // Resolved SM count for the preprocessing scan kernels (NCCL_EP_PREPROCESS_NUM_SMS).
+    bool unordered_unaligned_input_warned = false;
 
   // HT EM dispatch/combine code path. Resolved once at ncclEpCreateGroup.
     enum class HtEmMode : uint8_t {
@@ -6768,10 +6769,28 @@ ncclResult_t ncclEpDispatch(
         // This avoids ~60ms GIN registration overhead on the dispatch hot path
         void* token_ptr = x->data; // Default: use user buffer directly
         const bool token_uses_external_window = tensorUsesExternalWindow(group, x);
-        const bool staging_available =
-            !is_lsa_only && handle->ht.token_staging_buffer != nullptr;
+        // Unordered multi-node dispatch packs the input into its own send staging, so it reads the
+        // input in place and needs no registered copy of it -- unless a row is not 16B aligned,
+        // which the pack's and G2S's TMA cannot read; then it is staged, even when window-backed.
+        const bool unordered_dispatch =
+            nccl_ep::ht::ht_select_kernel_impl(&group->env) == nccl_ep::ht::HtKernelImpl::kUnordered;
+        const auto tma_aligned = [](const void* p) {
+            return reinterpret_cast<uintptr_t>(p) % NCCL_EP_HT_TMA_ALIGN == 0;
+        };
+        const bool inputs_tma_aligned =
+            tma_aligned(x->data) && (!scales_forward || scales == nullptr || tma_aligned(scales->data));
+        if (!is_lsa_only && unordered_dispatch && !inputs_tma_aligned && group->rank == 0 &&
+            !group->unordered_unaligned_input_warned) {
+            group->unordered_unaligned_input_warned = true;
+            fprintf(stderr,
+                    "[nccl_ep] warning: dispatch inputs are not 16B aligned; copying them to aligned staging "
+                    "before the unordered pack (slower)\n");
+        }
+        const bool staging_available = !is_lsa_only && (!unordered_dispatch || !inputs_tma_aligned) &&
+                                       handle->ht.token_staging_buffer != nullptr;
         const bool stage_regular_tokens =
-            staging_available && !scales_forward && !token_uses_external_window;
+            staging_available && !scales_forward &&
+            (!token_uses_external_window || (unordered_dispatch && !inputs_tma_aligned));
         if (stage_regular_tokens) {
             // Copy user tokens to pre-registered staging buffer (D2D copy is ~0.1ms vs ~30ms GIN registration)
             size_t token_size = x->sizes[0] * x->sizes[1] * ncclTypeSize(x->datatype);

@@ -105,6 +105,9 @@ NCCL before building all extension libraries. `make clean` cleans all extensions
 without touching NCCL. Each library has an independent build-root override,
 while `BUILDDIR` changes the shared default for all extensions:
 
+`nccl_ep` currently requires NCCL >= 2.31 headers; building against older
+NCCL fails at compile time with a clear error.
+
 ```bash
 make nccl-submodule NCCL_BUILDDIR=/path/to/nccl/build
 make BUILDDIR=/path/to/extensions/build

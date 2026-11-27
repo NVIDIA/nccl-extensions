@@ -30,6 +30,12 @@
 #include "nccl_ep.h"
 #include "nccl_ep_cft.h"
 #include "nccl_ep_env.h"
+
+#if NCCL_VERSION_CODE < NCCL_VERSION(2, 31, 0)
+// The hierarchical LL dispatch reads GIN fields that only exist in NCCL
+// 2.31+, so NCCL 2.30.x headers cannot compile this tree.
+#error "NCCL EP requires NCCL >= 2.31 headers (get 2.31.2 or newer)"
+#endif
 #include "ht_compact_prob.h"
 #include "ht_chunk_config.hpp"
 #include "ht_sm_policy.hpp"
